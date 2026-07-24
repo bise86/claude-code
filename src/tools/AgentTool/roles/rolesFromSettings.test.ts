@@ -43,4 +43,12 @@ describe('parseRoles', () => {
     const sp = await out[0].agentDef.getSystemPrompt({} as any)
     expect(sp).toBe('')
   })
+  it('skips a cli role with no command (would crash Bun.spawn(undefined)) instead of registering it', () => {
+    const out = parseRoles([{ name: 'nocommand', whenToUse: 'w', execMode: 'cli' }], 'userSettings')
+    expect(out).toHaveLength(0)
+  })
+  it('skips an api role missing apiUrl (would crash new URL(undefined)) instead of registering it', () => {
+    const out = parseRoles([{ name: 'noapiurl', whenToUse: 'w', execMode: 'api', apiProtocol: 'openai', apiToken: 'sk', model: 'gpt-4o' }], 'userSettings')
+    expect(out).toHaveLength(0)
+  })
 })

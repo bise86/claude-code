@@ -42,7 +42,10 @@ export function buildPermissionCard(d: PermissionCardData): object {
 }
 export function buildResolvedCard(d: PermissionCardData, winner: string, behavior: 'allow'|'deny'|'cancelled'): object {
   const label = behavior === 'allow' ? '✅ 已允许' : behavior === 'deny' ? '❌ 已拒绝' : '⏹ 已取消'
-  const via = winner === 'terminal' ? '终端' : winner === 'feishu' ? '飞书' : winner
+  const viaLabels: Record<string, string> = {
+    terminal: '终端', feishu: '飞书', hook: '钩子', classifier: '分类器', recheck: '复核',
+  }
+  const via = viaLabels[winner] ?? winner
   return { config: { wide_screen_mode: true }, header: { title: txt(`确认：${d.toolName}`) },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content: '```\n' + d.summary + '\n```' } },
       { tag: 'div', text: txt(`${label}（${via}）`) }] }

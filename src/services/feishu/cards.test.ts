@@ -26,6 +26,18 @@ describe('buildResolvedCard', () => {
     expect(flat).toContain('已允许'); expect(flat).toContain('终端')
     expect(flat).not.toContain('"behavior":"allow"') // 无可点回传按钮
   })
+  it('renders a readable label (not raw English) for hook/classifier/recheck winners', () => {
+    const hook = JSON.stringify(buildResolvedCard({ requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' }, 'hook', 'allow'))
+    expect(hook).toContain('钩子'); expect(hook).not.toContain('hook')
+    const classifier = JSON.stringify(buildResolvedCard({ requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' }, 'classifier', 'allow'))
+    expect(classifier).toContain('分类器'); expect(classifier).not.toContain('classifier')
+    const recheck = JSON.stringify(buildResolvedCard({ requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' }, 'recheck', 'allow'))
+    expect(recheck).toContain('复核'); expect(recheck).not.toContain('recheck')
+  })
+  it('falls back to the raw winner string for an unknown winner', () => {
+    const flat = JSON.stringify(buildResolvedCard({ requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' }, 'bridge', 'allow'))
+    expect(flat).toContain('bridge')
+  })
 })
 
 describe('formValueToAnswers', () => {

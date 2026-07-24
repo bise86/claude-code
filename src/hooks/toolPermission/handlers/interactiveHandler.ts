@@ -80,6 +80,7 @@ type FeishuRacerArgs = {
   claim: () => boolean
   resolveOnce: (d: unknown) => void
   buildAllow: (input: Record<string, unknown>, opts?: unknown) => unknown
+  persistPermissions: (updates: PermissionUpdate[]) => Promise<boolean>
   cancelAndAbort: (feedback?: string) => unknown
   teardownOthers: () => void
 }
@@ -109,11 +110,17 @@ function makeFeishuRacer(a: FeishuRacerArgs) {
         // 先注册回调
         if (!a.claim()) return
         a.teardownOthers() // 飞书胜出：清理其它面
+        // "总是允许" carries permissionUpdates — persist them (mirrors the
+        // Bridge win-branch below) so the rule actually sticks, not just
+        // allowing this one call. Fire-and-forget, same as Bridge: the
+        // allow decision resolves immediately regardless of persistence
+        // outcome (permanent-vs-once is a nicety, not a correctness gate).
+        if (r.behavior === 'allow' && r.permissionUpdates?.length) {
+          void a.persistPermissions(r.permissionUpdates)
+        }
         a.resolveOnce(
           r.behavior === 'allow'
-            ? a.buildAllow(r.updatedInput ?? {}, {
-                permissionUpdates: r.permissionUpdates,
-              })
+            ? a.buildAllow(r.updatedInput ?? {})
             : a.cancelAndAbort(r.feedback),
         )
         resolvedState = { winner: 'feishu', behavior: r.behavior }
@@ -428,6 +435,7 @@ function handleInteractivePermission(
       claim,
       resolveOnce,
       buildAllow: ctx.buildAllow,
+      persistPermissions: ctx.persistPermissions,
       cancelAndAbort: ctx.cancelAndAbort,
       teardownOthers: () => {
         ctx.removeFromQueue()

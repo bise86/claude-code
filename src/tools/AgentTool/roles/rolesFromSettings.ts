@@ -18,7 +18,32 @@ const RoleSchema = z.object({
   args: z.array(z.string()).optional(),
   interactive: z.boolean().optional(),
   cwd: z.string().optional(),
-}).strict()
+}).strict().superRefine((r, ctx) => {
+  // execMode-conditional requireds. Without this, a role missing these
+  // fields would still parse (they're all individually optional above)
+  // and only blow up later at dispatch time: Bun.spawn(undefined) for a
+  // cli role with no command, or `new URL(undefined)` inside
+  // buildRoleFetch for an api role missing apiUrl/apiToken/model. Catching
+  // it here means the role is skipped up front with a clear message
+  // instead of crashing mid-dispatch.
+  if (r.execMode === 'cli' && !r.command) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `role "${r.name}": execMode 'cli' requires 'command'`,
+      path: ['command'],
+    })
+  }
+  if (r.execMode === 'api') {
+    const missing = (['apiUrl', 'apiToken', 'model'] as const).filter(k => !r[k])
+    if (missing.length > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `role "${r.name}": execMode 'api' requires ${missing.join(', ')}`,
+        path: missing,
+      })
+    }
+  }
+})
 
 export const RolesSchema = z.array(RoleSchema)
 

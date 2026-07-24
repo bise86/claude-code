@@ -47,4 +47,23 @@ describe('makeFeishuRacer', () => {
     expect(h.patched.length).toBe(1)           // messageId 到手后补偿 patch
     expect(JSON.stringify(h.patched[0].card)).toContain('已允许')
   })
+
+  it('feishu allow carrying permissionUpdates ("总是允许") → persistPermissions invoked with those updates, in addition to resolving allow', async () => {
+    const h = harness()
+    const persistedCalls: any[] = []
+    let resolved: any = null
+    const rule = { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls' }], behavior: 'allow', destination: 'localSettings' }
+    const racer = makeFeishuRacer({
+      requestId: 'r1', cardData: { requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' },
+      client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
+      claim: () => true, resolveOnce: (d: any) => { resolved = d },
+      buildAllow: (i: any) => ({ behavior: 'allow', input: i }), cancelAndAbort: () => ({ behavior: 'deny' }),
+      persistPermissions: async (updates: any) => { persistedCalls.push(updates); return true },
+      teardownOthers: () => {},
+    })
+    await racer.start()
+    h.fire('r1', { behavior: 'allow', updatedInput: { x: 1 }, permissionUpdates: [rule] })
+    expect(persistedCalls).toEqual([[rule]])
+    expect(resolved).toEqual({ behavior: 'allow', input: { x: 1 } })
+  })
 })
