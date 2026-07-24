@@ -83,6 +83,12 @@ type FeishuRacerArgs = {
   persistPermissions: (updates: PermissionUpdate[]) => Promise<boolean>
   cancelAndAbort: (feedback?: string) => unknown
   teardownOthers: () => void
+  // The original tool input (ctx.input), used as the base for the allow
+  // decision's input. `r.updatedInput` from Feishu is only ever a *partial*
+  // patch (e.g. `{answers}` for AskUserQuestion) or absent entirely for a
+  // plain allow — it must be merged onto this, never used standalone, or
+  // the tool executes with a truncated/empty input. See CRIT#1.
+  originalInput: Record<string, unknown>
 }
 
 function makeFeishuRacer(a: FeishuRacerArgs) {
@@ -116,11 +122,11 @@ function makeFeishuRacer(a: FeishuRacerArgs) {
         // allow decision resolves immediately regardless of persistence
         // outcome (permanent-vs-once is a nicety, not a correctness gate).
         if (r.behavior === 'allow' && r.permissionUpdates?.length) {
-          void a.persistPermissions(r.permissionUpdates)
+          void a.persistPermissions(r.permissionUpdates).catch(logError)
         }
         a.resolveOnce(
           r.behavior === 'allow'
-            ? a.buildAllow(r.updatedInput ?? {})
+            ? a.buildAllow({ ...a.originalInput, ...(r.updatedInput ?? {}) })
             : a.cancelAndAbort(r.feedback),
         )
         resolvedState = { winner: 'feishu', behavior: r.behavior }
@@ -437,6 +443,7 @@ function handleInteractivePermission(
       buildAllow: ctx.buildAllow,
       persistPermissions: ctx.persistPermissions,
       cancelAndAbort: ctx.cancelAndAbort,
+      originalInput: ctx.input,
       teardownOthers: () => {
         ctx.removeFromQueue()
         if (bridgeCallbacks && bridgeRequestId) {
@@ -486,7 +493,7 @@ function handleInteractivePermission(
 
         if (response.behavior === 'allow') {
           if (response.updatedPermissions?.length) {
-            void ctx.persistPermissions(response.updatedPermissions)
+            void ctx.persistPermissions(response.updatedPermissions).catch(logError)
           }
           ctx.logDecision(
             {

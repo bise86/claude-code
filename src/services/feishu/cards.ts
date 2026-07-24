@@ -1,5 +1,10 @@
 export type QuestionSpec = { header: string; question: string; multiSelect: boolean; options: { label: string }[] }
-export type Answer = { header: string; question: string; answers: string[] }
+// Keyed by question TEXT (not header/index) — must match the shape the real
+// AskUserQuestionTool consumes in mapToolResultToToolResultBlockParam
+// (Object.entries(answers).map(([questionText, answer]) => ...)). Multi-select
+// values are joined into a single string, same as the terminal path
+// (label.join(", ")) in AskUserQuestionPermissionRequest.tsx.
+export type Answers = Record<string, string>
 export type PermissionCardData = {
   requestId: string; toolName: string; summary: string
   kind: 'buttons' | 'plan' | 'question'; questions?: QuestionSpec[]; suggestion?: unknown
@@ -50,8 +55,9 @@ export function buildResolvedCard(d: PermissionCardData, winner: string, behavio
     elements: [{ tag: 'div', text: { tag: 'lark_md', content: '```\n' + d.summary + '\n```' } },
       { tag: 'div', text: txt(`${label}（${via}）`) }] }
 }
-export function formValueToAnswers(questions: QuestionSpec[], formValue: Record<string, unknown>): { answers: Answer[] } {
-  const answers = questions.map((q, i) => {
+export function formValueToAnswers(questions: QuestionSpec[], formValue: Record<string, unknown>): { answers: Answers } {
+  const answers: Answers = {}
+  questions.forEach((q, i) => {
     const raw = formValue[`q${i}`]
     let picked = Array.isArray(raw) ? raw.slice() : raw != null ? [raw as string] : []
     if (picked.includes('__other__')) {
@@ -59,7 +65,7 @@ export function formValueToAnswers(questions: QuestionSpec[], formValue: Record<
       picked = picked.filter(v => v !== '__other__')
       if (typeof other === 'string' && other.trim()) picked.push(other.trim())
     }
-    return { header: q.header, question: q.question, answers: picked }
+    answers[q.question] = picked.join(', ')
   })
   return { answers }
 }

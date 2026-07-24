@@ -45,15 +45,31 @@ describe('formValueToAnswers', () => {
     { header: 'DB', question: 'which db?', multiSelect: false, options: [{ label: 'pg' }, { label: 'mysql' }] },
     { header: 'Feat', question: 'features?', multiSelect: true, options: [{ label: 'a' }, { label: 'b' }] },
   ]
-  it('maps single-select to a one-element answer and multi-select to array', () => {
+  // The real AskUserQuestionTool consumes answers via
+  // Object.entries(answers).map(([questionText, answer]) => ...) — so the
+  // result MUST be a plain Record<questionText, answerString>, keyed by the
+  // question TEXT, not an array of {header,question,answers[]} objects.
+  it('maps single-select to a string keyed by question text', () => {
     const out = formValueToAnswers(qs, { q0: 'pg', q1: ['a', 'b'] })
-    expect(out).toEqual({ answers: [
-      { header: 'DB', question: 'which db?', answers: ['pg'] },
-      { header: 'Feat', question: 'features?', answers: ['a', 'b'] },
-    ]})
+    expect(out).toEqual({ answers: {
+      'which db?': 'pg',
+      'features?': 'a, b',
+    }})
+  })
+  it('is a plain Record whose Object.entries pairs are [questionText, answerString]', () => {
+    const out = formValueToAnswers(qs, { q0: 'pg', q1: ['a', 'b'] })
+    expect(out.answers.constructor).toBe(Object)
+    expect(Object.entries(out.answers)).toEqual([
+      ['which db?', 'pg'],
+      ['features?', 'a, b'],
+    ])
+  })
+  it('joins multi-select labels with ", "', () => {
+    const out = formValueToAnswers(qs, { q0: 'mysql', q1: ['a', 'b'] })
+    expect(out.answers['features?']).toBe('a, b')
   })
   it('uses Other free-text when provided', () => {
     const out = formValueToAnswers(qs, { q0: '__other__', q0_other: 'sqlite', q1: [] })
-    expect(out.answers[0].answers).toEqual(['sqlite'])
+    expect(out.answers['which db?']).toBe('sqlite')
   })
 })

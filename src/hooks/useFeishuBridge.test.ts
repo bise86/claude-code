@@ -17,7 +17,7 @@ describe('wireCardAction', () => {
     const qById = new Map([['r1', [{ header: 'DB', question: 'which?', multiSelect: false, options: [{ label: 'pg' }] }]]])
     const handler = wireCardAction(cb, qById)
     handler({ action: { value: { requestId: 'r1', behavior: 'allow', form: true }, form_value: { q0: 'pg' } } })
-    expect(got.updatedInput).toEqual({ answers: [{ header: 'DB', question: 'which?', answers: ['pg'] }] })
+    expect(got.updatedInput).toEqual({ answers: { 'which?': 'pg' } })
   })
   it('deny → behavior deny', () => {
     const cb = createFeishuPermissionCallbacks(); let got: any = null
