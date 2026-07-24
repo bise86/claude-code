@@ -93,6 +93,8 @@ import { executePostSamplingHooks } from './utils/hooks/postSamplingHooks.js'
 import { executeStopFailureHooks } from './utils/hooks.js'
 import type { QuerySource } from './constants/querySource.js'
 import { createDumpPromptsFetch } from './services/api/dumpPrompts.js'
+import { buildRoleFetch } from './services/api/openaiCompat/roleFetch.js'
+import type { RoleClientConfig } from './tools/AgentTool/roles/roleTypes.js'
 import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js'
 import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
@@ -119,6 +121,22 @@ const taskSummaryModule = feature('BG_SESSIONS')
   ? (require('./utils/taskSummary.js') as typeof import('./utils/taskSummary.js'))
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
+
+/**
+ * Resolve the `fetchOverride` used for a query's API calls. Role subagents
+ * (`execMode: 'api'`) carry a `roleClientConfig` describing their own
+ * endpoint/protocol — when present, requests are routed through
+ * buildRoleFetch() instead of the default dumpPromptsFetch override so they
+ * hit the role's own endpoint (and, for the openai protocol, get
+ * request/response translation). Pure function so it's trivially testable
+ * without constructing a full query context.
+ */
+export function resolveRoleFetch(
+  roleClientConfig: RoleClientConfig | undefined,
+  dumpPromptsFetch: typeof fetch | undefined,
+): typeof fetch | undefined {
+  return roleClientConfig ? buildRoleFetch(roleClientConfig) : dumpPromptsFetch
+}
 
 function* yieldMissingToolResultBlocks(
   assistantMessages: AssistantMessage[],
@@ -685,7 +703,10 @@ async function* queryLoop(
               hasAppendSystemPrompt:
                 !!toolUseContext.options.appendSystemPrompt,
               maxOutputTokensOverride,
-              fetchOverride: dumpPromptsFetch,
+              fetchOverride: resolveRoleFetch(
+                toolUseContext.options.roleClientConfig,
+                dumpPromptsFetch,
+              ),
               mcpTools: appState.mcp.tools,
               hasPendingMcpServers: appState.mcp.clients.some(
                 c => c.type === 'pending',

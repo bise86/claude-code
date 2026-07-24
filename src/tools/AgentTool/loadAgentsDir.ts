@@ -36,6 +36,7 @@ import {
   clearPluginAgentCache,
   loadPluginAgents,
 } from '../../utils/plugins/loadPluginAgents.js'
+import { getSettingsForSource } from '../../utils/settings/settings.js'
 import { HooksSchema, type HooksSettings } from '../../utils/settings/types.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { FILE_EDIT_TOOL_NAME } from '../FileEditTool/constants.js'
@@ -52,6 +53,7 @@ import {
   initializeFromSnapshot,
 } from './agentMemorySnapshot.js'
 import { getBuiltInAgents } from './builtInAgents.js'
+import { parseRoles } from './roles/rolesFromSettings.js'
 
 // Type for MCP server specification in agent definitions
 // Can be either a reference to an existing server by name, or an inline definition as { [name]: config }
@@ -130,6 +132,14 @@ export type BaseAgentDefinition = {
    * full CLAUDE.md and interprets their output. Saves ~5-15 Gtok/week across
    * 34M+ Explore spawns. Kill-switch: tengu_slim_subagent_claudemd. */
   omitClaudeMd?: boolean
+  // Role-agent fields (multi-role sub-agents via settings `roles`). See
+  // src/tools/AgentTool/roles/rolesFromSettings.ts for how these are populated.
+  execMode?: 'api' | 'cli'
+  roleClientConfig?: import('./roles/roleTypes.js').RoleClientConfig
+  command?: string
+  args?: string[]
+  interactive?: boolean
+  roleCwd?: string
 }
 
 // Built-in agents - dynamic prompts only, no static systemPrompt field
@@ -197,6 +207,7 @@ export function getActiveAgentsFromList(
   const pluginAgents = allAgents.filter(a => a.source === 'plugin')
   const userAgents = allAgents.filter(a => a.source === 'userSettings')
   const projectAgents = allAgents.filter(a => a.source === 'projectSettings')
+  const localAgents = allAgents.filter(a => a.source === 'localSettings')
   const managedAgents = allAgents.filter(a => a.source === 'policySettings')
   const flagAgents = allAgents.filter(a => a.source === 'flagSettings')
 
@@ -205,6 +216,7 @@ export function getActiveAgentsFromList(
     pluginAgents,
     userAgents,
     projectAgents,
+    localAgents,
     flagAgents,
     managedAgents,
   ]
@@ -218,6 +230,48 @@ export function getActiveAgentsFromList(
   }
 
   return Array.from(agentMap.values())
+}
+
+/**
+ * Drops any role whose agentType collides with a built-in agent's agentType
+ * (logging an error so the collision isn't silent), keeping the rest. Built-in
+ * agents must never be shadowed by a user/project/local-configured role.
+ */
+export function filterCollidingRoles<T extends { agentType: string }>(
+  roles: T[],
+  builtinTypes: Set<string>,
+): T[] {
+  return roles.filter(r => {
+    if (builtinTypes.has(r.agentType)) {
+      logError(
+        new Error(
+          `role "${r.agentType}" collides with built-in agent; ignored`,
+        ),
+      )
+      // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+      console.error(`[roles] "${r.agentType}" collides with built-in agent; ignored`)
+      return false
+    }
+    return true
+  })
+}
+
+/**
+ * Reads role definitions (`roles`) from user/project/local settings, parses
+ * them into agent definitions via parseRoles, and drops any that collide with
+ * a built-in agentType. Roles are attributed to the settings source they came
+ * from so getActiveAgentsFromList's existing per-source dedup/precedence
+ * applies to them the same as markdown-defined custom agents.
+ */
+export function collectRoleAgents(): ReturnType<
+  typeof parseRoles
+>[number]['agentDef'][] {
+  const sources = ['userSettings', 'projectSettings', 'localSettings'] as const
+  const all = sources.flatMap(s =>
+    parseRoles(getSettingsForSource(s)?.roles, s).map(x => x.agentDef),
+  )
+  const builtinTypes = new Set(getBuiltInAgents().map(a => a.agentType))
+  return filterCollidingRoles(all, builtinTypes)
 }
 
 /**
@@ -360,6 +414,7 @@ export const getAgentDefinitionsWithOverrides = memoize(
         ...builtInAgents,
         ...pluginAgents,
         ...customAgents,
+        ...(collectRoleAgents() as unknown as AgentDefinition[]),
       ]
 
       const activeAgents = getActiveAgentsFromList(allAgentsList)

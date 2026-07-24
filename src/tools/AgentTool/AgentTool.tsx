@@ -47,6 +47,7 @@ import { spawnTeammate } from '../shared/spawnMultiAgent.js';
 import { setAgentColor } from './agentColorManager.js';
 import { agentToolResultSchema, classifyHandoffIfNeeded, emitTaskProgress, extractPartialResult, finalizeAgentTool, getLastToolUseName, runAsyncAgentLifecycle } from './agentToolUtils.js';
 import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js';
+import { runCliAgent } from './cliAgentRunner.js';
 import { AGENT_TOOL_NAME, LEGACY_AGENT_TOOL_NAME, ONE_SHOT_BUILTIN_AGENT_TYPES } from './constants.js';
 import { buildForkedMessages, buildWorktreeNotice, FORK_AGENT, isForkSubagentEnabled, isInForkChild } from './forkSubagent.js';
 import type { AgentDefinition } from './loadAgentsDir.js';
@@ -414,8 +415,14 @@ export const AgentTool = buildTool({
       setAgentColor(selectedAgent.agentType, selectedAgent.color);
     }
 
-    // Resolve agent params for logging (these are already resolved in runAgent)
-    const resolvedAgentModel = getAgentModel(selectedAgent.model, toolUseContext.options.mainLoopModel, isForkPath ? undefined : model, permissionMode);
+    // Resolve agent params for logging (these are already resolved in runAgent).
+    // openai-protocol roles store their real backend model (e.g. 'gpt-4o') in
+    // roleClientConfig.backendModel — runAgent.ts's getAgentModel call never sees
+    // selectedAgent.model for these (it passes undefined instead), so the engine
+    // actually runs a Claude alias. Mirror that guard here so telemetry reports
+    // the model the engine actually used rather than the openai backend model string.
+    const isOpenAIRole = selectedAgent.roleClientConfig?.apiProtocol === 'openai';
+    const resolvedAgentModel = getAgentModel(isOpenAIRole ? undefined : selectedAgent.model, toolUseContext.options.mainLoopModel, isForkPath ? undefined : model, permissionMode);
     logEvent('tengu_agent_tool_selected', {
       agent_type: selectedAgent.agentType as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       model: resolvedAgentModel as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -635,6 +642,37 @@ export const AgentTool = buildTool({
       description
     };
 
+    // CLI-mode roles (execMode: 'cli', see rolesFromSettings.ts) are spawned
+    // as an external process via runCliAgent (cliAgentRunner.ts) instead of
+    // the in-process, API-driven runAgent loop. runCliAgent yields the same
+    // Message[] shape runAgent does (see makeResultMessage), so every
+    // consumer below (finalizeAgentTool, progress tracking, the sync/async
+    // iteration loops) works unmodified -- only the producer differs. The
+    // runAgentParams-specific bits (override/onCacheSafeParams/isAsync) don't
+    // apply to an external process, so each call site below branches
+    // individually rather than threading them through. API-mode and plain
+    // agents are unaffected and keep going through runAgent (their
+    // roleClientConfig is consumed inside runAgent/query.ts).
+    //
+    // `effectiveAbortController` mirrors the abortController each adjacent
+    // runAgent(...) call site below threads through `override.abortController`
+    // -- background dispatch sites (~753, ~942) pass their task-specific
+    // controller (so main-session ESC doesn't tree-kill a background CLI
+    // child), while the sync/foreground site (~863) passes the parent's own
+    // toolUseContext.abortController (runAgent's default for non-async runs).
+    // wireAbort/runInteractive (cliAgentRunner.ts) listen on whatever
+    // abortController is on the toolUseContext they're handed, so this has to
+    // be swapped in per call site rather than always using the outer
+    // toolUseContext -- otherwise a background CLI child would be listening
+    // to the wrong controller (see IMP#4).
+    const makeCliAgentStream = (effectiveAbortController: AbortController) => runCliAgent(selectedAgent as unknown as Parameters<typeof runCliAgent>[0], {
+      prompt,
+      description
+    }, {
+      ...toolUseContext,
+      abortController: effectiveAbortController
+    }, canUseTool, assistantMessage);
+
     // Helper to wrap execution with a cwd override: explicit cwd arg (KAIROS)
     // takes precedence over worktree isolation path.
     const cwdOverridePath = cwd ?? worktreeInfo?.worktreePath;
@@ -733,7 +771,7 @@ export const AgentTool = buildTool({
       void runWithAgentContext(asyncAgentContext, () => wrapWithCwd(() => runAsyncAgentLifecycle({
         taskId: agentBackgroundTask.agentId,
         abortController: agentBackgroundTask.abortController!,
-        makeStream: onCacheSafeParams => runAgent({
+        makeStream: onCacheSafeParams => selectedAgent.execMode === 'cli' ? makeCliAgentStream(agentBackgroundTask.abortController!) : runAgent({
           ...runAgentParams,
           override: {
             ...runAgentParams.override,
@@ -843,7 +881,7 @@ export const AgentTool = buildTool({
         const summaryTaskId = foregroundTaskId;
 
         // Get async iterator for the agent
-        const agentIterator = runAgent({
+        const agentIterator = (selectedAgent.execMode === 'cli' ? makeCliAgentStream(toolUseContext.abortController) : runAgent({
           ...runAgentParams,
           override: {
             ...runAgentParams.override,
@@ -855,7 +893,7 @@ export const AgentTool = buildTool({
             } = startAgentSummarization(summaryTaskId, syncAgentId, params, rootSetAppState);
             stopForegroundSummarization = stop;
           } : undefined
-        })[Symbol.asyncIterator]();
+        }))[Symbol.asyncIterator]();
 
         // Track if an error occurred during iteration
         let syncAgentError: Error | undefined;
@@ -922,7 +960,7 @@ export const AgentTool = buildTool({
                     for (const existingMsg of agentMessages) {
                       updateProgressFromMessage(tracker, existingMsg, resolveActivity2, toolUseContext.options.tools);
                     }
-                    for await (const msg of runAgent({
+                    for await (const msg of (selectedAgent.execMode === 'cli' ? makeCliAgentStream(task.abortController!) : runAgent({
                       ...runAgentParams,
                       isAsync: true,
                       // Agent is now running in background
@@ -937,7 +975,7 @@ export const AgentTool = buildTool({
                         } = startAgentSummarization(backgroundedTaskId, asAgentId(backgroundedTaskId), params, rootSetAppState);
                         stopBackgroundedSummarization = stop;
                       } : undefined
-                    })) {
+                    }))) {
                       agentMessages.push(msg);
 
                       // Track progress for backgrounded agents

@@ -47,6 +47,7 @@ import { registerLeaderToolUseConfirmQueue, unregisterLeaderToolUseConfirmQueue,
 import { endInteractionSpan } from '../utils/telemetry/sessionTracing.js';
 import { useLogMessages } from '../hooks/useLogMessages.js';
 import { useReplBridge } from '../hooks/useReplBridge.js';
+import { useFeishuBridge } from '../hooks/useFeishuBridge.js';
 import { type Command, type CommandResultDisplay, type ResumeEntrypoint, getCommandName, isCommandEnabled } from '../commands.js';
 import type { PromptInputMode, QueuedCommand, VimMode } from '../types/textInputTypes.js';
 import { MessageSelector, selectableUserMessagesFilter, messagesAfterAreOnlySynthetic } from '../components/MessageSelector.js';
@@ -3835,6 +3836,13 @@ export function REPL({
   } = useReplBridge(messages, setMessages, abortControllerRef, commands, mainLoopModel);
   sendBridgeResultRef.current = sendBridgeResult;
   useAfterFirstRender();
+
+  // Feishu confirmation bridge: builds a FeishuClient + permission callbacks
+  // when settings.feishu is configured, and stores them in AppState so
+  // interactiveHandler.ts can race a Feishu card alongside the local dialog.
+  // No feature() gate — always mounted; useFeishuBridge() itself no-ops when
+  // Feishu isn't configured.
+  useFeishuBridge();
 
   // Track prompt queue usage for analytics. Fire once per transition from
   // empty to non-empty, not on every length change -- otherwise a render loop

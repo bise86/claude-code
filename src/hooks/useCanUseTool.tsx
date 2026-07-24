@@ -163,7 +163,10 @@ function useCanUseTool(setToolUseConfirmQueue, setToolPermissionContext) {
                 result,
                 awaitAutomatedChecksBeforeDialog: appState.toolPermissionContext.awaitAutomatedChecksBeforeDialog,
                 bridgeCallbacks: feature("BRIDGE_MODE") ? appState.replBridgePermissionCallbacks : undefined,
-                channelCallbacks: feature("KAIROS") || feature("KAIROS_CHANNELS") ? appState.channelPermissionCallbacks : undefined
+                channelCallbacks: feature("KAIROS") || feature("KAIROS_CHANNELS") ? appState.channelPermissionCallbacks : undefined,
+                feishuCallbacks: appState.feishuPermissionCallbacks,
+                feishuClient: appState.feishuClient,
+                feishuQuestionsById: appState.feishuQuestionsById
               }, resolve);
               return;
             }

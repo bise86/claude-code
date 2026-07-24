@@ -337,8 +337,17 @@ export async function* runAgent({
   const rootSetAppState =
     toolUseContext.setAppStateForTasks ?? toolUseContext.setAppState
 
+  // openai-protocol roles store their real backend model (e.g. 'gpt-4o') in
+  // roleClientConfig.backendModel, applied by buildRoleFetch's request-shim —
+  // NOT in agentDefinition.model as far as the engine is concerned. The engine
+  // (getRuntimeMainLoopModel, token budgeting, etc.) does Claude-model math and
+  // requires mainLoopModel to be a valid Claude alias/id, so we must not pass
+  // an openai model name through getAgentModel. Falling back to `undefined`
+  // (i.e. no agent-specific model) makes getAgentModel treat this like the
+  // 'inherit' default and resolve to the parent/session's Claude model.
+  const isOpenAIRole = agentDefinition.roleClientConfig?.apiProtocol === 'openai'
   const resolvedAgentModel = getAgentModel(
-    agentDefinition.model,
+    isOpenAIRole ? undefined : agentDefinition.model,
     toolUseContext.options.mainLoopModel,
     model,
     permissionMode,
@@ -685,6 +694,13 @@ export async function* runAgent({
     mcpClients: mergedMcpClients,
     mcpResources: toolUseContext.options.mcpResources,
     agentDefinitions: toolUseContext.options.agentDefinitions,
+    // Per-role API client config (execMode: 'api' roles only) — consumed by
+    // query.ts's resolveRoleFetch() to route this subagent's requests through
+    // its own endpoint/protocol instead of the default fetch.
+    roleClientConfig:
+      agentDefinition.execMode === 'api'
+        ? agentDefinition.roleClientConfig
+        : undefined,
     // Fork children (useExactTools path) need querySource on context.options
     // for the recursive-fork guard at AgentTool.tsx call() — it checks
     // options.querySource === 'agent:builtin:fork'. This survives autocompact

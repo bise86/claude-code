@@ -1068,6 +1068,12 @@ export const SettingsSchema = lazySchema(() =>
             'Useful for enterprise administrators to add organization-specific context ' +
             '(e.g., "All plugins from our internal marketplace are vetted and approved.").',
         ),
+      feishu: z.object({
+        enabled: z.boolean().optional(), appId: z.string().optional(), appSecret: z.string().optional(),
+        receiveIdType: z.enum(['open_id','chat_id','user_id','union_id','email']).optional(),
+        receiveId: z.string().optional(),
+      }).optional(),
+      roles: z.array(z.record(z.string(), z.unknown())).optional(),
     })
     .passthrough(),
 )

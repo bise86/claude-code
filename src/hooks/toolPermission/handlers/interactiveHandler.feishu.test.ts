@@ -1,0 +1,134 @@
+import { describe, it, expect } from 'bun:test'
+import { makeFeishuRacer } from './interactiveHandler.js'
+
+function harness() {
+  const patched: any[] = []
+  const client = {
+    sendCard: async () => 'om_1',
+    updateCard: async (id: string, card: any) => { patched.push({ id, card }) },
+  }
+  const onResp: Record<string, (r: any) => void> = {}
+  const callbacks = {
+    onResponse: (id: string, h: any) => { onResp[id] = h; return () => { delete onResp[id] } },
+    resolve: (id: string, r: any) => { onResp[id]?.(r); return true },
+  }
+  return { patched, client, callbacks, fire: (id: string, r: any) => callbacks.resolve(id, r) }
+}
+
+describe('makeFeishuRacer', () => {
+  it('claim() returns false (another surface already won) → onResponse is a no-op: resolveOnce and persistPermissions are NOT called', async () => {
+    const h = harness()
+    let resolvedCalls = 0
+    let persistedCalls = 0
+    const racer = makeFeishuRacer({
+      requestId: 'r1', cardData: { requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' },
+      client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
+      claim: () => false, resolveOnce: () => { resolvedCalls++ },
+      buildAllow: (i: any) => ({ behavior: 'allow', input: i }), cancelAndAbort: () => ({ behavior: 'deny' }),
+      persistPermissions: async (updates: any) => { persistedCalls++; return true },
+      teardownOthers: () => {},
+      originalInput: { command: 'ls' },
+    })
+    await racer.start()
+    // Feishu response arrives after another surface (terminal/hook) already
+    // claimed the single-winner slot — should be a complete no-op.
+    h.fire('r1', { behavior: 'allow', updatedInput: { x: 1 }, permissionUpdates: [{ type: 'addRules', rules: [], behavior: 'allow', destination: 'localSettings' }] })
+    expect(resolvedCalls).toBe(0)
+    expect(persistedCalls).toBe(0)
+  })
+
+  it('feishu wins → resolveOnce called, terminal/others cleaned via provided teardown', async () => {
+    const h = harness(); const cleaned: string[] = []; let resolved: any = null
+    const racer = makeFeishuRacer({
+      requestId: 'r1', cardData: { requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' },
+      client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
+      claim: () => true, resolveOnce: (d: any) => { resolved = d },
+      buildAllow: (i: any) => ({ behavior: 'allow', input: i }), cancelAndAbort: () => ({ behavior: 'deny' }),
+      persistPermissions: async () => true,
+      teardownOthers: () => { cleaned.push('others') },
+      originalInput: { command: 'ls' },
+    })
+    await racer.start()
+    h.fire('r1', { behavior: 'allow', updatedInput: { x: 1 } })
+    expect(resolved).toEqual({ behavior: 'allow', input: { command: 'ls', x: 1 } })
+    expect(cleaned).toContain('others')
+  })
+
+  it('terminal wins before messageId arrives → compensation patch after sendCard resolves', async () => {
+    const h = harness()
+    let resolveSend: (id: string) => void = () => {}
+    h.client.sendCard = () => new Promise<string>(res => { resolveSend = res })  // 卡片发送悬挂
+    const racer = makeFeishuRacer({
+      requestId: 'r1', cardData: { requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' },
+      client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
+      claim: () => true, resolveOnce: () => {}, buildAllow: (i: any) => i, cancelAndAbort: () => ({}), teardownOthers: () => {},
+      persistPermissions: async () => true,
+      originalInput: {},
+    })
+    await racer.start()
+    racer.syncOnResolved('terminal', 'allow')  // 终端先胜，messageId 尚未到
+    expect(h.patched.length).toBe(0)           // 还没 patch（无 messageId）
+    resolveSend('om_1'); await Promise.resolve(); await Promise.resolve()
+    expect(h.patched.length).toBe(1)           // messageId 到手后补偿 patch
+    expect(JSON.stringify(h.patched[0].card)).toContain('已允许')
+  })
+
+  it('feishu allow carrying permissionUpdates ("总是允许") → persistPermissions invoked with those updates, in addition to resolving allow', async () => {
+    const h = harness()
+    const persistedCalls: any[] = []
+    let resolved: any = null
+    const rule = { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls' }], behavior: 'allow', destination: 'localSettings' }
+    const racer = makeFeishuRacer({
+      requestId: 'r1', cardData: { requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' },
+      client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
+      claim: () => true, resolveOnce: (d: any) => { resolved = d },
+      buildAllow: (i: any) => ({ behavior: 'allow', input: i }), cancelAndAbort: () => ({ behavior: 'deny' }),
+      persistPermissions: async (updates: any) => { persistedCalls.push(updates); return true },
+      teardownOthers: () => {},
+      originalInput: { command: 'ls' },
+    })
+    await racer.start()
+    h.fire('r1', { behavior: 'allow', updatedInput: { x: 1 }, permissionUpdates: [rule] })
+    expect(persistedCalls).toEqual([[rule]])
+    expect(resolved).toEqual({ behavior: 'allow', input: { command: 'ls', x: 1 } })
+  })
+
+  it('plain allow (no updatedInput) → resolved input equals the ORIGINAL input, not {}', async () => {
+    const h = harness()
+    let resolved: any = null
+    const racer = makeFeishuRacer({
+      requestId: 'r1', cardData: { requestId: 'r1', toolName: 'Bash', summary: 'ls -la', kind: 'buttons' },
+      client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
+      claim: () => true, resolveOnce: (d: any) => { resolved = d },
+      buildAllow: (i: any) => ({ behavior: 'allow', input: i }), cancelAndAbort: () => ({ behavior: 'deny' }),
+      persistPermissions: async () => true,
+      teardownOthers: () => {},
+      originalInput: { command: 'ls -la' },
+    })
+    await racer.start()
+    // Feishu "允许一次"/"总是允许" buttons carry NO updatedInput at all.
+    h.fire('r1', { behavior: 'allow' })
+    expect(resolved).toEqual({ behavior: 'allow', input: { command: 'ls -la' } })
+  })
+
+  it('AskUserQuestion form-submit allow → resolved input merges answers onto the original questions input (questions preserved)', async () => {
+    const h = harness()
+    let resolved: any = null
+    const originalInput = { questions: [{ header: 'DB', question: 'which db?', multiSelect: false, options: [{ label: 'pg' }] }] }
+    const racer = makeFeishuRacer({
+      requestId: 'r1', cardData: { requestId: 'r1', toolName: 'AskUserQuestion', summary: '', kind: 'question', questions: originalInput.questions as any },
+      client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
+      claim: () => true, resolveOnce: (d: any) => { resolved = d },
+      buildAllow: (i: any) => ({ behavior: 'allow', input: i }), cancelAndAbort: () => ({ behavior: 'deny' }),
+      persistPermissions: async () => true,
+      teardownOthers: () => {},
+      originalInput,
+    })
+    await racer.start()
+    h.fire('r1', { behavior: 'allow', updatedInput: { answers: { 'which db?': 'pg' } } })
+    expect(resolved).toEqual({
+      behavior: 'allow',
+      input: { questions: originalInput.questions, answers: { 'which db?': 'pg' } },
+    })
+  })
+})

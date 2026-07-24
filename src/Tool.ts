@@ -176,6 +176,11 @@ export type ToolUseContext = {
     querySource?: QuerySource
     /** Optional callback to get the latest tools (e.g., after MCP servers connect mid-query) */
     refreshTools?: () => Tools
+    /** Per-role API client config (set for `execMode: 'api'` role subagents).
+     * When present, query.ts routes requests through buildRoleFetch() instead
+     * of the default fetch, so the role's own endpoint is used (and, for the
+     * openai protocol, the request/response are translated). */
+    roleClientConfig?: import('./tools/AgentTool/roles/roleTypes.js').RoleClientConfig
   }
   abortController: AbortController
   readFileState: FileStateCache

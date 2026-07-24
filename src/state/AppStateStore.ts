@@ -2,6 +2,9 @@ import type { Notification } from 'src/context/notifications.js'
 import type { TodoList } from 'src/utils/todo/types.js'
 import type { BridgePermissionCallbacks } from '../bridge/bridgePermissionCallbacks.js'
 import type { Command } from '../commands.js'
+import type { QuestionSpec } from '../services/feishu/cards.js'
+import type { FeishuClient } from '../services/feishu/FeishuClient.js'
+import type { FeishuPermissionCallbacks } from '../services/feishu/feishuPermissions.js'
 import type { ChannelPermissionCallbacks } from '../services/mcp/channelPermissions.js'
 import type { ElicitationRequestEvent } from '../services/mcp/elicitationHandler.js'
 import type {
@@ -449,6 +452,17 @@ export type AppState = DeepImmutable<{
   // Races against local UI + bridge + hooks + classifier via claim() in
   // interactiveHandler.ts. Constructed once in useManageMCPConnections.
   channelPermissionCallbacks?: ChannelPermissionCallbacks
+  // Feishu permission callbacks — permission/plan/question card confirmations
+  // over Feishu. Constructed once in useFeishuBridge; undefined when Feishu
+  // is not configured/enabled.
+  feishuPermissionCallbacks?: FeishuPermissionCallbacks
+  // Feishu client (card send/update + card.action.trigger websocket). Set
+  // alongside feishuPermissionCallbacks by useFeishuBridge.
+  feishuClient?: FeishuClient
+  // Pending question-card specs by requestId, so wireCardAction can turn a
+  // form_value submission back into answers. Registered by interactiveHandler
+  // when it sends a question card.
+  feishuQuestionsById?: Map<string, QuestionSpec[]>
 }
 
 export type AppStateStore = Store<AppState>
