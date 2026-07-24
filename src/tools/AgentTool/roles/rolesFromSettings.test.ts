@@ -25,4 +25,22 @@ describe('parseRoles', () => {
     const sp = await out[0].agentDef.getSystemPrompt?.({} as any)
     expect(sp).toContain('SYS')
   })
+  it('normalizes a valid thinkingDepth into effort and roleClientConfig.thinkingDepth', () => {
+    const out = parseRoles([{ name: 'rev', whenToUse: 'review', execMode: 'api',
+      apiProtocol: 'anthropic', apiUrl: 'https://x/v1', apiToken: 'sk', model: 'claude', thinkingDepth: 'High' }], 'userSettings')
+    expect(out[0].agentDef.effort).toBe('high')
+    expect(out[0].agentDef.roleClientConfig?.thinkingDepth).toBe('high')
+  })
+  it('drops an invalid thinkingDepth to undefined effort instead of forwarding a bad string', () => {
+    const out = parseRoles([{ name: 'rev', whenToUse: 'review', execMode: 'api',
+      apiProtocol: 'anthropic', apiUrl: 'https://x/v1', apiToken: 'sk', model: 'claude', thinkingDepth: 'deep' }], 'userSettings')
+    expect(out[0].agentDef.effort).toBeUndefined()
+    expect(out[0].agentDef.roleClientConfig?.thinkingDepth).toBeUndefined()
+  })
+  it('getSystemPrompt is always a callable function, even when prompt is absent', async () => {
+    const out = parseRoles([{ name: 'noprompt', whenToUse: 'w', execMode: 'cli', command: 'x' }], 'userSettings')
+    expect(typeof out[0].agentDef.getSystemPrompt).toBe('function')
+    const sp = await out[0].agentDef.getSystemPrompt({} as any)
+    expect(sp).toBe('')
+  })
 })
