@@ -47,6 +47,7 @@ import { spawnTeammate } from '../shared/spawnMultiAgent.js';
 import { setAgentColor } from './agentColorManager.js';
 import { agentToolResultSchema, classifyHandoffIfNeeded, emitTaskProgress, extractPartialResult, finalizeAgentTool, getLastToolUseName, runAsyncAgentLifecycle } from './agentToolUtils.js';
 import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js';
+import { runCliAgent } from './cliAgentRunner.js';
 import { AGENT_TOOL_NAME, LEGACY_AGENT_TOOL_NAME, ONE_SHOT_BUILTIN_AGENT_TYPES } from './constants.js';
 import { buildForkedMessages, buildWorktreeNotice, FORK_AGENT, isForkSubagentEnabled, isInForkChild } from './forkSubagent.js';
 import type { AgentDefinition } from './loadAgentsDir.js';
@@ -635,6 +636,22 @@ export const AgentTool = buildTool({
       description
     };
 
+    // CLI-mode roles (execMode: 'cli', see rolesFromSettings.ts) are spawned
+    // as an external process via runCliAgent (cliAgentRunner.ts) instead of
+    // the in-process, API-driven runAgent loop. runCliAgent yields the same
+    // Message[] shape runAgent does (see makeResultMessage), so every
+    // consumer below (finalizeAgentTool, progress tracking, the sync/async
+    // iteration loops) works unmodified -- only the producer differs. The
+    // runAgentParams-specific bits (override/onCacheSafeParams/isAsync) don't
+    // apply to an external process, so each call site below branches
+    // individually rather than threading them through. API-mode and plain
+    // agents are unaffected and keep going through runAgent (their
+    // roleClientConfig is consumed inside runAgent/query.ts).
+    const makeCliAgentStream = () => runCliAgent(selectedAgent as unknown as Parameters<typeof runCliAgent>[0], {
+      prompt,
+      description
+    }, toolUseContext, canUseTool, assistantMessage);
+
     // Helper to wrap execution with a cwd override: explicit cwd arg (KAIROS)
     // takes precedence over worktree isolation path.
     const cwdOverridePath = cwd ?? worktreeInfo?.worktreePath;
@@ -733,7 +750,7 @@ export const AgentTool = buildTool({
       void runWithAgentContext(asyncAgentContext, () => wrapWithCwd(() => runAsyncAgentLifecycle({
         taskId: agentBackgroundTask.agentId,
         abortController: agentBackgroundTask.abortController!,
-        makeStream: onCacheSafeParams => runAgent({
+        makeStream: onCacheSafeParams => selectedAgent.execMode === 'cli' ? makeCliAgentStream() : runAgent({
           ...runAgentParams,
           override: {
             ...runAgentParams.override,
@@ -843,7 +860,7 @@ export const AgentTool = buildTool({
         const summaryTaskId = foregroundTaskId;
 
         // Get async iterator for the agent
-        const agentIterator = runAgent({
+        const agentIterator = (selectedAgent.execMode === 'cli' ? makeCliAgentStream() : runAgent({
           ...runAgentParams,
           override: {
             ...runAgentParams.override,
@@ -855,7 +872,7 @@ export const AgentTool = buildTool({
             } = startAgentSummarization(summaryTaskId, syncAgentId, params, rootSetAppState);
             stopForegroundSummarization = stop;
           } : undefined
-        })[Symbol.asyncIterator]();
+        }))[Symbol.asyncIterator]();
 
         // Track if an error occurred during iteration
         let syncAgentError: Error | undefined;
@@ -922,7 +939,7 @@ export const AgentTool = buildTool({
                     for (const existingMsg of agentMessages) {
                       updateProgressFromMessage(tracker, existingMsg, resolveActivity2, toolUseContext.options.tools);
                     }
-                    for await (const msg of runAgent({
+                    for await (const msg of (selectedAgent.execMode === 'cli' ? makeCliAgentStream() : runAgent({
                       ...runAgentParams,
                       isAsync: true,
                       // Agent is now running in background
@@ -937,7 +954,7 @@ export const AgentTool = buildTool({
                         } = startAgentSummarization(backgroundedTaskId, asAgentId(backgroundedTaskId), params, rootSetAppState);
                         stopBackgroundedSummarization = stop;
                       } : undefined
-                    })) {
+                    }))) {
                       agentMessages.push(msg);
 
                       // Track progress for backgrounded agents
