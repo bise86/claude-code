@@ -2549,7 +2549,11 @@ async function* queryModel(
           : 'other') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       })
       const result = yield* executeNonStreamingRequest(
-        { model: options.model, source: options.querySource },
+        {
+          model: options.model,
+          fetchOverride: options.fetchOverride,
+          source: options.querySource,
+        },
         {
           model: options.model,
           fallbackModel: options.fallbackModel,
@@ -2648,7 +2652,11 @@ async function* queryModel(
       try {
         // Fall back to non-streaming mode
         const result = yield* executeNonStreamingRequest(
-          { model: options.model, source: options.querySource },
+          {
+            model: options.model,
+            fetchOverride: options.fetchOverride,
+            source: options.querySource,
+          },
           {
             model: options.model,
             fallbackModel: options.fallbackModel,
