@@ -248,6 +248,8 @@ export function filterCollidingRoles<T extends { agentType: string }>(
           `role "${r.agentType}" collides with built-in agent; ignored`,
         ),
       )
+      // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+      console.error(`[roles] "${r.agentType}" collides with built-in agent; ignored`)
       return false
     }
     return true

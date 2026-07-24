@@ -16,6 +16,27 @@ function harness() {
 }
 
 describe('makeFeishuRacer', () => {
+  it('claim() returns false (another surface already won) → onResponse is a no-op: resolveOnce and persistPermissions are NOT called', async () => {
+    const h = harness()
+    let resolvedCalls = 0
+    let persistedCalls = 0
+    const racer = makeFeishuRacer({
+      requestId: 'r1', cardData: { requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' },
+      client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
+      claim: () => false, resolveOnce: () => { resolvedCalls++ },
+      buildAllow: (i: any) => ({ behavior: 'allow', input: i }), cancelAndAbort: () => ({ behavior: 'deny' }),
+      persistPermissions: async (updates: any) => { persistedCalls++; return true },
+      teardownOthers: () => {},
+      originalInput: { command: 'ls' },
+    })
+    await racer.start()
+    // Feishu response arrives after another surface (terminal/hook) already
+    // claimed the single-winner slot — should be a complete no-op.
+    h.fire('r1', { behavior: 'allow', updatedInput: { x: 1 }, permissionUpdates: [{ type: 'addRules', rules: [], behavior: 'allow', destination: 'localSettings' }] })
+    expect(resolvedCalls).toBe(0)
+    expect(persistedCalls).toBe(0)
+  })
+
   it('feishu wins → resolveOnce called, terminal/others cleaned via provided teardown', async () => {
     const h = harness(); const cleaned: string[] = []; let resolved: any = null
     const racer = makeFeishuRacer({

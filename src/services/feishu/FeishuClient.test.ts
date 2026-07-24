@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'bun:test'
 import { FeishuClient } from './FeishuClient.js'
 
-const cfg = { enabled: true, appId: 'a', appSecret: 's', receiveIdType: 'open_id' as const, receiveId: 'ou_1', cardLanguage: 'zh' }
+const cfg = { enabled: true, appId: 'a', appSecret: 's', receiveIdType: 'open_id' as const, receiveId: 'ou_1' }
 
 function mockDeps() {
   const sent: any[] = []; let actionHandler: any

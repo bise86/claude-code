@@ -72,6 +72,8 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
   if (rawRoles != null) {
     if (!Array.isArray(rawRoles)) {
       logError(new Error('invalid roles config: expected an array'))
+      // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+      console.error(`[roles] invalid roles config from ${source}: expected an array`)
     } else {
       rawRoles.forEach((raw, i) => {
         const parsed = RoleSchema.safeParse(raw)
@@ -81,7 +83,10 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
           const label = raw && typeof raw === 'object' && typeof (raw as any).name === 'string'
             ? (raw as any).name
             : `index ${i}`
+          const reason = parsed.error.issues.map(iss => iss.message).join('; ')
           logError(new Error(`invalid role config (${label}): ${parsed.error.message}`))
+          // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+          console.error(`[roles] "${label}" from ${source} skipped: ${reason}`)
         }
       })
     }
@@ -121,6 +126,9 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
       }})
     } catch (e) {
       logError(e)
+      const reason = e instanceof Error ? e.message : String(e)
+      // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+      console.error(`[roles] "${r.name}" from ${source} skipped: ${reason}`)
     }
   }
   return out

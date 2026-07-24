@@ -23,7 +23,7 @@
 
 | 字段 | 必填 | 类型 | 说明 |
 |-----|------|------|------|
-| `name` | 是 | `string` | 角色的唯一标识符。用于主会话派遣时调用此角色。**不得与内置 Agent 类型重名**（如 `claude`、`fork` 等），否则会被丢弃并输出警告 |
+| `name` | 是 | `string` | 角色的唯一标识符。用于主会话派遣时调用此角色。**不得与内置 Agent 类型重名**（如 `general-purpose`、`Explore`、`Plan` 等），否则会被丢弃并输出警告 |
 | `whenToUse` | 是 | `string` | 角色的能力描述。主会话根据此描述判断何时使用该角色。例如：`"用于图像分析和 OCR 任务"` 或 `"后端 API 测试和集成"` |
 | `execMode` | 是 | `string` | 执行模式，可选值：`'api'` \| `'cli'`。决定角色如何运行 |
 | `tools` | 否 | `string[]` | 该角色可用的工具列表。如果未指定，则继承主会话的工具列表 |
@@ -412,15 +412,15 @@ main()
 
 ## 角色名称冲突处理
 
-如果 `roles` 配置中的某个 `name` 与内置 Agent 类型名称冲突（如 `claude`、`fork` 等），该角色会被**忽略**，并输出警告日志：
+如果 `roles` 配置中的某个 `name` 与内置 Agent 类型名称冲突（如 `general-purpose`、`Explore`、`Plan` 等），该角色会被**忽略**，并直接在终端输出一行警告（无需 `--debug`）：
 
 ```
-[warn] Role 'claude' conflicts with built-in agent type; skipping
+[roles] "general-purpose" collides with built-in agent; ignored
 ```
 
 **避免冲突的方式：**
 - 使用描述性的角色名，如 `gpt4-researcher`、`local-script-runner` 等
-- 定期检查项目日志，查找任何冲突警告
+- 启动时留意终端输出的 `[roles] ...` 警告行
 
 ---
 
@@ -429,9 +429,9 @@ main()
 ### 当前限制
 
 1. **CLI 角色的进程生命周期**：
-   - 进程超时检测与自动 kill 尚未实现
-   - 当主会话中止任务时，CLI 子进程可能无法立即关闭
-   - 后续版本会通过 `toolUseContext.abortController.signal` 完善这一点
+   - 中止（ESC / abort）已实现：主会话中止任务时，会通过 `toolUseContext.abortController.signal` 对 CLI 子进程做 tree-kill（整个进程树），不会留下孤儿进程
+   - 尚未实现的是**配置化的空闲/结果超时**：如果子进程既不中止也不产出 `result`/`error` 消息，目前没有固定超时会主动杀掉它（有意如此，避免误杀长时间运行的合法任务）；这是后续计划中的增强项
+   - 前台转后台（`ctrl+b` 等）会重新派发 CLI 角色的会话，而不是接续原会话——即前台运行中的 CLI 子进程会被结束，重新转入后台时是**重启**而非**恢复**（无会话续接）
 
 2. **API Token 明文存储**：
    - 配置文件中的 `apiToken` 目前以明文存储
@@ -443,7 +443,7 @@ main()
 
 ### 规划中的增强
 
-- [ ] 进程超时与自动 kill 支持
+- [ ] 配置化的空闲/结果超时（abort 时的 tree-kill 已实现，见上）
 - [ ] 环境变量展开（`${VAR_NAME}` 形式）
 - [ ] 角色热重载（无需重启主会话）
 - [ ] 角色预制模板库
@@ -460,7 +460,7 @@ main()
 **检查清单：**
 1. 确认 `settings.json` 的 `roles` 数组格式正确（检查 JSON 语法）
 2. 确认角色 `name` 字段存在且不为空
-3. 检查角色名是否与内置 Agent 类型冲突（查看启动日志中的警告）
+3. 检查角色名是否与内置 Agent 类型冲突（终端启动时会直接打印 `[roles] ...` 警告，无需 `--debug`）
 4. 对于 API 角色，确认 `apiProtocol`、`apiUrl`、`apiToken`、`model` 都已配置
 5. 对于 CLI 角色，确认 `command` 字段已配置且可执行
 

@@ -7,7 +7,6 @@ export const FeishuConfigSchema = z.object({
   appSecret: z.string().min(1),
   receiveIdType: z.enum(['open_id','chat_id','user_id','union_id','email']).default('open_id'),
   receiveId: z.string().min(1),
-  cardLanguage: z.string().default('zh'),
 })
 
 export function getFeishuConfig(settings: { feishu?: unknown }): FeishuConfig | null {

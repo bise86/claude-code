@@ -95,7 +95,10 @@
 
 ## 步骤 7: 配置本项目的飞书设置
 
-在项目根目录的 `settings.json` 中，添加或编辑 `feishu` 配置块：
+在 `.claude/settings.json` 中添加或编辑 `feishu` 配置块，支持三个层级：
+- **用户设置**：`~/.claude/settings.json`
+- **项目设置**：`<repo>/.claude/settings.json`
+- **本地设置**：`<repo>/.claude/settings.local.json`
 
 ### 完整配置示例
 
@@ -106,8 +109,7 @@
     "appId": "cli_a1b2c3d4e5f6g7h8i9j0k1l2",
     "appSecret": "AbCdEfGhIjKlMnOpQrStUvWxYz",
     "receiveIdType": "open_id",
-    "receiveId": "ou_abc123def456ghi789",
-    "cardLanguage": "zh"
+    "receiveId": "ou_abc123def456ghi789"
   }
 }
 ```
@@ -121,7 +123,6 @@
 | `appSecret` | 是 | `string` | 飞书应用的 App Secret，**不要泄露** |
 | `receiveIdType` | 否 | `string` | 接收方类型，可选值：`open_id`（推荐） \| `chat_id` \| `user_id` \| `union_id` \| `email`，默认 `open_id` |
 | `receiveId` | 是 | `string` | 接收方 ID，根据 `receiveIdType` 填入对应的 ID 值 |
-| `cardLanguage` | 否 | `string` | 卡片显示语言，默认 `zh`（简体中文）。其他选项如 `en` 等 |
 
 ### 快速查找配置值
 

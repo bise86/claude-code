@@ -43,16 +43,49 @@ describe('runInteractive', () => {
       kill: () => {},
       exited: Promise.resolve(0),
     }
-    const canUseTool = async () => ({ behavior: 'allow' })
+    // Strengthened fake (MIN#13): rather than ignoring its args, assert the
+    // exact shape/order canUseTool is invoked with — (tool, input,
+    // toolUseContext, assistantMessage, toolUseID) per CanUseToolFn — so an
+    // arg-order regression (e.g. swapping toolUseContext/assistantMessage,
+    // or passing the wrong request id) fails this test instead of silently
+    // passing.
+    const fakeToolUseContext = { options: {} }
+    const canUseToolCalls: any[] = []
+    const canUseTool = async (
+      tool: any,
+      input: any,
+      toolUseContext: any,
+      assistantMessage: any,
+      toolUseID: any,
+    ) => {
+      canUseToolCalls.push({ tool, input, toolUseContext, assistantMessage, toolUseID })
+      return { behavior: 'allow' }
+    }
     const msgs: any[] = []
     for await (const m of runInteractive(
       proc as any,
       { command: 'x' } as any,
       { prompt: 'go', description: 'd' },
-      { options: {} } as any,
+      fakeToolUseContext as any,
       canUseTool as any,
     ))
       msgs.push(m)
+    expect(canUseToolCalls).toHaveLength(1)
+    const call = canUseToolCalls[0]
+    // tool: a Tool-like object (createToolStub) named after the protocol's `tool` field
+    expect(call.tool).toMatchObject({ name: 'Bash' })
+    expect(typeof call.tool.renderToolUseMessage).toBe('function')
+    // input: exactly the permission_request's `input`, not e.g. the whole message
+    expect(call.input).toEqual({ cmd: 'ls' })
+    // toolUseContext: passed through unchanged (same reference)
+    expect(call.toolUseContext).toBe(fakeToolUseContext)
+    // assistantMessage: a synthetic AssistantMessage embedding the same tool_use
+    expect(call.assistantMessage.type).toBe('assistant')
+    expect(call.assistantMessage.message.content[0]).toMatchObject({
+      type: 'tool_use', name: 'Bash', input: { cmd: 'ls' }, id: 'p1',
+    })
+    // toolUseID (5th arg): the permission_request's own id, not undefined/misordered
+    expect(call.toolUseID).toBe('p1')
     expect(stdinLines.join('')).toContain('"type":"permission_response"')
     expect(stdinLines.join('')).toContain('"behavior":"allow"')
     expect(JSON.stringify(msgs[msgs.length - 1].message.content)).toContain('ok')

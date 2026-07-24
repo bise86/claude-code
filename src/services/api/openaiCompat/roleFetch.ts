@@ -1,4 +1,5 @@
 import type { RoleClientConfig } from '../../../tools/AgentTool/roles/roleTypes.js'
+import { logError } from '../../../utils/log.js'
 import { toOpenAIRequest } from './toOpenAIRequest.js'
 import { openaiChunksToAnthropicEvents, anthropicEventsToSSE } from './fromOpenAIStream.js'
 
@@ -17,7 +18,17 @@ async function* parseOpenAISSE(res: Response): AsyncGenerator<any> {
       if (dataLines.length === 0) continue
       const payload = dataLines.map(l => l.slice(5).trimStart()).join('\n').trim()
       if (payload === '[DONE]') return
-      try { yield JSON.parse(payload) } catch {}
+      try {
+        yield JSON.parse(payload)
+      } catch {
+        // Skip (don't throw) a malformed OpenAI SSE frame, same as
+        // cliAgentRunner.ts's parseJsonLines does for bad protocol lines —
+        // one bad frame shouldn't take down the whole stream. Still worth
+        // a log line so a consistently-malformed upstream isn't silently
+        // invisible.
+        const snippet = payload.length > 200 ? `${payload.slice(0, 200)}…` : payload
+        logError(new Error(`roleFetch: skipping malformed SSE frame: ${snippet}`))
+      }
     }
   }
 }

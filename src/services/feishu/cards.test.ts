@@ -38,6 +38,14 @@ describe('buildResolvedCard', () => {
     const flat = JSON.stringify(buildResolvedCard({ requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' }, 'bridge', 'allow'))
     expect(flat).toContain('bridge')
   })
+  it('renders a deny state with ❌/已拒绝', () => {
+    const flat = JSON.stringify(buildResolvedCard({ requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' }, 'terminal', 'deny'))
+    expect(flat).toContain('❌'); expect(flat).toContain('已拒绝')
+  })
+  it('renders a cancelled state with ⏹/已取消', () => {
+    const flat = JSON.stringify(buildResolvedCard({ requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' }, 'terminal', 'cancelled'))
+    expect(flat).toContain('⏹'); expect(flat).toContain('已取消')
+  })
 })
 
 describe('formValueToAnswers', () => {

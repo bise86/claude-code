@@ -415,8 +415,14 @@ export const AgentTool = buildTool({
       setAgentColor(selectedAgent.agentType, selectedAgent.color);
     }
 
-    // Resolve agent params for logging (these are already resolved in runAgent)
-    const resolvedAgentModel = getAgentModel(selectedAgent.model, toolUseContext.options.mainLoopModel, isForkPath ? undefined : model, permissionMode);
+    // Resolve agent params for logging (these are already resolved in runAgent).
+    // openai-protocol roles store their real backend model (e.g. 'gpt-4o') in
+    // roleClientConfig.backendModel — runAgent.ts's getAgentModel call never sees
+    // selectedAgent.model for these (it passes undefined instead), so the engine
+    // actually runs a Claude alias. Mirror that guard here so telemetry reports
+    // the model the engine actually used rather than the openai backend model string.
+    const isOpenAIRole = selectedAgent.roleClientConfig?.apiProtocol === 'openai';
+    const resolvedAgentModel = getAgentModel(isOpenAIRole ? undefined : selectedAgent.model, toolUseContext.options.mainLoopModel, isForkPath ? undefined : model, permissionMode);
     logEvent('tengu_agent_tool_selected', {
       agent_type: selectedAgent.agentType as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       model: resolvedAgentModel as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,

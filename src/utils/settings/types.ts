@@ -1071,7 +1071,7 @@ export const SettingsSchema = lazySchema(() =>
       feishu: z.object({
         enabled: z.boolean().optional(), appId: z.string().optional(), appSecret: z.string().optional(),
         receiveIdType: z.enum(['open_id','chat_id','user_id','union_id','email']).optional(),
-        receiveId: z.string().optional(), cardLanguage: z.string().optional(),
+        receiveId: z.string().optional(),
       }).optional(),
       roles: z.array(z.record(z.string(), z.unknown())).optional(),
     })
