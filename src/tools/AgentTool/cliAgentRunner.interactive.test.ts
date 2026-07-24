@@ -168,4 +168,58 @@ describe('runInteractive', () => {
     controller.abort()
     expect(killed).toBe(true)
   })
+
+  it('kill-on-dispose: disposing the generator early after receiving its one message kills a still-running (not-yet-exited) child', async () => {
+    let killed = false
+    const proc = {
+      stdin: { write: () => {}, end: () => {} },
+      stdout: (async function* () {
+        yield Buffer.from(JSON.stringify({ type: 'result', content: 'ok' }) + '\n')
+      })(),
+      stderr: (async function* () {})(),
+      kill: () => {
+        killed = true
+      },
+      // Never resolves: simulates a child whose stdout has already been
+      // fully drained but that hasn't actually exited yet.
+      exited: new Promise<number>(() => {}),
+    }
+    const gen = runInteractive(
+      proc as any,
+      { command: 'x' } as any,
+      { prompt: 'go', description: 'd' },
+      { options: {} } as any,
+      (async () => ({ behavior: 'allow' })) as any,
+    )
+    const first = await gen.next()
+    expect(first.done).toBe(false)
+    expect(killed).toBe(false)
+    await gen.return(undefined)
+    expect(killed).toBe(true)
+  })
+
+  it('does NOT kill an already-exited child on normal completion (fully drained via for-await)', async () => {
+    let killed = false
+    const proc = {
+      stdin: { write: () => {}, end: () => {} },
+      stdout: (async function* () {
+        yield Buffer.from(JSON.stringify({ type: 'result', content: 'ok' }) + '\n')
+      })(),
+      stderr: (async function* () {})(),
+      kill: () => {
+        killed = true
+      },
+      exited: Promise.resolve(0),
+    }
+    const msgs: any[] = []
+    for await (const m of runInteractive(
+      proc as any,
+      { command: 'x' } as any,
+      { prompt: 'go', description: 'd' },
+      { options: {} } as any,
+      (async () => ({ behavior: 'allow' })) as any,
+    ))
+      msgs.push(m)
+    expect(killed).toBe(false)
+  })
 })

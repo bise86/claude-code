@@ -647,10 +647,25 @@ export const AgentTool = buildTool({
     // individually rather than threading them through. API-mode and plain
     // agents are unaffected and keep going through runAgent (their
     // roleClientConfig is consumed inside runAgent/query.ts).
-    const makeCliAgentStream = () => runCliAgent(selectedAgent as unknown as Parameters<typeof runCliAgent>[0], {
+    //
+    // `effectiveAbortController` mirrors the abortController each adjacent
+    // runAgent(...) call site below threads through `override.abortController`
+    // -- background dispatch sites (~753, ~942) pass their task-specific
+    // controller (so main-session ESC doesn't tree-kill a background CLI
+    // child), while the sync/foreground site (~863) passes the parent's own
+    // toolUseContext.abortController (runAgent's default for non-async runs).
+    // wireAbort/runInteractive (cliAgentRunner.ts) listen on whatever
+    // abortController is on the toolUseContext they're handed, so this has to
+    // be swapped in per call site rather than always using the outer
+    // toolUseContext -- otherwise a background CLI child would be listening
+    // to the wrong controller (see IMP#4).
+    const makeCliAgentStream = (effectiveAbortController: AbortController) => runCliAgent(selectedAgent as unknown as Parameters<typeof runCliAgent>[0], {
       prompt,
       description
-    }, toolUseContext, canUseTool, assistantMessage);
+    }, {
+      ...toolUseContext,
+      abortController: effectiveAbortController
+    }, canUseTool, assistantMessage);
 
     // Helper to wrap execution with a cwd override: explicit cwd arg (KAIROS)
     // takes precedence over worktree isolation path.
@@ -750,7 +765,7 @@ export const AgentTool = buildTool({
       void runWithAgentContext(asyncAgentContext, () => wrapWithCwd(() => runAsyncAgentLifecycle({
         taskId: agentBackgroundTask.agentId,
         abortController: agentBackgroundTask.abortController!,
-        makeStream: onCacheSafeParams => selectedAgent.execMode === 'cli' ? makeCliAgentStream() : runAgent({
+        makeStream: onCacheSafeParams => selectedAgent.execMode === 'cli' ? makeCliAgentStream(agentBackgroundTask.abortController!) : runAgent({
           ...runAgentParams,
           override: {
             ...runAgentParams.override,
@@ -860,7 +875,7 @@ export const AgentTool = buildTool({
         const summaryTaskId = foregroundTaskId;
 
         // Get async iterator for the agent
-        const agentIterator = (selectedAgent.execMode === 'cli' ? makeCliAgentStream() : runAgent({
+        const agentIterator = (selectedAgent.execMode === 'cli' ? makeCliAgentStream(toolUseContext.abortController) : runAgent({
           ...runAgentParams,
           override: {
             ...runAgentParams.override,
@@ -939,7 +954,7 @@ export const AgentTool = buildTool({
                     for (const existingMsg of agentMessages) {
                       updateProgressFromMessage(tracker, existingMsg, resolveActivity2, toolUseContext.options.tools);
                     }
-                    for await (const msg of (selectedAgent.execMode === 'cli' ? makeCliAgentStream() : runAgent({
+                    for await (const msg of (selectedAgent.execMode === 'cli' ? makeCliAgentStream(task.abortController!) : runAgent({
                       ...runAgentParams,
                       isAsync: true,
                       // Agent is now running in background

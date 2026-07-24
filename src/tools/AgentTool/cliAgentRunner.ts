@@ -159,6 +159,68 @@ function wireAbort(proc: CliProcessHandle, signal: AbortSignal | undefined): () 
 }
 
 /**
+ * Fire-and-forget tracker for whether `proc`'s real process has already
+ * exited, backed by `proc.exited` (never awaited/blocked on by callers of
+ * the returned getter). Used by `withKillOnDispose` to tell a genuinely
+ * still-running child (worth killing on early dispose) apart from one that
+ * already finished on its own (nothing left to kill).
+ */
+function trackExited(proc: CliProcessHandle): () => boolean {
+  let exited = false
+  proc.exited.then(
+    () => {
+      exited = true
+    },
+    () => {
+      exited = true
+    },
+  )
+  return () => exited
+}
+
+/**
+ * Wraps `inner` — the generator actually driving `proc` — so that disposing
+ * it early (the consumer calling `.return()` before letting it run to
+ * completion, e.g. `AgentTool.tsx`'s foreground->background transition
+ * abandoning the foreground iterator via `agentIterator.return(undefined)`)
+ * proactively kills `proc`'s process tree first, rather than leaving it
+ * running as an orphan (gh finding IMP#5).
+ *
+ * This has to happen *here*, ahead of delegating to `inner.return()`, rather
+ * than relying solely on `inner`'s own try/finally: an async generator's
+ * `.return()`, when called while the generator is suspended mid-`await`
+ * (e.g. still reading stdout because the child is still running), does not
+ * preempt that await — per the spec it only takes effect once whatever is
+ * being awaited settles on its own. For a still-running child that could be
+ * a very long time (or never, if it's hung), which would leave the child
+ * orphaned for the entire foreground->background window this is meant to
+ * fix. Killing here forces the pending read to unblock promptly; `inner`'s
+ * own finally (e.g. `cleanupAbort()`) still runs once `inner.return()`
+ * below is allowed to take effect.
+ *
+ * Normal completion — the consumer drives `inner` to `{done: true}` via
+ * repeated `.next()` calls, the standard `for await` idiom — never calls
+ * `.return()` at all, so it's unaffected. And once the process has actually
+ * exited (tracked via `isExited`, independent of `inner`'s own progress) an
+ * early `.return()` is a no-op kill-wise: there's nothing left to kill.
+ */
+function withKillOnDispose(proc: CliProcessHandle, inner: AsyncGenerator<Message>): AsyncGenerator<Message> {
+  const isExited = trackExited(proc)
+  const wrapped: AsyncGenerator<Message> = {
+    next: (...args: [] | [unknown]) => inner.next(...args),
+    throw: (e?: unknown) => inner.throw(e),
+    return: (value?: Message | PromiseLike<Message>) => {
+      if (!isExited()) killProcessTree(proc)
+      return inner.return(value as Message)
+    },
+    [Symbol.asyncIterator]() {
+      return wrapped
+    },
+  }
+  return wrapped
+}
+
+/**
  * Accumulates `chunk` into `buffer.rest` and extracts every complete
  * `\n`-terminated line as a parsed JSON object. A trailing partial line
  * (no terminating newline yet) is left in `buffer.rest` for the next call,
@@ -286,8 +348,28 @@ async function handlePermissionRequest(
  * child isn't left running as an orphan. No result/idle timeout is applied
  * here — a fixed timeout risks killing legitimately long-running CLI agents;
  * a config-driven idle/result timeout remains a follow-up.
+ *
+ * Also wrapped (via `withKillOnDispose`) so that a consumer disposing this
+ * generator early (`.return()` before it completes on its own — see
+ * `AgentTool.tsx`'s foreground->background transition) kills `proc` rather
+ * than orphaning it (gh finding IMP#5). `await proc.exited` is deliberately
+ * placed *after* the final `yield` (rather than before, as a blocking gate
+ * on producing the result) so a consumer that stops iterating right after
+ * receiving that final message — without pulling once more to let the
+ * generator run to its natural end — is still treated as an early dispose
+ * by `withKillOnDispose`, not a normal completion.
  */
-export async function* runInteractive(
+export function runInteractive(
+  proc: CliProcessHandle,
+  agentDef: unknown,
+  task: CliAgentTask,
+  toolUseContext: ToolUseContext,
+  canUseTool: CanUseToolFn,
+): AsyncGenerator<Message> {
+  return withKillOnDispose(proc, runInteractiveInner(proc, agentDef, task, toolUseContext, canUseTool))
+}
+
+async function* runInteractiveInner(
   proc: CliProcessHandle,
   agentDef: unknown,
   task: CliAgentTask,
@@ -337,8 +419,8 @@ export async function* runInteractive(
       }
     }
 
-    await proc.exited
     yield makeResultMessage(result)
+    await proc.exited
   } finally {
     cleanupAbort()
   }
@@ -358,13 +440,22 @@ export async function* runInteractive(
  * surfaced via `logError` rather than mixed into the result text.
  *
  * The interactive tier (`agentDef.interactive` truthy) delegates to
- * `runInteractive` above, which wires its own abort handling. This tier
- * wires `toolUseContext.abortController?.signal` itself (via `wireAbort`) so
+ * `runInteractive` above, which wires its own abort handling and its own
+ * `withKillOnDispose` wrapping. This tier wires
+ * `toolUseContext.abortController?.signal` itself (via `wireAbort`) so
  * aborting the parent turn tree-kills this child too rather than orphaning
- * it. No result/idle timeout is applied here — see `runInteractive`'s doc
- * comment for why.
+ * it, and is likewise wrapped in `withKillOnDispose` (see that function's
+ * doc comment, and `runInteractiveInner`'s, for why `await proc.exited` is
+ * placed after the final `yield` rather than gating it). No result/idle
+ * timeout is applied here — see `runInteractive`'s doc comment for why.
+ *
+ * `proc` is spawned eagerly, synchronously, as soon as `runCliAgent` is
+ * called (unlike a plain `async function*`, whose body — including the
+ * spawn — would otherwise only run lazily on the first `.next()`) so that
+ * `withKillOnDispose` has a real process handle to track and kill from the
+ * moment the caller has a stream in hand.
  */
-export async function* runCliAgent(
+export function runCliAgent(
   agentDef: { command: string; args?: string[]; roleCwd?: string; interactive?: boolean },
   task: CliAgentTask,
   toolUseContext: ToolUseContext,
@@ -376,14 +467,21 @@ export async function* runCliAgent(
   const proc = spawn(agentDef.command, agentDef.args ?? [], { cwd: agentDef.roleCwd })
 
   if (agentDef.interactive) {
-    yield* runInteractive(proc, agentDef, task, toolUseContext, canUseTool)
-    return
+    return runInteractive(proc, agentDef, task, toolUseContext, canUseTool)
   }
 
-  // Non-interactive: prompt -> stdin, full stdout -> result (single-shot).
-  // Read stdout/stderr concurrently with the process running so a large
-  // stdout write doesn't block on a full pipe buffer while nothing drains
-  // it (classic spawn deadlock).
+  return withKillOnDispose(proc, runNonInteractive(proc, task, toolUseContext))
+}
+
+// Non-interactive: prompt -> stdin, full stdout -> result (single-shot).
+// Read stdout/stderr concurrently with the process running so a large
+// stdout write doesn't block on a full pipe buffer while nothing drains
+// it (classic spawn deadlock).
+async function* runNonInteractive(
+  proc: CliProcessHandle,
+  task: CliAgentTask,
+  toolUseContext: ToolUseContext,
+): AsyncGenerator<Message> {
   const cleanupAbort = wireAbort(proc, toolUseContext.abortController?.signal)
   try {
     proc.stdin.write(task.prompt)
@@ -394,9 +492,9 @@ export async function* runCliAgent(
         if (stderrText) logError(new Error(stderrText))
       }),
     ])
-    await proc.exited
 
     yield makeResultMessage(out.trim())
+    await proc.exited
   } finally {
     cleanupAbort()
   }
