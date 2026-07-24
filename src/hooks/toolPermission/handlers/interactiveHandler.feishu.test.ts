@@ -23,6 +23,7 @@ describe('makeFeishuRacer', () => {
       client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
       claim: () => true, resolveOnce: (d: any) => { resolved = d },
       buildAllow: (i: any) => ({ behavior: 'allow', input: i }), cancelAndAbort: () => ({ behavior: 'deny' }),
+      persistPermissions: async () => true,
       teardownOthers: () => { cleaned.push('others') },
     })
     await racer.start()
@@ -39,6 +40,7 @@ describe('makeFeishuRacer', () => {
       requestId: 'r1', cardData: { requestId: 'r1', toolName: 'Bash', summary: 'ls', kind: 'buttons' },
       client: h.client as any, callbacks: h.callbacks as any, questionsById: new Map(),
       claim: () => true, resolveOnce: () => {}, buildAllow: (i: any) => i, cancelAndAbort: () => ({}), teardownOthers: () => {},
+      persistPermissions: async () => true,
     })
     await racer.start()
     racer.syncOnResolved('terminal', 'allow')  // 终端先胜，messageId 尚未到

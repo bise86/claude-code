@@ -65,9 +65,29 @@ export type RoleAgentDefinition = {
 }
 
 export function parseRoles(rawRoles: unknown, source: string): { role: any; agentDef: RoleAgentDefinition }[] {
-  const parsed = RolesSchema.safeParse(rawRoles)
-  const items = parsed.success ? parsed.data : []
-  if (!parsed.success && rawRoles != null) logError(new Error('invalid roles config: ' + parsed.error.message))
+  // Validate each role independently rather than z.array(RoleSchema).safeParse(rawRoles)
+  // as a whole: zod array validation is atomic, so a single malformed role
+  // (e.g. an 'api' role missing apiToken) would fail the entire array and
+  // silently drop every OTHER valid role from this source too. Iterating and
+  // safeParse-ing element-by-element means one bad role only costs itself.
+  const items: z.infer<typeof RoleSchema>[] = []
+  if (rawRoles != null) {
+    if (!Array.isArray(rawRoles)) {
+      logError(new Error('invalid roles config: expected an array'))
+    } else {
+      rawRoles.forEach((raw, i) => {
+        const parsed = RoleSchema.safeParse(raw)
+        if (parsed.success) {
+          items.push(parsed.data)
+        } else {
+          const label = raw && typeof raw === 'object' && typeof (raw as any).name === 'string'
+            ? (raw as any).name
+            : `index ${i}`
+          logError(new Error(`invalid role config (${label}): ${parsed.error.message}`))
+        }
+      })
+    }
+  }
   const out: { role: any; agentDef: RoleAgentDefinition }[] = []
   for (const r of items) {
     try {

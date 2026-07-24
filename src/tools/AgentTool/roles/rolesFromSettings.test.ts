@@ -51,4 +51,20 @@ describe('parseRoles', () => {
     const out = parseRoles([{ name: 'noapiurl', whenToUse: 'w', execMode: 'api', apiProtocol: 'openai', apiToken: 'sk', model: 'gpt-4o' }], 'userSettings')
     expect(out).toHaveLength(0)
   })
+  it('validates roles individually: one bad role in a multi-role array does not drop its valid siblings', () => {
+    const out = parseRoles([
+      { name: 'good1', whenToUse: 'w1', execMode: 'cli', command: 'adapter1' },
+      { name: 'good2', whenToUse: 'w2', execMode: 'cli', command: 'adapter2' },
+      { name: 'bad-missing-apitoken', whenToUse: 'broken', execMode: 'api', apiUrl: 'https://x/v1', model: 'gpt-4o' },
+      { name: 'good3', whenToUse: 'w3', execMode: 'api', apiUrl: 'https://y/v1', apiToken: 'sk', model: 'claude' },
+      { name: 'good4', whenToUse: 'w4', execMode: 'cli', command: 'adapter4' },
+    ], 'userSettings')
+    const names = out.map(o => o.agentDef.agentType)
+    expect(names).not.toContain('bad-missing-apitoken')
+    expect(names).toContain('good1')
+    expect(names).toContain('good2')
+    expect(names).toContain('good3')
+    expect(names).toContain('good4')
+    expect(out).toHaveLength(4)
+  })
 })
