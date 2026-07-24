@@ -1,3 +1,4 @@
+import { logError } from '../../../utils/log.js'
 const STOP: Record<string, string> = { stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use', content_filter: 'end_turn' }
 type Evt = { event: string; data: any }
 export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>, ctx: { anthropicModel: string }): AsyncGenerator<Evt> {
@@ -14,6 +15,11 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
       usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } } }
   }
   for await (const c of chunks) {
+    if (c.error) {
+      logError(new Error(`OpenAI-compat upstream error: ${c.error?.message ?? JSON.stringify(c.error)}`))
+      yield { event: 'error', data: { type: 'error', error: { type: 'api_error', message: c.error?.message ?? 'upstream error' } } }
+      return
+    }
     if (c.usage) usage = { input_tokens: c.usage.prompt_tokens ?? 0, output_tokens: c.usage.completion_tokens ?? 0 }
     const choice = c.choices?.[0]; if (!choice && !c.usage) continue
     const delta = choice?.delta ?? {}
@@ -33,9 +39,10 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
     }
     if (choice?.finish_reason) stopReason = STOP[choice.finish_reason] ?? 'end_turn'
   }
+  yield* startIfNeeded()
   if (textOpen) yield { event: 'content_block_stop', data: { type: 'content_block_stop', index: textIndex } }
   for (const blk of toolBlocks.values()) yield { event: 'content_block_stop', data: { type: 'content_block_stop', index: blk.globalIndex } }
-  yield { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usage.output_tokens } } }
+  yield { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens } } }
   yield { event: 'message_stop', data: { type: 'message_stop' } }
 }
 export function anthropicEventsToSSE(events: AsyncIterable<Evt>): ReadableStream<Uint8Array> {
