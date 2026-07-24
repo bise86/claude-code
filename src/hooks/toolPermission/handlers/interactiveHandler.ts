@@ -6,6 +6,14 @@ import { getAllowedChannels } from '../../../bootstrap/state.js'
 import type { BridgePermissionCallbacks } from '../../../bridge/bridgePermissionCallbacks.js'
 import { getTerminalFocused } from '../../../ink/terminal-focus-state.js'
 import {
+  buildPermissionCard,
+  buildResolvedCard,
+  type PermissionCardData,
+  type QuestionSpec,
+} from '../../../services/feishu/cards.js'
+import type { FeishuClient } from '../../../services/feishu/FeishuClient.js'
+import type { FeishuPermissionCallbacks } from '../../../services/feishu/feishuPermissions.js'
+import {
   CHANNEL_PERMISSION_REQUEST_METHOD,
   type ChannelPermissionRequestParams,
   findChannelEntry,
@@ -16,8 +24,10 @@ import {
   shortRequestId,
   truncateForPreview,
 } from '../../../services/mcp/channelPermissions.js'
+import { ASK_USER_QUESTION_TOOL_NAME } from '../../../tools/AskUserQuestionTool/prompt.js'
 import { executeAsyncClassifierCheck } from '../../../tools/BashTool/bashPermissions.js'
 import { BASH_TOOL_NAME } from '../../../tools/BashTool/toolName.js'
+import { EXIT_PLAN_MODE_TOOL_NAME } from '../../../tools/ExitPlanModeTool/constants.js'
 import {
   clearClassifierChecking,
   setClassifierApproval,
@@ -25,6 +35,7 @@ import {
   setYoloClassifierApproval,
 } from '../../../utils/classifierApprovals.js'
 import { errorMessage } from '../../../utils/errors.js'
+import { logError } from '../../../utils/log.js'
 import type { PermissionDecision } from '../../../utils/permissions/PermissionResult.js'
 import type { PermissionUpdate } from '../../../utils/permissions/PermissionUpdateSchema.js'
 import { hasPermissionsToUseTool } from '../../../utils/permissions/permissions.js'
@@ -38,6 +49,160 @@ type InteractivePermissionParams = {
   awaitAutomatedChecksBeforeDialog: boolean | undefined
   bridgeCallbacks?: BridgePermissionCallbacks
   channelCallbacks?: ChannelPermissionCallbacks
+  feishuCallbacks?: FeishuPermissionCallbacks
+  feishuClient?: FeishuClient
+  feishuQuestionsById?: Map<string, QuestionSpec[]>
+}
+
+// -- Feishu confirmation card racer --------------------------------------
+//
+// Feishu races alongside the local dialog/bridge/channel/hook/classifier
+// surfaces above, but unlike those it carries NO `feature()` gate (see
+// Global Constraints in the Plan A doc: KAIROS/BRIDGE_MODE are false in
+// this fork, so Feishu is the only always-on remote confirmation surface).
+//
+// Extracted as a pure function so the race + cross-surface sync + messageId
+// compensation logic is testable without pulling in the React/Ink-heavy
+// rest of this file. `handleInteractivePermission` below is the only
+// caller; see interactiveHandler.feishu.test.ts for coverage.
+type FeishuRacerArgs = {
+  requestId: string
+  cardData: PermissionCardData
+  client: {
+    sendCard(c: object): Promise<string>
+    updateCard(id: string, c: object): Promise<void>
+  }
+  callbacks: {
+    onResponse(id: string, h: (r: any) => void): () => void
+    resolve(id: string, r: any): boolean
+  }
+  questionsById: Map<string, QuestionSpec[]>
+  claim: () => boolean
+  resolveOnce: (d: unknown) => void
+  buildAllow: (input: Record<string, unknown>, opts?: unknown) => unknown
+  cancelAndAbort: (feedback?: string) => unknown
+  teardownOthers: () => void
+}
+
+function makeFeishuRacer(a: FeishuRacerArgs) {
+  let messageId: string | undefined
+  let resolvedState:
+    | { winner: string; behavior: 'allow' | 'deny' | 'cancelled' }
+    | undefined
+  let unsub: (() => void) | undefined
+  if (a.cardData.kind === 'question' && a.cardData.questions) {
+    a.questionsById.set(a.requestId, a.cardData.questions)
+  }
+
+  function patchResolved() {
+    if (messageId && resolvedState) {
+      void a.client.updateCard(
+        messageId,
+        buildResolvedCard(a.cardData, resolvedState.winner, resolvedState.behavior),
+      )
+    }
+  }
+
+  return {
+    async start() {
+      unsub = a.callbacks.onResponse(a.requestId, r => {
+        // 先注册回调
+        if (!a.claim()) return
+        a.teardownOthers() // 飞书胜出：清理其它面
+        a.resolveOnce(
+          r.behavior === 'allow'
+            ? a.buildAllow(r.updatedInput ?? {}, {
+                permissionUpdates: r.permissionUpdates,
+              })
+            : a.cancelAndAbort(r.feedback),
+        )
+        resolvedState = { winner: 'feishu', behavior: r.behavior }
+        patchResolved()
+        a.questionsById.delete(a.requestId)
+      })
+      // fire-and-forget 发卡，messageId 后填；若已有终结态在卡片到手前先落地，
+      // patchResolved() 在这里再触发一次即完成补偿 patch。
+      void (async () => {
+        try {
+          messageId = await a.client.sendCard(buildPermissionCard(a.cardData))
+          patchResolved()
+        } catch (e) {
+          logError(e)
+        }
+      })()
+    },
+    // 其它面胜出时由 handler 调用
+    syncOnResolved(winner: string, behavior: 'allow' | 'deny' | 'cancelled') {
+      unsub?.()
+      resolvedState = { winner, behavior }
+      a.questionsById.delete(a.requestId)
+      patchResolved()
+    },
+  }
+}
+
+/**
+ * Determines the Feishu card shape for a given tool/permission-ask.
+ *
+ * ExitPlanMode -> 'plan'; AskUserQuestion -> 'question' (questions read
+ * from `input.questions`); everything else -> 'buttons' (best-effort
+ * summary via the tool's own renderToolUseMessage, falling back to the
+ * already-computed plain-text `description` when that doesn't yield a
+ * string — renderToolUseMessage's declared return type is React.ReactNode,
+ * so most tools hand back JSX, not text; only some (Bash, structured
+ * output, ...) return a plain string).
+ */
+function buildFeishuCardData(
+  ctx: PermissionContext,
+  description: string,
+  result: PermissionDecision & { behavior: 'ask' },
+  displayInput: Record<string, unknown>,
+): PermissionCardData {
+  const requestId = ctx.toolUseID
+  const toolName = ctx.tool.name
+
+  if (toolName === EXIT_PLAN_MODE_TOOL_NAME) {
+    return { requestId, toolName, summary: description, kind: 'plan' }
+  }
+
+  if (toolName === ASK_USER_QUESTION_TOOL_NAME) {
+    const rawQuestions = Array.isArray((displayInput as { questions?: unknown }).questions)
+      ? ((displayInput as { questions: any[] }).questions ?? [])
+      : []
+    const questions: QuestionSpec[] = rawQuestions.map(q => ({
+      header: q?.header ?? '',
+      question: q?.question ?? '',
+      multiSelect: !!q?.multiSelect,
+      options: Array.isArray(q?.options)
+        ? q.options.map((o: { label: string }) => ({ label: o?.label ?? '' }))
+        : [],
+    }))
+    return {
+      requestId,
+      toolName,
+      summary: description,
+      kind: 'question',
+      questions,
+    }
+  }
+
+  let summary = description
+  try {
+    const rendered = ctx.tool.renderToolUseMessage?.(displayInput as never, {
+      theme: 'dark',
+      verbose: false,
+    })
+    if (typeof rendered === 'string' && rendered) summary = rendered
+  } catch (e) {
+    logError(e)
+  }
+  return {
+    requestId,
+    toolName,
+    summary,
+    kind: 'buttons',
+    suggestion: result.suggestions?.[0],
+  }
 }
 
 /**
@@ -65,6 +230,9 @@ function handleInteractivePermission(
     awaitAutomatedChecksBeforeDialog,
     bridgeCallbacks,
     channelCallbacks,
+    feishuCallbacks,
+    feishuClient,
+    feishuQuestionsById,
   } = params
 
   const { resolve: resolveOnce, isResolved, claim } = createResolveOnce(resolve)
@@ -79,6 +247,11 @@ function handleInteractivePermission(
   // phone, and a stale "yes abc123" after local-resolve falls through
   // tryConsumeReply (entry gone) and gets enqueued as normal chat.
   let channelUnsubscribe: (() => void) | undefined
+  // Hoisted so every non-Feishu win-point (onAllow/onReject/onAbort/
+  // recheck/bridge/channel/hook/classifier) can sync the Feishu card to a
+  // terminal state via racer.syncOnResolved(...). Undefined when Feishu
+  // isn't configured (no feature() gate — see makeFeishuRacer above).
+  let feishuRacer: ReturnType<typeof makeFeishuRacer> | undefined
 
   const permissionPromptStartTimeMs = Date.now()
   const displayInput = result.updatedInput ?? ctx.input
@@ -144,6 +317,7 @@ function handleInteractivePermission(
         bridgeCallbacks.cancelRequest(bridgeRequestId)
       }
       channelUnsubscribe?.()
+      feishuRacer?.syncOnResolved('terminal', 'cancelled')
       ctx.logCancelled()
       ctx.logDecision(
         { decision: 'reject', source: { type: 'user_abort' } },
@@ -168,6 +342,7 @@ function handleInteractivePermission(
         bridgeCallbacks.cancelRequest(bridgeRequestId)
       }
       channelUnsubscribe?.()
+      feishuRacer?.syncOnResolved('terminal', 'allow')
 
       resolveOnce(
         await ctx.handleUserAllow(
@@ -191,6 +366,7 @@ function handleInteractivePermission(
         bridgeCallbacks.cancelRequest(bridgeRequestId)
       }
       channelUnsubscribe?.()
+      feishuRacer?.syncOnResolved('terminal', 'deny')
 
       ctx.logDecision(
         {
@@ -224,12 +400,45 @@ function handleInteractivePermission(
           bridgeCallbacks.cancelRequest(bridgeRequestId)
         }
         channelUnsubscribe?.()
+        feishuRacer?.syncOnResolved('recheck', 'allow')
         ctx.removeFromQueue()
         ctx.logDecision({ decision: 'accept', source: 'config' })
         resolveOnce(ctx.buildAllow(freshResult.updatedInput ?? ctx.input))
       }
     },
   })
+
+  // Feishu confirmation card race — deliberately NOT gated by feature().
+  // (Races alongside the Bridge/Channel blocks below and the local dialog
+  // callbacks above; see "Race 4" comment below for the Bridge race and the
+  // Channel comment further down for that surface.) In this fork,
+  // feature('KAIROS'|'KAIROS_CHANNELS'|'BRIDGE_MODE') are all false, so the
+  // Bridge/Channel races are dead in practice; Feishu is the only always-on
+  // remote confirmation surface. Fire-and-forget send (mirrors the Channel
+  // block below): if sendCard fails, the subscription never fires and
+  // another racer wins — the local dialog is always the floor.
+  if (feishuCallbacks && feishuClient) {
+    const cardData = buildFeishuCardData(ctx, description, result, displayInput)
+    feishuRacer = makeFeishuRacer({
+      requestId: ctx.toolUseID,
+      cardData,
+      client: feishuClient,
+      callbacks: feishuCallbacks,
+      questionsById: feishuQuestionsById ?? new Map(),
+      claim,
+      resolveOnce,
+      buildAllow: ctx.buildAllow,
+      cancelAndAbort: ctx.cancelAndAbort,
+      teardownOthers: () => {
+        ctx.removeFromQueue()
+        if (bridgeCallbacks && bridgeRequestId) {
+          bridgeCallbacks.cancelRequest(bridgeRequestId)
+        }
+        channelUnsubscribe?.()
+      },
+    })
+    void feishuRacer.start()
+  }
 
   // Race 4: Bridge permission response from CCR (claude.ai)
   // When the bridge is connected, send the permission request to CCR and
@@ -262,6 +471,10 @@ function handleInteractivePermission(
         clearClassifierIndicator()
         ctx.removeFromQueue()
         channelUnsubscribe?.()
+        feishuRacer?.syncOnResolved(
+          'bridge',
+          response.behavior === 'allow' ? 'allow' : 'deny',
+        )
 
         if (response.behavior === 'allow') {
           if (response.updatedPermissions?.length) {
@@ -372,6 +585,10 @@ function handleInteractivePermission(
           if (bridgeCallbacks && bridgeRequestId) {
             bridgeCallbacks.cancelRequest(bridgeRequestId)
           }
+          feishuRacer?.syncOnResolved(
+            'channel',
+            response.behavior === 'allow' ? 'allow' : 'deny',
+          )
 
           if (response.behavior === 'allow') {
             ctx.logDecision(
@@ -425,6 +642,10 @@ function handleInteractivePermission(
         bridgeCallbacks.cancelRequest(bridgeRequestId)
       }
       channelUnsubscribe?.()
+      feishuRacer?.syncOnResolved(
+        'hook',
+        hookDecision.behavior === 'allow' ? 'allow' : 'deny',
+      )
       ctx.removeFromQueue()
       resolveOnce(hookDecision)
     })()
@@ -457,6 +678,7 @@ function handleInteractivePermission(
             bridgeCallbacks.cancelRequest(bridgeRequestId)
           }
           channelUnsubscribe?.()
+          feishuRacer?.syncOnResolved('classifier', 'allow')
           clearClassifierChecking(ctx.toolUseID)
 
           const matchedRule =
@@ -532,5 +754,5 @@ function handleInteractivePermission(
 
 // --
 
-export { handleInteractivePermission }
+export { handleInteractivePermission, makeFeishuRacer }
 export type { InteractivePermissionParams }
