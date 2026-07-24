@@ -231,8 +231,26 @@ Run 目录:`.claude/efftask/<run-id>/`(`run-id` = 扫描 `.claude/efftask/` 下�
 ## 10. 实时视图与后台任务
 
 - Orchestrator 注册为后台任务(`src/tasks/` LocalAgent 风格:`registerAsyncAgent` 生命周期),在 `/tasks` 可见,`AppState.tasks` 里有条目。
-- `/et` 的 local-jsx 渲染一个**实时任务树面板**(Ink):树形展开各节点,着色显示 `status`/当前阶段/评分/是否在 worktree;顶部显示并行占用 n/N、Run 状态;支持中断整个 Run。
-- 面板数据来自 orchestrator 的内存树 + 变更订阅(类似 `onTasksUpdated`)。
+- 组件:`src/commands/efftask/TaskTreePanel.tsx`(树面板)+ `NodeDetailView.tsx`(节点详情)。数据来自 orchestrator 的内存树 + 变更订阅(类似 `onTasksUpdated`),以及每节点子 agent 的输出缓冲(捕获自 agent 流,类似异步 agent 进度)。
+
+### 10.1 交互式任务树面板(TaskTreePanel)
+
+- **树形 + 可展开/折叠**:每个有子节点的节点前显示展开标记(`▸` 折叠 / `▾` 展开)。键盘:↑/↓ 移动焦点,→/Enter 或空格展开、←折叠子树;支持鼠标点击标记展开/折叠(终端支持鼠标时)。默认展开根 + 第一层。
+- **每行内容**:`<状态徽标> <标题>  <当前阶段>  <耗时>  <评分>`。
+- **状态着色**(徽标 + 颜色):
+  - 🟢 绿色 = `ACCEPTED`(已完成)
+  - 🟡 运行中(动画/高亮)= `PLANNING`/`PLAN_REVIEW`/`EXECUTING`/`ACCEPTANCE`/`INTEGRATION_ACCEPT`/`SCORING`/`MERGE`/`REWORK`,并显示当前阶段名
+  - ⚪ 灰色 = 排队/等待 = `CREATED`/`READY`(等依赖)/`WAITING_CHILDREN`
+  - 🔴 红色 = `BLOCKED`(失败 / 触阀 / 升级人工)
+- **耗时(elapsed)**:每节点显示自进入活动态起的累计耗时;完成后显示总耗时。
+- **顶部状态条**:并行占用 `n/N`、Run 状态、计数(完成/运行中/排队/失败)。
+- **中断**:面板级快捷键可中断整个 Run(升级为 finishing-a-development-branch 收口)。
+
+### 10.2 节点详情视图(NodeDetailView)
+
+- 在树面板对某节点按 **Enter** → 进入该节点详情(Esc/← 返回树)。
+- 展示该节点 `node.md` 的完整内容:`完整方案 / 重点 / 风险点 / 验收点 / 执行状态 / 评审记录 / 验收记录 / 评分`,以及依赖、worktree 分支/路径、迭代次数、各阶段耗时。
+- **子 agent 实时终端**:若该节点正在执行/评审,详情视图下半区实时滚动显示该节点子 agent 的输出流(与单个子 agent 终端观感一致),完成后保留最终输出。
 
 ## 11. 安全阀(防失控)
 
@@ -269,9 +287,9 @@ Run 目录:`.claude/efftask/<run-id>/`(`run-id` = 扫描 `.claude/efftask/` 下�
 
 每期结束都能独立 `bun test` 通过并可跑:
 
-- **P1 骨架**:`/et` 命令 + 启动确认三关(终端+飞书)+ 树/节点内存模型 + md 持久化 + **串行**执行 + **单角色** plan/review/execute/accept(角色=主模型)。
+- **P1 骨架**:`/et` 命令 + 启动确认三关(终端+飞书)+ 树/节点内存模型 + md 持久化 + **串行**执行 + **单角色** plan/review/execute/accept(角色=主模型)+ **基础只读实时树**(状态着色 + 耗时,不含展开/详情)。
 - **P2 并行 + 隔离**:并发池(默认 5)+ 依赖门控 + git worktree 隔离 + 合并回集成分支 + 收口(finishing-a-development-branch)。
-- **P3 多角色 + 动态生长 + 评分**:多角色圆桌评审/验收(独立并行+全票)+ 观察评分 + 执行中动态加子节点 + 全部安全阀 + 实时树面板。
+- **P3 多角色 + 动态生长 + 评分 + 完整交互视图**:多角色圆桌评审/验收(独立并行+全票)+ 观察评分 + 执行中动态加子节点 + 全部安全阀 + 交互式树面板(展开/折叠 + Enter 进节点详情 + 子 agent 实时终端,见 §10)。
 
 ## 15. 关键集成点(来自代码勘察)
 
