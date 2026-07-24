@@ -116,4 +116,68 @@ describe('runCliAgent non-interactive', () => {
       msgs.push(m)
     expect(msgs.length).toBe(1)
   })
+
+  it('an already-aborted toolUseContext signal kills the child immediately (no real pid → falls back to proc.kill)', async () => {
+    let killed = false
+    const controller = new AbortController()
+    controller.abort()
+    const agentDef = { execMode: 'cli', interactive: false, command: 'x', args: [] } as any
+    const spawn = (_c: string, _a: string[]) => ({
+      stdin: { write: () => {}, end: () => {} },
+      stdout: (async function* () {
+        yield Buffer.from('out')
+      })(),
+      stderr: (async function* () {})(),
+      kill: () => {
+        killed = true
+      },
+      exited: Promise.resolve(0),
+    })
+    const msgs: any[] = []
+    for await (const m of runCliAgent(
+      agentDef,
+      { prompt: 'do it', description: 'd' },
+      { options: {}, abortController: controller } as any,
+      (async () => ({ behavior: 'allow' })) as any,
+      {} as any,
+      { spawn } as any,
+    ))
+      msgs.push(m)
+    expect(killed).toBe(true)
+  })
+
+  it('aborting mid-run kills the child (no real pid → falls back to proc.kill)', async () => {
+    let killed = false
+    const controller = new AbortController()
+    const agentDef = { execMode: 'cli', interactive: false, command: 'x', args: [] } as any
+    const spawn = (_c: string, _a: string[]) => ({
+      stdin: { write: () => {}, end: () => {} },
+      // Never yields/resolves — parks the run so we can abort mid-flight.
+      stdout: (async function* () {
+        await new Promise<void>(() => {})
+      })(),
+      stderr: (async function* () {
+        await new Promise<void>(() => {})
+      })(),
+      kill: () => {
+        killed = true
+      },
+      exited: new Promise<number>(() => {}),
+    })
+    const gen = runCliAgent(
+      agentDef,
+      { prompt: 'do it', description: 'd' },
+      { options: {}, abortController: controller } as any,
+      (async () => ({ behavior: 'allow' })) as any,
+      {} as any,
+      { spawn } as any,
+    )
+    // Advance the generator to its parked `Promise.all([readAll(stdout), ...])`
+    // point. The abort listener registration happens synchronously before
+    // that, so this schedules but does not need to be awaited before
+    // triggering the abort below.
+    void gen.next()
+    controller.abort()
+    expect(killed).toBe(true)
+  })
 })

@@ -17,6 +17,9 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
   for await (const c of chunks) {
     if (c.error) {
       logError(new Error(`OpenAI-compat upstream error: ${c.error?.message ?? JSON.stringify(c.error)}`))
+      // Emit message_start first even when the error is the very first chunk —
+      // callers expect a message_start to always precede any other event.
+      yield* startIfNeeded(c.id)
       yield { event: 'error', data: { type: 'error', error: { type: 'api_error', message: c.error?.message ?? 'upstream error' } } }
       return
     }

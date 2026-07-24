@@ -74,6 +74,50 @@ describe('buildRoleFetch openai translate', () => {
     expect(text).toContain('"hi"')
   })
 
+  it('forwards init.signal to the upstream chat/completions fetch so aborting the caller cancels it', async () => {
+    let seenSignal: AbortSignal | undefined
+    const inner = async (_url: any, init: any) => {
+      seenSignal = init.signal
+      const sse = 'data: [DONE]\n\n'
+      return new Response(sse, { headers: { 'content-type': 'text/event-stream' } })
+    }
+    const f = buildRoleFetch({ apiProtocol: 'openai', apiUrl: 'https://role/v1', apiToken: 'sk-role', backendModel: 'gpt-4o' }, inner as any)
+    const controller = new AbortController()
+    await f('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify({ model: 'claude-alias', messages: [{ role: 'user', content: 'hi' }], stream: true, max_tokens: 10 }),
+      signal: controller.signal,
+    })
+    expect(seenSignal).toBeTruthy()
+    expect(seenSignal).toBe(controller.signal)
+  })
+
+  it('joins two `data:` lines within a single SSE frame per the SSE spec before parsing', async () => {
+    const inner = async (_url: any, _init: any) => {
+      // A single JSON chunk split across two `data:` lines within ONE frame
+      // (no blank line between them). Neither line is valid JSON on its
+      // own — only the SSE-spec-mandated `\n` join between them reconstructs
+      // valid JSON (a raw newline between JSON tokens is legal whitespace).
+      const full = JSON.stringify({ id: 'x', choices: [{ delta: { role: 'assistant', content: 'hi' } }] })
+      const splitAt = full.length - 1 // keep the final closing `}` on its own line
+      const line1 = full.slice(0, splitAt)
+      const line2 = full.slice(splitAt)
+      const sse = `data: ${line1}\ndata: ${line2}\n\n` + 'data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + '\n\n' + 'data: [DONE]\n\n'
+      return new Response(sse, { headers: { 'content-type': 'text/event-stream' } })
+    }
+    const f = buildRoleFetch({ apiProtocol: 'openai', apiUrl: 'https://role/v1', apiToken: 'sk-role', backendModel: 'gpt-4o' }, inner as any)
+    const res = await f('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify({ model: 'claude-alias', messages: [{ role: 'user', content: 'hi' }], stream: true, max_tokens: 10 }),
+    })
+    const text = await res.text()
+    expect(text).toContain('event: message_start')
+    expect(text).toContain('event: message_stop')
+    expect(text).toContain('"hi"')
+  })
+
   it('returns a non-2xx status on upstream error even when upstream status was 2xx', async () => {
     const inner = async (_url: any, _init: any) => {
       // Simulate an upstream that responds 2xx but with a null body (edge

@@ -72,6 +72,16 @@ describe('openaiChunksToAnthropicEvents', () => {
     expect(trailingMd).toBeUndefined()
   })
 
+  it('emits message_start before the error event when the error is the very first chunk', async () => {
+    const evts = await collect([
+      { error: { message: 'upstream failure' } },
+    ])
+    const types = evts.map(e => e.event)
+    expect(types[0]).toBe('message_start')
+    expect(types[1]).toBe('error')
+    expect(types.length).toBe(2)
+  })
+
   it('maps content_filter finish_reason to end_turn stop_reason', async () => {
     const evts = await collect([
       { id: 'x', choices: [{ delta: { role: 'assistant', content: 'hi' } }] },

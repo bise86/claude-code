@@ -91,4 +91,81 @@ describe('runInteractive', () => {
     expect(stdinLines.join('')).toContain('"behavior":"deny"')
     expect(msgs.length).toBe(1)
   })
+
+  it('a {"type":"result"} line with no content yields an empty string, not the literal ""', async () => {
+    const proc = {
+      stdin: { write: () => {}, end: () => {} },
+      stdout: (async function* () {
+        yield Buffer.from(JSON.stringify({ type: 'result' }) + '\n')
+      })(),
+      stderr: (async function* () {})(),
+      kill: () => {},
+      exited: Promise.resolve(0),
+    }
+    const canUseTool = async () => ({ behavior: 'allow' })
+    const msgs: any[] = []
+    for await (const m of runInteractive(
+      proc as any,
+      { command: 'x' } as any,
+      { prompt: 'go', description: 'd' },
+      { options: {} } as any,
+      canUseTool as any,
+    ))
+      msgs.push(m)
+    const text = (msgs[msgs.length - 1] as any).message.content[0].text
+    expect(text).toBe('')
+    expect(text).not.toBe('""')
+  })
+
+  it('an already-aborted toolUseContext signal kills the child immediately (no real pid → falls back to proc.kill)', async () => {
+    let killed = false
+    const controller = new AbortController()
+    controller.abort()
+    const proc = {
+      stdin: { write: () => {}, end: () => {} },
+      stdout: (async function* () {})(),
+      stderr: (async function* () {})(),
+      kill: () => { killed = true },
+      exited: Promise.resolve(0),
+    }
+    const msgs: any[] = []
+    for await (const m of runInteractive(
+      proc as any,
+      { command: 'x' } as any,
+      { prompt: 'go', description: 'd' },
+      { options: {}, abortController: controller } as any,
+      (async () => ({ behavior: 'allow' })) as any,
+    ))
+      msgs.push(m)
+    expect(killed).toBe(true)
+  })
+
+  it('aborting mid-run kills the child (no real pid → falls back to proc.kill)', async () => {
+    let killed = false
+    const controller = new AbortController()
+    const proc = {
+      stdin: { write: () => {}, end: () => {} },
+      // Never yields/resolves — parks the run so we can abort mid-flight.
+      stdout: (async function* () {
+        await new Promise<void>(() => {})
+      })(),
+      stderr: (async function* () {})(),
+      kill: () => { killed = true },
+      exited: new Promise<number>(() => {}),
+    }
+    const gen = runInteractive(
+      proc as any,
+      { command: 'x' } as any,
+      { prompt: 'go', description: 'd' },
+      { options: {}, abortController: controller } as any,
+      (async () => ({ behavior: 'allow' })) as any,
+    )
+    // Advance the generator to its parked `for await (proc.stdout)` point.
+    // Everything before that point (including registering the abort
+    // listener) runs synchronously, so this schedules but does not need to
+    // be awaited before triggering the abort below.
+    void gen.next()
+    controller.abort()
+    expect(killed).toBe(true)
+  })
 })

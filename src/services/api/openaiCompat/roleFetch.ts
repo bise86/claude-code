@@ -58,7 +58,7 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
     headers.set('content-type', 'application/json')
     const anthropicBody = JSON.parse(init.body as string)
     const openaiBody = toOpenAIRequest(anthropicBody, cfg.backendModel, cfg.thinkingDepth)
-    const res = await inner(chatCompletionsUrl(target.toString()), { method: 'POST', headers, body: JSON.stringify(openaiBody) })
+    const res = await inner(chatCompletionsUrl(target.toString()), { ...init, method: 'POST', headers, body: JSON.stringify(openaiBody) })
     if (!res.ok || !res.body) {
       const errText = await res.text().catch(() => '')
       return new Response(JSON.stringify({ type: 'error', error: { type: 'api_error', message: errText || res.statusText } }), { status: res.ok ? 502 : res.status, headers: { 'content-type': 'application/json' } })

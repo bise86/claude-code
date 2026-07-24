@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto'
 import type { Readable, Writable } from 'stream'
+import treeKill from 'tree-kill'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import {
   createSyntheticAssistantMessage,
@@ -20,6 +21,15 @@ export type CliProcessHandle = {
   stderr: AsyncIterable<Uint8Array | string>
   kill: () => void
   exited: Promise<number>
+  /**
+   * Real OS pid, when known — used by `killProcessTree` to tree-kill the
+   * whole process group on abort rather than just the immediate child. Not
+   * set by fakes in tests (there's no real pid to tree-kill), which is the
+   * intended escape hatch: `killProcessTree` falls back to `proc.kill()`
+   * whenever `pid` is absent, so the abort path stays unit-testable via a
+   * `proc.kill` spy without touching a real OS process.
+   */
+  pid?: number
 }
 
 export type SpawnFn = (
@@ -106,7 +116,46 @@ function defaultSpawn(cmd: string, args: string[], opts?: { cwd?: string }): Cli
     stderr: p.stderr,
     kill: () => p.kill(),
     exited: p.exited,
+    pid: p.pid,
   }
+}
+
+/**
+ * Kills `proc`'s entire process tree (not just the immediate child) via
+ * `tree-kill`, so a CLI subagent that itself spawns children (e.g. a shell
+ * wrapper) doesn't leave orphans behind when the parent turn is aborted.
+ * Falls back to `proc.kill()` when there's no real pid to tree-kill (the
+ * case for fakes injected in tests via `deps.spawn`), which doubles as the
+ * unit-test seam for the abort path.
+ */
+function killProcessTree(proc: CliProcessHandle): void {
+  if (proc.pid) {
+    treeKill(proc.pid)
+  } else {
+    proc.kill()
+  }
+}
+
+/**
+ * Wires `signal` (the parent turn's `toolUseContext.abortController?.signal`,
+ * which may be undefined for callers that don't provide one) to kill `proc`'s
+ * process tree on abort, so ESC/abort during a CLI-agent run doesn't leave
+ * the child running as an orphan. Handles a signal that's already aborted by
+ * the time the run starts (kills immediately, synchronously) as well as one
+ * that aborts mid-run. Returns a cleanup function that removes the listener
+ * once the run finishes normally — call it in a `finally` so aborting a
+ * later, unrelated turn doesn't reach back into an already-finished run's
+ * (possibly-reused) proc handle.
+ */
+function wireAbort(proc: CliProcessHandle, signal: AbortSignal | undefined): () => void {
+  if (!signal) return () => {}
+  if (signal.aborted) {
+    killProcessTree(proc)
+    return () => {}
+  }
+  const onAbort = () => killProcessTree(proc)
+  signal.addEventListener('abort', onAbort)
+  return () => signal.removeEventListener('abort', onAbort)
 }
 
 /**
@@ -232,9 +281,11 @@ async function handlePermissionRequest(
  * non-interactive tier so `finalizeAgentTool`/`getLastAssistantMessage`
  * (agentToolUtils.ts) can treat any `runCliAgent` output uniformly.
  *
- * Process lifecycle (timeout / kill on abort) is NOT handled here — see the
- * brief's note on wiring `toolUseContext.abortController.signal` to
- * `proc.kill()`; deferred as a follow-up increment.
+ * Process lifecycle: on abort (ESC), `toolUseContext.abortController?.signal`
+ * is wired via `wireAbort` to tree-kill `proc`'s whole process tree so the
+ * child isn't left running as an orphan. No result/idle timeout is applied
+ * here — a fixed timeout risks killing legitimately long-running CLI agents;
+ * a config-driven idle/result timeout remains a follow-up.
  */
 export async function* runInteractive(
   proc: CliProcessHandle,
@@ -243,41 +294,54 @@ export async function* runInteractive(
   toolUseContext: ToolUseContext,
   canUseTool: CanUseToolFn,
 ): AsyncGenerator<Message> {
-  proc.stdin.write(JSON.stringify({ type: 'task', prompt: task.prompt }) + '\n')
+  const cleanupAbort = wireAbort(proc, toolUseContext.abortController?.signal)
+  try {
+    proc.stdin.write(JSON.stringify({ type: 'task', prompt: task.prompt }) + '\n')
 
-  void (async () => {
-    for await (const chunk of proc.stderr) {
+    void (async () => {
+      for await (const chunk of proc.stderr) {
+        const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+        if (text) logError(new Error(text))
+      }
+    })()
+
+    const buffer = { rest: '' }
+    let result = ''
+
+    for await (const chunk of proc.stdout) {
       const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
-      if (text) logError(new Error(text))
-    }
-  })()
-
-  const buffer = { rest: '' }
-  let result = ''
-
-  for await (const chunk of proc.stdout) {
-    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
-    for (const msg of parseJsonLines(text, buffer)) {
-      if (!msg || typeof msg !== 'object') continue
-      switch (msg.type) {
-        case 'permission_request':
-          await handlePermissionRequest(msg, proc, toolUseContext, canUseTool)
-          break
-        case 'result':
-          result = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '')
-          break
-        case 'error':
-          logError(new Error(`cli agent error: ${msg.message ?? 'unknown error'}`))
-          if (!result) result = `[cli error] ${msg.message ?? 'unknown error'}`
-          break
-        default:
-          break
+      for (const msg of parseJsonLines(text, buffer)) {
+        if (!msg || typeof msg !== 'object') continue
+        switch (msg.type) {
+          case 'permission_request':
+            await handlePermissionRequest(msg, proc, toolUseContext, canUseTool)
+            break
+          case 'result':
+            // Coerce a missing/undefined `content` to '' rather than the
+            // 2-char literal string `'""'` that `JSON.stringify(undefined ??
+            // '')` would otherwise produce.
+            result =
+              typeof msg.content === 'string'
+                ? msg.content
+                : msg.content == null
+                  ? ''
+                  : JSON.stringify(msg.content)
+            break
+          case 'error':
+            logError(new Error(`cli agent error: ${msg.message ?? 'unknown error'}`))
+            if (!result) result = `[cli error] ${msg.message ?? 'unknown error'}`
+            break
+          default:
+            break
+        }
       }
     }
-  }
 
-  await proc.exited
-  yield makeResultMessage(result)
+    await proc.exited
+    yield makeResultMessage(result)
+  } finally {
+    cleanupAbort()
+  }
 }
 
 /**
@@ -294,7 +358,11 @@ export async function* runInteractive(
  * surfaced via `logError` rather than mixed into the result text.
  *
  * The interactive tier (`agentDef.interactive` truthy) delegates to
- * `runInteractive` above.
+ * `runInteractive` above, which wires its own abort handling. This tier
+ * wires `toolUseContext.abortController?.signal` itself (via `wireAbort`) so
+ * aborting the parent turn tree-kills this child too rather than orphaning
+ * it. No result/idle timeout is applied here — see `runInteractive`'s doc
+ * comment for why.
  */
 export async function* runCliAgent(
   agentDef: { command: string; args?: string[]; roleCwd?: string; interactive?: boolean },
@@ -316,15 +384,20 @@ export async function* runCliAgent(
   // Read stdout/stderr concurrently with the process running so a large
   // stdout write doesn't block on a full pipe buffer while nothing drains
   // it (classic spawn deadlock).
-  proc.stdin.write(task.prompt)
-  proc.stdin.end()
-  const [out] = await Promise.all([
-    readAll(proc.stdout),
-    readAll(proc.stderr).then(stderrText => {
-      if (stderrText) logError(new Error(stderrText))
-    }),
-  ])
-  await proc.exited
+  const cleanupAbort = wireAbort(proc, toolUseContext.abortController?.signal)
+  try {
+    proc.stdin.write(task.prompt)
+    proc.stdin.end()
+    const [out] = await Promise.all([
+      readAll(proc.stdout),
+      readAll(proc.stderr).then(stderrText => {
+        if (stderrText) logError(new Error(stderrText))
+      }),
+    ])
+    await proc.exited
 
-  yield makeResultMessage(out.trim())
+    yield makeResultMessage(out.trim())
+  } finally {
+    cleanupAbort()
+  }
 }
