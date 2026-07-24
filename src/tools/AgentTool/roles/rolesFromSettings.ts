@@ -45,8 +45,6 @@ const RoleSchema = z.object({
   }
 })
 
-export const RolesSchema = z.array(RoleSchema)
-
 export type RoleAgentDefinition = {
   agentType: string
   whenToUse: string
