@@ -1,6 +1,10 @@
 import { randomUUID } from 'crypto'
 import type { Readable, Writable } from 'stream'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
+import {
+  createSyntheticAssistantMessage,
+  createToolStub,
+} from '../../remote/remotePermissionBridge.js'
 import type { ToolUseContext } from '../../Tool.js'
 import type { AssistantMessage, Message } from '../../types/message.js'
 import { logError } from '../../utils/log.js'
@@ -106,22 +110,174 @@ function defaultSpawn(cmd: string, args: string[], opts?: { cwd?: string }): Cli
 }
 
 /**
- * Interactive tier — implements the (future) bidirectional CLI protocol for
- * agents where `agentDef.interactive` is truthy. NOT implemented here; this
- * is Task 9's responsibility. The non-interactive path in `runCliAgent`
- * never calls this.
+ * Accumulates `chunk` into `buffer.rest` and extracts every complete
+ * `\n`-terminated line as a parsed JSON object. A trailing partial line
+ * (no terminating newline yet) is left in `buffer.rest` for the next call,
+ * so this tolerates the protocol stream being split across chunk
+ * boundaries (e.g. a child stdout write lands mid-line across two `read()`
+ * calls). Malformed lines are logged via `logError` and skipped rather than
+ * thrown, so one bad line from the child process doesn't take down the
+ * whole interactive session.
+ *
+ * `buffer` is caller-owned (one `{ rest: '' }` per proc's stdout stream) so
+ * this stays a pure, independently-unit-testable function with no hidden
+ * module-level state.
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function* runInteractive(
+export function parseJsonLines(chunk: string, buffer: { rest: string }): any[] {
+  buffer.rest += chunk
+  const out: any[] = []
+  let newlineIndex: number
+  while ((newlineIndex = buffer.rest.indexOf('\n')) >= 0) {
+    const line = buffer.rest.slice(0, newlineIndex).trim()
+    buffer.rest = buffer.rest.slice(newlineIndex + 1)
+    if (!line) continue
+    try {
+      out.push(JSON.parse(line))
+    } catch {
+      logError(new Error(`cliAgentRunner: skipping malformed protocol line: ${line}`))
+    }
+  }
+  return out
+}
+
+/**
+ * Adapts a single `permission_request` protocol line into a call against the
+ * PARENT's `canUseTool` — the same function `AgentTool.call` hands to
+ * `runAgent` for in-process subagents — rather than hand-rolling a
+ * confirmation path here. This is what routes a CLI subagent's tool-use
+ * request through the same terminal confirmation (and Feishu racer, see
+ * useFeishuBridge) as any other tool use.
+ *
+ * The protocol's `{id, tool, input}` shape doesn't carry a local `Tool`
+ * instance or a real `AssistantMessage`, both of which `canUseTool`
+ * requires, so it's adapted the same way remote/SSH sessions adapt an
+ * `SDKControlPermissionRequest` they don't have a local tool for: a
+ * `createToolStub(toolName)` stand-in `Tool` and a
+ * `createSyntheticAssistantMessage(request, requestId)` synthetic message
+ * embedding the tool_use block (see remotePermissionBridge.ts,
+ * useSSHSession.ts for the same pattern).
+ *
+ * The resulting `PermissionDecision` is mapped back into a
+ * `permission_response` line written to the child's stdin: `allow` carries
+ * `updatedInput` through; `deny` (and, defensively, `ask` — canUseTool's
+ * contract is to only resolve once a terminal decision is reached, so an
+ * `ask` reaching here would indicate an upstream bug) carries the
+ * decision's `message` as `feedback` rather than blocking the child
+ * indefinitely.
+ */
+async function handlePermissionRequest(
+  msg: { id: string; tool: string; input?: Record<string, unknown> },
+  proc: CliProcessHandle,
+  toolUseContext: ToolUseContext,
+  canUseTool: CanUseToolFn,
+): Promise<void> {
+  const input = msg.input ?? {}
+  const tool = createToolStub(msg.tool)
+  const assistantMessage = createSyntheticAssistantMessage(
+    {
+      subtype: 'can_use_tool',
+      tool_name: msg.tool,
+      input,
+      tool_use_id: msg.id,
+    } as Parameters<typeof createSyntheticAssistantMessage>[0],
+    msg.id,
+  )
+
+  const decision = await canUseTool(tool, input, toolUseContext, assistantMessage, msg.id)
+
+  if (decision.behavior === 'allow') {
+    proc.stdin.write(
+      JSON.stringify({
+        type: 'permission_response',
+        id: msg.id,
+        behavior: 'allow',
+        updatedInput: decision.updatedInput,
+      }) + '\n',
+    )
+    return
+  }
+
+  proc.stdin.write(
+    JSON.stringify({
+      type: 'permission_response',
+      id: msg.id,
+      behavior: 'deny',
+      feedback: 'message' in decision ? decision.message : undefined,
+    }) + '\n',
+  )
+}
+
+/**
+ * Interactive tier — implements the bidirectional JSON-lines protocol for
+ * agents where `agentDef.interactive` is truthy:
+ *
+ *  - parent -> child (stdin, one JSON object per line): `{"type":"task",
+ *    "prompt":...}` kicks off the run; `{"type":"permission_response", id,
+ *    behavior, ...}` answers a pending permission request.
+ *  - child -> parent (stdout, one JSON object per line, via
+ *    `parseJsonLines`): `{"type":"permission_request", id, tool, input}`
+ *    asks for a tool permission (handled by `handlePermissionRequest`
+ *    above); `{"type":"result", content}` carries the final answer;
+ *    anything else (e.g. a future "log" type) is ignored — the child's own
+ *    diagnostics belong on stderr, not the stdout protocol stream.
+ *
+ * stderr is drained concurrently (fire-and-forget, not awaited) and any
+ * output surfaced via `logError`, mirroring the non-interactive tier's
+ * treatment of stderr as diagnostics rather than protocol, and avoiding the
+ * same stdout/stderr pipe-buffer deadlock `runCliAgent`'s non-interactive
+ * branch guards against.
+ *
+ * Only ever yields one final `Message` (via `makeResultMessage`), once the
+ * child's stdout stream ends and the process has exited — matching the
+ * non-interactive tier so `finalizeAgentTool`/`getLastAssistantMessage`
+ * (agentToolUtils.ts) can treat any `runCliAgent` output uniformly.
+ *
+ * Process lifecycle (timeout / kill on abort) is NOT handled here — see the
+ * brief's note on wiring `toolUseContext.abortController.signal` to
+ * `proc.kill()`; deferred as a follow-up increment.
+ */
+export async function* runInteractive(
   proc: CliProcessHandle,
   agentDef: unknown,
   task: CliAgentTask,
   toolUseContext: ToolUseContext,
   canUseTool: CanUseToolFn,
 ): AsyncGenerator<Message> {
-  throw new Error('interactive tier not implemented yet (Task 9)')
-  // eslint-disable-next-line no-unreachable
-  yield undefined as never
+  proc.stdin.write(JSON.stringify({ type: 'task', prompt: task.prompt }) + '\n')
+
+  void (async () => {
+    for await (const chunk of proc.stderr) {
+      const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+      if (text) logError(new Error(text))
+    }
+  })()
+
+  const buffer = { rest: '' }
+  let result = ''
+
+  for await (const chunk of proc.stdout) {
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+    for (const msg of parseJsonLines(text, buffer)) {
+      if (!msg || typeof msg !== 'object') continue
+      switch (msg.type) {
+        case 'permission_request':
+          await handlePermissionRequest(msg, proc, toolUseContext, canUseTool)
+          break
+        case 'result':
+          result = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '')
+          break
+        case 'error':
+          logError(new Error(`cli agent error: ${msg.message ?? 'unknown error'}`))
+          if (!result) result = `[cli error] ${msg.message ?? 'unknown error'}`
+          break
+        default:
+          break
+      }
+    }
+  }
+
+  await proc.exited
+  yield makeResultMessage(result)
 }
 
 /**
@@ -137,8 +293,8 @@ async function* runInteractive(
  * a single final assistant `Message`. stderr is drained and, if non-empty,
  * surfaced via `logError` rather than mixed into the result text.
  *
- * The interactive tier (`agentDef.interactive` truthy) is out of scope for
- * this task — see `runInteractive` above (Task 9).
+ * The interactive tier (`agentDef.interactive` truthy) delegates to
+ * `runInteractive` above.
  */
 export async function* runCliAgent(
   agentDef: { command: string; args?: string[]; roleCwd?: string; interactive?: boolean },
