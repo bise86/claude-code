@@ -1073,6 +1073,7 @@ export const SettingsSchema = lazySchema(() =>
         receiveIdType: z.enum(['open_id','chat_id','user_id','union_id','email']).optional(),
         receiveId: z.string().optional(), cardLanguage: z.string().optional(),
       }).optional(),
+      roles: z.array(z.record(z.string(), z.unknown())).optional(),
     })
     .passthrough(),
 )
