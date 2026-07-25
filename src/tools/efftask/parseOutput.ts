@@ -27,15 +27,28 @@ export type AnswerTag = (typeof ANSWER_TAGS)[keyof typeof ANSWER_TAGS]
  * Letters only: FENCE_RE captures `[A-Za-z]+`.
  */
 export function answerTag(base: AnswerTag): string {
+  // Crypto randomness, not Math.random: this tag is the control the whole
+  // forged-verdict defence rests on, and a predictable PRNG stream would make it guessable.
+  const bytes = new Uint8Array(8)
+  globalThis.crypto.getRandomValues(bytes)
   let n = ''
-  for (let i = 0; i < 8; i++) n += String.fromCharCode(97 + Math.floor(Math.random() * 26))
+  for (const b of bytes) n += String.fromCharCode(97 + (b % 26))
   return `${base}${n}`
 }
 
 type Candidate = { obj: Record<string, unknown>; tagged: boolean }
 
 /** Every fenced block plus the bare-brace slice, parsed; unparseable ones dropped. */
-const FENCE_RE = /```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)```/g
+/**
+ * Fenced blocks, anchored to line starts.
+ *
+ * Without the anchor, ANY stray ``` run earlier in the reply pairs with the answer's own
+ * opening fence and swallows it. A reviewer that mentions the tag inline before answering —
+ * which is a normal thing to do — then looks like it produced no block at all, and since
+ * verdicts have no fallback (see pickAnswer's requireTag) that reads as "no verdict" and
+ * blocks a node whose reviewer actually passed it.
+ */
+const FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n([\s\S]*?)\n[ \t]*```/g
 
 /**
  * First balanced `{...}` that is NOT nested inside an array, or null.
@@ -197,7 +210,9 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
     return {
       role,
       pass: false,
-      blocking: [`未找到本轮的 \`\`\`${expected} 裁决块;按不通过处理`],
+      // Do NOT name the tag here: this string becomes blockingSummary, which the rework
+      // prompt shows the EXECUTOR. Handing it a live tag is handing it the forgery key.
+      blocking: ['未按要求输出本轮的裁决代码块;按不通过处理'],
       comments: text.trim().slice(0, 2000),
     }
   }
@@ -205,7 +220,7 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
     return {
       role,
       pass: false,
-      blocking: [`回复中有多个裁决块,无法判定哪个是本轮结论;请只输出一个 \`\`\`${expected} 块,且位于回复末尾`],
+      blocking: ['回复中有多个裁决块,无法判定哪个是本轮结论;请只输出一个本轮要求的裁决块'],
       comments: text.trim().slice(0, 2000),
     }
   }

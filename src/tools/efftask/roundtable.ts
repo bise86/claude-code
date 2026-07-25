@@ -61,7 +61,7 @@ export async function runRoundtable(args: {
   const verdicts: Verdict[] = settled.map((res, i) => {
     const role = roster[i]
     const roleName = role ? role.roleName : 'main'
-    if (res.status === "fulfilled") return parseVerdict(res.value, roleName, args.answerTag)
+    if (res.status === 'fulfilled') return parseVerdict(res.value, roleName, args.answerTag)
     const reason = res.reason instanceof Error ? res.reason.message : String(res.reason)
     // infra: the reviewer never judged anything, the CALL failed. Flagged so the caller
     // retries the review instead of reading it as a rejection and redoing real work.
