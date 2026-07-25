@@ -184,10 +184,16 @@ export function createNode(args: {
     goal: args.goal ?? args.title, // default goal to title so existing call-sites stay valid
     parentId: args.parentId,
     childIds: [],
-    deps: args.deps,
+    deps: [...args.deps],
     kind: 'unknown',
     status: 'CREATED',
-    phaseRoles: { ...args.phaseRoles }, // shallow copy: nodes must not alias one shared roster object
+    // Copy the per-phase ARRAYS too, not just the outer record: every child is
+    // created with `phaseRoles: parent.phaseRoles` (createChildren), so a one-level
+    // spread would leave the whole tree — and the run config it came from — sharing
+    // five array instances. P3's per-node role overrides edit a roster in place.
+    phaseRoles: Object.fromEntries(
+      PHASE_NAMES.map(p => [p, [...args.phaseRoles[p]]]),
+    ) as Record<PhaseName, RoleBinding[]>,
     plan: emptyPlan(),
     execStatus: '',
     blockedReason: '',
