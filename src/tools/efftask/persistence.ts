@@ -17,6 +17,15 @@ export interface FsLike {
    * second would overwrite the first's whole tree while both reported success.
    */
   mkdirExclusive(p: string): Promise<boolean>
+  /**
+   * Remove a file. REQUIRED, not optional: the only caller is the run lock's release path,
+   * and `fs.unlink?.(…)` on an adapter that forgot to implement it resolves successfully
+   * having done nothing — leaving the lock on disk and every other terminal refused, with
+   * nothing in any log to explain it.
+   */
+  unlink(p: string): Promise<void>
+  /** Remove an EMPTY directory. Used to release the lock directory; must not be recursive. */
+  rmdir(p: string): Promise<void>
 }
 
 /**
@@ -233,6 +242,10 @@ export async function writeRunManifest(
     goalPrompt: cfg.goalPrompt,
     notices: cfg.notices ?? [],
     ...(cfg.mainModel ? { mainModel: cfg.mainModel } : {}),
+    // Written CONDITIONALLY so a plain new run's frontmatter stays byte-identical to what
+    // P1 produced — resume must not change what a non-resumed run looks like on disk.
+    ...(cfg.resumeGuidance ? { resumeGuidance: cfg.resumeGuidance } : {}),
+    ...(cfg.resumes && cfg.resumes.length > 0 ? { resumes: cfg.resumes } : {}),
     ...(result ? { status: result.status, reason: result.reason ?? '' } : {}),
   })}---\n\n`
   await fs.mkdir(runDir)

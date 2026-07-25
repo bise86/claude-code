@@ -1,6 +1,6 @@
 import { parse as yamlParse } from 'yaml'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
-import type { Caps, EffTaskConfig, NodeKind, PhaseName, RoleBinding, TaskNode } from './types.js'
+import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
 
 const LEGAL_STATUS = new Set<string>([
@@ -289,5 +289,17 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   base.notices = Array.isArray(fm.notices) ? fm.notices.filter((n): n is string => typeof n === 'string') : []
   if (typeof fm.mainModel === 'string') base.mainModel = fm.mainModel
   if (typeof fm.resumeGuidance === 'string') base.resumeGuidance = fm.resumeGuidance
+  // Re-emitted verbatim on every later manifest write, so the resume history accumulates
+  // instead of being flattened by the next full-file rewrite.
+  if (Array.isArray(fm.resumes)) {
+    base.resumes = fm.resumes
+      .filter((r): r is ResumeRecord => !!r && typeof r === 'object' && typeof (r as { at?: unknown }).at === 'string')
+      .map(r => ({
+        at: r.at,
+        reseated: Number.isFinite(r.reseated) ? r.reseated : 0,
+        exhausted: Number.isFinite(r.exhausted) ? r.exhausted : 0,
+        repairs: Array.isArray(r.repairs) ? r.repairs.filter((x): x is string => typeof x === 'string') : [],
+      }))
+  }
   return { config: base, degraded }
 }

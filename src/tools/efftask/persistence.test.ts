@@ -13,6 +13,8 @@ function memFs(seed: Record<string, string> = {}): FsLike & { store: Map<string,
     async writeFile(p, data) { store.set(p, data) },
     async mkdir(p) { dirs.add(p) },
     async mkdirExclusive(p) { if (dirs.has(p)) return false; dirs.add(p); return true },
+    async unlink(p) { store.delete(p) },
+    async rmdir(p) { dirs.delete(p) },
     async exists(p) { return store.has(p) || dirs.has(p) },
     async readdir(p) {
       const prefix = p.endsWith('/') ? p : p + '/'

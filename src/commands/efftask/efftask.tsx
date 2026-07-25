@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import { access, mkdir, readFile, readdir, rmdir, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, readdir, rmdir, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { LocalJSXCommandCall } from '../../types/command.js'
@@ -227,6 +227,8 @@ function fsAdapter(): FsLike {
         throw e
       }
     },
+    unlink: p => unlink(p),
+    rmdir: p => rmdir(p), // NON-recursive: releasing a lock must never delete a tree
     readdir: p => readdir(p), // returns string[] by default — matches FsLike
     exists: p => access(p).then(() => true, () => false),
   }

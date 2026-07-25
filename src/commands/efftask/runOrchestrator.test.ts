@@ -16,6 +16,8 @@ function memFs(): FsLike & { files: Map<string, string> } {
     writeFile: async (p, d) => { files.set(p, d) },
     mkdir: async () => {},
     mkdirExclusive: async () => true,
+    unlink: async p => { files.delete(p) },
+    rmdir: async () => {},
     readdir: async () => [],
     exists: async p => files.has(p),
   }

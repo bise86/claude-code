@@ -199,6 +199,7 @@ import type { FsLike } from './persistence.js'
 const fsWith = (files: Record<string, string>): FsLike => ({
   readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error(`ENOENT ${p}`); return v },
   writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
+  unlink: async () => {}, rmdir: async () => {},
   readdir: async () => [], exists: async (p: string) => p in files,
 })
 

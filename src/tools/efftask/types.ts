@@ -94,7 +94,27 @@ export interface EffTaskConfig {
    * layer writes and another reads must exist before either is written.
    */
   resumeGuidance?: string
+  /**
+   * 每次恢复留下的一条记录(§17.5)。
+   *
+   * Carried ON THE CONFIG rather than appended to run.md, because `writeRunManifest`
+   * rewrites that file whole and `runOrchestrator` queues a write on the very first frame —
+   * anything merely appended beforehand is erased before the user can read it. Travelling
+   * with the config means every manifest write re-emits the history.
+   */
+  resumes?: ResumeRecord[]
 }
+
+export interface ResumeRecord {
+  at: string
+  /** How many nodes were returned to a runnable state. */
+  reseated: number
+  /** How many were blocked because the phase they would re-enter has no budget left. */
+  exhausted: number
+  /** Repair lines, capped — the full list is shown at the gate; this is the durable trace. */
+  repairs: string[]
+}
+export const MAX_RECORDED_REPAIRS = 5
 
 export function emptyPhaseRoles(): Record<PhaseName, RoleBinding[]> {
   return { plan: [], review: [], execute: [], accept: [], observer: [] }
