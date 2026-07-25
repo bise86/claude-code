@@ -1,11 +1,11 @@
 // src/tools/efftask/orchestrator.ts
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { createNode } from './types.js'
 import { byIdMap, isTerminal } from './stateMachine.js'
 import { createStallTracker, pickBatch, type Advanceable } from './scheduler.js'
 import { stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { WorktreePool } from './worktreePool.js'
+import { makeRootNode } from './rootPlan.js'
 
 export interface OrchestratorDeps {
   /**
@@ -33,14 +33,6 @@ export interface OrchestratorDeps {
   onUpdate: (nodes: TaskNode[]) => void
 }
 
-function rootTitle(goal: string): string {
-  // First NON-EMPTY line: a goal that opens with a blank line still has a real title.
-  const line = goal.split('\n').map(l => l.trim()).find(l => l.length > 0) ?? ''
-  // Slice CODE POINTS, matching persistence.slugify — a UTF-16 slice can strand a lone
-  // surrogate, and this title is rendered into run.md and into prompts.
-  return Array.from(line).slice(0, 80).join('') || '根任务'
-}
-
 export class EffTaskOrchestrator {
   private byId: Map<string, TaskNode>
   constructor(
@@ -63,10 +55,10 @@ export class EffTaskOrchestrator {
       this.byId = byIdMap(seed)
       return
     }
-    // root goal = the FULL goalPrompt (title is only a truncated display label); ctxGoal
-    // reads node.goal, so the plan prompt must see the whole objective, not the truncation.
-    const root = createNode({ id: 'root', title: rootTitle(cfg.goalPrompt), goal: cfg.goalPrompt, parentId: null, deps: [], depth: 0, phaseRoles: cfg.phaseRoles, now: this.nowSafe() })
-    this.byId = byIdMap([root])
+    // Shared with the 根方案关口 (rootPlan.makeRootNode), which mints the SAME root, drafts a
+    // plan into it and hands it back as `seed`. Two copies of this construction would let the
+    // gate's tree and the run's tree disagree about the id every child id derives from.
+    this.byId = byIdMap([makeRootNode(cfg, this.nowSafe())])
   }
 
   nodes(): TaskNode[] { return [...this.byId.values()] }

@@ -55,6 +55,21 @@ export interface TaskNode {
    * sweep, because for THIS node the path is where the human's resolution lives.
    */
   mergeConflict?: boolean
+  /**
+   * 启动关口第三关(spec §2)确认过的首层拆分。
+   *
+   * Its PRESENCE means "the plan already in this node was put in front of a human and
+   * approved", so stepStart must skip its first plan call and go straight to review.
+   * Without that, the confirmed plan would be overwritten by a fresh draft on the run's very
+   * first step — the gate would render, the user would edit, and none of it would reach the
+   * run. Consumed exactly once, and cleared as part of the commit that enters PLAN_REVIEW so
+   * a crash cannot make it apply twice.
+   *
+   * Children are carried as SPECS, not nodes: createChildren owns id allocation, sibling-dep
+   * resolution and the node-count reservation, and duplicating any of that here would give
+   * the gate's tree different ids from the run's.
+   */
+  confirmedDraft?: { children: { title: string; deps: string[] }[] }
   reviewLog: RoundtableRecord[]
   acceptLog: RoundtableRecord[]
   score: { plan?: ScoreRecord; exec?: ScoreRecord }

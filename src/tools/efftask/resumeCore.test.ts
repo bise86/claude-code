@@ -278,3 +278,34 @@ describe('readRunManifest recovers the config the run was started with', () => {
     expect(degraded.join(' ')).toContain('goalPrompt')
   })
 })
+
+describe('恢复:根方案确认记录', () => {
+  const base = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+  const opts = { goal: 'g', phaseRoles: emptyPhaseRoles(), now: NOW }
+
+  it('keeps a well-formed confirmation so the user does not re-approve the same plan', () => {
+    const n = base({ confirmedDraft: { children: [{ title: 'AA', deps: [] }, { title: 'BB', deps: ['AA'] }] } })
+    const { nodes } = validateLoadedNodes([n], opts)
+    expect(nodes[0].confirmedDraft?.children.map(c => c.title)).toEqual(['AA', 'BB'])
+    expect(nodes[0].confirmedDraft?.children[1].deps).toEqual(['AA'])
+  })
+
+  it('drops a malformed one rather than sending an EMPTY plan into review', () => {
+    // confirmedDraft is the one field that skips the plan phase. A hand-edited run.md /
+    // half-written node.md must degrade to "the plan role drafts it", never to
+    // "an empty plan was approved".
+    const n = base({ confirmedDraft: 'oops' as never })
+    const { nodes, repairs } = validateLoadedNodes([n], opts)
+    expect(nodes[0].confirmedDraft).toBeUndefined()
+    expect(repairs.some(r => r.includes('根方案确认记录已损坏'))).toBe(true)
+  })
+
+  it('drops child entries with no title instead of creating nameless nodes', () => {
+    const n = base({ confirmedDraft: { children: [{ title: 'AA', deps: ['x', 5 as never] }, { deps: [] } as never] } })
+    const { nodes } = validateLoadedNodes([n], opts)
+    expect(nodes[0].confirmedDraft?.children).toEqual([{ title: 'AA', deps: ['x'] }])
+  })
+})

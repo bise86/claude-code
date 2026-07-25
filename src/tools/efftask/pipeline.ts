@@ -122,9 +122,20 @@ function isInfraOnlyFailure(rec: { verdicts: { pass: boolean; blocking: string[]
   return failing.length > 0 && failing.every(v => v.infra === true)
 }
 
+/**
+ * Everything the PLAN prompt reads.
+ *
+ * Narrower than PipelineCtx on purpose: the 根方案关口 (spec §2 第三关) builds this exact
+ * prompt before any orchestrator exists, and it must be the SAME text the run would have
+ * used. Widening it to PipelineCtx would force the gate to fabricate a runAgent, a signal and
+ * a persist just to render a string — and a hand-rolled second copy of the prompt is how the
+ * gate and the run start describing different tasks.
+ */
+export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId'>
+
 // A node with deps must SEE what its dependencies produced, otherwise it replans from
 // scratch and redoes upstream work.
-function depsSection(node: TaskNode, ctx: PipelineCtx): string {
+function depsSection(node: TaskNode, ctx: Pick<PipelineCtx, 'byId'>): string {
   if (node.deps.length === 0) return ''
   const lines = node.deps.map(id => {
     const d = ctx.byId.get(id)
@@ -208,7 +219,7 @@ function quote(s: string): string {
   return s.replace(/`{3,}/g, m => '`​'.repeat(m.length))
 }
 
-function planPrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = ''): string {
+export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = ''): string {
   const caps = ctx.config.caps
   return (
     `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
@@ -323,7 +334,7 @@ function isFinished(node: TaskNode): boolean {
  * prompt whose reply is parsed by fence tag, so an unquoted \`\`\` in it could forge one.
  * Only affects unfinished work — an ACCEPTED node is never re-entered.
  */
-function guidanceSection(ctx: PipelineCtx): string {
+function guidanceSection(ctx: Pick<PipelineCtx, 'config'>): string {
   const g = ctx.config.resumeGuidance?.trim()
   return g ? `续跑指引(用户在恢复时补充,优先级高于原方案的枝节):\n${quote(g)}\n` : ''
 }
@@ -350,19 +361,40 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
   // Seeded from the log so a RESUMED node re-plans against the blockers it already earned
   // rather than starting blind (see lastFailureFeedback).
   let feedback = lastFailureFeedback(node.reviewLog)
+  /**
+   * 启动关口第三关 (spec §2): a plan a human has already seen and approved.
+   *
+   * Consumed on the FIRST iteration only, and re-drafted like any other plan if the review
+   * roundtable blocks it — the human's approval is an input to the process, not an exemption
+   * from it ("每个方案经多角色圆桌评审").
+   */
+  let confirmed = node.confirmedDraft
   // plan → review loop. A rejected child GROUP (dependency cycle) re-enters this same
   // loop, so replanning is bounded by the SAME maxIterations budget — a cycle costs a
   // retry, it does not instantly kill the run.
   for (;;) {
-    if (!(await commit(node, 'PLANNING', ctx))) return
-    const planTag = answerTag(ANSWER_TAGS.plan)
-    const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, ctx, planTag, feedback), signal: ctx.signal })
-    if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
-    const parsed = parsePlanOutput(res.text, planTag)
-    node.kind = parsed.kind
-    node.plan = parsed.plan
-    const lastChildren = parsed.children
-    if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
+    let lastChildren: { title: string; deps: string[] }[]
+    if (confirmed) {
+      // NO plan call. Re-drafting here would ask the plan role the question the user just
+      // answered and silently throw their edits away — the gate would render, they would
+      // approve a tree, and the run would build a different one.
+      lastChildren = confirmed.children
+      confirmed = undefined
+      // Cleared as part of the commit below, so the consumption is durable: a crash between
+      // here and the review must not let the gate's draft apply a second time on resume.
+      node.confirmedDraft = undefined
+      if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
+    } else {
+      if (!(await commit(node, 'PLANNING', ctx))) return
+      const planTag = answerTag(ANSWER_TAGS.plan)
+      const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, ctx, planTag, feedback), signal: ctx.signal })
+      if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
+      const parsed = parsePlanOutput(res.text, planTag)
+      node.kind = parsed.kind
+      node.plan = parsed.plan
+      lastChildren = parsed.children
+      if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
+    }
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
       system: 'review', buildPrompt: tag => reviewPrompt(node, tag), ctx,

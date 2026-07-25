@@ -19,8 +19,10 @@ import { reseatTransientNodes } from '../../tools/efftask/reseat.js'
 import { acquireRunLock, listRuns, releaseRunLock, type RunSummary } from '../../tools/efftask/runRegistry.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
-import { createNode, emptyPhaseRoles, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
+import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
+import { applyRootDraft, draftRootPlan, makeRootNode, type RootDraft } from '../../tools/efftask/rootPlan.js'
+import { ConfirmRootPlan, type RootPlanDecision } from './ConfirmRootPlan.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import {
   raceConfirm,
@@ -46,6 +48,10 @@ import { logError } from '../../utils/log.js'
 export const READ_ONLY_TOOL_NAMES = new Set(['Read', 'Glob', 'Grep'])
 
 const CANCELLED: StartupDecision = { parallelism: 0, approved: false }
+
+// Shown at the third gate ONLY when drafting failed, always next to the error that explains
+// it. Never seeded into the run — see onRootDecision.
+const EMPTY_DRAFT: RootDraft = { kind: 'unknown', plan: emptyPlan(), children: [] }
 
 // 集成接线,无单测;手动跑 /et 验证。
 // 构造顺序:fs → runId → runAgent 接缝 → 立刻返回 JSX(解析在组件内 parsing 态跑)。
@@ -374,6 +380,18 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const handoffRef = React.useRef<HandoffSummary | null>(null)
   // What the gate must SAY. Resolved before the gate opens; 'none' until then.
   const [isolation, setIsolation] = React.useState<'worktree' | 'none'>('none')
+  // 启动关口第三关 (spec §2). `approved` is the config as confirmed at gates 1+2 — held
+  // because the root-plan gate sits BETWEEN that confirmation and the run, and the drafting
+  // call needs the confirmed roster (the plan role) to draft with.
+  const [approved, setApproved] = React.useState<EffTaskConfig | null>(null)
+  const [draft, setDraft] = React.useState<RootDraft | null>(null)
+  const [draftError, setDraftError] = React.useState<string | null>(null)
+  // Bumped to re-enter the drafting effect; also what the gate shows as "重拟 N 次".
+  const [redrafts, setRedrafts] = React.useState(0)
+  const redraftFeedback = React.useRef<string | null>(null)
+  // The run's root node, minted ONCE. Re-minting per draft would give the run a different
+  // createdAt on every re-draft and discard the plan the previous pass wrote into it.
+  const rootRef = React.useRef<TaskNode | null>(null)
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
@@ -542,8 +560,104 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     }
   }, [args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel])
 
+  /**
+   * Hand the confirmed run to the orchestrator. ONE definition, because two gates now reach
+   * it: the resume gate goes straight here, while a fresh run passes through the root-plan
+   * gate first and arrives carrying its confirmed root as the seed.
+   */
+  const startRun = React.useCallback((cfg: EffTaskConfig, rootSeed?: TaskNode[]): void => {
+    setPhase('running')
+    // Built at gate time, before the first step: init() creates the integration branch and
+    // its worktree, which is real work the user has consented to. A failure is not fatal —
+    // the run continues honestly un-isolated.
+    const pool = poolRef.current
+    void runOrchestrator(
+      {
+        config: cfg, runDir: runDir!, fs: props.fs, runAgent: props.runAgent,
+        signal: props.signal, seed: rootSeed ?? seed ?? undefined, worktrees: pool,
+        // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
+        // read at escalation time, not at gate time, because the bridge may connect
+        // after the run starts. Absent bridge => no card; the node still blocks with
+        // the branch, path and files in blockedReason, which the tree shows.
+        onEscalate: e => {
+          const client = store.getState().feishuClient
+          if (!client) return
+          void client.sendCard(buildConflictCard(e, runId ?? undefined)).catch(err => {
+            logError(err instanceof Error ? err : new Error(String(err)))
+          })
+        },
+      },
+      setNodes,
+      recordOutcome,
+      setPhase,
+      h => { handoffRef.current = h; setHandoff(h) },
+    )
+    // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
+  }, [runDir, runId, seed, props.fs, props.runAgent, props.signal, recordOutcome, store])
+
+  // ---- 启动关口第三关: 起草根方案 + 首层任务树 (spec §2) ----
+  React.useEffect(() => {
+    if (phase !== 'drafting' || !approved) return
+    let cancelled = false
+    void (async () => {
+      const now = new Date().toISOString()
+      // Minted once and reused across re-drafts, so the plan text of the previous pass is
+      // still in the node when planPrompt renders 上一版方案 for the revision.
+      const root = rootRef.current ?? makeRootNode(approved, now)
+      rootRef.current = root
+      const feedback = redraftFeedback.current ?? undefined
+      redraftFeedback.current = null
+      const res = await draftRootPlan({ root, config: approved, runAgent: props.runAgent, signal: props.signal, feedback })
+      if (cancelled) return
+      if (res.ok) {
+        // Keep the node in step with what the gate shows: a later re-draft must revise THIS
+        // plan, and applyRootDraft on approval writes the same values again.
+        root.plan = { ...res.draft.plan }
+        root.kind = res.draft.kind
+        setDraft(res.draft)
+        setDraftError(null)
+      } else if (draft) {
+        // A failed RE-draft still has a plan on screen — the previous one. Saying only
+        // "失败" would leave the user approving a revision that never happened.
+        setDraftError(`重拟失败(${res.reason});下面仍是上一版方案。`)
+      } else {
+        setDraftError(`未能起草根方案(${res.reason});确认后将由 plan 角色在运行中自行起草。`)
+      }
+      setPhase('confirmRoot')
+    })().catch(e => {
+      if (cancelled) return
+      setDraftError(`起草根方案时出错(${msg(e)});确认后将由 plan 角色在运行中自行起草。`)
+      setPhase('confirmRoot')
+    })
+    return () => { cancelled = true }
+    // biome-ignore lint/correctness/useExhaustiveDependencies: re-runs per drafting entry
+  }, [phase, approved, redrafts])
+
+  const onRootDecision = React.useCallback((d: RootPlanDecision): void => {
+    if (d.action === 'cancel') { props.abort(); props.onExit(null); return }
+    if (d.action === 'redraft') {
+      redraftFeedback.current = d.feedback
+      setRedrafts(n => n + 1)
+      setPhase('drafting')
+      return
+    }
+    const cfg = approved
+    if (!cfg) return
+    const root = rootRef.current
+    // Seed ONLY with a real draft. Sealing an empty plan would make stepStart skip its plan
+    // call and send a blank plan straight to the review roundtable — the failed-draft path
+    // must degrade to "the run drafts it itself", which is what no seed means.
+    if (root && draft) {
+      applyRootDraft(root, draft, new Date().toISOString())
+      startRun(cfg, [root])
+      return
+    }
+    startRun(cfg)
+  }, [approved, draft, startRun, props])
+
   React.useEffect(() => {
     if ((phase !== 'confirm' && phase !== 'confirmResume') || !config) return
+    const isResumeGate = phase === 'confirmResume'
     let cancelled = false
     let settled = false
     const surfaces: ConfirmSurface[] = [
@@ -590,34 +704,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // but had not yet committed is discarded if the FEISHU surface wins the race. There
         // is no channel from the gate's React state to the Feishu surface.
         const effectiveConfig: EffTaskConfig = { ...config, parallelism: decision.parallelism }
-        setPhase('running')
-        void (async () => {
-          // Built HERE, after approval and before the first step: init() creates the
-          // integration branch and its worktree, which is real work the user has consented
-          // to. A failure is not fatal — the run continues honestly un-isolated.
-          const pool = poolRef.current
-          void runOrchestrator(
-            {
-              config: effectiveConfig, runDir: runDir!, fs: props.fs, runAgent: props.runAgent,
-              signal: props.signal, seed: seed ?? undefined, worktrees: pool,
-              // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
-              // read at escalation time, not at gate time, because the bridge may connect
-              // after the run starts. Absent bridge => no card; the node still blocks with
-              // the branch, path and files in blockedReason, which the tree shows.
-              onEscalate: e => {
-                const client = store.getState().feishuClient
-                if (!client) return
-                void client.sendCard(buildConflictCard(e, runId ?? undefined)).catch(err => {
-                  logError(err instanceof Error ? err : new Error(String(err)))
-                })
-              },
-            },
-            setNodes,
-            recordOutcome,
-            setPhase,
-            h => { handoffRef.current = h; setHandoff(h) },
-          )
-        })()
+        setApproved(effectiveConfig)
+        // RESUME skips the third gate. Its tree already exists on disk — drafting a fresh
+        // root plan would ask the user to confirm a decomposition the run is not going to
+        // build, and `confirmedDraft` on a root that already has children would graft a
+        // second copy of the first level.
+        if (isResumeGate) { startRun(effectiveConfig); return }
+        setPhase('drafting')
       })
       .catch(e => {
         settled = true
@@ -663,6 +756,28 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   }
   if (phase === 'confirm') {
     return <ConfirmStartup config={config} isolation={isolation} onDecision={d => terminalClaim.current?.('terminal', d)} />
+  }
+  if (phase === 'drafting') {
+    return (
+      <MessageView
+        title="高效任务模式 · 第三关"
+        body={redrafts > 0 ? '正在按你的意见重拟根方案与首层任务树…' : '正在起草根方案与首层任务树…'}
+        tone="dim"
+        onDismiss={bail}
+      />
+    )
+  }
+  if (phase === 'confirmRoot') {
+    return (
+      <ConfirmRootPlan
+        goalPrompt={config.goalPrompt}
+        // EMPTY_DRAFT only ever renders alongside draftError, which says why it is empty.
+        draft={draft ?? EMPTY_DRAFT}
+        draftError={draftError}
+        redrafts={redrafts}
+        onDecision={onRootDecision}
+      />
+    )
   }
   if (phase === 'running') {
     return <RunningView nodes={nodes} runId={runId ?? ''} onAbort={props.abort} />

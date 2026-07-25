@@ -16,7 +16,9 @@ export type Outcome = { status: 'completed' | 'blocked'; reason?: string }
  */
 export type Phase =
   | 'parsing' | 'picking' | 'recovering'
-  | 'confirm' | 'confirmResume' | 'running' | 'done' | 'fatal'
+  // 'drafting'/'confirmRoot' are 启动关口第三关 (spec §2): the root plan + first-level tree is
+  // drafted, then shown for confirmation/modification BEFORE autonomous execution begins.
+  | 'confirm' | 'drafting' | 'confirmRoot' | 'confirmResume' | 'running' | 'done' | 'fatal'
 
 /**
  * Drive one run to completion and report it.

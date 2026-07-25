@@ -129,6 +129,26 @@ export function validateLoadedNodes(
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>
     if (typeof n.title !== 'string' || n.title.length === 0) n.title = n.id
     if (typeof n.goal !== 'string' || n.goal.length === 0) n.goal = n.title
+    // 根方案关口 (spec §2 第三关) 的确认结果。Reachable on disk when the run was aborted
+    // before the root's first commit consumed it, so it must survive — but it is also the one
+    // field that SKIPS the plan phase, and a malformed one would send an empty plan straight
+    // into review. Anything that is not the exact shape is dropped, which degrades to
+    // "the plan role drafts it", never to "an empty plan is approved".
+    if (n.confirmedDraft !== undefined) {
+      const kids = (n.confirmedDraft as { children?: unknown }).children
+      const clean = Array.isArray(kids)
+        ? kids
+            .filter((c): c is { title: string; deps?: unknown } =>
+              !!c && typeof c === 'object' && typeof (c as { title?: unknown }).title === 'string' && (c as { title: string }).title.length > 0)
+            .map(c => ({ title: c.title, deps: strArray(c.deps) }))
+        : null
+      if (clean === null) {
+        repairs.push(`节点 ${n.id}:根方案确认记录已损坏,恢复后将由 plan 角色重新起草`)
+        n.confirmedDraft = undefined
+      } else {
+        n.confirmedDraft = { children: clean }
+      }
+    }
     // A worktree reference is a DISK path, and disk paths do not survive. serializeNode
     // round-trips it, so a resumed node arrives still claiming a worktree that dispose or gc
     // may have removed — and because the isolation gate is "no worktree yet", that stale
