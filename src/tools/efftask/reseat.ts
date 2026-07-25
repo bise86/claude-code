@@ -10,13 +10,20 @@ import type { Caps, NodeStatus, TaskNode } from './types.js'
  * this set does not know is a status `advanceableKind` also refuses — the node would sit
  * grey forever and every later resume would reproduce it.
  *
- * `EXECUTED` is still never committed by any path (grep-verified against pipeline.ts), so a
- * rule for it would be logic for a dead state. If that changes, add it here WITH a test that
- * drives the real transition.
+ * `EXECUTED` is included even though no pipeline path commits it, and the argument that it was
+ * "logic for a dead state" was wrong about where the state comes from. It is a legal
+ * `NodeStatus` that `validateLoadedNodes` ACCEPTS off disk, and node.md is hand-editable by
+ * design — the escalation cards tell users to edit these files. A node.md carrying
+ * `status: EXECUTED` therefore passes validation, is skipped here, and is refused by
+ * `advanceableKind` as well: it sits grey forever and every later resume reproduces it
+ * exactly. That is the identical failure this comment already describes for SCORING/MERGE,
+ * reached through the door that made all of them reachable in the first place. spec §17.2
+ * lists it explicitly: `EXECUTING`/`EXECUTED`/`ACCEPTANCE`/`REWORK`/`SCORING`/`MERGE` → READY.
+ * The real transition it is driven through is a load from disk (see reseat.test.ts).
  */
 const ACTIVE: ReadonlySet<NodeStatus> = new Set<NodeStatus>([
-  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'ACCEPTANCE', 'REWORK', 'INTEGRATION_ACCEPT',
-  'SCORING', 'MERGE',
+  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'EXECUTED', 'ACCEPTANCE', 'REWORK',
+  'INTEGRATION_ACCEPT', 'SCORING', 'MERGE',
 ])
 
 const ANNOTATION = '(注:上次运行在此处中断,已重新排队)'

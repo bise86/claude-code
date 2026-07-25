@@ -300,3 +300,46 @@ describe('关口渲染出来的那句话必须随隔离状态变化', () => {
     })
   }
 })
+
+describe('spec §17.1:选择器上要看得见最后更新时间', () => {
+  it('渲染相对时间 —— listRuns 一直算着它,却只用来排序', async () => {
+    // The pure formatter having tests does not prove the picker calls it: this repo has cut
+    // exactly this wire before (a chunk store passed to a view that never forwarded it).
+    // §17.1 lists 最后更新时间 as one of four required columns; with several runs the user
+    // was choosing between 003 and 007 on goal text alone.
+    const now = Date.now()
+    const withTimes: RunSummary[] = [
+      { runId: '003', goalLine: '重构支付', updatedAt: new Date(now - 20 * 60_000).toISOString(),
+        counts: { accepted: 1, blocked: 0, pending: 2, total: 3 }, degraded: false },
+      { runId: '001', goalLine: '打通登录', updatedAt: new Date(now - 3 * 3600_000).toISOString(),
+        counts: { accepted: 4, blocked: 1, pending: 0, total: 5 }, degraded: false },
+    ]
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ResumePicker, { runs: withTimes, onPick: () => {}, onCancel: () => {} }),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const frame = lastFrame()
+    expect(frame).toContain('20 分钟前')
+    expect(frame).toContain('3 小时前')
+    app.unmount()
+  })
+
+  it('时间戳坏掉的 run 不渲染占位符,也不炸', async () => {
+    // listRuns 的累加器从 '' 起步,所以 node.md 全被写坏的 run 到这里就是空串。
+    const broken: RunSummary[] = [
+      { runId: '004', goalLine: '坏掉的', updatedAt: '',
+        counts: { accepted: 0, blocked: 0, pending: 1, total: 1 }, degraded: false },
+    ]
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ResumePicker, { runs: broken, onPick: () => {}, onCancel: () => {} }),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(lastFrame()).toContain('坏掉的')
+    expect(lastFrame()).not.toContain('前')
+    app.unmount()
+  })
+})

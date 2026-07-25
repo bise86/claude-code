@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -437,5 +437,29 @@ describe('名册可编辑 (spec §2 第一关)', () => {
   it('says why the table is empty when settings has no roles at all', () => {
     // A blank row reads as a broken editor.
     expect(rosterEditorLines(empty() as never, [], 0, 0)[0]).toContain('没有可用角色')
+  })
+})
+
+describe('spec §17.1:恢复选择器要显示最后更新时间', () => {
+  const T = Date.parse('2026-07-26T12:00:00.000Z')
+  it('按量级给出相对时间', () => {
+    expect(relativeTime('2026-07-26T11:59:30.000Z', T)).toBe('刚刚')
+    expect(relativeTime('2026-07-26T11:40:00.000Z', T)).toBe('20 分钟前')
+    expect(relativeTime('2026-07-26T09:00:00.000Z', T)).toBe('3 小时前')
+    expect(relativeTime('2026-07-21T12:00:00.000Z', T)).toBe('5 天前')
+  })
+
+  it('时间戳不可用时返回空串,而不是编一个', () => {
+    // listRuns 的累加器从 '' 起步,只有节点带 STRING 时间戳才会被替换 —— 所以每个 node.md
+    // 都被写坏的 run 到这里就是空的。而 Date.parse 会强制转换不会抛,`updatedAt: 123`
+    // 曾经因此渲染出一个 1970 年的年龄。
+    expect(relativeTime('', T)).toBe('')
+    expect(relativeTime('不是时间', T)).toBe('')
+    expect(relativeTime(123 as never, T)).toBe('')
+  })
+
+  it('时钟偏差不能渲染成负数', () => {
+    // 另一台机器写的 run.md 可能比本机时钟略新。
+    expect(relativeTime('2026-07-26T12:05:00.000Z', T)).toBe('刚刚')
   })
 })

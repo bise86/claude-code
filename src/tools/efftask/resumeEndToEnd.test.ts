@@ -4,7 +4,7 @@ import { validateLoadedNodes } from './resumeCore.js'
 import { reseatTransientNodes } from './reseat.js'
 import { parseNodeFile, serializeNode } from './persistence.js'
 
-import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, type EffTaskConfig, type TaskNode } from './types.js'
+import { createNode, DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, type EffTaskConfig, type TaskNode } from './types.js'
 import type { RunAgentFn } from './roundtable.js'
 
 const cfg = (): EffTaskConfig => ({
@@ -290,5 +290,51 @@ describe('the resume guidance and the earned blockers both reach the model', () 
     const exec = seen.find(s => s.phase === 'execute')!
     expect(exec.prompt).toContain('没有提交任何测试')
     expect(exec.prompt).toContain('上一轮验收未通过')
+  })
+})
+
+describe('spec §17.2:手工写进 node.md 的 EXECUTED 必须能重新排队', () => {
+  it('从盘上读回 EXECUTED,校验放行,归位成 READY,并且真的能跑完', async () => {
+    // EXECUTED is a legal NodeStatus that no pipeline path ever commits — which was the whole
+    // argument for leaving it out of reseat's ACTIVE set. That argument had the SOURCE of the
+    // state wrong: node.md is hand-editable by design (the escalation cards tell users to edit
+    // these files), and validateLoadedNodes accepts EXECUTED as legal. So it was reachable —
+    // and once reached, permanent: reseat skipped it and advanceableKind refuses it too, so
+    // the node sat grey forever and every later resume reproduced it byte for byte. That is
+    // the identical failure SCORING/MERGE had, through the door that makes any of them
+    // reachable at all.
+    //
+    // Driven through the REAL chain — serialize → parse → validate → reseat → a real
+    // orchestrator — because a hand-built node would pass even if the disk path rejected it.
+    const seed = createNode({
+      id: 'root', title: '登录', goal: '打通登录接口', parentId: null, deps: [], depth: 0,
+      phaseRoles: emptyPhaseRoles(), now: new Date().toISOString(),
+    })
+    seed.status = 'EXECUTED'
+    seed.kind = 'executable'
+    seed.execStatus = '改了 src/login.ts,还没验收'
+    const parsed = parseNodeFile(serializeNode(seed), 'root')
+    expect(parsed.status).toBe('EXECUTED') // the disk really can carry it…
+
+    const { nodes: validated, repairs } = validateLoadedNodes([parsed], {
+      goal: '打通登录接口', phaseRoles: emptyPhaseRoles(), now: new Date().toISOString(),
+    })
+    // …and the validator really does treat it as legal, so nothing upstream ever blocks it.
+    expect(repairs.filter(r => r.includes('非法状态'))).toEqual([])
+    expect(validated[0].status).toBe('EXECUTED')
+
+    const r = reseatTransientNodes(validated, new Date().toISOString(), DEFAULT_CAPS)
+    expect(validated[0].status).toBe('READY')
+    expect(r.reseated).toEqual(['root'])
+    // spec §17.2: 不清空已有的执行证据 —— the acceptance roundtable still needs to see it.
+    expect(validated[0].execStatus).toContain('改了 src/login.ts')
+
+    // And the run actually finishes from there, rather than stalling on a node nobody picks.
+    const orch = new EffTaskOrchestrator(
+      cfg(), deps(cooperative(EXECUTABLE_PLAN)), new AbortController().signal, validated,
+    )
+    const out = await orch.run()
+    expect(out.status).toBe('completed')
+    expect(orch.nodes().find(n => n.id === 'root')!.status).toBe('ACCEPTED')
   })
 })

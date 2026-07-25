@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
 import type { RunSummary } from '../../tools/efftask/runRegistry.js'
-import { clip } from '../../tools/efftask/startupConfirm.js'
+import { clip, relativeTime } from '../../tools/efftask/startupConfirm.js'
 
 /**
  * §17.1 `/et --resume` with no id: choose a run.
@@ -17,6 +17,9 @@ export function ResumePicker(props: {
 }): React.ReactElement {
   const [cursor, setCursor] = React.useState(0)
   const { runs, onPick, onCancel } = props
+  // Read ONCE per mount, not per row: `Date.now()` inside the map would make the list
+  // re-render with drifting ages, and the picker is a momentary decision anyway.
+  const nowMs = React.useMemo(() => Date.now(), [])
   useInput((input, key) => {
     if (key.escape || input.toLowerCase() === 'q') { onCancel(); return }
     if (runs.length === 0) return
@@ -52,6 +55,13 @@ export function ResumePicker(props: {
             <Text color="error">✗{r.counts.blocked}</Text>
             {' '}
             <Text dimColor>…{r.counts.pending}</Text>
+            {/* spec §17.1's fourth column. Without it, choosing between 003 and 007 came down
+                to goal text alone — nothing said which one you were on an hour ago. Omitted
+                entirely (not rendered as '-') when the timestamp is unusable, so a damaged
+                run.md does not put a meaningless glyph where a time belongs. */}
+            {relativeTime(r.updatedAt, nowMs)
+              ? <Text dimColor>{'  '}{relativeTime(r.updatedAt, nowMs)}</Text>
+              : null}
             {r.degraded ? <Text color="warning">  (配置不完整)</Text> : null}
           </Text>
         )

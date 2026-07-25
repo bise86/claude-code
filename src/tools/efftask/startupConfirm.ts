@@ -376,6 +376,33 @@ export function capsLine(config: EffTaskConfig): string {
   return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}`
 }
 
+/**
+ * 「最后更新时间」for the resume picker — spec §17.1 lists it as one of the four things the
+ * chooser must show (编号、目标首行、状态计数、最后更新时间). `listRuns` already computes it
+ * (the max node `updatedAt`), but it was only ever used to sort, never rendered: with several
+ * runs the user picked between `003` and `007` on goal text alone, with nothing to say which
+ * one they were working on an hour ago.
+ *
+ * Relative, not absolute, because that is the question being asked — "which one is the one I
+ * was just on" — and an ISO timestamp makes the reader do the subtraction.
+ *
+ * Returns '' for a missing or unparseable value rather than inventing one. `listRuns` starts
+ * its accumulator at '' and only replaces it when a node carries a STRING timestamp, so a run
+ * whose node.md files were all hand-mangled reaches here empty; and `Date.parse` coerces
+ * rather than throwing, which is how a `updatedAt: 123` once rendered a year-1970 age.
+ */
+export function relativeTime(iso: string, nowMs: number): string {
+  if (typeof iso !== 'string' || iso.length === 0) return ''
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return ''
+  const secs = Math.round((nowMs - t) / 1000)
+  // A clock skew (or a run written by a machine slightly ahead) must not render "-30 分钟前".
+  if (secs < 60) return '刚刚'
+  if (secs < 3600) return `${Math.floor(secs / 60)} 分钟前`
+  if (secs < 86400) return `${Math.floor(secs / 3600)} 小时前`
+  return `${Math.floor(secs / 86400)} 天前`
+}
+
 export interface HandoffSummary {
   branch: string
   commits: number
