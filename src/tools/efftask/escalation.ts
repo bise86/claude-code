@@ -88,9 +88,20 @@ export function stopsTheNode(category: BlockCategory): boolean {
   return category !== 'cap-depth'
 }
 
-/** The phase a retried node re-enters, and therefore what the user is buying. */
-function retryTarget(node: TaskNode): string {
+/**
+ * The phase a retried node re-enters, and therefore what the user is buying.
+ *
+ * MUST mirror reseat.ts's seat rules, including its cap-iteration branch. It did not: for the
+ * typical cap-iteration node — a plan that called itself executable and was then rejected
+ * three times — reseat sends it back to CREATED to re-plan, while this said 「执行 → 验收」.
+ * A card headed 安全阀 · 方案评审迭代超限 told the user the retry would keep the plan and
+ * only re-run execution. Exactly backwards.
+ */
+function retryTarget(node: TaskNode, category: BlockCategory): string {
   if (node.childIds.length > 0) return '集成验收'
+  // reseat's `reviewExhausted`: a childless node whose REVIEW budget was the one that ran out
+  // goes back to CREATED, whatever `kind` happens to say.
+  if (category === 'cap-iteration') return '方案制定 → 评审(方案会重新生成)'
   return node.kind === 'executable' ? '执行 → 验收' : '方案制定 → 评审'
 }
 
@@ -137,14 +148,19 @@ export function blockEscalationLines(e: BlockEscalation, runId?: string): string
     // started now would acquire the run lock (the FIRST run never takes one — only --resume
     // does) and a second orchestrator would write the same node.md files concurrently, each
     // silently overwriting the other while both reported success.
-    '注意: 其它分支此刻仍在跑。请等本次运行结束后再执行下面的命令,不要在运行中另开一个 /et。',
+    // Says only what is KNOWN. The payload carries no in-flight count, so "其它分支此刻仍在跑"
+    // was an unconditional assertion that is false at parallelism 1, and false whenever this
+    // was the last step running. The ADVICE is sound either way — verified: a new run never
+    // takes the run lock (acquireRunLock is only called on the --resume path), so a second
+    // /et really would have two orchestrators writing the same node.md files.
+    '注意: 本次运行可能还有其它分支在跑。请等它结束后再执行下面的命令 —— 运行期间另开一个 /et 会有两个进程写同一批 node.md。',
     `记录: ${recordPath(e.node, runId)}`,
     `处理方式: ${REMEDY[e.category]}`,
     // The ONLY command that actually reopens this node. A bare `--resume` reproduces the
     // block having made zero model calls — measured behaviour of reseatTransientNodes.
     // Run-scoped, and says so: the flag reopens EVERY valve-stopped node in the run, not just
     // this one, and up to 8 cards can each be pointing at it.
-    `重试(会重开本次运行中所有被安全阀停下的节点,本节点将重跑「${retryTarget(e.node)}」): /et --resume ${id} --retry-blocked`,
+    `重试(会重开本次运行中所有被安全阀停下的节点,本节点将重跑「${retryTarget(e.node, e.category)}」): /et --resume ${id} --retry-blocked`,
     // NOT `/et --resume` — that is not a read-only operation. It takes the run lock, reseats
     // every interrupted node and issues real write-capable model calls.
     // The PATH, not a relative direction. node.md lives at <runDir>/<node.id>/node.md and
@@ -209,7 +225,11 @@ export function createEscalationLimiter(max = MAX_ESCALATION_CARDS): {
       if (sent < max - 1) { sent++; return { send: true } }
       if (sent === max - 1) {
         sent++
-        return { send: true, note: `本次运行的升级通知已达 ${max} 条上限,后续升级不再单独发卡。run.md 的任务树里每个阻断节点都带着原因和处理方式。` }
+        // NOT "详见 run.md" flat: renderTreeSnapshot only prints a reason for BLOCKED nodes,
+        // and the non-stopping valves (cap-depth flattening a branch, cap-nodes refusing a
+        // graft) leave their node running with an empty blockedReason — those land in the
+        // node's own node.md and appear nowhere in run.md. Point at both, accurately.
+        return { send: true, note: `本次运行的升级通知已达 ${max} 条上限,后续升级不再单独发卡。被阻断的节点在 run.md 的任务树里带着原因和处理方式;未阻断的(如深度上限、加子节点被拒)只记在该节点的 node.md 里。` }
       }
       dropped++
       return { send: false }

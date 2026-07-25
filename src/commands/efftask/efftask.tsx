@@ -220,7 +220,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
           return
         }
         const report = (withPath: boolean): void => {
-          const suppressed = dropped > 0 ? `\n(另有 ${dropped} 条升级通知因数量上限未发送,详见 run.md 的任务树)` : ''
+          const suppressed = dropped > 0
+            ? `\n(另有 ${dropped} 条升级通知因数量上限未发送;被阻断的节点见 run.md 的任务树,未阻断的见对应节点的 node.md)`
+            : ''
           onDone(
             exitReportLine({ runId, how, resumed, withPath, handoff: handoffOut.current }) + suppressed,
             { display: 'system' },
@@ -431,6 +433,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // The terminal surface stashes raceConfirm's `claim` here so the rendered ConfirmStartup
   // (and the unmount path) can settle the race.
   const terminalClaim = React.useRef<((w: ConfirmWinner, d: StartupDecision) => void) | null>(null)
+  /** Whether the terminal gate has uncommitted edits — see the Feishu-wins branch below. */
+  const terminalEdited = React.useRef(false)
 
   // If this view is ever torn down without going through onExit, the run must stop with it:
   // otherwise the orchestrator keeps issuing real, write-capable model calls and writing
@@ -781,9 +785,19 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // Race [terminalSurface, feishuSurface?]: first responder wins, the other is torn down.
     // The signal is passed in so a REPL-level abort settles the gate instead of hanging.
     void raceConfirm(surfaces, { signal: props.signal })
-      .then(({ decision }) => {
+      .then(({ winner, decision }) => {
         settled = true
         if (cancelled) return
+        // The Feishu card carries no roster and a gate-open parallelism snapshot, so a Feishu
+        // win uses what its card displayed. When the terminal had unsent edits that is a real
+        // loss, and it used to happen with nothing on any surface saying so — the view simply
+        // flipped to the next phase.
+        if (winner === 'feishu' && decision.approved && terminalEdited.current) {
+          onDone(
+            '注意: 本次启动由飞书批准,采用的是卡片上显示的并行数与角色名册;你在终端里未提交的修改没有生效。',
+            { display: 'system' },
+          )
+        }
         if (!decision.approved) {
           props.onExit(null) // cancelled at the gate: no run outcome to report
           return
@@ -857,6 +871,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // …and an edited seat must render with its model, like every other seat. annotateRoleModels
         // runs BEFORE this gate, so a role added here would otherwise show as a bare name.
         roleModel={name => effectiveModel(props.agentModels.find(a => a.agentType === name), props.mainModel)}
+        onEdited={() => { terminalEdited.current = true }}
         onDecision={d => terminalClaim.current?.('terminal', d)}
       />
     )

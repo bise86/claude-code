@@ -43,6 +43,14 @@ export function ConfirmStartup(props: {
   availableRoles?: string[]
   /** Which model a role runs on, so an edited seat is not rendered as a bare name. */
   roleModel?: (roleName: string) => string | undefined
+  /**
+   * Fired the first time the user changes anything here.
+   *
+   * The Feishu surface can win the race with a payload built when the gate OPENED, so an
+   * uncommitted terminal edit is silently discarded. The command uses this to say so rather
+   * than let the view flip to the next phase as if nothing was lost.
+   */
+  onEdited?: () => void
   onDecision: (d: StartupDecision) => void
 }): React.ReactElement {
   // 用户原话:"默认5个,需求提示词可指定,可跟用户确认修改" —— the fourth clause. Both
@@ -77,6 +85,7 @@ export function ConfirmStartup(props: {
           const name = available[roleRef.current]
           setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name)))
           setEdited(true)
+          props.onEdited?.()
           return
         }
       }
@@ -85,8 +94,8 @@ export function ConfirmStartup(props: {
       if (key.return) confirm()
       return
     }
-    if (key.leftArrow || input === '-') { setParallelism(clampParallelism(parRef.current - 1)); return }
-    if (key.rightArrow || input === '+' || input === '=') { setParallelism(clampParallelism(parRef.current + 1)); return }
+    if (key.leftArrow || input === '-') { setParallelism(clampParallelism(parRef.current - 1)); props.onEdited?.(); return }
+    if (key.rightArrow || input === '+' || input === '=') { setParallelism(clampParallelism(parRef.current + 1)); props.onEdited?.(); return }
     if (input.toLowerCase() === 'r') { setEditing(true); return }
     if (key.return || input.toLowerCase() === 'y') confirm()
     else if (key.escape || input.toLowerCase() === 'n') props.onDecision({ parallelism: parRef.current, approved: false })
@@ -118,7 +127,13 @@ export function ConfirmStartup(props: {
       )}
       <Text>{capsLine(props.config)}</Text>
       {editing ? (
-        <Text dimColor>↑/↓ 选阶段 · ←/→ 选角色 · 空格 增删 · 回车 确认并开始 · Esc 退出编辑</Text>
+        <Text dimColor>
+          {available.length > 0
+            ? '↑/↓ 选阶段 · ←/→ 选角色 · 空格 增删 · 回车 确认并开始 · Esc 退出编辑'
+            // ←/→ and 空格 are gated on there being candidates; listing them here made three
+            // dead keys look live.
+            : '回车 确认并开始 · Esc 退出编辑(没有可用角色,无法编辑)'}
+        </Text>
       ) : (
         <Text dimColor>回车/y 开始 · r 编辑角色名册 · ←/→ 调整并行数 · Esc/n 取消</Text>
       )}

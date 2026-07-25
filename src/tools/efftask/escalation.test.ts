@@ -42,8 +42,10 @@ describe('触阀升级卡 (spec §9/§11)', () => {
     // /et started now acquires it successfully and two orchestrators write the same node.md
     // files concurrently — each silently overwriting the other while both report success.
     const t = lines('rework')
-    expect(t).toContain('其它分支此刻仍在跑')
-    expect(t).toContain('不要在运行中另开一个 /et')
+    // Hedged, because the payload carries no in-flight count: the old unconditional
+    // "其它分支此刻仍在跑" is false at parallelism 1 and false when this was the last step.
+    expect(t).toContain('可能还有其它分支在跑')
+    expect(t).toContain('两个进程写同一批 node.md')
   })
 
   it('does NOT call a plain --resume a read-only way to look at results', () => {
@@ -95,6 +97,21 @@ describe('触阀升级卡 (spec §9/§11)', () => {
     expect(lines('rework', 'r', { kind: 'executable' })).toContain('执行 → 验收')
     expect(lines('cap-iteration', 'r', { kind: 'unknown' })).toContain('方案制定 → 评审')
     expect(lines('rework', 'r', { childIds: ['a'] })).toContain('集成验收')
+  })
+
+  it('评审超限的可执行节点,说的是"方案会重新生成" —— 不能说反', () => {
+    // THE case a cap-iteration card is most often sent about: a plan that called itself
+    // executable and was then rejected three times. reseat sends it back to CREATED to
+    // re-plan (see its reviewExhausted branch), but retryTarget only looked at kind and said
+    // 「执行 → 验收」 — a card headed 安全阀 · 方案评审迭代超限 telling the user the retry
+    // would KEEP the plan and only re-run execution. Exactly backwards.
+    const t = lines('cap-iteration', '评审迭代超限(3)', { kind: 'executable' })
+    expect(t).toContain('方案制定 → 评审(方案会重新生成)')
+    expect(t).not.toContain('本节点将重跑「执行 → 验收」')
+  })
+
+  it('但有子节点时仍然是集成验收 —— reseat 的规则 1 优先', () => {
+    expect(lines('cap-iteration', 'r', { childIds: ['a'] })).toContain('集成验收')
   })
 
   it('prescribes a DIFFERENT fix per valve — "just try again" is useless for all of them', () => {
@@ -177,7 +194,10 @@ describe('升级卡限流', () => {
     const third = l.admit()
     expect(third.send).toBe(true)
     expect(third.note).toContain('已达 3 条上限')
+    // Points at BOTH files: renderTreeSnapshot only prints a reason for BLOCKED nodes, so a
+    // suppressed non-stopping valve (cap-depth, cap-nodes-on-growth) appears nowhere in run.md.
     expect(third.note).toContain('run.md')
+    expect(third.note).toContain('node.md')
   })
 
   it('suppresses beyond the cap and keeps count', () => {

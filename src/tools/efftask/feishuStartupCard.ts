@@ -32,7 +32,13 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
     `**目标**: ${goal}\n` +
     // Same sentence as the terminal, from the same function. A Feishu approver must not
     // be told something different about the run than the person at the keyboard.
-    `**${parallelismLine(config, { editable: false, isolation })}**（如需调整请在终端确认界面修改）\n` +
+    `**${parallelismLine(config, { editable: false, isolation })}**\n` +
+    // NOT "如需调整请在终端修改". This card's own approve button is the path that DISCARDS
+    // terminal edits: the payload it claims with is {parallelism, approved} snapshotted when
+    // the gate opened, and applyStartupDecision reads an absent roster as "unchanged". So a
+    // user who edits in the terminal and is then approved from here silently gets the values
+    // shown on THIS card. Say that, instead of inviting the edit that will be thrown away.
+    `（在此批准 = 就用本卡片显示的并行数与名册;若要改动,请改在终端确认界面并在终端按回车)\n` +
     `**${capsLine(config)}**\n` +
     `**角色名册**:\n${rosterLines(config).map(l => `- ${l}`).join('\n')}` +
     // The roster says who WILL run; this says whose request was dropped and why. Without it

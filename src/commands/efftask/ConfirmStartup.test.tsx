@@ -248,3 +248,30 @@ describe('一次 chunk 里到达多个键(按住方向键、ssh/tmux 合并输�
     m.app.unmount()
   })
 })
+
+
+describe('编辑器的提示行不能列出死键', () => {
+  it('没有可用角色时,不再宣传 ←/→ 和空格', async () => {
+    // available.length > 0 gates those three keys, but the hint line was unconditional — it
+    // advertised three keys that do nothing, on the one screen where nothing can be edited.
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmStartup as never, {
+        config: {
+          goalPrompt: 'g', parallelism: 3, notices: [], mainModel: 'm',
+          caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 1 },
+          phaseRoles: { plan: [], review: [], execute: [], accept: [], observer: [] },
+        },
+        availableRoles: [], onDecision: () => {},
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    stdin.press('r')
+    await new Promise(r => setTimeout(r, 20))
+    const f = lastFrame()
+    expect(f).toContain('没有可用角色,无法编辑')
+    expect(f).not.toContain('空格 增删')
+    app.unmount()
+  })
+})
