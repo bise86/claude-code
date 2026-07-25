@@ -32,6 +32,7 @@ import {
   type HandoffSummary,
 } from '../../tools/efftask/startupConfirm.js'
 import { buildStartupCard, sendFeishuStartupCard } from '../../tools/efftask/feishuStartupCard.js'
+import { buildConflictCard } from '../../tools/efftask/conflictEscalation.js'
 import { ConfirmStartup } from './ConfirmStartup.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import { hasPermissionsToUseTool } from '../../utils/permissions/permissions.js'
@@ -509,7 +510,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       // here would otherwise strand the UI on 'parsing' forever. Keep unsupportedRoles here
       // too: dropping it would let a cli-mode role back onto the roster unannounced.
       .catch(() => parseDirectives(args, { knownRoles, unsupportedRoles }))
-      .then(cfg => {
+      .then(async cfg => {
         if (cancelled) return
         // parseDirectives only ever sees role NAMES, so the roster it produces cannot say
         // which model each one runs on. Resolve that here — this is the only layer that can
@@ -520,6 +521,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // i.e. denying the one thing the user asked for. init() only creates a branch and a
         // worktree; if the user then cancels, the teardown below disposes of them.
         const iso = await makeWorktreePool(runId!, getCwd())
+        // init() is async, so the effect can be torn down while it runs. Without this the
+        // pool it just created (a real branch and a real worktree on disk) would be
+        // unreachable and never disposed.
+        if (cancelled) { void iso.pool?.dispose([]); return }
         poolRef.current = iso.pool
         setIsolation(iso.pool ? 'worktree' : 'none')
         if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
@@ -590,6 +595,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
             {
               config: effectiveConfig, runDir: runDir!, fs: props.fs, runAgent: props.runAgent,
               signal: props.signal, seed: seed ?? undefined, worktrees: pool,
+              // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
+              // read at escalation time, not at gate time, because the bridge may connect
+              // after the run starts. Absent bridge => no card; the node still blocks with
+              // the branch, path and files in blockedReason, which the tree shows.
+              onEscalate: e => {
+                const client = store.getState().feishuClient
+                if (!client) return
+                void client.sendCard(buildConflictCard(e, runId ?? undefined)).catch(err => {
+                  logError(err instanceof Error ? err : new Error(String(err)))
+                })
+              },
             },
             setNodes,
             recordOutcome,

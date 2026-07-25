@@ -1,4 +1,5 @@
 import { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
+import type { PipelineCtx } from '../../tools/efftask/pipeline.js'
 import { writeNode, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
 import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
@@ -26,7 +27,17 @@ export type Phase =
  * module is deliberately importable and directly testable without mounting anything.
  */
 export async function runOrchestrator(
-  args: { config: EffTaskConfig; runDir: string; fs: FsLike; runAgent: RunAgentFn; signal: AbortSignal; seed?: TaskNode[]; worktrees?: WorktreePool },
+  args: {
+    config: EffTaskConfig
+    runDir: string
+    fs: FsLike
+    runAgent: RunAgentFn
+    signal: AbortSignal
+    seed?: TaskNode[]
+    worktrees?: WorktreePool
+    /** 升级人工 (spec §8): a conflict the node could not resolve itself. */
+    onEscalate?: PipelineCtx['onEscalate']
+  },
   setNodes: (n: TaskNode[]) => void,
   setOutcome: (o: Outcome) => void,
   setPhase: (p: Phase) => void,
@@ -52,6 +63,7 @@ export async function runOrchestrator(
         persist,
         now,
         worktrees: args.worktrees,
+        onEscalate: args.onEscalate,
         onUpdate: nodes => {
           setNodes([...nodes])
           void queueManifest(nodes)

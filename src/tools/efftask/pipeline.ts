@@ -40,6 +40,14 @@ export interface PipelineCtx {
    * them concurrently. That is the exact outcome isolation exists to prevent.
    */
   worktrees?: WorktreePool
+  /**
+   * 人工升级 (spec §8): a merge conflict the node could not resolve itself.
+   *
+   * A callback rather than a direct Feishu call, because the shared client lives in the
+   * command layer — the same rule the confirmation card follows. Absent in tests and in runs
+   * with no Feishu bridge; the node still blocks with the details in blockedReason either way.
+   */
+  onEscalate?: (info: { node: TaskNode; branch: string; path: string; files: string[] }) => void
 }
 
 /**
@@ -631,11 +639,44 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
   const res = await ctx.worktrees.commitAndMerge(node)
   if (!res.ok) {
     if (res.kind === 'conflict') {
-      await blockWithReason(
-        node,
-        `合并冲突,已保留工作区待人工处理。分支 ${node.worktree.branch};路径 ${node.worktree.path};冲突文件: ${res.files.join('、')}`,
-        ctx,
-      )
+      // spec §8: 触发一次"合并解决" —— the node's own execute role gets ONE shot at fixing the
+      // conflict inside its worktree, because it is the only agent that knows what its change
+      // meant. Bounded to one: an unbounded resolve loop would spend write-capable calls on a
+      // merge that keeps failing, and each attempt starts from a tree the previous one edited.
+      if (node.iteration.mergeResolve < 1) {
+        node.iteration.mergeResolve += 1
+        const tag = answerTag(ANSWER_TAGS.exec)
+        const resolve = await runPhase(ctx, {
+          phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute',
+          prompt:
+            `你的改动与集成分支冲突了。请在当前工作目录内解决冲突,保留双方的意图,不要简单丢弃任何一边。\n` +
+            `冲突文件:\n${res.files.map(f => '- ' + quote(f)).join('\n')}\n` +
+            `解决后输出:{ "execStatus":"如何解决的" }。` + answerRule(tag),
+          cwd: node.worktree.path, signal: ctx.signal,
+        })
+        if (resolve.ok) {
+          node.execStatus = `${node.execStatus}\n(合并冲突解决)${parseExecOutput(resolve.text, tag).execStatus}`
+          // 重跑验收 (spec §8, second half). A conflict resolution is NEW CODE that no
+          // reviewer has seen — it chose, by hand, which side of every hunk survives. Merging
+          // it because the ORIGINAL work passed acceptance would let the one edit most likely
+          // to silently drop a feature be the one edit nobody checks.
+          const { rec, infraExhausted } = await roundtableWithInfraRetry({
+            phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
+            system: 'accept', buildPrompt: t => acceptPrompt(node, t), ctx, cwd: node.worktree.path,
+          })
+          node.acceptLog.push(rec)
+          if (!infraExhausted && rec.synthesized.pass) return mergeAndRelease(node, ctx)
+          // The resolution broke the work, or nobody could judge it. Either way a human has
+          // to look — falling through to escalation is the honest outcome.
+          node.execStatus = `${node.execStatus}\n(冲突解决后验收未通过: ${rec.synthesized.blockingSummary || '验收角色调用失败'})`
+        }
+      }
+      const detail = `合并冲突,已保留工作区待人工处理。分支 ${node.worktree.branch};路径 ${node.worktree.path};冲突文件: ${res.files.join('、')}`
+      // Escalate BEFORE blocking, so the card carries the same facts the tree will show.
+      try {
+        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files: res.files })
+      } catch { /* a notification failure must not change the run's verdict */ }
+      await blockWithReason(node, detail, ctx)
       return false
     }
     await blockWithReason(node, `合并失败(基础设施): ${res.message}`, ctx)

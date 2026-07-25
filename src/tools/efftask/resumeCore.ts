@@ -114,6 +114,7 @@ export function validateLoadedNodes(
       acceptance: Number.isFinite(it.acceptance) ? (it.acceptance as number) : 0,
       integration: Number.isFinite(it.integration) ? (it.integration as number) : 0,
       scoring: Number.isFinite(it.scoring) ? (it.scoring as number) : 0,
+      mergeResolve: Number.isFinite(it.mergeResolve) ? (it.mergeResolve as number) : 0,
     }
     if (typeof n.execStatus !== 'string') n.execStatus = ''
     if (typeof n.blockedReason !== 'string') n.blockedReason = ''

@@ -996,6 +996,136 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     expect(n.blockedReason).toContain('/wt/root') // the path the user has to go to
   })
 
+  it('a conflict gets ONE self-resolve attempt by the execute role, inside the worktree', async () => {
+    // spec §8: 冲突 → 触发一次"合并解决"(由该节点 execute 角色在 worktree 内解决). The executor is
+    // the only agent that knows what its own change meant, so it — not the user — goes first.
+    const n = root()
+    let merges = 0
+    const cwds: (string | undefined)[] = []
+    const prompts: string[] = []
+    const agent = (async (req: { phase: string; prompt: string; cwd?: string }) => {
+      if (req.phase === 'execute') { cwds.push(req.cwd); prompts.push(req.prompt) }
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => (++merges === 1
+          ? { ok: false, kind: 'conflict', files: ['src/a.ts'] }
+          : { ok: true, merged: true }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')   // resolved, merged, accepted — no human needed
+    expect(merges).toBe(2)              // the second merge is the retry
+    expect(cwds).toEqual(['/wt/root', '/wt/root'])  // resolved IN the worktree, not the user's tree
+    expect(prompts[1]).toContain('src/a.ts')        // and it was told which files conflicted
+    expect(n.execStatus).toContain('合并冲突解决')   // the record says a resolution happened
+  })
+
+  it('re-runs ACCEPTANCE on the resolution before merging it', async () => {
+    // spec §8: 解决**并重跑验收**. The resolution picked, by hand, which side of every hunk
+    // survives — the single edit most likely to drop a feature, and the one nobody reviewed.
+    const n = root()
+    let merges = 0
+    const order: string[] = []
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      order.push(req.phase)
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => { order.push('MERGE'); return ++merges === 1
+          ? { ok: false, kind: 'conflict', files: ['src/a.ts'] }
+          : { ok: true, merged: true } },
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    // execute(resolve) must be followed by an accept BEFORE the second MERGE.
+    const firstMerge = order.indexOf('MERGE')
+    const secondMerge = order.indexOf('MERGE', firstMerge + 1)
+    expect(secondMerge).toBeGreaterThan(-1)
+    expect(order.slice(firstMerge, secondMerge)).toContain('accept')
+    expect(n.acceptLog.length).toBe(2) // the re-acceptance is on the record, not implied
+  })
+
+  it('escalates when the RESOLUTION itself fails acceptance', async () => {
+    // A resolution that breaks the work must not merge just because the original passed.
+    const n = root()
+    let accepts = 0
+    let merges = 0
+    const escalations: unknown[] = []
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      if (req.phase === 'accept' && ++accepts === 2) {
+        return vtag(req) + '\n{"pass":false,"blocking":["解决冲突时丢掉了退款分支"],"comments":""}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      onEscalate: (e: unknown) => { escalations.push(e) },
+      worktrees: fakePool({
+        commitAndMerge: async () => { merges++; return { ok: false, kind: 'conflict', files: ['src/a.ts'] } },
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(merges).toBe(1)              // it never tried to merge the rejected resolution
+    expect(escalations.length).toBe(1)  // a human is told
+    expect(n.execStatus).toContain('丢掉了退款分支') // and WHY, not just "conflict"
+  })
+
+  it('resolves AT MOST once, then escalates to a human with the facts', async () => {
+    // Unbounded resolution would spend write-capable calls on a merge that keeps failing, each
+    // attempt starting from a tree the last one already edited.
+    const n = root()
+    let merges = 0
+    const escalations: { node: TaskNode; branch: string; path: string; files: string[] }[] = []
+    const ctx = {
+      ...ctxFor([n], okAgent()),
+      onEscalate: (i: { node: TaskNode; branch: string; path: string; files: string[] }) => { escalations.push(i) },
+      worktrees: fakePool({
+        commitAndMerge: async () => { merges++; return { ok: false, kind: 'conflict', files: ['src/a.ts'] } },
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(merges).toBe(2)             // one original + exactly one retry
+    expect(n.iteration.mergeResolve).toBe(1)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('合并冲突')
+    expect(n.blockedReason).toContain('/wt/root')
+    // 升级人工: the card carries the same facts the tree shows, so the user can act from either.
+    expect(escalations.length).toBe(1)
+    expect(escalations[0]!.node).toBe(n) // the card names the node, not just a path
+    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'] })
+  })
+
+  it('a failing escalation channel does not change the run verdict', async () => {
+    // Feishu being down is not a reason to accept an unmerged node — nor to crash the run.
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], okAgent()),
+      onEscalate: () => { throw new Error('飞书连接已断开') },
+      worktrees: fakePool({ commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['a'] }) }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('合并冲突')
+  })
+
   it('a node that grows children still merges — that path had NO merge step at all', async () => {
     // The growth early-return leaves via stepIntegrate later, which never passes through the
     // merge on the acceptance path. Its worktree holds the executor's real writes.

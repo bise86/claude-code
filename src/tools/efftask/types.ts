@@ -52,7 +52,7 @@ export interface TaskNode {
   // Separate budgets. `acceptance` belongs to an executable node's accept loop and
   // `integration` to a decompose node's integrate loop; sharing one counter means a
   // resumed node could arrive at integration with its budget already spent elsewhere.
-  iteration: { planReview: number; acceptance: number; integration: number; scoring: number }
+  iteration: { planReview: number; acceptance: number; integration: number; scoring: number; mergeResolve: number }
   depth: number
   createdAt: string
   updatedAt: string
@@ -156,7 +156,7 @@ export function createNode(args: {
     reviewLog: [],
     acceptLog: [],
     score: {},
-    iteration: { planReview: 0, acceptance: 0, integration: 0, scoring: 0 },
+    iteration: { planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
     depth: args.depth,
     createdAt: args.now,
     updatedAt: args.now,
