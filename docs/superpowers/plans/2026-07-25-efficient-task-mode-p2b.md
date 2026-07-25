@@ -1,175 +1,148 @@
-# 高效任务模式 — P2b worktree 隔离与集成 实施计划
+# 高效任务模式 — P2b worktree 隔离与集成 实施计划 (v2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** 让每个可执行节点在自己的 git worktree 里执行,验收通过后合并回本 run 的集成分支,全部完成后把集成分支交给用户处置。隔离到位后解除 `execute` 的串行锁,兑现"各任务执行可以并行,默认5个"的后半句。
 
-**Architecture:** Run 启动时建集成分支 `efftask/<runId>/integration`(从 HEAD)。每个可执行节点进入执行前,从**集成分支当前状态**开一个 worktree;执行、验收都在该 worktree 内进行;验收通过后由一个**专用的集成 worktree**(绝不碰用户的检出)串行合并回集成分支。冲突先自动解决一次,仍失败则升级人工(飞书卡片)并保留 worktree。
+**Tech Stack:** 与前期同 —— Bun + TypeScript,`bun test`,`*.test.ts` 与源码同目录。git 操作全部经**注入的 `GitRunner`**,单测不碰真仓库;真 git 行为由一次性仓库的集成测试覆盖。
 
-## 本文档的由来(勿删)
+## 本文档的由来(v1 与 v2 都被否,勿删)
 
-P2 v1 的隔离部分被三方圆桌评审否决,其中**隔离相关 14 条阻断多数在一次性 git 仓库里实际复现**。下面每一条"必须"都对应一个已复现的失败,不是风格偏好。
+- **P2 v1**(`…-p2.md` 的隔离部分):三方圆桌 14 条阻断,多数在一次性 git 仓库里实测复现。
+- **P2b v1**:再评审 **12 条阻断**,同样多数实测复现。下面 §"v1 为何被否" 逐条记录。
+
+两次被否的共同点:**每一次"修法"都在真 git 的语义上撞墙**。所以 v2 的规则不再从"应该怎样"推导,而是从"实测会怎样"倒推。
 
 ---
 
-## 已复现的失败(实现者必读,每条都要有对应测试)
+## v1 为何被否(实测证据,勿删)
 
-| # | 失败 | 证据 |
+| # | 实测失败 | v2 的应对 |
 |---|---|---|
-| F1 | **slug 对几乎所有真实节点非法** | `validateWorktreeSlug` 每个 `/` 分段只允许 `[a-zA-Z0-9._-]`、全长 ≤64。`root/01-建表` 抛错;三层英文节点 94 字符抛错。**而 v1 指定的验收用例 `root/01-x` 恰是唯一能过的形状** —— 会在功能彻底失效时亮绿灯 |
-| F2 | **合并丢工作并报成功** | 执行者从不提交(`executePrompt` 没要求),worktree 脏但零提交 → `hasWorktreeChanges` 为真 → `git merge` 打印 "Already up to date" 退出 0 → 判成功 → `release` 用 `--force` 删 worktree → **改动在所有 ref 中消失**,节点 ACCEPTED、run 报 completed。**这是默认路径** |
-| F3 | **验收看不见被验收的工作** | `runRoundtable` 构造请求**不带 cwd**,只有 execute 阶段传 worktree 路径。验收角色读的是主工作树,只能照 `execStatus` 自述盖章 |
-| F4 | **worktree 基线是 `origin/<默认分支>`** | `createAgentWorktree` 无 base 参数。从 `feature/mine` 检出时,执行者的 worktree 里既没有用户的新文件也没有其改动;且节点**永远看不到依赖节点已合并的产出** |
-| F5 | **在主检出上合并会污染用户工作区** | `git checkout efftask/001` 会把用户未提交的改动一起带到集成分支上;冲突还会在**用户的检出**里留下 `MERGE_HEAD` 与冲突标记 |
-| F6 | **互斥锁按配置判定,隔离按运行时判定** | 配置写 `worktree` → 锁解除;`acquire` 因 F1 对每个节点都返回 null → **N 个带写权限的执行者同时在用户真实工作树上开工**,各自报成功 |
-| F7 | **绝对路径与 MCP 穿透隔离** | `runWithCwdOverride` 只改相对路径解析;plan 阶段无 cwd,`plan.solution` 常含主仓绝对路径;MCP 工具是进程外的,完全无视 AsyncLocalStorage |
-| F8 | **续跑会把执行者放回用户真实仓库** | `node.worktree` 会随 `serializeNode` 往返,但校验/归位从不读它。中断后 worktree 已被删,续跑时 `cwd` 指向不存在的路径,`Shell.exec` **静默回退到 `getOriginalCwd()`** |
-| F9 | **冲突阻断的节点是死局** | `blockWithReason` 设 `interrupted = signal.aborted` = false,`reseat` 每次续跑都跳过它;保留的 worktree 也不匹配 `EPHEMERAL_WORKTREE_PATTERNS`,永远不被清理 |
-| F10 | **`dispose` 会销毁真实工作** | `removeAgentWorktree` 是 `--force`;对 BLOCKED / 预算耗尽 / 被中断的节点,`node.md` 还描述着那些改动,盘上已被删 |
-| F11 | **`merge()` 缺基础设施错误档** | 每个非冲突的 git 失败(index.lock 争用、分支缺失、磁盘)都会被报成"冲突"并伪造文件列表 |
-| F12 | **hook 型 worktree 没有分支** | `createAgentWorktree` 的 `worktreeBranch` 可选;hook 型无分支,`git merge <undefined>` 会让每个 hook-VCS 用户的节点被误判为冲突 |
-| F13 | **spec §8 被静默削减** | 集成分支创建、冲突的**一次自动解决**、飞书升级卡、收口、非 git 时**让用户选择**,v1 全丢,还引用误读的 §16 当依据 |
+| B1 | **并发合并把失败判成成功并删掉工作。** 共享集成 worktree 里同时 merge:A rc=0 合入;B rc=128 `cannot lock ref 'HEAD'`,文件没进集成分支。但集成分支 HEAD 因 A 而前进 → v1 的"HEAD 前进即成功"对 B **判 PASS** → B 走 ACCEPTED → `release()` 的 `git branch -D` 把 B 的提交彻底删掉 | 合并**全局互斥**(Task 22.3);成功判据改为 `git merge-base --is-ancestor <wtBranch> <integrationBranch>` —— 问"本节点的提交是否已被集成分支包含",而不是"sha 变没变" |
+| B2 | **"无改动"与"钩子拒绝"退出码相同。** 空提交 rc=1;pre-commit 拒绝 rc=1;身份缺失 rc=128。按 v1 字面实现会把正常路径误判成 infra 无限重试;按 stderr 猜则会把钩子拒绝当成"该节点没有产出"→ ACCEPTED → 改动从不进集成分支 | 先 `git add -A` 再 `git diff --cached --quiet` 判空(退出码 0=空/1=有),**不靠 commit 的退出码区分**;commit 的任何非零一律 infra |
+| B3 | **`release()` 永不删除,100% 泄漏。** `hasWorktreeChanges(path, headCommit)` 是"工作树脏 **或** `headCommit..HEAD` 有提交";而规则要求合并前必然 commit,所以合并成功后恒为真。且 `lease.headCommit` 来自 `createAgentWorktree`,是 **origin/默认分支** 的 sha,`checkout -B` 之后 HEAD 已换基线 —— 全新未动过的 worktree 上 `rev-list --count` 就已经是 1 | acquire 在 `checkout -B` **之后重读 HEAD** 写进 lease;release 的判据改为"工作树脏 **或** 有未被集成分支包含的提交" |
+| B4 | **续跑复用脏 worktree 必然失败。** `getOrCreateWorktree` 会复用已存在的 worktree,而执行者从不提交,中断时它必然是脏的 → `checkout -B` rc=1 `local changes would be overwritten` → 按 v1 返回 null → 按"首个 null 即全局降级" → **每次 Ctrl+C 后的续跑都整体丢掉隔离**。另一半更糟:脏文件不冲突时 rc=0,未提交改动被**静默带到新基线上** | 复用路径先 `git add -A && git commit`(把中断时的产出固化成提交)再 `checkout -B`;**区分"本节点 worktree 复用失败"(节点级 infra)与"隔离不可用"(run 级降级)** |
+| B5 | **"首个 acquire 返回 null 前不得有第二个执行者启动"不可实现。** 调度器 `for (const {node,kind} of batch) inFlight.set(...)` 同一 tick 同步启动整批;拆掉 `executeChain` 后首批 N 个 acquire 同时在飞,没有承载点。且 hook 型探测与 init 能否建立在 init() 时已知,与"运行时降级"构成双真相 | **隔离可用性只在 `init()` 判定一次**(hook 探测、git 仓库探测、集成分支创建全在 init);init 之后 acquire 的失败一律按**节点级基础设施失败**处理并重试,不再触发 run 级降级 |
+| B6 | **acquire 并发争用。** 5 个并发 `git worktree add`:一个 rc=255 `could not lock config file .git/config`,worktree 根本没建出来 | acquire **全局串行**(与合并同一把锁的不同实例),并对可重试的 git 锁错误重试 |
+| B7 | **F3(验收看不见工作)只改一个 cwd 不够。** 链路要动四处:`runRoundtable` 参数、`roundtableWithInfraRetry`(三个圆桌唯一入口)、accept 调用点、`acceptPrompt`。且 `stepIntegrate`/`integratePrompt` 完全不在 v1 覆盖内:**分解节点的集成验收在子节点 worktree 已被删之后运行**,产出只在集成分支上,验收者无处可看。`scoreNode` 的 runPhase 也没有 cwd,是第五个站点 | Task 23.2 列全五个站点;集成验收在**集成 worktree** 内进行 |
+| B8 | **关口会开始撒谎。** `startupConfirm.parallelismLine` 硬编码"执行与叶子验收串行";`concurrency.test.ts` 用 `peak.execute===1`/`peak.accept===1` 把串行钉死。解除串行后一个变谎报、一个变红,而 v1 的 Files 清单没列它们 | Files 列入这三个界面 + `concurrency.test.ts`,并要求新增"隔离可用时 `peak.execute>1`、降级时 `==1`"的**时序**断言 |
+| B9 | **`node.worktree` 类型装不下租约。** 它是 `{branch, path}`,而 `removeAgentWorktree` 缺 `gitRoot` 会**静默返回 false 并泄漏**;hook 型无分支 | 扩成 `{branch?, path, headCommit, gitRoot, hookBased}` 并测往返 |
+| B10 | **Task 22-27 无可执行步骤**,违反本项目计划规则;而上面 6 条阻断恰好全落在被省略的步骤里 | Task 21/22/23 给真实测试与实现骨架;24-27 给 Files + Interfaces + 分步 |
+| B11 | **F4 只修一半。** 集成分支"从 HEAD"建,HEAD 不含用户**未提交**的修改与未跟踪文件,执行者依旧看不到 | 明确写进方案**并在关口告知用户**:执行基线是 HEAD,不含你未提交的改动 |
+| B12 | **保留的 worktree 永不清理。** `EPHEMERAL_WORKTREE_PATTERNS` 对新 slug 一条都不匹配;进程内清单随 kill 消失 | 加 pattern(`cleanupStaleAgentWorktrees` 对脏工作树 fail-closed,加了也不会删有工作的),或写明已知泄漏 |
+
+**另外两条(评审附注,同样实测):**
+- **幂等重合并假阴性**:续跑重合并一个已合入的节点 → rc=0 `Already up to date.` 且 HEAD 不前进 → 会被判失败。先用 `merge-base --is-ancestor` 判"已合入"。
+- **失败会把集成 worktree 弄瘫**:竞态失败留下常驻暂存区,`git merge --abort` 报 `no merge to abort` 清不掉,之后正确串行重试直接 rc=2 `local changes would be overwritten`,集成 worktree 从此卡死。清理必须用 `git reset --hard` + `git clean -fd`,不能只 `merge --abort`。
+
+---
+
+## 与已交付功能的冲突(必须先解决,评审指出)
+
+**评分会把已合并的节点打回返工。** `scoreNode`(已交付)在验收通过与 ACCEPTED 之间运行,并可返回"需返工"把节点打回 REWORK。而 v1 把合并挂在"验收通过之后",于是可能出现**已合并的节点又被打回返工,而它的 worktree 可能已被 release 掉**。
+
+**v2 的顺序固定为:** `执行 → 验收 → 评分 →(若返工则回执行,worktree 保留不动)→ 合并 → release → ACCEPTED`。
+即**合并是 ACCEPTED 前的最后一步**,评分返工发生在合并之前,worktree 在整个 execute→accept→score 循环期间**始终保留**。
 
 ---
 
 ## Global Constraints
 
 - 不做安全约束阻碍:token 明文写 `.claude/settings.json`,不引入 `env:` 间接、不脱敏。
-- **宁可不隔离,不可假隔离。** 任何一步拿不到真 worktree,整个 run 必须降级为串行执行并如实告知;**绝不允许**"配置说隔离了、实际在用户工作树上并发写"。
-- **宁可保留垃圾,不可删掉工作。** 任何 `--force` 删除前必须先确认该 worktree 干净。
-- **合并成功必须有正面证据**(集成分支多了一个提交),不能以退出码 0 为准 —— F2。
-- 验收必须能**读到**它要验收的东西 —— F3。
-- 断点续跑必须继续可用:`node.worktree` 是可能失效的磁盘引用,恢复路径必须校验它。
+- **宁可不隔离,不可假隔离。** init 判定隔离不可用 → 整个 run 串行执行并在关口如实告知;**绝不允许**"配置说隔离了、实际在用户工作树上并发写"。
+- **宁可保留垃圾,不可删掉工作。** 任何删除前必须确认该 worktree 既不脏、其提交也已被集成分支包含。
+- **合并成功必须有正面证据**:`merge-base --is-ancestor <wtBranch> <integrationBranch>`。退出码 0 不是证据(实测 "Already up to date" 也是 0)。
+- 验收与集成验收必须能**读到**它要验收的东西。
+- 断点续跑必须继续可用:`node.worktree` 是可能失效的磁盘引用,恢复路径必须校验。
 
 ---
 
-## Task 21: worktree 身份与生命周期(纯逻辑,不碰真 git)
+## File Structure
+
+| 文件 | 职责 |
+|---|---|
+| `src/tools/efftask/worktreeId.ts`(新) | slug/分支名派生 |
+| `src/tools/efftask/worktreePool.ts`(新) | init/acquire/commitAndMerge/release/dispose;内含 acquire 与 merge 的全局互斥 |
+| `src/tools/efftask/types.ts`(改) | `node.worktree` 扩成完整租约;`EffTaskConfig.isolation` |
+| `src/tools/efftask/pipeline.ts`(改) | 合并挂在评分之后;accept/score/integrate 三处传 cwd |
+| `src/tools/efftask/roundtable.ts`(改) | `runRoundtable` 增 `cwd` |
+| `src/tools/efftask/orchestrator.ts`(改) | 按隔离可用性决定是否解除 execute 串行 |
+| `src/tools/efftask/resumeCore.ts`(改) | 校验 `node.worktree` 路径存活 |
+| `src/tools/efftask/startupConfirm.ts`(改) | 并行/隔离文案单一真相;告知执行基线是 HEAD |
+| `src/commands/efftask/{ConfirmStartup,ConfirmResume}.tsx`、`feishuStartupCard.ts`(改) | 同上 |
+| `src/tools/efftask/concurrency.test.ts`(改) | 隔离可用时 `peak.execute>1`、降级时 `==1` |
+
+---
+
+### Task 21: worktree 身份(纯逻辑)
 
 **Files:** `src/tools/efftask/worktreeId.ts` + 测试
 
 ```ts
-/** runId + node.id → 一个一定合法的 worktree slug。 */
-export function worktreeSlug(runId: string, nodeId: string): string
-export function integrationBranch(runId: string): string
+export function worktreeSlug(runId: string, nodeId: string): string  // efftask-<runId>-<sha256(nodeId) 前 8 位>
+export function integrationBranch(runId: string): string             // efftask/<runId>/integration
 ```
 
-slug **不得**从标题或节点 id 直接派生(F1)。取 `efftask-<runId>-<sha256(nodeId) 前 8 位十六进制>`:恒为 `[a-z0-9-]`、恒 ≤ 32 字符、对同一节点稳定(续跑要能重新找到)、不同节点碰撞概率可忽略。
+评审已实测确认这条修法成立(`efftask-001-4813494d` 长 20,对中文/深层/超长 id 全部合法且稳定)。
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 写失败测试**(完整代码见 v1 文档 Task 21 Step 1,原样沿用 —— 它是唯一被评审判为"修对了、不必再动"的部分)
+- [ ] **Step 2-4:** 跑红 → 用 `node:crypto` 的 `createHash('sha256')` 实现 → 跑绿 → 提交
 
+### Task 22: worktreePool(注入 GitRunner)
+
+**Interfaces:**
 ```ts
-import { describe, expect, it } from 'bun:test'
-import { worktreeSlug, integrationBranch } from './worktreeId.js'
-import { validateWorktreeSlug } from '../../utils/worktree.js'
-import { childId } from './persistence.js'
-
-describe('worktreeSlug is legal for nodes that actually occur', () => {
-  it('accepts Chinese titles and deep nesting — the shapes that made v1 throw', () => {
-    // validateWorktreeSlug allows only [a-zA-Z0-9._-] per '/'-segment, max 64 chars total.
-    // v1 derived the slug from runId + node.id, so `root/01-建表` threw — and its own
-    // acceptance case `root/01-x` was the ONE shape that passed, i.e. it would have gone
-    // green over a total failure.
-    const deep = childId(childId(childId('root', 1, '建表'), 2, 'write integration tests for the endpoint'), 3, '压测')
-    for (const id of ['root', 'root/01-建表', deep, 'root/01-' + 'x'.repeat(200)]) {
-      const slug = worktreeSlug('001', id)
-      expect(() => validateWorktreeSlug(slug)).not.toThrow()
-      expect(slug.length).toBeLessThanOrEqual(64)
-    }
-  })
-
-  it('is stable for the same node and distinct across nodes', () => {
-    // Stability is load-bearing: resume must find the same worktree again.
-    expect(worktreeSlug('001', 'root/01-建表')).toBe(worktreeSlug('001', 'root/01-建表'))
-    expect(worktreeSlug('001', 'root/01-a')).not.toBe(worktreeSlug('001', 'root/02-a'))
-    expect(worktreeSlug('001', 'root/01-a')).not.toBe(worktreeSlug('002', 'root/01-a'))
-  })
-
-  it('integration branch is per-run', () => {
-    expect(integrationBranch('003')).toBe('efftask/003/integration')
-  })
-})
-```
-
-- [ ] **Step 2-4:** 跑红 → 实现(用 `node:crypto` 的 `createHash('sha256')`)→ 跑绿 → 提交。
-
----
-
-## Task 22: `worktreePool`(注入 git 执行器,不碰真仓库)
-
-**Files:** `src/tools/efftask/worktreePool.ts` + 测试
-
-```ts
-export interface GitRunner {
-  (args: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }>
-}
 export interface Lease {
-  path: string; branch: string; headCommit: string; gitRoot: string; hookBased: boolean
+  path: string; branch?: string; headCommit: string; gitRoot: string; hookBased: boolean
 }
 export type MergeResult =
-  | { ok: true; merged: boolean }                     // merged=false 表示该节点没有产出
+  | { ok: true; merged: boolean }
   | { ok: false; kind: 'conflict'; files: string[] }
-  | { ok: false; kind: 'infra'; message: string }     // F11:非冲突失败不得伪装成冲突
-
+  | { ok: false; kind: 'infra'; message: string }
 export interface WorktreePool {
-  init(): Promise<{ ok: true } | { ok: false; reason: string }>  // 建集成分支 + 集成 worktree
-  acquire(node: TaskNode): Promise<Lease | null>                 // null = 隔离不可用
+  init(): Promise<{ ok: true } | { ok: false; reason: string }>
+  acquire(node: TaskNode): Promise<Lease | { error: string }>   // 节点级失败,不是 run 级降级
   commitAndMerge(node: TaskNode): Promise<MergeResult>
   release(node: TaskNode): Promise<{ removed: boolean; keptBecause?: string }>
   dispose(): Promise<{ kept: { path: string; why: string }[] }>
 }
 ```
 
-**每条规则都对应一个已复现的失败:**
+**22.1 init()** —— 隔离可用性**在此一次判定**(B5):探测 git 仓库、探测 hook 型(hook 型无分支 → 判定隔离不可用)、从 HEAD 建 `efftask/<runId>/integration`、为它开**专用集成 worktree**。任一失败 → `{ok:false, reason}`,整个 run 降级串行并在关口如实告知。
 
-1. `init()` 从 HEAD 建 `efftask/<runId>/integration`,并为它开一个**专用集成 worktree**。所有合并都在该 worktree 内执行 —— **绝不 `git checkout` 用户的检出**(F5)。
-2. `acquire()` 先 `createAgentWorktree(slug)`,再在该 worktree 内 `git checkout -B <wtBranch> <integrationBranch>`,把基线换成集成分支当前状态(F4)。失败返回 `null`,**不抛**。
-3. `acquire()` 返回**完整**租约:`headCommit`(`hasWorktreeChanges` 要)、`gitRoot`(`removeAgentWorktree` 缺了它会静默失败并泄漏)、`hookBased`。**hook 型无分支 → 直接返回 null**,该 run 降级(F12)——不要试图合并一个 undefined 分支。
-4. `commitAndMerge()`:先在 worktree 内 `git add -A && git commit`(执行者不会自己提交,F2);无改动则返回 `{ok:true, merged:false}` 并**跳过合并**;有改动则在集成 worktree 内合并,并**核对集成分支的 HEAD 确实前进了**才算成功。
-5. 合并冲突 → `{kind:'conflict', files}`,并 `git merge --abort` 清理集成 worktree;其它非零退出 → `{kind:'infra'}`(F11)。
-6. `release()` 只在**合并成功**后删;删前再查一次 `hasWorktreeChanges`,脏则保留并说明原因(F10)。
-7. `dispose()` 逐个查干净才删,保留清单返回给调用方展示(F10)。
+**22.2 acquire()** —— 全局串行 + 锁错误重试(B6)。`createAgentWorktree(slug)` → 在 worktree 内 `git checkout -B <wtBranch> <integrationBranch>`(B4:若复用的 worktree 是脏的,**先 `git add -A && git commit` 固化**再 checkout)→ **重读 HEAD** 写进 `lease.headCommit`(B3)。失败返回 `{error}`,由调用方按节点级 infra 重试。
 
-- [ ] Step 1-10:测试先行,注入假 `GitRunner` 与假 worktree 函数。**必测**:F1 的中文/深层 id、F2 的"未提交即合并"(断言 `merged` 与集成分支 HEAD 前进)、F4 的基线换到集成分支、F10 的脏 worktree 不删、F11 的 infra 与 conflict 分档、F12 的 hook 型返回 null。
+**22.3 commitAndMerge()** —— 全局互斥(B1)。
+1. `git add -A`;`git diff --cached --quiet` 判空(B2)。空 → `{ok:true, merged:false}`,**不合并**。
+2. 非空 → `git commit`;任何非零退出一律 `{kind:'infra'}`,**不猜 stderr**。
+3. 已合入判定:`git merge-base --is-ancestor <wtBranch> <integrationBranch>` 为真 → `{ok:true, merged:true}`(幂等重合并)。
+4. 在集成 worktree 内 `git merge <wtBranch>`。
+5. **成功判据**:再次 `merge-base --is-ancestor`。为真才成功;为假则按退出码分档 conflict/infra。
+6. 失败清理必须 `git reset --hard && git clean -fd`,不能只 `merge --abort`(实测 abort 清不掉常驻暂存区,集成 worktree 会从此卡死)。
 
----
+**22.4 release()** —— 删除前必须**双条件**:工作树不脏 **且** 其提交已被集成分支包含(B3)。否则保留并说明原因。
 
-## Task 23: 接线到编排(隔离真正生效)
+**22.5 dispose()** —— 逐个查后再删,保留清单返回给调用方展示(B12:同时把新 slug 加进 `EPHEMERAL_WORKTREE_PATTERNS`,或在文档中写明已知泄漏)。
 
-**Files:** `orchestrator.ts`、`pipeline.ts`、`roundtable.ts`、`types.ts`、`efftask.tsx`
+- [ ] Step 1-12:测试先行,注入假 `GitRunner`。**必测**:B1(并发合并,断言失败节点的 worktree 未被删)、B2(空提交/钩子拒绝/身份缺失三种 rc 的分档)、B3(纯净 worktree 不被误判为脏)、B4(脏 worktree 复用)、B6(锁错误重试)、幂等重合并、失败后集成 worktree 仍可用。
 
-1. **执行前 acquire,写入 `node.worktree`**;`stepExecute` 已经在读 `node.worktree?.path` 当 cwd。
-2. **验收也要拿到 cwd**(F3):`runRoundtable` 增 `cwd?`,`accept` 阶段对可执行节点传 worktree 路径。否则验收角色读的是主工作树,只能照自述盖章。
-3. **提示词注入 worktree 告示**(F7):照 `forkSubagent.ts` 的 `buildWorktreeNotice` 做一份,告诉执行者它的工作目录已经变了、方案里的绝对路径需要换算。**同时在文档里写明:MCP 工具是进程外的,不受 cwd 覆盖约束 —— 这是隔离的已知漏洞,不是可以假装不存在的。**
-4. **验收通过 → `commitAndMerge`**;成功 → ACCEPTED + `release`;冲突 → 见 Task 24;infra → 按基础设施失败重试,**不当作冲突**。
-5. **互斥锁按运行时判定**(F6):只有 `acquire` 真的拿到租约的节点才允许并发执行;**第一个 `acquire` 返回 null 就把整个 run 降级为串行**,且在此之前不得有第二个执行者启动。
-6. `EffTaskConfig.isolation: 'worktree' | 'none'`,由 `init()` 的实际结果决定,不是用户随便声明的。
+### Task 23: 接线(隔离真正生效)
 
----
+1. 执行前 acquire,租约完整写入 `node.worktree`(B9)。
+2. **五个 cwd 站点**(B7):`stepExecute`(已有)、`runRoundtable` 参数、`roundtableWithInfraRetry` 透传、accept 调用点、`scoreNode`。集成验收在**集成 worktree** 内跑。
+3. 提示词注入 worktree 告示(照 `forkSubagent.ts` 的 `buildWorktreeNotice`),并在文档与注释中写明:**MCP 工具是进程外的,不受 cwd 覆盖 —— 这是隔离的已知漏洞**。
+4. 顺序固定:执行 → 验收 → 评分 → 合并 → release → ACCEPTED(见上文冲突章节)。
+5. execute 串行锁的解除**只看 `init()` 的结果**(B5)。
+6. 三个界面文案 + `concurrency.test.ts` 的时序断言(B8)。
 
-## Task 24: 冲突处理与人工升级(spec §8 原文)
+### Task 24-27
 
-1. 冲突 → **先自动解决一次**:由该节点的 execute 角色在 worktree 内解决冲突并重跑验收(spec §8 明确要求;§16 的"不追求全自动"指不保证无冲突,**不等于取消这一次尝试** —— v1 引用误读的 §16 把它删了)。
-2. 仍失败 → 升级人工:**飞书卡片**,节点标 BLOCKED,`blockedReason` 必须带上 **worktree 路径、分支名、冲突文件列表**,否则用户无从下手。
-3. **冲突阻断的节点必须可恢复**(F9):`TaskNode` 增 `conflict?: { path: string; branch: string; files: string[] }`;`reseat` 见到它时**不重开**(人还没处理),但恢复关口要把它列出来,并提供"我已手工解决,续跑时重试合并"的入口。
-4. 保留的 worktree 要能被清理:登记到一个 run 级清单里,`dispose` 与收口时展示。
-
-## Task 25: 收口(spec §8 最后一条)
-
-全部 ACCEPTED 后,集成分支交给用户:复用 `superpowers:finishing-a-development-branch` 的四选项(合回当前分支 / 建 PR / 保留 / 丢弃)。**默认不直接改用户当前工作区。** 缺了这一步,用户跑完一整个 run 在自己的工作区里看不到任何改动,而且没有任何地方告诉他东西在哪(v1 就是这样)。
-
-## Task 26: 非 git 仓库 → 让用户选择(spec §8 最后一条)
-
-启动时检测。非 git 仓库 → 关口提示"需要 git 仓库以隔离并行执行",给出选项:**改用共享工作目录串行执行** / 先 `git init` / 取消。v1 改成静默自动降级,那是未经认可的规格变更。
-
-## Task 27: 续跑路径校验 worktree(F8)
-
-`validateLoadedNodes` 增:`node.worktree` 存在但路径已不存在 → 清空该字段并记 repair。否则续跑时 `cwd` 指向已删目录,`Shell.exec` **静默回退到用户真实仓库**,而 `node.md` 还宣称隔离中。必测:worktree 路径不存在的节点被归位后不带陈旧 cwd。
-
----
+冲突自动解决一次 + 飞书升级卡(spec §8)、收口(finishing-a-development-branch)、非 git 让用户选择、续跑校验 `node.worktree`。**各自的 Files/Interfaces/分步在进入该任务前补齐 —— 上一版正是在这里留白,而 6 条阻断全落在留白处。**
 
 ## Self-Review
 
-- spec §8 五条(集成分支 / 每节点 worktree / 合并回收 / 冲突升级 / 收口 / 非 git 选择)→ Task 22-26,逐条对应。
-- 用户"各任务执行可以并行"的后半句 → Task 23 第 5 点。
-- **已知且不打算解决的漏洞(必须写进文档与代码注释,不得假装隔离是完备的)**:MCP 工具进程外执行,不受 cwd 覆盖;执行阶段的工具池是完整的 `context.options.tools`,含父级 MCP 工具。要真正封死需要按工具来源过滤,超出本期范围。
+- spec §8 五条逐条对应 Task 22-26。
+- **已知且不解决的漏洞(写进文档与代码注释,不假装隔离完备)**:MCP 工具进程外执行,不受 cwd 覆盖;执行阶段工具池含父级 MCP 工具。
+- **已知取舍(要告知用户)**:执行基线是 HEAD,不含用户未提交的改动(B11)。
 - 本期不做:P1 交接清单的启动第 3 关、后台任务注册、飞书推进 surface、跨分支依赖调度。
