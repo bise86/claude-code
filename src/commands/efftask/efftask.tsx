@@ -38,8 +38,9 @@ import { buildConflictCard } from '../../tools/efftask/conflictEscalation.js'
 import { ConfirmStartup } from './ConfirmStartup.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import { hasPermissionsToUseTool } from '../../utils/permissions/permissions.js'
-import { useAppStateStore } from '../../state/AppState.js'
+import { useAppStateStore, useSetAppState } from '../../state/AppState.js'
 import { getCwd } from '../../utils/cwd.js'
+import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { logError } from '../../utils/log.js'
 
 
@@ -167,6 +168,10 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       fs={fs}
       runAgent={runAgent}
       signal={signal}
+      // The controller ITSELF, not just an abort thunk: the /tasks entry (spec §10) has to
+      // stop the real run when the user presses `x`, and a private controller there would
+      // flip the panel to 已中断 while the orchestrator kept issuing write-capable calls.
+      controller={runController}
       abort={() => runController.abort()}
       detach={detachAbortRelay}
       // The REPL moves this JSX between four mutually-exclusive tree positions, so Ctrl+O
@@ -226,15 +231,6 @@ function isPidAlive(pid: number): boolean {
     // EPERM means the process EXISTS but belongs to another user — very much alive.
     return (e as NodeJS.ErrnoException).code === 'EPERM'
   }
-}
-
-function countStatuses(nodes: TaskNode[]): { accepted: number; blocked: number; pending: number; total: number } {
-  let accepted = 0, blocked = 0
-  for (const n of nodes) {
-    if (n.status === 'ACCEPTED') accepted++
-    else if (n.status === 'BLOCKED') blocked++
-  }
-  return { accepted, blocked, pending: nodes.length - accepted - blocked, total: nodes.length }
 }
 
 /** Run `fn` at most once — the exit key fires per keypress, onDone must not. */
@@ -355,6 +351,8 @@ type RunnerProps = {
   fs: FsLike
   runAgent: RunAgentFn
   signal: AbortSignal
+  /** The run's own controller — what the /tasks entry aborts (spec §10). */
+  controller: AbortController
   abort: () => void
   detach: () => void
   onTornDown: () => void
@@ -397,6 +395,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
   const runDir = runId ? `${props.effRoot}/${runId}` : null
   const store = useAppStateStore()
+  const setAppState = useSetAppState()
   // The terminal surface stashes raceConfirm's `claim` here so the rendered ConfirmStartup
   // (and the unmount path) can settle the race.
   const terminalClaim = React.useRef<((w: ConfirmWinner, d: StartupDecision) => void) | null>(null)
@@ -575,6 +574,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       {
         config: cfg, runDir: runDir!, fs: props.fs, runAgent: props.runAgent,
         signal: props.signal, seed: rootSeed ?? seed ?? undefined, worktrees: pool,
+        // 后台任务登记 (spec §10). Handed to runOrchestrator rather than wired here: that
+        // module is importable by a test, this one is not, and the last two features wired
+        // in this file were dead in production while every test passed over the severed wire.
+        // Absent a run id there is nothing to name or resume, so no entry is invented.
+        taskEntry: runId && runDir
+          ? { runId, runDir, setAppState, abortController: props.controller }
+          : undefined,
         // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
         // read at escalation time, not at gate time, because the bridge may connect
         // after the run starts. Absent bridge => no card; the node still blocks with
@@ -593,7 +599,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       h => { handoffRef.current = h; setHandoff(h) },
     )
     // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
-  }, [runDir, runId, seed, props.fs, props.runAgent, props.signal, recordOutcome, store])
+  }, [runDir, runId, seed, props.fs, props.runAgent, props.signal, props.controller, recordOutcome, store, setAppState])
 
   // ---- 启动关口第三关: 起草根方案 + 首层任务树 (spec §2) ----
   React.useEffect(() => {

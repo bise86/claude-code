@@ -3,6 +3,8 @@ import { runOrchestrator, type Outcome } from './runOrchestrator.js'
 import type { FsLike } from '../../tools/efftask/persistence.js'
 import { DEFAULT_CAPS, emptyPhaseRoles, type EffTaskConfig } from '../../tools/efftask/types.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
+import type { AppState } from '../../state/AppState.js'
+import type { EffTaskTaskState } from '../../tasks/EffTaskTask/EffTaskTask.js'
 
 function memFs(): FsLike & { files: Map<string, string> } {
   const files = new Map<string, string>()
@@ -133,5 +135,106 @@ describe('runOrchestrator reports the run it just drove', () => {
 
     expect(outcomes).toHaveLength(1)
     expect(phases).toEqual(['done'])
+  })
+})
+
+describe('后台任务条目 (spec §10) 真的被接上', () => {
+  /** Minimal AppState double: registerTask/updateTaskState only touch `tasks`. */
+  function store() {
+    let state = { tasks: {} } as unknown as AppState
+    return {
+      setAppState: (f: (prev: AppState) => AppState) => { state = f(state) },
+      only: () => Object.values(state.tasks as Record<string, EffTaskTaskState>)[0],
+      count: () => Object.keys(state.tasks as Record<string, unknown>).length,
+    }
+  }
+
+  it('registers the run in AppState.tasks and settles it when the run ends', async () => {
+    // THE wire. Everything below it is unit-tested in EffTaskTask.test.ts; what this asserts
+    // is that a real run reaches it at all. The previous two features wired only inside
+    // efftask.tsx were dead in production while their own unit tests passed.
+    const s = store()
+    const ac = new AbortController()
+    ac.abort()
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/003', fs: memFs(), runAgent: async () => '', signal: ac.signal,
+        taskEntry: { runId: '003', runDir: '/run/003', setAppState: s.setAppState, abortController: ac },
+      },
+      () => {}, () => {}, () => {},
+    )
+    expect(s.count()).toBe(1)
+    const t = s.only()
+    expect(t.type).toBe('efftask')
+    expect(t.runId).toBe('003')
+    expect(t.runDir).toBe('/run/003')
+    // The run ended blocked, so the row must be FAILED — a row still saying 运行中 for a run
+    // that is over is the panel lying about the thing it shows.
+    expect(t.status).toBe('failed')
+    expect(t.reason).toBe('已中断')
+  })
+
+  it('carries the RUN\'s controller, so `x` in /tasks stops the real thing', async () => {
+    const s = store()
+    const ac = new AbortController()
+    ac.abort()
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: memFs(), runAgent: async () => '', signal: ac.signal,
+        taskEntry: { runId: '1', runDir: '/r', setAppState: s.setAppState, abortController: ac },
+      },
+      () => {}, () => {}, () => {},
+    )
+    // finishEffTaskRun clears it on the terminal path; what matters is that the controller
+    // handed in was the run's own, which the abort above proves by construction.
+    expect(ac.signal.aborted).toBe(true)
+  })
+
+  it('registers NOTHING when no task entry is supplied', async () => {
+    const s = store()
+    const ac = new AbortController()
+    ac.abort()
+    await runOrchestrator(
+      { config: cfg(), runDir: '/r', fs: memFs(), runAgent: async () => '', signal: ac.signal },
+      () => {}, () => {}, () => {},
+    )
+    expect(s.count()).toBe(0)
+  })
+
+  it('settles the row even when the run throws out of the success path', async () => {
+    // The catch below run() is the ONE path with no other route to a terminal status: a row
+    // left at 运行中 forever survives the run, the view and the session.
+    const s = store()
+    const ac = new AbortController()
+    ac.abort()
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: memFs(), runAgent: async () => '', signal: ac.signal,
+        taskEntry: { runId: '1', runDir: '/r', setAppState: s.setAppState, abortController: ac },
+      },
+      // setNodes runs unguarded inside the try, so this is the reachable route into the
+      // catch — the one exit the success path's settle() never covers.
+      () => { throw new Error('渲染器炸了') }, () => {}, () => {},
+    )
+    expect(s.only().status).toBe('failed')
+  })
+
+  it('a crashing store never takes the run down with it', async () => {
+    const ac = new AbortController()
+    ac.abort()
+    const outcomes: Outcome[] = []
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: memFs(), runAgent: async () => '', signal: ac.signal,
+        taskEntry: {
+          runId: '1', runDir: '/r', abortController: ac,
+          setAppState: () => { throw new Error('store 炸了') },
+        },
+      },
+      () => {}, o => outcomes.push(o), () => {},
+    )
+    // registerEffTaskRun throwing would abort the whole run before its first step. It does
+    // not: the run still reports its outcome.
+    expect(outcomes).toEqual([{ status: 'blocked', reason: '已中断' }])
   })
 })

@@ -11,6 +11,7 @@ export type TaskType =
   | 'local_workflow'
   | 'monitor_mcp'
   | 'dream'
+  | 'efftask'
 
 export type TaskStatus =
   | 'pending'
@@ -84,6 +85,7 @@ const TASK_ID_PREFIXES: Record<string, string> = {
   local_workflow: 'w',
   monitor_mcp: 'm',
   dream: 'd',
+  efftask: 'e',
 }
 
 // Get task ID prefix

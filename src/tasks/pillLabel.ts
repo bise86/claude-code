@@ -60,6 +60,8 @@ export function getPillLabel(tasks: BackgroundTaskState[]): string {
         return n === 1 ? '1 monitor' : `${n} monitors`
       case 'dream':
         return 'dreaming'
+      case 'efftask':
+        return n === 1 ? '1 高效任务' : `${n} 个高效任务`
     }
   }
 

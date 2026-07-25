@@ -8,6 +8,7 @@ import { useAppState, useSetAppState } from 'src/state/AppState.js';
 import { enterTeammateView, exitTeammateView } from 'src/state/teammateViewHelpers.js';
 import type { ToolUseContext } from 'src/Tool.js';
 import { DreamTask, type DreamTaskState } from 'src/tasks/DreamTask/DreamTask.js';
+import { EffTaskTask, type EffTaskTaskState } from 'src/tasks/EffTaskTask/EffTaskTask.js';
 import { InProcessTeammateTask } from 'src/tasks/InProcessTeammateTask/InProcessTeammateTask.js';
 import type { InProcessTeammateTaskState } from 'src/tasks/InProcessTeammateTask/types.js';
 import type { LocalAgentTaskState } from 'src/tasks/LocalAgentTask/LocalAgentTask.js';
@@ -29,6 +30,7 @@ import type { ExitState } from '../../hooks/useExitOnCtrlCDWithKeybindings.js';
 import type { KeyboardEvent } from '../../ink/events/keyboard-event.js';
 import { Box, Text } from '../../ink.js';
 import { useKeybindings } from '../../keybindings/useKeybinding.js';
+import { EffTaskDetailDialog } from './EffTaskDetailDialog.js';
 import { useShortcutDisplay } from '../../keybindings/useShortcutDisplay.js';
 import { count } from '../../utils/array.js';
 import { Byline } from '../design-system/Byline.js';
@@ -95,6 +97,12 @@ type ListItem = {
   label: string;
   status: string;
   task: DeepImmutable<DreamTaskState>;
+} | {
+  id: string;
+  type: 'efftask';
+  label: string;
+  status: string;
+  task: DeepImmutable<EffTaskTaskState>;
 } | {
   id: string;
   type: 'leader';
@@ -176,6 +184,7 @@ export function BackgroundTasksDialog({
     workflowTasks,
     mcpMonitors,
     dreamTasks: dreamTasks_0,
+    effTasks,
     allSelectableItems
   } = useMemo(() => {
     // Filter to only show running/pending background tasks, matching the status bar count
@@ -197,6 +206,7 @@ export function BackgroundTasksDialog({
     const workflows = sorted.filter(item_2 => item_2.type === 'local_workflow');
     const monitorMcp = sorted.filter(item_3 => item_3.type === 'monitor_mcp');
     const dreamTasks = sorted.filter(item_4 => item_4.type === 'dream');
+    const effTaskItems = sorted.filter(item_12 => item_12.type === 'efftask');
     // In spinner-tree mode, exclude teammates from the dialog (they appear in the tree)
     const teammates = showSpinnerTree ? [] : sorted.filter(item_5 => item_5.type === 'in_process_teammate');
     // Add leader entry when there are teammates, so users can foreground back to leader
@@ -213,11 +223,12 @@ export function BackgroundTasksDialog({
       workflowTasks: workflows,
       mcpMonitors: monitorMcp,
       dreamTasks,
+      effTasks: effTaskItems,
       teammateTasks: [...leaderItem, ...teammates],
       // Order MUST match JSX render order (teammates \u2192 bash \u2192 monitorMcp \u2192
       // remote \u2192 agent \u2192 workflows \u2192 dream) so \u2193/\u2191 navigation moves the cursor
       // visually downward.
-      allSelectableItems: [...leaderItem, ...teammates, ...bash, ...monitorMcp, ...remote, ...agent, ...workflows, ...dreamTasks]
+      allSelectableItems: [...leaderItem, ...teammates, ...bash, ...monitorMcp, ...remote, ...agent, ...workflows, ...dreamTasks, ...effTaskItems]
     };
   }, [typedTasks, foregroundedTaskId, showSpinnerTree]);
   const currentSelection = allSelectableItems[selectedIndex] ?? null;
@@ -318,6 +329,9 @@ export function BackgroundTasksDialog({
   async function killRemoteAgentTask(taskId_3: string): Promise<void> {
     await RemoteAgentTask.kill(taskId_3, setAppState);
   }
+  async function killEffTask(taskId_4: string): Promise<void> {
+    await EffTaskTask.kill(taskId_4, setAppState);
+  }
 
   // Wrap onDone in useEffectEvent to get a stable reference that always calls
   // the current onDone callback without causing the effect to re-fire.
@@ -396,6 +410,10 @@ export function BackgroundTasksDialog({
         return <DreamDetailDialog task={task_0} onDone={() => onDone('Background tasks dialog dismissed', {
           display: 'system'
         })} onBack={goBackToList} onKill={task_0.status === 'running' ? () => void killDreamTask(task_0.id) : undefined} key={`dream-${task_0.id}`} />;
+      case 'efftask':
+        return <EffTaskDetailDialog task={task_0} onDone={() => onDone('Background tasks dialog dismissed', {
+          display: 'system'
+        })} onBack={goBackToList} onKill={task_0.status === 'running' ? () => void killEffTask(task_0.id) : undefined} key={`efftask-${task_0.id}`} />;
     }
   }
   const runningBashCount = count(bashTasks, _ => _.status === 'running');
@@ -411,7 +429,7 @@ export function BackgroundTasksDialog({
               {runningAgentCount}{' '}
               {runningAgentCount !== 1 ? 'active agents' : 'active agent'}
             </Text>] : [])], index => <Text key={`separator-${index}`}> · </Text>);
-  const actions = [<KeyboardShortcutHint key="upDown" shortcut="↑/↓" action="select" />, <KeyboardShortcutHint key="enter" shortcut="Enter" action="view" />, ...(currentSelection?.type === 'in_process_teammate' && currentSelection.status === 'running' ? [<KeyboardShortcutHint key="foreground" shortcut="f" action="foreground" />] : []), ...((currentSelection?.type === 'local_bash' || currentSelection?.type === 'local_agent' || currentSelection?.type === 'in_process_teammate' || currentSelection?.type === 'local_workflow' || currentSelection?.type === 'monitor_mcp' || currentSelection?.type === 'dream' || currentSelection?.type === 'remote_agent') && currentSelection.status === 'running' ? [<KeyboardShortcutHint key="kill" shortcut="x" action="stop" />] : []), ...(agentTasks.some(t => t.status === 'running') ? [<KeyboardShortcutHint key="kill-all" shortcut={killAgentsShortcut} action="stop all agents" />] : []), <KeyboardShortcutHint key="esc" shortcut="←/Esc" action="close" />];
+  const actions = [<KeyboardShortcutHint key="upDown" shortcut="↑/↓" action="select" />, <KeyboardShortcutHint key="enter" shortcut="Enter" action="view" />, ...(currentSelection?.type === 'in_process_teammate' && currentSelection.status === 'running' ? [<KeyboardShortcutHint key="foreground" shortcut="f" action="foreground" />] : []), ...((currentSelection?.type === 'local_bash' || currentSelection?.type === 'local_agent' || currentSelection?.type === 'in_process_teammate' || currentSelection?.type === 'local_workflow' || currentSelection?.type === 'monitor_mcp' || currentSelection?.type === 'dream' || currentSelection?.type === 'efftask' || currentSelection?.type === 'remote_agent') && currentSelection.status === 'running' ? [<KeyboardShortcutHint key="kill" shortcut="x" action="stop" />] : []), ...(agentTasks.some(t => t.status === 'running') ? [<KeyboardShortcutHint key="kill-all" shortcut={killAgentsShortcut} action="stop all agents" />] : []), <KeyboardShortcutHint key="esc" shortcut="←/Esc" action="close" />];
   const handleCancel = () => onDone('Background tasks dialog dismissed', {
     display: 'system'
   });
@@ -485,6 +503,15 @@ export function BackgroundTasksDialog({
                   {dreamTasks_0.map(item_11 => <Item key={item_11.id} item={item_11} isSelected={item_11.id === currentSelection?.id} />)}
                 </Box>
               </Box>}
+
+            {effTasks.length > 0 && <Box flexDirection="column" marginTop={teammateTasks.length > 0 || bashTasks.length > 0 || mcpMonitors.length > 0 || remoteSessions.length > 0 || agentTasks.length > 0 || workflowTasks.length > 0 || dreamTasks_0.length > 0 ? 1 : 0}>
+                <Text dimColor>
+                  <Text bold>{'  '}高效任务</Text> ({effTasks.length})
+                </Text>
+                <Box flexDirection="column">
+                  {effTasks.map(item_13 => <Item key={item_13.id} item={item_13} isSelected={item_13.id === currentSelection?.id} />)}
+                </Box>
+              </Box>}
           </Box>}
       </Dialog>
     </Box>;
@@ -543,6 +570,14 @@ function toListItem(task: BackgroundTaskState): ListItem {
       return {
         id: task.id,
         type: 'dream',
+        label: task.description,
+        status: task.status,
+        task
+      };
+    case 'efftask':
+      return {
+        id: task.id,
+        type: 'efftask',
         label: task.description,
         status: task.status,
         task

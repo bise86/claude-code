@@ -32,6 +32,21 @@ export function advanceableKind(node: TaskNode, byId: Map<string, TaskNode>): Ad
   return null
 }
 
+/**
+ * The run's headline tally.
+ *
+ * Shared, because three surfaces show it — the resume gate, the /tasks row, and the footer
+ * pill — and three copies of "what counts as done" is how they start disagreeing.
+ */
+export function countStatuses(nodes: TaskNode[]): { accepted: number; blocked: number; pending: number; total: number } {
+  let accepted = 0, blocked = 0
+  for (const n of nodes) {
+    if (n.status === 'ACCEPTED') accepted++
+    else if (n.status === 'BLOCKED') blocked++
+  }
+  return { accepted, blocked, pending: nodes.length - accepted - blocked, total: nodes.length }
+}
+
 export type UiStatus = 'done' | 'running' | 'queued' | 'failed'
 export function uiStatus(status: NodeStatus): UiStatus {
   if (status === 'ACCEPTED') return 'done'

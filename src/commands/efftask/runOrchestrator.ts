@@ -6,6 +6,9 @@ import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import { logError } from '../../utils/log.js'
 import type { WorktreePool } from '../../tools/efftask/worktreePool.js'
 import type { HandoffSummary } from '../../tools/efftask/startupConfirm.js'
+import { countStatuses } from '../../tools/efftask/stateMachine.js'
+import { finishEffTaskRun, registerEffTaskRun, updateEffTaskRun } from '../../tasks/EffTaskTask/EffTaskTask.js'
+import type { SetAppState } from '../../Task.js'
 
 export type Outcome = { status: 'completed' | 'blocked'; reason?: string }
 
@@ -39,6 +42,22 @@ export async function runOrchestrator(
     worktrees?: WorktreePool
     /** 升级人工 (spec §8): a conflict the node could not resolve itself. */
     onEscalate?: PipelineCtx['onEscalate']
+    /**
+     * 后台任务登记 (spec §10): make this run visible in `/tasks` and the footer pill, with
+     * live counts, and stoppable from there through the run's OWN controller.
+     *
+     * Lives here rather than in the command's React tree for the reason this whole module
+     * exists: the .tsx is not importable by a test (it renders Ink and touches the real
+     * store), and the last two features wired there were dead in production while every
+     * test passed over the severed wire.
+     */
+    taskEntry?: {
+      runId: string
+      runDir: string
+      setAppState: SetAppState
+      /** The RUN's controller. A private one would mark the task killed and stop nothing. */
+      abortController: AbortController
+    }
   },
   setNodes: (n: TaskNode[]) => void,
   setOutcome: (o: Outcome) => void,
@@ -55,6 +74,32 @@ export async function runOrchestrator(
       .catch(logError)
     return manifestQueue
   }
+  const entry = args.taskEntry
+  // Registered before the first step and ONLY here, so a run abandoned at a confirmation
+  // gate never shows up as something the user can stop.
+  //
+  // GUARDED like every other store touch below it. Unguarded, a failing store setter threw
+  // straight out of runOrchestrator before the run's first step — a cosmetic panel entry
+  // taking down the work it was supposed to describe.
+  let taskId: string | null = null
+  if (entry) {
+    try {
+      taskId = registerEffTaskRun(entry.setAppState, {
+        runId: entry.runId, runDir: entry.runDir,
+        counts: countStatuses(args.seed ?? []),
+        abortController: entry.abortController,
+      })
+    } catch { /* panel only — the run is what matters */ }
+  }
+  // A crashing store must not take the run down with it — same discipline as safeUpdate.
+  const touch = (nodes: TaskNode[]): void => {
+    if (!taskId || !entry) return
+    try { updateEffTaskRun(taskId, entry.setAppState, countStatuses(nodes)) } catch { /* panel only */ }
+  }
+  const settle = (o: Outcome): void => {
+    if (!taskId || !entry) return
+    try { finishEffTaskRun(taskId, entry.setAppState, o) } catch { /* panel only */ }
+  }
   try {
     const persist = (n: TaskNode) => writeNode(args.fs, args.runDir, n)
     const now = () => new Date().toISOString()
@@ -68,6 +113,7 @@ export async function runOrchestrator(
         onEscalate: args.onEscalate,
         onUpdate: nodes => {
           setNodes([...nodes])
+          touch(nodes)
           void queueManifest(nodes)
         },
       },
@@ -92,11 +138,16 @@ export async function runOrchestrator(
     }
     setNodes([...orch.nodes()])
     setOutcome(result)
+    settle(result)
     await queueManifest(orch.nodes(), result) // final manifest records {status, reason}
   } catch (e) {
     // run() is not supposed to reject (the orchestrator catches per-step), but if it ever
     // does, the UI must NOT wedge on 'running' with no way out.
-    setOutcome({ status: 'blocked', reason: e instanceof Error ? e.message : String(e) })
+    const failed: Outcome = { status: 'blocked', reason: e instanceof Error ? e.message : String(e) }
+    setOutcome(failed)
+    // …and the /tasks row must not sit at 运行中 forever for a run that is over. This path
+    // is the one that leaves a task with no other way to reach a terminal status.
+    settle(failed)
   } finally {
     setPhase('done') // the done view is ALWAYS reached
   }
