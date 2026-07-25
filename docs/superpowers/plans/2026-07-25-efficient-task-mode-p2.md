@@ -1,5 +1,25 @@
 # 高效任务模式 — P2 并行执行与 worktree 隔离 实施计划
 
+> ## ⛔ 本文档 v1 已被三方圆桌评审否决,**不可实施**
+>
+> 32 条阻断,多条在一次性 git 仓库中实际复现。保留原文仅为记录设计推理与被否原因;
+> 实施请看 `2026-07-25-efficient-task-mode-p2a.md`(并发调度,可实施)与本文档末尾的
+> **§P2b 修正设计**(worktree 隔离,需单独成文后方可实施)。
+>
+> 致命缺陷摘要(每条均已复现):
+>
+> 1. **互斥锁根本不互斥** —— `const task = runStep(...)` 已启动才被链接,链只串等待。实测并发峰值 3。照此交付即为"五个带写权限的执行者同时改同一个工作树",正是本文开篇声称要防止的事。朴素修法(把启动推进链里)又会饿死并发池:排队中的 execute 占着名额却不干活。
+> 2. **slug 对几乎所有真实节点都非法** —— `validateWorktreeSlug` 每个 `/` 分段只允许 `[a-zA-Z0-9._-]` 且全长 ≤64。`root/01-建表` 抛错;三层英文节点 94 字符抛错。而本文指定的验收用例 `root/01-x` 恰是唯一能过的形状 —— 会在功能彻底失效时亮绿灯。
+> 3. **合并丢工作并报成功** —— 执行者从不提交(提示词没要求),`git merge` 打印 "Already up to date" 退出 0,`release` 以 `--force` 删除 worktree,改动在所有 ref 中消失,节点却 ACCEPTED、run 报 completed。这是默认路径,不是边缘情况。
+> 4. **验收看不见被验收的工作** —— `runRoundtable` 构造请求不带 cwd,只有 execute 阶段传 worktree 路径,验收角色读的是主工作树,只能照 `execStatus` 自述盖章。
+> 5. **拒绝的步骤会挂死进程** —— 被污染的 `executeChain` 导致微任务饥饿(实测 20 万次循环内 30ms 定时器从未触发);另有两处:runStep 若不自捕会留下非终态节点而 run() 已下结论;stall 记账挂在 `.then(onFulfilled)` 上,恰好在步骤失败时被跳过。
+> 6. **额度泄漏** —— `specs.map` 内的裸 `ctx.now()` 是未枚举的第五条退出路径,抛错即泄漏,之后一次本来放得下的拆分会被误判超限而阻断(安全阀朝另一个方向坏掉)。
+> 7. **规格被静默削减** —— 集成分支创建、冲突的一次自动解决、飞书升级卡、收口(finishing-a-development-branch)、非 git 时让用户选择,全部丢失;并引用误读的 §16 当依据。§16 的"不追求全自动"指不保证无冲突,不等于取消那一次自动解决。
+> 8. **用户第四句"可跟用户确认修改"未交付** —— 两个关口都只回传原值,飞书卡片注释直言无编辑器。
+> 9. 硬编码文案是**三处**(含本会话新写的 `ConfirmResume.tsx:33`),原文只列了两处。
+> 10. **16 条既有测试对着有缺陷的实现全绿** —— 原定的"既有测试仍绿"关卡不构成验证。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让任务树真正并行推进(默认 5),并让并行执行在各自的 git worktree 里进行、完成后合并回集成分支——用户原话:"各任务执行可以并行,默认5个"。
