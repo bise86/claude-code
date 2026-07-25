@@ -351,3 +351,29 @@ describe('恢复:两扇必须关严的门', () => {
     expect(back.status).toBe('BLOCKED')
   })
 })
+
+
+describe('恢复:capCategory 也必须校验', () => {
+  const b = (over = {}) => ({
+    ...createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+  const o = { goal: 'g', phaseRoles: emptyPhaseRoles(), now: NOW }
+
+  it('认识的类别原样保留', () => {
+    expect(validateLoadedNodes([b({ capBlocked: true, capCategory: 'rework' })], o).nodes[0].capCategory).toBe('rework')
+  })
+
+  it('不认识的类别被清掉并记一笔 —— reseat 用它决定重进哪个阶段', () => {
+    // node.md is hand-editable and this string picks the PHASE a retried node re-enters. A
+    // garbage value silently took the executable seat, which is the review-bypass the field
+    // exists to prevent. Dropping it falls back to the derived check.
+    const { nodes, repairs } = validateLoadedNodes([b({ capBlocked: true, capCategory: 'lol-whatever' })], o)
+    expect(nodes[0].capCategory).toBeUndefined()
+    expect(repairs.some(r => r.includes('安全阀类别'))).toBe(true)
+  })
+
+  it('非字符串也被清掉', () => {
+    expect(validateLoadedNodes([b({ capBlocked: true, capCategory: true })], o).nodes[0].capCategory).toBeUndefined()
+  })
+})

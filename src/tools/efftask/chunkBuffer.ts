@@ -16,6 +16,18 @@
 /** Lines kept per node. Roughly a screenful; the detail view clips again on render. */
 export const MAX_CHUNK_LINES = 200
 
+/**
+ * Code points kept per LINE.
+ *
+ * MAX_CHUNK_LINES alone bounds nothing: one assistant message with no newline is one line of
+ * unbounded length. Measured — 250 single-line 1 MB messages kept 200 lines = 400 MB of
+ * UTF-16 that the panel never shows (it renders the first 100 code points of each line). The
+ * per-run ceiling is 5000 nodes (caps.maxNodes clamps there, and the cap-nodes card tells
+ * users to raise it), and the buffer is never released because spec §10.2 says
+ * "完成后保留最终输出" — so this is resident for the whole run.
+ */
+export const MAX_CHUNK_LINE_CHARS = 300
+
 export interface ChunkStore {
   /** Append one streamed message for a node. */
   push(nodeId: string, text: string): void
@@ -34,7 +46,21 @@ export function createChunkStore(maxLines = MAX_CHUNK_LINES): ChunkStore {
     push(nodeId, text) {
       // An empty or whitespace-only message is not output. The adapter emits one per
       // assistant message, and a tool-only turn produces exactly that.
-      const incoming = text.split('\n').filter(l => l.trim().length > 0)
+      const incoming = text.split('\n')
+        .filter(l => l.trim().length > 0)
+        // Control bytes come straight from the model to the terminal on this path — unlike
+        // every other field, chunk text is never written to disk, so persistence.stripControl
+        // never sees it. Measured: a chunk containing ESC[31m reached the terminal byte
+        // stream intact. ESC[2J (clear screen) and colour/attribute sequences are not the
+        // kind of thing a task's log should be able to emit.
+        // eslint-disable-next-line no-control-regex -- stripping control bytes is the point
+        .map(l => l.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ''))
+        .filter(l => l.trim().length > 0)
+        // Bounded by CODE POINTS, so one newline-free megabyte cannot sit in memory for the
+        // life of the run. The panel shows fewer than this anyway.
+        .map(l => (Array.from(l).length > MAX_CHUNK_LINE_CHARS
+          ? Array.from(l).slice(0, MAX_CHUNK_LINE_CHARS).join('') + '…'
+          : l))
       if (incoming.length === 0) return
       const cur = buf.get(nodeId) ?? []
       const next = [...cur, ...incoming]

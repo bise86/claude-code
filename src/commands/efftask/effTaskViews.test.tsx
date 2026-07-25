@@ -1,0 +1,93 @@
+/**
+ * The three §10.2 hops that live in `efftask.tsx`.
+ *
+ * That file has no tests — it renders Ink and touches the real store — and it is exactly
+ * where this repo has cut a wire twice (onEscalate, and the roster). A reviewer proved all
+ * three of these mutations stayed green:
+ *
+ *   - `onChunk: (nodeId, text) => chunks.current.push(...)` → undefined
+ *   - `chunks={props.chunks}` removed from RunningView
+ *   - `chunks={props.chunks}` removed from DoneView
+ *
+ * The two views are exported for this reason. The store creation and the onChunk closure are
+ * one line each and still uncovered; what is covered here is that a store handed to either
+ * view actually reaches the detail pane a user opens.
+ */
+import { describe, expect, it } from 'bun:test'
+import * as React from 'react'
+import { EventEmitter } from 'node:events'
+import { render } from '../../ink.js'
+import { RunningView, DoneView } from './efftask.js'
+import { createChunkStore } from '../../tools/efftask/chunkBuffer.js'
+import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
+
+const NOW = new Date().toISOString()
+const tick = (): Promise<void> => new Promise(r => setTimeout(r, 15))
+
+function fakeTty() {
+  let pending: string | null = null
+  const stdin = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    setRawMode() {}, resume() {}, pause() {}, setEncoding() {}, unref() {}, ref() {},
+    read: () => { const v = pending; pending = null; return v },
+    press(seq: string) { pending = seq; stdin.emit('readable') },
+  })
+  let frame = ''
+  const stdout = Object.assign(new EventEmitter(), {
+    isTTY: true, columns: 120, rows: 40,
+    write: (s: string) => { frame += s; return true },
+  })
+  const plain = (): string => frame.replace(/\u001b\[[0-9;>?]*[a-zA-Z]/g, ' ').replace(/\u001b/g, '')
+  return { stdin, stdout, lastFrame: plain }
+}
+
+const node = (over: Partial<TaskNode> = {}): TaskNode => ({
+  ...createNode({ id: 'root', title: '根任务', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+  kind: 'executable',
+  ...over,
+})
+
+async function openDetail(View: unknown, props: Record<string, unknown>) {
+  const t = fakeTty()
+  const app = await render(
+    React.createElement(View as never, props as never),
+    { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+  )
+  await tick()
+  t.stdin.press('\r') // Enter on the cursor row opens that node's detail
+  await tick()
+  const f = t.lastFrame()
+  app.unmount()
+  return f
+}
+
+describe('运行中的面板把输出缓冲交到详情视图手里', () => {
+  it('RunningView → 详情里看得到子 agent 的输出', async () => {
+    const chunks = createChunkStore()
+    chunks.push('root', '正在改 src/login.ts')
+    const f = await openDetail(RunningView, {
+      nodes: [node({ status: 'EXECUTING' })], runId: '003', chunks, onAbort: () => {},
+    })
+    expect(f).toContain('子 agent 输出')
+    expect(f).toContain('正在改 src/login.ts')
+  })
+
+  it('DoneView → 跑完之后输出仍然留着(spec §10.2 "完成后保留最终输出")', async () => {
+    const chunks = createChunkStore()
+    chunks.push('root', '最终产出:12 个测试通过')
+    const f = await openDetail(DoneView, {
+      nodes: [node({ status: 'ACCEPTED' })], runId: '003', chunks,
+      outcome: { status: 'completed' }, handoff: null, onExit: () => {},
+    })
+    expect(f).toContain('最终产出:12 个测试通过')
+  })
+
+  it('没有缓冲时两个视图都照常渲染,不炸', async () => {
+    // `chunks` is optional on both; a run that never streamed anything must still open.
+    const f = await openDetail(RunningView, {
+      nodes: [node({ status: 'EXECUTING' })], runId: '003', onAbort: () => {},
+    })
+    expect(f).toContain('根任务')
+    expect(f).not.toContain('子 agent 输出')
+  })
+})

@@ -80,6 +80,13 @@ export function NodeDetail(props: {
   const budget = Math.max(6, props.maxLines ?? 24)
   const perSection = Math.max(2, Math.floor(budget / 6))
   const ui = uiStatus(n.status)
+  // The live log gets its OWN budget, not a per-section slice: spec §10.2 wants it to read
+  // like a sub-agent terminal, and at perSection*2 the pane rendered a fixed 8 lines, leaving
+  // 96% of a 200-line buffer permanently unreachable.
+  const outputRows = Math.max(6, Math.floor(budget / 2))
+  const allOutput = props.output ?? []
+  const visibleOutput = allOutput.slice(-outputRows)
+  const hiddenOutput = (props.outputDropped ?? 0) + (allOutput.length - visibleOutput.length)
   const rounds = (log: TaskNode['reviewLog']) =>
     log.map(r => `第 ${r.round} 轮 ${r.synthesized.pass ? '通过' : '未通过'}${r.synthesized.blockingSummary ? ': ' + r.synthesized.blockingSummary : ''}`).join('\n')
   return (
@@ -109,10 +116,14 @@ export function NodeDetail(props: {
           <Text bold color={ui === 'running' ? 'warning' : undefined}>
             子 agent 输出{ui === 'running' ? '(进行中)' : ''}
           </Text>
-          {(props.outputDropped ?? 0) > 0 ? (
-            <Text dimColor>  … 更早的 {props.outputDropped} 行已滚出缓冲</Text>
+          {/* BOTH numbers. The buffer drops the oldest lines and the pane then renders only
+              its last few — reporting just the first left a user told "300 hidden" while 492
+              were. That is the same "starts in the middle but looks complete" lie block()
+              above had to fix. */}
+          {hiddenOutput > 0 ? (
+            <Text dimColor>  … 更早的 {hiddenOutput} 行未显示{(props.outputDropped ?? 0) > 0 ? `(其中 ${props.outputDropped} 行已滚出缓冲,无法找回)` : ''}</Text>
           ) : null}
-          {props.output.slice(-Math.max(3, perSection * 2)).map((l, i) => (
+          {visibleOutput.map((l, i) => (
             <Text key={`out-${i}`} dimColor>  {Array.from(l).slice(0, 100).join('')}</Text>
           ))}
         </Box>

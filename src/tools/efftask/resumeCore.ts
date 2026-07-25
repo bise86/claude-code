@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
+import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
 
@@ -140,6 +140,14 @@ export function validateLoadedNodes(
     // a truthy non-boolean (`capBlocked: "yes"`) would let the retry path reopen a node no
     // valve ever stopped. Only a real `true` counts; everything else means "not a valve".
     if (n.capBlocked !== undefined && n.capBlocked !== true) n.capBlocked = false
+    // Same discipline as capBlocked one line up, and it was missing: node.md is hand-editable,
+    // and reseat chooses which PHASE a retried node re-enters from this string. A garbage or
+    // non-string value silently took the executable seat — the review-bypass this field exists
+    // to prevent. Unknown values are dropped, which falls back to the derived check.
+    if (n.capCategory !== undefined && !BLOCK_CATEGORIES.has(n.capCategory as string)) {
+      repairs.push(`节点 ${n.id}:安全阀类别 ${String(n.capCategory)} 无法识别,已清除`)
+      n.capCategory = undefined
+    }
     // 根方案关口 (spec §2 第三关) 的确认结果。Reachable on disk when the run was aborted
     // before the root's first commit consumed it, so it must survive — but it is also the one
     // field that SKIPS the plan phase, and a malformed one would send an empty plan straight

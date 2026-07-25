@@ -11,7 +11,7 @@ import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
-import { annotateRoleModels, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
+import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { allocateRunId, loadRun, type FsLike } from '../../tools/efftask/persistence.js'
 import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResumeArgs.js'
 import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resumeCore.js'
@@ -32,6 +32,8 @@ import {
   type ResumeSummary,
   handoffLines,
   exitReportLine,
+  applyStartupDecision,
+  dispatchableRoles,
   type HandoffSummary,
 } from '../../tools/efftask/startupConfirm.js'
 import { buildStartupCard, sendFeishuStartupCard } from '../../tools/efftask/feishuStartupCard.js'
@@ -793,11 +795,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // KNOWN GAP, now covering both fields: this snapshots config at gate-open, so terminal
         // edits that were not yet committed are discarded if the FEISHU surface wins the race.
         // There is no channel from the gate's React state to the Feishu surface.
-        const effectiveConfig: EffTaskConfig = {
-          ...config,
-          parallelism: decision.parallelism,
-          phaseRoles: decision.phaseRoles ?? config.phaseRoles,
-        }
+        const effectiveConfig: EffTaskConfig = applyStartupDecision(config, decision)
         setApproved(effectiveConfig)
         // RESUME skips the third gate. Its tree already exists on disk — drafting a fresh
         // root plan would ask the user to confirm a decomposition the run is not going to
@@ -855,7 +853,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         isolation={isolation}
         // spec §2 第一关 "名册可编辑". Only roles this session can actually dispatch — the
         // roster must not offer a seat the run would then silently downgrade to the main model.
-        availableRoles={props.knownRoles.filter(r => !props.unsupportedRoles.includes(r))}
+        availableRoles={dispatchableRoles(props.knownRoles, props.unsupportedRoles)}
+        // …and an edited seat must render with its model, like every other seat. annotateRoleModels
+        // runs BEFORE this gate, so a role added here would otherwise show as a bare name.
+        roleModel={name => effectiveModel(props.agentModels.find(a => a.agentType === name), props.mainModel)}
         onDecision={d => terminalClaim.current?.('terminal', d)}
       />
     )
@@ -922,7 +923,10 @@ function ParsingView(props: { onCancel: () => void }): React.ReactElement {
 // 'running' phase: live tree + an interrupt affordance. Esc/q aborts the controller the
 // command owns; the orchestrator then returns {status:'blocked', reason:'已中断'} and the
 // finally-block flips us to 'done'.
-function RunningView(props: { nodes: TaskNode[]; runId: string; chunks?: ChunkStore; onAbort: () => void }): React.ReactElement {
+// EXPORTED for testing. The three §10.2 hops that live in this file — creating the store,
+// pushing into it, and handing it to each panel — are exactly the shape of wire this repo has
+// cut twice, and nothing else here is importable by a test.
+export function RunningView(props: { nodes: TaskNode[]; runId: string; chunks?: ChunkStore; onAbort: () => void }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
   // different things at once (abort the run vs leave the detail view). The panel owns the
@@ -931,7 +935,7 @@ function RunningView(props: { nodes: TaskNode[]; runId: string; chunks?: ChunkSt
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
-function DoneView(props: {
+export function DoneView(props: {
   nodes: TaskNode[]
   runId: string
   chunks?: ChunkStore

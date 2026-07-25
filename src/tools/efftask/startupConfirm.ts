@@ -40,8 +40,19 @@ export function clip(s: string, max = 80): string {
  * means 主模型 (and, for observer, "no scoring at all"), which rosterLines already renders
  * correctly. Refusing to empty a phase would make the editor unable to undo its own additions.
  */
+/**
+ * Phases that run a ROUNDTABLE — every bound role is dispatched, in parallel, and all must
+ * pass. Everything else runs `firstRole`, i.e. index 0 and nothing else.
+ *
+ * parseDirectives already trims the single-seat phases to one and pushes a notice, with the
+ * reason in its own comment: "listing extra seats there would put names on the confirmation
+ * roster that never get called — the gate must show who actually runs". The editor has to
+ * honour the same invariant or it re-opens exactly that hole by hand.
+ */
+export const MULTI_ROLE_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['review', 'accept'])
+
 export function toggleRole(
-  roster: Record<PhaseName, RoleBinding[]>, phase: PhaseName, roleName: string,
+  roster: Record<PhaseName, RoleBinding[]>, phase: PhaseName, roleName: string, model?: string,
 ): Record<PhaseName, RoleBinding[]> {
   const cur = roster[phase] ?? []
   const has = cur.some(r => r.roleName === roleName)
@@ -50,29 +61,90 @@ export function toggleRole(
   const next = Object.fromEntries(
     PHASE_NAMES.map(p => [p, [...(roster[p] ?? [])]]),
   ) as Record<PhaseName, RoleBinding[]>
-  next[phase] = has ? cur.filter(r => r.roleName !== roleName) : [...cur, { roleName }]
+  const binding: RoleBinding = model ? { roleName, model } : { roleName }
+  next[phase] = has
+    ? cur.filter(r => r.roleName !== roleName)
+    // SINGLE-SEAT phases replace rather than append: the run would dispatch only the first
+    // one, so a second name on the roster is a seat that never gets called.
+    : MULTI_ROLE_PHASES.has(phase) ? [...cur, binding] : [binding]
   return next
 }
 
-/** One line per phase for the EDITOR: every candidate role, with the bound ones marked. */
+/** How many candidate roles one editor row shows before it starts windowing. */
+export const ROSTER_WINDOW = 6
+
+/**
+ * One line per phase for the EDITOR: the candidate roles, with the bound ones marked.
+ *
+ * WINDOWED around the cursor. `available` is every dispatchable agent — built-ins, plugin
+ * agents and `.claude/agents/*.md`, not just settings `roles` — so a dozen candidates is
+ * ordinary. Measured unwindowed at 40: one row was 1281 characters and the box grew to 32
+ * lines on a 100-column terminal, pushing the goal and the caps line off screen. rosterLines
+ * has clipped for exactly this reason since P1; this path had nothing.
+ */
 export function rosterEditorLines(
   roster: Record<PhaseName, RoleBinding[]>, available: string[], phaseIdx: number, roleIdx: number,
+  window = ROSTER_WINDOW,
 ): string[] {
   return PHASE_NAMES.map((p, i) => {
     const bound = new Set((roster[p] ?? []).map(r => r.roleName))
-    const cells = available.length === 0
-      // Say WHY rather than render an empty row: with no roles in settings there is nothing
-      // to edit, and a blank line reads as a broken editor.
-      ? ['(settings 里没有配置任何角色,本阶段用主模型)']
-      : available.map((name, j) => {
-        const mark = bound.has(name) ? '[x]' : '[ ]'
-        const cursor = i === phaseIdx && j === roleIdx ? '>' : ' '
-        return `${cursor}${mark}${name}`
-      })
     const label = PHASE_LABEL[p]
     const empty = bound.size === 0 ? (p === 'observer' ? ' (不评分)' : ' (主模型)') : ''
-    return `${i === phaseIdx ? '▶' : ' '} ${label}${empty}: ${cells.join(' ')}`
+    const seats = MULTI_ROLE_PHASES.has(p) ? '' : '(单选)'
+    if (available.length === 0) {
+      // Say WHY rather than render an empty row: with no roles available there is nothing to
+      // edit, and a blank line reads as a broken editor.
+      return `${i === phaseIdx ? '▶' : ' '} ${label}${empty}: (没有可用角色,本阶段用主模型)`
+    }
+    // Keep the cursor inside the window, and keep bound roles visible on rows the cursor is
+    // not on — otherwise a user cannot see what they already selected.
+    const start = i === phaseIdx
+      ? Math.max(0, Math.min(roleIdx - Math.floor(window / 2), available.length - window))
+      : 0
+    const from = Math.max(0, start)
+    const shown = available.slice(from, from + window)
+    const cells = shown.map((name, j) => {
+      const k = from + j
+      const mark = bound.has(name) ? '[x]' : '[ ]'
+      const cursor = i === phaseIdx && k === roleIdx ? '>' : ' '
+      return `${cursor}${mark}${clip(name, 20)}`
+    })
+    const hiddenBefore = from
+    const hiddenAfter = available.length - (from + shown.length)
+    // Count what is off-screen. A window that silently shows a slice looks like the whole list.
+    const more = [hiddenBefore > 0 ? `←${hiddenBefore}` : '', hiddenAfter > 0 ? `→${hiddenAfter}` : ''].filter(Boolean).join(' ')
+    return `${i === phaseIdx ? '▶' : ' '} ${label}${seats}${empty}: ${cells.join(' ')}${more ? ' ' + more : ''}`
   })
+}
+
+/**
+ * Apply a confirmed gate decision to the run's config.
+ *
+ * A named, testable function because `efftask.tsx` has no tests: replacing this expression
+ * with `phaseRoles: config.phaseRoles` — i.e. making the whole editable-roster feature dead
+ * in production — left the entire suite green.
+ */
+export function applyStartupDecision(config: EffTaskConfig, decision: StartupDecision): EffTaskConfig {
+  return {
+    ...config,
+    parallelism: decision.parallelism,
+    // Absent means UNCHANGED, which is what a Feishu approval sends: that card has no channel
+    // for a five-phase role table, so it must keep exactly the roster it displayed.
+    phaseRoles: decision.phaseRoles ?? config.phaseRoles,
+  }
+}
+
+/**
+ * Role names this session can actually dispatch.
+ *
+ * The same filter parseDirectives applies (`known && !unsupported`), named once so the gate
+ * cannot drift from it. An execMode:'cli' role is dispatched by AgentTool, not by this run's
+ * runAgent seam — offering it would put a seat on the roster that silently becomes the main
+ * model.
+ */
+export function dispatchableRoles(known: string[], unsupported: string[]): string[] {
+  const bad = new Set(unsupported)
+  return known.filter(r => !bad.has(r))
 }
 
 export function rosterLines(config: EffTaskConfig): string[] {

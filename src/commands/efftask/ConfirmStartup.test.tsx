@@ -159,7 +159,7 @@ describe('启动关口的角色名册真的能改 (spec §2 第一关)', () => {
   it('没有可用角色时说明原因,而不是画一张空表', async () => {
     const m = await mount2({ availableRoles: [] })
     await press(m, 'r')
-    expect(m.lastFrame()).toContain('没有配置任何角色')
+    expect(m.lastFrame()).toContain('没有可用角色')
     // …and it must still be answerable.
     await press(m, '\r')
     expect(m.decisions[0].approved).toBe(true)
@@ -170,6 +170,80 @@ describe('启动关口的角色名册真的能改 (spec §2 第一关)', () => {
     const m = await mount2()
     await press(m, RIGHT2)
     await press(m, '\r')
+    expect(m.decisions[0].parallelism).toBe(4)
+    m.app.unmount()
+  })
+})
+
+describe('一次 chunk 里到达多个键(按住方向键、ssh/tmux 合并输入)', () => {
+  const cfg3 = () => ({
+    goalPrompt: 'g', parallelism: 3, notices: [], mainModel: 'claude-opus-5',
+    caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 600000 },
+    phaseRoles: { plan: [], review: [], execute: [], accept: [], observer: [] },
+  })
+  const mount3 = async () => {
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const decisions: { parallelism: number; approved: boolean; phaseRoles?: Record<string, { roleName: string }[]> }[] = []
+    const app = await render(
+      React.createElement(ConfirmStartup as never, {
+        config: cfg3(), availableRoles: ['architect', 'security', 'qa'],
+        onDecision: (d: never) => decisions.push(d),
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    return { stdin, lastFrame, decisions, app }
+  }
+  const ESC3 = String.fromCharCode(27)
+
+  it('↓ 和 空格 一起到达时,角色绑到光标所在的阶段', async () => {
+    // The renderer splits one stdin chunk into several InputEvents and dispatches them
+    // SYNCHRONOUSLY, while useInput only swaps its handler in a post-commit layout effect —
+    // so the second key ran the previous render's closure. Measured: the role landed on 方案
+    // while ▶ was rendered on 评审, and the read-only roster then showed the wrong panel,
+    // which the user confirmed.
+    const m = await mount3()
+    m.stdin.press('r')
+    await new Promise(r => setTimeout(r, 20))
+    m.stdin.press(ESC3 + '[B ')       // ↓ and space in ONE chunk
+    await new Promise(r => setTimeout(r, 30))
+    m.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    expect(m.decisions[0].phaseRoles?.review.map(r => r.roleName)).toEqual(['architect'])
+    expect(m.decisions[0].phaseRoles?.plan).toEqual([])
+    m.app.unmount()
+  })
+
+  it('↓↓ 和 空格 一起到达时也一样', async () => {
+    const m = await mount3()
+    m.stdin.press('r')
+    await new Promise(r => setTimeout(r, 20))
+    m.stdin.press(ESC3 + '[B' + ESC3 + '[B ')
+    await new Promise(r => setTimeout(r, 30))
+    m.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    expect(m.decisions[0].phaseRoles?.execute.map(r => r.roleName)).toEqual(['architect'])
+    m.app.unmount()
+  })
+
+  it('→ 和 空格 一起到达时,绑的是光标所在的角色', async () => {
+    const m = await mount3()
+    m.stdin.press('r')
+    await new Promise(r => setTimeout(r, 20))
+    m.stdin.press(ESC3 + '[C ')
+    await new Promise(r => setTimeout(r, 30))
+    m.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    expect(m.decisions[0].phaseRoles?.plan.map(r => r.roleName)).toEqual(['security'])
+    m.app.unmount()
+  })
+
+  it('→ 和 回车 一起到达时,确认的是屏幕上那个并行数', async () => {
+    // Same class, and it predates the roster editor: onDecision read `parallelism` from the
+    // closure, so the screen said 4 and the decision carried 3.
+    const m = await mount3()
+    m.stdin.press(ESC3 + '[C\r')
+    await new Promise(r => setTimeout(r, 30))
     expect(m.decisions[0].parallelism).toBe(4)
     m.app.unmount()
   })

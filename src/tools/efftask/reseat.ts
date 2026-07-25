@@ -138,7 +138,16 @@ export function reseatTransientNodes(
     // reads run.md — so a derived check evaluated false exactly for the user who followed the
     // advice, and handed a thrice-rejected plan to a write-capable executor.
     const reviewExhausted =
-      retryValve && n.childIds.length === 0 && n.capCategory === 'cap-iteration'
+      retryValve && n.childIds.length === 0 && (
+        n.capCategory === 'cap-iteration' ||
+        // FALLBACK for a node.md written before capCategory existed: that build already wrote
+        // capBlocked, so those nodes are retryable but carry no category — and without this
+        // they took the READY seat and handed a thrice-rejected plan to a write-capable
+        // executor. Measured end to end: phases ["execute","accept"], 0 plan calls, 0 reviews,
+        // ACCEPTED. The trigger is exactly what the escalation card tells users to do:
+        // upgrade, then `/et --resume NNN --retry-blocked`.
+        (n.capCategory === undefined && n.iteration.planReview >= caps.maxIterations)
+      )
     const target: NodeStatus =
       n.childIds.length > 0 ? 'WAITING_CHILDREN'
       : reviewExhausted ? 'CREATED'

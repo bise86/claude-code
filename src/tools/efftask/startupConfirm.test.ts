@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, exitReportLine, toggleRole, rosterEditorLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -322,6 +322,75 @@ describe('名册可编辑 (spec §2 第一关)', () => {
     expect(lines[0]).not.toContain('▶')
   })
 
+  it('单座位阶段是单选 —— 运行只派第 0 个,名册上第二个名字就是空头', () => {
+    // parseDirectives already trims plan/execute/observer to one and pushes a notice, because
+    // firstRole() dispatches index 0 and nothing else. An editor that appends re-opens that
+    // hole by hand: measured 观察: w1、w2 on the roster with only w1 ever dispatched, and no
+    // notice anywhere.
+    let r = toggleRole(empty() as never, 'observer', 'w1')
+    r = toggleRole(r, 'observer', 'w2')
+    expect(r.observer.map(x => x.roleName)).toEqual(['w2'])
+    let p = toggleRole(empty() as never, 'plan', 'a1')
+    p = toggleRole(p, 'plan', 'a2')
+    expect(p.plan.map(x => x.roleName)).toEqual(['a2'])
+    let e = toggleRole(empty() as never, 'execute', 'c1')
+    e = toggleRole(e, 'execute', 'c2')
+    expect(e.execute.map(x => x.roleName)).toEqual(['c2'])
+  })
+
+  it('圆桌阶段仍然可以多选 —— 那才是"多角色"的意思', () => {
+    let r = toggleRole(empty() as never, 'review', 'a')
+    r = toggleRole(r, 'review', 'b')
+    r = toggleRole(r, 'accept', 'c')
+    r = toggleRole(r, 'accept', 'd')
+    expect(r.review.map(x => x.roleName)).toEqual(['a', 'b'])
+    expect(r.accept.map(x => x.roleName)).toEqual(['c', 'd'])
+  })
+
+  it('单座位阶段的行上写明它是单选', () => {
+    const lines = rosterEditorLines(empty() as never, ['a'], 0, 0)
+    expect(lines[0]).toContain('(单选)')  // 方案
+    expect(lines[1]).not.toContain('(单选)') // 评审
+  })
+
+  it('toggleRole 记住模型,否则只读名册会掉回裸名字', () => {
+    const r = toggleRole(empty() as never, 'review', 'security', 'claude-opus-5')
+    expect(r.review[0]).toEqual({ roleName: 'security', model: 'claude-opus-5' })
+  })
+
+  it('候选很多时按窗口显示,并说明有多少在窗口外', () => {
+    // available is every dispatchable agent, not just settings roles — a dozen is ordinary.
+    // Measured unwindowed at 40: one row was 1281 chars and the box grew to 32 lines,
+    // pushing the goal and the caps line off screen.
+    const many = [...Array(40)].map((_, i) => `role${i}`)
+    const lines = rosterEditorLines(empty() as never, many, 0, 20)
+    expect(lines[0].length).toBeLessThan(200)
+    expect(lines[0]).toContain('>[ ]role20') // the cursor stays inside the window
+    expect(lines[0]).toMatch(/←\d+/)          // and the count off-screen is stated
+    expect(lines[0]).toMatch(/→\d+/)
+  })
+
+  it('applyStartupDecision:缺省的名册表示"没改"', () => {
+    const cfg = {
+      goalPrompt: 'g', parallelism: 3, notices: [], caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 1 },
+      phaseRoles: { plan: [{ roleName: 'a' }], review: [], execute: [], accept: [], observer: [] },
+    } as never
+    // A Feishu approval carries no roster; it must keep exactly the one its card displayed.
+    expect(applyStartupDecision(cfg, { parallelism: 7, approved: true }).phaseRoles.plan).toEqual([{ roleName: 'a' }])
+    expect(applyStartupDecision(cfg, { parallelism: 7, approved: true }).parallelism).toBe(7)
+    // A terminal approval carries the edited one.
+    const edited = { plan: [{ roleName: 'z' }], review: [], execute: [], accept: [], observer: [] }
+    expect(applyStartupDecision(cfg, { parallelism: 2, approved: true, phaseRoles: edited as never }).phaseRoles.plan)
+      .toEqual([{ roleName: 'z' }])
+  })
+
+  it('dispatchableRoles 滤掉这次会话派不出去的角色', () => {
+    // An execMode:'cli' role is dispatched by AgentTool, not by this run's runAgent seam.
+    // Offering it would put a seat on the roster that silently becomes the main model.
+    expect(dispatchableRoles(['architect', 'legacy-cli', 'qa'], ['legacy-cli'])).toEqual(['architect', 'qa'])
+    expect(dispatchableRoles([], ['x'])).toEqual([])
+  })
+
   it('names what an empty phase actually means, per phase', () => {
     // 观察 is opt-in and does NOT fall back to the main model; saying 主模型 there would
     // promise a scorer that never runs — the same distinction rosterLines already makes.
@@ -332,6 +401,6 @@ describe('名册可编辑 (spec §2 第一关)', () => {
 
   it('says why the table is empty when settings has no roles at all', () => {
     // A blank row reads as a broken editor.
-    expect(rosterEditorLines(empty() as never, [], 0, 0)[0]).toContain('没有配置任何角色')
+    expect(rosterEditorLines(empty() as never, [], 0, 0)[0]).toContain('没有可用角色')
   })
 })

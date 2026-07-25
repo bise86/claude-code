@@ -416,3 +416,57 @@ describe('阻断原因的字符串耦合', () => {
     expect(parent.blockedReason).toBe('')
   })
 })
+
+
+describe('capCategory:落盘、校验、和旧版本 node.md 的兼容', () => {
+  it('端到端:pipeline 写下的类别,reseat 真的读得到', async () => {
+    // Mutation-proved gap: deleting `node.capCategory = category` from blockWithReason left
+    // the whole suite green — every reseat fixture set the field by hand, so nothing walked
+    // the real path from a valve trip to the retry seat.
+    const { stepStart } = await import('./pipeline.js')
+    const { byIdMap } = await import('./stateMachine.js')
+    const n = mk({ id: 'root', kind: 'unknown', status: 'CREATED' })
+    await stepStart(n, {
+      config: { goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: DEFAULT_CAPS, notices: [] },
+      byId: byIdMap([n]), persist: async () => {}, now: () => NOW,
+      signal: new AbortController().signal, onUpdate: () => {},
+      reserveNodes: () => ({ release: () => {} }),
+      runAgent: async req =>
+        req.phase === 'plan'
+          ? '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+          : '\u0060\u0060\u0060' + (req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":false,"blocking":["不行"],"comments":""}\n\u0060\u0060\u0060',
+    })
+    // The valve tripped on REVIEW, and stepStart had already written kind='executable'.
+    expect(n.status).toBe('BLOCKED')
+    expect(n.kind).toBe('executable')
+    expect(n.capCategory).toBe('cap-iteration')
+    // …so the retry must send it back to re-plan, not to the executor.
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.status).toBe('CREATED')
+  })
+
+  it('旧版本写的 node.md 没有 capCategory,也不能绕过评审', () => {
+    // The previous build already wrote capBlocked but not capCategory. Keying the guard on the
+    // category alone made every such node take the READY seat — measured end to end: phases
+    // ["execute","accept"], 0 plan calls, 0 reviews, ACCEPTED. The trigger is exactly what the
+    // escalation card tells users to do: upgrade, then --retry-blocked.
+    const n = mk({
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true, // NO capCategory
+      blockedReason: '评审迭代超限(3)',
+      iteration: { planReview: 3, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.status).toBe('CREATED')
+    expect(n.iteration.planReview).toBe(0)
+  })
+
+  it('旧 node.md 里预算没到顶的,仍然回 READY', () => {
+    const n = mk({
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true,
+      blockedReason: '验收迭代超限(3)',
+      iteration: { planReview: 1, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.status).toBe('READY')
+  })
+})

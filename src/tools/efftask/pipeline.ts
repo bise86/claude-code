@@ -483,6 +483,10 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // ended '存在无法推进的阻断节点' with an empty blockedReason. Only an EXECUTABLE node
       // legitimately has no children.
       (node.kind !== 'executable' && confirmed.children.length === 0) ||
+      // …and the mirror image: an EXECUTABLE node with children in its draft. stepStart's
+      // executable branch commits READY and returns, so the approved children are consumed
+      // and dropped — measured phases ["review"], childIds [], one node in the tree.
+      (node.kind === 'executable' && confirmed.children.length > 0) ||
       node.childIds.length > 0
     )) {
       confirmed = undefined

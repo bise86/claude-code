@@ -12,13 +12,17 @@
 //    nodes, so an instruction to "just resume" would send the user to a run that reproduces
 //    the identical block having made zero model calls. `--retry-blocked` is the flag that
 //    makes the instruction true, and it exists because this card needed to be honest.
-import type { TaskNode } from './types.js'
+import type { BlockCategory, TaskNode } from './types.js'
+export type { BlockCategory }
 
 /**
  * Why the node stopped. Structural, because the card's whole content is chosen from it and
  * because `--retry-blocked` must never resurrect a node blocked by disk damage.
+ *
+ * The union itself lives in types.ts so TaskNode can name it without an import cycle; the
+ * per-member documentation stays here, next to the cards that render each one.
  */
-export type BlockCategory =
+type BlockCategoryDoc =
   /** 方案评审 / 拆分 迭代超限 (caps.maxIterations). */
   | 'cap-iteration'
   /** 整棵树的节点数超过 caps.maxNodes,拆分被拒。 */

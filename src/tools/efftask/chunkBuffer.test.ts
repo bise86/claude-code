@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { createChunkStore, MAX_CHUNK_LINES } from './chunkBuffer.js'
+import { createChunkStore, MAX_CHUNK_LINES, MAX_CHUNK_LINE_CHARS } from './chunkBuffer.js'
 
 describe('子 agent 输出缓冲 (spec §10.2)', () => {
   it('keeps output per node, oldest first', () => {
@@ -55,5 +55,43 @@ describe('子 agent 输出缓冲 (spec §10.2)', () => {
   it('the default cap is a screenful, not a transcript', () => {
     expect(MAX_CHUNK_LINES).toBeGreaterThan(50)
     expect(MAX_CHUNK_LINES).toBeLessThanOrEqual(500)
+  })
+})
+
+
+describe('缓冲要挡住的不只是行数', () => {
+  it('单行按码点截断 —— 否则一条没有换行的百万字消息会常驻整场运行', () => {
+    // Measured: 250 single-line 1 MB messages kept 200 lines = 400 MB of UTF-16 the panel
+    // never shows (it renders the first 100 code points). maxNodes clamps at 5000 and the
+    // cap-nodes card tells users to raise it, and §10.2 says the buffer is never released.
+    const s = createChunkStore()
+    s.push('n', 'x'.repeat(1_000_000))
+    const line = s.lines('n')[0]
+    expect(Array.from(line).length).toBeLessThanOrEqual(MAX_CHUNK_LINE_CHARS + 1)
+    expect(line.endsWith('…')).toBe(true)
+  })
+
+  it('不截断刚好合规的行', () => {
+    const s = createChunkStore()
+    s.push('n', 'a'.repeat(MAX_CHUNK_LINE_CHARS))
+    expect(s.lines('n')[0]).not.toContain('…')
+  })
+
+  it('剥掉控制字节 —— 这条路径的文本从模型直达终端,从不落盘', () => {
+    // Every other field is sanitised by persistence.stripControl on the way to disk. Chunk
+    // text never goes to disk, so nothing sanitised it: measured, a chunk containing an ANSI
+    // colour sequence reached the terminal byte stream intact.
+    const s = createChunkStore()
+    const esc = String.fromCharCode(27)
+    s.push('n', esc + '[2J' + esc + '[31m我把屏幕清了')
+    const line = s.lines('n')[0]
+    expect(line).not.toContain(esc)
+    expect(line).toContain('我把屏幕清了')
+  })
+
+  it('一条只有控制字节的消息不会留下一行空白', () => {
+    const s = createChunkStore()
+    s.push('n', String.fromCharCode(27) + String.fromCharCode(7))
+    expect(s.lines('n')).toEqual([])
   })
 })

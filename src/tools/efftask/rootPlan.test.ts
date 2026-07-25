@@ -381,3 +381,29 @@ describe('第三关的飞书通知卡', () => {
     expect(text).not.toContain('不拆分,根任务直接执行')
   })
 })
+
+
+describe('确认草稿的另一半对称情况', () => {
+  it('kind 是 executable 却带着子任务的草稿,也要回落到 plan 调用', async () => {
+    // The mirror image of the empty-decompose case. stepStart's executable branch commits
+    // READY and returns before lastChildren is used, so the approved children were consumed
+    // and dropped: measured phases ["review"], childIds [], one node in the whole tree — the
+    // user approved a two-task first level and got none of it.
+    const root = makeRootNode(cfg(), NOW)
+    root.kind = 'executable'
+    root.confirmedDraft = { children: [{ title: '甲', deps: [] }, { title: '乙', deps: [] }] }
+    const calls = []
+    const ctx = ctxFor([root], async req => {
+      calls.push(req.phase)
+      return req.phase === 'plan'
+        ? PLAN_REPLY
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n' + "```"
+    })
+    await stepStart(root, ctx)
+    expect(calls[0]).toBe('plan')            // not silently skipped
+    expect(root.confirmedDraft).toBeUndefined()
+    // …and the re-plan really does build a tree.
+    expect(root.status).toBe('WAITING_CHILDREN')
+    expect(root.childIds.length).toBeGreaterThan(0)
+  })
+})

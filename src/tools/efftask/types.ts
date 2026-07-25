@@ -3,6 +3,15 @@ export const PHASE_NAMES: PhaseName[] = ['plan', 'review', 'execute', 'accept', 
 
 export type NodeKind = 'decompose' | 'executable' | 'unknown'
 
+/**
+ * Why a safety valve stopped a node. Declared HERE rather than imported from escalation.ts so
+ * TaskNode can name it without a cycle (escalation.ts imports TaskNode).
+ */
+export type BlockCategory =
+  | 'cap-iteration' | 'cap-nodes' | 'rework' | 'timeout' | 'infra' | 'cap-depth'
+export const BLOCK_CATEGORIES: ReadonlySet<string> =
+  new Set(['cap-iteration', 'cap-nodes', 'rework', 'timeout', 'infra', 'cap-depth'])
+
 export type NodeStatus =
   | 'CREATED' | 'PLANNING' | 'PLAN_REVIEW'
   | 'READY' | 'EXECUTING' | 'EXECUTED' | 'ACCEPTANCE' | 'REWORK'
@@ -93,7 +102,7 @@ export interface TaskNode {
    *
    * Persisted with the rest of the node (serializeNode spreads the whole object).
    */
-  capCategory?: string
+  capCategory?: BlockCategory
   /**
    * 启动关口第三关(spec §2)确认过的首层拆分。
    *

@@ -471,3 +471,52 @@ describe('节点详情里的子 agent 实时输出 (spec §10.2)', () => {
     app.unmount()
   })
 })
+
+describe('实时输出面板不能只交代一半的截断', () => {
+  const mountDetail = async (props: Record<string, unknown>) => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: mk({ id: 'n', status: 'EXECUTING', kind: 'executable' }), elapsed: '1m', ...props,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    return f
+  }
+
+  it('隐藏的行数把"滚出缓冲"和"没渲染"两部分都算进去', async () => {
+    // Measured before: the buffer dropped 300 and the pane then rendered only its last 8, so a
+    // user was told 300 were hidden while 492 were. Same "starts in the middle but looks
+    // complete" lie block() had to fix in this very file.
+    const f = await mountDetail({
+      output: [...Array(200)].map((_, i) => `行${i}`), outputDropped: 300, maxLines: 24,
+    })
+    const m = f.match(/更早的 (\d+) 行未显示/)
+    expect(m).not.toBeNull()
+    const hidden = Number(m![1])
+    expect(hidden).toBeGreaterThan(300)     // strictly more than the buffer alone dropped
+    expect(f).toContain('其中 300 行已滚出缓冲')
+    // …and the newest line is on screen.
+    expect(f).toContain('行199')
+  })
+
+  it('缓冲没丢过东西时,不提"滚出缓冲"', async () => {
+    const f = await mountDetail({ output: ['一', '二'], outputDropped: 0 })
+    expect(f).not.toContain('滚出缓冲')
+    expect(f).not.toContain('未显示')
+  })
+
+  it('输出区有自己的预算,不是各段落里最小的那一份', async () => {
+    // At perSection*2 the pane rendered a fixed 8 lines, leaving 96% of a 200-line buffer
+    // permanently unreachable — a long way from §10.2's "与单个子 agent 终端观感一致".
+    // Zero-padded: 'L1' is a SUBSTRING of 'L10'..'L19', so an unpadded fixture counted lines
+    // that were never rendered and the assertion held no matter what the budget was.
+    const names = [...Array(60)].map((_, i) => `L${String(i).padStart(3, '0')}`)
+    const f = await mountDetail({ output: names, maxLines: 24 })
+    const shown = names.filter(l => f.includes(l))
+    expect(shown.length).toBeGreaterThan(8)
+  })
+})
