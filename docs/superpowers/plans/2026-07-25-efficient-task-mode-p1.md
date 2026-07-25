@@ -530,10 +530,16 @@ function pickAnswer(
 ): { obj: Record<string, unknown> | null; ambiguous: boolean } {
   const candidates = collectCandidates(text, tag).filter(c => matches(c.obj))
   const tagged = candidates.filter(c => c.tagged)
-  if (tagged.length > 0) return { obj: tagged[0].obj, ambiguous: false }
+  // Duplicates are ambiguous in BOTH groups. The tag says "this is my answer", so
+  // two of them is still two answers — a model that re-tags a recap of a stale
+  // verdict would otherwise win on recency, which is the exact failure this tag
+  // was introduced to stop. Never let "it's tagged" substitute for "it's the only one".
+  if (tagged.length > 0) return { obj: tagged[0].obj, ambiguous: tagged.length > 1 }
   if (candidates.length === 0) return { obj: null, ambiguous: false }
   // Untagged: the model ignored the output contract. One block is unambiguous;
   // several of the same shape are not — we cannot tell the answer from a recap.
+  // A malformed (unparseable) tagged block lands here too: it never became a
+  // candidate, so an honest typo degrades to the same tolerance as no tag at all.
   return { obj: candidates[0].obj, ambiguous: candidates.length > 1 }
 }
 
@@ -575,7 +581,7 @@ export function parseVerdict(text: string, role: string): Verdict {
     return {
       role,
       pass: false,
-      blocking: [`回复中有多个未标记的裁决块,无法判定哪个是本轮结论;请只输出一个 \`\`\`${ANSWER_TAGS.verdict} 块`],
+      blocking: [`回复中有多个裁决块,无法判定哪个是本轮结论;请只输出一个 \`\`\`${ANSWER_TAGS.verdict} 块,且位于回复末尾`],
       comments: text.trim().slice(0, 2000),
     }
   }
