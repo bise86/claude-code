@@ -2,7 +2,7 @@
 import type { PhaseName, RoleBinding, RoundtableRecord, TaskNode, Verdict } from './types.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
-import { parseVerdict } from './parseOutput.js'
+import { capText, MAX_SUMMARY_CHARS, parseVerdict } from './parseOutput.js'
 
 export type RunAgentFn = (req: {
   phase: PhaseName
@@ -30,7 +30,10 @@ export function synthesizeVerdicts(verdicts: Verdict[]): { pass: boolean; blocki
           : [`[${v.role}] 未通过但未给出具体阻断项`],
     )
     .join('; ')
-  return { pass, blockingSummary }
+  // CAPPED. This is the single biggest contributor to node.md: it concatenates every
+  // reviewer's every blocking entry, so 5 roles x 21 entries x 2000 chars is ~200 KB per
+  // round — and it is copied again into blockedReason. Measured 2.5 MB per node before this.
+  return { pass, blockingSummary: capText(blockingSummary, MAX_SUMMARY_CHARS) }
 }
 
 export async function runRoundtable(args: {

@@ -186,6 +186,30 @@ function pickAnswer(
 export const MAX_FIELD_CHARS = 8000
 export const MAX_BLOCKING_ITEMS = 20
 export const MAX_BLOCKING_CHARS = 2000
+/** The synthesized summary concatenates every reviewer's every blocking entry. */
+export const MAX_SUMMARY_CHARS = 4000
+
+/**
+ * Cap a blocking list on BOTH axes, keeping a marker when anything was dropped.
+ *
+ * Shared by the parse boundary and the resume boundary, because they disagreed: parseVerdict
+ * produced 20 entries + a "还有 N 条" marker (21), and the resume path then sliced to 20 —
+ * deleting exactly the marker. A user resuming saw a full 20 with no sign anything was cut.
+ */
+export const DROPPED_MARKER = '…(还有'
+
+export function capBlockingList(items: string[]): string[] {
+  // IDEMPOTENT. A list that already carries the marker is passed through untouched: the
+  // resume path runs this over values the parse path already capped, and re-deriving the
+  // count there rewrote "还有 30 条" into "还有 1 条" — a number that describes this pass
+  // rather than what was actually lost.
+  const alreadyCapped =
+    items.length === MAX_BLOCKING_ITEMS + 1 && items[items.length - 1].startsWith(DROPPED_MARKER)
+  if (alreadyCapped) return items.map(b => capText(b, MAX_BLOCKING_CHARS))
+  const capped = items.map(b => capText(b, MAX_BLOCKING_CHARS))
+  if (capped.length <= MAX_BLOCKING_ITEMS) return capped
+  return [...capped.slice(0, MAX_BLOCKING_ITEMS), `${DROPPED_MARKER} ${items.length - MAX_BLOCKING_ITEMS} 条阻断意见未记录)`]
+}
 
 /** Truncate by CODE POINTS, marking the cut so a reader knows it happened. */
 export function capText(s: string, max = MAX_FIELD_CHARS): string {
@@ -254,10 +278,13 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
   }
   // Bounded on BOTH axes. A reviewer that returns 200 entries of 2000 chars each puts
   // 400 KB into the node — which yamlStringify then dumps into node.md on every commit.
-  const rawBlocking = Array.isArray(obj.blocking) ? (obj.blocking as unknown[]).map(b => capText(str(b), MAX_BLOCKING_CHARS)).filter(Boolean) : []
-  const blocking = rawBlocking.length > MAX_BLOCKING_ITEMS
-    ? [...rawBlocking.slice(0, MAX_BLOCKING_ITEMS), `…(还有 ${rawBlocking.length - MAX_BLOCKING_ITEMS} 条阻断意见未记录)`]
-    : rawBlocking
+  // Capped ONCE, from the raw value. Going through str() first truncated at 8000 and then
+  // again at 2000, so the marker reported "原文 8017 字" for a 50000-character entry — wrong
+  // on the very first write.
+  const rawBlocking = Array.isArray(obj.blocking)
+    ? (obj.blocking as unknown[]).map(b => (typeof b === 'string' ? b : '')).filter(Boolean)
+    : []
+  const blocking = capBlockingList(rawBlocking)
   return { role, pass: obj.pass === true && blocking.length === 0, blocking, comments: str(obj.comments) }
 }
 
@@ -271,15 +298,22 @@ export interface NewChildSpec { parent?: string; title: string; deps: string[] }
  * "undefined". Everything that needs the tree — does the target exist, is it terminal, does
  * it fit under the depth and node caps — is the caller's job.
  */
+/** Children a single execute reply may graft. Beyond this the reply is not a task list. */
+export const MAX_NEW_CHILDREN = 20
+
 export function parseNewChildren(o: Record<string, unknown>): NewChildSpec[] {
   const raw = o.newChildren
   if (!Array.isArray(raw)) return []
   return raw
     .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+    // CAPPED, like every other parsed field. This function does not go through str(), so a
+    // 200000-character title landed verbatim in a node — and growTree copies refusals back
+    // into execStatus AFTER the caps, so 200 of them produced a 24 MB node.md. Measured.
+    .slice(0, MAX_NEW_CHILDREN)
     .map(c => ({
-      parent: typeof c.parent === 'string' && c.parent.length > 0 ? c.parent : undefined,
-      title: typeof c.title === 'string' ? c.title.trim() : '',
-      deps: Array.isArray(c.deps) ? c.deps.filter((d): d is string => typeof d === 'string') : [],
+      parent: typeof c.parent === 'string' && c.parent.length > 0 ? capText(c.parent, 200) : undefined,
+      title: typeof c.title === 'string' ? capText(c.title.trim(), 200) : '',
+      deps: Array.isArray(c.deps) ? c.deps.filter((d): d is string => typeof d === 'string').slice(0, MAX_NEW_CHILDREN).map(d => capText(d, 200)) : [],
     }))
     .filter(c => c.title.length > 0)
 }

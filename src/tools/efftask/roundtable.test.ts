@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, emptyPhaseRoles } from './types.js'
 import { synthesizeVerdicts, runRoundtable, RunAgentFn } from './roundtable.js'
+import { MAX_SUMMARY_CHARS } from './parseOutput.js'
 
 const NOW = '2026-07-25T00:00:00Z'
 const node = () => createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
@@ -66,5 +67,28 @@ describe('roundtable', () => {
     expect(rec.round).toBe(2)
     expect(rec.synthesized.pass).toBe(false)
     expect(rec.synthesized.blockingSummary).toContain('已中断')
+  })
+})
+
+
+describe('合成裁决也要封顶 —— 它是 node.md 体积最大的贡献者', () => {
+  it('blockingSummary 拼接后按上限截断', () => {
+    // It concatenates every reviewer's every blocking entry: 5 roles x 21 entries x 2000
+    // chars is ~200 KB per round, and it is copied again into blockedReason. Measured 2.5 MB
+    // per node before this.
+    const verdicts = [...Array(5)].map((_, i) => ({
+      role: 'r' + i, pass: false,
+      blocking: [...Array(21)].map(() => 'x'.repeat(2000)),
+      comments: '',
+    }))
+    const out = synthesizeVerdicts(verdicts)
+    expect(out.pass).toBe(false)
+    expect(Array.from(out.blockingSummary).length).toBeLessThan(MAX_SUMMARY_CHARS + 100)
+    expect(out.blockingSummary).toContain('已截断')
+  })
+
+  it('正常长度的意见一个字都不动', () => {
+    const out = synthesizeVerdicts([{ role: 'a', pass: false, blocking: ['缺测试'], comments: '' }])
+    expect(out.blockingSummary).toBe('[a] 缺测试')
   })
 })

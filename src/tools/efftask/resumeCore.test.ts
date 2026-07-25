@@ -478,8 +478,13 @@ describe('恢复:读者比校验器挖得深的那一类洞,全量收口', () =>
       const n = mk2({ score: { plan: { role: 'r', score: 1, rationale: bad } } })
       const { nodes } = validateLoadedNodes([n], o2)
       expect(() => serializeNode(nodes[0])).not.toThrow()
-      expect(nodes[0].score.plan.rationale).toBe('')
+      // STRINGIFIED, not dropped. The first version of this fix answered "YAML types
+      // `rationale: 90` as a number" by deleting the reviewer's actual comment — String()
+      // neither throws nor loses it.
+      expect(typeof nodes[0].score.plan!.rationale).toBe('string')
     }
+    const kept = validateLoadedNodes([mk2({ score: { plan: { role: 'r', score: 1, rationale: 90 } } })], o2).nodes[0]
+    expect(kept.score.plan!.rationale).toBe('90')
   })
 
   it('score 里整条记录不是对象时被丢掉,而不是留着炸', async () => {
@@ -519,10 +524,17 @@ describe('恢复:读者比校验器挖得深的那一类洞,全量收口', () =>
       const n = mk2({ worktree: bad, mergeConflict: true })
       const { nodes } = validateLoadedNodes([n], o2)
       expect(nodes[0].worktree).toBeUndefined()
-      // …and it is no longer advertised as a resumable conflict: there is no worktree to
-      // send anyone to.
-      expect(nodes[0].mergeConflict).toBe(false)
+      // mergeConflict is KEPT. It is the only key that reopens a conflict block — interrupted
+      // is false (a conflict is a verdict) and capBlocked is false (no valve tripped) — so
+      // clearing it left a node NEITHER `--resume` NOR `--retry-blocked` could touch, while
+      // its own blockedReason still told the user to resume. Clearing the worktree alone is
+      // enough: stepExecute's gate is `!node.worktree`, so it re-acquires.
+      expect(nodes[0].mergeConflict).toBe(true)
     }
+    // …and the node really is reopenable again.
+    const n2 = mk2({ status: 'BLOCKED', worktree: null as never, mergeConflict: true })
+    const fixed = validateLoadedNodes([n2], o2).nodes
+    expect(reseatTransientNodes(fixed, NOW, DEFAULT_CAPS).reseated).toEqual(['root'])
   })
 
   it('形状完好的冲突工作区仍然保留', () => {
@@ -552,7 +564,10 @@ describe('恢复:读者比校验器挖得深的那一类洞,全量收口', () =>
     const n = mk2({ reviewLog: [{ round: 1, verdicts: [{ role: 'a', pass: false, blocking: many, comments: '' }], synthesized: { pass: false, blockingSummary: '' } }] })
     const { nodes } = validateLoadedNodes([n], o2)
     const back = nodes[0].reviewLog[0].verdicts[0].blocking
-    expect(back.length).toBeLessThanOrEqual(20)
+    // 20 kept + the marker. The resume path used to slice to exactly 20, which deleted the
+    // very marker parseVerdict had appended — a user saw a full 20 with no sign of a cut.
+    expect(back.length).toBe(21)
+    expect(back[back.length - 1]).toContain('未记录')
     expect(Array.from(back[0]).length).toBeLessThan(2100)
   })
 })
@@ -582,5 +597,55 @@ describe('run.md 里的 scoreThreshold 不是数字时,关口不能说假话', (
     )
     expect(config.caps.scoreThreshold).toBe(80)
     expect(degraded).toEqual([])
+  })
+})
+
+
+describe('剩下五条守卫也要有测试', () => {
+  const mk3 = (over = {}) => ({
+    ...createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+  const o3 = { goal: 'g', phaseRoles: emptyPhaseRoles(), now: NOW }
+
+  it('score 夹到 0-100 —— 负分会白烧一轮返工', () => {
+    // parseScoreOutput clamps; a hand-edited node.md did not go through it, and -50 sits below
+    // any scoreThreshold.
+    expect(validateLoadedNodes([mk3({ score: { plan: { role: 'o', score: -50, rationale: '' } } })], o3)
+      .nodes[0].score.plan!.score).toBe(0)
+    expect(validateLoadedNodes([mk3({ score: { exec: { role: 'o', score: 999, rationale: '' } } })], o3)
+      .nodes[0].score.exec!.score).toBe(100)
+  })
+
+  it('单个裁决里丢掉的意见也要报修复,不只是整轮', () => {
+    // Reporting only whole rounds meant a verdict whose 30 entries became 20, or whose entire
+    // blocking list was a string, vanished without a line anywhere — §17.2 wants them shown.
+    const tooMany = mk3({ reviewLog: [{ round: 1, verdicts: [{ role: 'a', pass: false, blocking: [...Array(30)].map((_, i) => 'b' + i, ), comments: '' }], synthesized: { pass: false, blockingSummary: '' } }] })
+    expect(validateLoadedNodes([tooMany], o3).repairs.some(r => r.includes('评审/验收记录已损坏'))).toBe(true)
+    const notArray = mk3({ reviewLog: [{ round: 1, verdicts: [{ role: 'a', pass: false, blocking: '一整段', comments: '' }], synthesized: { pass: false, blockingSummary: '' } }] })
+    expect(validateLoadedNodes([notArray], o3).repairs.some(r => r.includes('评审/验收记录已损坏'))).toBe(true)
+  })
+
+  it('scoreThreshold 超出 0-100 也要说,而不是静默归零', async () => {
+    // clampInt turned -5 into 0, and `worst < 0` never holds — the same "the gate promises a
+    // rework that can never fire" the non-number branch exists to prevent.
+    const memfs = (runMd) => ({
+      readFile: async (p) => { if (p.endsWith('run.md')) return runMd; throw new Error('ENOENT') },
+      writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
+      unlink: async () => {}, rmdir: async () => {}, readdir: async () => [], exists: async () => true,
+    })
+    const { config, degraded } = await readRunManifest(memfs('---\ngoalPrompt: g\ncaps:\n  scoreThreshold: -5\n---\n\n'), '/r')
+    expect(config.caps.scoreThreshold).toBeUndefined()
+    expect(degraded.some(d => d.includes('超出 0-100'))).toBe(true)
+  })
+
+  it('提示语里的值加了引号 —— 免得 "80" 读成 "80 不是数字"', async () => {
+    const memfs = (runMd) => ({
+      readFile: async (p) => { if (p.endsWith('run.md')) return runMd; throw new Error('ENOENT') },
+      writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
+      unlink: async () => {}, rmdir: async () => {}, readdir: async () => [], exists: async () => true,
+    })
+    const { degraded } = await readRunManifest(memfs('---\ngoalPrompt: g\ncaps:\n  scoreThreshold: "80"\n---\n\n'), '/r')
+    expect(degraded[0]).toContain('"80"')
   })
 })

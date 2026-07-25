@@ -1,7 +1,7 @@
 // src/tools/efftask/pipeline.ts
 import type { EffTaskConfig, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import { createNode } from './types.js'
-import { ANSWER_TAGS, answerTag, parseExecOutput, parsePlanOutput, parseScoreOutput } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
@@ -1101,7 +1101,16 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         // Append, never replace: execStatus is the executor's own record of what it did, and
         // a growth request that vanished without trace is the same "said one thing, did
         // another" failure this project keeps paying for.
-        node.execStatus = `${reported}\n(注:以下加子节点请求被拒绝)\n${refusals.map(r => '- ' + r).join('\n')}`
+        // Capped, and the REFUSALS get the reserved room — not the report.
+        //
+        // This is appended AFTER the parse boundary, so it was the one path that could still
+        // put unbounded model text into a node. But capping the concatenation cut the refusals
+        // off the end, which is the opposite of the point: the executor believes it queued
+        // that work, and the refusal is the new information. So the refusals are capped on
+        // their own and the report is trimmed to fit around them.
+        const refusalText = capText(`(注:以下加子节点请求被拒绝)\n${refusals.map(r => '- ' + r).join('\n')}`, 2000)
+        const room = Math.max(500, MAX_FIELD_CHARS - Array.from(refusalText).length - 1)
+        node.execStatus = `${capText(reported, room)}\n${refusalText}`
       }
       // If the EXECUTING node itself grew children it is now WAITING_CHILDREN, and its own
       // acceptance must wait for them. Returning here is what the spec's "恢复" means: the

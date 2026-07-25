@@ -2,7 +2,7 @@ import { parse as yamlParse } from 'yaml'
 import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
-import { capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
+import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
 
 const LEGAL_STATUS = new Set<string>([
   'CREATED', 'PLANNING', 'PLAN_REVIEW', 'READY', 'EXECUTING', 'EXECUTED', 'ACCEPTANCE',
@@ -74,8 +74,13 @@ function scoreRecord(v: unknown): { role: string; score: number; rationale: stri
   const r = v as Record<string, unknown>
   return {
     role: typeof r.role === 'string' ? r.role : 'unknown',
-    score: Number.isFinite(r.score) ? (r.score as number) : 0,
-    rationale: typeof r.rationale === 'string' ? r.rationale : '',
+    // Clamped like parseScoreOutput does. An out-of-range -50 from a hand-edited file would
+    // otherwise sit below any scoreThreshold and burn a rework round for nothing.
+    score: Number.isFinite(r.score) ? Math.min(100, Math.max(0, Math.trunc(r.score as number))) : 0,
+    // STRINGIFIED, not dropped. The whole premise was "YAML types `rationale: 90` as a
+    // number" — and the first fix answered that by deleting the reviewer's actual comment.
+    // String() neither throws nor loses it.
+    rationale: typeof r.rationale === 'string' ? r.rationale : r.rationale === undefined || r.rationale === null ? '' : String(r.rationale),
   }
 }
 
@@ -97,6 +102,45 @@ function worktreeRef(v: unknown): { branch: string; path: string } | undefined {
   return { branch: w.branch, path: w.path }
 }
 
+/**
+ * The verdicts of one round.
+ *
+ * A plain function, not the comma-operator ternary it replaced: that expression's condition
+ * was ALWAYS false (the comma operator returns its right operand), so its `? []` branch was
+ * unreachable and its only effect was smuggling in a side effect. Deleting the whole thing
+ * left the suite green.
+ */
+function verdictArray(v: unknown, onDrop?: () => void): RoundtableRecord['verdicts'] {
+  if (!Array.isArray(v)) {
+    if (v !== undefined) onDrop?.()
+    return []
+  }
+  return v
+    .filter((x): x is Record<string, unknown> => {
+      const ok = !!x && typeof x === 'object'
+      if (!ok) onDrop?.()
+      return ok
+    })
+    .map(x => {
+      const blocking = strArray(x.blocking)
+      // Report a DROP at the level it happens. Reporting only whole rounds meant a verdict
+      // whose entire blocking list was a string, or whose 30 entries became 20, vanished
+      // without a line anywhere — and §17.2 wants the repairs shown to the user.
+      if (x.blocking !== undefined && !Array.isArray(x.blocking)) onDrop?.()
+      if (blocking.length > MAX_BLOCKING_ITEMS) onDrop?.()
+      return {
+        role: typeof x.role === 'string' ? x.role : 'unknown',
+        pass: x.pass === true,
+        // Same caps as the parse boundary: node.md is hand-editable, and this is the other
+        // door into the same field.
+        blocking: capBlockingList(blocking),
+        comments: typeof x.comments === 'string' ? capText(x.comments, MAX_BLOCKING_CHARS) : '',
+        ...(x.infra === true ? { infra: true as const } : {}),
+        ...(x.timeout === true ? { timeout: true as const } : {}),
+      }
+    })
+}
+
 /** One roundtable record, with every field the writers dereference guaranteed present. */
 function roundArray(v: unknown, onDrop?: () => void): RoundtableRecord[] {
   if (!Array.isArray(v)) { if (v !== undefined) onDrop?.(); return [] }
@@ -108,20 +152,7 @@ function roundArray(v: unknown, onDrop?: () => void): RoundtableRecord[] {
     })
     .map(r => ({
       round: Number.isFinite(r.round) ? (r.round as number) : 0,
-      verdicts: (r.verdicts !== undefined && !Array.isArray(r.verdicts) && (onDrop?.(), false)) ? [] : Array.isArray(r.verdicts)
-        ? r.verdicts
-            .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
-            .map(x => ({
-              role: typeof x.role === 'string' ? x.role : 'unknown',
-              pass: x.pass === true,
-              // Same caps as the parse boundary: node.md is hand-editable, and this is the
-              // other door into the same field.
-              blocking: strArray(x.blocking).slice(0, MAX_BLOCKING_ITEMS).map(b => capText(b, MAX_BLOCKING_CHARS)),
-              comments: typeof x.comments === 'string' ? capText(x.comments, MAX_BLOCKING_CHARS) : '',
-              ...(x.infra === true ? { infra: true as const } : {}),
-              ...(x.timeout === true ? { timeout: true as const } : {}),
-            }))
-        : [],
+      verdicts: verdictArray(r.verdicts, onDrop),
       synthesized: {
         pass: (r.synthesized as { pass?: unknown } | undefined)?.pass === true,
         blockingSummary: typeof (r.synthesized as { blockingSummary?: unknown } | undefined)?.blockingSummary === 'string'
@@ -296,8 +327,13 @@ export function validateLoadedNodes(
     if (n.worktree !== undefined && worktreeRef(n.worktree) === undefined) {
       repairs.push(`节点 ${n.id}:隔离工作区记录无法识别,已清除,恢复时将重新分配`)
       n.worktree = undefined
-      // …and it is no longer a resumable conflict: there is no worktree to send anyone to.
-      n.mergeConflict = false
+      // mergeConflict is DELIBERATELY kept. It is the only key that reopens a conflict block
+      // (interrupted is false — a conflict is a verdict — and capBlocked is false — no valve
+      // tripped), so clearing it left a node that NEITHER `--resume` NOR `--retry-blocked`
+      // could touch, while its own blockedReason still told the user to run `/et --resume`.
+      // That traded a loud failure (the previous version threw) for a silent one.
+      // Clearing the worktree alone is safe and sufficient: stepExecute's isolation gate is
+      // `!node.worktree`, so the node re-acquires a fresh one — measured, it then completes.
     }
     if (n.worktree !== undefined) {
       // EXCEPT for a conflict block. There the path is not stale bookkeeping — it is where
@@ -466,10 +502,16 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   if (caps.scoreThreshold !== undefined) {
     // A non-number silently became 0, and `worst < 0` never holds — so the gate said
     // "评分低于 0 触发一轮返工" while rework could never trigger. Say so instead.
-    if (typeof caps.scoreThreshold !== 'number' || !Number.isFinite(caps.scoreThreshold)) {
-      degraded.push(`run.md 里的 caps.scoreThreshold 不是数字(${String(caps.scoreThreshold)}),已忽略:评分将只记录、不触发返工`)
+    const t = caps.scoreThreshold
+    if (typeof t !== 'number' || !Number.isFinite(t)) {
+      // Quoted, so `"80"` does not read as "80 is not a number".
+      degraded.push(`run.md 里的 caps.scoreThreshold 不是数字(写的是 ${JSON.stringify(t)}),已忽略:评分将只记录、不触发返工`)
+    } else if (t < 0 || t > 100) {
+      // clampInt turned -5 into 0, and `worst < 0` never holds — the same "the gate promises
+      // a rework that can never fire" this branch exists to prevent, through the other door.
+      degraded.push(`run.md 里的 caps.scoreThreshold 超出 0-100(写的是 ${t}),已忽略:评分将只记录、不触发返工`)
     } else {
-      rebuilt.scoreThreshold = clampInt(caps.scoreThreshold, 0, 100, 0)
+      rebuilt.scoreThreshold = Math.trunc(t)
     }
   }
   base.caps = rebuilt

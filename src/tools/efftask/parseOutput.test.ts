@@ -1,6 +1,6 @@
 // src/tools/efftask/parseOutput.test.ts
 import { describe, expect, it } from 'bun:test'
-import { answerTag, extractJsonBlock, parsePlanOutput, parseVerdict, parseExecOutput, capText, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS } from './parseOutput.js'
+import { answerTag, extractJsonBlock, parsePlanOutput, parseVerdict, parseExecOutput, capText, capBlockingList, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS, MAX_NEW_CHILDREN } from './parseOutput.js'
 
 describe('parseOutput', () => {
   it('extractJsonBlock finds fenced json', () => {
@@ -265,5 +265,46 @@ describe('模型回复进节点时就要封顶 (node.md 96% 的体积在 frontma
   it('capText 按码点截断,不会把 emoji 劈成半个', () => {
     const out = capText('🙂'.repeat(100), 10)
     expect(Array.from(out.replace(/….*$/, '')).length).toBe(10)
+  })
+})
+
+
+describe('截断提示要活过 resume,数字要说真话', () => {
+  it('capBlockingList 在两侧产出同一个结果 —— 第二次调用是幂等的', () => {
+    // parseVerdict produced 20 + a marker (21) and the resume path sliced to exactly 20,
+    // deleting the marker: a user resuming saw a full 20 with no sign anything was cut.
+    const items = [...Array(50)].map((_, i) => 'item' + i)
+    const once = capBlockingList(items)
+    expect(once).toHaveLength(MAX_BLOCKING_ITEMS + 1)
+    expect(once[once.length - 1]).toContain('还有 30 条')
+    // Re-capping an already-capped list must not compound the marker or re-count it.
+    const twice = capBlockingList(once)
+    expect(twice).toEqual(once)
+  })
+
+  it('没超上限时不加提示,也不改内容', () => {
+    expect(capBlockingList(['a', 'b'])).toEqual(['a', 'b'])
+  })
+
+  it('"原文 N 字" 说的是真的原文长度,不是中间某一次截断后的长度', () => {
+    // capText used to run twice on the same value (str() capped at 8000, then the caller at
+    // 2000), so a 50000-char entry reported "原文 8017 字" on the very FIRST write.
+    const v = parseVerdict(
+      '```verdictabc\n' + JSON.stringify({ pass: false, blocking: ['q'.repeat(50_000)], comments: '' }) + '\n```',
+      'r', 'verdictabc',
+    )
+    expect(v.blocking[0]).toContain('原文 50000 字')
+  })
+
+  it('newChildren 的标题和条数都有上限 —— 它不走 str()', () => {
+    // parseNewChildren bypasses str() entirely: a 200000-char title landed verbatim, and
+    // growTree copies refusals back into execStatus AFTER the caps — 200 of them produced a
+    // 24 MB node.md.
+    const kids = [...Array(200)].map((_, i) => ({ title: 'z'.repeat(9000) + i, deps: [] }))
+    const out = parseExecOutput(
+      '```execabc\n' + JSON.stringify({ execStatus: 'ok', newChildren: kids }) + '\n```', 'execabc',
+    )
+    expect(out.newChildren.length).toBeLessThanOrEqual(MAX_NEW_CHILDREN)
+    expect(Array.from(out.newChildren[0].title).length).toBeLessThan(300)
   })
 })

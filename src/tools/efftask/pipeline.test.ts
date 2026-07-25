@@ -1937,3 +1937,35 @@ describe('集成路径的评分也要在面板上现身', () => {
     expect(seen).not.toContain('SCORING')
   })
 })
+
+
+describe('被拒绝的加子节点请求也不能把节点撑爆', () => {
+  it('refusals 拼回 execStatus 之后仍然封顶', async () => {
+    // growTree appends refusals AFTER the parse boundary, so this was the one path that could
+    // still put unbounded model text into a node — measured 200 refusals x 20000 chars = a
+    // 24 MB node.md.
+    const tiny: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 1 } }
+    const n = root(); n.kind = 'executable'
+    const etag4 = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+    // DISTINCT parents: growTree groups by target, so 30 children with no parent produce ONE
+    // refusal, not thirty — a fixture that never reaches the cap it claims to test.
+    const kids = [...Array(30)].map((_, i) => ({ parent: 'ghost/' + 'p'.repeat(150) + i, title: 'k'.repeat(150) + i, deps: [] }))
+    // A REPORT that is already at the field cap, plus a full batch of refusals. Without the
+    // cap on the concatenation the two simply add up and the node grows past the limit every
+    // field is supposed to respect.
+    const bigReport = '做'.repeat(8000)
+    const ctx = ctxFor([n], async req =>
+      req.phase === 'execute'
+        ? etag4(req) + '\n' + JSON.stringify({ execStatus: bigReport, newChildren: kids }) + '\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```', tiny)
+    await stepExecute(n, ctx)
+    expect(n.execStatus).toContain('加子节点请求被拒绝')
+    expect(Array.from(n.execStatus).length).toBeLessThan(8100)
+    // The refusal block itself is capped too — 20 refusals of 200-char titles is ~5 KB, and
+    // without its own cap it would eat the room reserved for the executor's own report.
+    const refusalPart = n.execStatus.slice(n.execStatus.indexOf('加子节点请求被拒绝'))
+    expect(Array.from(refusalPart).length).toBeLessThan(2100)
+    // …and the report survives alongside it rather than being cut off to make space.
+    expect(n.execStatus.startsWith('做做做')).toBe(true)
+  })
+})

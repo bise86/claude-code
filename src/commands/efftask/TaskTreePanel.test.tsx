@@ -634,3 +634,17 @@ describe('startedAt 不是字符串时,耗时不能渲染成 1900 年', () => {
     expect(elapsed(mk({ id: 'x', status: 'EXECUTING', startedAt: 'not a date' }), Date.now())).toBe('-')
   })
 })
+
+
+describe('updatedAt 也要查类型', () => {
+  it('终态节点的 updatedAt 不是字符串时,不把两小时显示成 0s', () => {
+    // Date.parse(123) coerces rather than throwing, and Math.max(0, …) then floored a
+    // two-hour node to 0s — the same "points at the wrong node" this field exists to prevent.
+    const n = mk({
+      id: 'x', status: 'ACCEPTED',
+      startedAt: new Date(Date.now() - 7_200_000).toISOString(),
+      updatedAt: 123,
+    })
+    expect(elapsed(n, Date.now())).not.toBe('0s')
+  })
+})

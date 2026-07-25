@@ -30,7 +30,9 @@ export function elapsed(node: TaskNode, nowMs: number): string {
   const start = typeof node.startedAt === 'string' ? Date.parse(node.startedAt) : Number.NaN
   if (!Number.isFinite(start)) return '-'
   const terminal = node.status === 'ACCEPTED' || node.status === 'BLOCKED'
-  const endParsed = terminal ? Date.parse(node.updatedAt) : nowMs
+  // typeof-checked for the same reason as startedAt two lines up: Date.parse(123) coerces
+  // rather than throwing, and Math.max(0, …) then rendered a two-hour node as 0s.
+  const endParsed = terminal && typeof node.updatedAt === 'string' ? Date.parse(node.updatedAt) : nowMs
   const end = Number.isFinite(endParsed) ? endParsed : nowMs
   return `${Math.max(0, Math.round((end - start) / 1000))}s`
 }
