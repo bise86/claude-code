@@ -3,6 +3,7 @@ import { writeNode, writeRunManifest, type FsLike } from '../../tools/efftask/pe
 import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import { logError } from '../../utils/log.js'
+import type { WorktreePool } from '../../tools/efftask/worktreePool.js'
 
 export type Outcome = { status: 'completed' | 'blocked'; reason?: string }
 
@@ -24,7 +25,7 @@ export type Phase =
  * module is deliberately importable and directly testable without mounting anything.
  */
 export async function runOrchestrator(
-  args: { config: EffTaskConfig; runDir: string; fs: FsLike; runAgent: RunAgentFn; signal: AbortSignal; seed?: TaskNode[] },
+  args: { config: EffTaskConfig; runDir: string; fs: FsLike; runAgent: RunAgentFn; signal: AbortSignal; seed?: TaskNode[]; worktrees?: WorktreePool },
   setNodes: (n: TaskNode[]) => void,
   setOutcome: (o: Outcome) => void,
   setPhase: (p: Phase) => void,
@@ -48,6 +49,7 @@ export async function runOrchestrator(
         runAgent: args.runAgent,
         persist,
         now,
+        worktrees: args.worktrees,
         onUpdate: nodes => {
           setNodes([...nodes])
           void queueManifest(nodes)

@@ -9,6 +9,8 @@ import type { Tools } from '../../Tool.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
+import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
+import { spawn } from 'node:child_process'
 import { annotateRoleModels, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { allocateRunId, loadRun, type FsLike } from '../../tools/efftask/persistence.js'
 import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResumeArgs.js'
@@ -267,6 +269,38 @@ function pickMainAgentDefinition(allAgents: AgentDefinition[]): AgentDefinition 
 }
 
 // FsLike backed directly by node:fs/promises.
+/** git via a child process. Every call names its own cwd — a worktree's index and HEAD are its own. */
+const gitRunner: GitRunner = (args, cwd) =>
+  new Promise(resolve => {
+    const p = spawn('git', args, { cwd })
+    let stdout = ''
+    let stderr = ''
+    p.stdout.on('data', d => { stdout += String(d) })
+    p.stderr.on('data', d => { stderr += String(d) })
+    p.on('close', code => resolve({ code: code ?? -1, stdout, stderr }))
+    p.on('error', err => resolve({ code: -1, stdout: '', stderr: String(err) }))
+  })
+
+/**
+ * Build the isolation pool, or report why the run has to share the working tree.
+ *
+ * Availability is decided ONCE, here, and never re-decided mid-run: a per-node fallback would
+ * mean some executors write to the user's checkout while the gate said the run was isolated.
+ * When init fails the pool is simply absent, and stepExecute then has nothing to gate on —
+ * the run is honestly un-isolated and says so at the confirmation gate.
+ */
+async function makeWorktreePool(
+  runId: string, cwd: string,
+): Promise<{ pool?: WorktreePool; reason?: string }> {
+  const top = await gitRunner(['rev-parse', '--show-toplevel'], cwd)
+  if (top.code !== 0) return { reason: '当前目录不是 git 仓库' }
+  const gitRoot = top.stdout.trim()
+  const pool = createWorktreePool({ runId, gitRoot, git: gitRunner, worktreeRoot: `${gitRoot}/.efftask-worktrees` })
+  const init = await pool.init()
+  if (!init.ok) return { reason: init.reason }
+  return { pool }
+}
+
 function fsAdapter(): FsLike {
   return {
     readFile: p => readFile(p, 'utf-8'),
@@ -328,6 +362,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [outcome, setOutcome] = React.useState<Outcome | null>(null)
   const [runs, setRuns] = React.useState<RunSummary[] | null>(null)
   const [seed, setSeed] = React.useState<TaskNode[] | null>(null)
+  // Isolation is resolved ONCE, when the gate is answered — never re-decided per node.
+  const poolRef = React.useRef<WorktreePool | undefined>(undefined)
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
@@ -524,12 +560,27 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // is no channel from the gate's React state to the Feishu surface.
         const effectiveConfig: EffTaskConfig = { ...config, parallelism: decision.parallelism }
         setPhase('running')
-        void runOrchestrator(
-          { config: effectiveConfig, runDir: runDir!, fs: props.fs, runAgent: props.runAgent, signal: props.signal, seed: seed ?? undefined },
-          setNodes,
-          recordOutcome,
-          setPhase,
-        )
+        void (async () => {
+          // Built HERE, after approval and before the first step: init() creates the
+          // integration branch and its worktree, which is real work the user has consented
+          // to. A failure is not fatal — the run continues honestly un-isolated.
+          const { pool, reason } = await makeWorktreePool(runId!, getCwd())
+          poolRef.current = pool
+          if (!pool && reason) {
+            // The gate already closed, so this cannot go into notices. It belongs in the
+            // transcript path the user is pointed at, and in the tree the run writes.
+            logError(new Error(`高效任务: 隔离不可用,执行将共享工作目录 —— ${reason}`))
+          }
+          void runOrchestrator(
+            {
+              config: effectiveConfig, runDir: runDir!, fs: props.fs, runAgent: props.runAgent,
+              signal: props.signal, seed: seed ?? undefined, worktrees: pool,
+            },
+            setNodes,
+            recordOutcome,
+            setPhase,
+          )
+        })()
       })
       .catch(e => {
         settled = true

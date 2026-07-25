@@ -641,6 +641,13 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
     await blockWithReason(node, `合并失败(基础设施): ${res.message}`, ctx)
     return false
   }
+  // The pool is the ONLY component that knows whether this node contributed a commit.
+  // Discarding that answer let a node that wrote nothing — while reporting "已实现并自测通过"
+  // — reach ACCEPTED with the integration branch byte-identical to base, and nothing anywhere
+  // recorded it. Put it in the evidence the acceptance record keeps.
+  if (!res.merged) {
+    node.execStatus = `${node.execStatus}\n(注:该节点没有向集成分支贡献任何改动)`
+  }
   const rel = await ctx.worktrees.release(node)
   // A kept worktree is NOT a failure — release refuses to delete anything holding real work.
   // Record it so the user can find it rather than discovering a stray directory later.
@@ -785,6 +792,10 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       round: node.iteration.integration + 1, system: 'integrate',
       buildPrompt: tag => integratePrompt(node, ctx, tag, feedback), // child evidence, NOT acceptPrompt
       ctx,
+      // The INTEGRATION worktree, not the user's tree. This roundtable accepts every
+      // decompose node — including root, i.e. the run's final verdict — and under isolation
+      // the user's checkout contains none of the run's work.
+      cwd: ctx.worktrees?.integrationPath,
     })
     node.acceptLog.push(rec)
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }

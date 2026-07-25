@@ -128,6 +128,16 @@ export function validateLoadedNodes(
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>
     if (typeof n.title !== 'string' || n.title.length === 0) n.title = n.id
     if (typeof n.goal !== 'string' || n.goal.length === 0) n.goal = n.title
+    // A worktree reference is a DISK path, and disk paths do not survive. serializeNode
+    // round-trips it, so a resumed node arrives still claiming a worktree that dispose or gc
+    // may have removed — and because the isolation gate is "no worktree yet", that stale
+    // value makes the gate PASS: acquire is never called again and the executor runs against
+    // a dead path, or against a base that never saw its dependencies' merges. Clearing it
+    // forces a fresh acquire, which is also what re-bases the worktree.
+    if (n.worktree !== undefined) {
+      repairs.push(`节点 ${n.id}:清除陈旧的隔离工作区引用,恢复时将重新分配`)
+      n.worktree = undefined
+    }
   }
 
   // ---- referential integrity: block the referrer, keep the edge ----

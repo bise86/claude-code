@@ -5,8 +5,18 @@ import { byIdMap, isTerminal } from './stateMachine.js'
 import { createStallTracker, pickBatch, type Advanceable } from './scheduler.js'
 import { stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
+import type { WorktreePool } from './worktreePool.js'
 
 export interface OrchestratorDeps {
+  /**
+   * Per-node git isolation, or undefined for a shared-tree run.
+   *
+   * Threaded all the way to PipelineCtx because its PRESENCE is the switch: with a pool, a
+   * node that cannot get a worktree is blocked rather than executed. Without this wiring the
+   * pool existed but nothing ever constructed or passed it, so every executor ran in the
+   * user's real checkout while the code claimed otherwise.
+   */
+  worktrees?: WorktreePool
   runAgent: RunAgentFn
   persist: (n: TaskNode) => Promise<void>
   now: () => string
@@ -92,6 +102,7 @@ export class EffTaskOrchestrator {
     return {
       config: this.cfg,
       reserveNodes: this.reserveNodes,
+      worktrees: this.deps.worktrees,
       byId: this.byId,
       runAgent: this.deps.runAgent,
       persist: this.deps.persist,

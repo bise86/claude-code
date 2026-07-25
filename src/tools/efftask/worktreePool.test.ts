@@ -238,7 +238,10 @@ describe('worktreePool against real git', () => {
     await writeFile(join(l.path, 'l.txt'), 'l\n')
     await p.commitAndMerge(n)
     await writeFile(join(l.path, 'later.txt'), 'written after the merge\n')
+    const st = await git(["status","--porcelain","--ignored"], l.path)
+    console.log("  [debug] worktree=", l.path, "status=", JSON.stringify(st.stdout), "code=", st.code)
     const r = await p.release(n)
+    console.log("  [debug] release=", JSON.stringify(r))
     expect(r.removed).toBe(false)
     expect(r.keptBecause).toContain('未提交')
   })
@@ -279,5 +282,71 @@ describe('worktreePool against real git', () => {
     expect(kept).toHaveLength(1)
     expect(kept[0].path).toContain('efftask-001-')
     expect(kept[0].why).toBeTruthy()
+  })
+})
+
+describe('生命周期边界(验收员用真 pool + 真 pipeline 同进程时发现的)', () => {
+  it('init is RE-ENTRANT and never moves an existing integration branch', async () => {
+    // Measured before this fix: `branch -f` was unconditional, so after a routine
+    // `git worktree prune` a second init returned ok:true while resetting the integration
+    // branch back to HEAD. Every already-merged node's commit landed in ZERO refs — release
+    // had already deleted their branches — and showed up under `git fsck --unreachable`.
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'kept.txt'), 'merged work\n')
+    await p.commitAndMerge(n)
+    await p.release(n)
+    const before = (await git(['rev-parse', 'efftask/001/integration'], gitRoot)).stdout.trim()
+
+    // Simulate the gc that makes this dangerous.
+    await rm(p.integrationPath, { recursive: true, force: true })
+    await git(['worktree', 'prune'], gitRoot)
+
+    expect(await p.init()).toEqual({ ok: true })
+    expect((await git(['rev-parse', 'efftask/001/integration'], gitRoot)).stdout.trim()).toBe(before)
+    expect((await git(['show', 'efftask/001/integration:kept.txt'], gitRoot)).code).toBe(0)
+  })
+
+  it('release KEEPS a worktree whose only output is gitignored', async () => {
+    // `git status --porcelain` does not list ignored files, so a node whose deliverable is a
+    // build output reported a CLEAN tree and `worktree remove --force` deleted it.
+    // .gitignore must be in place BEFORE init: git refuses to move a branch that a worktree
+    // has checked out, so committing it afterwards and force-moving the integration branch
+    // silently leaves the integration tip without it — and then dist/ is not ignored at all
+    // and deleting the worktree is the CORRECT behaviour. The first version of this test made
+    // exactly that mistake and "failed" against a working implementation.
+    await writeFile(join(gitRoot, '.gitignore'), 'dist/\n')
+    await git(['add', '-A'], gitRoot); await git(['commit', '-qm', 'ignore dist'], gitRoot)
+    const p = pool()
+    await p.init()
+
+    const n = node('root/02-b')
+    const l = await p.acquire(n) as { path: string }
+    await mkdir(join(l.path, 'dist'), { recursive: true })
+    await writeFile(join(l.path, 'dist', 'bundle.js'), 'the deliverable\n')
+    await p.commitAndMerge(n)
+    const r = await p.release(n)
+    expect(r.removed).toBe(false)
+    expect(r.keptBecause).toContain('忽略')
+  })
+
+  it('salvages commits the executor made itself, not only uncommitted edits', async () => {
+    // Measured: an executor that COMMITTED inside its worktree and was then interrupted had
+    // those commits reset away by `checkout -B` — 0 refs contained them, the file was gone.
+    // A dirty-only salvage check never fires for that shape.
+    const p = pool()
+    await p.init()
+    const n = node('root/03-c')
+    const l1 = await p.acquire(n) as { path: string }
+    await writeFile(join(l1.path, 'committed.ts'), 'executor committed this\n')
+    await git(['add', '-A'], l1.path)
+    await git(['commit', '-qm', 'executor own commit'], l1.path)
+    const sha = (await git(['rev-parse', 'HEAD'], l1.path)).stdout.trim()
+
+    await p.acquire(n) // resume re-acquires
+    const refs = await git(['for-each-ref', '--contains', sha, '--format=%(refname)'], gitRoot)
+    expect(refs.stdout.trim().length).toBeGreaterThan(0)
   })
 })

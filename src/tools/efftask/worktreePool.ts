@@ -54,6 +54,15 @@ export interface WorktreePoolDeps {
  * plan review were overturned by assumptions about these primitives. The measurements are
  * quoted at each rule so the next reader does not have to re-derive them.
  */
+/**
+ * The pool's public shape.
+ *
+ * Derived from the factory rather than hand-written: pipeline.ts imported a WorktreePool
+ * type that this module never exported, and import-type is ERASED by bun — so the suite
+ * stayed green while tsc would have said TS2305, and this repo has no typecheck to say it.
+ */
+export type WorktreePool = ReturnType<typeof createWorktreePool>
+
 export function createWorktreePool(deps: WorktreePoolDeps) {
   const { runId, gitRoot, git, worktreeRoot } = deps
   const intBranch = integrationBranch(runId)
@@ -82,10 +91,25 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     async init(): Promise<{ ok: true } | { ok: false; reason: string }> {
       const head = await git(['rev-parse', 'HEAD'], gitRoot)
       if (head.code !== 0) return { ok: false, reason: `不是 git 仓库或没有提交: ${head.stderr.trim()}` }
-      const br = await git(['branch', '-f', intBranch, 'HEAD'], gitRoot)
-      if (br.code !== 0) return { ok: false, reason: `无法创建集成分支: ${br.stderr.trim()}` }
-      const add = await git(['worktree', 'add', '-f', intPath, intBranch], gitRoot)
-      if (add.code !== 0) return { ok: false, reason: `无法创建集成工作区: ${add.stderr.trim()}` }
+      // RE-ENTRANT. `branch -f` was unconditional, which is catastrophic on resume:
+      // measured, after a routine `git worktree prune` init returned ok:true while resetting
+      // the integration branch back to HEAD — every already-merged node's commit ended up in
+      // ZERO refs (release had already deleted their branches) and showed up under
+      // `git fsck --unreachable`. An existing integration branch is the run's accumulated
+      // work; never move it.
+      const existing = await git(['rev-parse', '--verify', '--quiet', intBranch], gitRoot)
+      if (existing.code !== 0) {
+        const br = await git(['branch', intBranch, 'HEAD'], gitRoot)
+        if (br.code !== 0) return { ok: false, reason: `无法创建集成分支: ${br.stderr.trim()}` }
+      }
+      // The worktree may already be registered (resume) or may have been pruned out from
+      // under us (gc). Prune stale registrations first, then add only if it is really absent.
+      const registered = await git(['rev-parse', '--git-dir'], intPath)
+      if (registered.code !== 0) {
+        await git(['worktree', 'prune'], gitRoot)
+        const add = await git(['worktree', 'add', intPath, intBranch], gitRoot)
+        if (add.code !== 0) return { ok: false, reason: `无法创建集成工作区: ${add.stderr.trim()}` }
+      }
       return { ok: true }
     },
 
@@ -105,8 +129,15 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         const branch = branchFor(node)
         const exists = await git(['rev-parse', '--git-dir'], path)
         if (exists.code === 0) {
-          const dirty = await git(['status', '--porcelain'], path)
-          if (dirty.code === 0 && dirty.stdout.trim().length > 0) {
+          // Salvage covers BOTH shapes, because `checkout -B` below destroys both:
+          //   - uncommitted edits (obvious), and
+          //   - commits the executor made itself that never reached the integration branch.
+          // Measured on the second shape: after checkout -B the commit was in 0 refs and the
+          // file was gone from the tree — the very orphaning this branch exists to prevent,
+          // reached through the input a dirty-only check ignores.
+          const dirty = await git(['status', '--porcelain', '--ignored'], path)
+          const unmerged = !(await isMerged(branch))
+          if ((dirty.code === 0 && dirty.stdout.trim().length > 0) || unmerged) {
             await git(['add', '-A'], path)
             await git(['commit', '--no-verify', '-m', `efftask: 恢复时固化中断产出 (${node.id})`], path)
             const sha = await git(['rev-parse', 'HEAD'], path)
@@ -197,11 +228,17 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     async release(node: TaskNode): Promise<{ removed: boolean; keptBecause?: string }> {
       const path = pathFor(node)
       const branch = branchFor(node)
-      const dirty = await git(['status', '--porcelain'], path)
+      // --ignored is load-bearing: plain porcelain hides gitignored files, so a node whose
+      // deliverable is a build output (dist/, coverage/) reported a CLEAN tree and
+      // `worktree remove --force` then deleted it. Measured. That is the opposite of
+      // 宁可保留垃圾,不可删掉工作.
+      const dirty = await git(['status', '--porcelain', '--ignored'], path)
       if (dirty.code !== 0) return { removed: false, keptBecause: '无法读取工作区状态' }
-      if (dirty.stdout.trim().length > 0) return { removed: false, keptBecause: '工作区仍有未提交改动' }
+      if (dirty.stdout.trim().length > 0) return { removed: false, keptBecause: '工作区仍有未提交或被忽略的文件' }
       if (!(await isMerged(branch))) return { removed: false, keptBecause: '仍有未合入集成分支的提交' }
-      const rm = await git(['worktree', 'remove', '--force', path], gitRoot)
+      // No --force: the checks above already proved this tree clean and merged, so --force
+      // could only ever override a safeguard we want.
+      const rm = await git(['worktree', 'remove', path], gitRoot)
       if (rm.code !== 0) return { removed: false, keptBecause: `移除失败: ${rm.stderr.trim()}` }
       await git(['branch', '-D', branch], gitRoot)
       return { removed: true }
