@@ -258,7 +258,12 @@ export function parseExecOutput(
   text: string, tag: string = ANSWER_TAGS.exec,
 ): { execStatus: string; newChildren: NewChildSpec[] } {
   const { obj } = pickAnswer(text, tag, o => typeof o.execStatus === 'string')
-  if (obj) return { execStatus: str(obj.execStatus), newChildren: parseNewChildren(obj) }
+  // newChildren is read from a SEPARATE, tag-REQUIRED pick. Grafting nodes onto the tree is
+  // a structural change, and the lenient pick above matches any same-shaped object anywhere
+  // in the reply — including text quoted INTO the prompt. Reusing it meant an untagged
+  // ```json block, or even bare prose, could grow the tree (reproduced).
+  const { obj: tagged } = pickAnswer(text, tag, o => typeof o.execStatus === 'string', true)
+  if (obj) return { execStatus: str(obj.execStatus), newChildren: tagged ? parseNewChildren(tagged) : [] }
   // Untagged fallback: the whole reply becomes the status. A growth request must NOT be
   // honoured from untagged text — grafting nodes onto the tree is a structural change, and
   // the tag is the only thing separating "my answer" from text quoted into the prompt.

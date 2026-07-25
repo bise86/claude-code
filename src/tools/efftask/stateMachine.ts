@@ -24,7 +24,11 @@ export function advanceableKind(node: TaskNode, byId: Map<string, TaskNode>): Ad
   if (node.status === 'READY' && node.kind === 'executable' && depsSatisfied(node, byId)) return 'execute'
   // WAITING_CHILDREN with ZERO children has nothing to integrate — returning 'integrate'
   // would spin the orchestrator on an empty roundtable. Treat it as not advanceable.
-  if (node.status === 'WAITING_CHILDREN' && node.childIds.length > 0 && childrenAllAccepted(node, byId)) return 'integrate'
+  // depsSatisfied applies HERE too. It used to be checked only on the CREATED/READY paths,
+  // so a node that reached WAITING_CHILDREN by another route — dynamic growth grafting
+  // children onto it — could integrate while its own dependencies were still unfinished,
+  // silently widening the one gate the whole tree is built on.
+  if (node.status === 'WAITING_CHILDREN' && node.childIds.length > 0 && depsSatisfied(node, byId) && childrenAllAccepted(node, byId)) return 'integrate'
   return null
 }
 

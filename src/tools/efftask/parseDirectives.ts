@@ -11,7 +11,7 @@ const PHASE_LABEL: Record<PhaseName, string> = {
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { "plan"?: string[], "review"?: string[], "execute"?: string[], "accept"?: string[], "observer"?: string[] },
-  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number } }
+  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number } }
 phaseRoles 的值是角色名数组。未提及的字段省略。指令:\n`
 
 function clampInt(v: unknown, min: number, max: number, fallback: number): number {
@@ -100,6 +100,10 @@ export async function parseDirectives(
   if (caps.maxDepth !== undefined) c.maxDepth = clampInt(caps.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth)
   if (caps.maxNodes !== undefined) c.maxNodes = clampInt(caps.maxNodes, 1, 5000, DEFAULT_CAPS.maxNodes)
   if (caps.maxIterations !== undefined) c.maxIterations = clampInt(caps.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations)
+  // Without an entry point here the THRESHOLD had none at all: only readRunManifest read it
+  // back, so the "低分触发一次返工" half of 观察评分 was dead code on the normal path —
+  // reachable only by hand-editing run.md and resuming.
+  if (caps.scoreThreshold !== undefined) c.scoreThreshold = clampInt(caps.scoreThreshold, 0, 100, 0)
   base.caps = c
   return base
 }

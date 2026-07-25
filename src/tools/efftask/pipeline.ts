@@ -200,6 +200,26 @@ function planPrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = ''
     answerRule(tag)
   )
 }
+/**
+ * The nodes an executor may name in `newChildren.parent`.
+ *
+ * Without this the prompt asked for a node id and showed NONE — not even the executor's own —
+ * so spec §4's "向树的任一节点加子节点" degraded to "只能加到自己下面": any explicit parent
+ * was a guess, and a wrong guess came back as 目标节点不存在.
+ *
+ * Only SAFE targets are listed, and the set is exactly what growTree accepts: this node
+ * itself, plus nodes already waiting on children. Offering a target that would be refused
+ * invites the executor to spend a round on a request that cannot be honoured.
+ */
+function graftTargets(node: TaskNode, ctx: PipelineCtx): string {
+  const safe = [...ctx.byId.values()].filter(n => n.id === node.id || n.status === 'WAITING_CHILDREN')
+  if (safe.length === 0) return ''
+  // maxNodes can legally reach 5000; an unbounded list would swamp the prompt.
+  const lines = safe.slice(0, 40).map(n => `- ${quote(n.id)}${n.id === node.id ? '(本节点)' : ''}: ${quote(n.title)}`)
+  const more = safe.length > 40 ? `\n(还有 ${safe.length - 40} 个,未全部列出)` : ''
+  return `可作为 newChildren.parent 的节点(只有这些可以挂):\n${lines.join('\n')}${more}\n`
+}
+
 // Reference the IMMUTABLE node goal (set at creation), not the mutable plan.solution —
 // otherwise the goal drifts every time the plan is re-emitted during review iterations.
 function ctxGoal(node: TaskNode): string { return node.goal }
@@ -217,8 +237,9 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
     (feedback
       ? `上一轮验收未通过,阻断意见:\n${quote(feedback)}\n上一轮执行状态:\n${quote(node.execStatus)}\n请针对性返工。\n`
       : '') +
-    `完成后输出:{ "execStatus":"做了什么、结果如何", "newChildren"?:[{"parent"?:"节点 id,省略则挂到本节点下","title","deps":["同批兄弟标题"]}] }。` +
-    `只有在执行中发现必须先完成的新子任务时才给 newChildren;目标节点必须尚未完成。` + answerRule(tag)
+    graftTargets(node, ctx) +
+    `完成后输出:{ "execStatus":"做了什么、结果如何", "newChildren"?:[{"parent"?:"上面清单里的节点 id,省略则挂到本节点下","title","deps":["同批兄弟标题"]}] }。` +
+    `只有在执行中发现必须先完成的新子任务时才给 newChildren。` + answerRule(tag)
   )
 }
 // Blank fields must READ as blank. Interpolating an empty acceptance/execStatus renders
@@ -341,6 +362,15 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       continue
     }
 
+    // Re-check before committing READY. Read-only phases run CONCURRENTLY, so another node's
+    // growTree can have grafted children onto THIS one while its plan call was in flight.
+    // Overwriting that WAITING_CHILDREN with READY orphaned the new subtree: nothing waited
+    // on it, and the run reported completed with the grafted work never executed.
+    if (node.childIds.length > 0) {
+      node.kind = 'decompose'
+      await commit(node, 'WAITING_CHILDREN', ctx)
+      return
+    }
     if (node.kind !== 'decompose') { await commit(node, 'READY', ctx); return }
 
     // Depth cap: force this node executable rather than decomposing. Do NOT silently drop
@@ -395,12 +425,18 @@ export async function createChildren(node: TaskNode, specs: { title: string; dep
     specs.forEach((c, i) => titleToIndex.set(c.title, i))
     // Build the group in a LOCAL array first. Nothing touches ctx.byId / node.childIds until
     // the cycle guard passes, so a rejected group leaves ZERO partial state behind.
-    const created: TaskNode[] = specs.map((c, i) => {
-      const id = childId(node.id, i + 1, c.title)
+    const base = node.childIds.length
+  const created: TaskNode[] = specs.map((c, i) => {
+      // Number AFTER the children this node already has. Restarting at 1 every batch makes
+    // childId collide with an existing sibling — and childId's own comment warns that the
+    // same (index, title) yields the same id and writeNode would OVERWRITE it. Reproduced:
+    // a second batch reusing a title reset an ACCEPTED sibling to CREATED, wiped its
+    // execStatus, and rewrote its node.md. That is irreversible loss of real work.
+    const id = childId(node.id, base + i + 1, c.title)
       const deps = c.deps
         .map(t => titleToIndex.get(t))
         .filter((di): di is number => di !== undefined && di !== i) // unknown title / self-reference
-        .map(di => childId(node.id, di + 1, specs[di].title))
+        .map(di => childId(node.id, base + di + 1, specs[di].title))
       return createNode({
         id,
         title: c.title,
@@ -530,8 +566,21 @@ async function growTree(
   for (const [targetId, kids] of byTarget) {
     const target = ctx.byId.get(targetId)
     if (!target) { refusals.push(`目标节点不存在: ${quote(targetId)}`); continue }
+    // A target must be SAFE to graft onto. Blocking only terminal states was not enough
+    // (reproduced): grafting onto a CREATED/READY node overwrote its status and kind, so its
+    // own plan and execute phases were deleted outright — and because advanceableKind's
+    // WAITING_CHILDREN branch does not consult depsSatisfied, that node then advanced with
+    // its dependencies still unmet. The safe set is: the executing node itself, or a node
+    // that is already waiting on children.
     if (isTerminal(target.status)) {
       refusals.push(`目标节点 ${quote(targetId)} 已是终态(${target.status}),不能再加子节点`)
+      continue
+    }
+    if (target.id !== node.id && target.status !== 'WAITING_CHILDREN') {
+      refusals.push(
+        `目标节点 ${quote(targetId)} 当前是 ${target.status},尚未走完自己的方案/执行阶段;` +
+        `向它插子节点会顶掉那些阶段,请改为挂到本节点下,或等它进入 WAITING_CHILDREN`,
+      )
       continue
     }
     if (target.depth + 1 > ctx.config.caps.maxDepth) {

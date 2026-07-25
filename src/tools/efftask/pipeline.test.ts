@@ -1,5 +1,6 @@
 // src/tools/efftask/pipeline.test.ts
 import { describe, expect, it } from 'bun:test'
+import { parseDirectives } from './parseDirectives.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap } from './stateMachine.js'
@@ -664,17 +665,59 @@ describe('动态生长: an executor grafts children onto any node (spec §4)', (
     expect(n.execStatus).toContain('做了主体工作') // its own evidence survives
   })
 
-  it('grafting onto ANOTHER node leaves this one free to finish', async () => {
+  it('grafting onto a node that is already WAITING_CHILDREN leaves this one free to finish', async () => {
     const n = root()
     const other = createNode({ id: 'other', title: '别处', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
-    other.status = 'READY'
-    other.kind = 'executable'
+    other.status = 'WAITING_CHILDREN'
+    other.kind = 'decompose'
+    other.childIds = []
     const ctx = ctxFor([n, other], grower([{ parent: 'other', title: '挂到别处', deps: [] }]))
     await stepStart(n, ctx)
     await stepExecute(n, ctx)
     expect(n.status).toBe('ACCEPTED')       // this node was not the target, so it proceeds
     expect(other.status).toBe('WAITING_CHILDREN')
     expect(other.childIds).toHaveLength(1)
+  })
+
+  it('refuses a target that has not finished its OWN plan/execute yet', async () => {
+    // Reproduced before this guard: grafting onto a READY node overwrote its status and kind,
+    // deleting its own plan and execute phases outright. Worse, advanceableKind's
+    // WAITING_CHILDREN branch did not consult depsSatisfied, so that node then advanced with
+    // its dependencies still unmet — the one gate the whole tree is built on, widened.
+    const n = root()
+    for (const status of ['CREATED', 'READY', 'PLANNING'] as const) {
+      const target = createNode({ id: 't-' + status, title: '目标', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+      target.status = status
+      target.kind = 'executable'
+      const fresh = root()
+      const ctx = ctxFor([fresh, target], grower([{ parent: target.id, title: '插进去', deps: [] }]))
+      await stepStart(fresh, ctx)
+      await stepExecute(fresh, ctx)
+      expect(`${status}:${target.status}`).toBe(`${status}:${status}`) // untouched
+      expect(target.childIds).toHaveLength(0)
+      expect(fresh.execStatus).toContain('尚未走完自己的方案/执行阶段')
+    }
+    expect(n.id).toBe('root')
+  })
+
+  it('a second batch never reuses an existing sibling id', async () => {
+    // childId's own comment warns that the same (index, title) yields the same id and
+    // writeNode would OVERWRITE it. Restarting the index at 1 every batch reproduced exactly
+    // that: an ACCEPTED sibling was reset to CREATED, its execStatus wiped and its node.md
+    // rewritten — irreversible loss of real work.
+    const n = root()
+    n.status = 'WAITING_CHILDREN'
+    n.kind = 'decompose'
+    const first = createNode({ id: 'root/01-aa', title: 'aa', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    first.status = 'ACCEPTED'
+    first.execStatus = '这是真实完成的工作证据'
+    n.childIds = ['root/01-aa']
+    const ctx = ctxFor([n, first], (async () => '') as RunAgentFn)
+    const res = await createChildren(n, [{ title: 'aa', deps: [] }], ctx)
+    expect(res.ok).toBe(true)
+    expect(ctx.byId.get('root/01-aa')!.execStatus).toBe('这是真实完成的工作证据')
+    expect(ctx.byId.get('root/01-aa')!.status).toBe('ACCEPTED')
+    expect(n.childIds).toEqual(['root/01-aa', 'root/02-aa'])
   })
 
   it('refuses an unknown target and REPORTS the refusal', async () => {
@@ -715,16 +758,28 @@ describe('动态生长: an executor grafts children onto any node (spec §4)', (
   it('a growth request in UNTAGGED text is ignored', async () => {
     // Grafting nodes is a structural change; the per-call tag is the only thing separating
     // "my answer" from text quoted into the prompt.
+    //
+    // The previous version of this test was VACUOUS and a review caught it: its review reply
+    // carried no tag, so the node BLOCKED in stepStart before execute ever ran, and
+    // childIds=0 was trivially true. Mutating the guard away did not redden it. Every reply
+    // below is properly tagged EXCEPT the one under test.
     const n = root()
-    const agent = (async (req: { phase: string }) => {
-      if (req.phase === 'plan') return leafPlan
+    const seen: string[] = []
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      seen.push(req.phase)
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      // The untagged one: a plain json fence carrying a growth request.
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完","newChildren":[{"title":"偷渡","deps":[]}]}\n```'
-      return '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as RunAgentFn
     const ctx = ctxFor([n], agent)
     await stepStart(n, ctx)
     await stepExecute(n, ctx)
+    // Fixture guard: the node must actually have REACHED execute, or this proves nothing.
+    expect(seen).toContain('execute')
+    expect(n.status).toBe('ACCEPTED')
     expect(n.childIds).toHaveLength(0)
+    expect(ctx.byId.size).toBe(1)
   })
 
   it('an empty report is still an empty round even when it grafts nodes', async () => {
@@ -745,5 +800,70 @@ describe('动态生长: an executor grafts children onto any node (spec §4)', (
     expect(n.status).toBe('BLOCKED')
     expect(n.childIds).toHaveLength(0)
     expect(round).toBeGreaterThan(1) // it was sent back for rework, not accepted
+  })
+})
+
+describe('生长的可寻址性、并发安全与阈值入口', () => {
+  it('the execute prompt LISTS the node ids that may be named as parent', async () => {
+    // The prompt asked for a node id and showed none — not even the executor's own — so
+    // "向树的任一节点加子节点" degraded to "只能加到自己下面": any explicit parent was a
+    // guess, and a wrong guess came back as 目标节点不存在.
+    const n = root()
+    const waiting = createNode({ id: 'w', title: '等孩子的节点', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    waiting.status = 'WAITING_CHILDREN'
+    const busy = createNode({ id: 'busy', title: '还没规划的节点', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    busy.status = 'READY'
+    const seen: string[] = []
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'execute') seen.push(req.prompt)
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = ctxFor([n, waiting, busy], agent)
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(seen[0]).toContain('root')            // its own id
+    expect(seen[0]).toContain('(本节点)')
+    expect(seen[0]).toContain('w')               // a safe target
+    // A target growTree would refuse must NOT be offered — inviting a request that cannot be
+    // honoured just burns a round.
+    expect(seen[0]).not.toContain('还没规划的节点')
+  })
+
+  it('a node that gained children while planning does NOT get committed to READY', async () => {
+    // Read-only phases run concurrently, so another node's growTree can graft onto this one
+    // mid-plan. Overwriting with READY orphaned the subtree: nothing waited on it and the run
+    // reported completed with the grafted work never executed.
+    const n = root()
+    let ctx!: ReturnType<typeof ctxFor>
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') {
+        // Simulate the concurrent graft landing while this plan call is in flight.
+        const kid = createNode({ id: 'root/01-塞进来', title: '塞进来', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+        ctx.byId.set(kid.id, kid)
+        n.childIds.push(kid.id)
+        return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      }
+      // MUST carry the per-call tag: an untagged verdict is rejected fail-closed, and the
+      // node would BLOCK in review before this test ever reached what it is checking — the
+      // same vacuous-fixture trap a review just caught in this file.
+      return vtag(req as { prompt: string }) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    ctx = ctxFor([n], agent)
+    await stepStart(n, ctx)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(n.kind).toBe('decompose')
+  })
+
+  it('scoreThreshold can be set from the prompt, not only by hand-editing run.md', async () => {
+    // Without an entry point the "低分触发一次返工" half of 观察评分 was dead code on the
+    // normal path.
+    const cfg = await parseDirectives('打分严格些', {
+      knownRoles: ['watcher'],
+      modelJson: async () => '```json\n{"caps":{"scoreThreshold":80,"maxDepth":3}}\n```',
+    })
+    expect(cfg.caps.scoreThreshold).toBe(80)
+    expect(cfg.caps.maxDepth).toBe(3)
   })
 })

@@ -74,3 +74,26 @@ describe('stateMachine', () => {
     expect(hasCycle([c, d])).toBe(false)
   })
 })
+
+
+describe('the dependency gate holds on EVERY advanceable path', () => {
+  const mk = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id: 'n', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: '2026-07-25T00:00:00.000Z' }),
+    ...over,
+  })
+
+  it('a WAITING_CHILDREN node does NOT integrate while its own deps are unfinished', () => {
+    // depsSatisfied used to be checked only on the CREATED/READY paths. A node that reached
+    // WAITING_CHILDREN by another route — dynamic growth grafting children onto it — could
+    // therefore integrate with its dependencies still unmet, silently widening the one gate
+    // the whole tree is built on. Reproduced before this fix.
+    const dep = mk({ id: 'dep', status: 'READY', kind: 'executable' })
+    const kid = mk({ id: 'p/01-k', parentId: 'p', status: 'ACCEPTED', kind: 'executable' })
+    const parent = mk({ id: 'p', status: 'WAITING_CHILDREN', kind: 'decompose', childIds: ['p/01-k'], deps: ['dep'] })
+    const byId = byIdMap([dep, kid, parent])
+    expect(advanceableKind(parent, byId)).toBeNull()
+
+    dep.status = 'ACCEPTED'
+    expect(advanceableKind(parent, byId)).toBe('integrate')
+  })
+})
