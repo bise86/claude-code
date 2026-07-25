@@ -485,31 +485,49 @@ export type AnswerTag = (typeof ANSWER_TAGS)[keyof typeof ANSWER_TAGS]
 type Candidate = { obj: Record<string, unknown>; tagged: boolean }
 
 /** Every fenced block plus the bare-brace slice, parsed; unparseable ones dropped. */
+const FENCE_RE = /```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)```/g
+
 function collectCandidates(text: string, preferTag?: AnswerTag): Candidate[] {
   const tagged: string[] = []
   const generic: string[] = []
-  for (const m of text.matchAll(/```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)```/g)) {
+  for (const m of text.matchAll(FENCE_RE)) {
     const tag = (m[1] ?? '').toLowerCase()
     if (preferTag && tag === preferTag) tagged.push(m[2])
     else generic.push(m[2])
   }
   const out: Candidate[] = []
   const seen = new Set<string>()
-  const tryPush = (raw: string, isTagged: boolean): void => {
+  const consider = (raw: string, isTagged: boolean): void => {
+    const t = raw.trim()
     let parsed: unknown
-    try { parsed = JSON.parse(raw.trim()) } catch { return } // not JSON; skip
+    try {
+      parsed = JSON.parse(t)
+    } catch {
+      // Unparseable: try to salvage an object out of surrounding prose. Brace
+      // slicing is a REPAIR for broken text, never a way to reach inside valid
+      // JSON — so it only runs when the source failed to parse at all.
+      const f = t.indexOf('{')
+      const l = t.lastIndexOf('}')
+      if (f === -1 || l <= f) return
+      try { parsed = JSON.parse(t.slice(f, l + 1)) } catch { return }
+    }
+    // Valid JSON that isn't a plain object (an array, a number, a string) is not
+    // an answer. Disqualify the whole source rather than digging into it: an
+    // object inside an array is an element, not the model's reply.
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
-    const key = `${isTagged}:${raw.trim()}`
-    if (seen.has(key)) return // the bare-brace slice often re-captures a fence
+    const key = `${isTagged}:${JSON.stringify(parsed)}`
+    if (seen.has(key)) return // the whole-text pass often re-captures a fence
     seen.add(key)
     out.push({ obj: parsed as Record<string, unknown>, tagged: isTagged })
   }
   // Newest first within each group: a correction supersedes an earlier draft.
-  for (let i = tagged.length - 1; i >= 0; i--) tryPush(tagged[i], true)
-  for (let i = generic.length - 1; i >= 0; i--) tryPush(generic[i], false)
-  const first = text.indexOf('{')
-  const last = text.lastIndexOf('}')
-  if (first !== -1 && last > first) tryPush(text.slice(first, last + 1), false)
+  for (let i = tagged.length - 1; i >= 0; i--) consider(tagged[i], true)
+  for (let i = generic.length - 1; i >= 0; i--) consider(generic[i], false)
+  // Finally, prose OUTSIDE every fence — a model that answered without any fence.
+  // Fenced regions are stripped first: their contents were already judged above on
+  // their own terms, and re-slicing across them would mine an object out of a fence
+  // whose real content is an array (an element is not an answer).
+  consider(text.replace(FENCE_RE, ' '), false)
   return out
 }
 
@@ -676,7 +694,7 @@ Expected: FAIL。
 ```ts
 // src/tools/efftask/parseDirectives.ts
 import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES } from './types.js'
-import type { Caps, EffTaskConfig, PhaseName, RoleBinding } from './types.js'
+import type { Caps, EffTaskConfig, RoleBinding } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 
 export type ModelJsonFn = (prompt: string) => Promise<string>
@@ -714,13 +732,18 @@ export async function parseDirectives(
 
   const known = new Set(opts.knownRoles)
   const pr = (obj.phaseRoles ?? {}) as Record<string, unknown>
-  for (const phase of PHASE_NAMES as PhaseName[]) {
+  for (const phase of PHASE_NAMES) {
     const raw = pr[phase]
     if (!Array.isArray(raw)) continue
-    const bindings: RoleBinding[] = raw
-      .map(r => (typeof r === 'string' ? r.trim() : ''))
-      .filter(name => name.length > 0 && known.has(name))
-      .map(name => ({ roleName: name }))
+    // Dedupe: each entry is one seat at the roundtable, so a repeated name (an easy
+    // thing for an extraction model to emit) would run that role twice and give its
+    // verdict double weight.
+    const names = new Set(
+      raw
+        .map(r => (typeof r === 'string' ? r.trim() : ''))
+        .filter(name => name.length > 0 && known.has(name)),
+    )
+    const bindings: RoleBinding[] = [...names].map(name => ({ roleName: name }))
     base.phaseRoles[phase] = bindings
   }
 

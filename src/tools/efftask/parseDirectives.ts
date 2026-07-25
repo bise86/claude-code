@@ -1,6 +1,6 @@
 // src/tools/efftask/parseDirectives.ts
 import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES } from './types.js'
-import type { Caps, EffTaskConfig, PhaseName, RoleBinding } from './types.js'
+import type { Caps, EffTaskConfig, RoleBinding } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 
 export type ModelJsonFn = (prompt: string) => Promise<string>
@@ -38,13 +38,18 @@ export async function parseDirectives(
 
   const known = new Set(opts.knownRoles)
   const pr = (obj.phaseRoles ?? {}) as Record<string, unknown>
-  for (const phase of PHASE_NAMES as PhaseName[]) {
+  for (const phase of PHASE_NAMES) {
     const raw = pr[phase]
     if (!Array.isArray(raw)) continue
-    const bindings: RoleBinding[] = raw
-      .map(r => (typeof r === 'string' ? r.trim() : ''))
-      .filter(name => name.length > 0 && known.has(name))
-      .map(name => ({ roleName: name }))
+    // Dedupe: each entry is one seat at the roundtable, so a repeated name (an easy
+    // thing for an extraction model to emit) would run that role twice and give its
+    // verdict double weight.
+    const names = new Set(
+      raw
+        .map(r => (typeof r === 'string' ? r.trim() : ''))
+        .filter(name => name.length > 0 && known.has(name)),
+    )
+    const bindings: RoleBinding[] = [...names].map(name => ({ roleName: name }))
     base.phaseRoles[phase] = bindings
   }
 

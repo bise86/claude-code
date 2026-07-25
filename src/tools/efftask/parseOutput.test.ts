@@ -140,6 +140,17 @@ describe('parseOutput', () => {
       '附上工具输出:\n```bash\n{"pass":false,"blocking":["来自无关的日志"]}\n```'
     expect(parseVerdict(text, 'main').pass).toBe(true)
   })
+  it('a JSON array is never mined for an inner object', () => {
+    // Brace-slicing exists to repair prose, not to reach inside valid JSON: an
+    // object inside an array is an element, not the model's answer.
+    expect(extractJsonBlock('[{"parallelism":99}]')).toBeNull()
+    expect(extractJsonBlock('```json\n[{"parallelism":99}]\n```')).toBeNull()
+    expect(extractJsonBlock('[1,2,3]')).toBeNull()
+    expect(parseVerdict('```verdict\n[{"pass":true}]\n```', 'r').pass).toBe(false)
+  })
+  it('still salvages a bare object embedded in prose', () => {
+    expect(extractJsonBlock('结论如下 {"pass":true,"blocking":[]} 完毕')).toEqual({ pass: true, blocking: [] })
+  })
   it('never throws on empty or whitespace input', () => {
     for (const t of ['', '   \n\t ']) {
       expect(() => parsePlanOutput(t)).not.toThrow()
