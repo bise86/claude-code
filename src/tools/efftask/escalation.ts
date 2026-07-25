@@ -68,6 +68,8 @@ const TITLE: Record<BlockCategory, string> = {
   timeout: '安全阀 · 单节点执行超时',
   infra: '角色调用连续失败',
   'cap-depth': '安全阀 · 已达最大拆分深度',
+  // NOT an 安全阀 heading: nothing tripped and nothing stopped. The node just recovered.
+  revise: '集成验收未通过 · 已自动追加补救子任务',
 }
 
 /**
@@ -81,11 +83,13 @@ const REMEDY: Record<BlockCategory, string> = {
   timeout: '提高 run.md 里 caps.nodeTimeoutMs 后再重试,或把该节点拆小。',
   infra: '先确认角色模型/网络可用(角色配置在 .claude/settings.json 的 roles 里),再重试。',
   'cap-depth': '若这些子任务确实该独立成节点,提高 run.md 里 caps.maxDepth 后重跑该节点;否则无需处理。',
+  // The only category whose honest advice is 'do nothing'. Saying so beats inventing a knob.
+  revise: '暂时无需处理:补救子任务会照常评审/执行/验收,完成后该节点会重新做一次集成验收。若这一轮仍不通过,该节点才会真正阻断并再次通知你。',
 }
 
 /** The one valve that lets its node continue. Everything the card says branches on this. */
 export function stopsTheNode(category: BlockCategory): boolean {
-  return category !== 'cap-depth'
+  return category !== 'cap-depth' && category !== 'revise'
 }
 
 /**
@@ -132,9 +136,15 @@ export function blockEscalationLines(e: BlockEscalation, runId?: string): string
     // that is still working, and `--retry-blocked` would not match this node at all.
     return [
       ...head,
+      // Per-category, because "the node kept going" is true for all of these and WHY differs
+      // completely. The two-way version fell through to growTree's sentence for every category
+      // except cap-depth, so the 补救拆分 card announced 已追加 N 个补救子任务 on one line and
+      // 这次加子节点的请求被拒绝了 on the next.
       e.category === 'cap-depth'
         ? '状态: 该节点不再拆分,planner 要的子任务已折进它自己的方案里,继续执行。本次运行没有停。'
-        : '状态: 这次加子节点的请求被拒绝了,但该节点本身没有停,会带着这条拒绝记录继续执行和验收。',
+        : e.category === 'revise'
+          ? '状态: 该节点没有停,已转为等待这些补救子任务;它们全部验收通过后,该节点会重新做一次集成验收。'
+          : '状态: 这次加子节点的请求被拒绝了,但该节点本身没有停,会带着这条拒绝记录继续执行和验收。',
       `记录: ${recordPath(e.node, runId)}`,
       `处理方式: ${REMEDY[e.category]}`,
     ]

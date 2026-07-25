@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { blockEscalationLines, blockReasonWithRemedy, buildBlockCard, createEscalationLimiter, MAX_ESCALATION_CARDS, stopsTheNode, type BlockCategory } from './escalation.js'
+import { blockEscalationLines, blockReasonWithRemedy, buildBlockCard, createEscalationLimiter, MAX_ESCALATION_CARDS, stopsTheNode, type BlockCategory} from './escalation.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
 const NOW = '2026-07-26T00:00:00.000Z'
@@ -258,5 +258,52 @@ describe('限流:信息类通知不能吃掉决策类的额度', () => {
     let sent = 0
     for (let i = 0; i < 20; i++) if (l.admit(true).send) sent++
     expect(sent).toBe(8)
+  })
+})
+
+describe('补救拆分的卡片不能自相矛盾(spec §4.1 / §9)', () => {
+  const node = (): TaskNode => ({
+    ...createNode({ id: 'root', title: '根任务', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: '2026-07-26T00:00:00Z' }),
+    kind: 'decompose', childIds: ['root/01-a'],
+  })
+  const lines = () => blockEscalationLines(
+    { node: node(), reason: '集成验收未通过,已追加 2 个补救子任务并重新等待子任务完成', category: 'revise', stopped: false },
+    '003',
+  ).join('\n')
+
+  it('不说"已暂停",因为节点没有停', () => {
+    const t = lines()
+    expect(t).not.toContain('已停')
+    expect(t).toContain('没有停')
+  })
+
+  it('不复用 growTree 那句"加子节点的请求被拒绝了"', () => {
+    // 复用 'rework' 类别时,非停机分支对除 cap-depth 外的一切都硬编码了那句话,于是同一
+    // 张卡上一行说"已追加 2 个补救子任务"、下一行说"这次加子节点的请求被拒绝了"。
+    expect(lines()).not.toContain('被拒绝')
+  })
+
+  it('标题不带"安全阀",也不叫"连续返工超限"', () => {
+    // 什么阀都没触,节点也没停 —— 它刚刚自我恢复。而 'rework' 的定义是"连续返工超限",
+    // 在 §9 里是一个**停机**升级理由。
+    const card = buildBlockCard(
+      { node: node(), reason: 'r', category: 'revise', stopped: false }, '003',
+    ) as { header: { title: { content: string }; template: string } }
+    expect(card.header.title.content).not.toContain('安全阀')
+    expect(card.header.title.content).not.toContain('超限')
+    expect(card.header.title.content).toContain('补救')
+  })
+
+  it('处理方式是"暂时无需处理",不是叫用户去改代码', () => {
+    // 'rework' 的处理方式是"按阻断意见改代码或改验收点;必要时提高 caps.maxIterations" ——
+    // 而节点正在自己修。
+    const t = lines()
+    expect(t).toContain('无需处理')
+    expect(t).not.toContain('提高 caps.maxIterations')
+  })
+
+  it('revise 不是停机类别', () => {
+    expect(stopsTheNode('revise')).toBe(false)
+    expect(stopsTheNode('rework')).toBe(true)
   })
 })

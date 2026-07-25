@@ -7,6 +7,7 @@ import { byIdMap } from './stateMachine.js'
 import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
+import { reseatTransientNodes } from './reseat.js'
 
 // Verdict prompts carry a per-call random tag; a cooperative reviewer answers under THAT tag.
 // Anything else in the reply is quoted context, which parseVerdict deliberately refuses.
@@ -2167,3 +2168,164 @@ describe('spec §4.1:集成验收失败 → 回到 decompose 修订', () => {
     expect(n.execStatus).toContain('补回滚脚本')
   })
 })
+
+describe('§4.1 补救拆分:验收发现的问题', () => {
+  const withKids2 = (over: Partial<TaskNode> = {}): [TaskNode, TaskNode] => {
+    const n = root(); n.kind = 'decompose'; n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    Object.assign(n, over)
+    const c = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    c.status = 'ACCEPTED'; c.execStatus = '做了 A'
+    return [n, c]
+  }
+  const reject = (remedy: string): RunAgentFn =>
+    (async (req: { prompt: string }) => vtag(req) + `\n{"pass":false,"blocking":["缺少回滚"],"comments":"","remedy":${remedy}}\n\`\`\``) as RunAgentFn
+
+  it('修订成功后集成预算归零 —— 否则中断一次就永久打死', async () => {
+    // 修订把节点留在 WAITING_CHILDREN 且 integration === maxIterations,这个组合在本特性
+    // 之前不可达(到上限就立刻阻断)。补救子树要跑几分钟,期间按一次 Esc:
+    // propagateBlocked 扫成 BLOCKED+interrupted → 续跑时 reseat 的耗尽检查看到 3/3 →
+    // 阻断成「预算已耗尽」并把 interrupted 清成 false,而 capBlocked 从来没被设过,
+    // --retry-blocked 也匹配不上。节点永久死亡;是 root 的话就是整个 run 的最终交代。
+    const [n, c] = withKids2()
+    await stepIntegrate(n, ctxFor([n, c], reject('[{"title":"补回滚","deps":[]}]')))
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(n.iteration.integration).toBe(0)
+  })
+
+  it('中断后 --resume 能把修订过的节点重新排队,而不是判它预算耗尽', async () => {
+    const [n, c] = withKids2()
+    await stepIntegrate(n, ctxFor([n, c], reject('[{"title":"补回滚","deps":[]}]')))
+    // 用户按 Esc:propagateBlocked 的效果
+    n.status = 'BLOCKED'; n.interrupted = true; n.blockedReason = '已中断'
+    const r = reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(r.exhausted).toEqual([])
+    expect(r.reseated).toEqual(['root'])
+  })
+
+  it('createChildren 失败的真实原因要进阻断理由,而不是被"迭代超限"盖掉', async () => {
+    // 只有节点数上限会被报出来,其余(落盘失败/依赖成环/标题重复)整个被丢弃,
+    // 用户被告知"必要时提高 caps.maxIterations",而实际故障是磁盘写不进去。
+    const [n, c] = withKids2()
+    // 只让**子节点**落盘失败。第一版让所有 persist 都抛,于是节点在
+    // `commit(INTEGRATION_ACCEPT)` 那一步就先挂了,压根走不到 createChildren —— 用例是绿的,
+    // 但绿的理由完全不对(把 `note: res.reason` 变异掉它照样绿,验收评审的变异矩阵抓到了)。
+    const ctx = {
+      ...ctxFor([n, c], reject('[{"title":"补回滚","deps":[]}]')),
+      persist: async (x: TaskNode) => { if (x.id !== 'root') throw new Error('EIO 磁盘写入失败') },
+    }
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('EIO 磁盘写入失败')
+    // …同时保留上下文:这是集成验收走到头之后才发生的。
+    expect(n.blockedReason).toContain('集成验收迭代超限')
+  })
+
+  it('commit 失败时不覆盖它写下的真实理由,也不给它挂 --retry-blocked', async () => {
+    // `return await commit(...)` 返回 false 时,调用方原本会接着 blockWithReason,把
+    // commit 已经写好的「状态持久化失败: …」覆盖成「集成验收迭代超限」并设 capBlocked=true
+    // —— 于是给一个磁盘坏掉的节点发一张"重试试试"的卡。本文件其他所有 commit 调用点都是
+    // 失败即 return,正是为了这个。
+    const [n, c] = withKids2()
+    const ctx = {
+      ...ctxFor([n, c], reject('[{"title":"补回滚","deps":[]}]')),
+      // 只让**补救子节点挂上之后**那次 commit(WAITING_CHILDREN) 挂掉。用谓词而不是数调用
+      // 次数:圆桌每一轮都会 commit 一次 INTEGRATION_ACCEPT,数数很容易数到子节点落盘那一次
+      // 去(第一版就是,于是测到的是另一条分支)。
+      persist: async (x: TaskNode) => {
+        if (x.id === 'root' && x.childIds.length > 1) throw new Error('EIO 最后一次落盘失败')
+      },
+    }
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('持久化失败')
+    expect(n.blockedReason).not.toContain('集成验收迭代超限')
+    expect(n.capBlocked).not.toBe(true)
+  })
+
+  it('修订发出的升级卡是 revise 类别,不是"连续返工超限"', async () => {
+    // 类别决定卡片的标题、底色、状态句和处理方式。用 'rework' 时那张卡同时说
+    // 「已追加 2 个补救子任务」和「这次加子节点的请求被拒绝了」,标题写着"连续返工超限"
+    // (一个**停机**理由),处理方式叫用户去改代码 —— 而节点正在自己修。
+    const seen: { category: string; stopped?: boolean }[] = []
+    const [n, c] = withKids2()
+    const ctx = { ...ctxFor([n, c], reject('[{"title":"补回滚","deps":[]}]')), onBlocked: (i: { category: string; stopped?: boolean }) => { seen.push(i) } }
+    await stepIntegrate(n, ctx)
+    expect(seen).toHaveLength(1)
+    expect(seen[0].category).toBe('revise')
+    expect(seen[0].stopped).toBe(false)
+  })
+
+  it('深度到顶时把原因折进同一次阻断,不额外发一张"没有停"的卡', async () => {
+    // 那条分支 return 之后下一行就阻断。一张 stopped:false 的蓝卡说"本次运行没有停",
+    // 紧接着一张橙卡说停了,而且蓝卡还声称被拒的子任务"已折进它自己的方案里"——
+    // 那对 stepStart 为真,在这里为假(remedy 是被直接丢弃的)。
+    const fired: string[] = []
+    const [n, c] = withKids2({ depth: DEFAULT_CAPS.maxDepth })
+    const ctx = { ...ctxFor([n, c], reject('[{"title":"补一个","deps":[]}]')), onBlocked: (i: { reason: string; stopped?: boolean }) => { if (i.stopped === false) fired.push(i.reason) } }
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('深度上限')
+    expect(fired).toEqual([]) // 没有任何 stopped:false 的卡
+  })
+
+  it('编排器的注记不能被当成"本节点自己的执行产出"喂给最终裁决圆桌', async () => {
+    // 修订注记写进 execStatus,而 ownWork 的判定原本是"execStatus 非空"。于是纯 decompose
+    // 节点在下一轮被告知它有"已合入集成分支"的产出,内容是一行簿记文字。两句都是假的,
+    // 而这一轮正是 root 的最终裁决轮。
+    const [n, c] = withKids2()
+    await stepIntegrate(n, ctxFor([n, c], reject('[{"title":"补回滚","deps":[]}]')))
+    expect(n.execStatus).toContain('补救子任务') // 注记确实写进去了
+    const prompts: string[] = []
+    const kid = ctx2Child(n)
+    const ctx2 = ctxFor([n, kid], (async (req: { prompt: string }) => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }) as RunAgentFn)
+    n.childIds = [kid.id]
+    await stepIntegrate(n, ctx2)
+    expect(prompts[0]).not.toContain('本节点自己的执行产出')
+  })
+
+  it('reviewer 给的 deps 指向批外节点时回退成链,而不是静默变并行', async () => {
+    // createChildren 只按**本批**标题解析依赖,解析不到的直接丢。而 reviewer 在提示词的
+    // 「子任务结果」小节里看得见既有兄弟的标题,引用它是最自然的写法 —— 结果三个补救
+    // 节点一条边都没有,正是 spec §16 列为最大风险的"同时改同一批文件"。
+    const [n, c] = withKids2()
+    const ctx = ctxFor([n, c], reject('[{"title":"甲","deps":["AA"]},{"title":"乙","deps":["不存在"]},{"title":"丙","deps":["甲"]}]'))
+    await stepIntegrate(n, ctx)
+    const added = n.childIds.slice(1).map(id => ctx.byId.get(id)!)
+    expect(added[0].deps).toEqual([])              // "AA" 不在本批 → 回退(首个无依赖)
+    expect(added[1].deps).toEqual([added[0].id])   // "不存在" → 回退成链
+    expect(added[2].deps).toEqual([added[0].id])   // "甲" 在本批 → 如实解析
+  })
+
+  it('多角色提出同名补救时去重,否则整次修订会被"标题重复"静默放弃', async () => {
+    // 多角色验收正是这个特性的主场景,而 createChildren 对重复标题是整批拒绝的
+    // (兄弟依赖按标题解析,重名让每一处引用都有歧义)。
+    const [n, c] = withKids2()
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: 'r1' }, { roleName: 'r2' }] }
+    const ctx = ctxFor([n, c], reject('[{"title":"补回滚","deps":[]}]')) // 两个角色都会这么答
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(n.childIds).toHaveLength(2) // 原有 1 个 + 去重后的 1 个
+  })
+
+  it('修订只在打满预算那一刻发生,不是每轮都发生', async () => {
+    // 「只在 cap 处、不是每轮」是整个成本论证的核心,而原本只有 `revised` 开关被钉住,
+    // 位置本身零覆盖:挪到每轮的话,第一轮分歧就长出 3 个节点。
+    const [n, c] = withKids2()
+    let rounds = 0
+    const ctx = ctxFor([n, c], (async (req: { prompt: string }) => {
+      rounds++
+      return vtag(req) + '\n{"pass":false,"blocking":["缺少回滚"],"comments":"","remedy":[{"title":"补回滚","deps":[]}]}\n```'
+    }) as RunAgentFn)
+    await stepIntegrate(n, ctx)
+    // 打满 maxIterations 轮圆桌之后才修订一次,而不是第一轮就长树。
+    expect(rounds).toBe(DEFAULT_CAPS.maxIterations)
+    expect(n.childIds).toHaveLength(2)
+  })
+})
+
+function ctx2Child(parent: TaskNode): TaskNode {
+  const k = createNode({ id: 'root/09-fix', title: '补回滚', parentId: parent.id, deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+  k.status = 'ACCEPTED'; k.execStatus = '补好了'
+  return k
+}

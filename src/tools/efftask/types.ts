@@ -9,8 +9,15 @@ export type NodeKind = 'decompose' | 'executable' | 'unknown'
  */
 export type BlockCategory =
   | 'cap-iteration' | 'cap-nodes' | 'rework' | 'timeout' | 'infra' | 'cap-depth'
+  // 补救拆分 (spec §4.1). The only member that is NOT a valve: nothing tripped and nothing
+  // stopped — the node recovered and is waiting on new children. It has its own category
+  // because reusing 'rework' produced a card headed 连续返工超限 (a STOPPING reason) over a
+  // node that had just recovered, in the blue "nothing needs you" template, carrying the
+  // generic non-stopping body text that says the grow request was refused. One card, three
+  // contradictions.
+  | 'revise'
 export const BLOCK_CATEGORIES: ReadonlySet<string> =
-  new Set(['cap-iteration', 'cap-nodes', 'rework', 'timeout', 'infra', 'cap-depth'])
+  new Set(['cap-iteration', 'cap-nodes', 'rework', 'timeout', 'infra', 'cap-depth', 'revise'])
 
 export type NodeStatus =
   | 'CREATED' | 'PLANNING' | 'PLAN_REVIEW'
@@ -157,6 +164,19 @@ export interface TaskNode {
    * converts a terminal state into a recovery rather than taxing every round.
    *
    * Persisted (serializeNode spreads the node), so a crash mid-revision cannot buy a second.
+   *
+   * MEASURED, tree-wide, because "one subtree per node" is a per-node statement and the
+   * interesting number is what it compounds to. Adversarial worst case under DEFAULT_CAPS —
+   * every node decomposing to maxDepth, every decompose node failing integration three times
+   * and proposing three remedies each:
+   *
+   *     with the feature:     100 nodes (= maxNodes), 427 agent calls, 24 revised nodes
+   *     with it switched off:   6 nodes,               17 agent calls
+   *
+   * So the ceiling still holds — `maxNodes` is the binding constraint and `reserveNodes` is
+   * atomic — but on a pathological run this converts "block early" into "spend up to the node
+   * cap", ~25×. That is the honest price, and it is bounded by a cap the user sees and can
+   * lower at the confirmation gate.
    */
   revised?: boolean
   // Separate budgets. `acceptance` belongs to an executable node's accept loop and

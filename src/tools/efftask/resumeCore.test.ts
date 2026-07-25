@@ -649,3 +649,24 @@ describe('剩下五条守卫也要有测试', () => {
     expect(degraded[0]).toContain('"80"')
   })
 })
+
+describe('revised 的归一化(补救拆分只做一次的那把锁)', () => {
+  const base3 = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+  const opts3 = { goal: 'g', phaseRoles: emptyPhaseRoles(), now: NOW }
+
+  it('手改成 "yes" 之类的真值会被打成 false —— 否则能买到第二棵补救子树', () => {
+    // node.md 是设计上可手工编辑的。`revised: "yes"` 不是 `=== true`,而
+    // reviseDecomposition 的守卫是 `node.revised === true` —— 于是这个节点会再修一次,
+    // 而"每节点只修一次"正是整个成本论证唯一的上界。
+    expect(validateLoadedNodes([base3({ revised: 'yes' as never })], opts3).nodes[0].revised).toBe(false)
+    expect(validateLoadedNodes([base3({ revised: 1 as never })], opts3).nodes[0].revised).toBe(false)
+  })
+
+  it('真正的 true 保留,未设置的保持未设置', () => {
+    expect(validateLoadedNodes([base3({ revised: true })], opts3).nodes[0].revised).toBe(true)
+    expect(validateLoadedNodes([base3()], opts3).nodes[0].revised).toBeUndefined()
+  })
+})

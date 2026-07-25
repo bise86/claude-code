@@ -144,6 +144,17 @@ function notifyValve(node: TaskNode, reason: string, category: BlockCategory, ct
   try { ctx.onBlocked?.({ node, reason, category, stopped: false }) } catch { /* a notification failure must not change the run */ }
 }
 
+/**
+ * Prefix marking a line in `execStatus` as ORCHESTRATOR bookkeeping rather than executor output.
+ *
+ * Three writers append to a field that otherwise belongs to the execute phase: reseat's
+ * 上次运行在…中断 note, growTree's refusal list, and 补救拆分's note. Anything that asks
+ * "did this node do its own work?" has to be able to tell them apart — integratePrompt asked
+ * by checking non-emptiness and consequently presented a bookkeeping line to the final
+ * acceptance roundtable as merged code.
+ */
+export const ORCHESTRATOR_NOTE = '(注:'
+
 // A crashing renderer must never take the run down with it.
 function safeUpdate(ctx: PipelineCtx): void {
   try { ctx.onUpdate() } catch { /* UI failure is not a run failure */ }
@@ -430,8 +441,20 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
    * Empty for a pure decompose node, which never executes — so this adds nothing to the
    * prompt for the ordinary case.
    */
-  const ownWork = node.execStatus.trim().length > 0
-    ? `本节点自己的执行产出(已合入集成分支,同样需要你验收):\n${quote(node.execStatus)}\n\n`
+  // ORCHESTRATOR NOTES DO NOT COUNT. `execStatus` holds the executor's own report, but the
+  // orchestrator also appends bookkeeping lines to it — reseat's 上次运行在…中断, growTree's
+  // refusal list, and 补救拆分's own note. Keying "this node did its own work" on "execStatus
+  // is non-empty" therefore told this roundtable that a bookkeeping line was merged code:
+  //   本节点自己的执行产出(已合入集成分支,同样需要你验收):
+  //   (注:集成验收未通过,已追加补救子任务 …)
+  // Two falsehoods in one section, on the round that decides root's final verdict.
+  const realWork = node.execStatus
+    .split('\n')
+    .filter(l => !l.trimStart().startsWith(ORCHESTRATOR_NOTE))
+    .join('\n')
+    .trim()
+  const ownWork = realWork.length > 0
+    ? `本节点自己的执行产出(已合入集成分支,同样需要你验收):\n${quote(realWork)}\n\n`
     : ''
   return (
     (ownWork
@@ -1303,13 +1326,41 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     node.iteration.integration++
     if (node.iteration.integration >= caps.maxIterations) {
       // 回到 decompose 修订 (spec §4.1) — the LAST thing tried before blocking, exactly once.
-      if (await reviseDecomposition(node, rec, ctx)) return
-      await blockWithReason(node, `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx, 'rework')
+      const revise = await reviseDecomposition(node, rec, ctx)
+      if (revise.kind === 'revised') return
+      // commit() already blocked the node with the REAL reason (a persist failure). Falling
+      // through would overwrite it with the iteration message and set capBlocked, i.e. offer
+      // `--retry-blocked` for a node whose disk is broken. Every other commit call site in
+      // this file returns immediately for exactly this reason.
+      if (revise.kind === 'stop') return
+      await blockWithReason(
+        node,
+        `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}` +
+        // WHY the last resort did not fire, folded into the one block rather than announced
+        // on a separate card. A `stopped:false` card saying 本次运行没有停 immediately before
+        // a block that stops the node contradicts itself; and without this line the real
+        // cause (a cycle in the proposed deps, duplicate titles, the node cap, a persist
+        // error) was discarded entirely and the user was told to raise maxIterations.
+        (revise.note ? `;补救拆分未能进行: ${revise.note}` : ''),
+        ctx,
+        'rework',
+      )
       return
     }
     feedback = rec.synthesized.blockingSummary
   }
 }
+
+/**
+ * What `reviseDecomposition` did, so the caller can tell the three outcomes apart.
+ *
+ * A bare boolean conflated "could not revise" with "the node is already blocked for an
+ * unrelated reason", and the caller then reported the wrong cause for both.
+ */
+type ReviseOutcome =
+  | { kind: 'revised' }
+  | { kind: 'stop' }
+  | { kind: 'no'; note?: string }
 
 /**
  * spec §4.1: `INTEGRATION_ACCEPT ──fail──▶ (回到 decompose 修订)`.
@@ -1323,15 +1374,18 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
  * alone changed nothing.
  *
  * Runs at the cap rather than every round, and at most once per node — see TaskNode.revised
- * for why that bound is the whole cost argument. Returns true when the node has been given a
- * corrective subtree and now waits on it; false means "nothing to try, block as before".
+ * for why that bound is the whole cost argument.
  */
-async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: PipelineCtx): Promise<boolean> {
-  if (node.revised === true) return false
+async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: PipelineCtx): Promise<ReviseOutcome> {
+  if (node.revised === true) return { kind: 'no' }
   // Proposals come only from verdicts that FAILED — parseVerdict drops `remedy` on a pass —
   // and are deduped by title across roles. Exact-title agreement between roles is NOT
   // required: with the common single-role roster it would never fire, which would make the
   // whole feature dead code, and a corrective task nobody else named is not thereby wrong.
+  // The dedup itself IS load-bearing on a multi-role panel: two reviewers naming the same
+  // remedy would otherwise reach createChildren as duplicate titles, which it rejects
+  // wholesale (sibling deps are resolved by title, so duplicates make every reference
+  // ambiguous) — and the revision would be silently abandoned precisely when two roles agreed.
   const seen = new Set<string>()
   const specs: { title: string; deps: string[] }[] = []
   for (const v of rec.verdicts) {
@@ -1343,20 +1397,29 @@ async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: P
     }
     if (specs.length >= MAX_REMEDY_CHILDREN) break
   }
-  if (specs.length === 0) return false
-  // The depth valve, same rule and same announcement as stepStart and growTree. Reaching it
-  // through a corrective decomposition does not make it a different event.
+  if (specs.length === 0) return { kind: 'no' }
+  // The depth valve. NOT announced on its own card: this branch is immediately followed by a
+  // block, and a `stopped:false` card reading 本次运行没有停 in front of a stop contradicts
+  // itself — the cap-depth wording additionally claims the refused work was folded into the
+  // node's plan, which is true for stepStart and false here. The reason rides the block.
   if (node.depth + 1 > ctx.config.caps.maxDepth) {
-    notifyValve(node, `补救拆分被深度上限 ${ctx.config.caps.maxDepth} 挡下,该节点将直接阻断`, 'cap-depth', ctx)
-    return false
+    return { kind: 'no', note: `已达深度上限 ${ctx.config.caps.maxDepth}` }
   }
   // CHAINED, not parallel. These siblings are all closing the same integration gap, so they
   // touch the same files; spec §16 calls worktree merge conflict the run's biggest risk and
-  // names dependency edges as the mitigation. A remedy that already declared deps keeps them.
-  const chained = specs.map((c, i) => ({
-    title: c.title,
-    deps: c.deps.length > 0 ? c.deps : i === 0 ? [] : [specs[i - 1].title],
-  }))
+  // names dependency edges as its mitigation.
+  //
+  // A reviewer's own deps are honoured ONLY where they name a sibling in THIS batch, because
+  // that is the only thing createChildren can resolve — it maps dep titles to batch indices
+  // and silently drops the rest. Measured: a remedy citing an existing sibling ("AA", which
+  // the reviewer can see in the prompt's 子任务结果 section) produced three nodes with NO
+  // edges at all, i.e. exactly the parallel-same-files shape this chaining exists to prevent,
+  // and nothing anywhere said so. Anything unresolvable falls back to the chain.
+  const titles = new Set(specs.map(c => c.title))
+  const chained = specs.map((c, i) => {
+    const usable = c.deps.filter(d => titles.has(d) && d !== c.title)
+    return { title: c.title, deps: usable.length > 0 ? usable : i === 0 ? [] : [specs[i - 1].title] }
+  })
   // Carry WHY each child exists. createChildren composes a child goal from the parent goal
   // plus the parent's plan keyPoints — and that plan is the one the roundtable just refused,
   // so without this the corrective child replans against the very text that failed, knowing
@@ -1364,19 +1427,44 @@ async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: P
   const why = rec.synthesized.blockingSummary
   const res = await createChildren(node, chained, ctx, `集成验收未通过,本子任务是为解决以下问题而追加的:\n${why}`)
   if (!res.ok) {
-    if (res.cap) notifyValve(node, `补救拆分被节点上限挡下: ${res.reason}`, 'cap-nodes', ctx)
-    return false
+    // The REAL reason travels back, whatever it was. Only the node cap used to be reported,
+    // so a persist failure, a dependency cycle or duplicate titles were discarded entirely and
+    // the user was told 提高 caps.maxIterations while the actual fault was a broken disk.
+    return { kind: 'no', note: res.reason }
   }
   node.revised = true
+  /**
+   * A FRESH integration budget, and this is a correctness fix rather than generosity.
+   *
+   * Without it the node sits at WAITING_CHILDREN with `iteration.integration === maxIterations`
+   * for however long the corrective subtree takes — a state that was unreachable before this
+   * feature, because reaching the cap used to block immediately. Interrupt in that window
+   * (Esc during a multi-minute child run) and propagateBlocked marks the node
+   * BLOCKED+interrupted; on the next `--resume`, reseat's exhausted check sees 3/3, blocks it
+   * with 恢复时该阶段预算已耗尽 and clears `interrupted` — while `capBlocked` was never set,
+   * so `--retry-blocked` does not match it either. Both reviewers reproduced end to end:
+   * the node is permanently dead, its corrective children already merged, and on root that
+   * sentence becomes the run's final word.
+   *
+   * Resetting is also what the counter MEANS: it bounds re-judging the same evidence, and the
+   * evidence is about to be different. `revised` is the cost bound, and burning the budget was
+   * only ever doing that job by accident — badly, since it also left the re-verification with
+   * a single round and made the eventual block report 超限(3) with the counter reading 4.
+   */
+  node.iteration.integration = 0
   // Recorded where the user will actually look. §11's 不静默截断 applies: a round that
   // silently grew the tree by three nodes reads, in the detail view, as one more identical
   // FAIL — and the tree gaining rows with no explanation is the mirror image of the flattening
   // that stepStart already announces.
   node.execStatus = capText(
-    `${node.execStatus}${node.execStatus ? '\n' : ''}(注:集成验收未通过,已追加补救子任务 ${chained.map(c => c.title).join('、')};通过后将重新集成验收)`,
+    `${node.execStatus}${node.execStatus ? '\n' : ''}${ORCHESTRATOR_NOTE}集成验收未通过,已追加补救子任务 ${chained.map(c => c.title).join('、')};通过后将重新集成验收)`,
     MAX_FIELD_CHARS,
   )
-  notifyValve(node, `集成验收未通过,已追加 ${chained.length} 个补救子任务并重新等待子任务完成`, 'rework', ctx)
+  // Its OWN category, not 'rework'. 'rework' means 连续返工超限 — a stopping reason — so the
+  // card came out headed 安全阀 · 连续返工超限 over a node that had just recovered, in the
+  // blue "nothing is waiting on you" template, with the generic non-stopping body text that
+  // says the grow request was REFUSED. One card contradicted itself three ways.
+  notifyValve(node, `集成验收未通过,已追加 ${chained.length} 个补救子任务并重新等待子任务完成`, 'revise', ctx)
   node.kind = 'decompose'
-  return await commit(node, 'WAITING_CHILDREN', ctx)
+  return (await commit(node, 'WAITING_CHILDREN', ctx)) ? { kind: 'revised' } : { kind: 'stop' }
 }
