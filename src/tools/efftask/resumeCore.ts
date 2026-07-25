@@ -371,6 +371,7 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
         at: r.at,
         reseated: Number.isFinite(r.reseated) ? r.reseated : 0,
         exhausted: Number.isFinite(r.exhausted) ? r.exhausted : 0,
+        ...(Number.isFinite((r as { retried?: number }).retried) ? { retried: (r as { retried: number }).retried } : {}),
         repairs: Array.isArray(r.repairs) ? r.repairs.filter((x): x is string => typeof x === 'string') : [],
       }))
   }

@@ -500,3 +500,43 @@ describe('动态生长的节点撞上合并冲突', () => {
     expect(n.status).toBe('WAITING_CHILDREN')
   })
 })
+
+
+describe('--retry-blocked 重开时要说明工作区被重置了', () => {
+  it('把提示追加进 execStatus,否则返工提示词会指向一个已经不存在的文件', () => {
+    // The re-acquire that follows does `checkout -B <branch> <integration>`, parking the old
+    // output on a salvage ref. Measured: the REWORK prompt still said "上一轮执行状态: 我实现
+    // 了 feature.ts" while that file was gone from the worktree the executor re-entered.
+    const n = mk({
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true, capCategory: 'rework',
+      execStatus: '我实现了 feature.ts 里的令牌桶',
+      iteration: { planReview: 0, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.execStatus).toContain('我实现了 feature.ts')
+    expect(n.execStatus).toContain('隔离工作区已重置')
+    expect(n.execStatus).toContain('salvage')
+  })
+
+  it('重复重开不会把提示叠成一摞', () => {
+    const n = mk({
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true, capCategory: 'rework',
+      execStatus: '做了一半',
+      iteration: { planReview: 0, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    n.status = 'BLOCKED'; n.capBlocked = true; n.capCategory = 'rework'
+    n.iteration.acceptance = 3
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.execStatus.split('隔离工作区已重置').length - 1).toBe(1)
+  })
+
+  it('从没执行过的节点不会凭空多出一段执行状态', () => {
+    const n = mk({
+      id: 'root', kind: 'unknown', status: 'BLOCKED', capBlocked: true, capCategory: 'cap-iteration',
+      iteration: { planReview: 3, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.execStatus).toBe('')
+  })
+})

@@ -522,7 +522,11 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         resumeGuidance: given || inherited,
         resumes: [
           ...(recovered.resumes ?? []),
-          { at: now, reseated: reseated.reseated.length, exhausted: reseated.exhausted.length, repairs: validated.repairs.slice(0, MAX_RECORDED_REPAIRS) },
+          {
+            at: now, reseated: reseated.reseated.length, exhausted: reseated.exhausted.length,
+            ...(reseated.retried.length > 0 ? { retried: reseated.retried.length } : {}),
+            repairs: validated.repairs.slice(0, MAX_RECORDED_REPAIRS),
+          },
         ],
       }
       // Re-resolve the roster against THIS session: a role recorded on disk may no longer

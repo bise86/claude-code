@@ -14,6 +14,7 @@ const ACTIVE: ReadonlySet<NodeStatus> = new Set<NodeStatus>([
 ])
 
 const ANNOTATION = '(注:上次运行在此处中断,已重新排队)'
+const RETRY_NOTE = '(注:本节点被 --retry-blocked 重开,隔离工作区已重置为集成分支最新状态;上面描述的产出已移到 salvage 分支,当前工作区里不存在)'
 
 export interface ReseatResult {
   nodes: TaskNode[]
@@ -183,6 +184,14 @@ export function reseatTransientNodes(
       // Cleared so the NEXT valve trip is a fresh decision, and so a later plain `--resume`
       // does not silently keep offering a retry the user did not ask for again.
       n.capBlocked = false
+      // The re-acquire that follows does `checkout -B <branch> <integration>`, parking the
+      // previous round's output on a salvage ref — so the worktree the executor re-enters is a
+      // clean integration baseline. Without this note the REWORK prompt still said
+      // "上一轮执行状态: 我实现了 feature.ts", and the executor went looking for a file that is
+      // no longer there. Only reachable since --retry-blocked made these nodes resumable.
+      if (n.execStatus.length > 0 && !n.execStatus.includes(RETRY_NOTE)) {
+        n.execStatus = `${n.execStatus}\n${RETRY_NOTE}`
+      }
       retried.push(n.id)
     }
     const spent =

@@ -129,6 +129,14 @@ export interface TaskNode {
   depth: number
   createdAt: string
   updatedAt: string
+  /**
+   * When the node first entered an ACTIVE phase — spec §10.1's "自进入活动态起的累计耗时".
+   *
+   * The panel measured from `createdAt`, so a node that never ran because its dependencies
+   * were unfinished rendered an hour of "耗时" an hour after the tree was built — and a user
+   * hunting for the slow node was pointed at one that had not started.
+   */
+  startedAt?: string
 }
 
 export interface Caps { maxDepth: number; maxNodes: number; maxIterations: number; nodeTimeoutMs: number; scoreThreshold?: number }
@@ -184,6 +192,14 @@ export interface ResumeRecord {
   reseated: number
   /** How many were blocked because the phase they would re-enter has no budget left. */
   exhausted: number
+  /**
+   * How many nodes `--retry-blocked` re-armed.
+   *
+   * The one action on this path that spends budget the run had already refused to spend, and
+   * it was visible only on the resume gate — someone reading run.md afterwards could not tell
+   * a valve had ever been re-opened.
+   */
+  retried?: number
   /** Repair lines, capped — the full list is shown at the gate; this is the durable trace. */
   repairs: string[]
 }

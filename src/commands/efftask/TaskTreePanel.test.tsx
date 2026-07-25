@@ -8,7 +8,7 @@ import { describe, expect, it } from 'bun:test'
 import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
-import { TaskTreePanel, visibleRows, viewport } from './TaskTreePanel.js'
+import { TaskTreePanel, visibleRows, viewport, elapsed } from './TaskTreePanel.js'
 import { NodeDetail } from './NodeDetail.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
 
@@ -518,5 +518,40 @@ describe('实时输出面板不能只交代一半的截断', () => {
     const f = await mountDetail({ output: names, maxLines: 24 })
     const shown = names.filter(l => f.includes(l))
     expect(shown.length).toBeGreaterThan(8)
+  })
+})
+
+
+describe('耗时要量的是"干活的时间",不是"活了多久" (spec §10.1)', () => {
+  it('从没跑过的节点显示"排队中",不是它被创建以来的秒数', () => {
+    // Measured: a node blocked behind unfinished dependencies rendered 3600s an hour after
+    // the tree was built, so a user hunting for the slow node was pointed at one that had
+    // not started.
+    const queued = mk({ id: 'q', status: 'CREATED', createdAt: new Date(Date.now() - 3_600_000).toISOString() })
+    expect(elapsed(queued, Date.now())).toBe('排队中')
+  })
+
+  it('从进入活动态起算', () => {
+    const n = mk({
+      id: 'r', status: 'EXECUTING',
+      createdAt: new Date(Date.now() - 3_600_000).toISOString(),
+      startedAt: new Date(Date.now() - 5_000).toISOString(),
+    })
+    const s = Number(elapsed(n, Date.now()).replace('s', ''))
+    expect(s).toBeGreaterThanOrEqual(4)
+    expect(s).toBeLessThan(10)   // NOT 3600
+  })
+
+  it('终态节点用 updatedAt 收尾', () => {
+    const n = mk({
+      id: 'r', status: 'ACCEPTED',
+      startedAt: new Date(Date.now() - 30_000).toISOString(),
+      updatedAt: new Date(Date.now() - 10_000).toISOString(),
+    })
+    expect(elapsed(n, Date.now())).toBe('20s')
+  })
+
+  it('从没跑过就被阻断的节点显示 -,不假装它跑过', () => {
+    expect(elapsed(mk({ id: 'x', status: 'BLOCKED' }), Date.now())).toBe('-')
   })
 })

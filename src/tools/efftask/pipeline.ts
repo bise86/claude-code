@@ -101,8 +101,14 @@ export interface PipelineCtx {
  * would keep a stale (often transient) status forever. We mark it BLOCKED in memory so the
  * scheduler treats it as terminal rather than re-entering it every tick.
  */
+/** Statuses that mean the node is doing work, not waiting for its turn. */
+const ACTIVE_STATUSES = new Set(['PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'ACCEPTANCE', 'REWORK', 'INTEGRATION_ACCEPT'])
+
 async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineCtx): Promise<boolean> {
   node.status = status
+  // Stamped ONCE, on the first active phase. Re-stamping would restart the clock on every
+  // rework round and under-report exactly the nodes a user is looking for.
+  if (node.startedAt === undefined && ACTIVE_STATUSES.has(status)) node.startedAt = ctx.now()
   node.updatedAt = ctx.now()
   try {
     await ctx.persist(node)
@@ -1200,7 +1206,15 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       await blockWithReason(node, `集成验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec))
       return
     }
-    if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
+    if (rec.synthesized.pass) {
+      // 观察评分 (spec §7) applies to "每个节点", and it only ran on the executable-leaf path —
+      // so every decompose node, and therefore the ROOT (the run's own verdict), was never
+      // scored at all. The observer's rework signal is deliberately NOT honoured here: a
+      // decompose node has no execute phase to redo, and its children are already ACCEPTED.
+      await scoreNode(node, ctx)
+      await commit(node, 'ACCEPTED', ctx)
+      return
+    }
     node.iteration.integration++
     if (node.iteration.integration >= caps.maxIterations) {
       await blockWithReason(node, `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx, 'rework')

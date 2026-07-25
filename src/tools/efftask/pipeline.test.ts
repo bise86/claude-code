@@ -1721,3 +1721,81 @@ describe('长了子节点又没合上的节点,不能靠子任务成绩验收通
     expect(p.status).toBe('ACCEPTED')
   })
 })
+
+
+describe('观察评分要覆盖 decompose 节点 —— 包括 root,也就是整个 Run 的结果', () => {
+  it('集成验收通过后给 decompose 节点打分', async () => {
+    // spec §7 says 每个节点; scoreNode only ran on the executable-leaf path, so every
+    // decompose node — and therefore the root, the run's own verdict — was never scored.
+    const withObserver: EffTaskConfig = {
+      ...cfg, phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'scorer' }] },
+    }
+    const p = root()
+    // scoreNode reads the NODE's roster (firstRole(node,'observer')), not the config's —
+    // createNode copies phaseRoles per node, so the config alone would score nothing.
+    p.phaseRoles = { ...emptyPhaseRoles(), observer: [{ roleName: 'scorer' }] }
+    p.kind = 'decompose'
+    p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const ctx = ctxFor([p, kid], async req => {
+      if (req.phase === 'observer') {
+        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        return '```' + tag + '\n{"plan":{"score":88,"rationale":"结构清楚"},"exec":{"score":91,"rationale":"子任务齐"}}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    }, withObserver)
+    await stepIntegrate(p, ctx)
+    expect(p.status).toBe('ACCEPTED')
+    expect(p.score.plan?.score).toBe(88)
+    expect(p.score.exec?.score).toBe(91)
+  })
+
+  it('没有观察角色时仍然什么都不做', async () => {
+    const p = root()
+    p.kind = 'decompose'
+    p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const phases: string[] = []
+    const ctx = ctxFor([p, kid], async req => {
+      phases.push(req.phase)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    })
+    await stepIntegrate(p, ctx)
+    expect(phases).not.toContain('observer')
+    expect(p.status).toBe('ACCEPTED')
+  })
+})
+
+
+describe('startedAt:进入活动态的那一刻', () => {
+  it('第一次进入活动阶段时打戳,后续返工不重置', async () => {
+    // The panel measures 耗时 from this. Re-stamping on every commit would restart the clock
+    // on each rework round and under-report exactly the nodes a user is hunting for.
+    const n = root()
+    n.kind = 'executable'
+    let stamp = 0
+    const stamps: (string | undefined)[] = []
+    let accepts = 0
+    const ctx = ctxFor([n], async req => {
+      stamps.push(n.startedAt)
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做了"}\n```'
+      accepts++
+      return vtag(req) + (accepts === 1
+        ? '\n{"pass":false,"blocking":["再来"],"comments":""}\n```'
+        : '\n{"pass":true,"blocking":[],"comments":""}\n```')
+    })
+    ctx.now = () => new Date(1000 + stamp++ * 1000).toISOString()
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.startedAt).toBeDefined()
+    // Stamped once, on the FIRST active commit — not moved by the rework round.
+    const first = n.startedAt
+    expect(stamps.filter(Boolean).every(s => s === first)).toBe(true)
+  })
+
+  it('还没跑过的节点没有 startedAt', () => {
+    expect(root().startedAt).toBeUndefined()
+  })
+})

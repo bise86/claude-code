@@ -17,7 +17,14 @@ const GLYPH: Record<UiStatus, string> = { done: '●', running: '◐', queued: '
  * of leaking "NaNs" into the tree.
  */
 export function elapsed(node: TaskNode, nowMs: number): string {
-  const start = Date.parse(node.createdAt)
+  // From the node's FIRST ACTIVE phase, per spec §10.1 ("自进入活动态起的累计耗时"), not from
+  // creation. Measured before: a node that never ran because its dependencies were unfinished
+  // rendered 3600s an hour after the tree was built, so a user hunting for the slow node was
+  // pointed at one that had not started.
+  if (node.startedAt === undefined) {
+    return node.status === 'ACCEPTED' || node.status === 'BLOCKED' ? '-' : '排队中'
+  }
+  const start = Date.parse(node.startedAt)
   if (!Number.isFinite(start)) return '-'
   const terminal = node.status === 'ACCEPTED' || node.status === 'BLOCKED'
   const endParsed = terminal ? Date.parse(node.updatedAt) : nowMs
