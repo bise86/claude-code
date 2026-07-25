@@ -413,6 +413,53 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       return out
     },
 
+    /**
+     * Bring the integration branch INTO this node's worktree, and leave NO conflict behind.
+     *
+     * 跨分支依赖调度: a node's worktree is based on the integration tip at `acquire` time and
+     * then frozen. The dependency GATE guarantees a node's own deps merged before it starts,
+     * but nothing keeps it current afterwards — and an executable node can spend several
+     * rework rounds in that worktree while sibling branches merge. Measured consequence: the
+     * executor reworks against a tree that is missing merged work, the acceptance roundtable
+     * reads that same stale tree, and the final merge is far likelier to conflict over hunks
+     * neither side ever saw.
+     *
+     * Deliberately NOT `mergeIntegrationIntoNode`: that one leaves the conflict in place,
+     * which is exactly right when a human or a resolver is about to work on it and exactly
+     * wrong in the middle of a rework loop — the executor would be asked to fix acceptance
+     * blockers and resolve a merge in one round, in a tree it did not expect to be conflicted.
+     * Here a conflict simply means "stay on the old base"; the merge at the end still catches
+     * it and routes it through the tested §8 conflict path.
+     */
+    async refreshFromIntegration(node: TaskNode): Promise<
+      { ok: true; updated: boolean } | { ok: false; conflicted: boolean; message: string }
+    > {
+      const path = pathFor(node)
+      // Already contains everything the integration branch has → nothing to do, and no
+      // pointless commit of the executor's half-finished work.
+      const current = await git(['merge-base', '--is-ancestor', intBranch, 'HEAD'], path)
+      if (current.code === 0) return { ok: true, updated: false }
+      // `git merge` refuses to start on a dirty tree. Committing here is safe: commitAndMerge
+      // would commit exactly the same content under exactly the same message later, and it
+      // is what makes `merge --abort` below a lossless restore.
+      const add = await git(['add', '-A'], path)
+      if (add.code !== 0) return { ok: false, conflicted: false, message: `git add 失败: ${add.stderr.trim()}` }
+      const staged = await git(['diff', '--cached', '--quiet'], path)
+      if (staged.code !== 0) {
+        const c = await git(['commit', '--no-verify', '-m', `efftask: ${node.title}`], path)
+        if (c.code !== 0) return { ok: false, conflicted: false, message: `提交失败: ${c.stderr.trim() || c.stdout.trim()}` }
+      }
+      const merge = await git(['merge', '--no-edit', intBranch], path)
+      if (merge.code === 0) return { ok: true, updated: true }
+      const u = await git(['diff', '--name-only', '--diff-filter=U'], path)
+      const conflicted = u.stdout.trim().length > 0
+      // Restore. NOT reset --hard: the executor's work is committed now, and abort rewinds
+      // only the merge. A failed abort (no merge in progress) is harmless here — there is
+      // then nothing half-done to undo.
+      await git(['merge', '--abort'], path)
+      return { ok: false, conflicted, message: merge.stderr.trim() || merge.stdout.trim() || '合并未生效' }
+    },
+
     async conflictState(node: TaskNode): Promise<{ markers: boolean; staged: boolean; stale: boolean; files: string[] }> {
       const path = pathFor(node)
       const u = await git(['diff', '--name-only', '--diff-filter=U'], path)

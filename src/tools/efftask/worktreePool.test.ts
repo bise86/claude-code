@@ -660,3 +660,135 @@ describe('不把自己的痕迹留在用户的 git status 里', () => {
     expect(txt.split('.efftask-worktrees/').length - 1).toBe(1)
   })
 })
+
+describe('跨分支依赖调度:一个节点看得见依赖合进来的东西吗', () => {
+  const read = async (path: string, file: string): Promise<string> => {
+    const r = await git(['show', `HEAD:${file}`], path)
+    return r.code === 0 ? r.stdout : ''
+  }
+
+  it('a node acquired AFTER a dependency merged starts from that dependency\'s work', async () => {
+    // The whole isolation design rests on this: the dependency GATE only guarantees the dep
+    // reached ACCEPTED, and ACCEPTED means merged. What makes the downstream node able to
+    // BUILD on it is that acquire bases the new worktree on the integration tip. Nothing in
+    // the suite proved that, and it is one `worktree add <base>` argument away from silently
+    // becoming "based on main" — every node would then plan against a repo that never saw
+    // its upstream, and every merge would conflict.
+    const p = pool()
+    await p.init()
+    const dep = node('root/01-dep', '写 schema')
+    const lease = await p.acquire(dep)
+    if ('error' in lease) throw new Error(lease.error)
+    await writeFile(join(lease.path, 'schema.sql'), 'CREATE TABLE t;\n')
+    expect(await p.commitAndMerge(dep)).toEqual({ ok: true, merged: true })
+
+    const downstream = node('root/02-use', '用 schema')
+    const l2 = await p.acquire(downstream)
+    if ('error' in l2) throw new Error(l2.error)
+    expect(await read(l2.path, 'schema.sql')).toContain('CREATE TABLE t;')
+  })
+
+  it('a worktree acquired BEFORE the merge is stale — which is what refresh exists for', async () => {
+    // Measured, and the reason 跨分支依赖调度 needed anything at all: acquire freezes the
+    // base. A node that sits in a rework loop while siblings merge is editing a tree that no
+    // longer matches what it will merge into.
+    const p = pool()
+    await p.init()
+    const early = node('root/01-early', '早开工的')
+    const l1 = await p.acquire(early)
+    if ('error' in l1) throw new Error(l1.error)
+
+    const other = node('root/02-other', '别人')
+    const l2 = await p.acquire(other)
+    if ('error' in l2) throw new Error(l2.error)
+    await writeFile(join(l2.path, 'shared.ts'), 'export const a = 1\n')
+    await p.commitAndMerge(other)
+
+    // Stale by construction.
+    expect(await read(l1.path, 'shared.ts')).toBe('')
+    const sync = await p.refreshFromIntegration(early)
+    expect(sync).toEqual({ ok: true, updated: true })
+    expect(await read(l1.path, 'shared.ts')).toContain('export const a = 1')
+  })
+
+  it('refresh commits the executor\'s loose work instead of refusing on a dirty tree', async () => {
+    // `git merge` refuses to start on a dirty tree, and a rework round is exactly when the
+    // tree is dirty. Reporting that as a failure would make the refresh useless precisely
+    // where it is needed.
+    const p = pool()
+    await p.init()
+    const a = node('root/01-a')
+    const l = await p.acquire(a)
+    if ('error' in l) throw new Error(l.error)
+    await writeFile(join(l.path, 'mine.ts'), 'mine\n')
+
+    const other = node('root/02-b')
+    const l2 = await p.acquire(other)
+    if ('error' in l2) throw new Error(l2.error)
+    await writeFile(join(l2.path, 'theirs.ts'), 'theirs\n')
+    await p.commitAndMerge(other)
+
+    expect(await p.refreshFromIntegration(a)).toEqual({ ok: true, updated: true })
+    // BOTH survive: the loose work was committed, not discarded.
+    expect(await read(l.path, 'mine.ts')).toContain('mine')
+    expect(await read(l.path, 'theirs.ts')).toContain('theirs')
+  })
+
+  it('says "nothing to do" instead of manufacturing an empty commit', async () => {
+    const p = pool()
+    await p.init()
+    const a = node('root/01-a')
+    await p.acquire(a)
+    expect(await p.refreshFromIntegration(a)).toEqual({ ok: true, updated: false })
+  })
+
+  it('leaves NO conflict behind when the refresh conflicts', async () => {
+    // The rework loop is not the place to hand someone a conflicted tree: the executor was
+    // asked to fix acceptance blockers, and would find <<<<<<< markers it did not expect in
+    // files it may not even be working on. Staying on the old base is the honest answer —
+    // the merge at the end still catches it and routes it through the §8 conflict path.
+    const p = pool()
+    await p.init()
+    const a = node('root/01-a')
+    const la = await p.acquire(a)
+    if ('error' in la) throw new Error(la.error)
+    const b = node('root/02-b')
+    const lb = await p.acquire(b)
+    if ('error' in lb) throw new Error(lb.error)
+
+    await writeFile(join(la.path, 'shared.txt'), 'A 的版本\n')
+    await writeFile(join(lb.path, 'shared.txt'), 'B 的版本\n')
+    await p.commitAndMerge(b)
+
+    const sync = await p.refreshFromIntegration(a)
+    expect(sync.ok).toBe(false)
+    if (sync.ok) return
+    expect(sync.conflicted).toBe(true)
+    // No markers, no MERGE_HEAD, nothing half-done — and A's own work intact.
+    const st = await git(['status', '--porcelain'], la.path)
+    expect(st.stdout.trim()).toBe('')
+    expect(await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], la.path)).toMatchObject({ code: 1 })
+    expect(await read(la.path, 'shared.txt')).toContain('A 的版本')
+  })
+
+  it('a refreshed node still merges cleanly afterwards', async () => {
+    // The point of refreshing: the eventual merge becomes a fast-forward instead of a
+    // three-way merge over hunks neither side has seen.
+    const p = pool()
+    await p.init()
+    const a = node('root/01-a')
+    const la = await p.acquire(a)
+    if ('error' in la) throw new Error(la.error)
+    const b = node('root/02-b')
+    const lb = await p.acquire(b)
+    if ('error' in lb) throw new Error(lb.error)
+    await writeFile(join(lb.path, 'theirs.ts'), 'theirs\n')
+    await p.commitAndMerge(b)
+
+    await writeFile(join(la.path, 'mine.ts'), 'mine\n')
+    expect(await p.refreshFromIntegration(a)).toEqual({ ok: true, updated: true })
+    expect(await p.commitAndMerge(a)).toEqual({ ok: true, merged: true })
+    const intFile = await git(['show', `efftask/001/integration:mine.ts`], gitRoot)
+    expect(intFile.stdout).toContain('mine')
+  })
+})

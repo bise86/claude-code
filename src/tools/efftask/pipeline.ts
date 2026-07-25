@@ -285,11 +285,15 @@ function ctxGoal(node: TaskNode): string { return node.goal }
 function reviewPrompt(node: TaskNode, tag: string): string {
   return `请评审以下方案是否可执行、完整、无重大风险。方案:\n${quote(JSON.stringify(node.plan))}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` + answerRule(tag)
 }
-function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = ''): string {
+function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', syncNote = ''): string {
   return (
     `按以下方案执行任务并完成实际改动。方案:\n${quote(JSON.stringify(node.plan))}\n` +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
+    // 跨分支依赖调度: what happened on the integration branch while this node worked. Told to
+    // the executor rather than buried in execStatus, because it changes what it should DO —
+    // re-read files that moved, or expect a conflict it will have to help resolve.
+    syncNote +
     // REWORK path: show the acceptance blockers AND what the previous round already did,
     // so the rerun is a targeted fix rather than a blind repeat.
     (feedback
@@ -831,6 +835,12 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
   // Record it so the user can find it rather than discovering a stray directory later.
   if (!rel.removed && rel.keptBecause) {
     node.execStatus = `${node.execStatus}\n(注:隔离工作区已保留 —— ${rel.keptBecause};路径 ${node.worktree.path})`
+  } else if (rel.removed) {
+    // The directory is GONE. Keeping the reference made the node advertise a path that no
+    // longer exists — NodeDetail renders it under 隔离工作区, and handoff() probes it — which
+    // is the product stating something untrue about its own state. It also makes a later
+    // re-entry (resume, growth) skip `acquire` and run against nothing.
+    node.worktree = undefined
   }
   return true
 }
@@ -895,12 +905,31 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   // persisted log so a resumed node does not repeat work that was already rejected.
   let feedback = lastFailureFeedback(node.acceptLog)
   let emptyReports = 0
+  let round = 0
+  let syncNote = ''
   for (;;) {
+    round++
+    // 跨分支依赖调度. `acquire` based this worktree on the integration tip, and then froze it.
+    // Rounds 2+ can be minutes or hours later, with sibling branches merged in between — so
+    // refresh before reworking rather than editing a tree that no longer matches what the
+    // node will merge into. Round 1 needs nothing: acquire just did it.
+    if (round > 1 && ctx.worktrees && node.worktree) {
+      const sync = await ctx.worktrees.refreshFromIntegration(node)
+      syncNote = sync.ok
+        ? sync.updated
+          ? '注意:自上一轮以来集成分支上有其他任务的改动已合入你的工作区,相关文件可能已变化,动手前先重新读一遍。\n'
+          : ''
+        : sync.conflicted
+          // Honest, and actionable: the node stays on its old base, and the executor is the
+          // one who can make the eventual merge resolvable by not fighting the other side.
+          ? '注意:集成分支上有其他任务的改动,但与你的改动冲突,本轮未能同步(仍在原基线上)。请尽量只改与本任务相关的部分,避免让冲突扩大。\n'
+          : ''
+    }
     if (!(await commit(node, 'EXECUTING', ctx))) return
     // node.execStatus still holds the PREVIOUS round's result here (it's overwritten below),
     // which is exactly what executePrompt renders on rework.
     const execTag = answerTag(ANSWER_TAGS.exec)
-    const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback), cwd: node.worktree?.path, signal: ctx.signal })
+    const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote), cwd: node.worktree?.path, signal: ctx.signal })
     if (!res.ok) {
       // Keep whatever the executor managed to report before the interruption. It ran with
       // write tools, so discarding this can leave the repo changed with no record of it.

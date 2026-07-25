@@ -937,6 +937,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     conflictState: async () => ({ markers: true, staged: false, files: ['src/a.ts'] }),
+    refreshFromIntegration: async () => ({ ok: true, updated: false }),
     mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
     integrationBranchName: 'efftask/001/integration',
     ...over,
@@ -1315,5 +1316,151 @@ describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
     await stepStart(n, ctx)
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain('评审迭代超限')
+  })
+})
+
+describe('跨分支依赖调度:返工前先把基线拉齐', () => {
+  const fakePool = (over: Record<string, unknown> = {}) => ({
+    acquire: async (n: TaskNode) => ({ path: '/wt/' + n.id, branch: 'b/' + n.id, gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: true, merged: true }),
+    release: async () => ({ removed: true }),
+    dispose: async () => ({ kept: [] }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    handoff: async () => ({ branch: 'i', commits: 0, kept: [], salvage: [] }),
+    conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+    mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
+    refreshFromIntegration: async () => ({ ok: true, updated: false }),
+    integrationPath: '/wt/integration',
+    integrationBranchName: 'efftask/001/integration',
+    ...over,
+  })
+  /** Executor always reports work; the reviewer rejects the first `failures` rounds. */
+  const reworkAgent = (failures: number, prompts: string[]) => {
+    let seen = 0
+    const run: RunAgentFn = async req => {
+      if (req.phase === 'execute') { prompts.push(req.prompt); return '```json\n{"execStatus":"改了 src/a.ts"}\n```' }
+      seen++
+      return seen <= failures
+        ? vtag(req) + '\n{"pass":false,"blocking":["缺测试"],"comments":""}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    }
+    return run
+  }
+
+  it('does NOT refresh on the first round — acquire just based it on the integration tip', async () => {
+    const n = root(); n.kind = 'executable'
+    let refreshes = 0
+    const ctx = ctxFor([n], reworkAgent(0, []))
+    ctx.worktrees = fakePool({ refreshFromIntegration: async () => { refreshes++; return { ok: true, updated: false } } }) as never
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(refreshes).toBe(0)
+  })
+
+  it('refreshes before every REWORK round, so the rerun edits what it will merge into', async () => {
+    // Measured against real git: acquire freezes the base. A node reworking while siblings
+    // merge edits a tree missing their work — and the acceptance roundtable reads that same
+    // stale tree.
+    const n = root(); n.kind = 'executable'
+    const refreshed: string[] = []
+    const ctx = ctxFor([n], reworkAgent(2, []))
+    ctx.worktrees = fakePool({
+      refreshFromIntegration: async (x: TaskNode) => { refreshed.push(x.id); return { ok: true, updated: false } },
+    }) as never
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(refreshed).toEqual(['root', 'root']) // rounds 2 and 3, never round 1
+  })
+
+  it('tells the executor when its base actually moved', async () => {
+    const n = root(); n.kind = 'executable'
+    const prompts: string[] = []
+    const ctx = ctxFor([n], reworkAgent(1, prompts))
+    ctx.worktrees = fakePool({ refreshFromIntegration: async () => ({ ok: true, updated: true }) }) as never
+    await stepExecute(n, ctx)
+    expect(prompts[0]).not.toContain('已合入你的工作区')       // round 1: nothing moved
+    expect(prompts[1]).toContain('其他任务的改动已合入你的工作区') // round 2: say so
+    expect(prompts[1]).toContain('重新读一遍')
+  })
+
+  it('says nothing when the base did not move — no note is better than a false one', async () => {
+    const n = root(); n.kind = 'executable'
+    const prompts: string[] = []
+    const ctx = ctxFor([n], reworkAgent(1, prompts))
+    ctx.worktrees = fakePool() as never
+    await stepExecute(n, ctx)
+    expect(prompts[1]).not.toContain('已合入你的工作区')
+    expect(prompts[1]).not.toContain('未能同步')
+  })
+
+  it('a conflicting refresh does not kill the round — it warns and keeps going', async () => {
+    // Staying on the old base is recoverable; the merge at the end still routes a real
+    // conflict through the §8 path. Blocking here would throw away a finished rework.
+    const n = root(); n.kind = 'executable'
+    const prompts: string[] = []
+    const ctx = ctxFor([n], reworkAgent(1, prompts))
+    ctx.worktrees = fakePool({
+      refreshFromIntegration: async () => ({ ok: false, conflicted: true, message: 'CONFLICT' }),
+    }) as never
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(prompts[1]).toContain('未能同步')
+    expect(prompts[1]).toContain('避免让冲突扩大')
+  })
+
+  it('an un-isolated run has no base to refresh and must not try', async () => {
+    const n = root(); n.kind = 'executable'
+    const ctx = ctxFor([n], reworkAgent(1, []))
+    // No pool at all — reaching for refreshFromIntegration here would be a TypeError that
+    // reads to the user as a blocked node.
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+  })
+})
+
+describe('一个被回收掉的隔离工作区不能继续被声称存在', () => {
+  it('clears node.worktree once release actually removed the directory', async () => {
+    // NodeDetail renders 隔离工作区 from this field and handoff() probes the path. Keeping a
+    // reference to a deleted directory is the product stating something untrue about itself,
+    // and it also makes a later re-entry skip acquire and run against nothing.
+    const n = root(); n.kind = 'executable'
+    const ctx = ctxFor([n], async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```')
+    ctx.worktrees = {
+      acquire: async (x: TaskNode) => ({ path: '/wt/' + x.id, branch: 'b', gitRoot: '/repo' }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
+      release: async () => ({ removed: true }),
+      refreshFromIntegration: async () => ({ ok: true, updated: false }),
+      conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+      mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      integrationPath: '/wt/i', integrationBranchName: 'i',
+    } as never
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.worktree).toBeUndefined()
+  })
+
+  it('KEEPS the reference when release refused to delete — that is where the work still is', async () => {
+    const n = root(); n.kind = 'executable'
+    const ctx = ctxFor([n], async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```')
+    ctx.worktrees = {
+      acquire: async (x: TaskNode) => ({ path: '/wt/' + x.id, branch: 'b', gitRoot: '/repo' }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
+      release: async () => ({ removed: false, keptBecause: '工作区仍有未提交或被忽略的文件' }),
+      refreshFromIntegration: async () => ({ ok: true, updated: false }),
+      conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+      mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      integrationPath: '/wt/i', integrationBranchName: 'i',
+    } as never
+    await stepExecute(n, ctx)
+    expect(n.worktree?.path).toBe('/wt/root')
+    expect(n.execStatus).toContain('隔离工作区已保留')
   })
 })

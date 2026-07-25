@@ -60,6 +60,7 @@ describe('人工解决合并冲突后,--resume 真的接手', () => {
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     conflictState: async () => ({ markers: true, staged: false, files: ['src/pay.ts'] }),
+    refreshFromIntegration: async () => ({ ok: true, updated: false }),
     mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/pay.ts'] }),
     integrationBranchName: 'efftask/001/integration',
     ...over,
