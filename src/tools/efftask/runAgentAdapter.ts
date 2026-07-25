@@ -66,10 +66,10 @@ export function makeRunAgentFn(deps: {
     // Forward cancellation INTO the sub-agent instead of only polling between messages:
     // otherwise an abort is invisible until the next yield, so a stall before the first
     // message is never noticed and a cancelled run keeps a live agent working.
+    // (An already-aborted signal returned above, so the listener is always the live path.)
     const inner = new AbortController()
     const relay = (): void => inner.abort()
-    if (req.signal.aborted) inner.abort()
-    else req.signal.addEventListener('abort', relay, { once: true })
+    req.signal.addEventListener('abort', relay, { once: true })
 
     const collected: Message[] = []
     const invoke = (): AsyncGenerator<Message, void> =>
