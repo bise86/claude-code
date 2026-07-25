@@ -501,3 +501,52 @@ describe('slotUsage:状态条读的那个数', () => {
     expect(orch.slotUsage().limit).toBe(1)
   })
 })
+
+describe('spec §7:圆桌的多个角色是在同一个节点内并行的', () => {
+  /**
+   * 这条曾经完全没有被守住。
+   *
+   * 把 `mapWithinPool` 换成一个纯串行的 for 循环,**全套 883 个用例照样全绿** —— 包括那条
+   * `expect(m.peak.review).toBeGreaterThan(1)`。原因是它被跨节点的重叠满足了:三个叶子节点
+   * 各自的 review 调用本来就会同时在跑,所以"review 阶段峰值 > 1"为真,但为的是另一个理由。
+   * spec §7 要的是"独立**并行**"——同一个节点内的多个评审角色同时开跑。
+   *
+   * 所以这里只放**一个**节点,峰值就只能来自圆桌自身的扇出。
+   */
+  const roles = [{ roleName: 'r0' }, { roleName: 'r1' }, { roleName: 'r2' }]
+  const single = (): RunAgentFn => (async (req: { phase: string; prompt: string }) => {
+    await tick(8) // hold the call open long enough for siblings to overlap
+    if (req.phase === 'plan') return reply(req, LEAF) // executable ⇒ exactly one node in the tree
+    if (req.phase === 'execute') return reply(req, '{"execStatus":"done"}')
+    return reply(req, '{"pass":true,"blocking":[],"comments":"ok"}')
+  }) as unknown as RunAgentFn
+
+  it('单个节点的评审圆桌:三个角色同时在跑', async () => {
+    const m = phaseMeter()
+    const orch = new EffTaskOrchestrator(
+      cfg({ parallelism: 5, phaseRoles: { ...emptyPhaseRoles(), review: roles } }),
+      deps(m.wrap(single())), new AbortController().signal)
+    expect((await orch.run()).status).toBe('completed')
+    // 树里只有一个节点,所以这个峰值除了圆桌扇出没有别的来源。
+    expect(m.peak.review).toBe(3)
+  })
+
+  it('单个节点的验收圆桌同样并行', async () => {
+    const m = phaseMeter()
+    const orch = new EffTaskOrchestrator(
+      cfg({ parallelism: 5, phaseRoles: { ...emptyPhaseRoles(), accept: roles } }),
+      deps(m.wrap(single())), new AbortController().signal)
+    expect((await orch.run()).status).toBe('completed')
+    expect(m.peak.accept).toBe(3)
+  })
+
+  it('但仍然受全局池约束:parallelism 1 时圆桌退化为串行,而不是死锁', async () => {
+    // mapWithinPool 的第一项蹭调用方的槽位、其余 try-lease,正是为了这里不死锁。
+    const m = phaseMeter()
+    const orch = new EffTaskOrchestrator(
+      cfg({ parallelism: 1, phaseRoles: { ...emptyPhaseRoles(), review: roles } }),
+      deps(m.wrap(single())), new AbortController().signal)
+    expect((await orch.run()).status).toBe('completed')
+    expect(m.peak.review).toBe(1)
+  })
+})
