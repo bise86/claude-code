@@ -8,7 +8,7 @@ import { describe, expect, it } from 'bun:test'
 import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
-import { TaskTreePanel, visibleRows } from './TaskTreePanel.js'
+import { TaskTreePanel, visibleRows, viewport } from './TaskTreePanel.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
 
 const NOW = new Date().toISOString()
@@ -277,6 +277,55 @@ describe('评分必须在界面上可见(spec §10.1 / §10.2)', () => {
     t.stdin.press('\r')
     await tick()
     expect(t.lastFrame()).not.toContain('评分')
+    app.unmount()
+  })
+})
+
+describe('视口:大树不得把光标和表头挤出屏幕', () => {
+  // At the default cap of 100 nodes the panel drew 105 lines. In a 40-line terminal the
+  // cursor AND the counts header scrolled off, so the user could not see what they had
+  // selected — a review measured exactly this.
+  const big = (n: number): TaskNode[] => {
+    const root = mk({ id: 'root', title: '根', status: 'WAITING_CHILDREN', kind: 'decompose' })
+    const kids = Array.from({ length: n }, (_, i) =>
+      mk({ id: `root/${String(i + 1).padStart(2, '0')}-k`, title: `任务${i + 1}`, parentId: 'root', depth: 1, status: 'READY', kind: 'executable' }))
+    root.childIds = kids.map(k => k.id)
+    return [root, ...kids]
+  }
+
+  it('draws at most maxRows tree rows regardless of tree size', () => {
+    const rows = visibleRows(big(100), new Set())
+    expect(rows).toHaveLength(101)
+    expect(viewport(rows, 0, 20).slice).toHaveLength(20)
+    expect(viewport(rows, 100, 20).slice).toHaveLength(20)
+  })
+
+  it('always keeps the cursor inside the drawn slice', () => {
+    const rows = visibleRows(big(100), new Set())
+    for (const cursor of [0, 1, 5, 50, 99, 100]) {
+      const v = viewport(rows, cursor, 20)
+      expect(`${cursor}:${cursor >= v.from && cursor < v.from + v.slice.length}`).toBe(`${cursor}:true`)
+    }
+  })
+
+  it('does not clip a tree that already fits', () => {
+    const rows = visibleRows(big(5), new Set())
+    const v = viewport(rows, 0, 20)
+    expect(v.from).toBe(0)
+    expect(v.slice).toHaveLength(rows.length)
+  })
+
+  it('shows a position indicator only when rows are hidden', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel, { nodes: big(100), runId: '003', interactive: true, maxRows: 10 } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    expect(f).toContain('1/101')
+    expect(f).toContain('根')      // the header row is still on screen
+    expect(f).toContain('高效任务') // and so is the counts line
     app.unmount()
   })
 })

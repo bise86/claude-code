@@ -69,10 +69,31 @@ export function visibleRows(
  * takes away the user's ability to select and copy terminal text — a worse trade than
  * keyboard folding. Arrow/hjkl folding is the equivalent affordance here.
  */
+/**
+ * The slice of rows to actually draw, and where that slice starts.
+ *
+ * Without this the panel drew EVERY row: at the default cap of 100 nodes that is 105 lines
+ * in a 40-line terminal, so the cursor and the counts header both scrolled off and the user
+ * could not see what they were selecting. The cursor is kept away from the window edges by
+ * a small margin so that moving one row does not immediately re-scroll the whole view.
+ */
+export function viewport<T>(rows: T[], cursor: number, height: number): { slice: T[]; from: number } {
+  if (height <= 0 || rows.length <= height) return { slice: rows, from: 0 }
+  const margin = Math.min(2, Math.floor(height / 4))
+  let from = cursor - Math.floor(height / 2)
+  from = Math.max(0, Math.min(from, rows.length - height))
+  if (cursor < from + margin) from = cursor - margin
+  if (cursor > from + height - 1 - margin) from = cursor - height + 1 + margin
+  from = Math.max(0, Math.min(from, rows.length - height))
+  return { slice: rows.slice(from, from + height), from }
+}
+
 export function TaskTreePanel(props: {
   nodes: TaskNode[]
   runId: string
   interactive?: boolean
+  /** Rows of tree drawn at once; the rest scrolls with the cursor. */
+  maxRows?: number
   onExitKey?: () => void
 }): React.ReactElement {
   // Tick once a second so elapsed times keep moving even when no node transitions —
@@ -92,6 +113,8 @@ export function TaskTreePanel(props: {
   const [detailId, setDetailId] = React.useState<string | null>(null)
 
   const rows = visibleRows(props.nodes, collapsed)
+  // Rows of TREE to draw at once; the border, header and key hint live outside it.
+  const height = Math.max(3, props.maxRows ?? 20)
   // The tree grows while it runs, so a cursor parked past the end must not render a blank
   // selection — clamp on every paint rather than trying to fix it up on each mutation.
   const idx = rows.length === 0 ? 0 : Math.min(cursor, rows.length - 1)
@@ -139,6 +162,7 @@ export function TaskTreePanel(props: {
 
   if (detail) return <NodeDetail node={detail} elapsed={elapsed(detail, nowMs)} />
 
+  const view = viewport(rows, idx, height)
   const counts: Record<UiStatus, number> = { done: 0, running: 0, queued: 0, failed: 0 }
   for (const n of props.nodes) counts[uiStatus(n.status)]++
 
@@ -148,8 +172,10 @@ export function TaskTreePanel(props: {
         高效任务 · run {props.runId}{'  '}
         <Text color="success">✓{counts.done}</Text> <Text color="warning">◐{counts.running}</Text>{' '}
         <Text color="inactive">○{counts.queued}</Text> <Text color="error">✗{counts.failed}</Text>
+        {rows.length > view.slice.length ? <Text dimColor>{'  '}{idx + 1}/{rows.length}</Text> : null}
       </Text>
-      {rows.map(({ node: n, depth, hasKids }, i) => {
+      {view.slice.map(({ node: n, depth, hasKids }, vi) => {
+        const i = view.from + vi
         const ui = uiStatus(n.status)
         const selected = props.interactive === true && i === idx
         const fold = hasKids ? (collapsed.has(n.id) ? '▸' : '▾') : ' '
