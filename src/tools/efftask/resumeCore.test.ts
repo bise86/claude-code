@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { depCycleMembers, validateLoadedNodes } from './resumeCore.js'
+import { depCycleMembers, readRunManifest, validateLoadedNodes } from './resumeCore.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, type TaskNode } from './types.js'
 import { reseatTransientNodes } from './reseat.js'
 
@@ -458,5 +458,129 @@ describe('半截的 reviewLog 不能把整个 Run 打死', () => {
     const { serializeNode } = await import('./persistence.js')
     const raw = mkn({ reviewLog: [{ round: 1 }] })
     expect(() => serializeNode(raw)).not.toThrow()
+  })
+})
+
+
+describe('恢复:读者比校验器挖得深的那一类洞,全量收口', () => {
+  const mk2 = (over = {}) => ({
+    ...createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+  const o2 = { goal: 'g', phaseRoles: emptyPhaseRoles(), now: NOW }
+
+  it('score.rationale 不是字符串时 serializeNode 也不能抛', async () => {
+    // The SAME bug as reviewLog, eight lines below it, and MORE reachable: YAML types values
+    // automatically, so an unquoted `rationale: 90` in a hand-edited node.md is a number and
+    // stripControl calls .replace on it.
+    const { serializeNode } = await import('./persistence.js')
+    for (const bad of [90, true, ['a', 'b'], { x: 1 }]) {
+      const n = mk2({ score: { plan: { role: 'r', score: 1, rationale: bad } } })
+      const { nodes } = validateLoadedNodes([n], o2)
+      expect(() => serializeNode(nodes[0])).not.toThrow()
+      expect(nodes[0].score.plan.rationale).toBe('')
+    }
+  })
+
+  it('score 里整条记录不是对象时被丢掉,而不是留着炸', async () => {
+    const { serializeNode } = await import('./persistence.js')
+    const n = mk2({ score: { plan: 'nope', exec: null } })
+    const { nodes } = validateLoadedNodes([n], o2)
+    expect(nodes[0].score.plan).toBeUndefined()
+    expect(() => serializeNode(nodes[0])).not.toThrow()
+  })
+
+  it('confirmedDraft 是 null 时,不能把整场恢复带走', () => {
+    // `!== undefined` let null through and the dereference threw out of validateLoadedNodes
+    // entirely — efftask.tsx catches that as 恢复失败, so ONE malformed child node cost the
+    // user every node in the run. YAML's `confirmedDraft:` (empty) IS null.
+    const bad = mk2({ id: 'root/01-a', parentId: 'root', depth: 1, confirmedDraft: null })
+    const good = mk2({ id: 'root', childIds: ['root/01-a'] })
+    const { nodes, repairs } = validateLoadedNodes([good, bad], o2)
+    expect(nodes).toHaveLength(2)                       // the healthy node survives
+    expect(nodes.find(n => n.id === 'root/01-a').confirmedDraft).toBeUndefined()
+    expect(repairs.some(r => r.includes('根方案确认记录已损坏'))).toBe(true)
+  })
+
+  it('worktree 是 null + mergeConflict 时,也不能把整场恢复带走', () => {
+    const bad = mk2({ id: 'root/01-a', parentId: 'root', depth: 1, worktree: null, mergeConflict: true })
+    const good = mk2({ id: 'root', childIds: ['root/01-a'] })
+    const { nodes, repairs } = validateLoadedNodes([good, bad], o2)
+    expect(nodes).toHaveLength(2)
+    expect(repairs.some(r => r.includes('隔离工作区记录无法识别'))).toBe(true)
+  })
+
+  it('形状不对的 worktree 会被清掉 —— 否则隔离闸门被它绕过', () => {
+    // stepExecute's isolation gate is `!node.worktree`, so a truthy-but-malformed value made
+    // it PASS: measured, acquire() was never called, the acceptance roundtable ran with
+    // cwd: undefined (i.e. in the user's real checkout), and the node reached ACCEPTED. The
+    // repair line shown to the user read 保留冲突工作区 undefined.
+    for (const bad of [{ branch: 'b' }, { path: '/p' }, 'a string', { branch: '', path: '' }]) {
+      const n = mk2({ worktree: bad, mergeConflict: true })
+      const { nodes } = validateLoadedNodes([n], o2)
+      expect(nodes[0].worktree).toBeUndefined()
+      // …and it is no longer advertised as a resumable conflict: there is no worktree to
+      // send anyone to.
+      expect(nodes[0].mergeConflict).toBe(false)
+    }
+  })
+
+  it('形状完好的冲突工作区仍然保留', () => {
+    const n = mk2({ worktree: { branch: 'b', path: '/wt/a' }, mergeConflict: true })
+    const { nodes } = validateLoadedNodes([n], o2)
+    expect(nodes[0].worktree).toEqual({ branch: 'b', path: '/wt/a' })
+    expect(nodes[0].mergeConflict).toBe(true)
+  })
+
+  it('interrupted / mergeConflict 的真值也要收敛成布尔', () => {
+    // capBlocked already had this. A truthy non-boolean matches neither reseat's `=== true`
+    // nor --retry-blocked's capBlocked, so the node could never be reopened by anything.
+    const n = mk2({ interrupted: 'yes', mergeConflict: 1, status: 'BLOCKED' })
+    const { nodes } = validateLoadedNodes([n], o2)
+    expect(nodes[0].interrupted).toBe(false)
+    expect(nodes[0].mergeConflict).toBe(false)
+  })
+
+  it('丢弃损坏的评审记录时要报一条修复,不能静默', () => {
+    const n = mk2({ reviewLog: [{ round: 1, verdicts: 'nope', synthesized: { pass: true, blockingSummary: '' } }, null] })
+    const { repairs } = validateLoadedNodes([n], o2)
+    expect(repairs.some(r => r.includes('评审/验收记录已损坏'))).toBe(true)
+  })
+
+  it('从盘上读回来的 blocking 也受同样的上限', () => {
+    const many = [...Array(50)].map((_, i) => 'x'.repeat(5000) + i)
+    const n = mk2({ reviewLog: [{ round: 1, verdicts: [{ role: 'a', pass: false, blocking: many, comments: '' }], synthesized: { pass: false, blockingSummary: '' } }] })
+    const { nodes } = validateLoadedNodes([n], o2)
+    const back = nodes[0].reviewLog[0].verdicts[0].blocking
+    expect(back.length).toBeLessThanOrEqual(20)
+    expect(Array.from(back[0]).length).toBeLessThan(2100)
+  })
+})
+
+describe('run.md 里的 scoreThreshold 不是数字时,关口不能说假话', () => {
+  const memfs = (runMd: string) => ({
+    readFile: async (p: string) => { if (p.endsWith('run.md')) return runMd; throw new Error('ENOENT') },
+    writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
+    unlink: async () => {}, rmdir: async () => {}, readdir: async () => [], exists: async () => true,
+  })
+
+  it('非数字被忽略,并且明确告诉用户"评分不会触发返工"', async () => {
+    // clampInt turned a non-number into 0 silently, and `worst < 0` never holds — so the gate
+    // rendered "评分低于 0 触发一轮返工" while rework could never fire. Same function pushes a
+    // degraded line when goalPrompt is missing; the numeric fields pushed none.
+    const { config, degraded } = await readRunManifest(
+      memfs('---\ngoalPrompt: g\ncaps:\n  scoreThreshold: abc\n---\n\n') as never, '/r',
+    )
+    expect(config.caps.scoreThreshold).toBeUndefined()
+    expect(degraded.some(d => d.includes('scoreThreshold'))).toBe(true)
+    expect(degraded.some(d => d.includes('不触发返工'))).toBe(true)
+  })
+
+  it('真的数字照常生效', async () => {
+    const { config, degraded } = await readRunManifest(
+      memfs('---\ngoalPrompt: g\ncaps:\n  scoreThreshold: 80\n---\n\n') as never, '/r',
+    )
+    expect(config.caps.scoreThreshold).toBe(80)
+    expect(degraded).toEqual([])
   })
 })

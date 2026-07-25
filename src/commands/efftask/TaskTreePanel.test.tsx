@@ -618,3 +618,19 @@ describe('顶部状态条的并行占用 (spec §10.1)', () => {
     app.unmount()
   })
 })
+
+describe('startedAt 不是字符串时,耗时不能渲染成 1900 年', () => {
+  it('非字符串一律显示 -', () => {
+    // Date.parse(123) does NOT throw, it coerces — and Number.isFinite then passed, so a
+    // hand-edited `startedAt: 123` rendered as 60070736830s. This field exists precisely so
+    // the panel does not point at the wrong node.
+    for (const bad of [123, true, {}, []]) {
+      const n = mk({ id: 'x', status: 'EXECUTING', startedAt: bad as never })
+      expect(elapsed(n, Date.now())).toBe('-')
+    }
+  })
+
+  it('无法解析的字符串也显示 -', () => {
+    expect(elapsed(mk({ id: 'x', status: 'EXECUTING', startedAt: 'not a date' }), Date.now())).toBe('-')
+  })
+})

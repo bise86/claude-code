@@ -2,6 +2,7 @@ import { parse as yamlParse } from 'yaml'
 import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
+import { capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
 
 const LEGAL_STATUS = new Set<string>([
   'CREATED', 'PLANNING', 'PLAN_REVIEW', 'READY', 'EXECUTING', 'EXECUTED', 'ACCEPTANCE',
@@ -59,21 +60,64 @@ export function depCycleMembers(nodes: TaskNode[]): Set<string> {
   return new Set([...ids].filter(id => !settled.has(id)))
 }
 
+/**
+ * A score record with every field a writer dereferences.
+ *
+ * `validateLoadedNodes` checked only `typeof n.score === 'object'`, one level up. YAML types
+ * values automatically, so an unquoted `rationale: 90` in a hand-edited node.md is a NUMBER —
+ * and `stripControl` calls `.replace` on it. Measured: every persist throws, the node blocks
+ * with a raw TypeError, and the disk still holds the old reason so every later --resume
+ * reproduces it exactly.
+ */
+function scoreRecord(v: unknown): { role: string; score: number; rationale: string } | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const r = v as Record<string, unknown>
+  return {
+    role: typeof r.role === 'string' ? r.role : 'unknown',
+    score: Number.isFinite(r.score) ? (r.score as number) : 0,
+    rationale: typeof r.rationale === 'string' ? r.rationale : '',
+  }
+}
+
+/**
+ * A worktree reference, or nothing.
+ *
+ * The mergeConflict branch below KEEPS this field without checking its shape, and the
+ * isolation gate in stepExecute is `!node.worktree` — so a truthy-but-malformed value made
+ * the gate PASS: measured, acquire() was never called, the acceptance roundtable ran with
+ * `cwd: undefined` (i.e. in the user's real checkout rather than the node's worktree), and the
+ * node reached ACCEPTED. The repair line shown to the user read "保留冲突工作区 undefined".
+ * That is the exact failure this function's own comment warns about, through a door it left open.
+ */
+function worktreeRef(v: unknown): { branch: string; path: string } | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const w = v as Record<string, unknown>
+  if (typeof w.branch !== 'string' || w.branch.length === 0) return undefined
+  if (typeof w.path !== 'string' || w.path.length === 0) return undefined
+  return { branch: w.branch, path: w.path }
+}
+
 /** One roundtable record, with every field the writers dereference guaranteed present. */
-function roundArray(v: unknown): RoundtableRecord[] {
-  if (!Array.isArray(v)) return []
+function roundArray(v: unknown, onDrop?: () => void): RoundtableRecord[] {
+  if (!Array.isArray(v)) { if (v !== undefined) onDrop?.(); return [] }
   return v
-    .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object')
+    .filter((r): r is Record<string, unknown> => {
+      const ok = !!r && typeof r === 'object'
+      if (!ok) onDrop?.()
+      return ok
+    })
     .map(r => ({
       round: Number.isFinite(r.round) ? (r.round as number) : 0,
-      verdicts: Array.isArray(r.verdicts)
+      verdicts: (r.verdicts !== undefined && !Array.isArray(r.verdicts) && (onDrop?.(), false)) ? [] : Array.isArray(r.verdicts)
         ? r.verdicts
             .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
             .map(x => ({
               role: typeof x.role === 'string' ? x.role : 'unknown',
               pass: x.pass === true,
-              blocking: strArray(x.blocking),
-              comments: typeof x.comments === 'string' ? x.comments : '',
+              // Same caps as the parse boundary: node.md is hand-editable, and this is the
+              // other door into the same field.
+              blocking: strArray(x.blocking).slice(0, MAX_BLOCKING_ITEMS).map(b => capText(b, MAX_BLOCKING_CHARS)),
+              comments: typeof x.comments === 'string' ? capText(x.comments, MAX_BLOCKING_CHARS) : '',
               ...(x.infra === true ? { infra: true as const } : {}),
               ...(x.timeout === true ? { timeout: true as const } : {}),
             }))
@@ -170,9 +214,26 @@ export function validateLoadedNodes(
     // same way. Measured: '状态持久化失败: undefined is not an object (evaluating
     // r.verdicts.map)'. This function already normalises iteration/plan/phaseRoles for the
     // same reason; the logs were the gap.
-    n.reviewLog = roundArray(n.reviewLog)
-    n.acceptLog = roundArray(n.acceptLog)
-    if (!n.score || typeof n.score !== 'object') n.score = {}
+    // §17.2 wants the validation summary shown to the user, and these three previously
+    // dropped whole rounds of role opinions in silence.
+    let lostRounds = 0
+    n.reviewLog = roundArray(n.reviewLog, () => { lostRounds++ })
+    n.acceptLog = roundArray(n.acceptLog, () => { lostRounds++ })
+    if (lostRounds > 0) repairs.push(`节点 ${n.id}:${lostRounds} 处评审/验收记录已损坏,已丢弃(不影响后续执行)`)
+    // Per-FIELD, not just "is it an object": serializeNode reads score.plan.rationale on every
+    // commit. Same lesson as reviewLog — a reader that dereferences deeper than the validator
+    // checks is a run that dies on disk state a human can produce by hand.
+    const rawScore = (n.score ?? {}) as { plan?: unknown; exec?: unknown }
+    n.score = {
+      ...(scoreRecord(rawScore.plan) ? { plan: scoreRecord(rawScore.plan) } : {}),
+      ...(scoreRecord(rawScore.exec) ? { exec: scoreRecord(rawScore.exec) } : {}),
+    }
+    // The same `!== true → false` discipline capBlocked already had. A truthy non-boolean
+    // `interrupted: "yes"` matches neither reseat's `=== true` nor --retry-blocked's
+    // capBlocked, so the node could never be reopened by anything — measured: every resume
+    // stopped at BLOCKED 已中断 forever.
+    if (n.interrupted !== undefined && n.interrupted !== true) n.interrupted = false
+    if (n.mergeConflict !== undefined && n.mergeConflict !== true) n.mergeConflict = false
     const pr = (n.phaseRoles ?? {}) as Record<string, unknown>
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>
     if (typeof n.title !== 'string' || n.title.length === 0) n.title = n.id
@@ -194,6 +255,13 @@ export function validateLoadedNodes(
     // field that SKIPS the plan phase, and a malformed one would send an empty plan straight
     // into review. Anything that is not the exact shape is dropped, which degrades to
     // "the plan role drafts it", never to "an empty plan is approved".
+    // `!== undefined` let `null` through, and YAML's `confirmedDraft:` (empty) IS null. The
+    // dereference below then threw out of validateLoadedNodes entirely — which efftask.tsx
+    // catches as 恢复失败, so ONE malformed child node cost the user every node in the run.
+    if (n.confirmedDraft !== undefined && (!n.confirmedDraft || typeof n.confirmedDraft !== 'object')) {
+      repairs.push(`节点 ${n.id}:根方案确认记录已损坏,恢复后将由 plan 角色重新起草`)
+      n.confirmedDraft = undefined
+    }
     if (n.confirmedDraft !== undefined) {
       const kids = (n.confirmedDraft as { children?: unknown }).children
       const clean = Array.isArray(kids)
@@ -222,6 +290,15 @@ export function validateLoadedNodes(
     // value makes the gate PASS: acquire is never called again and the executor runs against
     // a dead path, or against a base that never saw its dependencies' merges. Clearing it
     // forces a fresh acquire, which is also what re-bases the worktree.
+    // Shape-checked BEFORE either branch reads it. `worktree: null` (YAML's empty value)
+    // threw out of this function on the mergeConflict path — again costing the whole run — and
+    // a malformed-but-truthy value slipped past stepExecute's isolation gate.
+    if (n.worktree !== undefined && worktreeRef(n.worktree) === undefined) {
+      repairs.push(`节点 ${n.id}:隔离工作区记录无法识别,已清除,恢复时将重新分配`)
+      n.worktree = undefined
+      // …and it is no longer a resumable conflict: there is no worktree to send anyone to.
+      n.mergeConflict = false
+    }
     if (n.worktree !== undefined) {
       // EXCEPT for a conflict block. There the path is not stale bookkeeping — it is where
       // the human was told to go and fix things. Clearing it forces a fresh acquire(), whose
@@ -386,7 +463,15 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   }
   // Rebuilding field-by-field silently dropped scoreThreshold, so a run configured with one
   // lost it on resume. Carry it when present.
-  if (caps.scoreThreshold !== undefined) rebuilt.scoreThreshold = clampInt(caps.scoreThreshold, 0, 100, 0)
+  if (caps.scoreThreshold !== undefined) {
+    // A non-number silently became 0, and `worst < 0` never holds — so the gate said
+    // "评分低于 0 触发一轮返工" while rework could never trigger. Say so instead.
+    if (typeof caps.scoreThreshold !== 'number' || !Number.isFinite(caps.scoreThreshold)) {
+      degraded.push(`run.md 里的 caps.scoreThreshold 不是数字(${String(caps.scoreThreshold)}),已忽略:评分将只记录、不触发返工`)
+    } else {
+      rebuilt.scoreThreshold = clampInt(caps.scoreThreshold, 0, 100, 0)
+    }
+  }
   base.caps = rebuilt
 
   const pr = (fm.phaseRoles ?? {}) as Record<string, unknown>

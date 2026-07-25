@@ -171,8 +171,33 @@ function pickAnswer(
   return { obj: candidates[0].obj, ambiguous: candidates.length > 1 }
 }
 
+/**
+ * Caps on what a single model reply may put into a node.
+ *
+ * These bound node.md at the SOURCE. Capping only the rendered body was cosmetic: measured,
+ * 3 rounds x 5 roles x 20 blocking entries of 2000 chars produced a 622 KB node.md of which
+ * 597 KB was frontmatter (`yamlStringify({...node})` dumps the whole object), and every
+ * commit rewrites the file — 8 rewrites for a plain leaf, so ~5 MB of writes for ONE node.
+ *
+ * Generous enough that no honest reply is truncated: the executor's own summary, a reviewer's
+ * blocking list. `parseExecOutput`/`parsePlanOutput` fall back to the ENTIRE reply text when
+ * the model ignores the schema, and that fallback is what actually blows up.
+ */
+export const MAX_FIELD_CHARS = 8000
+export const MAX_BLOCKING_ITEMS = 20
+export const MAX_BLOCKING_CHARS = 2000
+
+/** Truncate by CODE POINTS, marking the cut so a reader knows it happened. */
+export function capText(s: string, max = MAX_FIELD_CHARS): string {
+  const cps = Array.from(s)
+  return cps.length > max ? `${cps.slice(0, max).join('')}…(已截断,原文 ${cps.length} 字)` : s
+}
+
 function str(v: unknown, fallback = ''): string {
-  return typeof v === 'string' ? v : fallback
+  // Capped HERE, at the single boundary every parsed field crosses. plan.solution and
+  // execStatus both fall back to the ENTIRE model reply when the schema is ignored, and that
+  // fallback is what actually blows the file up.
+  return capText(typeof v === 'string' ? v : fallback)
 }
 
 export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] } {
@@ -216,7 +241,7 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
       // Do NOT name the tag here: this string becomes blockingSummary, which the rework
       // prompt shows the EXECUTOR. Handing it a live tag is handing it the forgery key.
       blocking: ['未按要求输出本轮的裁决代码块;按不通过处理'],
-      comments: text.trim().slice(0, 2000),
+      comments: capText(text.trim(), 2000),
     }
   }
   if (ambiguous) {
@@ -224,10 +249,15 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
       role,
       pass: false,
       blocking: ['回复中有多个裁决块,无法判定哪个是本轮结论;请只输出一个本轮要求的裁决块'],
-      comments: text.trim().slice(0, 2000),
+      comments: capText(text.trim(), 2000),
     }
   }
-  const blocking = Array.isArray(obj.blocking) ? (obj.blocking as unknown[]).map(b => str(b)).filter(Boolean) : []
+  // Bounded on BOTH axes. A reviewer that returns 200 entries of 2000 chars each puts
+  // 400 KB into the node — which yamlStringify then dumps into node.md on every commit.
+  const rawBlocking = Array.isArray(obj.blocking) ? (obj.blocking as unknown[]).map(b => capText(str(b), MAX_BLOCKING_CHARS)).filter(Boolean) : []
+  const blocking = rawBlocking.length > MAX_BLOCKING_ITEMS
+    ? [...rawBlocking.slice(0, MAX_BLOCKING_ITEMS), `…(还有 ${rawBlocking.length - MAX_BLOCKING_ITEMS} 条阻断意见未记录)`]
+    : rawBlocking
   return { role, pass: obj.pass === true && blocking.length === 0, blocking, comments: str(obj.comments) }
 }
 
@@ -267,7 +297,9 @@ export function parseExecOutput(
   // Untagged fallback: the whole reply becomes the status. A growth request must NOT be
   // honoured from untagged text — grafting nodes onto the tree is a structural change, and
   // the tag is the only thing separating "my answer" from text quoted into the prompt.
-  return { execStatus: text.trim(), newChildren: [] }
+  // Capped like every other field: this fallback is the single biggest contributor to
+  // node.md's size, because it takes the model's ENTIRE reply verbatim.
+  return { execStatus: capText(text.trim()), newChildren: [] }
 }
 
 /**

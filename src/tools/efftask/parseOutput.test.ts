@@ -1,6 +1,6 @@
 // src/tools/efftask/parseOutput.test.ts
 import { describe, expect, it } from 'bun:test'
-import { answerTag, extractJsonBlock, parsePlanOutput, parseVerdict, parseExecOutput } from './parseOutput.js'
+import { answerTag, extractJsonBlock, parsePlanOutput, parseVerdict, parseExecOutput, capText, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS } from './parseOutput.js'
 
 describe('parseOutput', () => {
   it('extractJsonBlock finds fenced json', () => {
@@ -223,5 +223,47 @@ describe('verdict tag discipline', () => {
     const v = parseVerdict('我忘了用代码块,结论是通过。', 'main', tag)
     expect(v.pass).toBe(false)
     expect(v.blocking.join(' ')).not.toContain(tag)
+  })
+})
+
+
+describe('模型回复进节点时就要封顶 (node.md 96% 的体积在 frontmatter)', () => {
+  it('execStatus 的兜底不能把整条回复原样收进来', () => {
+    // parseExecOutput falls back to the ENTIRE reply when the schema is ignored, and
+    // yamlStringify({...node}) then dumps it into node.md on EVERY commit — 8 rewrites for a
+    // plain leaf. Measured: a 50000-char field produced a 48.9K body and a far larger file.
+    const huge = 'x'.repeat(50_000)
+    const out = parseExecOutput(huge, 'execabc')
+    expect(Array.from(out.execStatus).length).toBeLessThan(MAX_FIELD_CHARS + 100)
+    expect(out.execStatus).toContain('已截断')
+  })
+
+  it('plan 的兜底同样封顶', () => {
+    const out = parsePlanOutput('y'.repeat(50_000), 'planabc')
+    expect(Array.from(out.plan.solution).length).toBeLessThan(MAX_FIELD_CHARS + 100)
+  })
+
+  it('正常长度的回复一个字都不动', () => {
+    const out = parseExecOutput('```execabc\n{"execStatus":"改了 src/a.ts,测试通过"}\n```', 'execabc')
+    expect(out.execStatus).toBe('改了 src/a.ts,测试通过')
+  })
+
+  it('blocking 的条数和单条长度都有上限', () => {
+    // A reviewer returning 200 entries of 2000 chars puts 400 KB into the node.
+    const many = JSON.stringify([...Array(200)].map(() => 'z'.repeat(9000)))
+    const v = parseVerdict('```verdictabc\n{"pass":false,"blocking":' + many + ',"comments":""}\n```', 'r', 'verdictabc')
+    expect(v.blocking.length).toBe(MAX_BLOCKING_ITEMS + 1)   // + the "还有 N 条" marker
+    expect(v.blocking[v.blocking.length - 1]).toContain('未记录')
+    expect(Array.from(v.blocking[0]).length).toBeLessThan(MAX_BLOCKING_CHARS + 100)
+  })
+
+  it('条数没超时不会多出那条提示', () => {
+    const v = parseVerdict('```verdictabc\n{"pass":false,"blocking":["缺测试","缺文档"],"comments":""}\n```', 'r', 'verdictabc')
+    expect(v.blocking).toEqual(['缺测试', '缺文档'])
+  })
+
+  it('capText 按码点截断,不会把 emoji 劈成半个', () => {
+    const out = capText('🙂'.repeat(100), 10)
+    expect(Array.from(out.replace(/….*$/, '')).length).toBe(10)
   })
 })

@@ -104,6 +104,20 @@ const RUN_ID = /^\d{1,4}$/
  * accumulate — and `--resume latest` picking one would recover nothing, synthesize a
  * childless root and die instantly with an opaque reason.
  */
+/**
+ * The run's objective, from the manifest or the recovered root.
+ *
+ * TYPE-CHECKED, because this path has no validateLoadedNodes: listRuns reads node.md through
+ * parseNodeFile directly. A hand-edited `goal: 123` therefore reached `.split` as a number
+ * and threw out of listRuns — taking the whole run PICKER with it, so one damaged run hid
+ * every healthy one.
+ */
+function pickGoal(fromManifest: unknown, nodes: { id: string; goal?: unknown }[]): string {
+  if (typeof fromManifest === 'string' && fromManifest.length > 0) return fromManifest
+  const rootGoal = nodes.find(n => n.id === 'root')?.goal
+  return typeof rootGoal === 'string' ? rootGoal : ''
+}
+
 export async function listRuns(fs: FsLike, effRoot: string): Promise<RunSummary[]> {
   let names: string[]
   try { names = await fs.readdir(effRoot) } catch { return [] } // no runs yet is not an error
@@ -126,7 +140,7 @@ export async function listRuns(fs: FsLike, effRoot: string): Promise<RunSummary[
       // and "the run you last touched" is exactly what `--resume latest` should mean.
       if (typeof n.updatedAt === 'string' && n.updatedAt > newest) newest = n.updatedAt
     }
-    const goal = config.goalPrompt || nodes.find(n => n.id === 'root')?.goal || ''
+    const goal = pickGoal(config.goalPrompt, nodes)
     summaries.push({
       runId: name,
       goalLine: goal.split('\n').map(l => l.trim()).find(l => l.length > 0) ?? '',

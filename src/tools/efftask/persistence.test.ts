@@ -357,3 +357,22 @@ describe('正文里的模型作者文本要有上限,控制字节要剥干净', 
     expect(body.slice(body.indexOf('## 评审记录'))).not.toContain(esc)
   })
 })
+
+
+describe('writer 自己也不能被坏数据打死', () => {
+  it('score.rationale 不是字符串时 serializeNode 不抛', () => {
+    // The validator normalises this, but serializeNode runs on EVERY commit and a throw here
+    // blocks the node with a raw TypeError and repeats on every resume. Belt and braces —
+    // and the belt half needs its own test, or only the braces are actually covered.
+    const n = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'x' })
+    n.score = { plan: { role: 'r', score: 1, rationale: 90 as never } }
+    expect(() => serializeNode(n)).not.toThrow()
+    expect(serializeNode(n)).toContain('plan: 1')
+  })
+
+  it('role 和 score 不是字符串/数字时也不抛', () => {
+    const n = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'x' })
+    n.score = { exec: { role: { a: 1 } as never, score: 'x' as never, rationale: '' } }
+    expect(() => serializeNode(n)).not.toThrow()
+  })
+})

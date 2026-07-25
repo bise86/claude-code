@@ -126,7 +126,7 @@ function scoreBody(node: TaskNode): string {
   const line = (label: string, s?: { role: string; score: number; rationale: string }): string =>
     // `score` is stripped too: it comes straight off yamlParse and validateLoadedNodes only
     // checks that `score` is an object, so a hand-edited node.md can put ESC[2J in the NUMBER.
-    s ? `${label}: ${stripControl(String(s.score))} [${stripControl(String(s.role))}]${s.rationale ? ' — ' + clipBody(stripControl(s.rationale)) : ''}` : `${label}: -`
+    s ? `${label}: ${stripControl(String(s.score))} [${stripControl(String(s.role))}]${s.rationale ? ' — ' + clipBody(stripControl(String(s.rationale))) : ''}` : `${label}: -`
   return [line('plan', node.score.plan), line('exec', node.score.exec)].join('\n')
 }
 

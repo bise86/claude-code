@@ -24,7 +24,10 @@ export function elapsed(node: TaskNode, nowMs: number): string {
   if (node.startedAt === undefined) {
     return node.status === 'ACCEPTED' || node.status === 'BLOCKED' ? '-' : '排队中'
   }
-  const start = Date.parse(node.startedAt)
+  // typeof-checked: Date.parse(123) does NOT throw, it coerces — and a hand-edited
+  // `startedAt: 123` rendered as 60070736830s. This field exists precisely so the panel does
+  // not point at the wrong node.
+  const start = typeof node.startedAt === 'string' ? Date.parse(node.startedAt) : Number.NaN
   if (!Number.isFinite(start)) return '-'
   const terminal = node.status === 'ACCEPTED' || node.status === 'BLOCKED'
   const endParsed = terminal ? Date.parse(node.updatedAt) : nowMs
