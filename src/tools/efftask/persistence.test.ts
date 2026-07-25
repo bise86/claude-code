@@ -203,3 +203,35 @@ describe('run ids are reservations, not guesses', () => {
     expect(second).toBe('002') // the reservation, not any written node, is what advances it
   })
 })
+
+
+describe('the artifacts must be readable and safe to cat', () => {
+  it('run.md carries the blocked reason, not just the status', () => {
+    // run.md is the file the transcript points at. "[failed] X (BLOCKED)" with the reason
+    // buried in a nested node.md leaves a human unable to see why the run stopped.
+    const root = createNode({ id: 'root', title: '根', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    const child = createNode({ id: 'root/01-x', title: '会失败的一步', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    root.childIds = ['root/01-x']
+    root.status = 'BLOCKED'; root.blockedReason = '子节点阻断'
+    child.status = 'BLOCKED'; child.blockedReason = '验收迭代超限(3): [main] 迁移脚本没写'
+    const snap = renderTreeSnapshot([root, child])
+    expect(snap).toContain('迁移脚本没写')
+    expect(snap).toContain('子节点阻断')
+  })
+
+  it('strips terminal control bytes from the markdown body', () => {
+    // Titles, plans and exec statuses are model-authored. YAML escapes control bytes; a
+    // markdown body does not, so `cat node.md` would clear the screen and set the title.
+    const ESC = String.fromCharCode(27)
+    const BEL = String.fromCharCode(7)
+    const CTRL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/
+    const n = createNode({ id: 'root', title: ESC + '[2J' + ESC + ']0;PWNED' + BEL + '标题', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    n.execStatus = 'done' + BEL
+    n.plan.solution = 'plan' + ESC + '[31m'
+    const text = serializeNode(n)
+    const body = text.slice(text.indexOf('\n---\n\n') + 6)
+    expect(CTRL.test(body)).toBe(false)
+    expect(body).toContain('标题') // the readable part survives
+    expect(CTRL.test(renderTreeSnapshot([n]))).toBe(false)
+  })
+})

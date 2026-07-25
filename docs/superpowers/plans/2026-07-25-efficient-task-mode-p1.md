@@ -794,10 +794,14 @@ Expected: FAIL。
 ```ts
 // src/tools/efftask/parseDirectives.ts
 import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES } from './types.js'
-import type { Caps, EffTaskConfig, RoleBinding } from './types.js'
+import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 
 export type ModelJsonFn = (prompt: string) => Promise<string>
+
+const PHASE_LABEL: Record<PhaseName, string> = {
+  plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
+}
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { "plan"?: string[], "review"?: string[], "execute"?: string[], "accept"?: string[], "observer"?: string[] },
@@ -811,13 +815,19 @@ function clampInt(v: unknown, min: number, max: number, fallback: number): numbe
 
 export async function parseDirectives(
   rawPrompt: string,
-  opts: { modelJson?: ModelJsonFn; knownRoles: string[] },
+  opts: {
+    modelJson?: ModelJsonFn
+    knownRoles: string[]
+    /** Roles that exist but P1 cannot dispatch (execMode 'cli' goes through AgentTool, not runAgent). */
+    unsupportedRoles?: string[]
+  },
 ): Promise<EffTaskConfig> {
   const base: EffTaskConfig = {
     goalPrompt: rawPrompt.trim(),
     parallelism: DEFAULT_PARALLELISM,
     phaseRoles: emptyPhaseRoles(),
     caps: { ...DEFAULT_CAPS },
+    notices: [],
   }
   if (!opts.modelJson) return base
   let obj: Record<string, unknown> | null = null
@@ -831,6 +841,7 @@ export async function parseDirectives(
   if (obj.parallelism !== undefined) base.parallelism = clampInt(obj.parallelism, 1, 64, DEFAULT_PARALLELISM)
 
   const known = new Set(opts.knownRoles)
+  const unsupported = new Set(opts.unsupportedRoles ?? [])
   const pr = (obj.phaseRoles ?? {}) as Record<string, unknown>
   for (const phase of PHASE_NAMES) {
     const raw = pr[phase]
@@ -838,13 +849,28 @@ export async function parseDirectives(
     // Dedupe: each entry is one seat at the roundtable, so a repeated name (an easy
     // thing for an extraction model to emit) would run that role twice and give its
     // verdict double weight.
-    const names = new Set(
-      raw
-        .map(r => (typeof r === 'string' ? r.trim() : ''))
-        .filter(name => name.length > 0 && known.has(name)),
-    )
-    const bindings: RoleBinding[] = [...names].map(name => ({ roleName: name }))
-    base.phaseRoles[phase] = bindings
+    const asked = [...new Set(raw.map(r => (typeof r === 'string' ? r.trim() : '')).filter(n => n.length > 0))]
+    const missing = asked.filter(n => !known.has(n))
+    const cliOnly = asked.filter(n => known.has(n) && unsupported.has(n))
+    let usable = asked.filter(n => known.has(n) && !unsupported.has(n))
+
+    if (missing.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:未找到角色 ${missing.join('、')},改用主模型`)
+    if (cliOnly.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:角色 ${cliOnly.join('、')} 是 CLI 模式,P1 尚不支持,已忽略`)
+
+    // Only review and accept fan out into a roundtable. plan and execute run ONE agent, so
+    // listing extra seats there would put names on the confirmation roster that never get
+    // called — the gate must show who actually runs.
+    if ((phase === 'plan' || phase === 'execute') && usable.length > 1) {
+      base.notices.push(`${PHASE_LABEL[phase]}:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
+      usable = usable.slice(0, 1)
+    }
+    // The observer phase is P3; nothing consults it yet. Showing it on the roster would
+    // promise a scorer that never scores.
+    if (phase === 'observer' && usable.length > 0) {
+      base.notices.push(`观察:评分角色 ${usable.join('、')} 属 P3,本期不会被调用,已忽略`)
+      usable = []
+    }
+    base.phaseRoles[phase] = usable.map(name => ({ roleName: name }))
   }
 
   const caps = (obj.caps ?? {}) as Record<string, unknown>
@@ -1720,14 +1746,17 @@ function safeUpdate(ctx: PipelineCtx): void {
   try { ctx.onUpdate() } catch { /* UI failure is not a run failure */ }
 }
 
-type PhaseResult = { ok: true; text: string } | { ok: false; reason: string }
+// `text` rides along on the FAILURE branch too: the execute phase runs with write-capable
+// tools, so an abort that arrives after the executor answered may be discarding the only
+// record of changes already made to the repo.
+type PhaseResult = { ok: true; text: string } | { ok: false; reason: string; text?: string }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
 // which records it into node.blockedReason and BLOCKs the node.
 async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promise<PhaseResult> {
   try {
     const text = await ctx.runAgent(req)
-    if (ctx.signal.aborted) return { ok: false, reason: '已中断' }
+    if (ctx.signal.aborted) return { ok: false, reason: '已中断', text }
     return { ok: true, text }
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) }
@@ -2061,7 +2090,14 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // which is exactly what executePrompt renders on rework.
     const execTag = answerTag(ANSWER_TAGS.exec)
     const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback), cwd: node.worktree?.path, signal: ctx.signal })
-    if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
+    if (!res.ok) {
+      // Keep whatever the executor managed to report before the interruption. It ran with
+      // write tools, so discarding this can leave the repo changed with no record of it.
+      const partial = res.text ? parseExecOutput(res.text, execTag).execStatus.trim() : ''
+      if (partial) node.execStatus = `${partial}\n(注:本轮在完成前被中断,以上为中断时已报告的产出)`
+      await blockWithReason(node, res.reason, ctx)
+      return
+    }
     const reported = parseExecOutput(res.text, execTag).execStatus.trim()
     // An executor that reports NOTHING has evidenced nothing. Sending a blank execStatus
     // into acceptance asks the reviewers to bless an empty slot — the one way a node can
@@ -2583,7 +2619,6 @@ Expected: FAIL。
 - [ ] **Step 3: 实现**
 
 ```ts
-// src/tools/efftask/runAgentAdapter.ts
 import { runAgent } from '../AgentTool/runAgent.js'
 import type { AgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import type { ToolUseContext, Tools } from '../../Tool.js'
@@ -2635,6 +2670,14 @@ export function makeRunAgentFn(deps: {
   readOnlyTools: Tools
   activeAgents: AgentDefinition[]
   mainModelDefault: AgentDefinition
+  /**
+   * Wall-clock deadline for ONE phase call. Every other axis of this system is bounded —
+   * depth, node count, three iteration counters, infra retries — but a provider that hangs
+   * without ever rejecting has no bound at all: the pipeline parks in `await`, the tree
+   * shows 运行中 forever, and even an abort cannot unstick it because nothing is polling.
+   * 0 disables it.
+   */
+  timeoutMs?: number
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
@@ -2656,6 +2699,12 @@ export function makeRunAgentFn(deps: {
     const inner = new AbortController()
     const relay = (): void => inner.abort()
     req.signal.addEventListener('abort', relay, { once: true })
+    // The deadline aborts the sub-agent the same way a user Esc does, so a hung provider
+    // ends the phase instead of parking the pipeline forever.
+    let timedOut = false
+    const timer = deps.timeoutMs && deps.timeoutMs > 0
+      ? setTimeout(() => { timedOut = true; inner.abort() }, deps.timeoutMs)
+      : undefined
 
     const collected: Message[] = []
     const invoke = (): AsyncGenerator<Message, void> =>
@@ -2689,14 +2738,31 @@ export function makeRunAgentFn(deps: {
           // A crashing renderer must not take the run down (same rule as pipeline/orchestrator).
           try { req.onChunk(collectText([message])) } catch { /* ignore */ }
         }
-        if (req.signal.aborted) break
+        if (req.signal.aborted || timedOut) break
       }
     }
     try {
-      await (req.cwd ? runWithCwdOverride(req.cwd, consume) : consume())
+      // Race the consumption against the deadline: a generator that never yields would
+      // otherwise never observe the abort, which is exactly the hang this bounds.
+      const work = req.cwd ? runWithCwdOverride(req.cwd, consume) : consume()
+      if (timer) {
+        await Promise.race([
+          work,
+          new Promise<void>(resolve => {
+            const check = setInterval(() => { if (timedOut) { clearInterval(check); resolve() } }, 50)
+            void work.finally(() => clearInterval(check))
+          }),
+        ])
+      } else {
+        await work
+      }
     } finally {
+      if (timer) clearTimeout(timer)
       req.signal.removeEventListener('abort', relay)
     }
+    // Report the deadline rather than returning a truncated answer that the phase would
+    // parse as a real (empty) reply.
+    if (timedOut) throw new Error(`阶段调用超时(${deps.timeoutMs} ms),已中止`)
     return collectText(collected)
   }
 }

@@ -45,14 +45,17 @@ function safeUpdate(ctx: PipelineCtx): void {
   try { ctx.onUpdate() } catch { /* UI failure is not a run failure */ }
 }
 
-type PhaseResult = { ok: true; text: string } | { ok: false; reason: string }
+// `text` rides along on the FAILURE branch too: the execute phase runs with write-capable
+// tools, so an abort that arrives after the executor answered may be discarding the only
+// record of changes already made to the repo.
+type PhaseResult = { ok: true; text: string } | { ok: false; reason: string; text?: string }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
 // which records it into node.blockedReason and BLOCKs the node.
 async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promise<PhaseResult> {
   try {
     const text = await ctx.runAgent(req)
-    if (ctx.signal.aborted) return { ok: false, reason: '已中断' }
+    if (ctx.signal.aborted) return { ok: false, reason: '已中断', text }
     return { ok: true, text }
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) }
@@ -386,7 +389,14 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // which is exactly what executePrompt renders on rework.
     const execTag = answerTag(ANSWER_TAGS.exec)
     const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback), cwd: node.worktree?.path, signal: ctx.signal })
-    if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
+    if (!res.ok) {
+      // Keep whatever the executor managed to report before the interruption. It ran with
+      // write tools, so discarding this can leave the repo changed with no record of it.
+      const partial = res.text ? parseExecOutput(res.text, execTag).execStatus.trim() : ''
+      if (partial) node.execStatus = `${partial}\n(注:本轮在完成前被中断,以上为中断时已报告的产出)`
+      await blockWithReason(node, res.reason, ctx)
+      return
+    }
     const reported = parseExecOutput(res.text, execTag).execStatus.trim()
     // An executor that reports NOTHING has evidenced nothing. Sending a blank execStatus
     // into acceptance asks the reviewers to bless an empty slot — the one way a node can

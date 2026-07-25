@@ -83,16 +83,19 @@ export async function allocateRunId(fs: FsLike, effRoot: string): Promise<string
 // machine-state frontmatter fields (everything except derived human body)
 export function serializeNode(node: TaskNode): string {
   const fm = { ...node }
+  // Body fields are model-authored. YAML frontmatter escapes control bytes; a markdown body
+  // does not, so an ESC or BEL in a title would make `cat node.md` clear the screen.
+  const c = stripControl
   const body =
-    `# ${node.title}\n\n` +
-    `## 完整方案\n${node.plan.solution}\n\n` +
-    `## 重点\n${node.plan.keyPoints}\n\n` +
-    `## 风险点\n${node.plan.risks}\n\n` +
-    `## 验收点\n${node.plan.acceptance}\n\n` +
-    `## 执行状态\n${node.execStatus}\n\n` +
-    (node.blockedReason ? `## 阻断原因\n${node.blockedReason}\n\n` : '') +
-    `## 评审记录\n${node.reviewLog.map(r => `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${r.synthesized.blockingSummary}`).join('\n')}\n\n` +
-    `## 验收记录\n${node.acceptLog.map(r => `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${r.synthesized.blockingSummary}`).join('\n')}\n\n` +
+    `# ${c(node.title)}\n\n` +
+    `## 完整方案\n${c(node.plan.solution)}\n\n` +
+    `## 重点\n${c(node.plan.keyPoints)}\n\n` +
+    `## 风险点\n${c(node.plan.risks)}\n\n` +
+    `## 验收点\n${c(node.plan.acceptance)}\n\n` +
+    `## 执行状态\n${c(node.execStatus)}\n\n` +
+    (node.blockedReason ? `## 阻断原因\n${c(node.blockedReason)}\n\n` : '') +
+    `## 评审记录\n${node.reviewLog.map(r => `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${c(r.synthesized.blockingSummary)}`).join('\n')}\n\n` +
+    `## 验收记录\n${node.acceptLog.map(r => `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${c(r.synthesized.blockingSummary)}`).join('\n')}\n\n` +
     `## 评分\nplan: ${node.score.plan?.score ?? '-'} / exec: ${node.score.exec?.score ?? '-'}\n`
   return `---\n${yamlStringify(fm)}---\n\n${body}`
 }
@@ -173,6 +176,19 @@ export async function loadRun(
  * guarantees, and printing a child before its parent renders a structurally wrong tree.
  * Orphans (parent missing/corrupt) are printed last so nothing is silently dropped.
  */
+/**
+ * Strip terminal control characters from model- and user-authored text before it is written
+ * into a markdown body.
+ *
+ * YAML frontmatter escapes them; the body does not. A node title carrying `ESC[2J` or a BEL
+ * makes `cat run.md` clear the screen and rewrite the terminal title — and titles, plans and
+ * exec statuses are all model-authored.
+ */
+export function stripControl(s: string): string {
+  // eslint-disable-next-line no-control-regex -- stripping control bytes is the point
+  return s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+}
+
 export function renderTreeSnapshot(nodes: TaskNode[]): string {
   const byId = new Map(nodes.map(n => [n.id, n]))
   const seen = new Set<string>()
@@ -180,7 +196,11 @@ export function renderTreeSnapshot(nodes: TaskNode[]): string {
   const emit = (n: TaskNode, depth: number): void => {
     if (seen.has(n.id)) return // defensive: a cyclic parent/child link must not hang the render
     seen.add(n.id)
-    lines.push(`${'  '.repeat(depth)}- [${uiStatus(n.status)}] ${n.title} (${n.status})`)
+    // Carry the blocked reason INTO the tree: run.md is the file the transcript points at,
+    // and "[failed] 某任务 (BLOCKED)" with the reason only in a nested node.md leaves a
+    // human unable to see why the run stopped without hunting through the directory.
+    const why = n.status === 'BLOCKED' && n.blockedReason ? ` — ${stripControl(n.blockedReason)}` : ''
+    lines.push(`${'  '.repeat(depth)}- [${uiStatus(n.status)}] ${stripControl(n.title)} (${n.status})${why}`)
     for (const cid of n.childIds) {
       const child = byId.get(cid)
       if (child) emit(child, depth + 1)
