@@ -38,9 +38,12 @@ const CANCELLED: StartupDecision = { parallelism: 0, approved: false }
 // 集成接线,无单测;手动跑 /et 验证。
 // 构造顺序:fs → runId → runAgent 接缝 → 立刻返回 JSX(解析在组件内 parsing 态跑)。
 export const call: LocalJSXCommandCall = async (onDone, context, args) => {
-  // Empty prompt: there is nothing to plan. Show a hint instead of planning nothing.
-  if (!args?.trim()) {
-    return <HintAndExit text="用法: /et <任务提示词>" onExit={() => onDone('已取消', { display: 'system' })} />
+  // Empty prompt: there is nothing to plan. The hint must travel through onDone — JSX
+  // painted for a single frame before exiting never reaches the transcript, so the user
+  // would be left with a bare '已取消' and no idea what the command wanted.
+  if (!args.trim()) {
+    onDone('用法: /et <任务提示词>', { display: 'system' })
+    return null
   }
   const cwd = process.cwd()
   const fs = fsAdapter()
@@ -53,14 +56,20 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // The command owns its own AbortController so the running view's Esc can stop the run;
   // it chains off the parent signal so a REPL-level abort still tears everything down.
   const runController = new AbortController()
+  const relayAbort = (): void => runController.abort()
   if (context.abortController.signal.aborted) runController.abort()
-  else context.abortController.signal.addEventListener('abort', () => runController.abort(), { once: true })
+  else context.abortController.signal.addEventListener('abort', relayAbort, { once: true })
   const signal = runController.signal
+  // The parent controller outlives this command, so a listener left behind accumulates one
+  // dead entry per /et invocation for the whole session.
+  const detachAbortRelay = (): void => context.abortController.signal.removeEventListener('abort', relayAbort)
 
   const activeAgents: AgentDefinition[] = context.options.agentDefinitions?.activeAgents ?? []
   const allAgents: AgentDefinition[] = context.options.agentDefinitions?.allAgents ?? activeAgents
-  // canUseTool falls back to hasPermissionsToUseTool (same fallback processSlashCommand's
-  // local-jsx branch uses for executeForkedSlashCommand).
+  // processSlashCommand passes canUseTool straight through for local-jsx commands
+  // (processSlashCommand.tsx:609) with NO fallback of its own, and it really can be
+  // undefined (QueryEngine builds contexts without one). So we supply the same fallback the
+  // fork path uses at processSlashCommand.tsx:728.
   const canUseTool = context.canUseTool ?? hasPermissionsToUseTool
   const mainModelDefault = pickMainAgentDefinition(allAgents)
   // REAL read-only pool (NOT []): a reviewer that cannot read the repo can only guess.
@@ -96,18 +105,15 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       runAgent={runAgent}
       signal={signal}
       abort={() => runController.abort()}
-      onExit={() => onDone('高效任务结束', { display: 'system' })}
+      // The transcript is the only durable trace once the panel is gone: say how the run
+      // ended and where its artifacts live, not just that it ended.
+      onExit={outcome => {
+        detachAbortRelay()
+        const how = outcome ? (outcome.status === 'completed' ? '完成' : `被阻断(${outcome.reason ?? '未知原因'})`) : '已退出'
+        onDone(`高效任务 ${runId} ${how} · .claude/efftask/${runId}/run.md`, { display: 'system' })
+      }}
     />
   )
-}
-
-function HintAndExit(props: { text: string; onExit: () => void }): React.ReactElement {
-  const onExit = props.onExit
-  React.useEffect(() => {
-    onExit()
-    // biome-ignore lint/correctness/useExhaustiveDependencies: fire exactly once on mount
-  }, [])
-  return <Text dimColor>{props.text}</Text>
 }
 
 // 一次性配置抽取用的占位节点(不入树,只是给 RunAgentFn 一个合法 node 形参)。
@@ -171,7 +177,7 @@ type RunnerProps = {
   runAgent: RunAgentFn
   signal: AbortSignal
   abort: () => void
-  onExit: () => void
+  onExit: (outcome: Outcome | null) => void
 }
 
 function EffTaskRunner(props: RunnerProps): React.ReactElement {
@@ -244,7 +250,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         settled = true
         if (cancelled) return
         if (!decision.approved) {
-          props.onExit()
+          props.onExit(null) // cancelled at the gate: no run outcome to report
           return
         }
         // Apply the confirmed parallelism. It is inert in P1's serial driver, but it must
@@ -307,10 +313,10 @@ function DoneView(props: {
   nodes: TaskNode[]
   runId: string
   outcome: Outcome | null
-  onExit: () => void
+  onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   useInput((input, key) => {
-    if (key.return || key.escape || input.toLowerCase() === 'q') props.onExit()
+    if (key.return || key.escape || input.toLowerCase() === "q") props.onExit(props.outcome)
   })
   const ok = props.outcome?.status === 'completed'
   return (

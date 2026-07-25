@@ -27,10 +27,14 @@ export function TaskTreePanel(props: { nodes: TaskNode[]; runId: string }): Reac
   // Tick once a second so elapsed times keep moving even when no node transitions —
   // otherwise the panel only repaints on onUpdate and looks frozen during a long phase.
   const [nowMs, setNowMs] = React.useState(() => Date.now())
+  // …but stop once every node is terminal: all elapsed values are frozen then, so ticking
+  // would repaint identical output every second for as long as the done view stays open.
+  const live = props.nodes.some(n => n.status !== 'ACCEPTED' && n.status !== 'BLOCKED')
   React.useEffect(() => {
+    if (!live) return
     const timer = setInterval(() => setNowMs(Date.now()), 1000)
     return () => clearInterval(timer)
-  }, [])
+  }, [live])
 
   // Plain code-point compare, NOT localeCompare — same ordering rule the orchestrator's
   // scheduler uses, so the panel shows nodes in the order they are actually picked.
