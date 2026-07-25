@@ -85,6 +85,15 @@ export interface EffTaskConfig {
    * existed still parses on the resume path; the roster then degrades to a bare 主模型.
    */
   mainModel?: string
+  /**
+   * 续跑指引(§17.4):恢复时用户补充的一段话,追加进后续 plan/execute 阶段的提示词。
+   *
+   * Only affects work that has NOT finished — an ACCEPTED node is never re-entered, so it is
+   * untouched by construction. Declared here (rather than alongside the command wiring that
+   * populates it) because `readRunManifest` reads it back off disk, and a field that one
+   * layer writes and another reads must exist before either is written.
+   */
+  resumeGuidance?: string
 }
 
 export function emptyPhaseRoles(): Record<PhaseName, RoleBinding[]> {
