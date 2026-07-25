@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
 import type { EffTaskConfig } from '../../tools/efftask/types.js'
-import { goalLine, rosterLines, type StartupDecision } from '../../tools/efftask/startupConfirm.js'
+import { goalLine, noticeLines, rosterLines, type StartupDecision } from '../../tools/efftask/startupConfirm.js'
 
 export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: StartupDecision) => void }): React.ReactElement {
   useInput((input, key) => {
@@ -16,6 +16,12 @@ export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: S
       {/* Real roster from config.phaseRoles — settings roles DO take effect in P1. */}
       <Text bold>角色名册:</Text>
       {rosterLines(props.config).map(line => <Text key={line}>  {line}</Text>)}
+      {noticeLines(props.config).length > 0 && (
+        <Box flexDirection="column">
+          <Text color="yellow">你的请求中有以下部分不会生效:</Text>
+          {noticeLines(props.config).map(l => <Text key={l} color="yellow">  · {l}</Text>)}
+        </Box>
+      )}
       <Text>安全阀: 深度{props.config.caps.maxDepth} / 节点{props.config.caps.maxNodes} / 迭代{props.config.caps.maxIterations}</Text>
       <Text dimColor>回车/y 开始 · Esc/n 取消</Text>
     </Box>

@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig } from './types.js'
-import { goalLine, rosterLines, type ConfirmWinner, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { goalLine, noticeLines, rosterLines, type ConfirmWinner, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -26,7 +26,12 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string): obje
     `**目标**: ${goal}\n` +
     `**并行数**: ${config.parallelism}（P1 串行,值 P2 生效）\n` +
     `**安全阀**: 深度${config.caps.maxDepth} / 节点${config.caps.maxNodes} / 迭代${config.caps.maxIterations}\n` +
-    `**角色名册**:\n${rosterLines(config).map(l => `- ${l}`).join('\n')}`
+    `**角色名册**:\n${rosterLines(config).map(l => `- ${l}`).join('\n')}` +
+    // The roster says who WILL run; this says whose request was dropped and why. Without it
+    // the card would answer the user's "确认有多少角色、各自承担什么" with a half-truth.
+    (noticeLines(config).length > 0
+      ? `\n\n**以下请求不会生效**:\n${noticeLines(config).map(l => `- ${l}`).join('\n')}`
+      : '')
   return {
     config: { wide_screen_mode: true },
     header: { title: { tag: 'plain_text', content: '高效任务模式 · 启动确认' } },

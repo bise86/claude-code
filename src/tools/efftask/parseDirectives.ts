@@ -1,9 +1,13 @@
 // src/tools/efftask/parseDirectives.ts
 import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES } from './types.js'
-import type { Caps, EffTaskConfig, RoleBinding } from './types.js'
+import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 
 export type ModelJsonFn = (prompt: string) => Promise<string>
+
+const PHASE_LABEL: Record<PhaseName, string> = {
+  plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
+}
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { "plan"?: string[], "review"?: string[], "execute"?: string[], "accept"?: string[], "observer"?: string[] },
@@ -17,13 +21,19 @@ function clampInt(v: unknown, min: number, max: number, fallback: number): numbe
 
 export async function parseDirectives(
   rawPrompt: string,
-  opts: { modelJson?: ModelJsonFn; knownRoles: string[] },
+  opts: {
+    modelJson?: ModelJsonFn
+    knownRoles: string[]
+    /** Roles that exist but P1 cannot dispatch (execMode 'cli' goes through AgentTool, not runAgent). */
+    unsupportedRoles?: string[]
+  },
 ): Promise<EffTaskConfig> {
   const base: EffTaskConfig = {
     goalPrompt: rawPrompt.trim(),
     parallelism: DEFAULT_PARALLELISM,
     phaseRoles: emptyPhaseRoles(),
     caps: { ...DEFAULT_CAPS },
+    notices: [],
   }
   if (!opts.modelJson) return base
   let obj: Record<string, unknown> | null = null
@@ -37,6 +47,7 @@ export async function parseDirectives(
   if (obj.parallelism !== undefined) base.parallelism = clampInt(obj.parallelism, 1, 64, DEFAULT_PARALLELISM)
 
   const known = new Set(opts.knownRoles)
+  const unsupported = new Set(opts.unsupportedRoles ?? [])
   const pr = (obj.phaseRoles ?? {}) as Record<string, unknown>
   for (const phase of PHASE_NAMES) {
     const raw = pr[phase]
@@ -44,13 +55,28 @@ export async function parseDirectives(
     // Dedupe: each entry is one seat at the roundtable, so a repeated name (an easy
     // thing for an extraction model to emit) would run that role twice and give its
     // verdict double weight.
-    const names = new Set(
-      raw
-        .map(r => (typeof r === 'string' ? r.trim() : ''))
-        .filter(name => name.length > 0 && known.has(name)),
-    )
-    const bindings: RoleBinding[] = [...names].map(name => ({ roleName: name }))
-    base.phaseRoles[phase] = bindings
+    const asked = [...new Set(raw.map(r => (typeof r === 'string' ? r.trim() : '')).filter(n => n.length > 0))]
+    const missing = asked.filter(n => !known.has(n))
+    const cliOnly = asked.filter(n => known.has(n) && unsupported.has(n))
+    let usable = asked.filter(n => known.has(n) && !unsupported.has(n))
+
+    if (missing.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:未找到角色 ${missing.join('、')},改用主模型`)
+    if (cliOnly.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:角色 ${cliOnly.join('、')} 是 CLI 模式,P1 尚不支持,已忽略`)
+
+    // Only review and accept fan out into a roundtable. plan and execute run ONE agent, so
+    // listing extra seats there would put names on the confirmation roster that never get
+    // called — the gate must show who actually runs.
+    if ((phase === 'plan' || phase === 'execute') && usable.length > 1) {
+      base.notices.push(`${PHASE_LABEL[phase]}:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
+      usable = usable.slice(0, 1)
+    }
+    // The observer phase is P3; nothing consults it yet. Showing it on the roster would
+    // promise a scorer that never scores.
+    if (phase === 'observer' && usable.length > 0) {
+      base.notices.push(`观察:评分角色 ${usable.join('、')} 属 P3,本期不会被调用,已忽略`)
+      usable = []
+    }
+    base.phaseRoles[phase] = usable.map(name => ({ roleName: name }))
   }
 
   const caps = (obj.caps ?? {}) as Record<string, unknown>

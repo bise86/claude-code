@@ -108,12 +108,17 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   })
 
   const knownRoles = activeAgents.map(a => a.agentType)
+  // execMode:'cli' roles are dispatched by AgentTool, not runAgent — this seam cannot run
+  // them, so they must be reported at the gate rather than silently downgraded to the main
+  // model while the roster still shows the role's name.
+  const unsupportedRoles = activeAgents.filter(a => 'execMode' in a && (a as { execMode?: string }).execMode === 'cli').map(a => a.agentType)
   // Set when the view is torn down rather than exited, so the report can tell the two apart.
   let tornDown = false
   return (
     <EffTaskRunner
       args={args}
       knownRoles={knownRoles}
+      unsupportedRoles={unsupportedRoles}
       extractJson={prompt => extractAgent({ phase: 'plan', node: stubNode(), role: null, system: '', prompt, signal })}
       runId={runId}
       runDir={runDir}
@@ -203,6 +208,7 @@ function fsAdapter(): FsLike {
 type RunnerProps = {
   args: string
   knownRoles: string[]
+  unsupportedRoles: string[]
   extractJson: (prompt: string) => Promise<string>
   runId: string
   runDir: string
@@ -231,12 +237,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const { abort, detach, onTornDown } = props
   React.useEffect(() => () => { onTornDown(); abort(); detach() }, [abort, detach, onTornDown])
 
-  const { args, knownRoles, extractJson } = props
+  const { args, knownRoles, unsupportedRoles, extractJson } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
   // call(), which would freeze the terminal with no UI while spending tokens.
   React.useEffect(() => {
     let cancelled = false
-    void parseDirectives(args, { knownRoles, modelJson: extractJson })
+    void parseDirectives(args, { knownRoles, unsupportedRoles, modelJson: extractJson })
       // belt & braces: parseDirectives already swallows extraction failures, but a rejection
       // here would otherwise strand the UI on 'parsing' forever.
       .catch(() => parseDirectives(args, { knownRoles }))

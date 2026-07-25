@@ -3486,7 +3486,7 @@ P1 合并后,基于真实接口再写:
 
 1. **(P2,安全)自定义 agent 的 MCP 工具绕过只读闸门。** `runAgentAdapter` 按阶段限制工具池,但 `runAgent` 在过滤之后又把 `agentMcpTools` 合并进来。若用户把一个声明了 `mcpServers` 的自定义 agent 绑成 `review`/`accept` 角色,该"评审员"会拿到自己的 MCP 工具(可能可写),从而能自己修好再放行——这正是执行者/评审者分离要防的事。修法:非 execute 阶段在 agent 定义上设 `disallowedTools`,或在合并后再过滤。
 2. **(P3,失控面)全系统没有任何墙钟上限。** `caps.nodeTimeoutMs` 已定义(默认 600s)但**无任何代码读取**。一个挂起而不拒绝的模型调用会让 `run()` 永久停住,唯一出路是用户在运行视图按 Esc。除此之外每条轴都已有界(深度/节点数/三个迭代计数/无进展守卫/基础设施重试)。修法:`runPhase` 包一层 `AbortSignal.timeout`,或 P3 的超时 tree-kill。
-3. **(P2,规格)被丢弃的角色名没有回显。** spec §3 要求"不存在的角色名回退主模型**并在确认表里标注**";当前 `parseDirectives` 静默丢弃,用户要求 `评审用 architect+security` 却只看到 `评审: 主模型`,不知道自己的请求被吞了。修法:把丢弃的名字挂在 config 上,由 `rosterLines` 渲染。
+3. ~~(P2,规格)被丢弃的角色名没有回显~~ — **已在 P1 修复**:`EffTaskConfig.notices` 记录所有被丢弃/降级/忽略的请求,终端与飞书两个确认界面都会渲染。同时覆盖:CLI 模式角色(P1 的 runAgent 接缝无 cli 分支)、plan/execute 的多余角色(只有首个生效)、观察角色(P3 才启用)。
 4. **(P2,一致性)确认竞速原语重复。** `startupConfirm.ts` 的 `createResolveOnce`/`raceConfirm` 与 `interactiveHandler.ts` 的 `makeFeishuRacer` 是同一形状的两份实现。飞书那半已正确复用共享 client 与 callbacks 注册表(无冲突),但在 P2 增加更多确认关口前应抽成共用原语。
 5. **(P2,性能)`run.md` 每次状态变更全量重写。** 约 10 次转移 × 100 节点 ≈ 每轮 1000 次全树重写(已串行化,只是浪费)。修法:防抖,或仅在状态变化时写。
 6. **(P2,恢复)`loadRun`/`readNode` 在 P1 无消费者。** 已实现并测试,专供 §17 断点续跑(Task 12/13)。`parseNodeFile` 的未校验 cast 必须由续跑路径的 `validateLoadedNodes` 补上。

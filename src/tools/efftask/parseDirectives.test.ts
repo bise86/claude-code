@@ -85,3 +85,44 @@ describe('parseDirectives', () => {
     expect(DEFAULT_CAPS.maxDepth).toBe(5)
   })
 })
+
+describe('the roster must not promise what will not run', () => {
+  const withRoles = (phaseRoles: unknown, opts: { knownRoles: string[]; unsupportedRoles?: string[] }) =>
+    parseDirectives('x', { ...opts, modelJson: async () => JSON.stringify({ phaseRoles }) })
+
+  it('reports unknown role names instead of silently dropping them', async () => {
+    const cfg = await withRoles({ review: ['arch', 'ghost'] }, { knownRoles: ['arch'] })
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: 'arch' }])
+    expect(cfg.notices.join(' ')).toContain('ghost')
+    expect(cfg.notices.join(' ')).toContain('未找到')
+  })
+
+  it('reports a CLI-mode role rather than downgrading it to the main model behind the name', async () => {
+    // runAgent has no cli branch — the role's command/args would be ignored and the main
+    // model would answer while the roster still displayed the role's name.
+    const cfg = await withRoles({ accept: ['codex', 'sec'] }, { knownRoles: ['codex', 'sec'], unsupportedRoles: ['codex'] })
+    expect(cfg.phaseRoles.accept).toEqual([{ roleName: 'sec' }])
+    expect(cfg.notices.join(' ')).toContain('codex')
+    expect(cfg.notices.join(' ')).toContain('CLI')
+  })
+
+  it('keeps only the plan/execute role that actually runs, and says so', async () => {
+    // Only review and accept fan out; plan and execute run a single agent.
+    const cfg = await withRoles(
+      { plan: ['p1', 'p2'], execute: ['e1', 'e2'], review: ['r1', 'r2'] },
+      { knownRoles: ['p1', 'p2', 'e1', 'e2', 'r1', 'r2'] },
+    )
+    expect(cfg.phaseRoles.plan).toEqual([{ roleName: 'p1' }])
+    expect(cfg.phaseRoles.execute).toEqual([{ roleName: 'e1' }])
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: 'r1' }, { roleName: 'r2' }]) // roundtable keeps all
+    expect(cfg.notices.join(' ')).toContain('p2')
+    expect(cfg.notices.join(' ')).toContain('e2')
+  })
+
+  it('does not seat an observer that P1 never calls', async () => {
+    const cfg = await withRoles({ observer: ['watcher'] }, { knownRoles: ['watcher'] })
+    expect(cfg.phaseRoles.observer).toEqual([])
+    expect(cfg.notices.join(' ')).toContain('watcher')
+    expect(cfg.notices.join(' ')).toContain('P3')
+  })
+})

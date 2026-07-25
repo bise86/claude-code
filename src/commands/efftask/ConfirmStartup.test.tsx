@@ -22,6 +22,7 @@ const config: EffTaskConfig = {
   parallelism: 3,
   phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: 'arch' }] } as Record<PhaseName, RoleBinding[]>,
   caps: { ...DEFAULT_CAPS },
+  notices: [],
 }
 
 function fakeTty() {

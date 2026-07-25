@@ -57,6 +57,16 @@ export interface EffTaskConfig {
   parallelism: number
   phaseRoles: Record<PhaseName, RoleBinding[]>
   caps: Caps
+  /**
+   * What was asked for but will NOT happen, in the user's terms — an unknown role name, a
+   * role this phase can't run, a seat P1 never consults.
+   *
+   * `phaseRoles` is what the run will actually do; the confirmation gate renders it as the
+   * roster. Anything quietly removed on the way in would leave that gate telling the user
+   * something untrue about who is on the panel, which is the one thing this gate exists to
+   * get right. So the removals travel WITH the config and are shown alongside it.
+   */
+  notices: string[]
 }
 
 export function emptyPhaseRoles(): Record<PhaseName, RoleBinding[]> {

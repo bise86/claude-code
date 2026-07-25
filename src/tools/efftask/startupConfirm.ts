@@ -21,12 +21,25 @@ export function clip(s: string, max = 80): string {
 
 export function rosterLines(config: EffTaskConfig): string[] {
   return PHASE_NAMES.map(p => {
+    // The observer phase is P3: nothing consults it, so naming ANY occupant — a role or
+    // "主模型" — would put a seat on the panel that never speaks. Say it plainly instead.
+    if (p === 'observer') return `${PHASE_LABEL[p]}: (评分本期未启用)`
     // Show the bound model too: this gate exists to let the user see exactly who is on the
     // panel, and "coder" alone hides which model that role actually runs on.
     const names = config.phaseRoles[p].map(r => (r.model ? `${r.roleName}(${r.model})` : r.roleName))
     // Same 80-code-point budget as the goal line, so one long roster can't wreck the layout.
     return `${PHASE_LABEL[p]}: ${clip(names.length > 0 ? names.join('、') : '主模型')}`
   })
+}
+
+/**
+ * What the user asked for that will NOT happen. Rendered next to the roster on BOTH
+ * surfaces: the roster says who runs, this says whose request was dropped and why.
+ */
+export function noticeLines(config: EffTaskConfig): string[] {
+  // Tolerate a config without the field: a run.md written before it existed is read back
+  // by the resume path, and a missing notice list must not crash the confirmation view.
+  return (config.notices ?? []).map(n => clip(n, 100))
 }
 
 /** First non-empty line of the goal, clipped — what both surfaces show as the objective. */
