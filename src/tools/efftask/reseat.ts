@@ -26,7 +26,25 @@ const ACTIVE: ReadonlySet<NodeStatus> = new Set<NodeStatus>([
   'INTEGRATION_ACCEPT', 'SCORING', 'MERGE',
 ])
 
-const ANNOTATION = '(注:上次运行在此处中断,已重新排队)'
+/**
+ * spec §17.2:「每个被归位的节点在 `execStatus` 追加一行"上次运行在 **<阶段>** 中断,
+ * 已重新排队"」。
+ *
+ * 阶段名此前被丢掉了 —— 注记是一个固定串,而节点原来的 status(唯一知道它停在哪的东西)
+ * 就在手上,归位时被覆盖掉。差别是实打实的:被杀在 `EXECUTING` 的节点会重跑一次带写工具的
+ * 执行调用,被杀在 `MERGE` 的节点只会重试一次合并。用户在详情页看到的两句话原本一模一样。
+ */
+const PHASE_OF: Partial<Record<NodeStatus, string>> = {
+  PLANNING: '方案制定', PLAN_REVIEW: '方案评审', EXECUTING: '执行', EXECUTED: '执行完成待验收',
+  ACCEPTANCE: '验收', REWORK: '返工', INTEGRATION_ACCEPT: '集成验收', SCORING: '观察评分',
+  MERGE: '合并回集成分支',
+}
+/** Stable prefix for the once-only check — the rest of the line now varies by phase. */
+const ANNOTATION_PREFIX = '(注:上次运行在'
+const annotationFor = (was: NodeStatus): string =>
+  // An interrupted node was already swept to BLOCKED, which erased where it had been; say
+  // that honestly rather than naming a phase we no longer know.
+  `${ANNOTATION_PREFIX}${PHASE_OF[was] ?? '某个阶段'}中断,已重新排队)`
 const RETRY_NOTE = '(注:本节点被 --retry-blocked 重开,隔离工作区已重置为集成分支最新状态;上面描述的产出已移到 salvage 分支,当前工作区里不存在)'
 
 export interface ReseatResult {
@@ -116,6 +134,9 @@ export function reseatTransientNodes(
   const exhausted: string[] = []
   const retried: string[] = []
   for (const n of nodes) {
+    // Captured BEFORE anything below overwrites it: this is the only record of which phase
+    // the process was killed in, and spec §17.2 wants that phase named in the note.
+    const wasStatus = n.status
     const wasInterrupted = n.status === 'BLOCKED' && n.interrupted === true
     // 触阀后的人工重试. Only with the explicit flag, and only for nodes a VALVE stopped.
     const retryValve = opts.retryBlocked === true && n.status === 'BLOCKED' && n.capBlocked === true
@@ -241,8 +262,11 @@ export function reseatTransientNodes(
     // and a decompose node that never executed would gain an execStatus out of nowhere.
     // NOTE this is a breadcrumb, not evidence preservation — stepExecute overwrites
     // execStatus wholesale on the next run.
-    if (n.execStatus.length > 0 && !n.execStatus.includes(ANNOTATION)) {
-      n.execStatus = `${n.execStatus}\n${ANNOTATION}`
+    // Matched on the PREFIX, not the whole line: the note now names the phase, so two
+    // successive crashes in different phases produce two different strings and a whole-line
+    // check would stack both.
+    if (n.execStatus.length > 0 && !n.execStatus.includes(ANNOTATION_PREFIX)) {
+      n.execStatus = `${n.execStatus}\n${annotationFor(wasStatus)}`
     }
     n.updatedAt = now
     // Counted ONCE. A valve retry already has its own (louder) section at the resume gate;

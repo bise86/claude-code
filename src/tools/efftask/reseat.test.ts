@@ -556,3 +556,41 @@ describe('SCORING / MERGE 现在是真会写盘的状态', () => {
     })
   }
 })
+
+describe('spec §17.2:归位注记要说清中断在哪个阶段', () => {
+  // 「每个被归位的节点在 execStatus 追加一行"上次运行在 <阶段> 中断,已重新排队"」。
+  // 阶段名原本被丢掉了:注记是固定串,而唯一知道它停在哪的东西(节点原来的 status)就在
+  // 手上、归位时被覆盖。差别是实打实的 —— 被杀在 EXECUTING 的节点会重跑一次带写工具的
+  // 执行调用,被杀在 MERGE 的只会重试一次合并。用户看到的两句话原本一模一样。
+  const cases: [string, string][] = [
+    ['EXECUTING', '执行'],
+    ['MERGE', '合并回集成分支'],
+    ['PLAN_REVIEW', '方案评审'],
+    ['SCORING', '观察评分'],
+  ]
+  for (const [status, phase] of cases) {
+    it(`${status} → 注记里写着「${phase}」`, () => {
+      const n = mk({ id: 'root', kind: 'executable', status, execStatus: '改了一半' })
+      reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+      expect(n.execStatus).toContain(`上次运行在${phase}中断`)
+    })
+  }
+
+  it('连着崩两次也只追加一行,不会越堆越长', () => {
+    // 注记按前缀去重,不按整行 —— 现在整行随阶段变化,按整行查会把两次都堆进去,而这段
+    // 文本会原样进到 acceptPrompt 给评审看。
+    const n = mk({ id: 'root', kind: 'executable', status: 'EXECUTING', execStatus: '改了一半' })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    n.status = 'MERGE' // 第二次运行又被杀在另一个阶段
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.execStatus.match(/上次运行在/g)).toHaveLength(1)
+  })
+
+  it('被中断扫成 BLOCKED 的节点已经不知道自己停在哪,就别硬编一个', () => {
+    // interrupted 的节点在被杀时已经被扫成 BLOCKED,原阶段就丢了。诚实地说"某个阶段",
+    // 好过随便点一个名。
+    const n = mk({ id: 'root', kind: 'executable', status: 'BLOCKED', interrupted: true, execStatus: '改了一半' })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.execStatus).toContain('上次运行在某个阶段中断')
+  })
+})
