@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Box, Text, useInput } from 'ink'
+import { Box, Text, useInput } from '../../ink.js'
 import type { EffTaskConfig } from '../../tools/efftask/types.js'
 import { goalLine, rosterLines, type StartupDecision } from '../../tools/efftask/startupConfirm.js'
 

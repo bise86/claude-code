@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Box, Text, useInput } from 'ink'
+import { Box, Text, useInput } from '../../ink.js'
 import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -24,6 +24,7 @@ import { ConfirmStartup } from './ConfirmStartup.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import { hasPermissionsToUseTool } from '../../utils/permissions/permissions.js'
 import { useAppStateStore } from '../../state/AppState.js'
+import { getCwd } from '../../utils/cwd.js'
 import { logError } from '../../utils/log.js'
 
 type Outcome = { status: 'completed' | 'blocked'; reason?: string }
@@ -45,12 +46,25 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     onDone('用法: /et <任务提示词>', { display: 'system' })
     return null
   }
-  const cwd = process.cwd()
+  // getCwd(), NOT process.cwd(): a Bash-tool `cd` updates the session cwd WITHOUT calling
+  // process.chdir, so process.cwd() would drop the run tree somewhere the user isn't while
+  // every sub-agent's Read/Edit/Bash resolves against the session cwd.
+  const cwd = getCwd()
   const fs = fsAdapter()
   const effRoot = `${cwd}/.claude/efftask`
   // Local fs scan only — no model call, no tokens, sub-millisecond. Everything that COSTS
   // something (parseDirectives) happens inside the component.
-  const runId = await allocateRunId(fs, effRoot)
+  // It can still fail (an unreadable .claude dir), and allocateRunId deliberately rethrows
+  // rather than hand out an id that would overwrite a previous run. Rejecting out of call()
+  // makes processSlashCommand resolve with no messages at all — the user types /et and
+  // NOTHING appears — so the failure has to be reported here.
+  let runId: string
+  try {
+    runId = await allocateRunId(fs, effRoot)
+  } catch (e) {
+    onDone(`高效任务无法启动: ${e instanceof Error ? e.message : String(e)}`, { display: 'system' })
+    return null
+  }
   const runDir = `${effRoot}/${runId}`
 
   // The command owns its own AbortController so the running view's Esc can stop the run;
@@ -105,15 +119,26 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       runAgent={runAgent}
       signal={signal}
       abort={() => runController.abort()}
+      detach={detachAbortRelay}
       // The transcript is the only durable trace once the panel is gone: say how the run
       // ended and where its artifacts live, not just that it ended.
-      onExit={outcome => {
+      // Latched: the done view's key handler fires per keypress, and the immediate-command
+      // call sites re-append transcript messages on a second onDone.
+      onExit={onceOnly(outcome => {
         detachAbortRelay()
-        const how = outcome ? (outcome.status === 'completed' ? '完成' : `被阻断(${outcome.reason ?? '未知原因'})`) : '已退出'
+        const how = outcome
+          ? outcome.status === 'completed' ? '完成' : `被阻断(${outcome.reason ?? '未知原因'})`
+          : '已取消'
         onDone(`高效任务 ${runId} ${how} · .claude/efftask/${runId}/run.md`, { display: 'system' })
-      }}
+      })}
     />
   )
+}
+
+/** Run `fn` at most once — the exit key fires per keypress, onDone must not. */
+function onceOnly<T>(fn: (arg: T) => void): (arg: T) => void {
+  let done = false
+  return arg => { if (done) return; done = true; fn(arg) }
 }
 
 // 一次性配置抽取用的占位节点(不入树,只是给 RunAgentFn 一个合法 node 形参)。
@@ -177,6 +202,7 @@ type RunnerProps = {
   runAgent: RunAgentFn
   signal: AbortSignal
   abort: () => void
+  detach: () => void
   onExit: (outcome: Outcome | null) => void
 }
 
@@ -189,6 +215,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // The terminal surface stashes raceConfirm's `claim` here so the rendered ConfirmStartup
   // (and the unmount path) can settle the race.
   const terminalClaim = React.useRef<((w: ConfirmWinner, d: StartupDecision) => void) | null>(null)
+
+  // If this view is ever torn down without going through onExit, the run must stop with it:
+  // otherwise the orchestrator keeps issuing real, write-capable model calls and writing
+  // node.md into a tree nothing is watching, and the parent-signal listener outlives us.
+  const { abort, detach } = props
+  React.useEffect(() => () => { abort(); detach() }, [abort, detach])
 
   const { args, knownRoles, extractJson } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in

@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Box, Text } from 'ink'
+import { Box, Text } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus, type UiStatus } from '../../tools/efftask/stateMachine.js'
 
