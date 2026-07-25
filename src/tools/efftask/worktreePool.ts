@@ -67,6 +67,20 @@ export type WorktreePool = ReturnType<typeof createWorktreePool>
 export function createWorktreePool(deps: WorktreePoolDeps) {
   const { runId, gitRoot, git, worktreeRoot } = deps
   const intBranch = integrationBranch(runId)
+  /**
+   * node id → the files git itself reported as conflicted by that node's local merge.
+   *
+   * The marker scan is restricted to these. Matching marker TEXT across everything the branch
+   * contributes is not a conflict predicate: a node that legitimately ships a CONFLICTS.md
+   * documenting <<<<<<< — and correctly resolves a real conflict in a different file — was
+   * refused permanently, and the card's "清理掉残留标记并提交" then had the author delete their
+   * own documentation to get unblocked. Measured: same resolution, opposite verdicts, decided
+   * only by an unrelated file.
+   *
+   * Empty after a restart, which is correct: on resume the human resolved by hand and the
+   * unmerged-paths guard is what protects that path.
+   */
+  const conflictedByNode = new Map<string, string[]>()
   const intPath = `${worktreeRoot}/integration`
   const acquireLock = mutex()
   const mergeLock = mutex()
@@ -380,8 +394,12 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     /** Files this branch would bring that still carry conflict-marker lines. */
     async markerFiles(node: TaskNode): Promise<string[]> {
       const path = pathFor(node)
-      // Gated the same way commitAndMerge is: marker TEXT is not evidence of a conflict, so a
-      // README about merge conflicts must not be reported as one.
+      // ONLY the files git said were conflicted. Everything else this branch contributes is
+      // ordinary work, and marker-shaped text in it is ordinary content — a documentation file,
+      // a Markdown setext underline, a fixture. Restricting the scan is what makes this a
+      // conflict predicate instead of a text search.
+      const suspect = conflictedByNode.get(node.id)
+      if (!suspect || suspect.length === 0) return []
       const merges = await git(['rev-list', '--merges', `${intBranch}..HEAD`], path)
       if (merges.stdout.trim().length === 0) return []
       const diff = await git(['diff', '-U0', `${intBranch}...HEAD`], path)
@@ -389,6 +407,7 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       let current = ''
       for (const line of diff.stdout.split('\n')) {
         if (line.startsWith('+++ b/')) { current = line.slice('+++ b/'.length).trim(); continue }
+        if (!suspect.includes(current)) continue
         if (current && /^\+(<{7} |>{7} |={7}$)/.test(line) && !out.includes(current)) out.push(current)
       }
       return out
@@ -408,8 +427,14 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       // `git merge` that answers "Already up to date."
       const stale = await this.markerFiles(node)
       if (stale.length > 0) return { markers: true, staged: false, stale: true, files: stale }
-      const made = await this.mergeIntegrationIntoNode(node)
-      if (made.ok && made.conflicted) return { markers: true, staged: false, stale: false, files: made.files }
+      // READ-ONLY from here. An earlier version called mergeIntegrationIntoNode to "make" a
+      // conflict so the card would have something to point at. That made a probe mutate what
+      // it measured: it committed the executor's loose files under a message claiming they
+      // were the deliverable, performed the merge, and then reported the state its own merge
+      // had produced — so the card's "请自行 git merge" answered "Already up to date", and the
+      // merge commit it manufactured was what armed the marker scan for the next round.
+      // Reporting a clean worktree honestly is worth more: the card's instruction to merge it
+      // in by hand then actually reproduces the conflict.
       return { markers: false, staged: false, stale: false, files: [] }
     },
 
@@ -429,7 +454,10 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       const u = await git(['diff', '--name-only', '--diff-filter=U'], path)
       const files = u.stdout.split('\n').map(l => l.trim()).filter(Boolean)
       // NOT aborted on purpose — the conflicted state IS the deliverable here.
-      if (files.length > 0) return { ok: true, conflicted: true, files }
+      if (files.length > 0) {
+        conflictedByNode.set(node.id, files)
+        return { ok: true, conflicted: true, files }
+      }
       // No unmerged paths and a non-zero exit is not a conflict; leave nothing half-done.
       await git(['merge', '--abort'], path)
       return { ok: false, message: merge.stderr.trim() || merge.stdout.trim() || '合并未生效' }

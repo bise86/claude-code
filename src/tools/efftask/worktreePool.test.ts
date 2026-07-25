@@ -507,6 +507,29 @@ describe('冲突必须发生在节点自己的工作区(spec §8),且绝不带�
     expect(res.ok === false && res.kind === 'conflict' && res.files).toEqual(['shared.txt'])
   })
 
+  it('a correct resolution still merges when an UNRELATED file documents markers', async () => {
+    // The controlled pair from an acceptance review: two byte-identical runs, differing only
+    // in that one also ships a CONFLICTS.md about merge markers. The genuine resolution of the
+    // real conflict was refused because of the other file — and the card then told the author
+    // to delete their own documentation to get unblocked.
+    const { p, b, pb } = await conflictingPair()
+    await p.commitAndMerge(b)
+    await p.mergeIntegrationIntoNode(b)
+    await writeFile(join(pb, 'shared.txt'), 'line1\nA 版本 + B 版本\nline3\n') // really resolved
+    await writeFile(join(pb, 'CONFLICTS.md'), [
+      '# 冲突处理指南', '', '你会看到:', '', '<<<<<<< HEAD', '你的', '=======', '别人的', '>>>>>>> other', '',
+    ].join('\n'))
+    await git(['add', '-A'], pb)
+
+    const res = await p.commitAndMerge(b)
+    expect(res).toEqual({ ok: true, merged: true })
+    const shared = await git(['show', `${p.integrationBranchName}:shared.txt`], gitRoot)
+    expect(shared.stdout).toContain('A 版本 + B 版本')
+    // the documentation survives intact — it was never the problem
+    const doc = await git(['show', `${p.integrationBranchName}:CONFLICTS.md`], gitRoot)
+    expect(doc.stdout).toContain('<<<<<<< HEAD')
+  })
+
   it('does NOT refuse a node whose deliverable merely CONTAINS marker-shaped text', async () => {
     // Conflict-marker text is not evidence of a conflict. A README about resolving merge
     // conflicts — or any Markdown using a `=======` setext underline — matches the pattern.
@@ -547,24 +570,39 @@ describe('冲突必须发生在节点自己的工作区(spec §8),且绝不带�
     expect(intFile.stdout).not.toContain('<<<<<<<')
   })
 
-  it('conflictState describes what is really there, and only creates a conflict if none exists', async () => {
-    // The escalation card is written from this measurement. Three states, three sentences —
-    // a single claim about <<<<<<< markers was false in two of them.
+  it('conflictState is READ-ONLY — a probe must not change what it reports', async () => {
+    // It used to call mergeIntegrationIntoNode so the card would have a conflict to point at.
+    // That made the probe commit the executor's loose files under a message claiming they were
+    // the deliverable, perform the merge, and then report the state its own merge produced:
+    // the card's "请自行 git merge" answered "Already up to date", and the merge commit it
+    // manufactured was what armed the marker scan for the next round.
     const { p, b, pb } = await conflictingPair()
     await p.commitAndMerge(b)
+    await writeFile(join(pb, 'loose.txt'), '执行者还没提交的东西\n')
+    const headBefore = await git(['rev-parse', 'HEAD'], pb)
 
-    // 1) clean → it makes the conflict so the card's instruction becomes actionable
+    const st = await p.conflictState(b)
+    expect(st).toEqual({ markers: false, staged: false, stale: false, files: [] })
+    expect((await git(['rev-parse', 'HEAD'], pb)).stdout).toBe(headBefore.stdout)
+    expect((await git(['status', '--porcelain'], pb)).stdout).toContain('loose.txt')
+    // …and because nothing was pre-merged, the instruction the card gives for this state
+    // ("请自行把集成分支合并进来") really does reproduce the conflict.
+    const byHand = await git(['merge', '--no-edit', p.integrationBranchName], pb)
+    expect(byHand.code).not.toBe(0)
+    expect(byHand.stdout + byHand.stderr).not.toContain('Already up to date')
+  })
+
+  it('reports a live conflict and a staged resolution without touching either', async () => {
+    const { p, b, pb } = await conflictingPair()
+    await p.commitAndMerge(b)
+    await p.mergeIntegrationIntoNode(b)
     expect(await p.conflictState(b)).toEqual({ markers: true, staged: false, stale: false, files: ['shared.txt'] })
-    // 2) markers present → reported as-is, no second merge attempted
-    expect(await p.conflictState(b)).toEqual({ markers: true, staged: false, stale: false, files: ['shared.txt'] })
-    // 3) resolved-and-staged → must NOT be described as a conflict scene, and must NOT be
-    //    re-merged: mergeIntegrationIntoNode would commit the staged work, which on the real
-    //    path is the resolution acceptance had just rejected.
+
     await writeFile(join(pb, 'shared.txt'), 'line1\n合并后的\nline3\n')
     await git(['add', 'shared.txt'], pb)
     const head = await git(['rev-parse', 'HEAD'], pb)
     expect(await p.conflictState(b)).toEqual({ markers: false, staged: true, stale: false, files: [] })
-    expect((await git(['rev-parse', 'HEAD'], pb)).stdout).toBe(head.stdout) // nothing committed
+    expect((await git(['rev-parse', 'HEAD'], pb)).stdout).toBe(head.stdout)
   })
 })
 
