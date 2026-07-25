@@ -424,6 +424,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const cardLimit = React.useRef(createEscalationLimiter())
   // 子 agent 实时输出 (spec §10.2). One bounded ring buffer per node for the whole run.
   const chunks = React.useRef(createChunkStore())
+  /** 并行占用 reader, handed over once by runOrchestrator. */
+  const poolRead = React.useRef<(() => { inUse: number; limit: number }) | null>(null)
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
@@ -627,6 +629,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 子 agent 实时输出 (spec §10.2). The buffer is bounded, so a long run cannot grow it
         // without limit; the detail view reads it directly at render time.
         onChunk: (nodeId, text) => chunks.current.push(nodeId, text),
+        // 并行占用 (spec §10.1). One call, storing a live reader for the status bar.
+        onPool: read => { poolRead.current = read },
         // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
         // read at escalation time, not at gate time, because the bridge may connect
         // after the run starts. Absent bridge => no card; the node still blocks with
@@ -905,7 +909,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'running') {
-    return <RunningView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} onAbort={props.abort} />
+    return <RunningView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} pool={poolRead.current ?? undefined} onAbort={props.abort} />
   }
   return <DoneView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} outcome={outcome} handoff={handoff} onExit={props.onExit} />
 }
@@ -945,12 +949,12 @@ function ParsingView(props: { onCancel: () => void }): React.ReactElement {
 // EXPORTED for testing. The three §10.2 hops that live in this file — creating the store,
 // pushing into it, and handing it to each panel — are exactly the shape of wire this repo has
 // cut twice, and nothing else here is importable by a test.
-export function RunningView(props: { nodes: TaskNode[]; runId: string; chunks?: ChunkStore; onAbort: () => void }): React.ReactElement {
+export function RunningView(props: { nodes: TaskNode[]; runId: string; chunks?: ChunkStore; pool?: () => { inUse: number; limit: number }; onAbort: () => void }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
   // different things at once (abort the run vs leave the detail view). The panel owns the
   // keyboard and calls back for exit.
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive chunks={props.chunks} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive chunks={props.chunks} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.

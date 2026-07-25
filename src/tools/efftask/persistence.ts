@@ -89,6 +89,35 @@ export async function allocateRunId(fs: FsLike, effRoot: string): Promise<string
   throw new Error('efftask: 无法分配 run id(连续 1000 个都已被占用)')
 }
 
+/**
+ * 评审/验收记录 (spec §7): "每一轮的**角色意见**与合成结果都追加进 reviewLog/acceptLog 并
+ * 落盘到 node.md 的 ## 评审记录/## 验收记录".
+ *
+ * The per-role opinions were the half that never made it into the body — only the synthesized
+ * verdict did. They survive in the frontmatter (serializeNode dumps the whole node), but the
+ * body is the part a human reads, and "为什么没通过" is exactly the question they open this
+ * file to answer.
+ */
+function roundtableBody(log: TaskNode['reviewLog']): string {
+  if (log.length === 0) return ''
+  return log.map(r => {
+    const head = `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${stripControl(r.synthesized.blockingSummary)}`
+    const roles = r.verdicts.map(v => {
+      const detail = v.blocking.length > 0 ? v.blocking.join('; ') : v.comments
+      const mark = v.infra ? 'CALL-FAILED' : v.pass ? 'pass' : 'FAIL'
+      return `  - [${stripControl(v.role)}] ${mark}${detail ? ': ' + stripControl(detail) : ''}`
+    })
+    return [head, ...roles].join('\n')
+  }).join('\n')
+}
+
+/** 评分 with the REASONS. The number alone does not say why, and §4.2 lists rationale. */
+function scoreBody(node: TaskNode): string {
+  const line = (label: string, s?: { role: string; score: number; rationale: string }): string =>
+    s ? `${label}: ${s.score} [${stripControl(s.role)}]${s.rationale ? ' — ' + stripControl(s.rationale) : ''}` : `${label}: -`
+  return [line('plan', node.score.plan), line('exec', node.score.exec)].join('\n')
+}
+
 // machine-state frontmatter fields (everything except derived human body)
 export function serializeNode(node: TaskNode): string {
   const fm = { ...node }
@@ -103,9 +132,9 @@ export function serializeNode(node: TaskNode): string {
     `## 验收点\n${c(node.plan.acceptance)}\n\n` +
     `## 执行状态\n${c(node.execStatus)}\n\n` +
     (node.blockedReason ? `## 阻断原因\n${c(node.blockedReason)}\n\n` : '') +
-    `## 评审记录\n${node.reviewLog.map(r => `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${c(r.synthesized.blockingSummary)}`).join('\n')}\n\n` +
-    `## 验收记录\n${node.acceptLog.map(r => `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${c(r.synthesized.blockingSummary)}`).join('\n')}\n\n` +
-    `## 评分\nplan: ${node.score.plan?.score ?? '-'} / exec: ${node.score.exec?.score ?? '-'}\n`
+    `## 评审记录\n${roundtableBody(node.reviewLog)}\n\n` +
+    `## 验收记录\n${roundtableBody(node.acceptLog)}\n\n` +
+    `## 评分\n${scoreBody(node)}\n`
   return `---\n${yamlStringify(fm)}---\n\n${body}`
 }
 
@@ -168,7 +197,17 @@ export async function loadRun(
       const path = `${dir}/${name}`
       if (name === 'node.md') {
         try {
-          nodes.push(parseNodeFile(await fs.readFile(path)))
+          const node = parseNodeFile(await fs.readFile(path))
+          // 路径即 id (spec §5): "node.md frontmatter 的 id 与其磁盘路径一致(路径即 id)".
+          // Nothing checked it, so a hand-edited or mis-copied id silently detached the node
+          // from its own directory — every later writeNode would then create a SECOND
+          // directory and the original would be read back again on the next resume.
+          const fromPath = dir.slice(runDir.length + 1)
+          if (fromPath.length > 0 && node.id !== fromPath) {
+            errors.push({ path, message: `frontmatter 的 id (${node.id}) 与所在目录 (${fromPath}) 不一致,已按目录为准` })
+            node.id = fromPath
+          }
+          nodes.push(node)
         } catch (e) {
           errors.push({ path, message: e instanceof Error ? e.message : String(e) })
         }

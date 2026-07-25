@@ -46,6 +46,8 @@ export async function runOrchestrator(
     onBlocked?: PipelineCtx['onBlocked']
     /** 子 agent 实时输出 (spec §10.2): streamed per node, for the detail view. */
     onChunk?: PipelineCtx['onChunk']
+    /** 并行占用 (spec §10.1): called ONCE with a live reader for the status bar. */
+    onPool?: (read: () => { inUse: number; limit: number }) => void
     /**
      * 后台任务登记 (spec §10): make this run visible in `/tasks` and the footer pill, with
      * live counts, and stoppable from there through the run's OWN controller.
@@ -131,6 +133,9 @@ export async function runOrchestrator(
       args.signal,
       args.seed, // resume: adopt the recovered tree instead of minting a fresh root
     )
+    // 并行占用 (spec §10.1): hand the panel a LIVE reader, once. A per-tick callback would
+    // fire many times a second for a number that only the header shows.
+    args.onPool?.(() => orch.slotUsage())
     setNodes(orch.nodes()) // seed with the root so the tree isn't blank on first paint
     void queueManifest(orch.nodes()) // run.md exists from the first frame, not just at the end
     const result = await orch.run() // { status, reason }

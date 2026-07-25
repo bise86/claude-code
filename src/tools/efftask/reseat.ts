@@ -4,13 +4,19 @@ import type { Caps, NodeStatus, TaskNode } from './types.js'
  * Statuses that mean "a phase was in flight". A process kill leaves these on disk while
  * nothing is actually running any more.
  *
- * `EXECUTED`, `SCORING` and `MERGE` are in the NodeStatus union but are NEVER committed by
- * any code path (grep-verified against pipeline.ts), so writing rules for them would be
- * writing logic for dead states. If a later phase starts using them, add them here WITH a
- * test that drives the real transition.
+ * `SCORING` and `MERGE` ARE now committed (spec §4's state machine lists them, and the panel
+ * showed both as ACCEPTANCE until they were). They belong here for the same reason as the
+ * rest: a process killed while scoring or merging leaves that status on disk, and a status
+ * this set does not know is a status `advanceableKind` also refuses — the node would sit
+ * grey forever and every later resume would reproduce it.
+ *
+ * `EXECUTED` is still never committed by any path (grep-verified against pipeline.ts), so a
+ * rule for it would be logic for a dead state. If that changes, add it here WITH a test that
+ * drives the real transition.
  */
 const ACTIVE: ReadonlySet<NodeStatus> = new Set<NodeStatus>([
   'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'ACCEPTANCE', 'REWORK', 'INTEGRATION_ACCEPT',
+  'SCORING', 'MERGE',
 ])
 
 const ANNOTATION = '(注:上次运行在此处中断,已重新排队)'

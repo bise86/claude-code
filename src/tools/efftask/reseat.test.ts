@@ -540,3 +540,19 @@ describe('--retry-blocked 重开时要说明工作区被重置了', () => {
     expect(n.execStatus).toBe('')
   })
 })
+
+
+describe('SCORING / MERGE 现在是真会写盘的状态', () => {
+  for (const st of ['SCORING', 'MERGE']) {
+    it(st + ' 被杀掉后能重新排队,而不是永远灰在那里', () => {
+      // These two were in NodeStatus and never committed, so reseat's ACTIVE set left them
+      // out on purpose. They ARE committed now (the panel showed both as ACCEPTANCE until
+      // then), and a status this set does not know is one advanceableKind also refuses —
+      // the node would sit grey forever and every later resume would reproduce it.
+      const n = mk({ id: 'root', kind: 'executable', status: st })
+      const r = reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+      expect(n.status).toBe('READY')
+      expect(r.reseated).toEqual(['root'])
+    })
+  }
+})

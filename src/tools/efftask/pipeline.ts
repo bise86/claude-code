@@ -1133,6 +1133,10 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     }
     if (rec.synthesized.pass) {
       // 观察评分 runs between acceptance and ACCEPTED (spec §8: 验收 + 评分通过后进入 MERGE).
+      // Committed as its own status: scoring and merging are separately slow phases, and the
+      // panel rendered both as ACCEPTANCE — a user watching a node sit for minutes could not
+      // tell which of the three it was in. SCORING/MERGE were in NodeStatus and never written.
+      if (firstRole(node, 'observer') && !(await commit(node, 'SCORING', ctx))) return
       const needsRework = await scoreNode(node, ctx)
       if (needsRework) {
         feedback = `观察角色评分低于阈值,请针对性改进后重新提交。\n方案 ${node.score.plan?.score}: ${node.score.plan?.rationale}\n执行 ${node.score.exec?.score}: ${node.score.exec?.rationale}`
@@ -1143,6 +1147,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // It runs AFTER scoring on purpose: scoring can send the node back to REWORK, and a
       // node that had already merged would then be reworking on top of work the integration
       // branch has taken — with its worktree possibly already released.
+      if (ctx.worktrees && node.worktree && !(await commit(node, 'MERGE', ctx))) return
       if (!(await mergeAndRelease(node, ctx))) return
       await commit(node, 'ACCEPTED', ctx)
       return

@@ -80,6 +80,17 @@ export class EffTaskOrchestrator {
 
   nodes(): TaskNode[] { return [...this.byId.values()] }
 
+  /**
+   * 并行占用 (spec §10.1's 顶部状态条). Live, because it changes many times per second and
+   * mirroring it into React state would repaint the tree on every reviewer.
+   *
+   * This is the POOL's occupancy, not a count of running nodes: a roundtable's reviewers hold
+   * slots too, and that is precisely the number the confirmation gate promised to cap.
+   */
+  slotUsage(): { inUse: number; limit: number } {
+    return { inUse: this.slots.inUse(), limit: Math.max(1, this.cfg.parallelism) }
+  }
+
   // run() must always RESOLVE with an outcome. Its failure handlers do I/O of their own, so
   // an ordinary disk error or a crashing renderer would otherwise reject the whole run —
   // and worst of all on the abort path, exactly when the user is bailing out of a broken

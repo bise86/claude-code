@@ -112,6 +112,8 @@ export function TaskTreePanel(props: {
    * which is the refresh rate a scrolling log needs.
    */
   chunks?: ChunkStore
+  /** 并行占用 (spec §10.1). Read at render time; see `chunks` for why it is not state. */
+  pool?: () => { inUse: number; limit: number }
 }): React.ReactElement {
   // Tick once a second so elapsed times keep moving even when no node transitions —
   // otherwise the panel only repaints on onUpdate and looks frozen during a long phase.
@@ -201,6 +203,9 @@ export function TaskTreePanel(props: {
         高效任务 · run {props.runId}{'  '}
         <Text color="success">✓{counts.done}</Text> <Text color="warning">◐{counts.running}</Text>{' '}
         <Text color="inactive">○{counts.queued}</Text> <Text color="error">✗{counts.failed}</Text>
+        {/* 并行占用 n/N (spec §10.1). The POOL's occupancy, which includes the reviewers a
+            roundtable is running — that is the number the confirmation gate capped. */}
+        {props.pool ? <Text dimColor>{'  '}并行 {props.pool().inUse}/{props.pool().limit}</Text> : null}
         {rows.length > view.slice.length ? <Text dimColor>{'  '}{idx + 1}/{rows.length}</Text> : null}
       </Text>
       {view.slice.map(({ node: n, depth, hasKids }, vi) => {

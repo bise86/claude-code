@@ -64,6 +64,18 @@ function scoreBody(n: TaskNode): string {
   return [line('方案质量', n.score.plan), line('执行质量', n.score.exec)].filter(Boolean).join('\n')
 }
 
+/** 迭代次数 (spec §10.2). Only the counters that have actually been spent. */
+function iterationBody(n: TaskNode): string {
+  const it = n.iteration
+  return [
+    it.planReview > 0 ? `方案评审返工 ${it.planReview}` : '',
+    it.acceptance > 0 ? `验收返工 ${it.acceptance}` : '',
+    it.integration > 0 ? `集成验收返工 ${it.integration}` : '',
+    it.scoring > 0 ? `评分触发返工 ${it.scoring}` : '',
+    it.mergeResolve > 0 ? `自动解决合并冲突 ${it.mergeResolve}` : '',
+  ].filter(Boolean).join(' · ')
+}
+
 export function NodeDetail(props: {
   node: TaskNode
   elapsed: string
@@ -105,6 +117,9 @@ export function NodeDetail(props: {
       <Section maxLines={perSection} title="执行状态" body={n.execStatus} />
       <Section maxLines={perSection} title="阻断原因" body={n.blockedReason} color="error" />
       <Section maxLines={perSection} title="评分" body={scoreBody(n)} />
+      {/* 迭代次数 (spec §10.2 lists it). Zero counters render nothing — Section drops an
+          empty body — so an untouched node stays uncluttered. */}
+      <Section maxLines={perSection} title="迭代次数" body={iterationBody(n)} />
       <Section maxLines={perSection} title="评审记录" body={rounds(n.reviewLog)} />
       <Section maxLines={perSection} title="验收记录" body={rounds(n.acceptLog)} />
       {n.worktree ? <Section maxLines={perSection} title="隔离工作区" body={`${n.worktree.branch}\n${n.worktree.path}`} /> : null}

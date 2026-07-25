@@ -1799,3 +1799,54 @@ describe('startedAt:进入活动态的那一刻', () => {
     expect(root().startedAt).toBeUndefined()
   })
 })
+
+
+describe('评分和合并是各自独立的阶段,面板不该把它们显示成验收', () => {
+  it('有观察角色时先落 SCORING,再落 MERGE', async () => {
+    // Both were in NodeStatus and never written: a user watching a node sit for minutes could
+    // not tell whether it was being reviewed, scored, or merged.
+    const seen: string[] = []
+    const n = root()
+    n.kind = 'executable'
+    n.phaseRoles = { ...emptyPhaseRoles(), observer: [{ roleName: 'scorer' }] }
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'observer') {
+        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        return '```' + tag + '\n{"plan":{"score":90,"rationale":"ok"},"exec":{"score":90,"rationale":"ok"}}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    })
+    ctx.persist = async node => { seen.push(node.status) }
+    ctx.worktrees = {
+      acquire: async (x: TaskNode) => ({ path: '/wt/' + x.id, branch: 'b', gitRoot: '/r' }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
+      release: async () => ({ removed: true }),
+      refreshFromIntegration: async () => ({ ok: true, updated: false }),
+      conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+      mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
+      withIntegrationRead: (fn: () => Promise<unknown>) => fn(),
+      integrationPath: '/wt/i', integrationBranchName: 'i',
+    } as never
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(seen).toContain('SCORING')
+    expect(seen).toContain('MERGE')
+    expect(seen.indexOf('SCORING')).toBeLessThan(seen.indexOf('MERGE'))
+  })
+
+  it('没有观察角色就不假装在评分', async () => {
+    const seen: string[] = []
+    const n = root()
+    n.kind = 'executable'
+    const ctx = ctxFor([n], async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```')
+    ctx.persist = async node => { seen.push(node.status) }
+    await stepExecute(n, ctx)
+    expect(seen).not.toContain('SCORING')
+    // …and with no worktree there is nothing to merge either.
+    expect(seen).not.toContain('MERGE')
+  })
+})

@@ -237,3 +237,82 @@ describe('the artifacts must be readable and safe to cat', () => {
     expect(CTRL.test(renderTreeSnapshot([n]))).toBe(false)
   })
 })
+
+
+describe('node.md 的正文要留下角色意见和评分理由 (spec §7 / §4.2)', () => {
+  const withLogs = () => {
+    const n = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: '2026-01-01T00:00:00Z' })
+    n.reviewLog = [{
+      round: 1,
+      verdicts: [
+        { role: 'architect', pass: false, blocking: ['缺回滚方案'], comments: '' },
+        { role: 'security', pass: true, blocking: [], comments: '没有暴露面' },
+        { role: 'qa', pass: false, blocking: [], comments: '', infra: true },
+      ],
+      synthesized: { pass: false, blockingSummary: '[architect] 缺回滚方案' },
+    }]
+    n.score = {
+      plan: { role: 'scorer', score: 88, rationale: '结构清楚' },
+      exec: { role: 'scorer', score: 91, rationale: '测试齐全' },
+    }
+    return n
+  }
+
+  it('每个角色说了什么都写进正文', () => {
+    // spec §7: "每一轮的角色意见与合成结果都追加进…并落盘到 node.md". Only the synthesized
+    // verdict made it; the per-role opinions survived in the frontmatter, but the body is the
+    // part a human opens this file to read, and "为什么没通过" is why they open it.
+    const body = serializeNode(withLogs())
+    expect(body).toContain('[architect] FAIL: 缺回滚方案')
+    expect(body).toContain('[security] pass: 没有暴露面')
+    // A reviewer whose CALL failed never judged anything — that must not read as a rejection.
+    expect(body).toContain('[qa] CALL-FAILED')
+  })
+
+  it('评分带上理由,不只是数字', () => {
+    const body = serializeNode(withLogs())
+    expect(body).toContain('plan: 88 [scorer] — 结构清楚')
+    expect(body).toContain('exec: 91 [scorer] — 测试齐全')
+  })
+
+  it('没有记录的节点不会多出空段落里的垃圾', () => {
+    const n = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'x' })
+    const body = serializeNode(n)
+    expect(body).toContain('## 评审记录\n\n')
+    expect(body).toContain('plan: -')
+  })
+
+  it('角色名和理由里的控制字节被剥掉 —— 正文不像 frontmatter 那样会转义', () => {
+    const n = withLogs()
+    n.score.plan = { role: 'sc' + String.fromCharCode(27) + '[2Jorer', score: 1, rationale: 'a' + String.fromCharCode(7) + 'b' }
+    const body = serializeNode(n)
+    expect(body).not.toContain(String.fromCharCode(27))
+    expect(body).not.toContain(String.fromCharCode(7))
+  })
+})
+
+describe('路径即 id (spec §5)', () => {
+  it('frontmatter 的 id 与目录不一致时,以目录为准并报出来', async () => {
+    // Nothing checked this. A hand-edited or mis-copied id detached the node from its own
+    // directory: every later writeNode created a SECOND directory, and the original was read
+    // back again on the next resume.
+    const files = new Map<string, string>()
+    const n = createNode({ id: 'root/99-wrong', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: 'x' })
+    files.set('/run/root/01-right/node.md', serializeNode(n))
+    const fs2 = {
+      readFile: async (p: string) => { const v = files.get(p); if (v === undefined) throw new Error('ENOENT'); return v },
+      writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
+      unlink: async () => {}, rmdir: async () => {}, exists: async () => true,
+      readdir: async (d: string) => {
+        if (d === '/run') return ['root']
+        if (d === '/run/root') return ['01-right']
+        if (d === '/run/root/01-right') return ['node.md']
+        throw new Error('not a dir')
+      },
+    }
+    const { nodes, errors } = await loadRun(fs2 as never, '/run')
+    expect(nodes).toHaveLength(1)
+    expect(nodes[0].id).toBe('root/01-right')          // the directory wins
+    expect(errors.some(e => e.message.includes('不一致'))).toBe(true)
+  })
+})

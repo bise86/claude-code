@@ -555,3 +555,66 @@ describe('耗时要量的是"干活的时间",不是"活了多久" (spec §10.1)
     expect(elapsed(mk({ id: 'x', status: 'BLOCKED' }), Date.now())).toBe('-')
   })
 })
+
+describe('顶部状态条的并行占用 (spec §10.1)', () => {
+  it('显示 n/N,数的是池子的占用而不是"跑着的节点数"', async () => {
+    // The pool's occupancy includes the reviewers a roundtable is running — that is precisely
+    // the number the confirmation gate promised to cap, and counting nodes would under-report
+    // it by a factor of |roles|.
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel as never, {
+        nodes: tree(), runId: '003', interactive: true,
+        pool: () => ({ inUse: 4, limit: 5 }),
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).toContain('并行 4/5')
+    app.unmount()
+  })
+
+  it('没有 pool 时不渲染这一段,也不显示 0/0', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel as never, { nodes: tree(), runId: '003', interactive: true } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).not.toContain('并行')
+    app.unmount()
+  })
+
+  it('节点详情列出已经花掉的迭代次数 (spec §10.2)', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: mk({
+          id: 'n', status: 'BLOCKED', kind: 'executable',
+          iteration: { planReview: 1, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 1 },
+        }),
+        elapsed: '1m',
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    expect(f).toContain('迭代次数')
+    expect(f).toContain('验收返工 3')
+    expect(f).toContain('自动解决合并冲突 1')
+    // Counters at zero are omitted rather than rendered as noise.
+    expect(f).not.toContain('集成验收返工')
+    app.unmount()
+  })
+
+  it('一次都没返工的节点不显示这一段', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, { node: mk({ id: 'n' }), elapsed: '1m' } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).not.toContain('迭代次数')
+    app.unmount()
+  })
+})
