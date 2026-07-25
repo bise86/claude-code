@@ -12,11 +12,11 @@ import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
-import { allocateRunId, loadRun, type FsLike } from '../../tools/efftask/persistence.js'
+import { loadRun, type FsLike } from '../../tools/efftask/persistence.js'
 import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResumeArgs.js'
 import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resumeCore.js'
 import { reseatTransientNodes } from '../../tools/efftask/reseat.js'
-import { acquireRunLock, listRuns, releaseRunLock, type RunSummary } from '../../tools/efftask/runRegistry.js'
+import { acquireRunLock, listRuns, releaseRunLock, reserveRun, type RunSummary } from '../../tools/efftask/runRegistry.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
@@ -124,12 +124,18 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     // It stays EAGER: creating the directory here is what reserves the id, and deferring it
     // into the component would let two concurrent /et runs share a directory.
     try {
-      active.runId = await allocateRunId(fs, effRoot)
+      // The LOCK comes with the id, not only on the --resume path. A new run used to hold
+      // nothing, so a second terminal running `/et --resume <thisRun>` found the lock free,
+      // took it, and started a SECOND orchestrator over the same directory — both writing
+      // node.md for the same ids, each silently overwriting the other, both reporting
+      // success. See reserveRun.
+      const reserved = await reserveRun(fs, effRoot, process.pid, new Date().toISOString(), isPidAlive)
+      active.runId = reserved.runId
+      active.runDir = reserved.runDir
     } catch (e) {
       onDone(`高效任务无法启动: ${e instanceof Error ? e.message : String(e)}`, { display: 'system' })
       return null
     }
-    active.runDir = `${effRoot}/${active.runId}`
   }
 
   // The command owns its own AbortController so the running view's Esc can stop the run;

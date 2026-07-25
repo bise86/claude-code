@@ -1,5 +1,5 @@
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml'
-import { loadRun, type FsLike } from './persistence.js'
+import { allocateRunId, loadRun, type FsLike } from './persistence.js'
 import { readRunManifest } from './resumeCore.js'
 
 /**
@@ -83,6 +83,42 @@ export async function acquireRunLock(
 export async function releaseRunLock(fs: FsLike, runDir: string): Promise<void> {
   try { await fs.unlink(ownerFile(runDir)) } catch { /* ignore */ }
   try { await fs.rmdir(lockDir(runDir)) } catch { /* ignore */ }
+}
+
+/**
+ * Reserve a fresh run id AND take its single-writer lock, in that order.
+ *
+ * The lock was only ever taken on the `--resume` path, so a NEW run held nothing. The hole
+ * that opens is not two resumes racing — `acquireRunLock` already refuses that — it is a
+ * resume racing a run that is still going:
+ *
+ *   terminal A: /et 做个功能       → run 004, no lock, orchestrator writing node.md
+ *   terminal B: /et --resume 004   → the lock is free, so B takes it and starts a SECOND
+ *                                    orchestrator over the same directory
+ *
+ * Both then write node.md for the same ids, each silently overwriting the other, and both
+ * report success. spec §17.5 says 「同一个 Run 不允许并发续跑」: the literal words were
+ * satisfied (two *resumes* do exclude each other) while the accident it exists to prevent was
+ * not. The code knew about it — the escalation card talks the user out of it in prose.
+ *
+ * Acquisition cannot legitimately fail here: `allocateRunId` reserves the directory with an
+ * atomic exclusive mkdir, so no one else has ever seen this path. A refusal therefore means
+ * the run root is in a genuinely strange state, and it is reported rather than worked around —
+ * proceeding unlocked would restore exactly the hole this closes.
+ */
+export async function reserveRun(
+  fs: FsLike, effRoot: string, pid: number, now: string, isAlive: (pid: number) => boolean,
+): Promise<{ runId: string; runDir: string }> {
+  const runId = await allocateRunId(fs, effRoot)
+  const runDir = `${effRoot}/${runId}`
+  const lock = await acquireRunLock(fs, runDir, pid, now, isAlive)
+  if (!lock.acquired) {
+    throw new Error(
+      `新建 run ${runId} 时无法取得写入锁(被 pid ${lock.heldBy?.pid ?? '?'} 占用)。` +
+      `该目录刚由本进程独占创建,出现这种情况说明 ${effRoot} 的状态异常。`,
+    )
+  }
+  return { runId, runDir }
 }
 
 export interface RunSummary {
