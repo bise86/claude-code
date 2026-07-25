@@ -615,15 +615,11 @@ function ParsingView(props: { onCancel: () => void }): React.ReactElement {
 // command owns; the orchestrator then returns {status:'blocked', reason:'已中断'} and the
 // finally-block flips us to 'done'.
 function RunningView(props: { nodes: TaskNode[]; runId: string; onAbort: () => void }): React.ReactElement {
-  useInput((input, key) => {
-    if (key.escape || input.toLowerCase() === 'q') props.onAbort()
-  })
-  return (
-    <Box flexDirection="column">
-      <TaskTreePanel nodes={props.nodes} runId={props.runId} />
-      <Text dimColor>Esc 中断</Text>
-    </Box>
-  )
+  // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
+  // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
+  // different things at once (abort the run vs leave the detail view). The panel owns the
+  // keyboard and calls back for exit.
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
@@ -633,19 +629,23 @@ function DoneView(props: {
   outcome: Outcome | null
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
-  useInput((input, key) => {
-    if (key.return || key.escape || input.toLowerCase() === "q") props.onExit(props.outcome)
-  })
+  // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
+  // node's detail — the run is over, so reading the tree matters more than leaving it fast.
   const ok = props.outcome?.status === 'completed'
   return (
     <Box flexDirection="column">
-      <TaskTreePanel nodes={props.nodes} runId={props.runId} />
+      <TaskTreePanel
+        nodes={props.nodes}
+        runId={props.runId}
+        interactive
+        onExitKey={() => props.onExit(props.outcome)}
+      />
       <Box borderStyle="round" paddingX={1} flexDirection="column">
         <Text bold color={ok ? 'green' : 'red'}>
           {ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
         </Text>
         {props.outcome?.reason ? <Text dimColor>原因: {props.outcome.reason}</Text> : null}
-        <Text dimColor>回车 / q / Esc 退出</Text>
+        <Text dimColor>q / Esc 退出 · 回车看节点详情</Text>
       </Box>
     </Box>
   )
