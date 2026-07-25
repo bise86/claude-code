@@ -11,7 +11,7 @@
 // surface after the gate — the exact "gate describes something other than the run" failure
 // the confirmation gates exist to prevent.
 import { ANSWER_TAGS, answerTag, parsePlanOutput } from './parseOutput.js'
-import { planPrompt } from './pipeline.js'
+import { planPrompt, type PlanPromptCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import { createNode } from './types.js'
 import type { EffTaskConfig, NodeKind, NodePlan, TaskNode } from './types.js'
@@ -73,12 +73,22 @@ export async function draftRootPlan(args: {
   runAgent: RunAgentFn
   signal: AbortSignal
   feedback?: string
+  /**
+   * Whether this run will execute children in separate git worktrees.
+   *
+   * planPrompt uses it to decide whether to warn the planner about spec §16's biggest risk
+   * (independent siblings editing one file, the later merge conflicting). At the third gate
+   * the isolation pool is already resolved, so the draft the user approves is planned under
+   * the same rules the run will use — otherwise the gate would show a decomposition made
+   * without the constraint the run then enforces.
+   */
+  worktrees?: PlanPromptCtx['worktrees']
 }): Promise<DraftResult> {
   const { root, config, runAgent, signal } = args
   const tag = answerTag(ANSWER_TAGS.plan)
   // byId holds only the root: it has no deps and no children yet, so depsSection renders
   // empty — the same string the run's first plan call would produce.
-  const ctx = { config, byId: new Map([[root.id, root]]) }
+  const ctx = { config, byId: new Map([[root.id, root]]), worktrees: args.worktrees }
   let text: string
   try {
     text = await runAgent({

@@ -4,7 +4,7 @@ import { parseDirectives } from './parseDirectives.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap } from './stateMachine.js'
-import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren } from './pipeline.js'
+import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, planPrompt } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 import { reseatTransientNodes } from './reseat.js'
@@ -2329,3 +2329,29 @@ function ctx2Child(parent: TaskNode): TaskNode {
   k.status = 'ACCEPTED'; k.execStatus = '补好了'
   return k
 }
+
+describe('spec §16:方案阶段必须被告知"可能冲突的子任务要用依赖边串起来"', () => {
+  // §16 把 worktree 合并冲突列为**最大风险**,并且只给了一条缓解:
+  // 「鼓励 plan 阶段以依赖边串联可能冲突的节点」。这条指示此前到不了 planner —— schema 那行
+  // 只要了 `deps` 却从没说它是干什么用的。一个为并行度优化的 planner 产出的正是 spec 警告
+  // 的那个形状:互不依赖的兄弟改同一个文件,各自一个 worktree,后合并的那个冲突。
+  const fakePool = { integrationPath: '/wt/integration' } as never
+
+  it('隔离运行时,提示词里要讲清 worktree 并行与冲突代价', () => {
+    const n = root()
+    const p = planPrompt(n, { config: cfg, byId: byIdMap([n]), worktrees: fakePool }, 'plantag')
+    expect(p).toContain('worktree')
+    expect(p).toContain('deps')
+    expect(p).toContain('合并冲突')
+  })
+
+  it('没有隔离时不讲 —— 那样是在描述一个这次运行不可能有的风险', () => {
+    // 共享工作目录下执行阶段是串行的(orchestrator 的 serialiseExecute),兄弟根本不会
+    // 同时动手。把冲突警告照发,就是又一句对模型说的假话。
+    const n = root()
+    const p = planPrompt(n, { config: cfg, byId: byIdMap([n]) }, 'plantag')
+    expect(p).not.toContain('合并冲突')
+    // 但 schema 本身照旧,拆分能力不受影响。
+    expect(p).toContain('"children"')
+  })
+})

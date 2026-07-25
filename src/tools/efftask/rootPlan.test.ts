@@ -430,3 +430,34 @@ describe('确认草稿守卫的第三档', () => {
     expect(root.childIds.length).toBeGreaterThan(0)
   })
 })
+
+describe('第三关起草时要用和 run 一样的隔离规则', () => {
+  it('有隔离池时,起草提示词里带着 §16 的冲突告知', async () => {
+    // 否则关口上给用户看的那棵树,是在**没有**这条约束的情况下拆出来的,而 run 随后按
+    // 有约束的规则跑 —— 用户批准的拆分和实际执行的规则不是一回事。
+    const prompts: string[] = []
+    const runAgent = (async (req: { prompt: string }) => {
+      prompts.push(req.prompt)
+      const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      return '```' + tag + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    }) as never
+    const root = makeRootNode(cfg(), NOW)
+    await draftRootPlan({
+      root, config: cfg(), runAgent, signal: new AbortController().signal,
+      worktrees: { integrationPath: '/wt/integration' } as never,
+    })
+    expect(prompts[0]).toContain('合并冲突')
+  })
+
+  it('没有隔离池时不带 —— 共享工作目录下执行是串行的,那个风险不存在', async () => {
+    const prompts: string[] = []
+    const runAgent = (async (req: { prompt: string }) => {
+      prompts.push(req.prompt)
+      const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      return '```' + tag + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    }) as never
+    const root = makeRootNode(cfg(), NOW)
+    await draftRootPlan({ root, config: cfg(), runAgent, signal: new AbortController().signal })
+    expect(prompts[0]).not.toContain('合并冲突')
+  })
+})

@@ -243,7 +243,14 @@ function exhaustionCategory(rec: RoundtableRecord): BlockCategory {
  * a persist just to render a string — and a hand-rolled second copy of the prompt is how the
  * gate and the run start describing different tasks.
  */
-export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId'>
+/**
+ * `worktrees` is here only so the prompt can tell the planner whether siblings will run in
+ * SEPARATE working trees — which is what makes spec §16's biggest risk (two independent
+ * siblings editing one file, the later merge conflicting) possible in the first place. Under
+ * a shared tree the execute phase is serialised, so that advice would be describing a hazard
+ * the run cannot have.
+ */
+export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId' | 'worktrees'>
 
 // A node with deps must SEE what its dependencies produced, otherwise it replans from
 // scratch and redoes upstream work.
@@ -335,6 +342,7 @@ function quote(s: string): string {
 
 export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = ''): string {
   const caps = ctx.config.caps
+  const isolated = ctx.worktrees !== undefined
   return (
     `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
     depsSection(node, ctx) +
@@ -344,6 +352,18 @@ export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feed
     `当前深度 ${node.depth}/上限 ${caps.maxDepth};已达上限时必须返回 kind=executable,不得再拆分。\n` +
     (feedback
       ? `上一版方案(就是它需要被修订):\n${quote(JSON.stringify(node.plan))}\n上一轮评审阻断意见,请针对性修订:\n${quote(feedback)}\n`
+      : '') +
+    // spec §16 names worktree merge conflict as the run's BIGGEST risk, and names exactly one
+    // mitigation for it: 「鼓励 plan 阶段以依赖边串联可能冲突的节点」. That instruction reached
+    // the planner nowhere — the schema line asked for `deps` and never said what they are for,
+    // so a planner optimising for parallelism produced precisely the shape the spec warns
+    // about: independent siblings editing one file, each in its own worktree, the later merge
+    // conflicting. Isolation is what makes this both possible and invisible until merge time.
+    (isolated
+      ? `注意:每个子任务在**各自独立的 git worktree** 里并行执行,最后逐个合并回集成分支。` +
+        `因此**可能改到同一批文件的子任务,必须用 deps 串起来**(让它们先后执行),` +
+        `不要为了并行把它们并列 —— 并列的代价是合并冲突,需要人工介入。` +
+        `真正互不相干的子任务才并列。\n`
       : '') +
     `请输出一个 json 代码块:{ "kind":"decompose"|"executable", "solution", "keyPoints", "risks", "acceptance", "children":[{"title","deps":["兄弟标题"]}] }。` +
     `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。` +

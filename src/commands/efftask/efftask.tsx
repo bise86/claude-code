@@ -709,7 +709,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       rootRef.current = root
       const feedback = redraftFeedback.current ?? undefined
       redraftFeedback.current = null
-      const res = await draftRootPlan({ root, config: approved, runAgent: props.runAgent, signal: props.signal, feedback })
+      const res = await draftRootPlan({ root, config: approved, runAgent: props.runAgent, signal: props.signal, feedback, worktrees: poolRef.current })
       if (cancelled) return
       if (res.ok) {
         // Keep the node in step with what the gate shows: a later re-draft must revise THIS
