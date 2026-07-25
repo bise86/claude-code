@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { createResolveOnce, raceConfirm, rosterLines, type ConfirmSurface } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -86,6 +86,27 @@ describe('startupConfirm racer', () => {
     expect(lines).toHaveLength(5) // one line per PHASE_NAMES entry
     expect(lines).toContain('评审: arch、sec(opus)') // the bound model is visible on the gate
     expect(lines).toContain('方案: 主模型')
+  })
+
+  it('clip/goalLine never emit a lone surrogate and skip leading blank lines', () => {
+    // A raw .slice() counts UTF-16 units, so an emoji at the boundary is cut in half and a
+    // lone surrogate reaches the card payload and the terminal.
+    const out = goalLine('x'.repeat(79) + '🎉尾部')
+    expect(out.isWellFormed()).toBe(true)
+    expect(Array.from(out).length).toBe(80)
+    expect(goalLine('\n\n  真正的目标  ')).toBe('真正的目标')
+    expect(clip('短')).toBe('短') // untouched when under budget
+  })
+
+  it('a teardown registered after the race settled still runs', async () => {
+    // A surface registering cleanup in a .then would otherwise never be torn down.
+    const late: string[] = []
+    let collect!: (fn: (w: string) => void) => void
+    await raceConfirm([
+      (claim, onTeardown) => { collect = onTeardown as never; later(() => claim('terminal', { parallelism: 1, approved: true })); onTeardown(() => {}) },
+    ])
+    collect(w => late.push(w))
+    expect(late).toEqual(['terminal'])
   })
 
   it('rosterLines clips a runaway roster so it cannot wreck the layout', () => {

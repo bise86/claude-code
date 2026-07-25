@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig } from './types.js'
-import { rosterLines, type ConfirmWinner, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { goalLine, rosterLines, type ConfirmWinner, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -21,7 +21,7 @@ function button(content: string, type: string, value: Record<string, unknown>) {
 }
 
 export function buildStartupCard(config: EffTaskConfig, requestId: string): object {
-  const goal = config.goalPrompt.split('\n')[0].slice(0, 80)
+  const goal = goalLine(config.goalPrompt)
   const body =
     `**目标**: ${goal}\n` +
     `**并行数**: ${config.parallelism}（P1 串行,值 P2 生效）\n` +

@@ -10,16 +10,28 @@ const PHASE_LABEL: Record<PhaseName, string> = {
 // The ACTUAL roster (spec gate-1 角色名册): each phase → its bound role names, or 主模型
 // when the phase has no bindings. Shared by the terminal card AND the Feishu card so the
 // two surfaces can never disagree about who is on the panel.
+/**
+ * Truncate to `max` CODE POINTS. A raw .slice() counts UTF-16 units and can cut an emoji
+ * in half, emitting a lone surrogate into a card payload and the terminal.
+ */
+export function clip(s: string, max = 80): string {
+  const cps = Array.from(s)
+  return cps.length > max ? `${cps.slice(0, max - 1).join('')}…` : s
+}
+
 export function rosterLines(config: EffTaskConfig): string[] {
   return PHASE_NAMES.map(p => {
     // Show the bound model too: this gate exists to let the user see exactly who is on the
     // panel, and "coder" alone hides which model that role actually runs on.
     const names = config.phaseRoles[p].map(r => (r.model ? `${r.roleName}(${r.model})` : r.roleName))
-    const joined = names.length > 0 ? names.join('、') : '主模型'
-    // Same 80-char budget the goal line uses, so one long roster can't wreck the layout.
-    const clipped = Array.from(joined).length > 80 ? `${Array.from(joined).slice(0, 79).join('')}…` : joined
-    return `${PHASE_LABEL[p]}: ${clipped}`
+    // Same 80-code-point budget as the goal line, so one long roster can't wreck the layout.
+    return `${PHASE_LABEL[p]}: ${clip(names.length > 0 ? names.join('、') : '主模型')}`
   })
+}
+
+/** First non-empty line of the goal, clipped — what both surfaces show as the objective. */
+export function goalLine(goalPrompt: string): string {
+  return clip(goalPrompt.split('\n').map(l => l.trim()).find(l => l.length > 0) ?? '')
 }
 
 /** Who answered first. Surfaces use it to render an accurate resolved state. */
@@ -59,8 +71,14 @@ export async function raceConfirm(
 ): Promise<{ winner: ConfirmWinner; decision: StartupDecision }> {
   const once = createResolveOnce<{ winner: ConfirmWinner; decision: StartupDecision }>()
   const teardowns: SurfaceTeardown[] = []
+  let settled: { winner: ConfirmWinner; decision: StartupDecision } | undefined
   const claim = (winner: ConfirmWinner, decision: StartupDecision) => { once.claim({ winner, decision }) }
-  const collect = (fn: SurfaceTeardown) => { teardowns.push(fn) }
+  // A surface that registers cleanup asynchronously (in a .then) could otherwise register
+  // AFTER the race ended and never be torn down at all — run it immediately instead.
+  const collect = (fn: SurfaceTeardown) => {
+    if (settled) { try { fn(settled.winner, settled.decision) } catch { /* ignore */ } return }
+    teardowns.push(fn)
+  }
 
   let started = 0
   for (const surface of surfaces) {
@@ -81,7 +99,10 @@ export async function raceConfirm(
   }
   try {
     const result = await once.promise
-    for (const t of teardowns) { try { t(result.winner, result.decision) } catch { /* ignore */ } }
+    settled = result
+    // Snapshot before iterating: a teardown that registers another one would otherwise
+    // extend the array being walked and loop forever.
+    for (const t of teardowns.splice(0)) { try { t(result.winner, result.decision) } catch { /* ignore */ } }
     return result
   } finally {
     opts.signal?.removeEventListener('abort', onAbort)
