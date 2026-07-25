@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { applyRootDraft, childLines, draftRootPlan, makeRootNode, rootTitle, type RootDraft } from './rootPlan.js'
+import { applyRootDraft, childLines, draftBlockers, draftRootPlan, makeRootNode, rootTitle, type RootDraft } from './rootPlan.js'
 import { EffTaskOrchestrator } from './orchestrator.js'
 import { PipelineCtx, stepStart } from './pipeline.js'
 import { byIdMap } from './stateMachine.js'
@@ -260,5 +260,77 @@ describe('根方案关口 · 任务树渲染', () => {
 
   it('says so when the plan does not decompose at all', () => {
     expect(childLines({ kind: 'executable', plan: emptyPlan(), children: [] })).toEqual(['(不拆分,根任务直接执行)'])
+  })
+})
+
+describe('根方案确认记录:不能变成"批准了一棵空树"', () => {
+  it('stepStart 拒绝一个说要拆分却没有子任务的确认草稿', async () => {
+    // Reachable from a half-written node.md. Honoured, it made stepStart skip the plan call
+    // and approve an EMPTY decomposition: the node parked at WAITING_CHILDREN with childIds
+    // [], advanceableKind returned null, propagateBlocked had nothing to blame, and the run
+    // ended '存在无法推进的阻断节点' showing a grey root with no reason — on every resume.
+    const root = makeRootNode(cfg(), NOW)
+    root.kind = 'decompose'
+    root.confirmedDraft = { children: [] }
+    const calls: string[] = []
+    const ctx = ctxFor([root], async req => {
+      calls.push(req.phase)
+      return req.phase === 'plan'
+        ? PLAN_REPLY
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    })
+    await stepStart(root, ctx)
+    // Degrades to "the plan role drafts it" — what the run did before this gate existed.
+    expect(calls[0]).toBe('plan')
+    expect(root.status).toBe('WAITING_CHILDREN')
+    expect(root.childIds.length).toBeGreaterThan(0)
+  })
+
+  it('stepStart 拒绝一个已经有子节点的节点身上的确认草稿', async () => {
+    // The WAITING_CHILDREN guard further down returns before lastChildren is used, so the
+    // approved first level was consumed and silently dropped — no children, no log, no refusal.
+    const root = makeRootNode(cfg(), NOW)
+    root.childIds = ['root/01-已有']
+    root.confirmedDraft = { children: [{ title: '甲', deps: [] }, { title: '乙', deps: [] }] }
+    const existing = createNode({ id: 'root/01-已有', title: '已有', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    const calls: string[] = []
+    const ctx = ctxFor([root, existing], async req => {
+      calls.push(req.phase)
+      return req.phase === 'plan'
+        ? PLAN_REPLY
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    })
+    await stepStart(root, ctx)
+    expect(calls[0]).toBe('plan') // not silently skipped
+    expect(root.confirmedDraft).toBeUndefined()
+  })
+})
+
+describe('draftBlockers:整批被退回的两种草稿', () => {
+  it('标题重复', () => {
+    const b = draftBlockers({ kind: 'decompose', plan: emptyPlan(), children: [
+      { title: 'A', deps: [] }, { title: 'A', deps: [] }, { title: 'B', deps: [] },
+    ] })
+    expect(b.join()).toContain('子任务标题重复(A)')
+  })
+  it('依赖成环', () => {
+    const b = draftBlockers({ kind: 'decompose', plan: emptyPlan(), children: [
+      { title: 'A', deps: ['B'] }, { title: 'B', deps: ['C'] }, { title: 'C', deps: ['A'] },
+    ] })
+    expect(b.join()).toContain('依赖成环')
+  })
+  it('正常的树没有告警', () => {
+    expect(draftBlockers({ kind: 'decompose', plan: emptyPlan(), children: [
+      { title: 'A', deps: [] }, { title: 'B', deps: ['A'] },
+    ] })).toEqual([])
+  })
+  it('自依赖不算环 —— createChildren 只是把那条边丢掉', () => {
+    // childLines already flags it as 无效依赖; calling it a cycle would double-report and
+    // over-state the consequence (an edge is lost, not the whole batch).
+    expect(draftBlockers({ kind: 'decompose', plan: emptyPlan(), children: [{ title: 'A', deps: ['A'] }] })).toEqual([])
+  })
+  it('起草失败时任务树那一段不假装做过决定', () => {
+    expect(childLines({ kind: 'unknown', plan: emptyPlan(), children: [] }, false))
+      .toEqual(['(未能起草,运行时由 plan 角色重新拆分)'])
   })
 })

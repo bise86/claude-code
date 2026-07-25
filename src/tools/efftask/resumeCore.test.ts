@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { depCycleMembers, validateLoadedNodes } from './resumeCore.js'
-import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
+import { createNode, emptyPhaseRoles, DEFAULT_CAPS, type TaskNode } from './types.js'
+import { reseatTransientNodes } from './reseat.js'
 
 const NOW = '2026-07-25T00:00:00.000Z'
 const OPTS = { goal: '打通登录接口', phaseRoles: emptyPhaseRoles(), now: NOW }
@@ -307,5 +308,46 @@ describe('恢复:根方案确认记录', () => {
     const n = base({ confirmedDraft: { children: [{ title: 'AA', deps: ['x', 5 as never] }, { deps: [] } as never] } })
     const { nodes } = validateLoadedNodes([n], opts)
     expect(nodes[0].confirmedDraft?.children).toEqual([{ title: 'AA', deps: ['x'] }])
+  })
+})
+
+describe('恢复:两扇必须关严的门', () => {
+  const base2 = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+  const opts2 = { goal: 'g', phaseRoles: emptyPhaseRoles(), now: NOW }
+
+  it('children 是数组但每一项都畸形 → 丢掉草稿,不要留成一棵空树', () => {
+    // clean === [] is NOT "no children", it is "we lost them". Kept, stepStart skipped the
+    // plan call and approved an EMPTY decomposition: the node parked at WAITING_CHILDREN with
+    // childIds [], advanceableKind returned null, and the run ended
+    // '存在无法推进的阻断节点' with a grey root and no reason — on every later resume.
+    const n = base2({ confirmedDraft: { children: [{ deps: [] }, { titel: '打错了' }] } as never })
+    const { nodes, repairs } = validateLoadedNodes([n], opts2)
+    expect(nodes[0].confirmedDraft).toBeUndefined()
+    expect(repairs.some(r => r.includes('根方案确认记录已损坏'))).toBe(true)
+  })
+
+  it('一个空 children 列表本身是合法的(不拆分),不该被当成损坏', () => {
+    const n = base2({ confirmedDraft: { children: [] } })
+    expect(validateLoadedNodes([n], opts2).nodes[0].confirmedDraft).toEqual({ children: [] })
+  })
+
+  it('因磁盘状态不可用而阻断的节点,capBlocked 必须被关掉', () => {
+    // Otherwise a node that had legitimately tripped a valve keeps capBlocked === true, and a
+    // later --retry-blocked reopens it even though THIS pass blocked it for an unrecoverable
+    // reason. The resume gate then reports 重开 1 个节点 for a node that re-blocks with zero
+    // model calls — exactly the failure --retry-blocked exists to fix.
+    const parent = base2({ id: 'root', childIds: ['root/01-gone'], capBlocked: true, kind: 'decompose' })
+    const { nodes } = validateLoadedNodes([parent], opts2)
+    const back = nodes.find(x => x.id === 'root')!
+    expect(back.status).toBe('BLOCKED')
+    expect(back.blockedReason).toContain('子节点缺失')
+    expect(back.capBlocked).toBe(false)
+    // …and the retry must genuinely refuse it now.
+    const r = reseatTransientNodes(nodes, NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(r.retried).toEqual([])
+    expect(back.status).toBe('BLOCKED')
   })
 })

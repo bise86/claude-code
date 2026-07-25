@@ -31,6 +31,7 @@ import {
   type StartupDecision,
   type ResumeSummary,
   handoffLines,
+  exitReportLine,
   type HandoffSummary,
 } from '../../tools/efftask/startupConfirm.js'
 import { buildStartupCard, sendFeishuStartupCard } from '../../tools/efftask/feishuStartupCard.js'
@@ -152,6 +153,11 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   const unsupportedRoles = activeAgents.filter(a => 'execMode' in a && (a as { execMode?: string }).execMode === 'cli').map(a => a.agentType)
   // Set when the view is torn down rather than exited, so the report can tell the two apart.
   let tornDown = false
+  // The handoff, in call()'s OWN scope. onExit runs here, and it used to read `handoffRef` —
+  // which is declared inside the component, not here — so every exit with a run id threw
+  // ReferenceError from inside a .then(), onDone was never called, and processSlashCommand's
+  // promise stayed pending forever.
+  const handoffOut: { current: HandoffSummary | null } = { current: null }
   return (
     <EffTaskRunner
       args={args}
@@ -181,6 +187,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       // nobody is watching — but the user never asked to stop, so the message must not
       // claim they cancelled. It points at the run dir, which is exactly what resume reads.
       onTornDown={() => { tornDown = true }}
+      handoffOut={handoffOut}
       // The transcript is the only durable trace once the panel is gone: say how the run
       // ended and where its artifacts live, not just that it ended.
       // Latched: the done view's key handler fires per keypress, and the immediate-command
@@ -197,10 +204,8 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
           return
         }
         const report = (withPath: boolean): void => {
-          const verb = resumed ? '续跑' : ''
-          const where = handoffRef.current ? '\n' + handoffLines(handoffRef.current).join('\n') : ''
           onDone(
-            `高效任务 ${runId} ${verb}${how}${withPath ? ` · .claude/efftask/${runId}/run.md` : ''}${where}`,
+            exitReportLine({ runId, how, resumed, withPath, handoff: handoffOut.current }),
             { display: 'system' },
           )
         }
@@ -357,6 +362,8 @@ type RunnerProps = {
   abort: () => void
   detach: () => void
   onTornDown: () => void
+  /** call()-scoped holder for the handoff, read by onExit. See exitReportLine. */
+  handoffOut: { current: HandoffSummary | null }
   onExit: (outcome: Outcome | null) => void
 }
 
@@ -617,7 +624,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       setNodes,
       recordOutcome,
       setPhase,
-      h => { handoffRef.current = h; setHandoff(h) },
+      h => { handoffRef.current = h; props.handoffOut.current = h; setHandoff(h) },
     )
     // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
   }, [runDir, runId, seed, props.fs, props.runAgent, props.signal, props.controller, recordOutcome, store, setAppState])
@@ -660,7 +667,21 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: re-runs per drafting entry
   }, [phase, approved, redrafts])
 
+  /**
+   * Settle-once. The other two gates go through raceConfirm, whose claim() is single-shot;
+   * this one calls onDecision directly, and the component is still mounted and still
+   * listening while React commits setPhase('running'). Three fast Enters therefore started
+   * THREE orchestrators on the same run directory — measured: 8 model calls instead of 4, one
+   * node.md written 12 times, and under isolation a second acquire() that parks the first
+   * run's in-flight work on a salvage ref while two write-capable executors share a worktree.
+   */
+  const rootDecided = React.useRef(false)
   const onRootDecision = React.useCallback((d: RootPlanDecision): void => {
+    // 'redraft' may legitimately happen many times; only 'start'/'cancel' are terminal.
+    if (d.action !== 'redraft') {
+      if (rootDecided.current) return
+      rootDecided.current = true
+    }
     if (d.action === 'cancel') { props.abort(); props.onExit(null); return }
     if (d.action === 'redraft') {
       redraftFeedback.current = d.feedback
@@ -800,6 +821,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         goalPrompt={config.goalPrompt}
         // EMPTY_DRAFT only ever renders alongside draftError, which says why it is empty.
         draft={draft ?? EMPTY_DRAFT}
+        drafted={draft !== null}
+        reviewRoles={config.phaseRoles.review.length}
         draftError={draftError}
         redrafts={redrafts}
         onDecision={onRootDecision}

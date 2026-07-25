@@ -112,6 +112,9 @@ export async function runOrchestrator(
         persist,
         now,
         worktrees: args.worktrees,
+        // So blockWithReason can write the REAL retry command into blockedReason (run.md is
+        // where suppressed escalations have to remain actionable).
+        runId: args.taskEntry?.runId,
         onEscalate: args.onEscalate,
         onBlocked: args.onBlocked,
         onUpdate: nodes => {

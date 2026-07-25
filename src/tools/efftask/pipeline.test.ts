@@ -1464,3 +1464,137 @@ describe('一个被回收掉的隔离工作区不能继续被声称存在', () =
     expect(n.execStatus).toContain('隔离工作区已保留')
   })
 })
+
+describe('触阀升级:被变异测试指出的 4 个没人管的调用点', () => {
+  type Fired = { id: string; category: string; reason: string }
+  function ctxWithBlocks(nodes: TaskNode[], runAgent: RunAgentFn, config: EffTaskConfig = cfg, signal?: AbortSignal) {
+    const c = ctxFor(nodes, runAgent, config, signal)
+    const fired: Fired[] = []
+    c.onBlocked = info => { fired.push({ id: info.node.id, category: info.category, reason: info.reason }) }
+    return { ctx: c, fired }
+  }
+
+  it('拆分迭代超限 → cap-iteration(和评审迭代超限是两个不同的调用点)', async () => {
+    // Reached by a plan that keeps proposing a CYCLIC child group: createChildren returns a
+    // retryable error, stepStart burns planReview, and the cap trips on the split path — a
+    // different blockWithReason call from the review-iteration one.
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"decompose","solution":"s","keyPoints":"","risks":"","acceptance":"","children":[{"title":"AA","deps":["BB"]},{"title":"BB","deps":["AA"]}]}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```')
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('拆分迭代超限')
+    expect(fired.map(f => f.category)).toEqual(['cap-iteration'])
+  })
+
+  it('验收角色连续失败 → infra(stepExecute 的那一处)', async () => {
+    const n = root(); n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks([n], async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      throw new Error('provider down')
+    })
+    await stepExecute(n, ctx)
+    expect(n.blockedReason).toContain('验收角色连续')
+    expect(fired.map(f => f.category)).toEqual(['infra'])
+  })
+
+  it('集成验收角色连续失败 → infra(stepIntegrate 的那一处)', async () => {
+    const p = root(); p.kind = 'decompose'; p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const { ctx, fired } = ctxWithBlocks([p, kid], async () => { throw new Error('provider down') })
+    await stepIntegrate(p, ctx)
+    expect(p.blockedReason).toContain('集成验收角色连续')
+    expect(fired.map(f => f.category)).toEqual(['infra'])
+  })
+
+  it('方案阶段超时 → timeout(stepStart 的那一处,不是只有 stepExecute)', async () => {
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async () => { throw new PhaseTimeoutError(600_000) })
+    await stepStart(n, ctx)
+    expect(fired.map(f => f.category)).toEqual(['timeout'])
+  })
+
+  it('圆桌阶段的超时报成 timeout,不是 infra —— 两者的处置办法完全不同', async () => {
+    // Measured gap: review/accept/integrate go through runRoundtable, where allSettled turns
+    // a PhaseTimeoutError into an ordinary infra verdict. The card then told the user to
+    // check their network while the real fix was one line of caps.nodeTimeoutMs.
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+        : (() => { throw new PhaseTimeoutError(600_000) })())
+    await stepStart(n, ctx)
+    expect(fired.map(f => f.category)).toEqual(['timeout'])
+  })
+
+  it('取消 + 超时同时成立时也不发卡', async () => {
+    // The abort guard in blockWithReason was previously unreachable in every test: each
+    // fixture cancelled on a path whose category was undefined, so `category !== undefined`
+    // short-circuited first. This is the state where the guard is the ONLY thing stopping a
+    // card — a deadline that fires while the user is cancelling.
+    const ac = new AbortController()
+    const n = root(); n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks([n], async () => {
+      ac.abort()
+      throw new PhaseTimeoutError(600_000)
+    }, cfg, ac.signal)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(fired).toEqual([]) // the user is at the keyboard; do not page them
+  })
+
+  it('深度上限:折进节点内继续跑,但要说一声', async () => {
+    const shallow: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxDepth: 1 } }
+    const n = root(); n.depth = 1
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"decompose","solution":"s","keyPoints":"","risks":"","acceptance":"","children":[{"title":"AA","deps":[]},{"title":"BB","deps":[]}]}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```', shallow)
+    await stepStart(n, ctx)
+    // spec §11 lets maxDepth take the 强制 executable branch — the node keeps going.
+    expect(n.status).toBe('READY')
+    expect(n.kind).toBe('executable')
+    expect(n.plan.solution).toContain('AA、BB')
+    // …but the tree WAS flattened, and nothing else says so: the node now renders exactly
+    // like any other executable leaf.
+    expect(fired.map(f => f.category)).toEqual(['cap-depth'])
+    expect(fired[0].reason).toContain('AA、BB')
+    // NOT a block, so it must not be offered to --retry-blocked.
+    expect(n.capBlocked).toBeUndefined()
+  })
+
+  it('动态生长撞上节点数上限,也要喊人', async () => {
+    // Same valve, reached through growth instead of decomposition. It used to land ONLY in
+    // execStatus, so a run could pass acceptance having silently dropped work the executor
+    // said it needed first.
+    const tiny: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 1 } }
+    const n = root(); n.kind = 'executable'
+    // The exec answer must carry the per-call fence tag, exactly as the grower fixtures do:
+    // parseExecOutput only reads newChildren out of the block tagged for THIS call.
+    const etag2 = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'execute'
+        ? etag2(req) + '\n{"execStatus":"做了一半,发现要先建表","newChildren":[{"title":"建表","deps":[]}]}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```', tiny)
+    await stepExecute(n, ctx)
+    expect(fired.map(f => f.category)).toEqual(['cap-nodes'])
+    expect(n.execStatus).toContain('加子节点请求被拒绝')
+  })
+
+  it('run.md 里的阻断原因带着处置办法和重试命令', async () => {
+    // The escalation limiter drops cards past its cap and tells the user to read run.md.
+    // If the remedy lives only on the card, those escalations are unactionable.
+    const n = root(); n.kind = 'executable'
+    const { ctx } = ctxWithBlocks([n], async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"改了点东西"}\n```'
+        : vtag(req) + '\n{"pass":false,"blocking":["缺测试"],"comments":""}\n```')
+    ctx.runId = '007'
+    await stepExecute(n, ctx)
+    expect(n.blockedReason).toContain('验收迭代超限')
+    expect(n.blockedReason).toContain('/et --resume 007 --retry-blocked')
+  })
+})

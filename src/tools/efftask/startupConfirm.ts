@@ -262,6 +262,33 @@ export interface HandoffSummary {
  * Deliberately does NOT touch the user's checkout. The branch is handed over; what to do
  * with it is theirs to decide.
  */
+/**
+ * The transcript line `/et` leaves behind when it exits.
+ *
+ * Extracted from the command's onExit closure because that closure referenced `handoffRef` —
+ * an identifier declared inside the React component, NOT inside `call()`. It therefore threw
+ * `ReferenceError: handoffRef is not defined` on EVERY exit that had a run id, from inside a
+ * `.then()`, so `onDone` was never called and processSlashCommand's promise stayed pending
+ * forever — the exact deadlock that file's own comments warn about. Nothing caught it: the
+ * file has no tests, and a bare identifier is valid syntax so the parse gate passes it.
+ *
+ * A pure function with a test is the fix that stays fixed.
+ */
+export function exitReportLine(args: {
+  runId: string
+  /** '完成' / '被阻断(…)' / '已取消' / '因界面重建而中断' */
+  how: string
+  resumed: boolean
+  /** False only when the run directory was an unused reservation we just removed. */
+  withPath: boolean
+  handoff: HandoffSummary | null
+}): string {
+  const verb = args.resumed ? '续跑' : ''
+  const path = args.withPath ? ` · .claude/efftask/${args.runId}/run.md` : ''
+  const where = args.handoff ? '\n' + handoffLines(args.handoff).join('\n') : ''
+  return `高效任务 ${args.runId} ${verb}${args.how}${path}${where}`
+}
+
 export function handoffLines(h: HandoffSummary): string[] {
   const out = [
     h.commits > 0

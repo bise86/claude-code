@@ -284,3 +284,65 @@ describe('--retry-blocked:触阀后的人工重试', () => {
     expect(conflicted.mergeConflict).toBe(true)
   })
 })
+
+describe('--retry-blocked 不能让被否掉的方案绕过评审', () => {
+  it('评审超限的节点回到 CREATED 重做方案,而不是直接进执行器', async () => {
+    // THE bug: stepStart writes node.kind from the plan output BEFORE the review roundtable
+    // runs. A plan that called itself `executable` and was then rejected three times sits at
+    // BLOCKED with kind === 'executable', so the structural seat rule sent it to READY —
+    // and --retry-blocked handed a unanimously-refused plan straight to a write-capable
+    // executor with zero plan calls and zero reviews.
+    const n = mk({
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true,
+      blockedReason: '评审迭代超限(3): 方案不可行',
+      iteration: { planReview: 3, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    const r = reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.status).toBe('CREATED')      // → stepStart → plan → review
+    expect(n.iteration.planReview).toBe(0) // and with a fresh review budget
+    expect(r.retried).toEqual(['root'])
+
+    // Prove the seat really re-runs the plan phase, not the executor.
+    const { stepStart } = await import('./pipeline.js')
+    const { byIdMap } = await import('./stateMachine.js')
+    const phases: string[] = []
+    const byId = byIdMap([n])
+    await stepStart(n, {
+      config: { goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: DEFAULT_CAPS, notices: [] },
+      byId, persist: async () => {}, now: () => NOW, signal: new AbortController().signal,
+      onUpdate: () => {}, reserveNodes: () => ({ release: () => {} }),
+      runAgent: async req => {
+        phases.push(req.phase)
+        return req.phase === 'plan'
+          ? '```json\n{"kind":"executable","solution":"改好的方案","keyPoints":"","risks":"","acceptance":"a"}\n```'
+          : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+      },
+    })
+    expect(phases[0]).toBe('plan')   // the plan is REDONE
+    expect(phases).toContain('review') // and re-reviewed
+  })
+
+  it('验收超限的可执行节点仍然回到 READY —— 它的方案是过了评审的', () => {
+    // The distinction that matters: this node's PLAN was approved; only its execution kept
+    // failing. Sending it back to CREATED would discard a reviewed plan for no reason.
+    const n = mk({
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true,
+      blockedReason: '验收迭代超限(3): 缺测试',
+      iteration: { planReview: 1, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.status).toBe('READY')
+    expect(n.iteration.acceptance).toBe(0)
+  })
+
+  it('一个节点只被算一次,不会同时出现在"重新排队"和"重开"里', () => {
+    const n = mk({
+      id: 'root/01-a', parentId: 'root', depth: 1, kind: 'executable', status: 'BLOCKED',
+      capBlocked: true, blockedReason: '验收迭代超限(3)',
+      iteration: { planReview: 0, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    const r = reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(r.retried).toEqual(['root/01-a'])
+    expect(r.reseated).toEqual([]) // the resume gate renders both counts; this read as 2 nodes
+  })
+})

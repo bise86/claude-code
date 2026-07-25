@@ -33,6 +33,8 @@ export interface OrchestratorDeps {
    * whole feature is dead while its unit tests pass over a hand-built ctx.
    */
   onBlocked?: PipelineCtx['onBlocked']
+  /** Run id, used only to write an actionable retry command into `blockedReason`. */
+  runId?: string
   runAgent: RunAgentFn
   persist: (n: TaskNode) => Promise<void>
   now: () => string
@@ -113,6 +115,7 @@ export class EffTaskOrchestrator {
       worktrees: this.deps.worktrees,
       onEscalate: this.deps.onEscalate,
       onBlocked: this.deps.onBlocked,
+      runId: this.deps.runId,
       byId: this.byId,
       runAgent: this.deps.runAgent,
       persist: this.deps.persist,

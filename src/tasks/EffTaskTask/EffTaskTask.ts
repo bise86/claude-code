@@ -111,9 +111,15 @@ export function finishEffTaskRun(
     // as {status:'blocked', reason:'已中断'} here. Overwriting would relabel the user's own
     // stop as a failure.
     if (task.status !== 'running') return task
+    // The user's own stop is not a failure. `x` in /tasks goes through kill() and lands here
+    // already 'killed', which the guard above protects — but Esc in the /et view aborts the
+    // controller directly, so the run reports {blocked, '已中断'} with the task still
+    // 'running' and it was written up as 失败. Two ways to stop the same run, two different
+    // words for it, one of them wrong.
+    const cancelled = outcome.status === 'blocked' && outcome.reason === '已中断'
     return {
       ...task,
-      status: outcome.status === 'completed' ? 'completed' : 'failed',
+      status: outcome.status === 'completed' ? 'completed' : cancelled ? 'killed' : 'failed',
       reason: outcome.reason,
       endTime: Date.now(),
       // The run's own transcript line IS the user-facing notification (see efftask.tsx's

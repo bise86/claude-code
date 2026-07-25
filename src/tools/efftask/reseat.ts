@@ -114,8 +114,23 @@ export function reseatTransientNodes(
     // Re-entry for this node is the ACCEPTANCE+merge path in stepExecute, which the flag
     // itself selects; the READY seat below is only how the scheduler picks it up again.
 
+    /**
+     * A valve retry must re-enter the phase that FAILED, not the phase the node's shape
+     * suggests.
+     *
+     * `stepStart` writes `node.kind` from the plan output BEFORE the review roundtable runs,
+     * so a plan that called itself `executable` and was then rejected three times sits at
+     * BLOCKED with kind === 'executable'. The structural rule below would seat it at READY —
+     * and `--retry-blocked` would hand a plan the reviewers unanimously refused straight to a
+     * write-capable executor, with zero plan calls and zero reviews. Measured: phases called
+     * were ["execute", "accept"] and the node reached ACCEPTED with planReview still at 3.
+     *
+     * If the exhausted budget was planReview, the node goes back to CREATED and re-plans.
+     */
+    const reviewExhausted = retryValve && n.iteration.planReview >= caps.maxIterations
     const target: NodeStatus =
-      n.childIds.length > 0 ? 'WAITING_CHILDREN'
+      reviewExhausted ? 'CREATED'
+      : n.childIds.length > 0 ? 'WAITING_CHILDREN'
       : n.kind === 'executable' ? 'READY'
       : 'CREATED'
 
@@ -173,7 +188,10 @@ export function reseatTransientNodes(
       n.execStatus = `${n.execStatus}\n${ANNOTATION}`
     }
     n.updatedAt = now
-    reseated.push(n.id)
+    // Counted ONCE. A valve retry already has its own (louder) section at the resume gate;
+    // pushing it here as well made "重开 1 个节点" render alongside "重新排队 1 个节点" with
+    // the same id in both lists, reading as two nodes.
+    if (!retryValve) reseated.push(n.id)
   }
   return { nodes, reseated, exhausted, retried }
 }

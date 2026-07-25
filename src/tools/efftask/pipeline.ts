@@ -6,7 +6,7 @@ import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
-import type { BlockCategory } from './escalation.js'
+import { blockReasonWithRemedy, type BlockCategory } from './escalation.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 
 /** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
@@ -64,6 +64,14 @@ export interface PipelineCtx {
    * fields empty for whichever case it wasn't.
    */
   onBlocked?: (info: { node: TaskNode; reason: string; category: BlockCategory }) => void
+  /**
+   * The run id, when the caller knows it.
+   *
+   * Only used to write actionable text — the record path and the retry command — into
+   * `blockedReason`, which is what run.md renders. Optional because every test builds a ctx
+   * by hand; absent, the text degrades to a placeholder rather than to nothing.
+   */
+  runId?: string
 }
 
 /**
@@ -88,6 +96,26 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
   }
   safeUpdate(ctx)
   return true
+}
+
+/**
+ * 触阀但不停机 (spec §11 的 maxDepth 分支)。
+ *
+ * blockWithReason cannot serve this: the node is NOT blocked, and setting capBlocked would
+ * offer it to `--retry-blocked`, which would then reopen a node that is running fine.
+ * Announced anyway — "触任何阀:…不静默截断" means the user gets to know the tree was
+ * flattened, not merely that the run succeeded.
+ */
+function notifyValve(node: TaskNode, reason: string, category: BlockCategory, ctx: PipelineCtx): void {
+  // Same rule as blockWithReason: a cancel must never page a human.
+  //
+  // NOT COVERED BY A TEST, and recorded rather than faked: both call sites sit behind an
+  // earlier `runPhase`/roundtable abort check that returns first, so the only way to reach
+  // here with the signal set is an abort landing in the await window between that check and
+  // this line. Removing this guard leaves the suite green. It is defence for a race the
+  // current control flow makes very narrow — keep it, but do not claim it is tested.
+  if (ctx.signal.aborted) return
+  try { ctx.onBlocked?.({ node, reason, category }) } catch { /* a notification failure must not change the run */ }
 }
 
 // A crashing renderer must never take the run down with it.
@@ -117,7 +145,10 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promi
 // Records WHY the node died in its own field. It must NOT touch node.execStatus, which may
 // hold real completed-work evidence that acceptance/audit still needs.
 async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx, category?: BlockCategory): Promise<void> {
-  node.blockedReason = reason
+  // The 处理方式 and the retry command travel WITH the reason, exactly as the merge-conflict
+  // path does. The escalation limiter drops cards past its cap while telling the user to read
+  // run.md — so run.md has to actually contain what the card would have said.
+  node.blockedReason = category !== undefined ? blockReasonWithRemedy(reason, category, ctx.runId) : reason
   // Assigned in BOTH directions, like `interrupted`: a node that previously tripped a valve
   // and is now blocked for a structural reason must not keep a flag that offers a retry.
   node.capBlocked = category !== undefined
@@ -133,6 +164,8 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx,
   // standing at the keyboard, and a card saying 已暂停等待人工 would contradict the run's own
   // 已取消 in the same second. Fired AFTER the commit so the card and the tree agree.
   if (category !== undefined && !ctx.signal.aborted) {
+    // The RAW reason: buildBlockCard renders its own 处理方式 line, and passing the already-
+    // decorated text would print the remedy twice on one card.
     try { ctx.onBlocked?.({ node, reason, category }) } catch { /* a notification failure must not change the verdict */ }
   }
 }
@@ -142,6 +175,19 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx,
 function isInfraOnlyFailure(rec: { verdicts: { pass: boolean; blocking: string[]; infra?: boolean }[] }): boolean {
   const failing = rec.verdicts.filter(v => !v.pass || v.blocking.length > 0)
   return failing.length > 0 && failing.every(v => v.infra === true)
+}
+
+/**
+ * Which valve an exhausted roundtable actually tripped.
+ *
+ * caps.nodeTimeoutMs is its own valve (spec §11) with its own fix — 提高 nodeTimeoutMs / 把
+ * 节点拆小 — and it is nothing like "the provider is unreachable". Reported as `infra`, the
+ * card told users to go check their network while the real cause was a deadline they could
+ * raise in one line of run.md.
+ */
+function exhaustionCategory(rec: RoundtableRecord): BlockCategory {
+  const failing = rec.verdicts.filter(v => !v.pass || v.blocking.length > 0)
+  return failing.length > 0 && failing.every(v => v.timeout === true) ? 'timeout' : 'infra'
 }
 
 /**
@@ -400,14 +446,33 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
   // retry, it does not instantly kill the run.
   for (;;) {
     let lastChildren: { title: string; deps: string[] }[]
+    // A confirmed draft is only usable if it can actually BUILD what it promises. Two shapes
+    // reach here and neither can:
+    //  - decompose with no children: nothing gets created, the node parks at
+    //    WAITING_CHILDREN with childIds: [], and advanceableKind returns null forever. The run
+    //    ends '存在无法推进的阻断节点' with no reason on any node. (Reachable from a
+    //    half-written node.md; measured.)
+    //  - the node ALREADY has children: the guard further down returns before lastChildren is
+    //    used, so the approved first level is consumed and silently dropped.
+    // Falling back to a normal plan call is the honest degradation — it is what the run did
+    // before this gate existed.
+    if (confirmed && (
+      (node.kind === 'decompose' && confirmed.children.length === 0) ||
+      node.childIds.length > 0
+    )) {
+      confirmed = undefined
+      node.confirmedDraft = undefined
+    }
     if (confirmed) {
       // NO plan call. Re-drafting here would ask the plan role the question the user just
       // answered and silently throw their edits away — the gate would render, they would
       // approve a tree, and the run would build a different one.
       lastChildren = confirmed.children
       confirmed = undefined
-      // Cleared as part of the commit below, so the consumption is durable: a crash between
-      // here and the review must not let the gate's draft apply a second time on resume.
+      // Cleared by the commit below. NOTE the assignment happens BEFORE it: if that write
+      // fails the node is BLOCKED having already lost the draft, and neither `interrupted`
+      // nor `capBlocked` is set, so no resume reopens it. commit()'s failure path is
+      // pre-existing; the draft merely gives it one more thing to lose.
       node.confirmedDraft = undefined
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     } else {
@@ -432,7 +497,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {
       // Nobody judged the plan — say that rather than blaming the plan.
-      await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, 'infra')
+      await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec))
       return
     }
     if (!rec.synthesized.pass) {
@@ -462,9 +527,14 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     if (node.depth + 1 > caps.maxDepth) {
       // parsePlanOutput only reports 'decompose' when it parsed at least one child, so
       // lastChildren is non-empty here.
-      node.plan.solution += `\n\n已达最大深度,不得再拆分,请在本节点内依次完成:${lastChildren.map(c => c.title).join('、')}`
+      const folded = lastChildren.map(c => c.title).join('、')
+      node.plan.solution += `\n\n已达最大深度,不得再拆分,请在本节点内依次完成:${folded}`
       node.kind = 'executable'
       await commit(node, 'READY', ctx)
+      // The valve tripped. The work is not lost (it is folded into the plan above, which the
+      // executor and the acceptance roundtable both read) but the TREE was flattened, and
+      // nothing else anywhere says so — the node renders exactly like a normal executable.
+      notifyValve(node, `已达最大深度 ${caps.maxDepth},以下子任务被折进本节点内完成:${folded}`, 'cap-depth', ctx)
       return
     }
 
@@ -673,11 +743,24 @@ async function growTree(
       continue
     }
     if (target.depth + 1 > ctx.config.caps.maxDepth) {
-      refusals.push(`目标节点 ${quote(targetId)} 已达深度上限 ${ctx.config.caps.maxDepth}`)
+      const why = `目标节点 ${quote(targetId)} 已达深度上限 ${ctx.config.caps.maxDepth}`
+      refusals.push(why)
+      // Same valve as the stepStart path, same announcement. Reaching it through dynamic
+      // growth instead of decomposition does not make it a different event — and it used to
+      // land ONLY in execStatus, where a run could pass acceptance having silently dropped
+      // the work the executor said it needed.
+      notifyValve(node, why, 'cap-depth', ctx)
       continue
     }
     const res = await createChildren(target, kids, ctx)
-    if (!res.ok) { refusals.push(`向 ${quote(targetId)} 加子节点失败: ${res.reason}`); continue }
+    if (!res.ok) {
+      const why = `向 ${quote(targetId)} 加子节点失败: ${res.reason}`
+      refusals.push(why)
+      // spec §11: "maxNodes 超限 → 暂停新增,升级人工". The 暂停新增 half was done; this is
+      // the other half. Same valve as the decomposition path, which DOES escalate.
+      if (res.cap) notifyValve(node, why, 'cap-nodes', ctx)
+      continue
+    }
     // The target now has unfinished children, so it must wait — including when the target IS
     // the executing node, which is exactly the spec's "父节点转 WAITING_CHILDREN,待新子节点
     // ACCEPTED 后恢复". kind becomes decompose so the state machine routes it to integration
@@ -919,11 +1002,17 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         ? sync.updated
           ? '注意:自上一轮以来集成分支上有其他任务的改动已合入你的工作区,相关文件可能已变化,动手前先重新读一遍。\n'
           : ''
-        : sync.conflicted
-          // Honest, and actionable: the node stays on its old base, and the executor is the
-          // one who can make the eventual merge resolvable by not fighting the other side.
-          ? '注意:集成分支上有其他任务的改动,但与你的改动冲突,本轮未能同步(仍在原基线上)。请尽量只改与本任务相关的部分,避免让冲突扩大。\n'
-          : ''
+        : sync.dirty
+          // The rollback FAILED and the tree is still conflicted. Saying 仍在原基线上 here
+          // would send the executor into a directory with <<<<<<< markers it does not expect.
+          ? '注意:同步集成分支时发生冲突且未能回滚,你的工作区里现在有冲突标记。请先解决这些冲突再继续本轮返工。\n'
+          : sync.conflicted
+            // Honest, and actionable: the node stays on its old base, and the executor is the
+            // one who can make the eventual merge resolvable by not fighting the other side.
+            ? '注意:集成分支上有其他任务的改动,但与你的改动冲突,本轮未能同步(仍在原基线上)。请尽量只改与本任务相关的部分,避免让冲突扩大。\n'
+            // Neither up-to-date nor conflicted: the sync itself broke (git add/commit failed).
+            // Silence here left the executor believing it was current when it was not.
+            : '注意:本轮未能与集成分支同步(同步过程出错),你仍在较旧的基线上,可能看不到其他任务已合入的改动。\n'
     }
     if (!(await commit(node, 'EXECUTING', ctx))) return
     // node.execStatus still holds the PREVIOUS round's result here (it's overwritten below),
@@ -993,7 +1082,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {
       // Nobody ever judged the work — say that, rather than blaming the work.
-      await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, 'infra')
+      await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec))
       return
     }
     if (rec.synthesized.pass) {
@@ -1054,7 +1143,7 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     if (infraExhausted) {
       // A decompose node whose children ALL succeeded must not be thrown away because the
       // reviewer's connection failed three times.
-      await blockWithReason(node, `集成验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, 'infra')
+      await blockWithReason(node, `集成验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec))
       return
     }
     if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }

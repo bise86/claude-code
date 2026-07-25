@@ -1,5 +1,6 @@
 // src/tools/efftask/roundtable.ts
 import type { PhaseName, RoleBinding, RoundtableRecord, TaskNode, Verdict } from './types.js'
+import { PhaseTimeoutError } from './runAgentAdapter.js'
 import { parseVerdict } from './parseOutput.js'
 
 export type RunAgentFn = (req: {
@@ -75,7 +76,10 @@ export async function runRoundtable(args: {
     const reason = res.reason instanceof Error ? res.reason.message : String(res.reason)
     // infra: the reviewer never judged anything, the CALL failed. Flagged so the caller
     // retries the review instead of reading it as a rejection and redoing real work.
-    return { role: roleName, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true }
+    // A DEADLINE is still infra (nobody judged anything), but it is a different fact from
+    // an unreachable provider and needs different advice on the escalation card.
+    const timedOut = res.reason instanceof PhaseTimeoutError
+    return { role: roleName, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true, ...(timedOut ? { timeout: true } : {}) }
   })
   return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts) }
 }

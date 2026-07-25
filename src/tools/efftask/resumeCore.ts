@@ -97,6 +97,13 @@ export function validateLoadedNodes(
     // NEVER interrupted: reseat reopens interrupted nodes, and a node blocked because its
     // own disk state is unusable must stay blocked.
     n.interrupted = false
+    // Same door, and it was left open: a node that had legitimately tripped a valve keeps
+    // capBlocked === true, so a later --retry-blocked reopened it even though this pass has
+    // since blocked it for an UNRECOVERABLE reason (a missing child/dep, a cycle). The resume
+    // gate then reported "重开 1 个节点" for a node that re-blocks with zero model calls —
+    // exactly the failure --retry-blocked exists to fix — and n.blockedReason = '' erased the
+    // original diagnosis on the way.
+    n.capBlocked = false
     repairs.push(`节点 ${n.id}:${why}`)
   }
 
@@ -146,7 +153,14 @@ export function validateLoadedNodes(
               !!c && typeof c === 'object' && typeof (c as { title?: unknown }).title === 'string' && (c as { title: string }).title.length > 0)
             .map(c => ({ title: c.title, deps: strArray(c.deps) }))
         : null
-      if (clean === null) {
+      // An array whose every entry is malformed cleans to [] — which is NOT "no children",
+      // it is "we lost them". Kept, it made stepStart skip the plan call and approve an EMPTY
+      // decomposition: root went to WAITING_CHILDREN with childIds: [], advanceableKind
+      // returned null, propagateBlocked had nothing to blame, and the run ended
+      // '存在无法推进的阻断节点' with a grey root and no explanation — reproducibly, on every
+      // later resume. Measured: planCalls = 0.
+      const lostChildren = clean !== null && clean.length === 0 && Array.isArray(kids) && kids.length > 0
+      if (clean === null || lostChildren) {
         repairs.push(`节点 ${n.id}:根方案确认记录已损坏,恢复后将由 plan 角色重新起草`)
         n.confirmedDraft = undefined
       } else {

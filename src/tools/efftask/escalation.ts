@@ -29,14 +29,20 @@ export type BlockCategory =
   | 'timeout'
   /** 角色调用连续失败,没有任何人真正裁决过这份工作。 */
   | 'infra'
+  /**
+   * 深度上限 (caps.maxDepth)。The ONLY valve that does not stop its node: spec §11 says
+   * "该分支不再拆,强制 `executable` 或 BLOCKED 升级", and this implementation takes the
+   * first branch — the children the planner asked for are folded into the node's own
+   * solution and it keeps going. Still announced, because "触任何阀:…不静默截断" means the
+   * user gets to know the tree was flattened, not just that it succeeded.
+   */
+  | 'cap-depth'
 
 export interface BlockEscalation {
   node: TaskNode
   /** The reason as recorded on the node — quoted, never paraphrased. */
   reason: string
   category: BlockCategory
-  /** `.claude/efftask/<runId>` — where node.md and run.md live. */
-  runDir?: string
 }
 
 const TITLE: Record<BlockCategory, string> = {
@@ -45,11 +51,12 @@ const TITLE: Record<BlockCategory, string> = {
   rework: '连续返工超限',
   timeout: '安全阀 · 单节点执行超时',
   infra: '角色调用连续失败',
+  'cap-depth': '安全阀 · 已达最大拆分深度',
 }
 
 /**
  * What to change BEFORE retrying. Category-specific, because "retry it again unchanged" is
- * useless advice for four of these five: the same cap trips at the same place.
+ * useless advice for most of these: the same cap trips at the same place.
  */
 const REMEDY: Record<BlockCategory, string> = {
   'cap-iteration': '若方案本身没问题,可提高 run.md 里 caps.maxIterations 后再重试;否则先按评审意见改需求或补充信息。',
@@ -57,6 +64,12 @@ const REMEDY: Record<BlockCategory, string> = {
   rework: '先看该节点的验收记录,按阻断意见改代码或改验收点;必要时提高 caps.maxIterations。',
   timeout: '提高 run.md 里 caps.nodeTimeoutMs 后再重试,或把该节点拆小。',
   infra: '先确认角色模型/网络可用(角色配置在 .claude/settings.json 的 roles 里),再重试。',
+  'cap-depth': '若这些子任务确实该独立成节点,提高 run.md 里 caps.maxDepth 后重跑该节点;否则无需处理。',
+}
+
+/** The one valve that lets its node continue. Everything the card says branches on this. */
+export function stopsTheNode(category: BlockCategory): boolean {
+  return category !== 'cap-depth'
 }
 
 /** The phase a retried node re-enters, and therefore what the user is buying. */
@@ -65,23 +78,58 @@ function retryTarget(node: TaskNode): string {
   return node.kind === 'executable' ? '执行 → 验收' : '方案制定 → 评审'
 }
 
+/**
+ * Where the node's own record lives.
+ *
+ * Derived from the run id rather than passed in. It WAS a `runDir` field on the payload, and
+ * in production it was never populated — `PipelineCtx.onBlocked` carries only
+ * {node, reason, category}, so every real card printed the fallback "该节点目录下的 node.md"
+ * with no path in it, while the tests set the field by hand and asserted the full path. One
+ * fewer wire is one fewer wire that can be cut.
+ */
+function recordPath(node: TaskNode, runId?: string): string {
+  return runId ? `.claude/efftask/${runId}/${node.id}/node.md` : `.claude/efftask/<运行 ID>/${node.id}/node.md`
+}
+
 export function blockEscalationLines(e: BlockEscalation, runId?: string): string[] {
   const id = runId ?? '<运行 ID>'
-  return [
+  const head = [
     `节点: ${e.node.title}(${e.node.id})`,
     `类别: ${TITLE[e.category]}`,
     // Verbatim. The reason already names the counts ("验收迭代超限(3): …") and paraphrasing
     // it here would give the card and node.md two different accounts of the same event.
     `原因: ${e.reason}`,
+  ]
+  if (!stopsTheNode(e.category)) {
+    // The depth valve does NOT stop anything. Saying 已暂停 here would send the user to fix a
+    // run that is still working, and `--retry-blocked` would not match this node at all.
+    return [
+      ...head,
+      '状态: 该节点不再拆分,planner 要的子任务已折进它自己的方案里,继续执行。本次运行没有停。',
+      `记录: ${recordPath(e.node, runId)}`,
+      `处理方式: ${REMEDY[e.category]}`,
+    ]
+  }
+  return [
+    ...head,
     // Say the ABSENCE out loud. This node is not queued, not retrying, not waiting on
     // anything — and a card that only says "已暂停" reads as "it will pick up later".
-    '状态: 已暂停,不会自动重试;这一支下面的任务也不会继续。',
-    e.runDir ? `记录: ${e.runDir}/${e.node.id}/node.md` : '记录: 该节点目录下的 node.md',
+    '状态: 该节点已停,不会自动重试。它的上级会被标记为阻断,本次运行最终会以「被阻断」收场。',
+    // …but the RUN has not stopped yet, and that distinction is load-bearing: a second `/et`
+    // started now would acquire the run lock (the FIRST run never takes one — only --resume
+    // does) and a second orchestrator would write the same node.md files concurrently, each
+    // silently overwriting the other while both reported success.
+    '注意: 其它分支此刻仍在跑。请等本次运行结束后再执行下面的命令,不要在运行中另开一个 /et。',
+    `记录: ${recordPath(e.node, runId)}`,
     `处理方式: ${REMEDY[e.category]}`,
     // The ONLY command that actually reopens this node. A bare `--resume` reproduces the
     // block having made zero model calls — measured behaviour of reseatTransientNodes.
-    `重试该节点: /et --resume ${id} --retry-blocked(会重跑「${retryTarget(e.node)}」)`,
-    `不重试、只看结果: /et --resume ${id} 或直接读 run.md`,
+    // Run-scoped, and says so: the flag reopens EVERY valve-stopped node in the run, not just
+    // this one, and up to 8 cards can each be pointing at it.
+    `重试(会重开本次运行中所有被安全阀停下的节点,本节点将重跑「${retryTarget(e.node)}」): /et --resume ${id} --retry-blocked`,
+    // NOT `/et --resume` — that is not a read-only operation. It takes the run lock, reseats
+    // every interrupted node and issues real write-capable model calls.
+    '只看结果、不重跑: 直接读 run.md(上面路径的上一级目录)。',
   ]
 }
 
@@ -92,7 +140,8 @@ export function buildBlockCard(e: BlockEscalation, runId?: string): object {
       // Orange, not red: red is the merge-conflict card, which is a stop the user must
       // personally unblock. This is a valve — the run protected itself and is asking whether
       // to spend more. Two different asks should not look identical in a chat window.
-      template: 'orange',
+      // The depth valve is blue: nothing is wrong and nothing is waiting on anyone.
+      template: stopsTheNode(e.category) ? 'orange' : 'blue',
       title: { tag: 'plain_text', content: `高效任务模式 · ${TITLE[e.category]}` },
     },
     elements: [
@@ -102,6 +151,19 @@ export function buildBlockCard(e: BlockEscalation, runId?: string): object {
       },
     ],
   }
+}
+
+/**
+ * The same 处理方式 the card carries, for `node.blockedReason`.
+ *
+ * run.md is the only durable surface a run has, and the escalation limiter drops cards past
+ * the cap while telling the user to "看 run.md" — so the remedy has to actually be there.
+ * The merge-conflict path already does exactly this (its detail string carries the 处理方式
+ * and the resume command); the valve path recorded a bare reason.
+ */
+export function blockReasonWithRemedy(reason: string, category: BlockCategory, runId?: string): string {
+  const id = runId ?? '<运行 ID>'
+  return `${reason} · ${REMEDY[category]} · 重试: /et --resume ${id} --retry-blocked`
 }
 
 /** Default cards per run before the limiter starts suppressing. */
@@ -126,7 +188,7 @@ export function createEscalationLimiter(max = MAX_ESCALATION_CARDS): {
       if (sent < max - 1) { sent++; return { send: true } }
       if (sent === max - 1) {
         sent++
-        return { send: true, note: `本次运行的升级通知已达 ${max} 条上限,后续升级不再单独发卡,请看 run.md 或终端任务树。` }
+        return { send: true, note: `本次运行的升级通知已达 ${max} 条上限,后续升级不再单独发卡。run.md 的任务树里每个阻断节点都带着原因和处理方式。` }
       }
       dropped++
       return { send: false }

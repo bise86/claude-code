@@ -16,7 +16,18 @@ export interface NodePlan { solution: string; keyPoints: string; risks: string; 
  * failed (network, provider error). It is NOT a judgement about the work, so a caller
  * must retry the review rather than treat it as a rejection and redo the executor's work.
  */
-export interface Verdict { role: string; pass: boolean; blocking: string[]; comments: string; infra?: boolean }
+export interface Verdict {
+  role: string; pass: boolean; blocking: string[]; comments: string; infra?: boolean
+  /**
+   * The reviewer's call hit caps.nodeTimeoutMs rather than failing to connect.
+   *
+   * Both are `infra` (nobody judged the work, so retrying the review is right), but they
+   * escalate to DIFFERENT advice: a timeout says 提高 nodeTimeoutMs / 把节点拆小, an
+   * unreachable provider says 检查角色模型和网络. Without this the roundtable phases
+   * reported every deadline as 角色调用连续失败 and prescribed the wrong fix.
+   */
+  timeout?: boolean
+}
 export interface RoundtableRecord { round: number; verdicts: Verdict[]; synthesized: { pass: boolean; blockingSummary: string } }
 export interface ScoreRecord { role: string; score: number; rationale: string }
 

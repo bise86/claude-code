@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { blockEscalationLines, buildBlockCard, createEscalationLimiter, MAX_ESCALATION_CARDS, type BlockCategory } from './escalation.js'
+import { blockEscalationLines, blockReasonWithRemedy, buildBlockCard, createEscalationLimiter, MAX_ESCALATION_CARDS, stopsTheNode, type BlockCategory } from './escalation.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
 const NOW = '2026-07-26T00:00:00.000Z'
@@ -27,8 +27,37 @@ describe('触阀升级卡 (spec §9/§11)', () => {
     // skips a cap-blocked node on every plain resume.
     const t = lines('rework')
     expect(t).toContain('不会自动重试')
-    // …and that the branch below it is stuck too, which is why a run can look idle.
-    expect(t).toContain('下面的任务也不会继续')
+    // What is ACTUALLY true, and was checked against propagateBlocked: every node that can
+    // reach onBlocked either has no children or has children that are all ACCEPTED, so
+    // "这一支下面的任务也不会继续" was a claim about a subtree that does not exist. What does
+    // happen is upward: the ancestor chain is marked 子节点阻断 and the run ends 被阻断.
+    expect(t).toContain('上级会被标记为阻断')
+    expect(t).toContain('以「被阻断」收场')
+    expect(t).not.toContain('下面的任务也不会继续')
+  })
+
+  it('warns that the RUN has not stopped, because a second /et would corrupt it', () => {
+    // The card is sent mid-run: other branches are still executing. And the FIRST run never
+    // takes the run lock (acquireRunLock is only called on the --resume path), so a second
+    // /et started now acquires it successfully and two orchestrators write the same node.md
+    // files concurrently — each silently overwriting the other while both report success.
+    const t = lines('rework')
+    expect(t).toContain('其它分支此刻仍在跑')
+    expect(t).toContain('不要在运行中另开一个 /et')
+  })
+
+  it('does NOT call a plain --resume a read-only way to look at results', () => {
+    // /et --resume takes the run lock, reseats every interrupted node and issues real
+    // write-capable model calls. Offering it as "只看结果" invited a full re-run.
+    const t = lines('rework')
+    expect(t).toContain('只看结果、不重跑: 直接读 run.md')
+    expect(t).not.toMatch(/只看结果[^\n]*--resume/)
+  })
+
+  it('says the retry is RUN-scoped, because that is what --retry-blocked does', () => {
+    // reseat walks the whole tree and reopens EVERY capBlocked node. Up to 8 cards can each
+    // point at this one flag; "重试该节点" made each of them look independent.
+    expect(lines('rework')).toContain('会重开本次运行中所有被安全阀停下的节点')
   })
 
   it('names the ONE command that actually reopens it', () => {
@@ -64,7 +93,35 @@ describe('触阀升级卡 (spec §9/§11)', () => {
   it('degrades to a placeholder rather than dropping the resume step', () => {
     const t = blockEscalationLines({ node: node(), reason: 'r', category: 'rework' }).join('\n')
     expect(t).toContain('<运行 ID>')
-    expect(t).toContain('该节点目录下的 node.md') // no runDir given → say so, don't print an empty path
+    // The record path is DERIVED from the run id, not passed in on the payload. It used to be
+    // a `runDir` field that no production caller ever set — PipelineCtx.onBlocked carries
+    // only {node, reason, category} — so every real card printed a pathless fallback while
+    // this test set the field by hand and asserted a full path. One fewer wire to cut.
+    expect(t).toContain('/root/02-支付/node.md')
+  })
+
+  it('derives the record path from the run id, with no field for production to forget', () => {
+    const t = lines('rework')
+    expect(t).toContain('记录: .claude/efftask/007/root/02-支付/node.md')
+  })
+
+  it('深度阀 does not claim anything stopped, because nothing did', () => {
+    // spec §11 lets maxDepth take the 强制 executable branch, which this implementation does:
+    // the planner's children are folded into the node's own solution and it keeps running.
+    // Reusing the 已暂停 wording would send the user to fix a run that is still working, and
+    // --retry-blocked does not match this node at all.
+    const t = lines('cap-depth', '已达最大深度,不得再拆分')
+    expect(t).toContain('本次运行没有停')
+    expect(t).not.toContain('不会自动重试')
+    expect(t).not.toContain('--retry-blocked')
+    expect(t).toContain('caps.maxDepth')
+  })
+
+  it('深度阀 does not look like a stop in the chat window either', () => {
+    const card = buildBlockCard({ node: node(), reason: 'r', category: 'cap-depth' }, '007') as { header: { template: string } }
+    expect(card.header.template).toBe('blue')
+    expect(stopsTheNode('cap-depth')).toBe(false)
+    expect(stopsTheNode('rework')).toBe(true)
   })
 
   it('does NOT look like the merge-conflict card — the two ask for different things', () => {
@@ -114,5 +171,22 @@ describe('升级卡限流', () => {
     let sent = 0
     for (let i = 0; i < 50; i++) if (l.admit().send) sent++
     expect(sent).toBe(MAX_ESCALATION_CARDS)
+  })
+})
+
+describe('run.md 也得带着处置办法', () => {
+  it('blockedReason carries the remedy AND the retry command', () => {
+    // The limiter drops cards past its cap while telling the user to read run.md. If the
+    // remedy lives only on the card, the suppressed escalations are unactionable — the user
+    // sees 「— 验收迭代超限(3): …」 in the tree and nothing else. The merge-conflict path
+    // already writes its 处理方式 into blockedReason for exactly this reason.
+    const r = blockReasonWithRemedy('验收迭代超限(3): 缺测试', 'rework', '007')
+    expect(r).toContain('验收迭代超限(3): 缺测试')
+    expect(r).toContain('caps.maxIterations')
+    expect(r).toContain('/et --resume 007 --retry-blocked')
+  })
+
+  it('degrades to a placeholder run id rather than printing a broken command', () => {
+    expect(blockReasonWithRemedy('r', 'timeout')).toContain('/et --resume <运行 ID> --retry-blocked')
   })
 })

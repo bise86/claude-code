@@ -169,9 +169,11 @@ describe('后台任务条目 (spec §10) 真的被接上', () => {
     expect(t.type).toBe('efftask')
     expect(t.runId).toBe('003')
     expect(t.runDir).toBe('/run/003')
-    // The run ended blocked, so the row must be FAILED — a row still saying 运行中 for a run
-    // that is over is the panel lying about the thing it shows.
-    expect(t.status).toBe('failed')
+    // The run ended without finishing, so the row must be TERMINAL — a row still saying 运行中
+    // for a run that is over is the panel lying about the thing it shows. This fixture aborts,
+    // and a run the user stopped is 'killed', not 'failed': Esc in the /et view and `x` in
+    // /tasks are two ways to do the same thing and must not be written up differently.
+    expect(t.status).toBe('killed')
     expect(t.reason).toBe('已中断')
   })
 

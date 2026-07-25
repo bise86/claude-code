@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import { childLines, type RootDraft } from '../../tools/efftask/rootPlan.js'
+import { childLines, draftBlockers, type RootDraft } from '../../tools/efftask/rootPlan.js'
 import { clip, goalLine } from '../../tools/efftask/startupConfirm.js'
 
 /**
@@ -51,6 +51,20 @@ function Section(props: { title: string; body: string }): React.ReactElement {
 export function ConfirmRootPlan(props: {
   goalPrompt: string
   draft: RootDraft
+  /**
+   * False when drafting failed and `draft` is the empty placeholder. The tree section then
+   * says so instead of asserting 不拆分 — a decision nobody made, and one that contradicts
+   * the error line telling the user the plan role will draft at run time.
+   */
+  drafted?: boolean
+  /**
+   * How many roles will actually sit on the review roundtable.
+   *
+   * An empty roster is NOT "multi-role": runRoundtable turns it into a single main-model
+   * reviewer. Promising 多角色圆桌评审 there would have users waving through a plan they did
+   * not read, believing a panel would catch it.
+   */
+  reviewRoles?: number
   /** Set when a previous draft attempt failed; the gate then offers to start without one. */
   draftError?: string | null
   /** How many times the user has already asked for a re-draft — shown so the cost is visible. */
@@ -83,7 +97,9 @@ export function ConfirmRootPlan(props: {
     if (key.escape || input.toLowerCase() === 'n') props.onDecision({ action: 'cancel' })
   })
 
-  const kids = childLines(props.draft)
+  const kids = childLines(props.draft, props.drafted !== false)
+  const panel = (props.reviewRoles ?? 0) > 1 ? `${props.reviewRoles} 位角色圆桌评审` : '一位评审角色(未配置多角色评审)'
+  const blockers = props.drafted === false ? [] : draftBlockers(props.draft)
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 根方案确认(第三关)</Text>
@@ -98,13 +114,20 @@ export function ConfirmRootPlan(props: {
       <Section title="验收点" body={props.draft.plan.acceptance} />
       <Box flexDirection="column">
         <Text bold>
-          初始任务树 · 第一层({props.draft.children.length} 个)
+          初始任务树 · 第一层({props.drafted === false ? '未起草' : `${props.draft.children.length} 个`})
         </Text>
         {kids.map((l, i) => <Text key={`kid-${i}`}>{'  '}{clip(l, 160)}</Text>)}
+        {/* These two shapes make createChildren reject the WHOLE batch, so the tree above is
+            not what would get built — the plan role would be asked again and produce a
+            different one. Worth a warning before the user approves it. */}
+        {blockers.map(b => <Text key={b} color="warning">{'  ⚠ '}{clip(b, 160)}</Text>)}
       </Box>
       {/* Say what confirming BUYS. The plan is not final — it still faces the review
           roundtable — and a gate that implied otherwise would misrepresent the process. */}
-      <Text dimColor>确认后该方案仍会经过多角色圆桌评审;评审提出阻断问题时会按意见修订。</Text>
+      {/* Names the REAL panel size. "多角色圆桌评审" with an empty roster was a promise the
+          run could not keep — runRoundtable degrades an empty roster to one main-model
+          reviewer, and a user may approve an unread plan believing a panel will catch it. */}
+      <Text dimColor>确认后该方案仍会经过{panel};提出阻断问题时会按意见修订。</Text>
       {props.redrafts && props.redrafts > 0 ? (
         <Text dimColor>已按你的意见重拟 {props.redrafts} 次。</Text>
       ) : null}

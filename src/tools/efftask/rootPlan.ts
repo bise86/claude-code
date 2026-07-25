@@ -115,8 +115,42 @@ export function applyRootDraft(root: TaskNode, draft: RootDraft, now: string): v
   root.updatedAt = now
 }
 
+/**
+ * Problems that make `createChildren` REJECT the whole batch, sending stepStart back to the
+ * plan role — which discards the tree the user just approved and builds a different one.
+ *
+ * Distinct from the per-child 无效依赖 warning below: that one loses an edge, this one loses
+ * everything. The gate is the only place a human can see it coming.
+ */
+export function draftBlockers(draft: RootDraft): string[] {
+  const out: string[] = []
+  const titles = draft.children.map(c => c.title)
+  const dupes = [...new Set(titles.filter((t, i) => titles.indexOf(t) !== i))]
+  if (dupes.length > 0) out.push(`子任务标题重复(${dupes.join('、')})——依赖只能按标题引用,这会让整批子任务被退回重拟`)
+  // Sibling deps only; resolved by title within the batch, exactly as createChildren does.
+  const index = new Map(titles.map((t, i) => [t, i]))
+  const edges = draft.children.map(c => c.deps.map(d => index.get(d)).filter((i): i is number => i !== undefined))
+  const state = new Array(draft.children.length).fill(0)
+  const hasCycle = (i: number): boolean => {
+    if (state[i] === 1) return true
+    if (state[i] === 2) return false
+    state[i] = 1
+    for (const j of edges[i]) if (j !== i && hasCycle(j)) return true
+    state[i] = 2
+    return false
+  }
+  if (draft.children.some((_, i) => hasCycle(i))) {
+    out.push('子任务依赖成环——这会让整批子任务被退回重拟')
+  }
+  return out
+}
+
 /** Gate rendering: one line per first-level child, with its sibling dependencies named. */
-export function childLines(draft: RootDraft): string[] {
+export function childLines(draft: RootDraft, drafted = true): string[] {
+  // A FAILED draft has no tree at all. Rendering the empty list as "不拆分,根任务直接执行"
+  // asserted a decision nobody made, and directly contradicted the error line above it, which
+  // says the plan role will draft (and probably decompose) at run time.
+  if (!drafted) return ['(未能起草,运行时由 plan 角色重新拆分)']
   if (draft.children.length === 0) return ['(不拆分,根任务直接执行)']
   return draft.children.map((c, i) => {
     // Deps are sibling TITLES at this stage — ids do not exist until createChildren runs.

@@ -74,9 +74,53 @@ describe('根方案确认关口 · 渲染', () => {
   it('does not imply the plan is final — it still faces the roundtable', async () => {
     // A gate that reads as "this is what will be built" would misdescribe the process: the
     // confirmed plan goes to PLAN_REVIEW and can be sent back for revision.
-    const m = await mount()
-    expect(m.lastFrame()).toContain('多角色圆桌评审')
+    const m = await mount({ reviewRoles: 3 })
+    expect(m.lastFrame()).toContain('3 位角色圆桌评审')
     m.app.unmount()
+  })
+
+  it('does NOT promise a panel that will not convene', async () => {
+    // runRoundtable turns an empty roster into ONE main-model reviewer. Saying 多角色圆桌评审
+    // there invites the user to wave through a plan they did not read, believing a panel will
+    // catch it.
+    const m = await mount({ reviewRoles: 0 })
+    const f = m.lastFrame()
+    expect(f).toContain('一位评审角色(未配置多角色评审)')
+    expect(f).not.toContain('多角色圆桌评审')
+    m.app.unmount()
+  })
+
+  it('a failed draft does not claim the run decided NOT to decompose', async () => {
+    // The empty placeholder used to render as 「(不拆分,根任务直接执行)」 — a decision nobody
+    // made, contradicting the error line directly above it, which says the plan role will
+    // draft (and probably decompose) at run time.
+    const m = await mount({
+      draft: { kind: 'unknown', plan: emptyPlan(), children: [] },
+      drafted: false,
+      draftError: '未能起草根方案(provider down);确认后将由 plan 角色在运行中自行起草。',
+    })
+    const f = m.lastFrame()
+    expect(f).toContain('未能起草,运行时由 plan 角色重新拆分')
+    expect(f).not.toContain('不拆分,根任务直接执行')
+    expect(f).toContain('第一层(未起草)')
+    m.app.unmount()
+  })
+
+  it('warns before the user approves a tree that would be thrown away whole', async () => {
+    // Duplicate titles and dependency cycles make createChildren reject the ENTIRE batch —
+    // stepStart then asks the plan role again and builds a different tree. The per-child
+    // 无效依赖 warning only covers edges that get dropped; these lose everything.
+    const dupes = await mount({
+      draft: { kind: 'decompose', plan: emptyPlan(), children: [{ title: 'A', deps: [] }, { title: 'A', deps: [] }] },
+    })
+    expect(dupes.lastFrame()).toContain('子任务标题重复')
+    dupes.app.unmount()
+
+    const cyc = await mount({
+      draft: { kind: 'decompose', plan: emptyPlan(), children: [{ title: 'A', deps: ['B'] }, { title: 'B', deps: ['A'] }] },
+    })
+    expect(cyc.lastFrame()).toContain('依赖成环')
+    cyc.app.unmount()
   })
 
   it('states its own scope instead of implying Feishu can answer it', async () => {
@@ -140,7 +184,11 @@ describe('根方案确认关口 · 键盘', () => {
     m.stdin.press(CR)
     await tick()
     expect(m.decisions).toEqual([])
-    expect(m.lastFrame()).toContain('修改意见') // still editing, not started
+    // A DISCRIMINATING substring. The old assertion used '修改意见', which the default footer
+    // 「e 提修改意见重拟」 also contains — so it passed whether or not the editor was open.
+    // This phrase exists only in the editor header. (reset() is no help here: the renderer
+    // paints incremental diffs, so a cleared buffer only ever holds the changed region.)
+    expect(m.lastFrame()).toContain('修改意见(回车提交重拟')
     m.app.unmount()
   })
 
@@ -169,8 +217,13 @@ describe('根方案确认关口 · 键盘', () => {
     await tick()
     m.stdin.press(ESC)
     await tickEsc()
+    // The DECISION is the property: Esc inside the editor must abandon the edit without
+    // starting or cancelling the run.
     expect(m.decisions).toEqual([])
-    expect(m.lastFrame()).toContain('回车/y 确认并开始')
+    // NO frame assertion here, deliberately. '回车/y 确认并开始' is painted at mount and the
+    // buffer accumulates, so it is present whether or not Esc did anything — it would be a
+    // decorative assertion. The editor-vs-gate distinction is covered by the test above, whose
+    // substring only the editor produces.
     m.app.unmount()
   })
 

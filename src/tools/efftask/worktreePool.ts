@@ -432,7 +432,10 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * it and routes it through the tested §8 conflict path.
      */
     async refreshFromIntegration(node: TaskNode): Promise<
-      { ok: true; updated: boolean } | { ok: false; conflicted: boolean; message: string }
+      | { ok: true; updated: boolean }
+      // `dirty` means the rollback itself failed and the worktree is STILL conflicted. The
+      // caller must not then tell the executor it is on a clean base.
+      | { ok: false; conflicted: boolean; message: string; dirty?: boolean }
     > {
       const path = pathFor(node)
       // Already contains everything the integration branch has → nothing to do, and no
@@ -454,9 +457,18 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       const u = await git(['diff', '--name-only', '--diff-filter=U'], path)
       const conflicted = u.stdout.trim().length > 0
       // Restore. NOT reset --hard: the executor's work is committed now, and abort rewinds
-      // only the merge. A failed abort (no merge in progress) is harmless here — there is
-      // then nothing half-done to undo.
-      await git(['merge', '--abort'], path)
+      // only the merge.
+      const abort = await git(['merge', '--abort'], path)
+      // The exit code MATTERS. The caller tells the executor "仍在原基线上" on this branch,
+      // and that sentence is only true if the abort actually happened. A failed abort with
+      // unmerged paths still present leaves markers in the tree the executor is about to edit
+      // — so verify rather than assume, and say so when it did not work.
+      if (abort.code !== 0 && conflicted) {
+        const still = await git(['diff', '--name-only', '--diff-filter=U'], path)
+        if (still.stdout.trim().length > 0) {
+          return { ok: false, conflicted: true, dirty: true, message: `合并冲突且无法回滚(git merge --abort 失败): ${abort.stderr.trim()}` }
+        }
+      }
       return { ok: false, conflicted, message: merge.stderr.trim() || merge.stdout.trim() || '合并未生效' }
     },
 
