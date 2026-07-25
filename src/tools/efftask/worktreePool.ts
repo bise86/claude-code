@@ -1,4 +1,5 @@
 import { integrationBranch, worktreeBranch, worktreeSlug } from './worktreeId.js'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import type { TaskNode } from './types.js'
 
 /**
@@ -104,6 +105,18 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       }
       // The worktree may already be registered (resume) or may have been pruned out from
       // under us (gc). Prune stale registrations first, then add only if it is really absent.
+      // Keep our scratch out of the user's `git status`. .git/info/exclude is the right
+      // place: it is per-clone and NOT a tracked file, so we are not editing something the
+      // user committed. Without it, .efftask-worktrees/ shows as untracked forever.
+      try {
+        const info = `${gitRoot}/.git/info`
+        await mkdir(info, { recursive: true })
+        const excl = `${info}/exclude`
+        const cur = await readFile(excl, 'utf-8').catch(() => '')
+        if (!cur.includes('.efftask-worktrees/')) {
+          await writeFile(excl, `${cur}${cur.endsWith('\n') || cur === '' ? '' : '\n'}.efftask-worktrees/\n`)
+        }
+      } catch { /* cosmetic only — never fail a run over it */ }
       const registered = await git(['rev-parse', '--git-dir'], intPath)
       if (registered.code !== 0) {
         await git(['worktree', 'prune'], gitRoot)
@@ -283,6 +296,19 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         kept,
         salvage: salv.stdout.split('\n').map(s => s.trim()).filter(Boolean),
       }
+    },
+
+    /**
+     * Run `fn` with exclusive use of the integration worktree.
+     *
+     * That worktree has ONE index and ONE checkout: commitAndMerge writes it (merge, and on
+     * failure reset --hard + clean -fd) while integration acceptance READS it. Measured
+     * without this: a reviewer saw conflict markers and a live MERGE_HEAD mid-review, and
+     * clean -fd deleted its scratch files. Serialising execute used to keep that to one
+     * writer; lifting the lock made it N.
+     */
+    withIntegrationRead<T>(fn: () => Promise<T>): Promise<T> {
+      return mergeLock(fn)
     },
 
     integrationPath: intPath,

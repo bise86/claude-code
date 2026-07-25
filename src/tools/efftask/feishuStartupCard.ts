@@ -26,13 +26,13 @@ function button(content: string, type: string, value: Record<string, unknown>) {
  * it a Feishu approver would sanction a resume seeing only a normal startup card — no counts,
  * no repairs — i.e. approving something different from what the terminal describes.
  */
-export function buildStartupCard(config: EffTaskConfig, requestId: string, resume?: ResumeSummary): object {
+export function buildStartupCard(config: EffTaskConfig, requestId: string, resume?: ResumeSummary, isolation?: 'worktree' | 'none'): object {
   const goal = goalLine(config.goalPrompt)
   const body =
     `**目标**: ${goal}\n` +
     // Same sentence as the terminal, from the same function. A Feishu approver must not
     // be told something different about the run than the person at the keyboard.
-    `**${parallelismLine(config, { editable: false })}**（如需调整请在终端确认界面修改）\n` +
+    `**${parallelismLine(config, { editable: false, isolation })}**（如需调整请在终端确认界面修改）\n` +
     `**${capsLine(config)}**\n` +
     `**角色名册**:\n${rosterLines(config).map(l => `- ${l}`).join('\n')}` +
     // The roster says who WILL run; this says whose request was dropped and why. Without it

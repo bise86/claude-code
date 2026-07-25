@@ -18,6 +18,7 @@ import {
 export function ConfirmResume(props: {
   config: EffTaskConfig
   summary: ResumeSummary
+  isolation?: 'worktree' | 'none'
   onDecision: (d: StartupDecision) => void
 }): React.ReactElement {
   const [parallelism, setParallelism] = React.useState(clampParallelism(props.config.parallelism))
@@ -33,7 +34,7 @@ export function ConfirmResume(props: {
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 恢复确认</Text>
       <Text>目标: {goalLine(props.config.goalPrompt)}</Text>
-      <Text>{parallelismLine({ ...props.config, parallelism }, { editable: true })}</Text>
+      <Text>{parallelismLine({ ...props.config, parallelism }, { editable: true, isolation: props.isolation })}</Text>
       <Text bold>角色名册:</Text>
       {rosterLines(props.config).map(line => <Text key={line}>  {line}</Text>)}
       {noticeLines(props.config).length > 0 && (

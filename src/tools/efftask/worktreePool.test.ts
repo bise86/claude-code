@@ -383,3 +383,25 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     expect(h.kept).toEqual([])
   })
 })
+
+describe('不把自己的痕迹留在用户的 git status 里', () => {
+  it('init excludes the worktree scratch dir via .git/info/exclude', async () => {
+    // .efftask-worktrees/ lives under gitRoot, so without this it shows as untracked forever.
+    // info/exclude is per-clone and NOT a tracked file, so we are not editing anything the
+    // user committed.
+    const p = pool()
+    await p.init()
+    const excl = await git(['check-ignore', '-v', '.efftask-worktrees/'], gitRoot)
+    expect(excl.code).toBe(0)
+    expect((await git(['status', '--porcelain'], gitRoot)).stdout).not.toContain('.efftask-worktrees')
+  })
+
+  it('is idempotent — a second init does not duplicate the entry', async () => {
+    const p = pool()
+    await p.init()
+    await p.init()
+    const { readFile } = await import('node:fs/promises')
+    const txt = await readFile(join(gitRoot, '.git', 'info', 'exclude'), 'utf-8')
+    expect(txt.split('.efftask-worktrees/').length - 1).toBe(1)
+  })
+})

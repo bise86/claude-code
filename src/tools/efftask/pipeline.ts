@@ -787,7 +787,9 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
   // so a node that spent `acceptance` elsewhere still gets a full integration allowance.
   for (;;) {
     if (!(await commit(node, 'INTEGRATION_ACCEPT', ctx))) return
-    const { rec, infraExhausted } = await roundtableWithInfraRetry({
+    // Hold the integration worktree for the whole review: it is what the reviewers read, and
+    // concurrent merges rewrite it underneath them.
+    const runIntegrate = async () => roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept,
       round: node.iteration.integration + 1, system: 'integrate',
       buildPrompt: tag => integratePrompt(node, ctx, tag, feedback), // child evidence, NOT acceptPrompt
@@ -797,6 +799,9 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       // the user's checkout contains none of the run's work.
       cwd: ctx.worktrees?.integrationPath,
     })
+    const { rec, infraExhausted } = ctx.worktrees
+      ? await ctx.worktrees.withIntegrationRead(runIntegrate)
+      : await runIntegrate()
     node.acceptLog.push(rec)
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {

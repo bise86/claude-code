@@ -371,6 +371,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // worktrees still exist, and shown in the two places the user actually looks.
   const [handoff, setHandoff] = React.useState<HandoffSummary | null>(null)
   const handoffRef = React.useRef<HandoffSummary | null>(null)
+  // What the gate must SAY. Resolved before the gate opens; 'none' until then.
+  const [isolation, setIsolation] = React.useState<'worktree' | 'none'>('none')
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
@@ -473,6 +475,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       // The recovered caps are the run's caps — run.md is hand-editable, so a manifest that
       // declares a different nodeTimeoutMs must actually get it.
       props.capsRef.nodeTimeoutMs = withGuidance.caps.nodeTimeoutMs
+      const isoR = await makeWorktreePool(runId!, getCwd())
+      poolRef.current = isoR.pool
+      setIsolation(isoR.pool ? 'worktree' : 'none')
+      if (!isoR.pool && isoR.reason) withGuidance.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${isoR.reason}`)
       setConfig(annotateRoleModels(withGuidance, props.agentModels, props.mainModel))
       setSeed(reseated.nodes)
       setSummary({
@@ -509,6 +515,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // which model each one runs on. Resolve that here — this is the only layer that can
         // see the agent definitions and the session model.
         props.capsRef.nodeTimeoutMs = cfg.caps.nodeTimeoutMs
+        // Isolation is resolved BEFORE the gate opens, because the gate has to tell the user
+        // which kind of run this is — and it was telling every isolated run it was serial,
+        // i.e. denying the one thing the user asked for. init() only creates a branch and a
+        // worktree; if the user then cancels, the teardown below disposes of them.
+        const iso = await makeWorktreePool(runId!, getCwd())
+        poolRef.current = iso.pool
+        setIsolation(iso.pool ? 'worktree' : 'none')
+        if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
         setConfig(annotateRoleModels(cfg, agentModels, mainModel))
         setPhase('confirm')
       })
@@ -536,7 +550,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     const { feishuClient, feishuPermissionCallbacks } = store.getState()
     if (feishuClient && feishuPermissionCallbacks) {
       const requestId = randomUUID()
-      const cardContent = buildStartupCard(config, requestId, summary ?? undefined)
+      const cardContent = buildStartupCard(config, requestId, summary ?? undefined, isolation)
       surfaces.push((claim, onTeardown) =>
         sendFeishuStartupCard(
           {
@@ -571,13 +585,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           // Built HERE, after approval and before the first step: init() creates the
           // integration branch and its worktree, which is real work the user has consented
           // to. A failure is not fatal — the run continues honestly un-isolated.
-          const { pool, reason } = await makeWorktreePool(runId!, getCwd())
-          poolRef.current = pool
-          if (!pool && reason) {
-            // The gate already closed, so this cannot go into notices. It belongs in the
-            // transcript path the user is pointed at, and in the tree the run writes.
-            logError(new Error(`高效任务: 隔离不可用,执行将共享工作目录 —— ${reason}`))
-          }
+          const pool = poolRef.current
           void runOrchestrator(
             {
               config: effectiveConfig, runDir: runDir!, fs: props.fs, runAgent: props.runAgent,
@@ -630,10 +638,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return <ParsingView onCancel={bail} />
   }
   if (phase === 'confirmResume' && summary) {
-    return <ConfirmResume config={config} summary={summary} onDecision={d => terminalClaim.current?.('terminal', d)} />
+    return <ConfirmResume config={config} summary={summary} isolation={isolation} onDecision={d => terminalClaim.current?.('terminal', d)} />
   }
   if (phase === 'confirm') {
-    return <ConfirmStartup config={config} onDecision={d => terminalClaim.current?.('terminal', d)} />
+    return <ConfirmStartup config={config} isolation={isolation} onDecision={d => terminalClaim.current?.('terminal', d)} />
   }
   if (phase === 'running') {
     return <RunningView nodes={nodes} runId={runId ?? ''} onAbort={props.abort} />

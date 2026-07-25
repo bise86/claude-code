@@ -260,3 +260,43 @@ describe('the gate lets the user CHANGE the parallelism (用户第四句)', () =
     })
   }
 })
+
+describe('关口渲染出来的那句话必须随隔离状态变化', () => {
+  // A review found parallelismLine could say two things while NO call site ever passed
+  // `isolation` — every gate rendered "未启用隔离" including runs whose measured execute
+  // concurrency was 4. Testing the function alone could not see that: the gap was the wiring.
+  const propsFor = (name: string, isolation?: 'worktree' | 'none') =>
+    (name === 'ConfirmResume'
+      ? { config, summary, isolation, onDecision: () => {} }
+      : { config, isolation, onDecision: () => {} }) as never
+
+  for (const [name, Comp] of [
+    ['ConfirmStartup', ConfirmStartup],
+    ['ConfirmResume', ConfirmResume],
+  ] as [string, (p: never) => React.ReactElement][]) {
+    it(name + ': says isolated when the run IS isolated', async () => {
+      const { stdin, stdout, lastFrame } = fakeTty()
+      const app = await render(
+        React.createElement(Comp as never, propsFor(name, 'worktree')),
+        { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      const f = lastFrame()
+      expect(f).toContain('各阶段并行')
+      expect(f).toContain('worktree')
+      expect(f).not.toContain('未启用隔离')
+      app.unmount()
+    })
+
+    it(name + ': says serial when it is NOT isolated', async () => {
+      const { stdin, stdout, lastFrame } = fakeTty()
+      const app = await render(
+        React.createElement(Comp as never, propsFor(name, 'none')),
+        { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      expect(lastFrame()).toContain('未启用隔离')
+      app.unmount()
+    })
+  }
+})

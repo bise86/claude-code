@@ -932,6 +932,8 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     release: async () => ({ removed: true }),
     dispose: async () => ({ kept: [] }),
     init: async () => ({ ok: true }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     integrationBranchName: 'efftask/001/integration',
     ...over,

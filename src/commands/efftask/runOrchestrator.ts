@@ -66,6 +66,10 @@ export async function runOrchestrator(
     // 收口: ask the pool where everything landed, while its worktrees still exist.
     if (args.worktrees) {
       try {
+        // dispose FIRST: it reclaims what is provably safe, so handoff then reports only the
+        // worktrees that genuinely still hold something. Reporting before reclaiming would
+        // list directories that are about to disappear.
+        await args.worktrees.dispose(orch.nodes())
         const h = await args.worktrees.handoff(orch.nodes())
         onHandoff?.(h)
       } catch (e) {
