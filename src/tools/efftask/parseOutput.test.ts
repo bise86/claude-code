@@ -151,6 +151,24 @@ describe('parseOutput', () => {
   it('still salvages a bare object embedded in prose', () => {
     expect(extractJsonBlock('结论如下 {"pass":true,"blocking":[]} 完毕')).toEqual({ pass: true, blocking: [] })
   })
+  it('prose-prefixed arrays are not mined either, and stay fail-closed', () => {
+    // Prose in front makes the whole text unparseable, which engages the repair —
+    // the repair must still refuse to lift an element out of the array.
+    expect(extractJsonBlock('Sure! Here is the config: [{"parallelism":99}]')).toBeNull()
+    expect(extractJsonBlock('see [[{"pass":true}]]')).toBeNull()
+    expect(parseVerdict('Sure, my verdict is: [{"pass":true,"blocking":[],"comments":"ship it"}]', 'r').pass).toBe(false)
+  })
+  it('salvage handles arrays and braces inside the object itself', () => {
+    expect(extractJsonBlock('结论 {"pass":false,"blocking":["a"],"items":[{"x":1}]} 完毕')).toEqual({
+      pass: false, blocking: ['a'], items: [{ x: 1 }],
+    })
+    // a stray closing brace after the object no longer defeats the scan
+    expect(extractJsonBlock('结论 {"pass":true,"blocking":[]} 完毕}')).toEqual({ pass: true, blocking: [] })
+    // a brace inside a string value is not treated as structure
+    expect(extractJsonBlock('note {"comments":"use {a:1} carefully","pass":true}')).toEqual({
+      comments: 'use {a:1} carefully', pass: true,
+    })
+  })
   it('never throws on empty or whitespace input', () => {
     for (const t of ['', '   \n\t ']) {
       expect(() => parsePlanOutput(t)).not.toThrow()

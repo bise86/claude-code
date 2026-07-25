@@ -19,6 +19,43 @@ type Candidate = { obj: Record<string, unknown>; tagged: boolean }
 /** Every fenced block plus the bare-brace slice, parsed; unparseable ones dropped. */
 const FENCE_RE = /```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)```/g
 
+/**
+ * First balanced `{...}` that is NOT nested inside an array, or null.
+ *
+ * Naive first-`{`..last-`}` slicing cannot see brackets, so on prose like
+ * `这是配置: [{"pass":true}]` it happily lifts an element out of a JSON array and
+ * hands it back as the model's answer — which is how a rejected verdict became an
+ * accepted one. Tracking bracket depth (and string literals, so a brace inside a
+ * quoted value doesn't confuse the scan) is what makes the repair safe.
+ */
+function sliceTopLevelObject(t: string): string | null {
+  let inStr = false
+  let esc = false
+  let bracket = 0
+  let brace = 0
+  let start = -1
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (ch === '\\') esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') { inStr = true; continue }
+    else if (ch === '[') bracket++
+    else if (ch === ']') { if (bracket > 0) bracket-- }
+    else if (ch === '{') {
+      if (brace === 0 && bracket === 0) start = i
+      brace++
+    } else if (ch === '}') {
+      if (brace > 0) brace--
+      if (brace === 0 && start !== -1) return t.slice(start, i + 1)
+    }
+  }
+  return null
+}
+
 function collectCandidates(text: string, preferTag?: AnswerTag): Candidate[] {
   const tagged: string[] = []
   const generic: string[] = []
@@ -35,13 +72,13 @@ function collectCandidates(text: string, preferTag?: AnswerTag): Candidate[] {
     try {
       parsed = JSON.parse(t)
     } catch {
-      // Unparseable: try to salvage an object out of surrounding prose. Brace
-      // slicing is a REPAIR for broken text, never a way to reach inside valid
-      // JSON — so it only runs when the source failed to parse at all.
-      const f = t.indexOf('{')
-      const l = t.lastIndexOf('}')
-      if (f === -1 || l <= f) return
-      try { parsed = JSON.parse(t.slice(f, l + 1)) } catch { return }
+      // Unparseable: try to salvage an object out of surrounding prose. This is a
+      // REPAIR for broken text, never a way to reach inside valid JSON — it only
+      // runs when the source failed to parse at all, and it refuses objects that
+      // sit inside an array.
+      const slice = sliceTopLevelObject(t)
+      if (slice === null) return
+      try { parsed = JSON.parse(slice) } catch { return }
     }
     // Valid JSON that isn't a plain object (an array, a number, a string) is not
     // an answer. Disqualify the whole source rather than digging into it: an
