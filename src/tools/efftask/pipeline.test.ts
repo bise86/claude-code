@@ -632,3 +632,118 @@ describe('观察评分 is advisory by default and bounded when it is not', () =>
     expect(n.score.plan?.rationale).toContain('评分调用失败')
   })
 })
+
+describe('动态生长: an executor grafts children onto any node (spec §4)', () => {
+  const etag = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+  /** Executes once asking to graft, then behaves normally. */
+  const grower = (newChildren: unknown, seen?: string[]) => {
+    let asked = false
+    return (async (req: { phase: string; prompt: string }) => {
+      seen?.push(req.phase)
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        const extra = asked ? '' : `,"newChildren":${JSON.stringify(newChildren)}`
+        asked = true
+        return `${etag(req)}\n{"execStatus":"做了主体工作"${extra}}\n\`\`\``
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+  }
+
+  it('grafting onto ITSELF turns the node into a waiting parent', async () => {
+    // spec §4: 父节点转 WAITING_CHILDREN,待新子节点 ACCEPTED 后恢复.
+    const n = root()
+    const ctx = ctxFor([n], grower([{ title: '先补迁移脚本', deps: [] }]))
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(n.kind).toBe('decompose') // so the state machine routes it to integration
+    expect(n.childIds).toHaveLength(1)
+    expect(ctx.byId.get(n.childIds[0])!.title).toBe('先补迁移脚本')
+    expect(n.execStatus).toContain('做了主体工作') // its own evidence survives
+  })
+
+  it('grafting onto ANOTHER node leaves this one free to finish', async () => {
+    const n = root()
+    const other = createNode({ id: 'other', title: '别处', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    other.status = 'READY'
+    other.kind = 'executable'
+    const ctx = ctxFor([n, other], grower([{ parent: 'other', title: '挂到别处', deps: [] }]))
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')       // this node was not the target, so it proceeds
+    expect(other.status).toBe('WAITING_CHILDREN')
+    expect(other.childIds).toHaveLength(1)
+  })
+
+  it('refuses an unknown target and REPORTS the refusal', async () => {
+    // A growth request that vanished without trace is the "said one thing, did another"
+    // failure this project keeps paying for: the executor believes it queued that work.
+    const n = root()
+    const ctx = ctxFor([n], grower([{ parent: 'ghost', title: 'x', deps: [] }]))
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.execStatus).toContain('目标节点不存在')
+    expect(n.execStatus).toContain('做了主体工作')
+  })
+
+  it('refuses a TERMINAL target — its verdict already exists', async () => {
+    // Reopening an ACCEPTED node would make the passing verdict on record describe work it
+    // never saw.
+    const n = root()
+    const done = createNode({ id: 'done', title: '已完成', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    done.status = 'ACCEPTED'
+    const ctx = ctxFor([n, done], grower([{ parent: 'done', title: 'x', deps: [] }]))
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(done.status).toBe('ACCEPTED')
+    expect(done.childIds).toHaveLength(0)
+    expect(n.execStatus).toContain('已是终态')
+  })
+
+  it('refuses to exceed the depth cap', async () => {
+    const n = root()
+    const ctx = ctxFor([n], grower([{ title: '太深了', deps: [] }]), { ...cfg, caps: { ...DEFAULT_CAPS, maxDepth: 0 } })
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.childIds).toHaveLength(0)
+    expect(n.execStatus).toContain('深度上限')
+  })
+
+  it('a growth request in UNTAGGED text is ignored', async () => {
+    // Grafting nodes is a structural change; the per-call tag is the only thing separating
+    // "my answer" from text quoted into the prompt.
+    const n = root()
+    const agent = (async (req: { phase: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完","newChildren":[{"title":"偷渡","deps":[]}]}\n```'
+      return '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = ctxFor([n], agent)
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.childIds).toHaveLength(0)
+  })
+
+  it('an empty report is still an empty round even when it grafts nodes', async () => {
+    // Otherwise "add a child" becomes a way to reach acceptance without evidencing work.
+    const n = root()
+    let round = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        round++
+        return `${etag(req)}\n{"execStatus":"","newChildren":[{"title":"混过去","deps":[]}]}\n\`\`\``
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = ctxFor([n], agent)
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.childIds).toHaveLength(0)
+    expect(round).toBeGreaterThan(1) // it was sent back for rework, not accepted
+  })
+})

@@ -217,7 +217,8 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
     (feedback
       ? `上一轮验收未通过,阻断意见:\n${quote(feedback)}\n上一轮执行状态:\n${quote(node.execStatus)}\n请针对性返工。\n`
       : '') +
-    `完成后输出:{ "execStatus":"做了什么、结果如何" }。` + answerRule(tag)
+    `完成后输出:{ "execStatus":"做了什么、结果如何", "newChildren"?:[{"parent"?:"节点 id,省略则挂到本节点下","title","deps":["同批兄弟标题"]}] }。` +
+    `只有在执行中发现必须先完成的新子任务时才给 newChildren;目标节点必须尚未完成。` + answerRule(tag)
   )
 }
 // Blank fields must READ as blank. Interpolating an empty acceptance/execStatus renders
@@ -497,6 +498,62 @@ async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
   return true
 }
 
+/**
+ * 动态生长(spec §4):an executing node grafts children onto ANY node of the tree.
+ *
+ * Every rule here exists because the target is named by a MODEL, in text, at runtime:
+ *  - unknown id → refused; creating it anyway would invent a parent.
+ *  - TERMINAL target → refused. An ACCEPTED node already has a passing verdict on record,
+ *    and reopening it would make that verdict describe work it never saw. A BLOCKED one is
+ *    dead and its subtree is not scheduled.
+ *  - depth cap → refused per target, so one bad spec cannot sink the whole batch.
+ *  - node cap → left to createChildren's atomic reservation, untouched here.
+ *
+ * Refusals are REPORTED back into execStatus rather than silently dropped: the executor
+ * believes it queued that work, and a growth request that vanishes without trace is the
+ * same "said one thing, did another" failure this project keeps paying for.
+ */
+async function growTree(
+  node: TaskNode,
+  specs: { parent?: string; title: string; deps: string[] }[],
+  ctx: PipelineCtx,
+): Promise<{ grown: string[]; refusals: string[] }> {
+  const grown: string[] = []
+  const refusals: string[] = []
+  // Group by target so each target's children are created as ONE batch: createChildren
+  // resolves sibling deps by title WITHIN a batch, so splitting them would break the links.
+  const byTarget = new Map<string, { title: string; deps: string[] }[]>()
+  for (const spec of specs) {
+    const targetId = spec.parent ?? node.id
+    byTarget.set(targetId, [...(byTarget.get(targetId) ?? []), { title: spec.title, deps: spec.deps }])
+  }
+  for (const [targetId, kids] of byTarget) {
+    const target = ctx.byId.get(targetId)
+    if (!target) { refusals.push(`目标节点不存在: ${quote(targetId)}`); continue }
+    if (isTerminal(target.status)) {
+      refusals.push(`目标节点 ${quote(targetId)} 已是终态(${target.status}),不能再加子节点`)
+      continue
+    }
+    if (target.depth + 1 > ctx.config.caps.maxDepth) {
+      refusals.push(`目标节点 ${quote(targetId)} 已达深度上限 ${ctx.config.caps.maxDepth}`)
+      continue
+    }
+    const res = await createChildren(target, kids, ctx)
+    if (!res.ok) { refusals.push(`向 ${quote(targetId)} 加子节点失败: ${res.reason}`); continue }
+    // The target now has unfinished children, so it must wait — including when the target IS
+    // the executing node, which is exactly the spec's "父节点转 WAITING_CHILDREN,待新子节点
+    // ACCEPTED 后恢复". kind becomes decompose so the state machine routes it to integration
+    // rather than re-executing it.
+    target.kind = 'decompose'
+    if (!(await commit(target, 'WAITING_CHILDREN', ctx))) {
+      refusals.push(`向 ${quote(targetId)} 加子节点后落盘失败`)
+      continue
+    }
+    grown.push(targetId)
+  }
+  return { grown, refusals }
+}
+
 export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
@@ -519,7 +576,8 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       await blockWithReason(node, res.reason, ctx)
       return
     }
-    const reported = parseExecOutput(res.text, execTag).execStatus.trim()
+    const out = parseExecOutput(res.text, execTag)
+    const reported = out.execStatus.trim()
     // An executor that reports NOTHING has evidenced nothing. Sending a blank execStatus
     // into acceptance asks the reviewers to bless an empty slot — the one way a node can
     // reach ACCEPTED without any work having happened. Treat it as a failed round.
@@ -535,6 +593,26 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       continue
     }
     node.execStatus = reported
+
+    // 动态生长(spec §4):honoured AFTER the empty-report gate, so a reply that grafts nodes
+    // but evidences no work still counts as an empty round rather than buying a free pass.
+    if (out.newChildren.length > 0) {
+      const { grown, refusals } = await growTree(node, out.newChildren, ctx)
+      if (refusals.length > 0) {
+        // Append, never replace: execStatus is the executor's own record of what it did, and
+        // a growth request that vanished without trace is the same "said one thing, did
+        // another" failure this project keeps paying for.
+        node.execStatus = `${reported}\n(注:以下加子节点请求被拒绝)\n${refusals.map(r => '- ' + r).join('\n')}`
+      }
+      // If the EXECUTING node itself grew children it is now WAITING_CHILDREN, and its own
+      // acceptance must wait for them. Returning here is what the spec's "恢复" means: the
+      // scheduler picks it up again for integration once every child is ACCEPTED.
+      if (grown.includes(node.id)) {
+        await ctx.persist(node)
+        safeUpdate(ctx)
+        return
+      }
+    }
 
     // Acceptance. Reviewer-CALL failures retry the roundtable on their own budget (see
     // roundtableWithInfraRetry) — redoing the executor's real work over a flaky connection

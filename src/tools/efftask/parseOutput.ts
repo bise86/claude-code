@@ -231,10 +231,38 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
   return { role, pass: obj.pass === true && blocking.length === 0, blocking, comments: str(obj.comments) }
 }
 
-export function parseExecOutput(text: string, tag: string = ANSWER_TAGS.exec): { execStatus: string } {
+export interface NewChildSpec { parent?: string; title: string; deps: string[] }
+
+/**
+ * Child specs an executor asked to graft onto the tree (spec §4 动态生长).
+ *
+ * Shape-checked here, not trusted: `parent` merely NAMES a node id the caller must still
+ * resolve, and a spec with no usable title is dropped rather than creating a node titled
+ * "undefined". Everything that needs the tree — does the target exist, is it terminal, does
+ * it fit under the depth and node caps — is the caller's job.
+ */
+export function parseNewChildren(o: Record<string, unknown>): NewChildSpec[] {
+  const raw = o.newChildren
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+    .map(c => ({
+      parent: typeof c.parent === 'string' && c.parent.length > 0 ? c.parent : undefined,
+      title: typeof c.title === 'string' ? c.title.trim() : '',
+      deps: Array.isArray(c.deps) ? c.deps.filter((d): d is string => typeof d === 'string') : [],
+    }))
+    .filter(c => c.title.length > 0)
+}
+
+export function parseExecOutput(
+  text: string, tag: string = ANSWER_TAGS.exec,
+): { execStatus: string; newChildren: NewChildSpec[] } {
   const { obj } = pickAnswer(text, tag, o => typeof o.execStatus === 'string')
-  if (obj) return { execStatus: str(obj.execStatus) }
-  return { execStatus: text.trim() }
+  if (obj) return { execStatus: str(obj.execStatus), newChildren: parseNewChildren(obj) }
+  // Untagged fallback: the whole reply becomes the status. A growth request must NOT be
+  // honoured from untagged text — grafting nodes onto the tree is a structural change, and
+  // the tag is the only thing separating "my answer" from text quoted into the prompt.
+  return { execStatus: text.trim(), newChildren: [] }
 }
 
 /**
