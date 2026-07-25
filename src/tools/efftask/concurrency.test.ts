@@ -272,7 +272,7 @@ describe('an interrupt must not declare a verdict while work is still landing', 
 })
 
 describe('what is and is not parallel — pinned, because the gate tells the user', () => {
-  it('leaf acceptance is SERIAL: it lives inside the execute loop', async () => {
+  it('leaf acceptance is SERIAL *when un-isolated*: it lives inside the execute loop', async () => {
     // The acceptance roundtable for an executable leaf runs inside stepExecute's
     // execute→accept→rework for(;;) loop, and that whole loop is what goes on the serial
     // chain. So the globally-serialised region is not one execute call — it is execute plus
@@ -298,5 +298,50 @@ describe('parallelism = 1 reproduces the serial implementation exactly', () => {
       cfg({ parallelism: 1 }), deps(m.wrap(cooperative({ delay: 4 }))), new AbortController().signal)
     expect((await orch.run()).status).toBe('completed')
     expect(m.peakAny()).toBe(1)
+  })
+})
+
+describe('隔离可用时才解除 execute 串行(用户第一句的后半)', () => {
+  // A previous phase pinned `peak.execute === 1` unconditionally. That was true THEN, and
+  // keeping it would have quietly capped the feature at half — so these assertions replace it
+  // with the real rule: serial without isolation, parallel with it.
+  const fakePool = {
+    init: async () => ({ ok: true as const }),
+    acquire: async (n: TaskNode) => ({ path: `/wt/${n.id}`, branch: `worktree-${n.id}`, gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: true as const, merged: true }),
+    release: async () => ({ removed: true }),
+    dispose: async () => ({ kept: [] }),
+    integrationPath: '/wt/integration',
+    integrationBranchName: 'efftask/001/integration',
+  }
+
+  it('WITHOUT isolation, execute stays strictly serial', async () => {
+    const m = phaseMeter()
+    const orch = new EffTaskOrchestrator(
+      cfg({ parallelism: 5 }), deps(m.wrap(cooperative({ delay: 12 }))), new AbortController().signal)
+    expect((await orch.run()).status).toBe('completed')
+    expect(m.peak.execute).toBe(1)
+  })
+
+  it('WITH isolation, executors really do run at the same time', async () => {
+    const m = phaseMeter()
+    const orch = new EffTaskOrchestrator(
+      cfg({ parallelism: 5 }),
+      { ...deps(m.wrap(cooperative({ delay: 12 }))), worktrees: fakePool as never },
+      new AbortController().signal,
+    )
+    expect((await orch.run()).status).toBe('completed')
+    expect(m.peak.execute).toBeGreaterThan(1)
+  })
+
+  it('isolation does not let the pool exceed the configured limit', async () => {
+    const m = phaseMeter()
+    const orch = new EffTaskOrchestrator(
+      cfg({ parallelism: 2 }),
+      { ...deps(m.wrap(cooperative({ delay: 8 }))), worktrees: fakePool as never },
+      new AbortController().signal,
+    )
+    await orch.run()
+    expect(m.peakAny()).toBeLessThanOrEqual(2)
   })
 })

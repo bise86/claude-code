@@ -200,18 +200,24 @@ export const clampParallelism = (n: number): number =>
  * which still said "P1 串行执行,此值 P2 生效" after the pool shipped. A gate that describes
  * the run wrongly is the one failure this gate exists to prevent.
  */
-export function parallelismLine(config: EffTaskConfig, opts: { editable: boolean }): string {
+export function parallelismLine(
+  config: EffTaskConfig,
+  opts: { editable: boolean; isolation?: 'worktree' | 'none' },
+): string {
+  // What this run will ACTUALLY do. Isolation decides whether the execute phase can run in
+  // parallel at all, so a fixed sentence is right for one kind of run and a lie for the
+  // other — and this line is the one place the user is told.
+  //
+  // The phase names are this product's own (方案/评审/执行/验收/观察, see PHASE_LABEL). An
+  // earlier wording said "读取…阶段并行": 读取 is not a phase here at all — it was a
+  // mistranslation of "read-only phases" — and it also claimed 验收 was parallel, which is
+  // false for every executable leaf, whose acceptance lives inside stepExecute's
+  // execute→accept→rework loop.
+  const scope = opts.isolation === 'worktree'
+    ? '各阶段并行,执行任务在各自的 git worktree 中隔离'
+    : '方案/评审阶段并行;执行与叶子验收串行(未启用隔离)'
   const hint = opts.editable ? ' · ←/→ 调整' : ''
-  // Name the phases THIS product has (方案/评审/执行/验收/观察 — see PHASE_LABEL above), and
-  // only the ones measurably parallel:
-  //   方案 / 评审  → stepStart, dispatched straight into the pool                → parallel
-  //   执行 / 验收  → BOTH live in stepExecute's execute→accept→rework for(;;) loop,
-  //                  and that whole loop is what goes on the serial chain          → serial
-  //   集成验收     → stepIntegrate, in the pool, but only for decompose nodes
-  // An earlier wording said "读取…验收阶段并行". 读取 is not a phase of this product at all
-  // (it was a mistranslation of "read-only phases"), and 验收 is serial for every executable
-  // leaf — measured peak accept concurrency 1 at parallelism 20.
-  return `并行数: ${config.parallelism}（方案/评审阶段并行;执行与叶子验收串行,隔离见 P2b 计划）${hint}`
+  return `并行数: ${config.parallelism}（${scope}）${hint}`
 }
 
 /**

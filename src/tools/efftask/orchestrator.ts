@@ -163,7 +163,15 @@ export class EffTaskOrchestrator {
       // one failure cannot poison every later link. A poisoned chain makes Promise.race
       // resolve within a microtask forever: measured 200k iterations with a pending 30 ms
       // timer never firing, i.e. the process hangs with no I/O and no timers.
-      const task = kind === 'execute' ? (executeChain = executeChain.then(step, step)) : step()
+      // The execute mutex exists ONLY because un-isolated executors share one working tree.
+      // With a worktree per node that reason is gone, and serialising would throw away the
+      // parallelism the user asked for ("各任务执行可以并行,默认5个").
+      //
+      // Keyed on the POOL, not on config: a config flag could say "isolated" while every
+      // acquire failed. With a pool present, stepExecute refuses to run any node it cannot
+      // isolate, so "pool exists" really does mean "no two executors share a tree".
+      const serialiseExecute = kind === 'execute' && this.deps.worktrees === undefined
+      const task = serialiseExecute ? (executeChain = executeChain.then(step, step)) : step()
       return task.finally(() => { inFlight.delete(n.id) })
     }
 

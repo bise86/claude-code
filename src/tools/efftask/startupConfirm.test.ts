@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -175,5 +175,29 @@ describe('capsLine discloses the scoring threshold, which CHANGES behaviour', ()
     expect(capsLine(base)).toContain('深度5')
     expect(capsLine(base)).toContain('节点100')
     expect(capsLine(base)).toContain('迭代3')
+  })
+})
+
+describe('parallelismLine 必须描述 THIS run,而不是一句固定话', () => {
+  const base: EffTaskConfig = {
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [],
+  }
+  it('un-isolated: says execute and leaf acceptance are serial', () => {
+    const line = parallelismLine(base, { editable: false, isolation: 'none' })
+    expect(line).toContain('方案/评审阶段并行')
+    expect(line).toContain('执行与叶子验收串行')
+    expect(line).toContain('未启用隔离')
+  })
+  it('isolated: says every phase runs in parallel, in its own worktree', () => {
+    // The same sentence for both would be right for one kind of run and a lie for the other —
+    // and this line is the ONLY place the user is told.
+    const line = parallelismLine(base, { editable: false, isolation: 'worktree' })
+    expect(line).toContain('各阶段并行')
+    expect(line).toContain('worktree')
+    expect(line).not.toContain('串行')
+  })
+  it('defaults to the honest, conservative description when isolation is unknown', () => {
+    expect(parallelismLine(base, { editable: false })).toContain('串行')
   })
 })
