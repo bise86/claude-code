@@ -22,7 +22,26 @@ function rootTitle(goal: string): string {
 
 export class EffTaskOrchestrator {
   private byId: Map<string, TaskNode>
-  constructor(private cfg: EffTaskConfig, private deps: OrchestratorDeps, private signal: AbortSignal) {
+  constructor(
+    private cfg: EffTaskConfig,
+    private deps: OrchestratorDeps,
+    private signal: AbortSignal,
+    /**
+     * Resume: the recovered tree IS the state, so adopt it instead of minting a fresh root.
+     * The caller must have run it through `validateLoadedNodes`, which guarantees the two
+     * things run() assumes on every iteration — a node with id 'root' exists, and every
+     * dep/childId reference resolves.
+     */
+    seed?: TaskNode[],
+  ) {
+    if (seed !== undefined) {
+      // An EMPTY seed is a caller bug, not an empty run: falling through would silently mint
+      // a fresh root from cfg.goalPrompt and turn a resume into a brand-new run writing into
+      // the old run's directory.
+      if (seed.length === 0) throw new Error('efftask: 恢复失败,没有可恢复的节点')
+      this.byId = byIdMap(seed)
+      return
+    }
     // root goal = the FULL goalPrompt (title is only a truncated display label); ctxGoal
     // reads node.goal, so the plan prompt must see the whole objective, not the truncation.
     const root = createNode({ id: 'root', title: rootTitle(cfg.goalPrompt), goal: cfg.goalPrompt, parentId: null, deps: [], depth: 0, phaseRoles: cfg.phaseRoles, now: this.nowSafe() })
