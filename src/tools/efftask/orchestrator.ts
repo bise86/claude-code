@@ -164,6 +164,12 @@ export class EffTaskOrchestrator {
       for (const n of this.byId.values()) {
         if (isTerminal(n.status)) continue
         n.status = 'BLOCKED'
+        // Mark WHY it is blocked, structurally. Resume must reopen the nodes this sweep
+        // killed while leaving genuinely failed ones dead, and it cannot tell them apart
+        // from the reason text — see TaskNode.interrupted. isTerminal skips nodes that were
+        // already BLOCKED, so a real failure never picks the flag up here; the nodes the
+        // pipeline blocked during this same abort are covered by blockWithReason.
+        n.interrupted = true
         if (!n.blockedReason) n.blockedReason = '已中断'
         n.updatedAt = this.nowSafe()
         await this.safePersist(n)

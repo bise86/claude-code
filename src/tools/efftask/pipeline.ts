@@ -66,6 +66,13 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promi
 // hold real completed-work evidence that acceptance/audit still needs.
 async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx): Promise<void> {
   node.blockedReason = reason
+  // Structural, not textual: if the run is aborting, this block is an interruption rather
+  // than a judgement about the work, and resume must be able to reopen exactly these nodes.
+  // Assigned in BOTH directions on purpose — a node reseated by an earlier resume carries a
+  // cleared flag, and if it later fails for real the flag must not linger and resurrect it.
+  // (The orchestrator's abort sweep marks the rest; it skips nodes that are already BLOCKED,
+  // which is exactly the set this line covers.)
+  node.interrupted = ctx.signal.aborted
   await commit(node, 'BLOCKED', ctx)
 }
 

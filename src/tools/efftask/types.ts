@@ -35,6 +35,16 @@ export interface TaskNode {
   // Why a separate field: execStatus may hold real completed-work evidence that the
   // acceptance roundtable still needs to see. Blocking must never overwrite it.
   blockedReason: string
+  /**
+   * 该节点是被"中断"扫成 BLOCKED 的,而不是它自己失败了。
+   *
+   * WHY a field rather than matching blockedReason against '已中断': resume must reopen
+   * exactly these nodes and must NOT reopen one that exhausted its iteration budget. A
+   * literal shared by two unrelated modules is not an interface — a genuine failure reason
+   * could equal it, and a later reword would silently resurrect failed work as if it were
+   * merely interrupted. Cleared the moment the node is reseated.
+   */
+  interrupted?: boolean
   reviewLog: RoundtableRecord[]
   acceptLog: RoundtableRecord[]
   score: { plan?: ScoreRecord; exec?: ScoreRecord }

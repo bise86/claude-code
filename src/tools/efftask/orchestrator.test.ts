@@ -216,3 +216,38 @@ describe('EffTaskOrchestrator (serial)', () => {
     expect(calls).toBeLessThan(200)
   })
 })
+
+describe('an interrupted run is distinguishable from a failed one', () => {
+  it('marks swept nodes as interrupted, and leaves genuinely blocked ones unmarked', async () => {
+    // propagateBlocked(aborted) sweeps EVERY non-terminal node to BLOCKED. Resume must be
+    // able to tell "we killed this mid-flight" from "this really failed", and it must not do
+    // so by string-matching blockedReason: a genuine reason could equal that literal, and two
+    // unrelated modules agreeing on a string is not an interface.
+    // Without this distinction a resumed run advances NOTHING — verified empirically:
+    // interrupt, resume, zero model calls, immediate {status:'blocked'}.
+    const ac = new AbortController()
+    let calls = 0
+    const runAgent = (async () => {
+      calls++
+      if (calls >= 2) ac.abort()
+      return '```json\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a","children":[{"title":"子一","deps":[]}]}\n```'
+    }) as unknown as RunAgentFn
+    const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), ac.signal)
+    expect(await orch.run()).toEqual({ status: 'blocked', reason: '已中断' })
+    for (const n of orch.nodes()) {
+      expect(n.status).toBe('BLOCKED')
+      expect(n.interrupted).toBe(true)
+    }
+  })
+
+  it('a node blocked by a real failure is never marked interrupted', async () => {
+    // A node that exhausted its review budget must NOT come back to life on resume.
+    const runAgent = (async () => 'no fence at all, ever') as unknown as RunAgentFn
+    const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
+    const res = await orch.run()
+    expect(res.status).toBe('blocked')
+    const root = orch.nodes().find(n => n.id === 'root')!
+    expect(root.status).toBe('BLOCKED')
+    expect(root.interrupted).toBeFalsy()
+  })
+})
