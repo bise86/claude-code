@@ -8,6 +8,15 @@ export interface FsLike {
   mkdir(p: string): Promise<void>
   readdir(p: string): Promise<string[]>
   exists(p: string): Promise<boolean>
+  /**
+   * Create `p` and report whether WE created it — false if it already existed.
+   *
+   * Must be atomic (a non-recursive mkdir is, on every real filesystem). This is what makes
+   * a run id a reservation rather than a guess: two commands started before either wrote
+   * anything would otherwise both scan an empty directory, both pick the same id, and the
+   * second would overwrite the first's whole tree while both reported success.
+   */
+  mkdirExclusive(p: string): Promise<boolean>
 }
 
 /**
@@ -58,7 +67,17 @@ export async function allocateRunId(fs: FsLike, effRoot: string): Promise<string
     const m = name.match(/^(\d+)$/)
     if (m) max = Math.max(max, parseInt(m[1], 10))
   }
-  return String(max + 1).padStart(3, '0')
+  // RESERVE it, don't just compute it. Scanning alone is a guess: nothing is written until
+  // the orchestrator starts, so a second /et launched in that window would scan the same
+  // directory, pick the same id, and later overwrite the first run's tree — with both
+  // commands reporting success at the same path. Creating the directory here is the
+  // reservation, and mkdirExclusive tells us whether we won it.
+  await fs.mkdir(effRoot)
+  for (let n = max + 1; n <= max + 1000; n++) {
+    const id = String(n).padStart(3, '0')
+    if (await fs.mkdirExclusive(`${effRoot}/${id}`)) return id
+  }
+  throw new Error('efftask: 无法分配 run id(连续 1000 个都已被占用)')
 }
 
 // machine-state frontmatter fields (everything except derived human body)

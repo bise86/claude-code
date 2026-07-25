@@ -197,3 +197,50 @@ describe('runAgentAdapter helpers', () => {
     expect(text).toBe('AB')
   })
 })
+
+describe('a hung provider is bounded by the phase deadline', () => {
+  it('aborts and reports instead of parking forever', async () => {
+    // Wall clock was the one unbounded axis: a provider that never rejects leaves the
+    // pipeline in `await`, the tree showing 运行中 forever, and even Esc cannot unstick it
+    // because nothing is polling.
+    let innerAborted = false
+    async function* neverYields(args: any): AsyncGenerator<any> {
+      args.override.abortController.signal.addEventListener('abort', () => { innerAborted = true })
+      await new Promise(() => {}) // hangs
+      yield { type: 'assistant', message: { content: [] } }
+    }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as any,
+      canUseTool: (async () => ({ behavior: 'allow' })) as any,
+      availableTools: [] as any,
+      readOnlyTools: [] as any,
+      activeAgents: [],
+      mainModelDefault: { agentType: 'main' } as any,
+      timeoutMs: 60,
+      runAgentImpl: neverYields as any,
+    })
+    const started = Date.now()
+    await expect(
+      fn({ phase: 'execute', node: {} as any, role: null, system: 's', prompt: 'p', signal: new AbortController().signal }),
+    ).rejects.toThrow('超时')
+    expect(Date.now() - started).toBeLessThan(3000)
+    expect(innerAborted).toBe(true) // the sub-agent really was told to stop
+  })
+
+  it('a responsive call is unaffected by the deadline', async () => {
+    async function* quick(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } }
+    }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as any,
+      canUseTool: (async () => ({ behavior: 'allow' })) as any,
+      availableTools: [] as any,
+      readOnlyTools: [] as any,
+      activeAgents: [],
+      mainModelDefault: { agentType: 'main' } as any,
+      timeoutMs: 5000,
+      runAgentImpl: quick as any,
+    })
+    expect(await fn({ phase: 'plan', node: {} as any, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })).toBe('done')
+  })
+})

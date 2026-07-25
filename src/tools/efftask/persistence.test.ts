@@ -12,6 +12,7 @@ function memFs(seed: Record<string, string> = {}): FsLike & { store: Map<string,
     async readFile(p) { const v = store.get(p); if (v === undefined) throw new Error('ENOENT ' + p); return v },
     async writeFile(p, data) { store.set(p, data) },
     async mkdir(p) { dirs.add(p) },
+    async mkdirExclusive(p) { if (dirs.has(p)) return false; dirs.add(p); return true },
     async exists(p) { return store.has(p) || dirs.has(p) },
     async readdir(p) {
       const prefix = p.endsWith('/') ? p : p + '/'
@@ -173,5 +174,32 @@ describe('persistence', () => {
     expect(slugify('!!!???')).toBe('node')
     expect(slugify('x'.repeat(39) + '🎉' + 'y'.repeat(10))).not.toMatch(/-$/)
     expect(slugify('中文标题测试')).toBe('中文标题测试')
+  })
+})
+
+describe('run ids are reservations, not guesses', () => {
+  it('two allocations racing on an empty root never get the same id', async () => {
+    // Nothing is written until the orchestrator starts, so two /et commands launched in
+    // that window would both scan an empty dir. Without an atomic reservation the second
+    // overwrites the first run's entire tree while both report success.
+    const fs = memFs()
+    const [a, b] = await Promise.all([allocateRunId(fs, '/eff'), allocateRunId(fs, '/eff')])
+    expect(a).not.toBe(b)
+    expect([a, b].sort()).toEqual(['001', '002'])
+  })
+
+  it('reserves the next free id when earlier ones are taken', async () => {
+    const fs = memFs()
+    await fs.mkdirExclusive('/eff/001')
+    await fs.mkdirExclusive('/eff/002')
+    expect(await allocateRunId(fs, '/eff')).toBe('003')
+  })
+
+  it('a reserved id is really on disk, so a later scan sees it', async () => {
+    const fs = memFs()
+    const first = await allocateRunId(fs, '/eff')
+    const second = await allocateRunId(fs, '/eff')
+    expect(first).toBe('001')
+    expect(second).toBe('002') // the reservation, not any written node, is what advances it
   })
 })

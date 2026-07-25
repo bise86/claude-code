@@ -10,7 +10,7 @@ import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
 import { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { allocateRunId, writeNode, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
-import { createNode, emptyPhaseRoles } from '../../tools/efftask/types.js'
+import { createNode, emptyPhaseRoles, DEFAULT_CAPS } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import {
@@ -95,6 +95,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     readOnlyTools, // plan / review / accept / observer
     activeAgents,
     mainModelDefault,
+    // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded
+    // axis left. The extraction seam below gets it too.
+    timeoutMs: DEFAULT_CAPS.nodeTimeoutMs,
   })
   // Separate NO-TOOLS seam for the one-shot config extraction: it only rewrites text into
   // JSON, so it needs neither read nor write tools. This is the ONLY place that passes [].
@@ -105,6 +108,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     readOnlyTools: [],
     activeAgents,
     mainModelDefault,
+    timeoutMs: DEFAULT_CAPS.nodeTimeoutMs,
   })
 
   const knownRoles = activeAgents.map(a => a.agentType)
@@ -200,6 +204,17 @@ function fsAdapter(): FsLike {
       await writeFile(p, d, 'utf-8')
     },
     mkdir: p => mkdir(p, { recursive: true }).then(() => {}),
+    // NON-recursive on purpose: that is the atomic form. EEXIST means another run already
+    // reserved this id, so we report the loss rather than sharing the directory.
+    mkdirExclusive: async p => {
+      try {
+        await mkdir(p)
+        return true
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false
+        throw e
+      }
+    },
     readdir: p => readdir(p), // returns string[] by default — matches FsLike
     exists: p => access(p).then(() => true, () => false),
   }
@@ -234,8 +249,21 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // If this view is ever torn down without going through onExit, the run must stop with it:
   // otherwise the orchestrator keeps issuing real, write-capable model calls and writing
   // node.md into a tree nothing is watching, and the parent-signal listener outlives us.
-  const { abort, detach, onTornDown } = props
-  React.useEffect(() => () => { onTornDown(); abort(); detach() }, [abort, detach, onTornDown])
+  const { abort, detach, onTornDown, onExit } = props
+  // outcomeRef, not the state: the cleanup closure captures whatever the last render saw,
+  // and a run that finished in the same tick as the teardown would report nothing.
+  const outcomeRef = React.useRef<Outcome | null>(null)
+  const recordOutcome = React.useCallback((o: Outcome) => { outcomeRef.current = o; setOutcome(o) }, [])
+  React.useEffect(() => () => {
+    onTornDown()
+    abort()
+    detach()
+    // onDone is the ONLY thing that resolves processSlashCommand's promise. Reaching it
+    // solely from the done view's key handler means any teardown that isn't a keypress
+    // (Ctrl+O, Ctrl+Z→fg) leaves that promise pending forever, which the host warns
+    // deadlocks the queue processor — and loses the result of a run that already finished.
+    onExit(outcomeRef.current)
+  }, [abort, detach, onTornDown, onExit])
 
   const { args, knownRoles, unsupportedRoles, extractJson } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
@@ -307,7 +335,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         void runOrchestrator(
           { config: effectiveConfig, runDir: props.runDir, fs: props.fs, runAgent: props.runAgent, signal: props.signal },
           setNodes,
-          setOutcome,
+          recordOutcome,
           setPhase,
         )
       })
@@ -315,7 +343,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         settled = true
         // A broken race must land on the done view, not hang on 'confirm'.
         if (cancelled) return
-        setOutcome({ status: 'blocked', reason: e instanceof Error ? e.message : String(e) })
+        recordOutcome({ status: 'blocked', reason: e instanceof Error ? e.message : String(e) })
         setPhase('done')
       })
     return () => {
@@ -329,7 +357,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   }, [phase, config])
 
   if (phase === 'parsing' || !config) {
-    return <Text dimColor>正在解析需求…</Text>
+    // Needs its own key handler: a bare <Text> has none, and while a local-jsx dialog is
+    // mounted the REPL disables Esc/Ctrl+C, so an extraction call that never resolves would
+    // leave the user with no way out of the session at all.
+    return <ParsingView onCancel={() => { props.abort(); onExit(null) }} />
   }
   if (phase === 'confirm') {
     return <ConfirmStartup config={config} onDecision={d => terminalClaim.current?.('terminal', d)} />
@@ -338,6 +369,19 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return <RunningView nodes={nodes} runId={props.runId} onAbort={props.abort} />
   }
   return <DoneView nodes={nodes} runId={props.runId} outcome={outcome} onExit={props.onExit} />
+}
+
+// 'parsing' phase: the extraction model call is in flight. Esc/q must work here too.
+function ParsingView(props: { onCancel: () => void }): React.ReactElement {
+  useInput((input, key) => {
+    if (key.escape || input.toLowerCase() === 'q') props.onCancel()
+  })
+  return (
+    <Box flexDirection="column">
+      <Text dimColor>正在解析需求…</Text>
+      <Text dimColor>Esc/q 取消</Text>
+    </Box>
+  )
 }
 
 // 'running' phase: live tree + an interrupt affordance. Esc/q aborts the controller the
@@ -416,12 +460,12 @@ async function runOrchestrator(
     void queueManifest(orch.nodes()) // run.md exists from the first frame, not just at the end
     const result = await orch.run() // { status, reason }
     setNodes([...orch.nodes()])
-    setOutcome(result)
+    recordOutcome(result)
     await queueManifest(orch.nodes(), result) // final manifest records {status, reason}
   } catch (e) {
     // run() is not supposed to reject (the orchestrator catches per-step), but if it ever
     // does, the UI must NOT wedge on 'running' with no way out.
-    setOutcome({ status: 'blocked', reason: e instanceof Error ? e.message : String(e) })
+    recordOutcome({ status: 'blocked', reason: e instanceof Error ? e.message : String(e) })
   } finally {
     setPhase('done') // the done view is ALWAYS reached
   }

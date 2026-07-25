@@ -49,6 +49,14 @@ export function makeRunAgentFn(deps: {
   readOnlyTools: Tools
   activeAgents: AgentDefinition[]
   mainModelDefault: AgentDefinition
+  /**
+   * Wall-clock deadline for ONE phase call. Every other axis of this system is bounded —
+   * depth, node count, three iteration counters, infra retries — but a provider that hangs
+   * without ever rejecting has no bound at all: the pipeline parks in `await`, the tree
+   * shows 运行中 forever, and even an abort cannot unstick it because nothing is polling.
+   * 0 disables it.
+   */
+  timeoutMs?: number
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
@@ -70,6 +78,12 @@ export function makeRunAgentFn(deps: {
     const inner = new AbortController()
     const relay = (): void => inner.abort()
     req.signal.addEventListener('abort', relay, { once: true })
+    // The deadline aborts the sub-agent the same way a user Esc does, so a hung provider
+    // ends the phase instead of parking the pipeline forever.
+    let timedOut = false
+    const timer = deps.timeoutMs && deps.timeoutMs > 0
+      ? setTimeout(() => { timedOut = true; inner.abort() }, deps.timeoutMs)
+      : undefined
 
     const collected: Message[] = []
     const invoke = (): AsyncGenerator<Message, void> =>
@@ -103,14 +117,31 @@ export function makeRunAgentFn(deps: {
           // A crashing renderer must not take the run down (same rule as pipeline/orchestrator).
           try { req.onChunk(collectText([message])) } catch { /* ignore */ }
         }
-        if (req.signal.aborted) break
+        if (req.signal.aborted || timedOut) break
       }
     }
     try {
-      await (req.cwd ? runWithCwdOverride(req.cwd, consume) : consume())
+      // Race the consumption against the deadline: a generator that never yields would
+      // otherwise never observe the abort, which is exactly the hang this bounds.
+      const work = req.cwd ? runWithCwdOverride(req.cwd, consume) : consume()
+      if (timer) {
+        await Promise.race([
+          work,
+          new Promise<void>(resolve => {
+            const check = setInterval(() => { if (timedOut) { clearInterval(check); resolve() } }, 50)
+            void work.finally(() => clearInterval(check))
+          }),
+        ])
+      } else {
+        await work
+      }
     } finally {
+      if (timer) clearTimeout(timer)
       req.signal.removeEventListener('abort', relay)
     }
+    // Report the deadline rather than returning a truncated answer that the phase would
+    // parse as a real (empty) reply.
+    if (timedOut) throw new Error(`阶段调用超时(${deps.timeoutMs} ms),已中止`)
     return collectText(collected)
   }
 }
