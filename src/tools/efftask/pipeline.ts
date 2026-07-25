@@ -172,6 +172,7 @@ function planPrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = ''
   return (
     `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
     depsSection(node, ctx) +
+    guidanceSection(ctx) +
     // The depth budget lives IN THE PROMPT so the model self-limits, instead of us
     // silently discarding the children it asked for once it hits the cap.
     `当前深度 ${node.depth}/上限 ${caps.maxDepth};已达上限时必须返回 kind=executable,不得再拆分。\n` +
@@ -194,6 +195,7 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
   return (
     `按以下方案执行任务并完成实际改动。方案:\n${quote(JSON.stringify(node.plan))}\n` +
     depsSection(node, ctx) +
+    guidanceSection(ctx) +
     // REWORK path: show the acceptance blockers AND what the previous round already did,
     // so the rerun is a targeted fix rather than a blind repeat.
     (feedback
@@ -250,11 +252,41 @@ function isFinished(node: TaskNode): boolean {
   return isTerminal(node.status)
 }
 
+
+/**
+ * 续跑指引(§17.4):恢复时用户补充的一段话,追加进后续 plan/execute 提示词。
+ *
+ * quote()d like every other model- or user-authored interpolation: this text lands in a
+ * prompt whose reply is parsed by fence tag, so an unquoted \`\`\` in it could forge one.
+ * Only affects unfinished work — an ACCEPTED node is never re-entered.
+ */
+function guidanceSection(ctx: PipelineCtx): string {
+  const g = ctx.config.resumeGuidance?.trim()
+  return g ? `续跑指引(用户在恢复时补充,优先级高于原方案的枝节):\n${quote(g)}\n` : ''
+}
+
+/**
+ * The blocking summary of the last round that FAILED, recovered from the persisted log.
+ *
+ * `feedback` is a local inside stepStart/stepExecute, so a node reseated out of REWORK or
+ * PLAN_REVIEW would re-enter with an empty one and the executor would blindly repeat the
+ * work that was just rejected — with one fewer round of budget left. The data survives on
+ * disk in the logs; read it back instead of losing it.
+ */
+function lastFailureFeedback(log: { synthesized: { pass: boolean; blockingSummary: string } }[]): string {
+  for (let i = log.length - 1; i >= 0; i--) {
+    if (!log[i].synthesized.pass) return log[i].synthesized.blockingSummary
+  }
+  return ''
+}
+
 export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
-  let feedback = ''
+  // Seeded from the log so a RESUMED node re-plans against the blockers it already earned
+  // rather than starting blind (see lastFailureFeedback).
+  let feedback = lastFailureFeedback(node.reviewLog)
   // plan → review loop. A rejected child GROUP (dependency cycle) re-enters this same
   // loop, so replanning is bounded by the SAME maxIterations budget — a cycle costs a
   // retry, it does not instantly kill the run.
@@ -388,7 +420,9 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
-  let feedback = '' // previous round's acceptance blockingSummary; drives the REWORK prompt
+  // previous round's acceptance blockingSummary; drives the REWORK prompt. Seeded from the
+  // persisted log so a resumed node does not repeat work that was already rejected.
+  let feedback = lastFailureFeedback(node.acceptLog)
   let emptyReports = 0
   for (;;) {
     if (!(await commit(node, 'EXECUTING', ctx))) return
