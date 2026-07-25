@@ -299,6 +299,11 @@ export function validateLoadedNodes(
     // stopped at BLOCKED 已中断 forever.
     if (n.interrupted !== undefined && n.interrupted !== true) n.interrupted = false
     if (n.mergeConflict !== undefined && n.mergeConflict !== true) n.mergeConflict = false
+    // Same `!== true → false` discipline, and for a sharper reason than the others: this flag
+    // is what stops 补救拆分 happening twice. A truthy non-boolean (`revised: "yes"` from a
+    // hand-edited node.md) is not `=== true`, so the node would buy a SECOND corrective
+    // subtree — which is the one bound the whole cost argument rests on.
+    if (n.revised !== undefined && n.revised !== true) n.revised = false
     const pr = (n.phaseRoles ?? {}) as Record<string, unknown>
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>
     if (typeof n.title !== 'string' || n.title.length === 0) n.title = n.id

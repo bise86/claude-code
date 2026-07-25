@@ -2054,3 +2054,116 @@ describe('被拒绝的加子节点请求也不能把节点撑爆', () => {
     expect(n.execStatus.startsWith('做做做')).toBe(true)
   })
 })
+
+describe('spec §4.1:集成验收失败 → 回到 decompose 修订', () => {
+  // 这条边画在状态机图上,代码里一直不存在。stepIntegrate 的循环对着**同一批**子节点
+  // 重跑**同一个**圆桌:integratePrompt 只读父目标和各子节点的 execStatus,轮与轮之间
+  // 一个字都不会变,唯一的变量是 feedback 那一行。烧满 maxIterations 次真实圆桌然后阻断。
+  // 图上另外两条 fail 边都会重跑"产出被判物的那个阶段"(PLAN_REVIEW→PLANNING 重写方案,
+  // ACCEPTANCE→REWORK 重跑执行器),只有这一条什么都不改。
+  const withKids = (over: Partial<TaskNode> = {}): [TaskNode, TaskNode] => {
+    const n = root(); n.kind = 'decompose'; n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    Object.assign(n, over)
+    const c = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    c.status = 'ACCEPTED'; c.execStatus = '做了 A'
+    return [n, c]
+  }
+  const rejectWith = (remedy: string): RunAgentFn =>
+    (async (req: { prompt: string }) => vtag(req) + `\n{"pass":false,"blocking":["缺少回滚"],"comments":"","remedy":${remedy}}\n\`\`\``) as RunAgentFn
+
+  it('打满预算后追加补救子任务,回到 WAITING_CHILDREN 而不是直接阻断', async () => {
+    const [n, c] = withKids()
+    const ctx = ctxFor([n, c], rejectWith('[{"title":"补回滚脚本","deps":[]}]'))
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(n.blockedReason).toBe('')
+    expect(n.childIds).toHaveLength(2)
+    const added = ctx.byId.get(n.childIds[1])!
+    expect(added.title).toBe('补回滚脚本')
+    // 阻断原文必须进到子节点的 goal:createChildren 拼的是父目标 + 父方案要点,而那份方案
+    // 正是刚刚被否掉的那份 —— 不带上原因,补救子节点就会照着失败的文本重新规划。
+    expect(added.goal).toContain('缺少回滚')
+  })
+
+  it('只做一次 —— 第二次打满预算就老老实实阻断', async () => {
+    // 这个上界就是整个成本论证本身。每轮都修的话,每个补救子节点都带回全新的迭代预算和
+    // 自己的子树,maxIterations 就不再封任何东西,只剩 maxNodes 兜底。
+    const [n, c] = withKids({ revised: true })
+    const ctx = ctxFor([n, c], rejectWith('[{"title":"再补一个","deps":[]}]'))
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('集成验收迭代超限')
+    expect(n.childIds).toHaveLength(1) // 没有新增
+  })
+
+  it('没给 remedy 就按老路阻断,不会凭空造子任务', async () => {
+    const [n, c] = withKids()
+    const ctx = ctxFor([n, c], (async (req: { prompt: string }) =>
+      vtag(req) + '\n{"pass":false,"blocking":["就是做错了"],"comments":""}\n```') as RunAgentFn)
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.childIds).toHaveLength(1)
+  })
+
+  it('协议失败(没按 tag 输出)不会触发补救拆分', async () => {
+    // 关键的一条。parseVerdict 是 fail-closed 的:没按要求输出裁决块 → pass:false 且不带
+    // infra 标记。那种失败的正确疗法恰恰是重跑一轮(每轮 answerTag 重新随机),而不是
+    // 为一个格式错误新建一棵子树。因为 remedy 和裁决来自同一次带 tag 的解析,这类回复
+    // 压根解析不出 remedy —— 保护是结构性的,不是靠额外判断。
+    const [n, c] = withKids()
+    const ctx = ctxFor([n, c], (async () => '我觉得不太行,你再改改吧') as RunAgentFn)
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.childIds).toHaveLength(1)
+  })
+
+  it('通过的裁决即使带了 remedy 也不长树', async () => {
+    const [n, c] = withKids()
+    const ctx = ctxFor([n, c], (async (req: { prompt: string }) =>
+      vtag(req) + '\n{"pass":true,"blocking":[],"comments":"","remedy":[{"title":"顺手再来一个","deps":[]}]}\n```') as RunAgentFn)
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.childIds).toHaveLength(1)
+  })
+
+  it('多个补救子任务串成依赖链,不并行改同一批文件', async () => {
+    // spec §16 把 worktree 合并冲突列为最大风险,缓解措施就是"用依赖边串联可能冲突的
+    // 节点"。补救子任务按定义都在补同一个缺口,是冲突风险最高的形状。
+    const [n, c] = withKids()
+    const ctx = ctxFor([n, c], rejectWith('[{"title":"甲","deps":[]},{"title":"乙","deps":[]},{"title":"丙","deps":[]}]'))
+    await stepIntegrate(n, ctx)
+    const added = n.childIds.slice(1).map(id => ctx.byId.get(id)!)
+    expect(added.map(x => x.title)).toEqual(['甲', '乙', '丙'])
+    expect(added[0].deps).toEqual([])
+    expect(added[1].deps).toEqual([added[0].id])
+    expect(added[2].deps).toEqual([added[1].id])
+  })
+
+  it('最多 3 个,多给的被截掉', async () => {
+    const [n, c] = withKids()
+    const ctx = ctxFor([n, c], rejectWith(JSON.stringify(
+      Array.from({ length: 9 }, (_, i) => ({ title: `补${i}`, deps: [] })))))
+    await stepIntegrate(n, ctx)
+    expect(n.childIds).toHaveLength(1 + 3)
+  })
+
+  it('深度到顶就不修订,而且要喊人(不静默截断)', async () => {
+    const fired: string[] = []
+    const [n, c] = withKids({ depth: DEFAULT_CAPS.maxDepth })
+    const ctx = { ...ctxFor([n, c], rejectWith('[{"title":"补一个","deps":[]}]')), onBlocked: (i: { reason: string }) => { fired.push(i.reason) } }
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.childIds).toHaveLength(1)
+    expect(fired.some(r => r.includes('深度上限'))).toBe(true)
+  })
+
+  it('修订这件事本身要落进 execStatus,详情页看得见', async () => {
+    // §11 的"不静默截断":一轮悄悄把树长了三个节点,在详情页里读起来和多失败一轮
+    // 一模一样;而树凭空多出几行、没人解释,正是 stepStart 已经在announce 的那种情况的镜像。
+    const [n, c] = withKids()
+    const ctx = ctxFor([n, c], rejectWith('[{"title":"补回滚脚本","deps":[]}]'))
+    await stepIntegrate(n, ctx)
+    expect(n.execStatus).toContain('补救子任务')
+    expect(n.execStatus).toContain('补回滚脚本')
+  })
+})

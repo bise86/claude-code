@@ -1,7 +1,7 @@
 // src/tools/efftask/pipeline.ts
 import type { EffTaskConfig, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import { createNode } from './types.js'
-import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
@@ -441,6 +441,13 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
     ownWork +
     `子任务结果:\n${children || '(无子任务)'}\n\n` +
     (feedback ? `上一轮集成验收阻断意见,请复核是否已解决:\n${quote(feedback)}\n\n` : '') +
+    // 补救拆分 (spec §4.1). Asked for HERE, inside the verdict, rather than by a separate plan
+    // call — see Verdict.remedy for why that placement is the design. Described as optional
+    // and small on purpose: it is spent at most once per node, and these siblings all touch
+    // the same files.
+    `不通过时,若你认为"再补几个子任务"能补上缺口,可在同一个 json 里给出 ` +
+    `"remedy":[{"title":"子任务标题","deps":[]}](最多 ${MAX_REMEDY_CHILDREN} 个;` +
+    `补不上、或问题不在于缺工作,就省略该字段)。\n` +
     `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +
     answerRule(tag)
   )
@@ -633,7 +640,21 @@ type CreateResult =
   // sentence is not an interface, and the two need different cards.
   | { ok: false; reason: string; retryable: boolean; cap?: boolean }
 
-export async function createChildren(node: TaskNode, specs: { title: string; deps: string[] }[], ctx: PipelineCtx): Promise<CreateResult> {
+export async function createChildren(
+  node: TaskNode,
+  specs: { title: string; deps: string[] }[],
+  ctx: PipelineCtx,
+  /**
+   * Extra context appended to each child's goal — why this batch exists.
+   *
+   * Added for 补救拆分 (spec §4.1). The composed goal below carries the parent's plan
+   * keyPoints, and for a corrective batch that plan is precisely the one the integration
+   * roundtable just refused: without this the child would replan against the failing text
+   * with nothing to go on but a ≤200-char title. Absent for ordinary decomposition, where
+   * the parent's plan IS the right context.
+   */
+  goalNote?: string,
+): Promise<CreateResult> {
   // Node-count cap: if creating these children would exceed maxNodes, create NONE
   // (never silently truncate). Not retryable — replanning can't create budget.
   // Reserved ATOMICALLY (see PipelineCtx.reserveNodes): the old check compared against
@@ -674,7 +695,8 @@ export async function createChildren(node: TaskNode, specs: { title: string; dep
         title: c.title,
         // Children inherit a COMPOSED goal. A bare title strips all parent context and the
         // child then replans the wrong thing from nothing.
-        goal: `${node.goal}\n> 上级方案要点: ${(node.plan.keyPoints || node.plan.solution).slice(0, 500)}\n> 本子任务: ${c.title}`,
+        goal: `${node.goal}\n> 上级方案要点: ${(node.plan.keyPoints || node.plan.solution).slice(0, 500)}\n> 本子任务: ${c.title}`
+          + (goalNote ? `\n> ${goalNote.slice(0, 1000)}` : ''),
         parentId: node.id,
         deps,
         depth: node.depth + 1,
@@ -1280,9 +1302,81 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     }
     node.iteration.integration++
     if (node.iteration.integration >= caps.maxIterations) {
+      // 回到 decompose 修订 (spec §4.1) — the LAST thing tried before blocking, exactly once.
+      if (await reviseDecomposition(node, rec, ctx)) return
       await blockWithReason(node, `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx, 'rework')
       return
     }
     feedback = rec.synthesized.blockingSummary
   }
+}
+
+/**
+ * spec §4.1: `INTEGRATION_ACCEPT ──fail──▶ (回到 decompose 修订)`.
+ *
+ * The edge existed in the diagram and nowhere in the code. `stepIntegrate`'s loop re-ran the
+ * SAME roundtable over the SAME children with the same evidence — `integratePrompt` reads only
+ * the parent goal and each child's execStatus, none of which changes between rounds — so the
+ * only variable was the feedback line. It burned `maxIterations` real roundtables and blocked.
+ * Every other fail edge in that diagram re-runs the phase that PRODUCED the thing being judged
+ * (PLAN_REVIEW→PLANNING rewrites the plan, ACCEPTANCE→REWORK re-runs the executor); this one
+ * alone changed nothing.
+ *
+ * Runs at the cap rather than every round, and at most once per node — see TaskNode.revised
+ * for why that bound is the whole cost argument. Returns true when the node has been given a
+ * corrective subtree and now waits on it; false means "nothing to try, block as before".
+ */
+async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: PipelineCtx): Promise<boolean> {
+  if (node.revised === true) return false
+  // Proposals come only from verdicts that FAILED — parseVerdict drops `remedy` on a pass —
+  // and are deduped by title across roles. Exact-title agreement between roles is NOT
+  // required: with the common single-role roster it would never fire, which would make the
+  // whole feature dead code, and a corrective task nobody else named is not thereby wrong.
+  const seen = new Set<string>()
+  const specs: { title: string; deps: string[] }[] = []
+  for (const v of rec.verdicts) {
+    for (const c of v.remedy ?? []) {
+      if (seen.has(c.title)) continue
+      seen.add(c.title)
+      specs.push(c)
+      if (specs.length >= MAX_REMEDY_CHILDREN) break
+    }
+    if (specs.length >= MAX_REMEDY_CHILDREN) break
+  }
+  if (specs.length === 0) return false
+  // The depth valve, same rule and same announcement as stepStart and growTree. Reaching it
+  // through a corrective decomposition does not make it a different event.
+  if (node.depth + 1 > ctx.config.caps.maxDepth) {
+    notifyValve(node, `补救拆分被深度上限 ${ctx.config.caps.maxDepth} 挡下,该节点将直接阻断`, 'cap-depth', ctx)
+    return false
+  }
+  // CHAINED, not parallel. These siblings are all closing the same integration gap, so they
+  // touch the same files; spec §16 calls worktree merge conflict the run's biggest risk and
+  // names dependency edges as the mitigation. A remedy that already declared deps keeps them.
+  const chained = specs.map((c, i) => ({
+    title: c.title,
+    deps: c.deps.length > 0 ? c.deps : i === 0 ? [] : [specs[i - 1].title],
+  }))
+  // Carry WHY each child exists. createChildren composes a child goal from the parent goal
+  // plus the parent's plan keyPoints — and that plan is the one the roundtable just refused,
+  // so without this the corrective child replans against the very text that failed, knowing
+  // only a ≤200-char title.
+  const why = rec.synthesized.blockingSummary
+  const res = await createChildren(node, chained, ctx, `集成验收未通过,本子任务是为解决以下问题而追加的:\n${why}`)
+  if (!res.ok) {
+    if (res.cap) notifyValve(node, `补救拆分被节点上限挡下: ${res.reason}`, 'cap-nodes', ctx)
+    return false
+  }
+  node.revised = true
+  // Recorded where the user will actually look. §11's 不静默截断 applies: a round that
+  // silently grew the tree by three nodes reads, in the detail view, as one more identical
+  // FAIL — and the tree gaining rows with no explanation is the mirror image of the flattening
+  // that stepStart already announces.
+  node.execStatus = capText(
+    `${node.execStatus}${node.execStatus ? '\n' : ''}(注:集成验收未通过,已追加补救子任务 ${chained.map(c => c.title).join('、')};通过后将重新集成验收)`,
+    MAX_FIELD_CHARS,
+  )
+  notifyValve(node, `集成验收未通过,已追加 ${chained.length} 个补救子任务并重新等待子任务完成`, 'rework', ctx)
+  node.kind = 'decompose'
+  return await commit(node, 'WAITING_CHILDREN', ctx)
 }

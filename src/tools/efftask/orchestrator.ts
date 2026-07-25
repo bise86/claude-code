@@ -195,7 +195,24 @@ export class EffTaskOrchestrator {
         // Hanging it off .then(onFulfilled) alone would skip it exactly when a step fails,
         // which is the one situation the stall guard could ever be needed for.
         if (n.status !== before) { stalls.clear(n.id); return }
-        if (stalls.note(n.id, n.status) >= 2) {
+        // The fingerprint is status PLUS child count, not status alone.
+        //
+        // 补救拆分 (spec §4.1) is the first path that legitimately re-enters a node in the
+        // status it was picked in: a decompose node picked at WAITING_CHILDREN grows
+        // corrective children and returns to WAITING_CHILDREN. Keyed on status alone, the
+        // counter survives across rounds — nothing clears it while the children run — so a
+        // SECOND such return force-BLOCKED the node with 「节点未能推进(状态未变化)」: a
+        // reason unrelated to what happened, on a node that had just grown a subtree. That
+        // block sets neither `interrupted` nor `capBlocked`, so no resume path can reopen it;
+        // on root it becomes the run's final word to the user.
+        //
+        // NOT REACHABLE TODAY, and not covered — stated plainly rather than implied. A
+        // revision happens at most once per node (TaskNode.revised), so the count reaches 1
+        // and never 2, and a mutation reverting this line leaves the whole suite green. It is
+        // kept because the ONLY thing making it unreachable is that once-per-node bound, which
+        // is a policy knob someone could plausibly relax to "allow two"; leaving a landmine
+        // under a knob is worse than a one-line fingerprint. Do not read it as tested.
+        if (stalls.note(n.id, `${n.status}:${n.childIds.length}`) >= 2) {
           n.status = 'BLOCKED'
           n.blockedReason = n.blockedReason || '节点未能推进(状态未变化),已阻断以避免空转'
           // Mark it interrupted when the run is aborting, or resume refuses to reopen it.

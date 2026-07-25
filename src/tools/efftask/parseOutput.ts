@@ -285,7 +285,47 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
     ? (obj.blocking as unknown[]).map(b => (typeof b === 'string' ? b : '')).filter(Boolean)
     : []
   const blocking = capBlockingList(rawBlocking)
-  return { role, pass: obj.pass === true && blocking.length === 0, blocking, comments: str(obj.comments) }
+  const pass = obj.pass === true && blocking.length === 0
+  return {
+    role, pass, blocking, comments: str(obj.comments),
+    // 补救子任务 (spec §4.1). Read from the SAME tag-verified object as the verdict itself,
+    // which is exactly what makes it safe: `obj` came from a pick that required this call's
+    // unguessable tag, so a `remedy` planted in the quoted evidence is unreachable here.
+    // Dropped entirely on a PASS — a reviewer that approved the work has nothing to remedy,
+    // and honouring one would let a passing verdict grow the tree.
+    ...(pass ? {} : { remedy: parseRemedy(obj) }),
+  }
+}
+
+/** Corrective children ONE reviewer may propose. Deliberately far below MAX_NEW_CHILDREN. */
+export const MAX_REMEDY_CHILDREN = 3
+
+/**
+ * 补救子任务, shape-checked.
+ *
+ * Capped at 3 rather than the 20 `newChildren` allows, because these siblings are by
+ * definition all closing the SAME integration gap — so they touch the same files, and spec
+ * §16 names worktree merge conflict as the run's single biggest risk. Three is enough to say
+ * "the gap has a few parts" and small enough that the caller can chain them into a line.
+ *
+ * No `parent` field, unlike NewChildSpec: these attach to the node being integrated and
+ * nowhere else. Letting a reviewer name an arbitrary target would bypass growTree's
+ * safe-target rules, which exist because grafting onto a CREATED/READY node silently
+ * overwrites its own plan and execute phases.
+ */
+export function parseRemedy(o: Record<string, unknown>): { title: string; deps: string[] }[] {
+  const raw = o.remedy
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
+    .slice(0, MAX_REMEDY_CHILDREN)
+    .map(c => ({
+      title: typeof c.title === 'string' ? capText(c.title.trim(), 200) : '',
+      deps: Array.isArray(c.deps)
+        ? c.deps.filter((d): d is string => typeof d === 'string').slice(0, MAX_REMEDY_CHILDREN).map(d => capText(d, 200))
+        : [],
+    }))
+    .filter(c => c.title.length > 0)
 }
 
 export interface NewChildSpec { parent?: string; title: string; deps: string[] }

@@ -338,3 +338,50 @@ describe('spec §17.2:手工写进 node.md 的 EXECUTED 必须能重新排队', 
     expect(orch.nodes().find(n => n.id === 'root')!.status).toBe('ACCEPTED')
   })
 })
+
+describe('spec §4.1 补救拆分:必须在真实调度器下活下来,不能被"空转"闸门打死', () => {
+  it('集成验收连续失败 → 补救拆分 → 子任务跑完 → 重新集成验收 → 完成', async () => {
+    // 这条用例只能在 orchestrator 级别写。缺陷活在 orchestrator.launch 里:它在派工前记下
+    // `before = n.status`,step 结束后状态没变就给"空转"计数 +1,累计 2 次强制 BLOCKED。
+    // 补救拆分的节点是以 WAITING_CHILDREN 被选中、又回到 WAITING_CHILDREN 的,而计数器
+    // 在子节点跑的期间不会被清 —— 于是第二次修订必被打死,理由是一句和实情无关的
+    // 「节点未能推进(状态未变化)」,而且既不设 interrupted 也不设 capBlocked,任何
+    // resume 路径都打不开它。root 走这条路时,那就是整个 run 给用户的最终交代。
+    //
+    // 用 stepIntegrate 手工连调两次(pipeline.test.ts 的写法)会完全绕过这个闸门:全绿,
+    // 而真实 run 里第二轮就死。
+    let integrations = 0
+    const runAgent = (async (req: { phase: string; prompt: string }) => {
+      const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      if (req.phase === 'plan') {
+        // root 先拆一个子任务;补救出来的子节点自己是可执行叶子。
+        return `\`\`\`${tag}\n${req.prompt.includes('补救') || req.prompt.includes('AA')
+          ? EXECUTABLE_PLAN
+          : '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a","children":[{"title":"AA","deps":[]}]}'}\n\`\`\``
+      }
+      if (req.phase === 'execute') return `\`\`\`${tag}\n{"execStatus":"改完并通过测试"}\n\`\`\``
+      // 集成验收:前 3 次(maxIterations)全否,并给出补救子任务;之后放行。
+      const isIntegration = req.prompt.includes('子任务结果')
+      if (isIntegration) {
+        integrations++
+        if (integrations <= 3) {
+          return `\`\`\`${tag}\n{"pass":false,"blocking":["缺少回滚"],"comments":"","remedy":[{"title":"补回滚脚本","deps":[]}]}\n\`\`\``
+        }
+      }
+      return `\`\`\`${tag}\n{"pass":true,"blocking":[],"comments":"ok"}\n\`\`\``
+    }) as unknown as RunAgentFn
+
+    const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
+    const out = await orch.run()
+    const rootNode = orch.nodes().find(n => n.id === 'root')!
+    // 不管最终是完成还是阻断,都绝不能是"空转"那句话 —— 那是这个特性会踩到的那颗雷。
+    expect(rootNode.blockedReason).not.toContain('未能推进')
+    expect(rootNode.blockedReason).not.toContain('空转')
+    // 补救子任务真的被建出来并跑完了。
+    const remedyNode = orch.nodes().find(n => n.title === '补回滚脚本')
+    expect(remedyNode).toBeDefined()
+    expect(remedyNode!.status).toBe('ACCEPTED')
+    expect(rootNode.revised).toBe(true)
+    expect(out.status).toBe('completed')
+  })
+})

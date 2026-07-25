@@ -52,6 +52,9 @@ const HOSTILE: unknown[] = [
   [{ round: 1, verdicts: [{ role: 'a' }] }],
   [{ round: 1, verdicts: [{ role: 'a', blocking: 'not an array' }] }],
   [{ round: 1, verdicts: [{ role: 'a', blocking: ['x'], comments: 5 }] }],
+  // 补救拆分 proposals ride on a verdict, so a hand-edited node.md can carry any shape here.
+  [{ round: 1, verdicts: [{ role: 'a', blocking: ['x'], comments: 'c', remedy: 'nope' }] }],
+  [{ round: 1, verdicts: [{ role: 'a', blocking: ['x'], comments: 'c', remedy: [{ title: 5 }] }] }],
   [{ round: 1, synthesized: 'nope' }],
   { plan: { rationale: 90 } },
   { plan: { role: 'r', score: -50, rationale: [] } },
@@ -96,6 +99,9 @@ function richNode(): TaskNode {
   n.mergeConflict = true
   n.capBlocked = true
   n.capCategory = 'rework'
+  // 补救拆分 already used once — the flag that stops it happening twice, which is the bound
+  // the whole cost argument for that feature rests on.
+  n.revised = true
   n.confirmedDraft = { children: [{ title: '甲', deps: [] }] }
   n.worktree = { branch: 'b', path: '/wt/root' }
   n.startedAt = NOW

@@ -36,6 +36,28 @@ export interface Verdict {
    * reported every deadline as 角色调用连续失败 and prescribed the wrong fix.
    */
   timeout?: boolean
+  /**
+   * 集成验收不通过时,这位角色提出的**补救子任务** —— spec §4.1 的
+   * `INTEGRATION_ACCEPT ──fail──▶ (回到 decompose 修订)`。
+   *
+   * Carried on the VERDICT rather than fetched with a separate plan call, and that placement
+   * IS the design. The obvious alternative — ask a plan role for a corrective decomposition
+   * after the roundtable rejects — was reviewed and rejected on four counts, every one of
+   * which this placement removes for free:
+   *   - it costs no extra model call;
+   *   - it inherits parseVerdict's tag-required pick, so a `newChildren` planted in a node's
+   *     execStatus (authored by the only agent that holds write tools, and quoted into this
+   *     very prompt as evidence) cannot graft nodes onto the tree;
+   *   - the integration roundtable already runs with `cwd` = the integration worktree, so a
+   *     proposal comes from a role that can actually READ the run's output — a fresh plan
+   *     call would have run in the user's checkout, which under isolation contains none of it;
+   *   - a protocol failure (no tagged block) or an unreachable provider yields no remedy at
+   *     all, so a corrective decomposition can never be triggered by a malformed reply —
+   *     and a malformed reply is precisely the case the plain re-review loop is the cure for.
+   *
+   * Only meaningful on a FAILING verdict: a reviewer that passed has nothing to remedy.
+   */
+  remedy?: { title: string; deps: string[] }[]
 }
 export interface RoundtableRecord { round: number; verdicts: Verdict[]; synthesized: { pass: boolean; blockingSummary: string } }
 export interface ScoreRecord { role: string; score: number; rationale: string }
@@ -122,6 +144,21 @@ export interface TaskNode {
   acceptLog: RoundtableRecord[]
   score: { plan?: ScoreRecord; exec?: ScoreRecord }
   worktree?: { branch: string; path: string }
+  /**
+   * 这个节点已经做过一次「集成验收失败 → 补救拆分」(spec §4.1),不会再做第二次。
+   *
+   * ONCE per node, and only at the moment it would otherwise BLOCK — not once per round.
+   * The difference is the whole cost argument. Revising on every failed round lets each
+   * corrective child bring its OWN fresh iteration budget and its own subtree, so
+   * `maxIterations` stops bounding anything and the only remaining ceiling is `maxNodes`:
+   * a single root-level integration failure was measured to reach ~2300 agent calls that
+   * way, against 2–6 for the plain re-review loop. Bounded here at one revision per
+   * decompose node, the whole feature costs at most one extra subtree per node, and it
+   * converts a terminal state into a recovery rather than taxing every round.
+   *
+   * Persisted (serializeNode spreads the node), so a crash mid-revision cannot buy a second.
+   */
+  revised?: boolean
   // Separate budgets. `acceptance` belongs to an executable node's accept loop and
   // `integration` to a decompose node's integrate loop; sharing one counter means a
   // resumed node could arrive at integration with its budget already spent elsewhere.
