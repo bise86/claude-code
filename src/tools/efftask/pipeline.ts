@@ -16,11 +16,33 @@ export interface PipelineCtx {
   onUpdate: () => void
 }
 
-async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineCtx): Promise<void> {
+/**
+ * Advance the node and make it durable. Returns false when the write failed — the caller
+ * must stop immediately.
+ *
+ * A persist failure cannot be ignored: the orchestrator schedules off in-memory state, so
+ * continuing would run work whose progress can never be recovered, and on-disk the node
+ * would keep a stale (often transient) status forever. We mark it BLOCKED in memory so the
+ * scheduler treats it as terminal rather than re-entering it every tick.
+ */
+async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineCtx): Promise<boolean> {
   node.status = status
   node.updatedAt = ctx.now()
-  await ctx.persist(node)
-  ctx.onUpdate()
+  try {
+    await ctx.persist(node)
+  } catch (e) {
+    node.status = 'BLOCKED'
+    node.blockedReason = `状态持久化失败: ${e instanceof Error ? e.message : String(e)}`
+    safeUpdate(ctx)
+    return false
+  }
+  safeUpdate(ctx)
+  return true
+}
+
+// A crashing renderer must never take the run down with it.
+function safeUpdate(ctx: PipelineCtx): void {
+  try { ctx.onUpdate() } catch { /* UI failure is not a run failure */ }
 }
 
 type PhaseResult = { ok: true; text: string } | { ok: false; reason: string }
@@ -42,6 +64,13 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promi
 async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx): Promise<void> {
   node.blockedReason = reason
   await commit(node, 'BLOCKED', ctx)
+}
+
+// True when a round failed only because reviewer CALLS failed, not because anyone judged
+// the work. Retrying the review is right; redoing the executor's work would be wrong.
+function isInfraOnlyFailure(rec: { verdicts: { pass: boolean; blocking: string[]; infra?: boolean }[] }): boolean {
+  const failing = rec.verdicts.filter(v => !v.pass || v.blocking.length > 0)
+  return failing.length > 0 && failing.every(v => v.infra === true)
 }
 
 // A node with deps must SEE what its dependencies produced, otherwise it replans from
@@ -105,16 +134,30 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string 
     `完成后输出:{ "execStatus":"做了什么、结果如何" }。` + answerRule(ANSWER_TAGS.exec)
   )
 }
+// Blank fields must READ as blank. Interpolating an empty acceptance/execStatus renders
+// "验收点:\n执行状态:" — two empty slots a reviewer can wave through as satisfied.
 function acceptPrompt(node: TaskNode): string {
-  return `请验收执行结果是否达成验收点。验收点:${node.plan.acceptance}\n执行状态:${node.execStatus}\n输出:{ "pass":boolean, "blocking":string[], "comments":string }。` + answerRule(ANSWER_TAGS.verdict)
+  return (
+    `请验收执行结果是否达成验收点。\n` +
+    `验收点:${node.plan.acceptance || '(本节点未定义验收点,请依据目标判断:' + ctxGoal(node) + ')'}\n` +
+    `执行状态:${node.execStatus || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
+    `输出:{ "pass":boolean, "blocking":string[], "comments":string }。` +
+    answerRule(ANSWER_TAGS.verdict)
+  )
 }
 // Integration acceptance judges CHILD evidence against the parent goal. acceptPrompt would
 // show only the parent's own execStatus — which for a decompose node is empty.
 function integratePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
+  // A child missing from the map is REPORTED, not filtered away: silently shrinking the
+  // evidence list would let a parent be accepted on the strength of the children that
+  // happen to still be there.
   const children = node.childIds
-    .map(id => ctx.byId.get(id))
-    .filter((c): c is TaskNode => c !== undefined)
-    .map(c => `### ${c.title}\n- 状态: ${c.status}\n- 执行状态: ${c.execStatus || '(无)'}\n- 验收点: ${c.plan.acceptance || '(无)'}`)
+    .map(id => {
+      const c = ctx.byId.get(id)
+      return c
+        ? `### ${c.title}\n- 状态: ${c.status}\n- 执行状态: ${c.execStatus || '(无)'}\n- 验收点: ${c.plan.acceptance || '(无)'}`
+        : `### ${id}\n- 状态: (节点缺失,无法核实其结果)`
+    })
     .join('\n')
   return (
     `请验收"全部子任务的结果合起来是否达成本节点目标"。\n` +
@@ -126,11 +169,20 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): strin
   )
 }
 
+// P1 runs a single planner/executor even if several are configured; only review and
+// accept fan out into a roundtable. Extra plan/execute roles are deliberately ignored.
 function firstRole(node: TaskNode, phase: 'plan' | 'execute') {
   return node.phaseRoles[phase][0] ?? null
 }
 
+// Re-entering a finished node would append a second verdict log and could flip a BLOCKED
+// node to ACCEPTED. Terminal means terminal.
+function isFinished(node: TaskNode): boolean {
+  return node.status === 'ACCEPTED' || node.status === 'BLOCKED'
+}
+
 export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
   let feedback = ''
@@ -138,16 +190,20 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
   // loop, so replanning is bounded by the SAME maxIterations budget — a cycle costs a
   // retry, it does not instantly kill the run.
   for (;;) {
-    await commit(node, 'PLANNING', ctx)
+    if (!(await commit(node, 'PLANNING', ctx))) return
     const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, ctx, feedback), signal: ctx.signal })
     if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
     const parsed = parsePlanOutput(res.text)
     node.kind = parsed.kind
     node.plan = parsed.plan
     const lastChildren = parsed.children
-    await commit(node, 'PLAN_REVIEW', ctx)
+    if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     const rec = await runRoundtable({ phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1, system: 'review', prompt: reviewPrompt(node), runAgent: ctx.runAgent, signal: ctx.signal })
     node.reviewLog.push(rec)
+    // runRoundtable resolves even when the run was cancelled mid-flight (it collects
+    // whatever settled). Without this the node would go on to commit READY/WAITING_CHILDREN
+    // after the user already cancelled.
+    if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (!rec.synthesized.pass) {
       node.iteration.planReview++
       feedback = rec.synthesized.blockingSummary
@@ -164,9 +220,9 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     // the children the model asked for — fold their titles into the solution so the work
     // survives as an in-node checklist.
     if (node.depth + 1 > caps.maxDepth) {
-      if (lastChildren.length > 0) {
-        node.plan.solution += `\n\n已达最大深度,不得再拆分,请在本节点内依次完成:${lastChildren.map(c => c.title).join('、')}`
-      }
+      // parsePlanOutput only reports 'decompose' when it parsed at least one child, so
+      // lastChildren is non-empty here.
+      node.plan.solution += `\n\n已达最大深度,不得再拆分,请在本节点内依次完成:${lastChildren.map(c => c.title).join('、')}`
       node.kind = 'executable'
       await commit(node, 'READY', ctx)
       return
@@ -174,12 +230,13 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
 
     const created = await createChildren(node, lastChildren, ctx)
     if (created.ok) { await commit(node, 'WAITING_CHILDREN', ctx); return }
-    // Node-count cap is fatal (retrying can't make room); a dependency cycle is not.
+    // Node-count cap and persist failures are fatal (retrying can't make room or fix the
+    // disk); a dependency cycle is a planning mistake the model can correct.
     if (!created.retryable) { await blockWithReason(node, created.reason, ctx); return }
     node.iteration.planReview++
     feedback = created.reason
     if (node.iteration.planReview >= caps.maxIterations) {
-      await blockWithReason(node, `评审迭代超限(${caps.maxIterations}): ${created.reason}`, ctx)
+      await blockWithReason(node, `拆分迭代超限(${caps.maxIterations}): ${created.reason}`, ctx)
       return
     }
   }
@@ -193,16 +250,25 @@ async function createChildren(node: TaskNode, specs: { title: string; deps: stri
   if (ctx.byId.size + specs.length > ctx.config.caps.maxNodes) {
     return { ok: false, reason: '节点数超过上限', retryable: false }
   }
-  // child.deps reference SIBLING TITLES; map each to the sibling's id (drop unknown titles).
-  // NOTE: duplicate child titles bind dep-by-title to the LAST duplicate (minor, accepted).
-  const titleToId = new Map<string, string>()
-  specs.forEach((c, i) => titleToId.set(c.title, childId(node.id, i + 1, c.title)))
+  // Sibling deps are written as TITLES, so duplicate titles make every reference to them
+  // ambiguous — including "does this node depend on itself?". Don't guess: hand it back as
+  // a planning error the model can fix, the same way a dependency cycle is handled.
+  const titles = specs.map(c => c.title)
+  if (new Set(titles).size !== titles.length) {
+    return { ok: false, reason: '子任务标题重复,依赖只能按标题引用,请给出互不相同的子任务标题', retryable: true }
+  }
+  // Map each dep title to the sibling's INDEX; resolving by index (not id) makes the
+  // self-reference check exact.
+  const titleToIndex = new Map<string, number>()
+  specs.forEach((c, i) => titleToIndex.set(c.title, i))
   // Build the group in a LOCAL array first. Nothing touches ctx.byId / node.childIds until
   // the cycle guard passes, so a rejected group leaves ZERO partial state behind.
   const created: TaskNode[] = specs.map((c, i) => {
     const id = childId(node.id, i + 1, c.title)
-    // map sibling titles → ids; drop unknown titles AND any self-reference (child depping on itself).
-    const deps = c.deps.map(t => titleToId.get(t)).filter((x): x is string => !!x && x !== id)
+    const deps = c.deps
+      .map(t => titleToIndex.get(t))
+      .filter((di): di is number => di !== undefined && di !== i) // unknown title / self-reference
+      .map(di => childId(node.id, di + 1, specs[di].title))
     return createNode({
       id,
       title: c.title,
@@ -221,59 +287,94 @@ async function createChildren(node: TaskNode, specs: { title: string; deps: stri
   if (hasCycle(created)) {
     return { ok: false, reason: '子任务依赖成环,请重新给出无环的子任务依赖', retryable: true }
   }
+  // Persist the whole group BEFORE attaching any of it. Attaching first and writing inside
+  // the loop meant a failure on child 2 of 3 left a half-attached subtree in ctx.byId and
+  // node.childIds — the exact partial state the local-array staging above exists to prevent.
+  for (const child of created) {
+    try {
+      await ctx.persist(child)
+    } catch (e) {
+      return { ok: false, reason: `子节点持久化失败: ${e instanceof Error ? e.message : String(e)}`, retryable: false }
+    }
+  }
   for (const child of created) {
     ctx.byId.set(child.id, child)
     node.childIds.push(child.id)
-    await ctx.persist(child)
   }
-  await ctx.persist(node)
-  ctx.onUpdate()
+  // The parent's own durable point is the commit(WAITING_CHILDREN) that follows.
+  safeUpdate(ctx)
   return { ok: true }
 }
 
 export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
   let feedback = '' // previous round's acceptance blockingSummary; drives the REWORK prompt
   for (;;) {
-    await commit(node, 'EXECUTING', ctx)
+    if (!(await commit(node, 'EXECUTING', ctx))) return
     // node.execStatus still holds the PREVIOUS round's result here (it's overwritten below),
     // which is exactly what executePrompt renders on rework.
     const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, feedback), cwd: node.worktree?.path, signal: ctx.signal })
     if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
-    node.execStatus = parseExecOutput(res.text).execStatus
-    await commit(node, 'ACCEPTANCE', ctx)
-    const rec = await runRoundtable({ phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1, system: 'accept', prompt: acceptPrompt(node), runAgent: ctx.runAgent, signal: ctx.signal })
-    node.acceptLog.push(rec)
-    if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
-    node.iteration.acceptance++
-    if (node.iteration.acceptance >= caps.maxIterations) {
-      await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
-      return
+    const reported = parseExecOutput(res.text).execStatus.trim()
+    // An executor that reports NOTHING has evidenced nothing. Sending a blank execStatus
+    // into acceptance asks the reviewers to bless an empty slot — the one way a node can
+    // reach ACCEPTED without any work having happened. Treat it as a failed round.
+    if (reported === '') {
+      node.iteration.acceptance++
+      if (node.iteration.acceptance >= caps.maxIterations) {
+        await blockWithReason(node, `执行阶段连续 ${caps.maxIterations} 次未报告任何产出`, ctx)
+        return
+      }
+      feedback = '上一轮执行没有报告任何产出。请真正执行任务,并在 execStatus 里写明具体做了什么、结果如何。'
+      if (!(await commit(node, 'REWORK', ctx))) return
+      continue
     }
-    feedback = rec.synthesized.blockingSummary
-    await commit(node, 'REWORK', ctx)
+    node.execStatus = reported
+
+    // Acceptance loop. An infra-only failure (the reviewer CALL failed) retries just the
+    // roundtable — redoing the executor's real work over a flaky connection would be wrong.
+    for (;;) {
+      if (!(await commit(node, 'ACCEPTANCE', ctx))) return
+      const rec = await runRoundtable({ phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1, system: 'accept', prompt: acceptPrompt(node), runAgent: ctx.runAgent, signal: ctx.signal })
+      node.acceptLog.push(rec)
+      if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
+      if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
+      node.iteration.acceptance++
+      if (node.iteration.acceptance >= caps.maxIterations) {
+        await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
+        return
+      }
+      if (isInfraOnlyFailure(rec)) continue // retry the review only
+      feedback = rec.synthesized.blockingSummary
+      break // genuine rejection → rework the execution
+    }
+    if (!(await commit(node, 'REWORK', ctx))) return
   }
 }
 
 export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
   let feedback = ''
   // Same bounded-retry shape as stepExecute: a single failed integration verdict must not
-  // be terminal (the roundtable may simply have misread the evidence).
+  // be terminal (the roundtable may simply have misread the evidence). Uses its OWN budget
+  // so a node that spent `acceptance` elsewhere still gets a full integration allowance.
   for (;;) {
-    await commit(node, 'INTEGRATION_ACCEPT', ctx)
+    if (!(await commit(node, 'INTEGRATION_ACCEPT', ctx))) return
     const rec = await runRoundtable({
       phase: 'accept', node, roles: node.phaseRoles.accept,
-      round: node.iteration.acceptance + 1, system: 'integrate',
+      round: node.iteration.integration + 1, system: 'integrate',
       prompt: integratePrompt(node, ctx, feedback), // child evidence, NOT acceptPrompt
       runAgent: ctx.runAgent, signal: ctx.signal,
     })
     node.acceptLog.push(rec)
+    if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
-    node.iteration.acceptance++
-    if (node.iteration.acceptance >= caps.maxIterations) {
+    node.iteration.integration++
+    if (node.iteration.integration >= caps.maxIterations) {
       await blockWithReason(node, `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
       return
     }

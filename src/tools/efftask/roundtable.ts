@@ -61,7 +61,9 @@ export async function runRoundtable(args: {
     const roleName = role ? role.roleName : 'main'
     if (res.status === 'fulfilled') return parseVerdict(res.value, roleName)
     const reason = res.reason instanceof Error ? res.reason.message : String(res.reason)
-    return { role: roleName, pass: false, blocking: ['角色调用失败: ' + reason], comments: '' }
+    // infra: the reviewer never judged anything, the CALL failed. Flagged so the caller
+    // retries the review instead of reading it as a rejection and redoing real work.
+    return { role: roleName, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true }
   })
   return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts) }
 }

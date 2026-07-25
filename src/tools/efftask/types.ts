@@ -11,7 +11,12 @@ export type NodeStatus =
 
 export interface RoleBinding { roleName: string; model?: string }
 export interface NodePlan { solution: string; keyPoints: string; risks: string; acceptance: string }
-export interface Verdict { role: string; pass: boolean; blocking: string[]; comments: string }
+/**
+ * `infra: true` marks a verdict the reviewer never actually rendered — the call itself
+ * failed (network, provider error). It is NOT a judgement about the work, so a caller
+ * must retry the review rather than treat it as a rejection and redo the executor's work.
+ */
+export interface Verdict { role: string; pass: boolean; blocking: string[]; comments: string; infra?: boolean }
 export interface RoundtableRecord { round: number; verdicts: Verdict[]; synthesized: { pass: boolean; blockingSummary: string } }
 export interface ScoreRecord { role: string; score: number; rationale: string }
 
@@ -34,7 +39,10 @@ export interface TaskNode {
   acceptLog: RoundtableRecord[]
   score: { plan?: ScoreRecord; exec?: ScoreRecord }
   worktree?: { branch: string; path: string }
-  iteration: { planReview: number; acceptance: number }
+  // Separate budgets. `acceptance` belongs to an executable node's accept loop and
+  // `integration` to a decompose node's integrate loop; sharing one counter means a
+  // resumed node could arrive at integration with its budget already spent elsewhere.
+  iteration: { planReview: number; acceptance: number; integration: number }
   depth: number
   createdAt: string
   updatedAt: string
@@ -91,7 +99,7 @@ export function createNode(args: {
     reviewLog: [],
     acceptLog: [],
     score: {},
-    iteration: { planReview: 0, acceptance: 0 },
+    iteration: { planReview: 0, acceptance: 0, integration: 0 },
     depth: args.depth,
     createdAt: args.now,
     updatedAt: args.now,

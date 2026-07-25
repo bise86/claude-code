@@ -239,9 +239,179 @@ describe('pipeline', () => {
     const ctx = ctxFor([n, child], runAgent)
     await stepIntegrate(n, ctx)
     expect(n.status).toBe('BLOCKED')
-    expect(n.iteration.acceptance).toBe(DEFAULT_CAPS.maxIterations) // retried, not one-shot
+    // Integration spends its OWN budget, not the executable-path acceptance budget.
+    expect(n.iteration.integration).toBe(DEFAULT_CAPS.maxIterations) // retried, not one-shot
+    expect(n.iteration.acceptance).toBe(0)
     expect(n.acceptLog).toHaveLength(DEFAULT_CAPS.maxIterations)
     expect(n.blockedReason).toContain('集成验收迭代超限')
     expect(prompts[1]).toContain('子结果未达成父目标') // failure feedback appended on retry
+  })
+
+  // ---- regression tests for the acceptance-review findings ----
+
+  it('an executor that reports nothing is reworked, never accepted', async () => {
+    // The worst outcome this module can produce: ACCEPTED with no evidence of work.
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    let accepts = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```exec\n{"execStatus":"   "}\n```'
+      accepts++
+      return '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const ctx = ctxFor([n], runAgent)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(accepts).toBe(0) // acceptance is never even asked to bless an empty result
+    expect(n.blockedReason).toContain('未报告任何产出')
+  })
+
+  it('the accept prompt never shows a blank acceptance point or a blank status', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      prompts.push(req.prompt)
+      return req.phase === 'execute'
+        ? '```exec\n{"execStatus":"做了一点事"}\n```'
+        : '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepExecute(n, ctxFor([n], runAgent))
+    const acceptPromptText = prompts[1]
+    expect(acceptPromptText).toContain('本节点未定义验收点') // blank reads as blank, not as satisfied
+  })
+
+  it('aborting during the acceptance roundtable blocks instead of accepting', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    const ac = new AbortController()
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```exec\n{"execStatus":"改了文件"}\n```'
+      ac.abort() // cancelled while the reviewers were out
+      return '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const ctx: PipelineCtx = { ...ctxFor([n], runAgent), signal: ac.signal }
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('已中断')
+    expect(n.execStatus).toBe('改了文件') // evidence of real work is preserved
+  })
+
+  it('a reviewer whose CALL fails retries the review, it does not redo the work', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    let executes = 0
+    let accepts = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') { executes++; return '```exec\n{"execStatus":"改了文件"}\n```' }
+      accepts++
+      if (accepts === 1) throw new Error('网络抖动')
+      return '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepExecute(n, ctxFor([n], runAgent))
+    expect(n.status).toBe('ACCEPTED')
+    expect(executes).toBe(1) // the executor's real work was NOT repeated
+    expect(accepts).toBe(2)
+  })
+
+  it('a failed persist stops the node instead of running on unrecoverable state', async () => {
+    const n = root()
+    const runAgent: RunAgentFn = async () => '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+    let writes = 0
+    const ctx: PipelineCtx = {
+      ...ctxFor([n], runAgent),
+      persist: async () => { writes++; if (writes >= 2) throw new Error('ENOSPC') },
+    }
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('状态持久化失败')
+  })
+
+  it('a persist failure while creating children attaches none of them', async () => {
+    const n = root()
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'plan'
+        ? '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":[]},{"title":"BB","deps":[]}]}\n```'
+        : '```verdict\n{"pass":true,"blocking":[],"comments":""}\n```'
+    const ctx: PipelineCtx = {
+      ...ctxFor([n], runAgent),
+      persist: async (node) => { if (node.id.includes('02-bb')) throw new Error('EACCES') },
+    }
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.childIds).toEqual([]) // no half-attached subtree
+    expect(ctx.byId.size).toBe(1)
+  })
+
+  it('a terminal node is never re-entered', async () => {
+    const n = root(); n.status = 'ACCEPTED'; n.kind = 'executable'
+    let calls = 0
+    const runAgent: RunAgentFn = async () => { calls++; return '```exec\n{"execStatus":"x"}\n```' }
+    await stepExecute(n, ctxFor([n], runAgent))
+    await stepStart(n, ctxFor([n], runAgent))
+    await stepIntegrate(n, ctxFor([n], runAgent))
+    expect(calls).toBe(0)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.acceptLog).toHaveLength(0)
+  })
+
+  it('duplicate child titles are sent back as a planning error, never guessed at', async () => {
+    // deps are written as titles, so duplicates make every reference to them ambiguous.
+    const prompts: string[] = []
+    const n = root()
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return '```verdict\n{"pass":true,"blocking":[],"comments":""}\n```'
+      prompts.push(req.prompt)
+      return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":["AA"]},{"title":"AA","deps":[]}]}\n```'
+    }
+    const ctx = ctxFor([n], runAgent)
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(ctx.byId.size).toBe(1) // nothing attached
+    expect(n.childIds).toEqual([])
+    expect(prompts[1]).toContain('标题重复') // retried with actionable feedback first
+    expect(n.blockedReason).toContain('拆分迭代超限')
+  })
+
+  it('a child that names itself as a dependency has it dropped', async () => {
+    const n = root()
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'plan'
+        ? '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":["AA"]},{"title":"BB","deps":["AA"]}]}\n```'
+        : '```verdict\n{"pass":true,"blocking":[],"comments":""}\n```'
+    const ctx = ctxFor([n], runAgent)
+    await stepStart(n, ctx)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(ctx.byId.get('root/01-aa')!.deps).toEqual([]) // self-reference dropped
+    expect(ctx.byId.get('root/02-bb')!.deps).toEqual(['root/01-aa']) // real dep kept
+  })
+
+  it('every phase prompt demands its own answer tag', async () => {
+    const seen: Record<string, string> = {}
+    const runAgent: RunAgentFn = async req => {
+      seen[req.phase] = req.prompt
+      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+      if (req.phase === 'execute') return '```exec\n{"execStatus":"做完了"}\n```'
+      return '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    const ctx = ctxFor([n], runAgent)
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(seen.plan).toContain('```plan')
+    expect(seen.execute).toContain('```exec')
+    expect(seen.review).toContain('```verdict')
+    expect(seen.accept).toContain('```verdict')
+  })
+
+  it('a dissenting role blocks the round even when the others pass', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    n.phaseRoles.accept = [{ roleName: 'arch' }, { roleName: 'sec' }]
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```exec\n{"execStatus":"改了文件"}\n```'
+      return req.role?.roleName === 'sec'
+        ? '```verdict\n{"pass":false,"blocking":["注入风险"],"comments":""}\n```'
+        : '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepExecute(n, ctxFor([n], runAgent))
+    expect(n.status).toBe('BLOCKED')
+    expect(n.acceptLog[0].verdicts).toHaveLength(2)
+    expect(n.blockedReason).toContain('注入风险')
   })
 })
