@@ -3,3 +3,7 @@
 !.env.example
 node_modules
 .superpowers/
+
+# /et efficient-task-mode run trees. Every run writes a mirrored md tree here; it is
+# working state for the resume path, not something to commit.
+.claude/efftask/
