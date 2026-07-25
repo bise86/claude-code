@@ -1,7 +1,8 @@
 // src/tools/efftask/orchestrator.ts
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { createNode } from './types.js'
-import { advanceableKind, byIdMap, isTerminal } from './stateMachine.js'
+import { byIdMap, isTerminal } from './stateMachine.js'
+import { createStallTracker, pickBatch, type Advanceable } from './scheduler.js'
 import { stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 
@@ -100,92 +101,129 @@ export class EffTaskOrchestrator {
     }
   }
 
-  // A node under a BLOCKED ancestor can no longer contribute: its parent will never be
-  // accepted, so running it spends real model calls and mutates the repo for a result
-  // nothing will consume.
-  private hasBlockedAncestor(node: TaskNode): boolean {
-    const seen = new Set<string>()
-    let cur = node.parentId ? this.byId.get(node.parentId) : undefined
-    while (cur && !seen.has(cur.id)) {
-      if (cur.status === 'BLOCKED') return true
-      seen.add(cur.id)
-      cur = cur.parentId ? this.byId.get(cur.parentId) : undefined
-    }
-    return false
-  }
-
   async run(): Promise<{ status: 'completed' | 'blocked'; reason?: string }> {
-    // No-progress guard: if the same node is picked twice in a row in the same STATUS it
-    // did not move, and re-picking it forever would be a hot loop issuing real model calls.
-    // Deliberately excludes updatedAt: every commit refreshes it, so including it would make
-    // the fingerprint differ on every re-pick under a real clock and the guard would only
-    // ever fire under a frozen test clock — insurance that holds nowhere it matters.
-    // A node is picked at most once per status, and the one status that can repeat
-    // (WAITING_CHILDREN via the subtreeAlive path) always has another node picked in
-    // between, which resets lastPick — so this cannot false-positive on a healthy run.
-    let lastPick = ''
-    let stalls = 0
+    const stalls = createStallTracker()
+    /**
+     * node id → its pending task. Used ONLY for dedup: a queued-but-not-started execute is
+     * in here too, so pickBatch will not hand out the same node twice.
+     */
+    const inFlight = new Map<string, Promise<void>>()
+    /**
+     * Steps that have actually STARTED. The pool budget is charged against this, NOT against
+     * inFlight: a queued execute holds no resource, and charging it would let a tree with
+     * more ready executables than `parallelism` starve every other phase.
+     */
+    let running = 0
+    /**
+     * execute is STRICTLY serial in P2a. It is the only phase with write-capable tools, and
+     * two executors in one working tree overwrite each other's edits while BOTH report
+     * success to their own acceptance roundtables. Lifted only once every executable node
+     * has its own worktree (P2b).
+     *
+     * The step is STARTED inside the chain. Chaining an already-started promise
+     * (`chain.then(() => task)`) serialises only the waiting — measured peak 3.
+     */
+    let executeChain: Promise<void> = Promise.resolve()
+
+    const launch = (n: TaskNode, kind: Advanceable['kind']): Promise<void> => {
+      const before = n.status
+      const step = async (): Promise<void> => {
+        running++
+        try {
+          await this.runStep(n, kind) // never rejects — see runStep
+        } finally {
+          running--
+        }
+        // Bookkeeping runs on the failure path too, because runStep absorbs its own errors.
+        // Hanging it off .then(onFulfilled) alone would skip it exactly when a step fails,
+        // which is the one situation the stall guard could ever be needed for.
+        if (n.status !== before) { stalls.clear(n.id); return }
+        if (stalls.note(n.id, n.status) >= 2) {
+          n.status = 'BLOCKED'
+          n.blockedReason = n.blockedReason || '节点未能推进(状态未变化),已阻断以避免空转'
+          // Mark it interrupted when the run is aborting, or resume refuses to reopen it.
+          n.interrupted = this.signal.aborted
+          n.updatedAt = this.nowSafe()
+          await this.safePersist(n)
+          this.safeUpdate()
+        }
+      }
+      // `.then(step, step)` — the same handler on BOTH settle paths absorbs a rejection so
+      // one failure cannot poison every later link. A poisoned chain makes Promise.race
+      // resolve within a microtask forever: measured 200k iterations with a pending 30 ms
+      // timer never firing, i.e. the process hangs with no I/O and no timers.
+      const task = kind === 'execute' ? (executeChain = executeChain.then(step, step)) : step()
+      return task.finally(() => { inFlight.delete(n.id) })
+    }
+
     for (;;) {
       const root = this.byId.get('root')!
       // Completion wins over abort: a tree that finished before the signal fired IS done,
       // and reporting 'blocked' would contradict what was persisted.
-      if (root.status === 'ACCEPTED') return { status: 'completed' }
-      if (this.signal.aborted) { await this.propagateBlocked(true); return { status: 'blocked', reason: '已中断' } }
-      // pick the first advanceable node (serial). Deterministic order by id — a plain
-      // codepoint compare, NOT localeCompare (which is locale/ICU-dependent).
-      const ordered = [...this.byId.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-      let kind: ReturnType<typeof advanceableKind> = null
-      const next = ordered.find(n => {
-        if (this.hasBlockedAncestor(n)) return false
-        kind = advanceableKind(n, this.byId)
-        return kind !== null
-      })
-      if (!next) {
-        // deadlock: nothing advanceable and root not accepted. Surface WHY the tree is
-        // dead by propagating BLOCKED upward before returning.
+      if (root.status === 'ACCEPTED') { await this.settleAll(inFlight); return { status: 'completed' } }
+      if (this.signal.aborted) {
+        // Settle FIRST. propagateBlocked sweeps and returns; a step still running would
+        // commit AFTER the sweep, leaving a non-terminal node in a tree we already declared
+        // finished. (It also establishes propagateBlocked's live-iterator invariant.)
+        await this.settleAll(inFlight)
+        if (this.byId.get('root')!.status === 'ACCEPTED') return { status: 'completed' }
+        await this.propagateBlocked(true)
+        return { status: 'blocked', reason: '已中断' }
+      }
+
+      const budget = Math.max(1, this.cfg.parallelism) - running
+      // NO await between pickBatch and the dispatch loop — that is what makes the dependency
+      // check atomic (see pickBatch's contract).
+      const batch = pickBatch(this.nodes(), this.byId, new Set(inFlight.keys()), budget)
+      for (const { node, kind } of batch) inFlight.set(node.id, launch(node, kind))
+
+      if (inFlight.size === 0) {
+        // Nothing running and nothing pickable → the tree cannot move. Surface WHY by
+        // propagating BLOCKED upward before returning.
         await this.propagateBlocked(false)
         const reason = root.status === 'BLOCKED' ? (root.blockedReason || '根任务被阻断') : '存在无法推进的阻断节点'
         return { status: 'blocked', reason }
       }
-      const fingerprint = `${next.id}|${next.status}`
-      stalls = fingerprint === lastPick ? stalls + 1 : 0
-      lastPick = fingerprint
-      if (stalls >= 2) {
+      // Wake on the FIRST completion, then rescan and top the pool back up.
+      await Promise.race([...inFlight.values()]).catch(() => {})
+    }
+  }
+
+  private async settleAll(inFlight: Map<string, Promise<void>>): Promise<void> {
+    await Promise.allSettled([...inFlight.values()])
+  }
+
+  /**
+   * One advancement step. NEVER REJECTS: it absorbs its own errors and drives the node to a
+   * terminal state, exactly as the serial loop's try/catch did. A rejection escaping here
+   * would lose that terminal-drive AND poison the execute chain.
+   */
+  private async runStep(next: TaskNode, kind: Advanceable['kind']): Promise<void> {
+    const ctx = this.ctx()
+    try {
+      if (kind === 'start') await stepStart(next, ctx)
+      else if (kind === 'execute') await stepExecute(next, ctx)
+      else await stepIntegrate(next, ctx)
+    } catch (e) {
+      // A step should not normally throw (pipeline catches runAgent and persist errors).
+      // Reachable in practice via a transient deps.now() failure inside commit().
+      const message = e instanceof Error ? e.message : String(e)
+      // Do NOT clobber a parent whose subtree is still alive — BLOCKing it would strand
+      // children that are still advanceable.
+      const subtreeAlive =
+        next.status === 'WAITING_CHILDREN' &&
+        next.childIds.length > 0 &&
+        next.childIds.some(id => { const c = this.byId.get(id); return c !== undefined && !isTerminal(c.status) })
+      // Only record a reason when we actually block; otherwise a recovered node would carry
+      // a stale blockedReason into an ACCEPTED state.
+      if (!subtreeAlive) {
         next.status = 'BLOCKED'
-        next.blockedReason = next.blockedReason || '节点未能推进(状态未变化),已阻断以避免空转'
-        next.updatedAt = this.nowSafe()
-        await this.safePersist(next)
-        this.safeUpdate()
-        continue
+        next.blockedReason = message
+        next.interrupted = this.signal.aborted
       }
-      const ctx = this.ctx()
-      try {
-        if (kind === 'start') await stepStart(next, ctx)
-        else if (kind === 'execute') await stepExecute(next, ctx)
-        else if (kind === 'integrate') await stepIntegrate(next, ctx)
-        else throw new Error(`efftask: unhandled advance kind ${String(kind)}`)
-      } catch (e) {
-        // A step should not normally throw (pipeline catches runAgent and persist errors),
-        // but if one does, keep the run alive and drive this node to a terminal state.
-        // Reachable in practice only via a transient deps.now() failure inside commit().
-        const message = e instanceof Error ? e.message : String(e)
-        // Do NOT clobber a parent whose subtree is still alive — BLOCKing it would strand
-        // children that are still advanceable. Keep WAITING_CHILDREN only while at least
-        // one child is non-terminal; otherwise this node would be re-picked forever.
-        const subtreeAlive =
-          next.status === 'WAITING_CHILDREN' &&
-          next.childIds.length > 0 &&
-          next.childIds.some(id => { const c = this.byId.get(id); return c !== undefined && !isTerminal(c.status) })
-        // Only record a reason when we actually block; otherwise a recovered node would
-        // carry a stale blockedReason into an ACCEPTED state.
-        if (!subtreeAlive) {
-          next.status = 'BLOCKED'
-          next.blockedReason = message
-        }
-        next.updatedAt = this.nowSafe()
-        await this.safePersist(next)
-        this.safeUpdate()
-      }
+      next.updatedAt = this.nowSafe()
+      await this.safePersist(next)
+      this.safeUpdate()
     }
   }
 
@@ -193,6 +231,9 @@ export class EffTaskOrchestrator {
   // child, any BLOCKED dep, or any DANGLING dep becomes BLOCKED. Repeat until stable so
   // death propagates up the tree. `aborted` additionally sweeps every non-terminal node so
   // the final tree shows no phantom "running" rows after an interrupt.
+  // INVARIANT: every in-flight step must be settled before calling this. It awaits inside
+  // a LIVE `for (const n of this.byId.values())` iterator, so a concurrent createChildren
+  // inserting mid-sweep would be visited — or not — unpredictably.
   private async propagateBlocked(aborted: boolean): Promise<void> {
     if (aborted) {
       // Sweep on !isTerminal rather than a status whitelist: every non-terminal status
