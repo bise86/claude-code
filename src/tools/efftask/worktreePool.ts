@@ -254,6 +254,37 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       return { kept }
     },
 
+    /**
+     * Everything the user needs to find their work after the run — spec §8's 收口.
+     *
+     * Without this the run ends having written every change to a branch the user is never
+     * told about, in worktrees they do not know exist. The work is preserved and invisible,
+     * which for them is indistinguishable from lost.
+     */
+    async handoff(nodes: TaskNode[]): Promise<{
+      branch: string
+      commits: number
+      kept: { path: string; why: string }[]
+      salvage: string[]
+    }> {
+      const count = await git(['rev-list', '--count', `HEAD..${intBranch}`], gitRoot)
+      const salv = await git(
+        ['for-each-ref', '--format=%(refname:short)', `refs/heads/efftask/${runId}/salvage`], gitRoot,
+      )
+      const kept: { path: string; why: string }[] = []
+      for (const n of nodes) {
+        if (!n.worktree) continue
+        const st = await git(['status', '--porcelain', '--ignored'], n.worktree.path)
+        if (st.code === 0) kept.push({ path: n.worktree.path, why: st.stdout.trim() ? '仍有未合入的内容' : '未回收' })
+      }
+      return {
+        branch: intBranch,
+        commits: Number.parseInt(count.stdout.trim(), 10) || 0,
+        kept,
+        salvage: salv.stdout.split('\n').map(s => s.trim()).filter(Boolean),
+      }
+    },
+
     integrationPath: intPath,
     integrationBranchName: intBranch,
   }

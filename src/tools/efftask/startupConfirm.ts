@@ -233,3 +233,34 @@ export function capsLine(config: EffTaskConfig): string {
     : `评分低于 ${c.scoreThreshold} 触发一轮返工`
   return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}`
 }
+
+export interface HandoffSummary {
+  branch: string
+  commits: number
+  kept: { path: string; why: string }[]
+  salvage: string[]
+}
+
+/**
+ * Where the run's work ended up — spec §8's 收口.
+ *
+ * A run writes every change to an integration branch and, when something could not be
+ * reclaimed, leaves worktrees and salvage refs behind. None of that is anywhere the user
+ * looks unless it is said out loud: preserved-and-invisible is indistinguishable from lost.
+ *
+ * Deliberately does NOT touch the user's checkout. The branch is handed over; what to do
+ * with it is theirs to decide.
+ */
+export function handoffLines(h: HandoffSummary): string[] {
+  const out = [
+    h.commits > 0
+      ? `本次改动已合并到分支 ${h.branch}(${h.commits} 个提交),你的工作区未被改动`
+      : `本次没有产生任何改动;分支 ${h.branch} 与起点相同`,
+  ]
+  if (h.commits > 0) {
+    out.push(`查看: git log ${h.branch}   合并: git merge ${h.branch}   丢弃: git branch -D ${h.branch}`)
+  }
+  for (const k of h.kept) out.push(`保留的工作区(${k.why}): ${k.path}`)
+  for (const s of h.salvage) out.push(`中断时抢救出的提交: ${s}`)
+  return out
+}

@@ -4,6 +4,7 @@ import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import { logError } from '../../utils/log.js'
 import type { WorktreePool } from '../../tools/efftask/worktreePool.js'
+import type { HandoffSummary } from '../../tools/efftask/startupConfirm.js'
 
 export type Outcome = { status: 'completed' | 'blocked'; reason?: string }
 
@@ -29,6 +30,7 @@ export async function runOrchestrator(
   setNodes: (n: TaskNode[]) => void,
   setOutcome: (o: Outcome) => void,
   setPhase: (p: Phase) => void,
+  onHandoff?: (h: HandoffSummary) => void,
 ): Promise<void> {
   // Serialize run.md writes. onUpdate fires on EVERY state transition; firing writeFile
   // unawaited each time lets concurrent writes to the same path interleave into a corrupt
@@ -61,6 +63,15 @@ export async function runOrchestrator(
     setNodes(orch.nodes()) // seed with the root so the tree isn't blank on first paint
     void queueManifest(orch.nodes()) // run.md exists from the first frame, not just at the end
     const result = await orch.run() // { status, reason }
+    // 收口: ask the pool where everything landed, while its worktrees still exist.
+    if (args.worktrees) {
+      try {
+        const h = await args.worktrees.handoff(orch.nodes())
+        onHandoff?.(h)
+      } catch (e) {
+        logError(e instanceof Error ? e : new Error(String(e)))
+      }
+    }
     setNodes([...orch.nodes()])
     setOutcome(result)
     await queueManifest(orch.nodes(), result) // final manifest records {status, reason}

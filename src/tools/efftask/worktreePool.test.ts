@@ -350,3 +350,36 @@ describe('生命周期边界(验收员用真 pool + 真 pipeline 同进程时发
     expect(refs.stdout.trim().length).toBeGreaterThan(0)
   })
 })
+
+describe('收口:用户必须能找到自己的工作(spec §8)', () => {
+  it('reports the branch, the commit count and anything left behind', async () => {
+    // Without this the run ends having written every change to a branch the user is never
+    // told about, in worktrees they do not know exist. Preserved-and-invisible is
+    // indistinguishable from lost.
+    const p = pool()
+    await p.init()
+    const done = node('root/01-a')
+    const l = await p.acquire(done) as { path: string }
+    await writeFile(join(l.path, 'shipped.ts'), 'the work\n')
+    await p.commitAndMerge(done)
+    await p.release(done)
+
+    const stuck = node('root/02-b')
+    const ls = await p.acquire(stuck) as { path: string }
+    await writeFile(join(ls.path, 'unmerged.ts'), 'never merged\n')
+    ;(stuck as { worktree?: unknown }).worktree = { branch: 'x', path: ls.path }
+
+    const h = await p.handoff([done, stuck])
+    expect(h.branch).toBe('efftask/001/integration')
+    expect(h.commits).toBeGreaterThan(0)
+    expect(h.kept.map(k => k.path)).toContain(ls.path)
+  })
+
+  it('says plainly when a run produced nothing', async () => {
+    const p = pool()
+    await p.init()
+    const h = await p.handoff([])
+    expect(h.commits).toBe(0)
+    expect(h.kept).toEqual([])
+  })
+})

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -199,5 +199,34 @@ describe('parallelismLine 必须描述 THIS run,而不是一句固定话', () =>
   })
   it('defaults to the honest, conservative description when isolation is unknown', () => {
     expect(parallelismLine(base, { editable: false })).toContain('串行')
+  })
+})
+
+describe('handoffLines 告诉用户工作在哪,以及怎么处置', () => {
+  it('names the branch and the exact commands, and says the tree is untouched', () => {
+    const lines = handoffLines({ branch: 'efftask/001/integration', commits: 7, kept: [], salvage: [] })
+    const text = lines.join('\n')
+    expect(text).toContain('efftask/001/integration')
+    expect(text).toContain('7 个提交')
+    expect(text).toContain('你的工作区未被改动') // we deliberately did not touch it
+    expect(text).toContain('git merge efftask/001/integration')
+    expect(text).toContain('git branch -D efftask/001/integration')
+  })
+
+  it('does not offer merge commands for a run that produced nothing', () => {
+    const text = handoffLines({ branch: 'b', commits: 0, kept: [], salvage: [] }).join('\n')
+    expect(text).toContain('没有产生任何改动')
+    expect(text).not.toContain('git merge')
+  })
+
+  it('surfaces kept worktrees and salvage refs — the things nobody would find otherwise', () => {
+    const text = handoffLines({
+      branch: 'b', commits: 1,
+      kept: [{ path: '/wt/efftask-001-abc', why: '仍有未合入的内容' }],
+      salvage: ['efftask/001/salvage/efftask-001-abc'],
+    }).join('\n')
+    expect(text).toContain('/wt/efftask-001-abc')
+    expect(text).toContain('仍有未合入的内容')
+    expect(text).toContain('salvage')
   })
 })

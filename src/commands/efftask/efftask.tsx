@@ -28,6 +28,8 @@ import {
   type ConfirmWinner,
   type StartupDecision,
   type ResumeSummary,
+  handoffLines,
+  type HandoffSummary,
 } from '../../tools/efftask/startupConfirm.js'
 import { buildStartupCard, sendFeishuStartupCard } from '../../tools/efftask/feishuStartupCard.js'
 import { ConfirmStartup } from './ConfirmStartup.js'
@@ -183,8 +185,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
         }
         const report = (withPath: boolean): void => {
           const verb = resumed ? '续跑' : ''
+          const where = handoffRef.current ? '\n' + handoffLines(handoffRef.current).join('\n') : ''
           onDone(
-            `高效任务 ${runId} ${verb}${how}${withPath ? ` · .claude/efftask/${runId}/run.md` : ''}`,
+            `高效任务 ${runId} ${verb}${how}${withPath ? ` · .claude/efftask/${runId}/run.md` : ''}${where}`,
             { display: 'system' },
           )
         }
@@ -364,6 +367,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [seed, setSeed] = React.useState<TaskNode[] | null>(null)
   // Isolation is resolved ONCE, when the gate is answered — never re-decided per node.
   const poolRef = React.useRef<WorktreePool | undefined>(undefined)
+  // 收口 (spec §8): where the run's work ended up. Collected when the run ends, while the
+  // worktrees still exist, and shown in the two places the user actually looks.
+  const [handoff, setHandoff] = React.useState<HandoffSummary | null>(null)
+  const handoffRef = React.useRef<HandoffSummary | null>(null)
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
@@ -579,6 +586,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
             setNodes,
             recordOutcome,
             setPhase,
+            h => { handoffRef.current = h; setHandoff(h) },
           )
         })()
       })
@@ -630,7 +638,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   if (phase === 'running') {
     return <RunningView nodes={nodes} runId={runId ?? ''} onAbort={props.abort} />
   }
-  return <DoneView nodes={nodes} runId={runId ?? ''} outcome={outcome} onExit={props.onExit} />
+  return <DoneView nodes={nodes} runId={runId ?? ''} outcome={outcome} handoff={handoff} onExit={props.onExit} />
 }
 
 /** A one-line status/error screen that can always be dismissed. */
@@ -678,6 +686,7 @@ function DoneView(props: {
   nodes: TaskNode[]
   runId: string
   outcome: Outcome | null
+  handoff: HandoffSummary | null
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -696,6 +705,9 @@ function DoneView(props: {
           {ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
         </Text>
         {props.outcome?.reason ? <Text dimColor>原因: {props.outcome.reason}</Text> : null}
+        {props.handoff
+          ? handoffLines(props.handoff).map(l => <Text key={l} dimColor>{l}</Text>)
+          : null}
         <Text dimColor>q / Esc 退出 · 回车看节点详情</Text>
       </Box>
     </Box>
