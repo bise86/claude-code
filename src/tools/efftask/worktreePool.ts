@@ -203,19 +203,6 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         const staged = await git(['diff', '--cached', '--quiet'], path)
         const hasStaged = staged.code !== 0
 
-        // Markers can also arrive without an unmerged path — a resolver that edits the file by
-        // hand, or one that "resolves" by leaving both sides in and committing. Scan what this
-        // branch would BRING (its diff against the merge base), not just what is staged: an
-        // earlier version checked only the index and a resolver that committed its markers
-        // sailed straight through. Scanned by pattern rather than `diff --check`, which also
-        // fires on trailing whitespace and would refuse perfectly good commits.
-        const incoming = await git(['diff', '-U0', `${intBranch}...HEAD`], path)
-        const marked = incoming.stdout.split('\n').filter(l => /^\+(<{7}|>{7}|={7})/.test(l))
-        if (marked.length > 0) {
-          const names = await git(['diff', '--name-only', `${intBranch}...HEAD`], path)
-          return { ok: false, kind: 'conflict', files: names.stdout.split('\n').map(l => l.trim()).filter(Boolean) }
-        }
-
         if (hasStaged) {
           const commit = await git(['commit', '--no-verify', '-m', `efftask: ${node.title}`], path)
           // We KNOW there was something staged, so any failure here is real — no exit-code
@@ -224,6 +211,35 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
           // agent output is deterministic: retrying it would never converge.
           if (commit.code !== 0) {
             return { ok: false, kind: 'infra', message: `提交失败: ${commit.stderr.trim() || commit.stdout.trim()}` }
+          }
+        }
+
+        // AFTER the commit on purpose. Placed before it, this scanned a HEAD that did not
+        // yet contain the round's work, so it matched nothing and the guard was decorative —
+        // the test that "proved" it passed only because its fixture committed separately.
+        // Refusing here is safe: the commit stays on the node branch, unmerged, and the
+        // escalation hands the user a branch that still holds everything.
+        // Markers can also arrive without an unmerged path — a resolver that edits the file by
+        // hand, or one that "resolves" by leaving both sides in and committing. Scan what this
+        // branch would BRING (its diff against the merge base), not just what is staged: an
+        // earlier version checked only the index and a resolver that committed its markers
+        // sailed straight through. Scanned by pattern rather than `diff --check`, which also
+        // fires on trailing whitespace and would refuse perfectly good commits.
+        // Gated on this branch actually having performed an integration merge. Conflict-marker
+        // TEXT is not evidence of a conflict: a node whose deliverable is a README about
+        // resolving merge conflicts, or any Markdown using a `=======` setext underline, trips
+        // the pattern. Measured on a throwaway repo: 3 hits, and the node would have been
+        // refused permanently while the card told the user to go resolve a conflict that does
+        // not exist. A resolver that commits its markers, on the other hand, necessarily
+        // produces a merge commit here — so gate on that and the false positive disappears
+        // without losing the case the scan exists for.
+        const mergeCommits = await git(['rev-list', '--merges', `${intBranch}..HEAD`], path)
+        if (mergeCommits.stdout.trim().length > 0) {
+          const incoming = await git(['diff', '-U0', `${intBranch}...HEAD`], path)
+          const marked = incoming.stdout.split('\n').some(l => /^\+(<{7} |>{7} |={7}$)/.test(l))
+          if (marked) {
+            const names = await git(['diff', '--name-only', `${intBranch}...HEAD`], path)
+            return { ok: false, kind: 'conflict', files: names.stdout.split('\n').map(l => l.trim()).filter(Boolean) }
           }
         }
 

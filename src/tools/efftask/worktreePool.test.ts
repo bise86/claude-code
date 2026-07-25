@@ -400,9 +400,14 @@ describe('冲突必须发生在节点自己的工作区(spec §8),且绝不带�
     await p.commitAndMerge(b)
     await p.mergeIntegrationIntoNode(b)   // conflict now live in pb, nobody resolves it
 
+    const headBefore = await git(['rev-parse', 'HEAD'], pb)
     const second = await p.commitAndMerge(b)
     expect(second.ok).toBe(false)
     expect(second.ok === false && second.kind).toBe('conflict')
+    // The unmerged-paths check earns its keep HERE: the marker scan downstream would also
+    // refuse this, but only after `git add -A` + commit had already built a junk merge commit
+    // full of markers on the node branch — which is what the human then has to untangle.
+    expect((await git(['rev-parse', 'HEAD'], pb)).stdout).toBe(headBefore.stdout)
 
     const intFile = await git(['show', `${p.integrationBranchName}:shared.txt`], gitRoot)
     expect(intFile.stdout).not.toContain('<<<<<<<')
@@ -426,6 +431,51 @@ describe('冲突必须发生在节点自己的工作区(spec §8),且绝不带�
     expect(res.ok).toBe(false)
     const intFile = await git(['show', `${p.integrationBranchName}:shared.txt`], gitRoot)
     expect(intFile.stdout).not.toContain('<<<<<<<')
+  })
+
+  it('refuses markers a resolver merely staged — the exact shape the prompt asks for', async () => {
+    // The resolve prompt says "解决后 git add 冲突文件即可,不要提交". A resolver that stages the
+    // file with both sides still in it therefore leaves NO unmerged path and NO commit of its
+    // own — commitAndMerge makes the merge commit itself. An earlier version ran this scan
+    // BEFORE that commit, against a HEAD that did not yet contain the round's work, so it
+    // matched nothing: the guard was decorative and its test passed for another reason.
+    const { p, b, pb } = await conflictingPair()
+    await p.commitAndMerge(b)
+    await p.mergeIntegrationIntoNode(b)
+    await writeFile(join(pb, 'shared.txt'), 'line1\n<<<<<<< HEAD\nB 版本\n=======\nA 版本\n>>>>>>> x\nline3\n')
+    await git(['add', 'shared.txt'], pb) // staged, NOT committed — exactly as instructed
+
+    const res = await p.commitAndMerge(b)
+    expect(res.ok).toBe(false)
+    expect(res.ok === false && res.kind).toBe('conflict')
+    const intFile = await git(['show', `${p.integrationBranchName}:shared.txt`], gitRoot)
+    expect(intFile.stdout).not.toContain('<<<<<<<')
+    expect(intFile.stdout).toContain('A 版本') // the earlier node's work is intact
+  })
+
+  it('does NOT refuse a node whose deliverable merely CONTAINS marker-shaped text', async () => {
+    // Conflict-marker text is not evidence of a conflict. A README about resolving merge
+    // conflicts — or any Markdown using a `=======` setext underline — matches the pattern.
+    // Measured before the merge-commit gate: 3 hits on a documentation file, and the node
+    // would have been refused permanently while the card sent its author to resolve a
+    // conflict that did not exist.
+    const p = pool()
+    await p.init()
+    const n = node('n-doc')
+    const lease = await p.acquire(n)
+    if ('error' in lease) throw new Error('acquire failed')
+    n.worktree = { branch: lease.branch, path: lease.path }
+    await writeFile(join(lease.path, 'doc.md'), [
+      '# 冲突处理', '', '出现下面这样的内容时:', '',
+      '<<<<<<< HEAD', '你的改动', '=======', '别人的改动', '>>>>>>> other', '',
+      '请手工合并。', '',
+      '标题', '=======', '',
+    ].join('\n'))
+
+    const res = await p.commitAndMerge(n)
+    expect(res).toEqual({ ok: true, merged: true })
+    const shown = await git(['show', `${p.integrationBranchName}:doc.md`], gitRoot)
+    expect(shown.stdout).toContain('请手工合并')
   })
 
   it('a real resolution merges cleanly and keeps BOTH sides', async () => {
