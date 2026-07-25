@@ -2167,7 +2167,7 @@ export class EffTaskOrchestrator {
   constructor(private cfg: EffTaskConfig, private deps: OrchestratorDeps, private signal: AbortSignal) {
     // root goal = the FULL goalPrompt (title is only a truncated display label); ctxGoal
     // reads node.goal, so the plan prompt must see the whole objective, not the truncation.
-    const root = createNode({ id: 'root', title: rootTitle(cfg.goalPrompt), goal: cfg.goalPrompt, parentId: null, deps: [], depth: 0, phaseRoles: cfg.phaseRoles, now: deps.now() })
+    const root = createNode({ id: 'root', title: rootTitle(cfg.goalPrompt), goal: cfg.goalPrompt, parentId: null, deps: [], depth: 0, phaseRoles: cfg.phaseRoles, now: this.nowSafe() })
     this.byId = byIdMap([root])
   }
 
@@ -2183,8 +2183,14 @@ export class EffTaskOrchestrator {
   private safeUpdate(): void {
     try { this.deps.onUpdate(this.nodes()) } catch { /* a crashing renderer is not a run failure */ }
   }
+  // Last timestamp the injected clock actually produced. A failing clock falls back to it
+  // rather than to '', which would land NaN in updatedAt and break elapsed-time rendering.
+  private lastNow = ''
   private nowSafe(): string {
-    try { return this.deps.now() } catch { return '' }
+    try {
+      this.lastNow = this.deps.now()
+    } catch { /* keep the previous good value */ }
+    return this.lastNow
   }
 
   private ctx(): PipelineCtx {
@@ -2214,10 +2220,14 @@ export class EffTaskOrchestrator {
   }
 
   async run(): Promise<{ status: 'completed' | 'blocked'; reason?: string }> {
-    // No-progress guard: if the same node is selected twice with an identical
-    // (status, updatedAt) it did not move, and re-picking it forever would be a hot loop
-    // issuing real model calls. Cheap insurance against a future step that returns without
-    // advancing — the scheduler must never be the thing that runs away.
+    // No-progress guard: if the same node is picked twice in a row in the same STATUS it
+    // did not move, and re-picking it forever would be a hot loop issuing real model calls.
+    // Deliberately excludes updatedAt: every commit refreshes it, so including it would make
+    // the fingerprint differ on every re-pick under a real clock and the guard would only
+    // ever fire under a frozen test clock — insurance that holds nowhere it matters.
+    // A node is picked at most once per status, and the one status that can repeat
+    // (WAITING_CHILDREN via the subtreeAlive path) always has another node picked in
+    // between, which resets lastPick — so this cannot false-positive on a healthy run.
     let lastPick = ''
     let stalls = 0
     for (;;) {
@@ -2242,7 +2252,7 @@ export class EffTaskOrchestrator {
         const reason = root.status === 'BLOCKED' ? (root.blockedReason || '根任务被阻断') : '存在无法推进的阻断节点'
         return { status: 'blocked', reason }
       }
-      const fingerprint = `${next.id}|${next.status}|${next.updatedAt}`
+      const fingerprint = `${next.id}|${next.status}`
       stalls = fingerprint === lastPick ? stalls + 1 : 0
       lastPick = fingerprint
       if (stalls >= 2) {
@@ -2306,6 +2316,11 @@ export class EffTaskOrchestrator {
       changed = false
       for (const n of this.byId.values()) {
         if (isTerminal(n.status)) continue
+        // Downward too: once an ancestor is BLOCKED its descendants can never contribute,
+        // and the scheduler already refuses to run them. Leaving them CREATED/READY would
+        // render the dead subtree as grey "queued" forever — the same complaint that the
+        // abort sweep and the missing-child rule exist to answer.
+        const parentBlocked = n.parentId !== null && this.byId.get(n.parentId)?.status === 'BLOCKED'
         const childBlocked = n.childIds.some(id => this.byId.get(id)?.status === 'BLOCKED')
         // A child id MISSING from byId can never be accepted, so childrenAllAccepted will
         // never be true and the parent would sit WAITING_CHILDREN (rendered as grey/queued)
@@ -2315,10 +2330,14 @@ export class EffTaskOrchestrator {
         // like a blocked dep instead of leaving the node queued forever.
         const depDangling = n.deps.some(id => !this.byId.has(id))
         const depBlocked = n.deps.some(id => this.byId.get(id)?.status === 'BLOCKED')
-        if (childBlocked || childMissing || depBlocked || depDangling) {
+        if (parentBlocked || childBlocked || childMissing || depBlocked || depDangling) {
           n.status = 'BLOCKED'
           if (!n.blockedReason) {
-            n.blockedReason = childBlocked ? '子节点阻断' : childMissing ? '子节点缺失' : depDangling ? '依赖节点缺失' : '依赖阻断'
+            n.blockedReason = childBlocked ? '子节点阻断'
+              : childMissing ? '子节点缺失'
+                : depDangling ? '依赖节点缺失'
+                  : depBlocked ? '依赖阻断'
+                    : '上级任务阻断'
           }
           n.updatedAt = this.nowSafe()
           await this.safePersist(n)

@@ -160,6 +160,42 @@ describe('EffTaskOrchestrator (serial)', () => {
     expect(a.length).toBeGreaterThan(0)
   })
 
+  it('the no-progress guard also holds under an ADVANCING clock, not just a frozen one', async () => {
+    // Every commit refreshes updatedAt, so a fingerprint that included it would differ on
+    // each re-pick and the guard would only ever fire under the frozen clock the other
+    // tests use — i.e. nowhere real. Drive a stalling step with a real advancing clock.
+    let t = Date.parse('2026-07-25T00:00:00Z')
+    let calls = 0
+    const runAgent: RunAgentFn = async () => { calls++; if (calls > 60) throw new Error('runaway'); return '' }
+    const orch = new EffTaskOrchestrator(
+      cfg(),
+      { runAgent, persist: async () => {}, now: () => new Date((t += 1000)).toISOString(), onUpdate: () => {} },
+      new AbortController().signal,
+    )
+    const result = await orch.run()
+    expect(result.status).toBe('blocked')
+    expect(calls).toBeLessThan(60) // did not hot-loop
+  })
+
+  it('a dead subtree is marked BLOCKED, not left rendering as queued', async () => {
+    // The scheduler refuses to run nodes under a BLOCKED ancestor; without a downward
+    // sweep those descendants would keep a queued status forever in the tree view.
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan' && req.node.id === 'root') {
+        return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"A","deps":[]},{"title":"B","deps":[]}]}\n```'
+      }
+      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
+      if (req.phase === 'review') return '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
+      return '```verdict\n{"pass":false,"blocking":["不过"],"comments":""}\n```'
+    }
+    const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
+    const result = await orch.run()
+    expect(result.status).toBe('blocked')
+    // no node may be left in a non-terminal (grey/queued or running) state
+    expect(orch.nodes().filter(n => n.status !== 'ACCEPTED' && n.status !== 'BLOCKED')).toEqual([])
+  })
+
   it('terminates on a bounded number of model calls when acceptance never passes', async () => {
     let calls = 0
     const runAgent: RunAgentFn = async req => {
