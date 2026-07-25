@@ -3551,9 +3551,11 @@ P1 合并后,基于真实接口再写:
 这些是终审确认过、**已知且已被显式接受**的缺口,不是遗漏。P2/P3 必须处理:
 
 1. **(P2,安全)自定义 agent 的 MCP 工具绕过只读闸门。** `runAgentAdapter` 按阶段限制工具池,但 `runAgent` 在过滤之后又把 `agentMcpTools` 合并进来。若用户把一个声明了 `mcpServers` 的自定义 agent 绑成 `review`/`accept` 角色,该"评审员"会拿到自己的 MCP 工具(可能可写),从而能自己修好再放行——这正是执行者/评审者分离要防的事。修法:非 execute 阶段在 agent 定义上设 `disallowedTools`,或在合并后再过滤。
-2. **(P3,失控面)全系统没有任何墙钟上限。** `caps.nodeTimeoutMs` 已定义(默认 600s)但**无任何代码读取**。一个挂起而不拒绝的模型调用会让 `run()` 永久停住,唯一出路是用户在运行视图按 Esc。除此之外每条轴都已有界(深度/节点数/三个迭代计数/无进展守卫/基础设施重试)。修法:`runPhase` 包一层 `AbortSignal.timeout`,或 P3 的超时 tree-kill。
+2. ~~(P3,失控面)全系统没有任何墙钟上限~~ — **已在 P1 修复**:`makeRunAgentFn` 接受 `timeoutMs`(命令层传 `caps.nodeTimeoutMs`),每次阶段调用与该期限竞速,超时即中止子 agent 并抛 `阶段调用超时(N ms),已中止`。至此每条轴都有界:深度/节点数/三个迭代计数/无进展守卫/基础设施重试/墙钟。
 3. ~~(P2,规格)被丢弃的角色名没有回显~~ — **已在 P1 修复**:`EffTaskConfig.notices` 记录所有被丢弃/降级/忽略的请求,终端与飞书两个确认界面都会渲染。同时覆盖:CLI 模式角色(P1 的 runAgent 接缝无 cli 分支)、plan/execute 的多余角色(只有首个生效)、观察角色(P3 才启用)。
 4. **(P2,一致性)确认竞速原语重复。** `startupConfirm.ts` 的 `createResolveOnce`/`raceConfirm` 与 `interactiveHandler.ts` 的 `makeFeishuRacer` 是同一形状的两份实现。飞书那半已正确复用共享 client 与 callbacks 注册表(无冲突),但在 P2 增加更多确认关口前应抽成共用原语。
 5. **(P2,性能)`run.md` 每次状态变更全量重写。** 约 10 次转移 × 100 节点 ≈ 每轮 1000 次全树重写(已串行化,只是浪费)。修法:防抖,或仅在状态变化时写。
 6. **(P2,恢复)`loadRun`/`readNode` 在 P1 无消费者。** 已实现并测试,专供 §17 断点续跑(Task 12/13)。`parseNodeFile` 的未校验 cast 必须由续跑路径的 `validateLoadedNodes` 补上。
-7. **(P2,交互)REPL 重建视图会中断运行。** Ctrl+O 切换转写、Ctrl+Z→fg 都会卸载并重建 `toolJSX`,当前实现随即中止运行(正确——否则编排器变孤儿继续烧 token),并如实报告"因界面重建而中断"。断点续跑落地后,此场景可用 `/et --resume <id>` 恢复。
+7. **(流程,已知缺口)仓库没有任何类型检查。** 未装 `typescript`,无 `typecheck`/lint 脚本,`bun` 只做转译不做检查;且 `src/types/message.ts`、`src/constants/querySource.ts` 等被 180+ 文件按类型导入的模块在本 fork 中实际不存在,直接跑 `tsc` 无法通过。后果不是假设:`runOrchestrator` 曾引用一个只存在于它被抽出来的组件内的标识符,`tsc` 会直接报 `Cannot find name`,而这里一路滑到运行时才炸(见 `1e4a037`)。当前唯一防线是"每条代码路径都得有测试真跑一遍"。若要补工具链,得先决定如何处理那些幽灵模块 —— 不是顺手能做的事,故登记而非擅自引入依赖。
+
+8. **(P2,交互)REPL 重建视图会中断运行。** Ctrl+O 切换转写、Ctrl+Z→fg 都会卸载并重建 `toolJSX`,当前实现随即中止运行(正确——否则编排器变孤儿继续烧 token),并如实报告"因界面重建而中断"。断点续跑落地后,此场景可用 `/et --resume <id>` 恢复。
