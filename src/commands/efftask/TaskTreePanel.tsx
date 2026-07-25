@@ -186,7 +186,7 @@ export function TaskTreePanel(props: {
             {'  '.repeat(depth)}
             {fold} {GLYPH[ui]} {n.title}{' '}
             <Text dimColor>
-              [{n.status}] {elapsed(n, nowMs)}{scoreTag(n)}{hidden}
+              [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{scoreTag(n)}{hidden}
             </Text>
           </Text>
         )

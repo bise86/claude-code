@@ -1118,6 +1118,22 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'], attempted: true, state: { markers: true, staged: false, stale: false }, integrationBranch: 'efftask/001/integration' })
   })
 
+  it('blockedReason stands on its own when there is no Feishu bridge', async () => {
+    // 处理方式 and the resume command lived ONLY on the card. A run with no bridge sends no
+    // card, and the tree was then the user's only surface — showing a path with no hint of
+    // what to do with it.
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], okAgent()),
+      worktrees: fakePool({ commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }) }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.blockedReason).toContain('/wt/root')
+    expect(n.blockedReason).toContain('git add')      // what to do there
+    expect(n.blockedReason).toContain('/et --resume') // and how to come back
+  })
+
   it('a failing escalation channel does not change the run verdict', async () => {
     // Feishu being down is not a reason to accept an unmerged node — nor to crash the run.
     const n = root()

@@ -731,7 +731,20 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
       // Marks this as a HUMAN-RESUMABLE block. Without it reseat skips the node on every
       // later --resume, which made the escalation card's instructions untrue.
       node.mergeConflict = true
-      const detail = `合并冲突,已保留工作区待人工处理。分支 ${node.worktree.branch};路径 ${node.worktree.path};冲突文件: ${files.join('、')}`
+      // Carries the 处理方式 and the resume command too. Those lived ONLY on the Feishu card,
+      // so a run with no bridge left the user with a path and no idea what to do with it —
+      // and the tree is the only surface such a run has.
+      const detail =
+        `合并冲突,已保留工作区待人工处理。分支 ${node.worktree.branch};路径 ${node.worktree.path};` +
+        `冲突文件: ${files.join('、')}。` +
+        (state.stale
+          ? '该分支的文件里残留了已提交的冲突标记,请清理后提交;'
+          : state.staged
+            ? '那里有一个已 git add 但未提交的合并,请核对后 git commit;'
+            : state.markers
+              ? '进入该路径解决冲突后 git add 并 git commit;'
+              : `进入该路径后自行 git merge ${ctx.worktrees.integrationBranchName} 重现冲突并解决;`) +
+        `随后用 /et --resume 继续。`
       // Escalate BEFORE blocking, so the card carries the same facts the tree will show.
       // `attempted` is threaded through the recursion rather than derived from
       // iteration.mergeResolve, which is PERSISTED: a node resumed with its one attempt

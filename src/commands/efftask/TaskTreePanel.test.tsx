@@ -9,6 +9,7 @@ import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { TaskTreePanel, visibleRows, viewport } from './TaskTreePanel.js'
+import { NodeDetail } from './NodeDetail.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
 
 const NOW = new Date().toISOString()
@@ -87,6 +88,56 @@ describe('visibleRows folds subtrees, parent before child', () => {
   it('still emits an orphan whose parent is missing', () => {
     const orphan = mk({ id: 'x', parentId: 'ghost', depth: 1 })
     expect(visibleRows([orphan], new Set()).map(r => r.node.id)).toEqual(['x'])
+  })
+})
+
+describe('树行要能一眼看出哪个节点在等人(真渲染器)', () => {
+  it('marks the node that is waiting on a human, not just [BLOCKED]', async () => {
+    // mergeConflict is persisted and nothing rendered it: on a 100-node tree every ✗ looked
+    // identical, so finding the one node waiting on YOU meant pressing Enter into each of them.
+    const nodes = [
+      mk({ id: 'root', title: '根', status: 'BLOCKED', blockedReason: '子节点阻断', childIds: ['root/01', 'root/02'], kind: 'decompose' }),
+      mk({ id: 'root/01', parentId: 'root', depth: 1, title: '要人工解冲突的', status: 'BLOCKED', mergeConflict: true }),
+      mk({ id: 'root/02', parentId: 'root', depth: 1, title: '验收超限的', status: 'BLOCKED', blockedReason: '验收迭代超限(3)' }),
+    ]
+    const { lastFrame, app } = await mount({ nodes })
+    const frame = lastFrame()
+    app.unmount()
+    const rows = frame.split('\n')
+    expect(rows.find(r => r.includes('要人工解冲突的'))).toContain('待人工解冲突')
+    expect(rows.find(r => r.includes('验收超限的'))).not.toContain('待人工解冲突')
+  })
+})
+
+describe('详情裁剪不能把最新发生的事截掉(真渲染器)', () => {
+  it('keeps the LAST lines of 执行状态, where every conflict note is appended', async () => {
+    // Three acceptance reviews measured the same thing: 执行状态 clipped to its first 4 lines,
+    // so a node's last visible line was "自测全绿" while the conflict rejection that actually
+    // blocked it — appended below — was findable nowhere in the TUI. blockedReason does not
+    // carry it either.
+    const n = mk({
+      id: 'root', title: '接支付回调', status: 'BLOCKED',
+      blockedReason: '合并冲突,已保留工作区待人工处理。',
+      execStatus: [
+        '已实现支付回调签名校验与幂等落库。',
+        '改动文件:src/pay/callback.ts',
+        '自测:bun test src/pay 全绿(17 项)。',
+        '遗留:退款回调走旧分支,本次未动。',
+        '(合并冲突解决)按集成分支的新签名重写了 refundKey 的调用点。',
+        '(冲突解决后验收未通过: [qa] 解决冲突时把退款回调的重试丢了)',
+      ].join('\n'),
+    })
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail, { node: n, elapsed: '3s' } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const frame = t.lastFrame()
+    app.unmount()
+    expect(frame).toContain('已实现支付回调签名校验')          // the head is still there
+    expect(frame).toContain('解决冲突时把退款回调的重试丢了')  // and so is the newest line
+    expect(frame).toContain('中间省略')                        // honestly labelled
   })
 })
 

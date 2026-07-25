@@ -14,7 +14,21 @@ function block(text: string, maxLines = 12, width = 100): string[] {
     for (let i = 0; i < cps.length; i += width) out.push(cps.slice(i, i + width).join(''))
     return out
   })
-  return lines.length > maxLines ? [...lines.slice(0, maxLines), `… 还有 ${lines.length - maxLines} 行`] : lines
+  if (lines.length <= maxLines) return lines
+  // Keep the HEAD and the TAIL, not just the head.
+  //
+  // Every line this run appends is appended at the END: 执行状态 gains "(合并冲突解决)…" and
+  // "(冲突解决后验收未通过: …)", 验收记录 gains the newest verdict. A head-only clip therefore
+  // hid exactly the lines that say what happened most recently — three acceptance reviews
+  // measured a node whose last visible line was "自测全绿" while the rejection that blocked it
+  // was in the part that got dropped, findable nowhere in the TUI.
+  const tail = Math.min(2, maxLines - 1)
+  const head = maxLines - tail
+  return [
+    ...lines.slice(0, head),
+    `… 中间省略 ${lines.length - maxLines} 行`,
+    ...lines.slice(lines.length - tail),
+  ]
 }
 
 function Section(props: { title: string; body: string; color?: string; maxLines?: number }): React.ReactElement | null {
