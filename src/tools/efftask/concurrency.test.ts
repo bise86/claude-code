@@ -92,18 +92,98 @@ describe('the pool parallelises the read-only phases', () => {
     expect(m.peak.execute).toBe(1)
   })
 
-  // NOT COVERED BY A TEST, and deliberately so — recorded rather than faked.
-  //
-  // The pool charges its budget against STARTED steps (`running`), not against `inFlight`,
-  // so a queued-not-started execute holds no slot. That is the correct accounting, but no
-  // end-to-end assertion here can discriminate it: the loop dispatches one batch per wake and
-  // then awaits a completion, so the two accountings diverge by at most one slot and only
-  // while `inFlight > parallelism` — a state a small fixture tree does not reach. Three
-  // fixture shapes were tried; all three produced identical numbers under both versions.
-  //
-  // A test that passes under the broken version while claiming to guard the property is
-  // worse than no test: it is exactly the false assurance that let a mutex which never
-  // serialised anything ship green through 16 existing tests.
+  it('a QUEUED execute holds no pool slot: read-only work keeps flowing behind the mutex', async () => {
+    // The pool charges its budget against STARTED steps (`running`), not against `inFlight`,
+    // so a queued-not-started execute holds no slot. Get that wrong —
+    // `budget = parallelism - inFlight.size` — and the executes waiting on the serial chain
+    // eat the whole pool, so every other phase starves behind them. Against a one-line mutant
+    // of that expression the broken pool dispatches NOTHING for the entire window.
+    //
+    // The fixture must satisfy THREE conditions at once or the two accountings agree and the
+    // assertion is vacuous — three earlier fixture shapes failed on exactly this, and an
+    // earlier version of this file wrongly concluded no end-to-end assertion could exist:
+    //   1. several executable leaves become READY together, so >=2 executes sit in `inFlight`
+    //      while the mutex lets only one run (traced: inFlight 11 vs running 3);
+    //   2. a DEEP supply of purely read-only work that stays available throughout — a shallow
+    //      read-only fan-out is exhausted before the window opens and measures nothing;
+    //   3. the window is "the FIRST execute holds the tree", NOT "any execute is running".
+    //      execute is serial, so the latter is true for nearly the whole run and the count
+    //      degenerates into "how many read-only steps does this tree have" — a property of
+    //      the fixture, identical under both accountings.
+    //
+    // Divergence begins at `inFlight.size > running` (at parallelism 3 that is inFlight 2),
+    // not at `inFlight > parallelism`, and the gap reaches 3 slots rather than 1.
+    const CHAIN_DEPTH = 5
+    const decompose = (titles: string[]): string => JSON.stringify({
+      kind: 'decompose', solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a',
+      children: titles.map(t => ({ title: t, deps: [] })),
+    })
+    const kids = [
+      ...Array.from({ length: 4 }, (_, i) => `E${i + 1}`),   // queue on the execute chain
+      ...Array.from({ length: 8 }, (_, i) => `P${i + 1}`),   // pure read-only chains
+    ]
+
+    const TARGET = 12
+    let readOnlyInWindow = 0
+    let windowOpen = false
+    let windowClosed = false
+    let release = (): void => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+
+    // Every status change goes through persist, so it is a complete observation channel.
+    // A queued execute is still READY — commit('EXECUTING') happens when its step STARTS —
+    // so "executable leaves at READY while one executes" is exactly the state under test.
+    const seen = new Map<string, { title: string; status: string }>()
+    let peakReadyExecutables = 0
+
+    const orch = new EffTaskOrchestrator(cfg({
+      parallelism: 3,
+      caps: { maxDepth: 8, maxNodes: 400, maxIterations: 2, nodeTimeoutMs: 600_000 },
+    }), {
+      runAgent: (async (req: { phase: string; node: TaskNode; prompt: string }) => {
+        if (windowOpen && !windowClosed && (req.phase === 'plan' || req.phase === 'review')) {
+          if (++readOnlyInWindow >= TARGET) release()
+        }
+        if (req.phase === 'plan') {
+          await tick(2)
+          if (req.node.id === 'root') return reply(req, decompose(kids))
+          if (req.node.title.startsWith('E')) return reply(req, LEAF)
+          // Each chain node plans into exactly ONE child: a long-lived read-only supply.
+          if (req.node.depth < CHAIN_DEPTH) return reply(req, decompose([req.node.title + '-']))
+          return reply(req, LEAF)
+        }
+        if (req.phase === 'execute' && req.node.title.startsWith('E') && !windowOpen) {
+          windowOpen = true
+          // Hold the tree open until the pool has DISPATCHED enough read-only work. The timer
+          // is only a safety net so a regression fails instead of hanging: the pass criterion
+          // is the COUNT, never elapsed time.
+          await Promise.race([gate, tick(2000)])
+          windowClosed = true
+          return reply(req, '{"execStatus":"done"}')
+        }
+        if (req.phase === 'execute') { await tick(2); return reply(req, '{"execStatus":"done"}') }
+        await tick(2)
+        return reply(req, '{"pass":true,"blocking":[],"comments":"ok"}')
+      }) as unknown as RunAgentFn,
+      persist: async (n: TaskNode) => {
+        seen.set(n.id, { title: n.title, status: n.status })
+        if (!windowOpen || windowClosed) return
+        let ready = 0
+        for (const v of seen.values()) if (v.status === 'READY' && v.title.startsWith('E')) ready++
+        peakReadyExecutables = Math.max(peakReadyExecutables, ready)
+      },
+      now: () => new Date().toISOString(),
+      onUpdate: () => {},
+    }, new AbortController().signal)
+
+    expect((await orch.run()).status).toBe('completed')
+    // Fixture-rot guard: without an executable parked at READY behind the one the mutex is
+    // running, nothing is queued, the two accountings agree, and the count below would pass
+    // vacuously. Holds under both implementations — it is a property of the tree.
+    expect(peakReadyExecutables).toBeGreaterThanOrEqual(1)
+    // Gate trips at 12; the mutant dispatches 0 for the whole window.
+    expect(readOnlyInWindow).toBeGreaterThanOrEqual(8)
+  }, 20_000)
 
   it('never exceeds the configured limit', async () => {
     const m = phaseMeter()

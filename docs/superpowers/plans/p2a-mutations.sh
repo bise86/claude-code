@@ -33,6 +33,13 @@ fs.writeFileSync(p,s)' $O
 run_case "互斥链一个已启动的 promise" ""
 
 
+# 2. budget charged against inFlight instead of running (queued executes eat the pool)
+bun -e '
+const fs=require("fs");const p=process.argv[1];let s=fs.readFileSync(p,"utf8")
+s=s.replace("const budget = Math.max(1, this.cfg.parallelism) - running","const budget = Math.max(1, this.cfg.parallelism) - inFlight.size")
+fs.writeFileSync(p,s)' $O
+run_case "预算按 inFlight 计(排队占名额)" ""
+
 # 3. runStep no longer absorbs its own errors
 bun -e '
 const fs=require("fs");const p=process.argv[1];let s=fs.readFileSync(p,"utf8")

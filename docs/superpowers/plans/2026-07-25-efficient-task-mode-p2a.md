@@ -42,7 +42,7 @@ P2 v1(`…-p2.md`)经三方圆桌评审否决,32 条阻断。**本文档只承�
 | 事实 | 为什么要命 |
 |---|---|
 | `const task = this.runStep(...)` 会**立刻开始执行**;`chain.then(() => task)` 只把等待排队,执行早已并发展开 | 这是 v1 "互斥锁"的实现方式,实测并发峰值 3。互斥必须把**启动**本身推迟到链上 |
-| 排队中(未启动)的 execute 若也计入并发预算,会占满名额却不干活 | 就绪 execute 节点数 ≥ 并发上限时,plan/review/accept 一个都挑不出来,并行等于没做 |
+| 排队中(未启动)的 execute 若也计入并发预算,会占满名额却不干活 | 实测:`budget = P - inFlight.size` 时,第一个 execute 持有树的整个窗口内**一次调用都不发**(正确实现同窗口发出 82 次)。分歧起点是 `inFlight.size > running`(P=3 时 inFlight=2 即分歧),最大差 3 个名额 |
 | 一个被拒绝的任务会**永久污染** `executeChain`:此后每个 `.then` 立即拒绝,`Promise.race([...]).catch(()=>{})` 在微任务内返回 | 实测 20 万次循环内一个 30ms 定时器从未触发 —— 无 I/O、无定时器的纯微任务饥饿,进程挂死 |
 | `createChildren` 在 `specs.map` 内调用**裸 `ctx.now()`**(非 `nowSafe`) | 这是额度释放未枚举到的第五条退出路径;时钟抛错即泄漏,之后一次本来放得下的拆分会被误判超限并阻断 |
 | `propagateBlocked` 在 `for (const n of this.byId.values())` 这个**活迭代器**内 `await safePersist` | 目前安全,仅因为它只在 inFlight 为空时被调用。这条不变式是承重的且此前无人写下 |
