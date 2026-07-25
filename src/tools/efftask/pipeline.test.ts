@@ -935,6 +935,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
+    conflictState: async () => ({ markers: true, staged: false, files: ['src/a.ts'] }),
     mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
     integrationBranchName: 'efftask/001/integration',
     ...over,
@@ -1096,10 +1097,10 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     // attempt starting from a tree the last one already edited.
     const n = root()
     let merges = 0
-    const escalations: { node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean }[] = []
+    const escalations: Record<string, unknown>[] = []
     const ctx = {
       ...ctxFor([n], okAgent()),
-      onEscalate: (i: { node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean }) => { escalations.push(i) },
+      onEscalate: (i: Record<string, unknown>) => { escalations.push(i) },
       worktrees: fakePool({
         commitAndMerge: async () => { merges++; return { ok: false, kind: 'conflict', files: ['src/a.ts'] } },
       }) as never,
@@ -1114,7 +1115,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     // 升级人工: the card carries the same facts the tree shows, so the user can act from either.
     expect(escalations.length).toBe(1)
     expect(escalations[0]!.node).toBe(n) // the card names the node, not just a path
-    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'], attempted: true })
+    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'], attempted: true, state: { markers: true, staged: false }, integrationBranch: 'efftask/001/integration' })
   })
 
   it('a failing escalation channel does not change the run verdict', async () => {

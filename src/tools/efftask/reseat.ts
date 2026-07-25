@@ -52,6 +52,24 @@ export interface ReseatResult {
  * the deliberate trade: redo work rather than let half-finished work pass as finished.
  */
 export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps): ReseatResult {
+  // A node blocked ONLY because something below it failed. propagateBlocked writes this
+  // reason on the way up and — unlike the abort path — never sets `interrupted`, so the
+  // ancestors of a reopened node stayed BLOCKED. The scheduler then refuses to pick any node
+  // with a blocked ancestor, so the reopened child was unreachable and the run immediately
+  // re-blocked it as 上级任务阻断: measured, a resume that reopened the right node still made
+  // ZERO model calls and the human's merge fix never landed.
+  const DESCENDANT_BLOCK = new Set(['子节点阻断', '上级任务阻断'])
+  const byId = new Map(nodes.map(n => [n.id, n]))
+  const reopenAncestors = (n: TaskNode): void => {
+    let p = n.parentId === null ? undefined : byId.get(n.parentId)
+    while (p && p.status === 'BLOCKED' && DESCENDANT_BLOCK.has(p.blockedReason)) {
+      p.status = p.childIds.length > 0 ? 'WAITING_CHILDREN' : 'READY'
+      p.blockedReason = ''
+      p.updatedAt = now
+      p = p.parentId === null ? undefined : byId.get(p.parentId)
+    }
+  }
+
   const reseated: string[] = []
   const exhausted: string[] = []
   for (const n of nodes) {
@@ -89,6 +107,8 @@ export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps)
 
     n.status = target
     n.interrupted = false
+    // Reopen the chain above too, or this seat is unreachable.
+    reopenAncestors(n)
     // It is no longer blocked, so the reason must not linger — it would render in the tree
     // and be read as a live failure.
     n.blockedReason = ''

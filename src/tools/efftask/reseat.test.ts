@@ -8,6 +8,62 @@ const mk = (over: Partial<TaskNode> = {}): TaskNode => ({
   ...over,
 })
 
+describe('重开一个节点,却把它的上级留在阻断状态,等于什么也没重开', () => {
+  // Measured end to end before this existed: a decomposed run whose child hit a merge conflict
+  // reopened the child correctly on --resume, and then made ZERO model calls. propagateBlocked
+  // had marked the ancestors 子节点阻断 — a non-abort path that never sets `interrupted` — so
+  // reseat skipped them, the scheduler refuses any node with a blocked ancestor, and the run
+  // immediately re-blocked the child as 上级任务阻断. The human's merge fix never landed.
+  //
+  // The suite could not see it because its only conflict fixture put the conflict on ROOT,
+  // a shape that cannot occur once the tree decomposes — i.e. the normal shape.
+  const tree = (): TaskNode[] => {
+    const root = mk({ id: 'root', childIds: ['root/01', 'root/02'], kind: 'decompose', status: 'BLOCKED', blockedReason: '子节点阻断' })
+    const ok = mk({ id: 'root/01', parentId: 'root', depth: 1, kind: 'executable', status: 'ACCEPTED' })
+    const bad = mk({
+      id: 'root/02', parentId: 'root', depth: 1, kind: 'executable', status: 'BLOCKED',
+      blockedReason: '合并冲突,已保留工作区待人工处理。', mergeConflict: true,
+      worktree: { branch: 'efftask/001/n-02', path: '/wt/02' },
+    })
+    return [root, ok, bad]
+  }
+
+  it('reopens the whole ancestor chain of a conflict node', () => {
+    const nodes = tree()
+    const { reseated } = reseatTransientNodes(nodes, NOW, DEFAULT_CAPS)
+    expect(reseated).toContain('root/02')
+    const root = nodes.find(n => n.id === 'root')!
+    expect(root.status).toBe('WAITING_CHILDREN') // it has children, so this is its seat
+    expect(root.blockedReason).toBe('')          // a stale reason renders as a live failure
+    expect(nodes.find(n => n.id === 'root/01')!.status).toBe('ACCEPTED') // untouched
+  })
+
+  it('does NOT reopen an ancestor that failed on its own account', () => {
+    // Only 子节点阻断 / 上级任务阻断 are propagation artefacts. A parent blocked because ITS
+    // OWN plan review failed must stay blocked — clearing that would resume a tree on a plan
+    // no reviewer ever passed.
+    const nodes = tree()
+    const root = nodes.find(n => n.id === 'root')!
+    root.blockedReason = '方案评审迭代超限(3): [arch] 缺少回滚设计'
+    reseatTransientNodes(nodes, NOW, DEFAULT_CAPS)
+    expect(root.status).toBe('BLOCKED')
+    expect(root.blockedReason).toContain('缺少回滚设计')
+  })
+
+  it('walks the chain more than one level up', () => {
+    const root = mk({ id: 'root', childIds: ['root/01'], kind: 'decompose', status: 'BLOCKED', blockedReason: '子节点阻断' })
+    const mid = mk({ id: 'root/01', parentId: 'root', depth: 1, childIds: ['root/01/01'], kind: 'decompose', status: 'BLOCKED', blockedReason: '子节点阻断' })
+    const leaf = mk({
+      id: 'root/01/01', parentId: 'root/01', depth: 2, kind: 'executable', status: 'BLOCKED',
+      blockedReason: '合并冲突', mergeConflict: true, worktree: { branch: 'b', path: '/wt/x' },
+    })
+    reseatTransientNodes([root, mid, leaf], NOW, DEFAULT_CAPS)
+    expect(root.status).toBe('WAITING_CHILDREN')
+    expect(mid.status).toBe('WAITING_CHILDREN')
+    expect(leaf.status).toBe('READY')
+  })
+})
+
 describe('reseatTransientNodes returns killed-mid-phase nodes to a re-enterable state', () => {
   it('reopens nodes the abort sweep blocked — otherwise resume advances nothing at all', () => {
     // propagateBlocked(aborted) sweeps EVERY non-terminal node to BLOCKED, and Esc, Ctrl+C

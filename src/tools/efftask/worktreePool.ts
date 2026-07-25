@@ -188,10 +188,33 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         const path = pathFor(node)
         const branch = branchFor(node)
 
+        // REFUSE an unresolved merge. `git add -A` on a worktree with a live MERGE_HEAD marks
+        // every conflicted path RESOLVED — with the <<<<<<< text still in it — and the commit
+        // below then becomes a merge commit that fast-forwards straight onto the integration
+        // branch. Measured: markers shipped, node ACCEPTED, nobody paged, and release() then
+        // deleted the worktree because it was clean and merged. Blocking here is strictly
+        // better: the work survives and a human is told.
+        const unmerged = await git(['diff', '--name-only', '--diff-filter=U'], path)
+        const unmergedFiles = unmerged.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        if (unmergedFiles.length > 0) return { ok: false, kind: 'conflict', files: unmergedFiles }
+
         const add = await git(['add', '-A'], path)
         if (add.code !== 0) return { ok: false, kind: 'infra', message: `git add 失败: ${add.stderr.trim()}` }
         const staged = await git(['diff', '--cached', '--quiet'], path)
         const hasStaged = staged.code !== 0
+
+        // Markers can also arrive without an unmerged path — a resolver that edits the file by
+        // hand, or one that "resolves" by leaving both sides in and committing. Scan what this
+        // branch would BRING (its diff against the merge base), not just what is staged: an
+        // earlier version checked only the index and a resolver that committed its markers
+        // sailed straight through. Scanned by pattern rather than `diff --check`, which also
+        // fires on trailing whitespace and would refuse perfectly good commits.
+        const incoming = await git(['diff', '-U0', `${intBranch}...HEAD`], path)
+        const marked = incoming.stdout.split('\n').filter(l => /^\+(<{7}|>{7}|={7})/.test(l))
+        if (marked.length > 0) {
+          const names = await git(['diff', '--name-only', `${intBranch}...HEAD`], path)
+          return { ok: false, kind: 'conflict', files: names.stdout.split('\n').map(l => l.trim()).filter(Boolean) }
+        }
 
         if (hasStaged) {
           const commit = await git(['commit', '--no-verify', '-m', `efftask: ${node.title}`], path)
@@ -323,6 +346,34 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * so a human who follows the escalation card finds exactly what the card describes.
      * Once resolved and committed, the integration merge becomes a fast-forward.
      */
+    /**
+     * What a human will ACTUALLY find in this node's worktree, and a conflict to find if
+     * there is none yet.
+     *
+     * The escalation card describes this directory, so the card can only be truthful if it is
+     * built from a measurement rather than an assumption. Three real states reach an
+     * escalation and they need three different sentences:
+     *   - unmerged paths present  → markers are there, resolve them
+     *   - MERGE_HEAD but no unmerged paths → a resolution is STAGED and was rejected by
+     *     acceptance; telling the user to "git add and commit" would commit exactly the code
+     *     the reviewers just refused
+     *   - clean → the conflict was never reproduced here (budget already spent), so make one
+     *
+     * Never touches a worktree that already has a merge in progress: `mergeIntegrationIntoNode`
+     * would commit the staged resolution before merging, which is the rejected work.
+     */
+    async conflictState(node: TaskNode): Promise<{ markers: boolean; staged: boolean; files: string[] }> {
+      const path = pathFor(node)
+      const u = await git(['diff', '--name-only', '--diff-filter=U'], path)
+      const files = u.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+      if (files.length > 0) return { markers: true, staged: false, files }
+      const mh = await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], path)
+      if (mh.code === 0) return { markers: false, staged: true, files: [] }
+      const made = await this.mergeIntegrationIntoNode(node)
+      if (made.ok && made.conflicted) return { markers: true, staged: false, files: made.files }
+      return { markers: false, staged: false, files: [] }
+    },
+
     async mergeIntegrationIntoNode(node: TaskNode): Promise<{ ok: true; conflicted: false } | { ok: true; conflicted: true; files: string[] } | { ok: false; message: string }> {
       const path = pathFor(node)
       // Commit whatever the executor left loose first: `git merge` refuses to start on a

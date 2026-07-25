@@ -351,6 +351,119 @@ describe('生命周期边界(验收员用真 pool + 真 pipeline 同进程时发
   })
 })
 
+describe('冲突必须发生在节点自己的工作区(spec §8),且绝不带着标记合入', () => {
+  /** Two nodes editing the same line, A merged first — the only way to get a real conflict. */
+  async function conflictingPair() {
+    const p = pool()
+    await p.init()
+    const a = node('n-a'), b = node('n-b')
+    const la = await p.acquire(a), lb = await p.acquire(b)
+    if ('error' in la || 'error' in lb) throw new Error('acquire failed')
+    a.worktree = { branch: la.branch, path: la.path }
+    b.worktree = { branch: lb.branch, path: lb.path }
+    await writeFile(join(la.path, 'shared.txt'), 'line1\nA 版本\nline3\n')
+    await writeFile(join(lb.path, 'shared.txt'), 'line1\nB 版本\nline3\n')
+    await p.commitAndMerge(a)
+    return { p, a, b, pa: la.path, pb: lb.path }
+  }
+
+  it('reproduces the conflict IN the node worktree, with markers and MERGE_HEAD', async () => {
+    // The whole feature rests on this. commitAndMerge merges in the SHARED integration
+    // worktree and then reset --hard + clean -fd there, so at the moment a conflict is
+    // reported the node's own worktree is CLEAN — measured. Sending a resolver (or a human)
+    // there to 解决冲突 pointed both at a directory with nothing in it to resolve.
+    const { p, b, pb } = await conflictingPair()
+    const first = await p.commitAndMerge(b)
+    expect(first.ok).toBe(false)
+    expect(first.ok === false && first.kind).toBe('conflict')
+
+    const before = await git(['status', '--porcelain'], pb)
+    expect(before.stdout.trim()).toBe('') // the defect: clean, nothing to fix
+
+    const made = await p.mergeIntegrationIntoNode(b)
+    expect(made).toEqual({ ok: true, conflicted: true, files: ['shared.txt'] })
+    const mh = await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], pb)
+    expect(mh.code).toBe(0)
+    const txt = await Bun.file(join(pb, 'shared.txt')).text()
+    expect(txt).toContain('<<<<<<<')
+    expect(txt).toContain('A 版本')
+    expect(txt).toContain('B 版本')
+  })
+
+  it('REFUSES to merge an unresolved worktree instead of shipping the markers', async () => {
+    // REGRESSION, and the worst kind: commitAndMerge opens with `git add -A`, which on a
+    // worktree with a live MERGE_HEAD marks every conflicted path RESOLVED with the <<<<<<<
+    // text still in it. The commit became a merge commit, isMerged() said true, and the
+    // integration branch received conflict markers while the node reached ACCEPTED and nobody
+    // was paged. Blocking is strictly better: the work survives and a human is told.
+    const { p, b, pb } = await conflictingPair()
+    await p.commitAndMerge(b)
+    await p.mergeIntegrationIntoNode(b)   // conflict now live in pb, nobody resolves it
+
+    const second = await p.commitAndMerge(b)
+    expect(second.ok).toBe(false)
+    expect(second.ok === false && second.kind).toBe('conflict')
+
+    const intFile = await git(['show', `${p.integrationBranchName}:shared.txt`], gitRoot)
+    expect(intFile.stdout).not.toContain('<<<<<<<')
+    expect(intFile.stdout).toContain('A 版本')
+    // and the node's work is still there to be rescued
+    expect(await Bun.file(join(pb, 'shared.txt')).text()).toContain('<<<<<<<')
+  })
+
+  it('refuses staged conflict markers even with no merge in progress', async () => {
+    // A resolver can also "resolve" by staging a file that still has both sides in it. There
+    // is no MERGE_HEAD in that case, so the unmerged-paths check above does not catch it.
+    const { p, b, pb } = await conflictingPair()
+    await p.commitAndMerge(b)
+    await p.mergeIntegrationIntoNode(b)
+    await writeFile(join(pb, 'shared.txt'), 'line1\n<<<<<<< HEAD\nB 版本\n=======\nA 版本\n>>>>>>> x\nline3\n')
+    await git(['add', '-A'], pb)
+    await git(['commit', '--no-verify', '-qm', 'fake resolve'], pb) // merge concluded, markers kept
+    await writeFile(join(pb, 'other.txt'), 'x\n')
+
+    const res = await p.commitAndMerge(b)
+    expect(res.ok).toBe(false)
+    const intFile = await git(['show', `${p.integrationBranchName}:shared.txt`], gitRoot)
+    expect(intFile.stdout).not.toContain('<<<<<<<')
+  })
+
+  it('a real resolution merges cleanly and keeps BOTH sides', async () => {
+    // The counterfactual that proves the mechanism works, not just that it refuses things.
+    const { p, b, pb } = await conflictingPair()
+    await p.commitAndMerge(b)
+    await p.mergeIntegrationIntoNode(b)
+    await writeFile(join(pb, 'shared.txt'), 'line1\nA 版本 + B 版本\nline3\n')
+    await git(['add', 'shared.txt'], pb)
+
+    const res = await p.commitAndMerge(b)
+    expect(res.ok).toBe(true)
+    const intFile = await git(['show', `${p.integrationBranchName}:shared.txt`], gitRoot)
+    expect(intFile.stdout).toContain('A 版本 + B 版本')
+    expect(intFile.stdout).not.toContain('<<<<<<<')
+  })
+
+  it('conflictState describes what is really there, and only creates a conflict if none exists', async () => {
+    // The escalation card is written from this measurement. Three states, three sentences —
+    // a single claim about <<<<<<< markers was false in two of them.
+    const { p, b, pb } = await conflictingPair()
+    await p.commitAndMerge(b)
+
+    // 1) clean → it makes the conflict so the card's instruction becomes actionable
+    expect(await p.conflictState(b)).toEqual({ markers: true, staged: false, files: ['shared.txt'] })
+    // 2) markers present → reported as-is, no second merge attempted
+    expect(await p.conflictState(b)).toEqual({ markers: true, staged: false, files: ['shared.txt'] })
+    // 3) resolved-and-staged → must NOT be described as a conflict scene, and must NOT be
+    //    re-merged: mergeIntegrationIntoNode would commit the staged work, which on the real
+    //    path is the resolution acceptance had just rejected.
+    await writeFile(join(pb, 'shared.txt'), 'line1\n合并后的\nline3\n')
+    await git(['add', 'shared.txt'], pb)
+    const head = await git(['rev-parse', 'HEAD'], pb)
+    expect(await p.conflictState(b)).toEqual({ markers: false, staged: true, files: [] })
+    expect((await git(['rev-parse', 'HEAD'], pb)).stdout).toBe(head.stdout) // nothing committed
+  })
+})
+
 describe('收口:用户必须能找到自己的工作(spec §8)', () => {
   it('reports the branch, the commit count and anything left behind', async () => {
     // Without this the run ends having written every change to a branch the user is never

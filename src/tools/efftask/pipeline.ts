@@ -47,7 +47,12 @@ export interface PipelineCtx {
    * command layer — the same rule the confirmation card follows. Absent in tests and in runs
    * with no Feishu bridge; the node still blocks with the details in blockedReason either way.
    */
-  onEscalate?: (info: { node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean }) => void
+  onEscalate?: (info: {
+    node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean
+    /** MEASURED state of that worktree, so the card can describe it instead of guessing. */
+    state: { markers: boolean; staged: boolean }
+    integrationBranch?: string
+  }) => void
 }
 
 /**
@@ -650,7 +655,6 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
       let attempted = triedThisRun
       if (node.iteration.mergeResolve < 1) {
         node.iteration.mergeResolve += 1
-        attempted = true
         // Put the conflict INTO this node's own worktree first. Without this the resolver is
         // sent to a clean directory (see mergeIntegrationIntoNode) and can only pretend.
         const local = await ctx.worktrees.mergeIntegrationIntoNode(node)
@@ -673,6 +677,13 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
             `解决后输出:{ "execStatus":"如何解决的" }。` + answerRule(tag),
           cwd: node.worktree.path, signal: ctx.signal,
         })
+        // Set only once the executor has actually been asked. Setting it on entry made the
+        // card claim an attempt on the branch that recurses without ever calling the model.
+        attempted = true
+        // The resolve call is the longest window in this path (a write-capable model call with
+        // the node timeout). An abort landing inside it arrived here with no check and fell
+        // straight through to onEscalate: the run said 已取消 while the card said 等待人工.
+        if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
         if (!resolve.ok) {
           // Record WHY. Every other runPhase failure in this file reports its reason; letting
           // this one fall silently into the generic conflict message hid timeouts entirely.
@@ -685,11 +696,15 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           // strength of the ORIGINAL acceptance would make the edit likeliest to silently drop
           // a feature the one edit nobody checks.
           //
-          // Charged to the acceptance counter so the record does not carry two "第 1 轮" lines,
-          // one PASS and one FAIL, for two different judgements.
-          node.iteration.acceptance++
+          // Round number from the LOG's length, not from iteration.acceptance.
+          //
+          // Incrementing the counter looked equivalent and was not: reseat charges a resumed
+          // node's re-entry against iteration.acceptance and refuses at maxIterations, so a
+          // node that had used its normal rounds became un-resumable the moment it hit a
+          // conflict — measured "恢复时该阶段预算已耗尽(3/3)" on a node whose card had just
+          // told the user to resume it. The rework budget must mean rework.
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
-            phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance,
+            phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
             system: 'accept', buildPrompt: t => acceptPrompt(node, t), ctx, cwd: node.worktree.path,
           })
           node.acceptLog.push(rec)
@@ -698,6 +713,16 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           node.execStatus = `${node.execStatus}\n(冲突解决后验收未通过: ${rec.synthesized.blockingSummary || '验收角色调用失败'})`
         }
       }
+      // MEASURE the worktree instead of asserting anything about it. A blanket re-merge here
+      // was wrong: on the primary path the worktree already holds a STAGED resolution that
+      // acceptance rejected, and merging would have committed exactly that.
+      // Only the two booleans travel: conflictState also returns its own file list, and
+      // shipping both would put two different answers to "which files" on one card.
+      let state = { markers: false, staged: false }
+      try {
+        const probed = await ctx.worktrees.conflictState(node)
+        state = { markers: probed.markers, staged: probed.staged }
+      } catch { /* describe what we already know rather than swallowing the escalation */ }
       // Marks this as a HUMAN-RESUMABLE block. Without it reseat skips the node on every
       // later --resume, which made the escalation card's instructions untrue.
       node.mergeConflict = true
@@ -709,7 +734,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
       // describing something that happened in a previous session — or, after an interrupt,
       // something that never finished at all.
       try {
-        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files: res.files, attempted })
+        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files: res.files, attempted, state, integrationBranch: ctx.worktrees.integrationBranchName })
       } catch { /* a notification failure must not change the run's verdict */ }
       await blockWithReason(node, detail, ctx)
       return false
@@ -769,6 +794,9 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     }
     // No REWORK: a human is in this loop, and sending their resolution back to the executor
     // would discard it. Block again with what the reviewers actually said.
+    // Keep the flag: the user can revise their resolution and resume again. Clearing it made
+    // this a dead end — reseat skipped the node forever and no second card was ever sent.
+    node.mergeConflict = true
     await blockWithReason(node, `人工解决冲突后验收未通过: ${rec.synthesized.blockingSummary || '验收角色调用失败'}`, ctx)
     return
   }

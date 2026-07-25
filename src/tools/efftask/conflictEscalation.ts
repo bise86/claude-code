@@ -22,6 +22,16 @@ export type ConflictEscalation = {
    * previous session — or, after an interrupt, an attempt that never finished.
    */
   attempted: boolean
+  /**
+   * MEASURED state of that worktree at escalation time — not assumed.
+   *
+   * The card's whole value is that the user can act on it without investigating first, so a
+   * wrong description costs more than no description. Three states reach here and each needs
+   * a different instruction; a single sentence about <<<<<<< markers was false in two of them.
+   */
+  state: { markers: boolean; staged: boolean }
+  /** The other side of the merge. Without it the user cannot reproduce the conflict at all. */
+  integrationBranch?: string
 }
 
 /**
@@ -41,12 +51,18 @@ export function escalationLines(e: ConflictEscalation, runId?: string): string[]
     e.attempted
       ? '该节点已自动尝试解决一次未成功,现已暂停等待人工。'
       : '该节点的自动解决机会已在此前用完,本次未再尝试,现已暂停等待人工。',
-    // The conflict is LEFT IN PLACE in that worktree (markers and MERGE_HEAD), which is the
-    // only reason this instruction is actionable. An earlier version pointed here while the
-    // conflict lived — and was then reset away — in the SHARED integration worktree, so a user
-    // who followed it found a clean directory with nothing in it to fix.
-    `处理方式: cd 到上面的工作区,那里就是冲突现场(带 <<<<<<< 标记),解决后 git add 并 git commit;` +
-      `然后用 /et --resume ${runId ?? '<运行 ID>'} 继续,恢复后会重跑验收再合并。`,
+    // Written from the measurement. `staged` in particular must not say "git add 并 commit":
+    // what is staged there is the resolution acceptance JUST REJECTED, so that instruction
+    // would have the user commit verbatim the code the reviewers refused.
+    e.state.staged
+      ? '处理方式: cd 到上面的工作区。自动解决已经改好并 git add 过,但验收未通过 —— ' +
+        '请先看 node.md 的验收记录,改正后再 git commit(不要直接提交现状)。'
+      : e.state.markers
+        ? '处理方式: cd 到上面的工作区,那里就是冲突现场(带 <<<<<<< 标记),解决后 git add 并 git commit。'
+        : '处理方式: cd 到上面的工作区。那里目前没有冲突现场 —— 请自行把集成分支合并进来' +
+          '(git merge <上面的集成分支>),解决冲突后提交。',
+    `集成分支: ${e.integrationBranch ?? '(未知)'}`,
+    `恢复: /et --resume ${runId ?? '<运行 ID>'};恢复后会重跑验收再合并。`,
   ]
 }
 
