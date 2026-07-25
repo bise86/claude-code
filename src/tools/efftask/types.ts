@@ -67,6 +67,14 @@ export interface EffTaskConfig {
    * get right. So the removals travel WITH the config and are shown alongside it.
    */
   notices: string[]
+  /**
+   * The session's main model — what every un-roled phase runs on ("不指定就用主模型").
+   *
+   * Filled in by annotateRoleModels at the command seam, because that is the only place
+   * that can see `options.mainLoopModel`. Optional so a run.md written before this field
+   * existed still parses on the resume path; the roster then degrades to a bare 主模型.
+   */
+  mainModel?: string
 }
 
 export function emptyPhaseRoles(): Record<PhaseName, RoleBinding[]> {

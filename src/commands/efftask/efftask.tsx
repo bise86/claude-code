@@ -9,6 +9,7 @@ import type { Tools } from '../../Tool.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { runOrchestrator, type Outcome } from './runOrchestrator.js'
+import { annotateRoleModels, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { allocateRunId, type FsLike } from '../../tools/efftask/persistence.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
@@ -122,6 +123,10 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       args={args}
       knownRoles={knownRoles}
       unsupportedRoles={unsupportedRoles}
+      // The roster must say which model each seat runs on, and that answer lives in the
+      // agent definitions + the session model — neither of which parseDirectives can see.
+      agentModels={activeAgents}
+      mainModel={context.options.mainLoopModel}
       extractJson={prompt => extractAgent({ phase: 'plan', node: stubNode(), role: null, system: '', prompt, signal })}
       runId={runId}
       runDir={runDir}
@@ -223,6 +228,8 @@ type RunnerProps = {
   args: string
   knownRoles: string[]
   unsupportedRoles: string[]
+  agentModels: AgentModelInfo[]
+  mainModel: string
   extractJson: (prompt: string) => Promise<string>
   runId: string
   runDir: string
@@ -264,25 +271,29 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     onExit(outcomeRef.current)
   }, [abort, detach, onTornDown, onExit])
 
-  const { args, knownRoles, unsupportedRoles, extractJson } = props
+  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
   // call(), which would freeze the terminal with no UI while spending tokens.
   React.useEffect(() => {
     let cancelled = false
     void parseDirectives(args, { knownRoles, unsupportedRoles, modelJson: extractJson })
       // belt & braces: parseDirectives already swallows extraction failures, but a rejection
-      // here would otherwise strand the UI on 'parsing' forever.
-      .catch(() => parseDirectives(args, { knownRoles }))
+      // here would otherwise strand the UI on 'parsing' forever. Keep unsupportedRoles here
+      // too: dropping it would let a cli-mode role back onto the roster unannounced.
+      .catch(() => parseDirectives(args, { knownRoles, unsupportedRoles }))
       .then(cfg => {
         if (cancelled) return
-        setConfig(cfg)
+        // parseDirectives only ever sees role NAMES, so the roster it produces cannot say
+        // which model each one runs on. Resolve that here — this is the only layer that can
+        // see the agent definitions and the session model.
+        setConfig(annotateRoleModels(cfg, agentModels, mainModel))
         setPhase('confirm')
       })
       .catch(logError)
     return () => {
       cancelled = true
     }
-  }, [args, knownRoles, extractJson])
+  }, [args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel])
 
   React.useEffect(() => {
     if (phase !== 'confirm' || !config) return

@@ -27,8 +27,11 @@ export function rosterLines(config: EffTaskConfig): string[] {
     // Show the bound model too: this gate exists to let the user see exactly who is on the
     // panel, and "coder" alone hides which model that role actually runs on.
     const names = config.phaseRoles[p].map(r => (r.model ? `${r.roleName}(${r.model})` : r.roleName))
+    // An un-roled phase runs on the session's main model — name it. "主模型" alone is the
+    // same omission as a bare role name: it says a model was chosen without saying which.
+    const bare = config.mainModel ? `主模型(${config.mainModel})` : '主模型'
     // Same 80-code-point budget as the goal line, so one long roster can't wreck the layout.
-    return `${PHASE_LABEL[p]}: ${clip(names.length > 0 ? names.join('、') : '主模型')}`
+    return `${PHASE_LABEL[p]}: ${clip(names.length > 0 ? names.join('、') : bare)}`
   })
 }
 

@@ -60,22 +60,36 @@ export async function parseDirectives(
     const cliOnly = asked.filter(n => known.has(n) && unsupported.has(n))
     let usable = asked.filter(n => known.has(n) && !unsupported.has(n))
 
-    if (missing.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:未找到角色 ${missing.join('、')},改用主模型`)
-    if (cliOnly.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:角色 ${cliOnly.join('、')} 是 CLI 模式,P1 尚不支持,已忽略`)
-
+    // The trim notices are collected first but PUSHED LAST, because the consequence clause
+    // of the missing/cli notices below can only be written once the roster is final.
+    const trimNotices: string[] = []
     // Only review and accept fan out into a roundtable. plan and execute run ONE agent, so
     // listing extra seats there would put names on the confirmation roster that never get
     // called — the gate must show who actually runs.
     if ((phase === 'plan' || phase === 'execute') && usable.length > 1) {
-      base.notices.push(`${PHASE_LABEL[phase]}:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
+      trimNotices.push(`${PHASE_LABEL[phase]}:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
       usable = usable.slice(0, 1)
     }
     // The observer phase is P3; nothing consults it yet. Showing it on the roster would
     // promise a scorer that never scores.
     if (phase === 'observer' && usable.length > 0) {
-      base.notices.push(`观察:评分角色 ${usable.join('、')} 属 P3,本期不会被调用,已忽略`)
+      trimNotices.push(`观察:评分角色 ${usable.join('、')} 属 P3,本期不会被调用,已忽略`)
       usable = []
     }
+
+    // "改用主模型" is only TRUE when the phase ends up with nobody. Saying it while another
+    // role still holds the seat describes a fallback that never happens — the same class of
+    // untrue gate line these notices exist to prevent. When someone remains, name them, so
+    // the notice and the roster agree. The observer phase never runs at all in P1, so no
+    // fallback occurs there either.
+    const tail =
+      phase === 'observer' ? '已忽略'
+      : usable.length === 0 ? '改用主模型'
+      : `已忽略(${PHASE_LABEL[phase]}仍由 ${usable.join('、')} 承担)`
+    if (missing.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:未找到角色 ${missing.join('、')},${tail}`)
+    if (cliOnly.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:角色 ${cliOnly.join('、')} 是 CLI 模式,P1 尚不支持,${tail}`)
+    base.notices.push(...trimNotices)
+
     base.phaseRoles[phase] = usable.map(name => ({ roleName: name }))
   }
 

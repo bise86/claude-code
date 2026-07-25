@@ -221,12 +221,18 @@ export async function writeRunManifest(
 ): Promise<void> {
   // run-level createdAt from the root node (fallback: first node) for a stable manifest timestamp.
   const createdAt = nodes.find(n => n.parentId === null)?.createdAt ?? nodes[0]?.createdAt ?? ''
+  // Every field the resume path needs to rebuild an EffTaskConfig (§17.2) belongs here —
+  // run.md IS the persisted config. `notices` and `mainModel` are part of that: a resumed
+  // run re-opens the same confirmation gate, and without them it would show a roster with
+  // no models and silently drop the record of what was refused the first time.
   const header = `---\n${yamlStringify({
     createdAt,
     parallelism: cfg.parallelism,
     phaseRoles: cfg.phaseRoles,
     caps: cfg.caps,
     goalPrompt: cfg.goalPrompt,
+    notices: cfg.notices ?? [],
+    ...(cfg.mainModel ? { mainModel: cfg.mainModel } : {}),
     ...(result ? { status: result.status, reason: result.reason ?? '' } : {}),
   })}---\n\n`
   await fs.mkdir(runDir)

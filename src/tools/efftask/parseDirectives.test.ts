@@ -126,3 +126,61 @@ describe('the roster must not promise what will not run', () => {
     expect(cfg.notices.join(' ')).toContain('P3')
   })
 })
+
+describe('a notice must not describe a fallback that never happens', () => {
+  const json = (o: unknown) => async () => JSON.stringify(o)
+
+  it('says who still holds the seat when one of several names was dropped', async () => {
+    // 方案 runs planner1; planner2 is unknown and merely dropped. Announcing "改用主模型"
+    // here would tell the user the plan phase fell back to the main model while the roster
+    // simultaneously shows planner1 — the gate contradicting itself.
+    const cfg = await parseDirectives('方案用 planner1 和 planner2', {
+      knownRoles: ['planner1'],
+      modelJson: json({ phaseRoles: { plan: ['planner1', 'planner2'] } }),
+    })
+    const n = cfg.notices.join(' ')
+    expect(n).toContain('未找到角色 planner2')
+    expect(n).toContain('仍由 planner1 承担')
+    expect(n).not.toContain('改用主模型')
+    expect(cfg.phaseRoles.plan.map(r => r.roleName)).toEqual(['planner1'])
+  })
+
+  it('still says 改用主模型 when the phase really is left with nobody', async () => {
+    const cfg = await parseDirectives('评审用 ghost', {
+      knownRoles: ['arch'],
+      modelJson: json({ phaseRoles: { review: ['ghost'] } }),
+    })
+    expect(cfg.notices.join(' ')).toContain('改用主模型')
+    expect(cfg.phaseRoles.review).toEqual([])
+  })
+
+  it('a dropped reviewer names the reviewers that remain, so the panel size is honest', async () => {
+    const cfg = await parseDirectives('评审用 arch、sec、ghost', {
+      knownRoles: ['arch', 'sec'],
+      modelJson: json({ phaseRoles: { review: ['arch', 'sec', 'ghost'] } }),
+    })
+    expect(cfg.notices.join(' ')).toContain('仍由 arch、sec 承担')
+    expect(cfg.phaseRoles.review.map(r => r.roleName)).toEqual(['arch', 'sec'])
+  })
+
+  it('a cli-mode role that empties the phase reports the fallback, not a bare 已忽略', async () => {
+    const cfg = await parseDirectives('验收用 codex-reviewer', {
+      knownRoles: ['codex-reviewer'],
+      unsupportedRoles: ['codex-reviewer'],
+      modelJson: json({ phaseRoles: { accept: ['codex-reviewer'] } }),
+    })
+    const n = cfg.notices.join(' ')
+    expect(n).toContain('CLI 模式')
+    expect(n).toContain('改用主模型')
+    expect(cfg.phaseRoles.accept).toEqual([])
+  })
+
+  it('the observer phase never claims a fallback — nothing runs there at all', async () => {
+    const cfg = await parseDirectives('观察用 ghost', {
+      knownRoles: ['arch'],
+      modelJson: json({ phaseRoles: { observer: ['ghost'] } }),
+    })
+    expect(cfg.notices.join(' ')).not.toContain('改用主模型')
+    expect(cfg.phaseRoles.observer).toEqual([])
+  })
+})
