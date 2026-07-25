@@ -1,4 +1,4 @@
-import type { Caps, NodeStatus, TaskNode } from './types.js'
+import type { Caps, NodeStatus, TaskNode } from '../types.js'
 
 /**
  * Statuses that mean "a phase was in flight". A process kill leaves these on disk while
@@ -114,29 +114,8 @@ export function reseatTransientNodes(
     // Re-entry for this node is the ACCEPTANCE+merge path in stepExecute, which the flag
     // itself selects; the READY seat below is only how the scheduler picks it up again.
 
-    /**
-     * A valve retry must re-enter the phase that FAILED, not the phase the node's shape
-     * suggests.
-     *
-     * `stepStart` writes `node.kind` from the plan output BEFORE the review roundtable runs,
-     * so a plan that called itself `executable` and was then rejected three times sits at
-     * BLOCKED with kind === 'executable'. The structural rule below would seat it at READY —
-     * and `--retry-blocked` would hand a plan the reviewers unanimously refused straight to a
-     * write-capable executor, with zero plan calls and zero reviews. Measured: phases called
-     * were ["execute", "accept"] and the node reached ACCEPTED with planReview still at 3.
-     *
-     * If the exhausted budget was planReview, the node goes back to CREATED and re-plans.
-     */
-    // Rule 1 still wins. A node that ALREADY has children must never go to CREATED — that is
-    // what builds a SECOND set (see the rules above), and no amount of "the review failed"
-    // justifies duplicating a subtree. Believed unreachable today (a node that passed review
-    // has planReview < cap, and growTree refuses PLAN_REVIEW targets), but the ordering is
-    // what makes that a guarantee rather than an observation.
-    const reviewExhausted =
-      retryValve && n.childIds.length === 0 && n.iteration.planReview >= caps.maxIterations
     const target: NodeStatus =
       n.childIds.length > 0 ? 'WAITING_CHILDREN'
-      : reviewExhausted ? 'CREATED'
       : n.kind === 'executable' ? 'READY'
       : 'CREATED'
 
@@ -194,10 +173,7 @@ export function reseatTransientNodes(
       n.execStatus = `${n.execStatus}\n${ANNOTATION}`
     }
     n.updatedAt = now
-    // Counted ONCE. A valve retry already has its own (louder) section at the resume gate;
-    // pushing it here as well made "重开 1 个节点" render alongside "重新排队 1 个节点" with
-    // the same id in both lists, reading as two nodes.
-    if (!retryValve) reseated.push(n.id)
+    reseated.push(n.id)
   }
   return { nodes, reseated, exhausted, retried }
 }

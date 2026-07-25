@@ -346,3 +346,53 @@ describe('--retry-blocked 不能让被否掉的方案绕过评审', () => {
     expect(r.reseated).toEqual([]) // the resume gate renders both counts; this read as 2 nodes
   })
 })
+
+describe('--retry-blocked 的边界:不能凭"评审失败"复制一整棵子树', () => {
+  it('已经有子节点的节点仍然回 WAITING_CHILDREN,即使 planReview 也到顶', () => {
+    // Rule 1 of this module: a node that already has children must NEVER go to CREATED —
+    // that is what builds a SECOND set. The review-exhausted branch must not override it.
+    const parent = mk({
+      id: 'root', kind: 'decompose', status: 'BLOCKED', capBlocked: true,
+      childIds: ['root/01-a'], blockedReason: '集成验收迭代超限(3)',
+      iteration: { planReview: 3, acceptance: 0, integration: 3, scoring: 0, mergeResolve: 0 },
+    })
+    const kid = mk({ id: 'root/01-a', parentId: 'root', depth: 1, status: 'ACCEPTED', kind: 'executable' })
+    reseatTransientNodes([parent, kid], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(parent.status).toBe('WAITING_CHILDREN')
+    expect(parent.childIds).toEqual(['root/01-a']) // no second set
+    expect(parent.iteration.integration).toBe(0)   // the budget that actually binds here
+  })
+
+  it('两个计数都到顶的无子节点则回 CREATED —— 方案是根源', () => {
+    const n = mk({
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true,
+      blockedReason: '评审迭代超限(3)',
+      iteration: { planReview: 3, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.status).toBe('CREATED')
+    expect(n.iteration.planReview).toBe(0)
+  })
+})
+
+describe('阻断原因的字符串耦合', () => {
+  it('传播理由是精确匹配的,而带处置办法的理由绝不会污染它们', () => {
+    // reseat matches PROPAGATED with FULL EQUALITY (.has(n.blockedReason)). blockWithReason now
+    // decorates its reason with the remedy and the retry command, so if those two ever met,
+    // the ancestor-reopening walk would silently stop working. They cannot: the propagated
+    // literals are written only by propagateBlocked (orchestrator.ts), which does not go
+    // through blockWithReason. This test is the tripwire if that ever changes.
+    const parent = mk({ id: 'root', status: 'BLOCKED', blockedReason: '子节点阻断', childIds: ['root/01-a'], kind: 'decompose' })
+    const child = mk({
+      id: 'root/01-a', parentId: 'root', depth: 1, kind: 'executable', status: 'BLOCKED',
+      capBlocked: true,
+      // A DECORATED reason, exactly as blockWithReason writes it now.
+      blockedReason: '验收迭代超限(3): 缺测试 · 先看该节点的验收记录… · 重试: /et --resume 007 --retry-blocked',
+      iteration: { planReview: 0, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([parent, child], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(child.status).toBe('READY')
+    expect(parent.status).toBe('WAITING_CHILDREN') // the exact-match walk still fires
+    expect(parent.blockedReason).toBe('')
+  })
+})
