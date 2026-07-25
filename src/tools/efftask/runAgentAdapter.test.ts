@@ -41,12 +41,15 @@ describe('runAgentAdapter helpers', () => {
     expect(text).toBe('part1 part2')
   })
 
-  it('makeRunAgentFn stops consuming once req.signal is aborted', async () => {
+  it('makeRunAgentFn does not dispatch at all when the signal is ALREADY aborted', async () => {
+    // An abort racing the next phase call must not launch a real, tool-bearing sub-agent —
+    // in the execute phase that pool is write-capable.
     const ac = new AbortController()
-    ac.abort() // already aborted before the run starts
+    ac.abort()
+    let dispatched = false
     async function* fakeRun(): AsyncGenerator<any> {
+      dispatched = true
       yield { type: 'assistant', message: { content: [{ type: 'text', text: 'first' }] } }
-      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'second' }] } }
     }
     const fn = makeRunAgentFn({
       toolUseContext: {} as any,
@@ -57,8 +60,33 @@ describe('runAgentAdapter helpers', () => {
       mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fakeRun as any,
     })
-    const text = await fn({ phase: 'plan', node: {} as any, role: null, system: 's', prompt: 'p', signal: ac.signal })
-    expect(text).toBe('first') // breaks after the first message; 'second' never consumed
+    const text = await fn({ phase: 'execute', node: {} as any, role: null, system: 's', prompt: 'p', signal: ac.signal })
+    expect(dispatched).toBe(false)
+    expect(text).toBe('')
+  })
+
+  it('makeRunAgentFn stops consuming once the signal aborts mid-stream', async () => {
+    const ac = new AbortController()
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'first' }] } }
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'second' }] } }
+    }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as any,
+      canUseTool: (async () => ({ behavior: 'allow' })) as any,
+      availableTools: [] as any,
+      readOnlyTools: [] as any,
+      activeAgents: [],
+      mainModelDefault: { agentType: 'main' } as any,
+      runAgentImpl: fakeRun as any,
+    })
+    // Cancel from outside once the first message lands — the real timing of a user hitting
+    // Esc, rather than the generator cancelling itself between yields.
+    const text = await fn({
+      phase: 'plan', node: {} as any, role: null, system: 's', prompt: 'p',
+      signal: ac.signal, onChunk: () => ac.abort(),
+    })
+    expect(text).toBe('first') // 'second' is never consumed
   })
 
   const baseDeps = (runAgentImpl: unknown) => ({
@@ -117,6 +145,45 @@ describe('runAgentAdapter helpers', () => {
     await makeRunAgentFn(baseDeps(fakeRun))(req({ phase: 'execute', cwd: '/tmp/some-worktree' }))
     expect(observedWorktreePath).toBe('/tmp/some-worktree')
     expect(observedCwd).toBe('/tmp/some-worktree')
+  })
+
+  it('collectText handles string content, multiple blocks and interleaved block types', async () => {
+    // `content` as a plain string is a real variant in this codebase; iterating it as
+    // blocks would silently yield '' and erase the whole answer.
+    expect(collectText([{ type: 'assistant', message: { content: '纯字符串回答' } } as any])).toBe('纯字符串回答')
+    expect(collectText([
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'A' }, { type: 'thinking', thinking: 'x' }, { type: 'text', text: 'B' }] } },
+      { type: 'assistant', message: { content: [] } },
+      { type: 'assistant', message: { content: '尾巴' } },
+    ] as any)).toBe('AB尾巴')
+  })
+
+  it('a rejecting sub-agent propagates instead of becoming a bogus empty answer', async () => {
+    // roundtable's Promise.allSettled turns this into an infra-flagged failing verdict; if
+    // it were swallowed into '', the phase would read as a real (empty) answer instead.
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'partial' }] } }
+      throw new Error('provider exploded')
+    }
+    await expect(makeRunAgentFn(baseDeps(fakeRun))(req({ phase: 'plan' }))).rejects.toThrow('provider exploded')
+  })
+
+  it('onChunk receives each message individually, not the cumulative buffer', async () => {
+    const chunks: string[] = []
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'AAA' }] } }
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'BBB' }] } }
+    }
+    const text = await makeRunAgentFn(baseDeps(fakeRun))(req({ phase: 'plan', onChunk: (t: string) => chunks.push(t) }))
+    expect(chunks).toEqual(['AAA', 'BBB'])
+    expect(text).toBe('AAABBB')
+  })
+
+  it('pickAgentDefinition resolves a duplicated agentType to the first match', () => {
+    const first = { agentType: 'dup', tag: 1 } as any
+    const second = { agentType: 'dup', tag: 2 } as any
+    const main = { agentType: 'main' } as any
+    expect(pickAgentDefinition({ roleName: 'dup' }, [first, second], main)).toBe(first)
   })
 
   it('a throwing onChunk does not take the call down', async () => {

@@ -2466,12 +2466,20 @@ import type { ModelAlias } from '../../utils/model/aliases.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { runWithCwdOverride } from '../../utils/cwd.js'
 import type { RunAgentFn } from './roundtable.js'
+import type { RoleBinding } from './types.js'
 
 export function collectText(messages: Message[]): string {
   let out = ''
   for (const m of messages) {
     if (m.type !== 'assistant') continue
-    for (const block of (m.message.content as { type: string; text?: string }[])) {
+    const content = m.message.content
+    // `content` is a plain string in one legitimate variant (see utils/messages.ts and
+    // services/api/claude.ts). Falling through to the block loop would iterate CHARACTERS,
+    // every `.type` would be undefined, and the whole answer would vanish silently — the
+    // exact "dropped content corrupts every downstream decision" failure this seam exists
+    // to avoid.
+    if (typeof content === 'string') { out += content; continue }
+    for (const block of (content as { type: string; text?: string }[])) {
       if (block.type === 'text' && typeof block.text === 'string') out += block.text
     }
   }
@@ -2479,11 +2487,13 @@ export function collectText(messages: Message[]): string {
 }
 
 export function pickAgentDefinition(
-  role: { roleName: string } | null,
+  role: RoleBinding | null,
   activeAgents: AgentDefinition[],
   mainModelDefault: AgentDefinition,
 ): AgentDefinition {
   if (!role) return mainModelDefault
+  // First match wins on a duplicated agentType — deterministic, and the roster order is
+  // itself deterministic (settings order), so the same role always resolves the same way.
   return activeAgents.find(a => a.agentType === role.roleName) ?? mainModelDefault
 }
 
@@ -2502,6 +2512,10 @@ export function makeRunAgentFn(deps: {
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
   return async req => {
+    // Already cancelled → don't start a sub-agent at all. Without this an abort racing the
+    // next phase call still launches a real, tool-bearing agent (write-capable in the
+    // execute phase). runRoundtable guards the same way for the same reason.
+    if (req.signal.aborted) return ''
     const agentDefinition = pickAgentDefinition(req.role, deps.activeAgents, deps.mainModelDefault)
     // Per-phase tool gating: only the execute phase gets the write-capable tool pool.
     const tools: Tools = req.phase === 'execute' ? deps.availableTools : deps.readOnlyTools
