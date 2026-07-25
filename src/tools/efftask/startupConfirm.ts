@@ -182,3 +182,22 @@ export function resumeSummarySections(s: ResumeSummary): SummarySection[] {
   }
   return out
 }
+
+/** Hard bounds for the confirmation gate's parallelism editor; mirrors parseDirectives' clamp. */
+export const MIN_PARALLELISM = 1
+export const MAX_PARALLELISM = 64
+export const clampParallelism = (n: number): number =>
+  Math.min(MAX_PARALLELISM, Math.max(MIN_PARALLELISM, Math.trunc(n) || MIN_PARALLELISM))
+
+/**
+ * The one place that describes what `parallelism` currently BUYS.
+ *
+ * Shared by both terminal gates and the Feishu card for the same reason `rosterLines` is:
+ * the three surfaces previously carried three separately-worded hardcoded strings, two of
+ * which still said "P1 串行执行,此值 P2 生效" after the pool shipped. A gate that describes
+ * the run wrongly is the one failure this gate exists to prevent.
+ */
+export function parallelismLine(config: EffTaskConfig, opts: { editable: boolean }): string {
+  const hint = opts.editable ? ' · ←/→ 调整' : ''
+  return `并行数: ${config.parallelism}（读取/评审/验收阶段并行;执行阶段串行,隔离能力见 P2b）${hint}`
+}

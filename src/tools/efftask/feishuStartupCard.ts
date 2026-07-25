@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig } from './types.js'
-import { goalLine, noticeLines, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -30,7 +30,9 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
   const goal = goalLine(config.goalPrompt)
   const body =
     `**目标**: ${goal}\n` +
-    `**并行数**: ${config.parallelism}（P1 串行,值 P2 生效）\n` +
+    // Same sentence as the terminal, from the same function. A Feishu approver must not
+    // be told something different about the run than the person at the keyboard.
+    `**${parallelismLine(config, { editable: false })}**（如需调整请在终端确认界面修改）\n` +
     `**安全阀**: 深度${config.caps.maxDepth} / 节点${config.caps.maxNodes} / 迭代${config.caps.maxIterations}\n` +
     `**角色名册**:\n${rosterLines(config).map(l => `- ${l}`).join('\n')}` +
     // The roster says who WILL run; this says whose request was dropped and why. Without it

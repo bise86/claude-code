@@ -2,7 +2,7 @@ import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
 import type { EffTaskConfig } from '../../tools/efftask/types.js'
 import {
-  goalLine, noticeLines, rosterLines, resumeSummarySections,
+  clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections,
   type ResumeSummary, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -20,17 +20,20 @@ export function ConfirmResume(props: {
   summary: ResumeSummary
   onDecision: (d: StartupDecision) => void
 }): React.ReactElement {
+  const [parallelism, setParallelism] = React.useState(clampParallelism(props.config.parallelism))
   useInput((input, key) => {
     const k = input.toLowerCase()
-    if (key.return || k === 'y') props.onDecision({ parallelism: props.config.parallelism, approved: true })
-    else if (key.escape || k === 'n' || k === 'v') props.onDecision({ parallelism: props.config.parallelism, approved: false })
+    if (key.leftArrow || input === '-') { setParallelism(p => clampParallelism(p - 1)); return }
+    if (key.rightArrow || input === '+' || input === '=') { setParallelism(p => clampParallelism(p + 1)); return }
+    if (key.return || k === 'y') props.onDecision({ parallelism, approved: true })
+    else if (key.escape || k === 'n' || k === 'v') props.onDecision({ parallelism, approved: false })
   })
   const sections = resumeSummarySections(props.summary)
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 恢复确认</Text>
       <Text>目标: {goalLine(props.config.goalPrompt)}</Text>
-      <Text>并行数: {props.config.parallelism}（P1 串行执行,此值 P2 生效）</Text>
+      <Text>{parallelismLine({ ...props.config, parallelism }, { editable: true })}</Text>
       <Text bold>角色名册:</Text>
       {rosterLines(props.config).map(line => <Text key={line}>  {line}</Text>)}
       {noticeLines(props.config).length > 0 && (

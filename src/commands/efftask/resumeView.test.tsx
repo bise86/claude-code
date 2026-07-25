@@ -184,3 +184,75 @@ describe('ConfirmResume (vendored renderer)', () => {
     app.unmount()
   })
 })
+
+
+import { ConfirmStartup } from './ConfirmStartup.js'
+
+const RIGHT = ESC + '[C'
+const LEFT = ESC + '[D'
+
+describe('the gate lets the user CHANGE the parallelism (用户第四句)', () => {
+  // "各任务执行可以并行,默认5个,需求提示词可指定,可跟用户确认修改" — the fourth clause.
+  // Both branches used to echo props.config.parallelism, so the number was display-only, and
+  // the Feishu card's own comment said "the card has no inline editor in P1".
+  const propsFor = (name: string, onDecision: (d: { parallelism: number; approved: boolean }) => void) =>
+    (name === 'ConfirmResume' ? { config, summary, onDecision } : { config, onDecision }) as never
+
+  for (const [name, Comp] of [
+    ['ConfirmStartup', ConfirmStartup],
+    ['ConfirmResume', ConfirmResume],
+  ] as [string, (p: never) => React.ReactElement][]) {
+    it(name + ': arrows change it and the decision carries the NEW value', async () => {
+      const decisions: { parallelism: number; approved: boolean }[] = []
+      const { stdin, stdout, lastFrame } = fakeTty()
+      const app = await render(
+        React.createElement(Comp as never, propsFor(name, d => decisions.push(d))),
+        { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      expect(lastFrame()).toContain('并行数: 3')
+      stdin.press(RIGHT)
+      await tick()
+      stdin.press('+')
+      await tick()
+      // The renderer repaints only the CHANGED line, so the accumulated buffer holds a bare
+      // "5" rather than the whole label — assert the contract (what onDecision carries),
+      // not the intermediate frame.
+      expect(lastFrame()).toMatch(/\n\s*5\r?\n/)
+      stdin.press('\r')
+      await tick()
+      expect(decisions).toEqual([{ parallelism: 5, approved: true }])
+      app.unmount()
+    })
+
+    it(name + ': cannot be pushed below 1', async () => {
+      const decisions: { parallelism: number; approved: boolean }[] = []
+      const { stdin, stdout } = fakeTty()
+      const app = await render(
+        React.createElement(Comp as never, propsFor(name, d => decisions.push(d))),
+        { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      for (let i = 0; i < 6; i++) { stdin.press(LEFT); await tick() }
+      stdin.press('\r')
+      await tick()
+      expect(decisions[0].parallelism).toBe(1)
+      app.unmount()
+    })
+
+    it(name + ': describes what parallelism actually buys today', async () => {
+      // Three surfaces once carried three separately-worded hardcoded strings, two of which
+      // still claimed "P1 串行执行" after the concurrent pool shipped.
+      const { stdin, stdout, lastFrame } = fakeTty()
+      const app = await render(
+        React.createElement(Comp as never, propsFor(name, () => {})),
+        { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      const frame = lastFrame()
+      expect(frame).toContain('执行阶段串行')
+      expect(frame).not.toContain('P1 串行执行')
+      app.unmount()
+    })
+  }
+})
