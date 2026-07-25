@@ -529,3 +529,106 @@ describe('the node-count cap must hold when decompositions overlap', () => {
     expect(ctx.reserved()).toBe(0)
   })
 })
+
+describe('观察评分 is advisory by default and bounded when it is not', () => {
+  const scoreTag = (req: { prompt: string }) =>
+    '```' + (req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score')
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+
+  const agentWith = (scores: { plan: number; exec: number }[], seen?: string[]) => {
+    let n = 0
+    let calls = 0
+    return (async (req: { phase: string; prompt: string }) => {
+      // Hard call cap. Removing the one-rework guard makes the execute→accept loop
+      // UNBOUNDED, and an unbounded loop hangs the test rather than failing it — which
+      // takes the whole suite down with a timeout instead of naming the defect. Turning
+      // the hang into a thrown failure is what makes that mutation observable.
+      if (++calls > 30) throw new Error('评分返工未收敛:调用次数超过 30')
+      seen?.push(req.phase)
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'observer') {
+        const s = scores[Math.min(n++, scores.length - 1)]
+        return `${scoreTag(req)}\n{"plan":{"score":${s.plan},"rationale":"方案还行"},"exec":{"score":${s.exec},"rationale":"执行一般"}}\n\`\`\``
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+  }
+  /** phaseRoles live on the NODE — firstRole reads node.phaseRoles, not ctx.config. */
+  const observerRoot = () => createNode({
+    id: 'root', title: 'r', parentId: null, deps: [], depth: 0,
+    phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] }, now: NOW,
+  })
+  const withObserver = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    ...cfg,
+    phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] },
+    ...over,
+  })
+
+  it('does not run at all when no observer role is bound', async () => {
+    const seen: string[] = []
+    const n = root()
+    const ctx = ctxFor([n], agentWith([{ plan: 10, exec: 10 }], seen))
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(seen).not.toContain('observer')
+    expect(n.score.plan).toBeUndefined()
+  })
+
+  it('records the scores and accepts anyway when no threshold is set', async () => {
+    // spec §11: 默认仅记录,不触发返工.
+    const n = observerRoot()
+    const ctx = ctxFor([n], agentWith([{ plan: 3, exec: 5 }]), withObserver())
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.score.plan).toEqual({ role: 'watcher', score: 3, rationale: '方案还行' })
+    expect(n.score.exec?.score).toBe(5)
+    expect(n.iteration.scoring).toBe(0)
+  })
+
+  it('a low score under a threshold triggers exactly ONE rework, then proceeds', async () => {
+    // An advisory number must not be able to spend an unbounded number of write-capable
+    // execute calls. Second round scores low too — the node still ends ACCEPTED.
+    const seen: string[] = []
+    const n = observerRoot()
+    const ctx = ctxFor([n], agentWith([{ plan: 10, exec: 10 }, { plan: 10, exec: 10 }], seen),
+      withObserver({ caps: { ...DEFAULT_CAPS, scoreThreshold: 60 } }))
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.iteration.scoring).toBe(1)
+    expect(seen.filter(p => p === 'execute')).toHaveLength(2) // reworked once
+    expect(seen.filter(p => p === 'observer')).toHaveLength(2)
+  })
+
+  it('a passing score under a threshold does not rework', async () => {
+    const seen: string[] = []
+    const n = observerRoot()
+    const ctx = ctxFor([n], agentWith([{ plan: 90, exec: 80 }], seen),
+      withObserver({ caps: { ...DEFAULT_CAPS, scoreThreshold: 60 } }))
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(seen.filter(p => p === 'execute')).toHaveLength(1)
+    expect(n.iteration.scoring).toBe(0)
+  })
+
+  it('a failing scoring CALL never costs the node its acceptance', async () => {
+    // Acceptance already passed; scoring is advisory. Failing the node here would discard
+    // real completed work over an optional number.
+    const n = observerRoot()
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'observer') throw new Error('观察角色掉线')
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = ctxFor([n], agent, withObserver({ caps: { ...DEFAULT_CAPS, scoreThreshold: 60 } }))
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.score.plan?.rationale).toContain('评分调用失败')
+  })
+})

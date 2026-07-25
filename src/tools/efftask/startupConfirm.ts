@@ -21,9 +21,12 @@ export function clip(s: string, max = 80): string {
 
 export function rosterLines(config: EffTaskConfig): string[] {
   return PHASE_NAMES.map(p => {
-    // The observer phase is P3: nothing consults it, so naming ANY occupant — a role or
-    // "主模型" — would put a seat on the panel that never speaks. Say it plainly instead.
-    if (p === 'observer') return `${PHASE_LABEL[p]}: (评分本期未启用)`
+    // Scoring is OPT-IN: with no observer role nothing scores, and it does NOT fall back to
+    // the main model the way the other phases do. Saying 主模型 here would promise a scorer
+    // that never runs.
+    if (p === 'observer' && config.phaseRoles.observer.length === 0) {
+      return `${PHASE_LABEL[p]}: (未配置,不评分)`
+    }
     // Show the bound model too: this gate exists to let the user see exactly who is on the
     // panel, and "coder" alone hides which model that role actually runs on.
     const names = config.phaseRoles[p].map(r => (r.model ? `${r.roleName}(${r.model})` : r.roleName))

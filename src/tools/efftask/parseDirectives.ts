@@ -70,11 +70,11 @@ export async function parseDirectives(
       trimNotices.push(`${PHASE_LABEL[phase]}:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
       usable = usable.slice(0, 1)
     }
-    // The observer phase is P3; nothing consults it yet. Showing it on the roster would
-    // promise a scorer that never scores.
-    if (phase === 'observer' && usable.length > 0) {
-      trimNotices.push(`观察:评分角色 ${usable.join('、')} 属 P3,本期不会被调用,已忽略`)
-      usable = []
+    // Scoring runs ONE observer, like plan and execute — node.score holds a single record
+    // per dimension, so listing more would put names on the roster that never get called.
+    if (phase === 'observer' && usable.length > 1) {
+      trimNotices.push(`观察:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
+      usable = usable.slice(0, 1)
     }
 
     // "改用主模型" is only TRUE when the phase ends up with nobody. Saying it while another
@@ -83,7 +83,9 @@ export async function parseDirectives(
     // the notice and the roster agree. The observer phase never runs at all in P1, so no
     // fallback occurs there either.
     const tail =
-      phase === 'observer' ? '已忽略'
+      // An un-roled observer phase does not fall back to the main model — scoring is opt-in
+      // and simply does not happen.
+      phase === 'observer' && usable.length === 0 ? '已忽略(未配置观察角色时不评分)'
       : usable.length === 0 ? '改用主模型'
       : `已忽略(${PHASE_LABEL[phase]}仍由 ${usable.join('、')} 承担)`
     if (missing.length > 0) base.notices.push(`${PHASE_LABEL[phase]}:未找到角色 ${missing.join('、')},${tail}`)

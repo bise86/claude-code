@@ -119,11 +119,29 @@ describe('the roster must not promise what will not run', () => {
     expect(cfg.notices.join(' ')).toContain('e2')
   })
 
-  it('does not seat an observer that P1 never calls', async () => {
+  it('seats the observer now that scoring actually runs', async () => {
+    // This assertion used to be the opposite: while scoring was unimplemented the roster
+    // dropped every observer and said so, because naming a scorer that never scores is the
+    // untrue-gate failure these notices exist to prevent. Scoring is implemented now, so the
+    // seat is real — and the test flips with the behaviour rather than being deleted.
     const cfg = await withRoles({ observer: ['watcher'] }, { knownRoles: ['watcher'] })
+    expect(cfg.phaseRoles.observer).toEqual([{ roleName: 'watcher' }])
+    expect(cfg.notices.join(' ')).not.toContain('watcher')
+  })
+
+  it('seats only the FIRST observer — node.score holds one record per dimension', async () => {
+    const cfg = await withRoles({ observer: ['w1', 'w2'] }, { knownRoles: ['w1', 'w2'] })
+    expect(cfg.phaseRoles.observer).toEqual([{ roleName: 'w1' }])
+    expect(cfg.notices.join(' ')).toContain('w2')
+  })
+
+  it('an unknown observer does NOT fall back to the main model — scoring is opt-in', async () => {
+    // Every other phase falls back to 主模型. Scoring must not: silently promoting the main
+    // model into a scorer nobody asked for would spend real calls on an advisory number.
+    const cfg = await withRoles({ observer: ['ghost'] }, { knownRoles: ['arch'] })
     expect(cfg.phaseRoles.observer).toEqual([])
-    expect(cfg.notices.join(' ')).toContain('watcher')
-    expect(cfg.notices.join(' ')).toContain('P3')
+    expect(cfg.notices.join(' ')).toContain('不评分')
+    expect(cfg.notices.join(' ')).not.toContain('改用主模型')
   })
 })
 

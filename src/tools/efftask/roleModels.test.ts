@@ -58,7 +58,7 @@ describe('annotateRoleModels feeds the roster the fourth thing the gate was aske
     expect(lines).toContain(`评审: arch(${MAIN})、sec(gpt-4o)`)
     // 不指定就用主模型 — and the gate must say WHICH main model, not just "主模型".
     expect(lines).toContain(`执行: 主模型(${MAIN})`)
-    expect(lines).toContain('观察: (评分本期未启用)') // P3 seat stays honest
+    expect(lines).toContain('观察: (未配置,不评分)') // scoring is opt-in, and says so
   })
 
   it('resolves a duplicated agentType the same way pickAgentDefinition does (first wins)', () => {

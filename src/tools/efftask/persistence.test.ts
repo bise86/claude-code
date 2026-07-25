@@ -111,7 +111,7 @@ describe('persistence', () => {
     n.execStatus = '改了文件\n---\n# 标题\n```json\n{"a":1}\n```\n\t制表符 🎉 中文'
     n.plan = { solution: '---\n方案', keyPoints: '&anchor', risks: '2026-07-25', acceptance: 'yes' }
     n.worktree = { branch: 'efftask/001/root-01-x', path: '/tmp/wt' }
-    n.iteration = { planReview: 2, acceptance: 1, integration: 0 }
+    n.iteration = { planReview: 2, acceptance: 1, integration: 0, scoring: 3 }
     n.reviewLog = [{ round: 1, verdicts: [{ role: 'arch', pass: false, blocking: ['缺验收点'], comments: 'c' }], synthesized: { pass: false, blockingSummary: '[arch] 缺验收点' } }]
     n.acceptLog = []
     n.score = { plan: { role: 'obs', score: 88, rationale: 'ok' }, exec: { role: 'obs', score: 91, rationale: 'good' } }
@@ -127,7 +127,7 @@ describe('persistence', () => {
     const text = serializeNode(n).replace(/\n {2}integration: 0/, '')
     expect(text).not.toContain('integration')
     const back = parseNodeFile(text)
-    expect(back.iteration).toEqual({ planReview: 0, acceptance: 0, integration: 0 })
+    expect(back.iteration).toEqual({ planReview: 0, acceptance: 0, integration: 0, scoring: 0 })
     // and a garbage counter is not trusted either
     const junk = parseNodeFile(serializeNode(n).replace('planReview: 0', 'planReview: "many"'))
     expect(junk.iteration.planReview).toBe(0)

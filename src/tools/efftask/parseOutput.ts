@@ -11,7 +11,7 @@ import type { NodeKind, NodePlan, Verdict } from './types.js'
  * recency both mis-select it, silently turning a fail into a pass. The tag is what
  * actually separates answer from quotation.
  */
-export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec' } as const
+export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec', score: 'score' } as const
 export type AnswerTag = (typeof ANSWER_TAGS)[keyof typeof ANSWER_TAGS]
 
 /**
@@ -235,4 +235,38 @@ export function parseExecOutput(text: string, tag: string = ANSWER_TAGS.exec): {
   const { obj } = pickAnswer(text, tag, o => typeof o.execStatus === 'string')
   if (obj) return { execStatus: str(obj.execStatus) }
   return { execStatus: text.trim() }
+}
+
+/**
+ * An observer's scores for a node: plan quality and execution quality, 0-100, with reasons.
+ *
+ * Out-of-range or unparseable numbers are CLAMPED rather than rejected. A score is advisory
+ * by default (it only gates anything when caps.scoreThreshold is set), so failing the phase
+ * over a malformed number would cost a real rework round for a field nobody is gating on.
+ * A missing number reads as 0, and 0 is the most conservative reading — with a threshold
+ * configured it triggers the rework rather than waving the work through.
+ */
+export function parseScoreOutput(
+  text: string, tag: string,
+): { plan: { score: number; rationale: string }; exec: { score: number; rationale: string } } {
+  const clamp = (v: unknown): number => {
+    const n = typeof v === 'number' ? Math.round(v) : Number.NaN
+    return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0
+  }
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '')
+  // requireTag: the score is read out of a reply that also QUOTES the node's plan and
+  // execStatus, both written by other agents. Without the tag an executor could plant a
+  // score block in its own report and grade itself.
+  const { obj } = pickAnswer(text, tag, o => 'plan' in o || 'exec' in o, true)
+  if (!obj) {
+    const miss = '未按要求输出评分代码块'
+    return { plan: { score: 0, rationale: miss }, exec: { score: 0, rationale: miss } }
+  }
+  const o = obj
+  const planO = (o.plan ?? {}) as Record<string, unknown>
+  const execO = (o.exec ?? {}) as Record<string, unknown>
+  return {
+    plan: { score: clamp(planO.score), rationale: str(planO.rationale) },
+    exec: { score: clamp(execO.score), rationale: str(execO.rationale) },
+  }
 }

@@ -1,7 +1,7 @@
 // src/tools/efftask/pipeline.ts
 import type { EffTaskConfig, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import { createNode } from './types.js'
-import { ANSWER_TAGS, answerTag, parseExecOutput, parsePlanOutput } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, parseExecOutput, parsePlanOutput, parseScoreOutput } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
@@ -445,6 +445,58 @@ export async function createChildren(node: TaskNode, specs: { title: string; dep
   }
 }
 
+function scorePrompt(node: TaskNode, tag: string): string {
+  return (
+    `请对这个已通过验收的任务打分。\n` +
+    `目标:${quote(ctxGoal(node))}\n` +
+    `方案:\n${quote(JSON.stringify(node.plan))}\n` +
+    `执行结果:\n${quote(node.execStatus)}\n` +
+    `输出 json:{ "plan": {"score": 0-100, "rationale": "…"}, "exec": {"score": 0-100, "rationale": "…"} }。` +
+    `plan 评方案质量,exec 评执行质量。` +
+    answerRule(tag)
+  )
+}
+
+/**
+ * 观察评分(spec §11). Runs after acceptance passes, only when an observer role is bound.
+ *
+ * Advisory BY DEFAULT: the scores are recorded and nothing else happens. They gate the node
+ * only when `caps.scoreThreshold` is set, and then for exactly ONE rework — an advisory
+ * number must not be able to spend an unbounded number of write-capable execute calls.
+ *
+ * Returns true when the node should go back for rework.
+ */
+async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
+  const role = firstRole(node, 'observer')
+  if (!role) return false // opt-in: no observer, no scoring, no fallback to the main model
+  const tag = answerTag(ANSWER_TAGS.score)
+  const res = await runPhase(ctx, {
+    phase: 'observer', node, role, system: 'observer', prompt: scorePrompt(node, tag), signal: ctx.signal,
+  })
+  if (!res.ok) {
+    // A failed scoring call must NOT fail the node: acceptance already passed, and scoring is
+    // advisory. Record why the number is missing instead of discarding hours of accepted work.
+    node.score = {
+      plan: { role: role.roleName, score: 0, rationale: `评分调用失败: ${res.reason}` },
+      exec: { role: role.roleName, score: 0, rationale: `评分调用失败: ${res.reason}` },
+    }
+    return false
+  }
+  const parsed = parseScoreOutput(res.text, tag)
+  node.score = {
+    plan: { role: role.roleName, score: parsed.plan.score, rationale: parsed.plan.rationale },
+    exec: { role: role.roleName, score: parsed.exec.score, rationale: parsed.exec.rationale },
+  }
+  const threshold = ctx.config.caps.scoreThreshold
+  if (threshold === undefined) return false // 默认仅记录
+  const worst = Math.min(parsed.plan.score, parsed.exec.score)
+  if (worst >= threshold) return false
+  // Exactly one rework, then the score is recorded and the node proceeds regardless.
+  if (node.iteration.scoring >= 1) return false
+  node.iteration.scoring += 1
+  return true
+}
+
 export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
@@ -500,7 +552,17 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
       return
     }
-    if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
+    if (rec.synthesized.pass) {
+      // 观察评分 runs between acceptance and ACCEPTED (spec §8: 验收 + 评分通过后进入 MERGE).
+      const needsRework = await scoreNode(node, ctx)
+      if (needsRework) {
+        feedback = `观察角色评分低于阈值,请针对性改进后重新提交。\n方案 ${node.score.plan?.score}: ${node.score.plan?.rationale}\n执行 ${node.score.exec?.score}: ${node.score.exec?.rationale}`
+        if (!(await commit(node, 'REWORK', ctx))) return
+        continue
+      }
+      await commit(node, 'ACCEPTED', ctx)
+      return
+    }
     node.iteration.acceptance++
     if (node.iteration.acceptance >= caps.maxIterations) {
       await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)

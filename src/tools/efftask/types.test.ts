@@ -10,7 +10,7 @@ describe('createNode', () => {
     expect(n.status).toBe('CREATED')
     expect(n.kind).toBe('unknown')
     expect(n.childIds).toEqual([])
-    expect(n.iteration).toEqual({ planReview: 0, acceptance: 0, integration: 0 })
+    expect(n.iteration).toEqual({ planReview: 0, acceptance: 0, integration: 0, scoring: 0 })
     expect(n.plan).toEqual({ solution: '', keyPoints: '', risks: '', acceptance: '' })
     expect(n.blockedReason).toBe('') // blocking reason lives in its own field, not execStatus
     expect(n.createdAt).toBe('2026-07-25T00:00:00Z')

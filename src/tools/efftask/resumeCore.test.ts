@@ -36,7 +36,7 @@ describe('validateLoadedNodes keeps illegal disk state out of the state machine'
     expect(got.depth).toBe(0)
     // A missing counter reads as 0, never as "no limit" — undefined + 1 is NaN, which never
     // satisfies >= maxIterations and turns a bounded retry loop into an unbounded one.
-    expect(got.iteration).toEqual({ planReview: 2, acceptance: 0, integration: 0 })
+    expect(got.iteration).toEqual({ planReview: 2, acceptance: 0, integration: 0, scoring: 0 })
     expect(got.execStatus).toBe('')
     expect(got.plan.solution).toBe('')
     expect(got.reviewLog).toEqual([])
