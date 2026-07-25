@@ -62,6 +62,28 @@ const EMPTY_DRAFT: RootDraft = { kind: 'unknown', plan: emptyPlan(), children: [
 // 集成接线,无单测;手动跑 /et 验证。
 // 构造顺序:fs → runId → runAgent 接缝 → 立刻返回 JSX(解析在组件内 parsing 态跑)。
 export const call: LocalJSXCommandCall = async (onDone, context, args) => {
+  /**
+   * headless(`claude -p`)是 spec §12 明列的 Non-Goal —— 但它此前被实现成一个**带磁盘
+   * 副作用的静默 no-op**,而不是一次拒绝。
+   *
+   * processSlashCommand 只在 `await mod.call(...)` **之后**才检查 isNonInteractiveSession
+   * (:610 vs :614),然后把返回的 JSX 整个丢掉、resolve 成 `messages: []`。等它检查时,
+   * 这个函数已经跑完了:allocateRunId 用 mkdirExclusive 在用户仓库里**真的建了一个编号
+   * 目录**(那正是它保留 id 的手段),并往父 abortController 上挂了一个监听器 —— 而两者
+   * 的清理都挂在 onExit 上,组件根本没有挂载过。用户一个字的输出都看不到。
+   *
+   * 于是每跑一次 `claude -p "/et …"` 就泄漏一个空 run 目录,并把下一次真实 run 的编号往
+   * 后顶。Non-Goal 实现成"悄悄产生副作用",比明确报错糟得多。
+   */
+  if (context.options.isNonInteractiveSession) {
+    onDone(
+      '高效任务模式是 TUI-only:确认关口、任务树面板和子 agent 实时输出都需要交互式终端,' +
+      'headless(claude -p / --print)下无法呈现,因此不启动,也不会创建 run 目录。\n' +
+      '请在交互式会话里运行 /et。',
+      { display: 'system' },
+    )
+    return null
+  }
   // Empty prompt: there is nothing to plan. The hint must travel through onDone — JSX
   // painted for a single frame before exiting never reaches the transcript, so the user
   // would be left with a bare '已取消' and no idea what the command wanted.
