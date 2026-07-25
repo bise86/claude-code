@@ -73,12 +73,104 @@ describe('ConfirmStartup (vendored renderer)', () => {
     // this stays empty and the gate becomes unanswerable in the real REPL.
     stdin.press('\r')
     await new Promise(r => setTimeout(r, 20))
-    expect(decisions).toEqual([{ parallelism: 3, approved: true }])
+    // The decision now carries the roster too (spec §2 第一关 "名册可编辑后确认"); an
+    // unedited gate sends back exactly what it was given.
+    expect(decisions[0]).toMatchObject({ parallelism: 3, approved: true })
+    expect(decisions[0].phaseRoles).toBeDefined()
 
     stdin.press('n')
     await new Promise(r => setTimeout(r, 20))
+    // A CANCEL carries no roster — there is nothing to apply.
     expect(decisions[1]).toEqual({ parallelism: 3, approved: false })
 
     app.unmount()
+  })
+})
+
+describe('启动关口的角色名册真的能改 (spec §2 第一关)', () => {
+  const cfg2 = () => ({
+    goalPrompt: '打通登录接口', parallelism: 3, notices: [], mainModel: 'claude-opus-5',
+    caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 600000 },
+    phaseRoles: { plan: [], review: [], execute: [], accept: [], observer: [] },
+  })
+  const mount2 = async (over: Record<string, unknown> = {}) => {
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const decisions: { parallelism: number; approved: boolean; phaseRoles?: Record<string, { roleName: string }[]> }[] = []
+    const app = await render(
+      React.createElement(ConfirmStartup as never, {
+        config: cfg2(), availableRoles: ['architect', 'security', 'qa'],
+        onDecision: (d: never) => decisions.push(d), ...over,
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    return { stdin, lastFrame, decisions, app }
+  }
+  const press = async (m: { stdin: { press: (s: string) => void } }, s: string) => {
+    m.stdin.press(s); await new Promise(r => setTimeout(r, 20))
+  }
+  const DOWN2 = String.fromCharCode(27) + '[B'
+  const RIGHT2 = String.fromCharCode(27) + '[C'
+
+  it('r 打开编辑器,空格把角色加到当前阶段,回车带着新名册确认', async () => {
+    // spec §2: "名册可编辑后确认". It was rendered read-only, so a user who wanted a
+    // different panel had to cancel, reword the prompt and start the whole thing over.
+    const m = await mount2()
+    await press(m, 'r')
+    expect(m.lastFrame()).toContain('编辑中')
+    await press(m, DOWN2)     // plan → review
+    await press(m, RIGHT2)    // architect → security
+    await press(m, ' ')       // bind it
+    await press(m, '\r')
+    expect(m.decisions).toHaveLength(1)
+    expect(m.decisions[0].approved).toBe(true)
+    expect(m.decisions[0].phaseRoles?.review.map(r => r.roleName)).toEqual(['security'])
+    m.app.unmount()
+  })
+
+  it('编辑器里的 Esc 只退出编辑,不取消整个 run', async () => {
+    // Cancelling from inside an editor the user just opened would lose the edits AND the gate
+    // in one keystroke.
+    const m = await mount2()
+    await press(m, 'r')
+    await press(m, ' ')       // bind architect to plan
+    await press(m, String.fromCharCode(27))
+    await new Promise(r => setTimeout(r, 250))
+    expect(m.decisions).toEqual([])           // NOT cancelled
+    await press(m, '\r')
+    expect(m.decisions[0].phaseRoles?.plan.map(r => r.roleName)).toEqual(['architect']) // edit kept
+    m.app.unmount()
+  })
+
+  it('名册显示的是编辑后的样子,不是传进来的那份', async () => {
+    // A gate that shows one panel and starts another is the failure this gate exists to prevent.
+    const m = await mount2()
+    await press(m, 'r')
+    await press(m, ' ')
+    await press(m, String.fromCharCode(27))
+    await new Promise(r => setTimeout(r, 250))
+    // A DISCRIMINATING substring. Plain 'architect' is printed by the EDITOR too (it lists
+    // every candidate), and the frame buffer accumulates — so that assertion passed whether
+    // or not the read-only roster reflected the edit. Only rosterLines produces this shape.
+    expect(m.lastFrame()).toContain('方案: architect')
+    m.app.unmount()
+  })
+
+  it('没有可用角色时说明原因,而不是画一张空表', async () => {
+    const m = await mount2({ availableRoles: [] })
+    await press(m, 'r')
+    expect(m.lastFrame()).toContain('没有配置任何角色')
+    // …and it must still be answerable.
+    await press(m, '\r')
+    expect(m.decisions[0].approved).toBe(true)
+    m.app.unmount()
+  })
+
+  it('不编辑时,←/→ 仍然调并行数', async () => {
+    const m = await mount2()
+    await press(m, RIGHT2)
+    await press(m, '\r')
+    expect(m.decisions[0].parallelism).toBe(4)
+    m.app.unmount()
   })
 })

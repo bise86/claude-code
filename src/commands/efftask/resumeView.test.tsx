@@ -221,7 +221,7 @@ describe('the gate lets the user CHANGE the parallelism (用户第四句)', () =
       expect(lastFrame()).toMatch(/\n\s*5\r?\n/)
       stdin.press('\r')
       await tick()
-      expect(decisions).toEqual([{ parallelism: 5, approved: true }])
+      expect(decisions[0]).toMatchObject({ parallelism: 5, approved: true })
       app.unmount()
     })
 

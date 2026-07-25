@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, exitReportLine } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, exitReportLine, toggleRole, rosterEditorLines } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -283,5 +283,55 @@ describe('exitReportLine:退出时留在 transcript 里的那一行', () => {
     const l = exitReportLine({ runId: '007', how: '完成', resumed: false, withPath: true, handoff: h })
     expect(l).toContain('efftask/007/integration')
     expect(l).toContain('3 个提交')
+  })
+})
+
+describe('名册可编辑 (spec §2 第一关)', () => {
+  const empty = (): Record<string, { roleName: string }[]> =>
+    ({ plan: [], review: [], execute: [], accept: [], observer: [] })
+
+  it('toggleRole adds and removes', () => {
+    const a = toggleRole(empty() as never, 'review', 'architect')
+    expect(a.review.map(r => r.roleName)).toEqual(['architect'])
+    const b = toggleRole(a, 'review', 'security')
+    expect(b.review.map(r => r.roleName)).toEqual(['architect', 'security'])
+    const c = toggleRole(b, 'review', 'architect')
+    expect(c.review.map(r => r.roleName)).toEqual(['security'])
+  })
+
+  it('returns a NEW roster and shares no array with the old one', () => {
+    // createNode copies phaseRoles per node; a shared array instance would let one edit at the
+    // gate reach every node in the tree.
+    const a = toggleRole(empty() as never, 'review', 'architect')
+    const b = toggleRole(a, 'accept', 'qa')
+    expect(a.accept).toEqual([])          // the earlier roster is untouched
+    expect(b.review).not.toBe(a.review)   // and no array is shared
+  })
+
+  it('lets a phase be emptied — otherwise the editor cannot undo its own additions', () => {
+    const a = toggleRole(empty() as never, 'plan', 'architect')
+    expect(toggleRole(a, 'plan', 'architect').plan).toEqual([])
+  })
+
+  it('rosterEditorLines marks what is bound and where the cursor is', () => {
+    const r = toggleRole(empty() as never, 'review', 'security')
+    const lines = rosterEditorLines(r, ['architect', 'security'], 1, 1)
+    expect(lines[1]).toContain('▶')             // the focused phase
+    expect(lines[1]).toContain('>[x]security')  // focused role, and it IS bound
+    expect(lines[1]).toContain(' [ ]architect') // unfocused, unbound
+    expect(lines[0]).not.toContain('▶')
+  })
+
+  it('names what an empty phase actually means, per phase', () => {
+    // 观察 is opt-in and does NOT fall back to the main model; saying 主模型 there would
+    // promise a scorer that never runs — the same distinction rosterLines already makes.
+    const lines = rosterEditorLines(empty() as never, ['a'], 0, 0)
+    expect(lines[0]).toContain('(主模型)')
+    expect(lines[4]).toContain('(不评分)')
+  })
+
+  it('says why the table is empty when settings has no roles at all', () => {
+    // A blank row reads as a broken editor.
+    expect(rosterEditorLines(empty() as never, [], 0, 0)[0]).toContain('没有配置任何角色')
   })
 })

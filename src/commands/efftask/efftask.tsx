@@ -786,11 +786,18 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           props.onExit(null) // cancelled at the gate: no run outcome to report
           return
         }
-        // Apply the confirmed parallelism — the pool reads it straight off the config.
-        // KNOWN GAP: this snapshots config at gate-open, so a value the terminal user dialled
-        // but had not yet committed is discarded if the FEISHU surface wins the race. There
-        // is no channel from the gate's React state to the Feishu surface.
-        const effectiveConfig: EffTaskConfig = { ...config, parallelism: decision.parallelism }
+        // Apply what the user confirmed — the parallelism AND the roster (spec §2 第一关
+        // "名册可编辑后确认"). An absent roster means "unchanged", which is what a Feishu
+        // approval sends: that card has no channel for a five-phase role table.
+        //
+        // KNOWN GAP, now covering both fields: this snapshots config at gate-open, so terminal
+        // edits that were not yet committed are discarded if the FEISHU surface wins the race.
+        // There is no channel from the gate's React state to the Feishu surface.
+        const effectiveConfig: EffTaskConfig = {
+          ...config,
+          parallelism: decision.parallelism,
+          phaseRoles: decision.phaseRoles ?? config.phaseRoles,
+        }
         setApproved(effectiveConfig)
         // RESUME skips the third gate. Its tree already exists on disk — drafting a fresh
         // root plan would ask the user to confirm a decomposition the run is not going to
@@ -842,7 +849,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return <ConfirmResume config={config} summary={summary} isolation={isolation} onDecision={d => terminalClaim.current?.('terminal', d)} />
   }
   if (phase === 'confirm') {
-    return <ConfirmStartup config={config} isolation={isolation} onDecision={d => terminalClaim.current?.('terminal', d)} />
+    return (
+      <ConfirmStartup
+        config={config}
+        isolation={isolation}
+        // spec §2 第一关 "名册可编辑". Only roles this session can actually dispatch — the
+        // roster must not offer a seat the run would then silently downgrade to the main model.
+        availableRoles={props.knownRoles.filter(r => !props.unsupportedRoles.includes(r))}
+        onDecision={d => terminalClaim.current?.('terminal', d)}
+      />
+    )
   }
   if (phase === 'drafting') {
     return (

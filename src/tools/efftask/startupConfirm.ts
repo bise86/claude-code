@@ -1,7 +1,18 @@
 import { PHASE_NAMES } from './types.js'
-import type { EffTaskConfig, PhaseName } from './types.js'
+import type { EffTaskConfig, PhaseName, RoleBinding } from './types.js'
 
-export interface StartupDecision { parallelism: number; approved: boolean }
+export interface StartupDecision {
+  parallelism: number
+  approved: boolean
+  /**
+   * 名册可编辑后确认 (spec §2 第一关) — the roster as the user left it.
+   *
+   * OPTIONAL because only the terminal surface can edit it: the Feishu card carries
+   * approve/deny plus a parallelism number and has no channel for a five-phase role table.
+   * Absent means "unchanged", so a Feishu approval keeps exactly the roster its card showed.
+   */
+  phaseRoles?: Record<PhaseName, RoleBinding[]>
+}
 
 const PHASE_LABEL: Record<PhaseName, string> = {
   plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
@@ -17,6 +28,51 @@ const PHASE_LABEL: Record<PhaseName, string> = {
 export function clip(s: string, max = 80): string {
   const cps = Array.from(s)
   return cps.length > max ? `${cps.slice(0, max - 1).join('')}…` : s
+}
+
+/**
+ * Toggle one role on a phase, returning a NEW roster.
+ *
+ * Pure so the gate's edit logic is testable without mounting anything — the gate itself is
+ * keyboard plumbing around this.
+ *
+ * `observer` is deliberately allowed to be empty and everything else is too: an empty phase
+ * means 主模型 (and, for observer, "no scoring at all"), which rosterLines already renders
+ * correctly. Refusing to empty a phase would make the editor unable to undo its own additions.
+ */
+export function toggleRole(
+  roster: Record<PhaseName, RoleBinding[]>, phase: PhaseName, roleName: string,
+): Record<PhaseName, RoleBinding[]> {
+  const cur = roster[phase] ?? []
+  const has = cur.some(r => r.roleName === roleName)
+  // Copy every phase's ARRAY, not just the outer record: TaskNode.createNode copies these per
+  // node, and a shared array instance would let one edit reach the whole tree.
+  const next = Object.fromEntries(
+    PHASE_NAMES.map(p => [p, [...(roster[p] ?? [])]]),
+  ) as Record<PhaseName, RoleBinding[]>
+  next[phase] = has ? cur.filter(r => r.roleName !== roleName) : [...cur, { roleName }]
+  return next
+}
+
+/** One line per phase for the EDITOR: every candidate role, with the bound ones marked. */
+export function rosterEditorLines(
+  roster: Record<PhaseName, RoleBinding[]>, available: string[], phaseIdx: number, roleIdx: number,
+): string[] {
+  return PHASE_NAMES.map((p, i) => {
+    const bound = new Set((roster[p] ?? []).map(r => r.roleName))
+    const cells = available.length === 0
+      // Say WHY rather than render an empty row: with no roles in settings there is nothing
+      // to edit, and a blank line reads as a broken editor.
+      ? ['(settings 里没有配置任何角色,本阶段用主模型)']
+      : available.map((name, j) => {
+        const mark = bound.has(name) ? '[x]' : '[ ]'
+        const cursor = i === phaseIdx && j === roleIdx ? '>' : ' '
+        return `${cursor}${mark}${name}`
+      })
+    const label = PHASE_LABEL[p]
+    const empty = bound.size === 0 ? (p === 'observer' ? ' (不评分)' : ' (主模型)') : ''
+    return `${i === phaseIdx ? '▶' : ' '} ${label}${empty}: ${cells.join(' ')}`
+  })
 }
 
 export function rosterLines(config: EffTaskConfig): string[] {
