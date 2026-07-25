@@ -108,6 +108,8 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   })
 
   const knownRoles = activeAgents.map(a => a.agentType)
+  // Set when the view is torn down rather than exited, so the report can tell the two apart.
+  let tornDown = false
   return (
     <EffTaskRunner
       args={args}
@@ -120,6 +122,12 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       signal={signal}
       abort={() => runController.abort()}
       detach={detachAbortRelay}
+      // The REPL moves this JSX between four mutually-exclusive tree positions, so Ctrl+O
+      // (toggle transcript) or Ctrl+Z→fg unmounts and remounts it. That stops the run —
+      // which is right, an orphaned orchestrator would keep burning tokens into a tree
+      // nobody is watching — but the user never asked to stop, so the message must not
+      // claim they cancelled. It points at the run dir, which is exactly what resume reads.
+      onTornDown={() => { tornDown = true }}
       // The transcript is the only durable trace once the panel is gone: say how the run
       // ended and where its artifacts live, not just that it ended.
       // Latched: the done view's key handler fires per keypress, and the immediate-command
@@ -128,7 +136,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
         detachAbortRelay()
         const how = outcome
           ? outcome.status === 'completed' ? '完成' : `被阻断(${outcome.reason ?? '未知原因'})`
-          : '已取消'
+          : tornDown ? '因界面重建而中断' : '已取消'
         onDone(`高效任务 ${runId} ${how} · .claude/efftask/${runId}/run.md`, { display: 'system' })
       })}
     />
@@ -203,6 +211,7 @@ type RunnerProps = {
   signal: AbortSignal
   abort: () => void
   detach: () => void
+  onTornDown: () => void
   onExit: (outcome: Outcome | null) => void
 }
 
@@ -219,8 +228,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // If this view is ever torn down without going through onExit, the run must stop with it:
   // otherwise the orchestrator keeps issuing real, write-capable model calls and writing
   // node.md into a tree nothing is watching, and the parent-signal listener outlives us.
-  const { abort, detach } = props
-  React.useEffect(() => () => { abort(); detach() }, [abort, detach])
+  const { abort, detach, onTornDown } = props
+  React.useEffect(() => () => { onTornDown(); abort(); detach() }, [abort, detach, onTornDown])
 
   const { args, knownRoles, extractJson } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
