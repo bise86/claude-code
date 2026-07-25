@@ -824,7 +824,7 @@ git commit -m "feat(efftask): prompt→config directive parsing"
   - `serializeNode(node): string` / `parseNodeFile(text): TaskNode`（YAML frontmatter 往返)
   - `writeNode(fs, runDir, node): Promise<void>`（写 `runDir/<node.id>/node.md`)
   - `readNode(fs, runDir, nodeId): Promise<TaskNode>`
-  - `loadRun(fs, runDir): Promise<{ nodes: TaskNode[] }>`（递归遍历 run 目录、读每个 `node.md`(经 `parseNodeFile`),返回全部节点;供 resume/审计)
+  - `loadRun(fs, runDir): Promise<{ nodes: TaskNode[]; errors: {path,message}[] }>`（递归遍历 run 目录、读每个 `node.md`(经 `parseNodeFile`),返回全部节点;供 resume/审计)
   - `writeRunManifest(fs, runDir, cfg, nodes, result?): Promise<void>`（写 `runDir/run.md`;frontmatter 存 run 级 `createdAt`(取 root 节点 createdAt)+ cfg;`result`(可选,`{status, reason}`)只在收尾那次调用时传,把最终结局记进清单)
   - `renderTreeSnapshot(nodes): string`
 - 说明:`node.id` 即相对路径(root='root',子='root/01-slug')。fs 注入,测试用内存假实现。
@@ -945,7 +945,6 @@ Expected: FAIL。
 - [ ] **Step 3: 实现**
 
 ```ts
-// src/tools/efftask/persistence.ts
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { uiStatus } from './stateMachine.js'
@@ -958,13 +957,29 @@ export interface FsLike {
   exists(p: string): Promise<boolean>
 }
 
+/**
+ * Title → a safe single path segment. Strips anything that could escape the run
+ * directory (`/`, `..`) by construction, since the result is used as a directory name.
+ * Note: Windows device names (`con`, `aux`, …) survive; that is safe only because the
+ * sole caller, childId, always prefixes `NN-`. Don't use slugify standalone for a path.
+ */
 export function slugify(title: string): string {
-  const s = title.toLowerCase().replace(/[^a-z0-9一-龥]+/g, '-').replace(/^-+|-+$/g, '')
+  const s = title.toLowerCase().replace(/[^a-z0-9一-龥]+/g, '-')
   // Array.from + slice on CODE POINTS: a plain .slice(0,40) can cut a surrogate pair in
-  // half and produce a lone surrogate in a filesystem path.
-  return Array.from(s || 'node').slice(0, 40).join('')
+  // half and produce a lone surrogate in a filesystem path. Trim separators AFTER
+  // truncating — cutting at 40 can land right on one and leave a trailing dash.
+  const cut = Array.from(s).slice(0, 40).join('').replace(/^-+|-+$/g, '')
+  return cut || 'node'
 }
 
+/**
+ * Child node id = parent id + `NN-slug`. The two-digit index only orders siblings
+ * for human readability; the authoritative structure is each node's `childIds`, so a
+ * parent with ≥100 children (impossible under DEFAULT_CAPS.maxNodes) would look
+ * mis-sorted in a directory listing but still load correctly.
+ * Uniqueness comes from the caller assigning distinct indices — same (index, title)
+ * twice yields the same id, and writeNode would overwrite.
+ */
 export function childId(parentId: string, index: number, title: string): string {
   const nn = String(index).padStart(2, '0')
   return `${parentId}/${nn}-${slugify(title)}`
@@ -972,11 +987,23 @@ export function childId(parentId: string, index: number, title: string): string 
 
 export async function allocateRunId(fs: FsLike, effRoot: string): Promise<string> {
   let max = 0
-  if (await fs.exists(effRoot)) {
-    for (const name of await fs.readdir(effRoot)) {
-      const m = name.match(/^(\d+)$/)
-      if (m) max = Math.max(max, parseInt(m[1], 10))
-    }
+  // Read directly rather than gating on fs.exists(effRoot): mkdir() implementations
+  // (real recursive mkdir, and the in-memory test fake) don't necessarily register an
+  // entry for every ancestor path, so an exists() pre-check can false-negative even
+  // when effRoot has numbered children.
+  let names: string[] = []
+  try {
+    names = await fs.readdir(effRoot)
+  } catch (e) {
+    // A missing root is the normal first-run case → start at 001. But if the directory
+    // IS there and merely unreadable, treating it as empty would hand out an id that
+    // already exists and overwrite a previous run's tree — fail loudly instead.
+    if (await fs.exists(effRoot)) throw e
+    names = []
+  }
+  for (const name of names) {
+    const m = name.match(/^(\d+)$/)
+    if (m) max = Math.max(max, parseInt(m[1], 10))
   }
   return String(max + 1).padStart(3, '0')
 }
@@ -1022,25 +1049,62 @@ export async function readNode(fs: FsLike, runDir: string, nodeId: string): Prom
   return parseNodeFile(await fs.readFile(nodeMdPath(runDir, nodeId)))
 }
 
-// Recursively walk the run dir; every `node.md` is parsed into a TaskNode. The physical
-// layout mirrors node.id (runDir/<id>/node.md), so a DFS over subdirs recovers all nodes.
-export async function loadRun(fs: FsLike, runDir: string): Promise<{ nodes: TaskNode[] }> {
+/**
+ * Recursively walk the run dir; every `node.md` becomes a TaskNode. The physical layout
+ * mirrors node.id (runDir/<id>/node.md), so a DFS over subdirs recovers all nodes.
+ *
+ * A corrupt file never aborts the walk. This runs after a crash — a half-written
+ * `node.md` is exactly what a crash leaves behind — so losing every successfully
+ * recovered node because one sibling is truncated would defeat the purpose. Failures
+ * are returned in `errors` for the caller to surface; they are not swallowed silently.
+ */
+export async function loadRun(
+  fs: FsLike,
+  runDir: string,
+): Promise<{ nodes: TaskNode[]; errors: { path: string; message: string }[] }> {
   const nodes: TaskNode[] = []
+  const errors: { path: string; message: string }[] = []
   async function walk(dir: string): Promise<void> {
     let entries: string[]
     try { entries = await fs.readdir(dir) } catch { return } // not a dir (e.g. a file) → skip
     for (const name of entries) {
       const path = `${dir}/${name}`
-      if (name === 'node.md') nodes.push(parseNodeFile(await fs.readFile(path)))
-      else await walk(path) // recurse into child node dirs; non-dirs (run.md) readdir-throw and skip
+      if (name === 'node.md') {
+        try {
+          nodes.push(parseNodeFile(await fs.readFile(path)))
+        } catch (e) {
+          errors.push({ path, message: e instanceof Error ? e.message : String(e) })
+        }
+      } else {
+        await walk(path) // recurse into child node dirs; non-dirs (run.md) readdir-throw and skip
+      }
     }
   }
   await walk(runDir)
-  return { nodes }
+  return { nodes, errors }
 }
 
+/**
+ * Indented tree text for run.md. Walks parent→children from the roots rather than
+ * trusting array order: loadRun's order comes from readdir, which no filesystem
+ * guarantees, and printing a child before its parent renders a structurally wrong tree.
+ * Orphans (parent missing/corrupt) are printed last so nothing is silently dropped.
+ */
 export function renderTreeSnapshot(nodes: TaskNode[]): string {
-  const lines = nodes.map(n => `${'  '.repeat(n.depth)}- [${uiStatus(n.status)}] ${n.title} (${n.status})`)
+  const byId = new Map(nodes.map(n => [n.id, n]))
+  const seen = new Set<string>()
+  const lines: string[] = []
+  const emit = (n: TaskNode, depth: number): void => {
+    if (seen.has(n.id)) return // defensive: a cyclic parent/child link must not hang the render
+    seen.add(n.id)
+    lines.push(`${'  '.repeat(depth)}- [${uiStatus(n.status)}] ${n.title} (${n.status})`)
+    for (const cid of n.childIds) {
+      const child = byId.get(cid)
+      if (child) emit(child, depth + 1)
+    }
+  }
+  for (const n of nodes) if (n.parentId === null) emit(n, 0)
+  for (const n of nodes) if (!seen.has(n.id)) emit(n, n.depth)
   return `# Efficient Task Run\n\n${lines.join('\n')}\n`
 }
 

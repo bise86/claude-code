@@ -97,4 +97,67 @@ describe('persistence', () => {
     expect(final).toContain('status: blocked')
     expect(final).toContain('评审迭代超限')
   })
+
+  it('round-trips a fully populated node, including content that could break YAML', async () => {
+    const n = createNode({ id: 'root/01-x', title: '含冒号: 与"引号"', goal: '真实目标', parentId: 'root', deps: ['root/02-y'], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    n.phaseRoles.review = [{ roleName: 'arch' }, { roleName: 'sec', model: 'sonnet' }]
+    n.childIds = ['root/01-x/01-a']
+    n.kind = 'decompose'
+    n.status = 'BLOCKED'
+    n.blockedReason = '评审迭代超限(3)'
+    n.execStatus = '改了文件\n---\n# 标题\n```json\n{"a":1}\n```\n\t制表符 🎉 中文'
+    n.plan = { solution: '---\n方案', keyPoints: '&anchor', risks: '2026-07-25', acceptance: 'yes' }
+    n.worktree = { branch: 'efftask/001/root-01-x', path: '/tmp/wt' }
+    n.iteration = { planReview: 2, acceptance: 1 }
+    n.reviewLog = [{ round: 1, verdicts: [{ role: 'arch', pass: false, blocking: ['缺验收点'], comments: 'c' }], synthesized: { pass: false, blockingSummary: '[arch] 缺验收点' } }]
+    n.acceptLog = []
+    n.score = { plan: { role: 'obs', score: 88, rationale: 'ok' }, exec: { role: 'obs', score: 91, rationale: 'good' } }
+    const back = parseNodeFile(serializeNode(n))
+    expect(back).toEqual(n) // every field survives, byte-for-byte
+  })
+
+  it('loadRun keeps the nodes it can read when one node.md is corrupt', async () => {
+    // A crash is exactly what leaves a half-written node.md behind, so one bad file
+    // must not throw away every node that WAS recovered.
+    const fs = memFs()
+    const good = createNode({ id: 'root', title: '根', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    await writeNode(fs, '/eff/001', good)
+    fs.store.set('/eff/001/root/01-broken/node.md', '这不是 frontmatter')
+    const { nodes, errors } = await loadRun(fs, '/eff/001')
+    expect(nodes.map(n => n.id)).toEqual(['root'])
+    expect(errors).toHaveLength(1)
+    expect(errors[0].path).toContain('01-broken')
+  })
+
+  it('renderTreeSnapshot nests by childIds, not by array order', async () => {
+    // loadRun's order comes from readdir, which no filesystem guarantees.
+    const root = createNode({ id: 'root', title: '根', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    const child = createNode({ id: 'root/01-a', title: '子', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    root.childIds = ['root/01-a']
+    const shuffled = renderTreeSnapshot([child, root]) // child first on purpose
+    const lines = shuffled.trim().split('\n').filter(l => l.startsWith('-') || l.startsWith(' '))
+    expect(lines[0]).toContain('根')
+    expect(lines[1]).toMatch(/^ {2}- .*子/) // child indented under its parent
+    expect(shuffled).toBe(renderTreeSnapshot([root, child])) // order-independent
+  })
+
+  it('allocateRunId ignores non-numeric dirs and rethrows when the root exists but is unreadable', async () => {
+    const fs = memFs()
+    await fs.mkdir('/eff/007'); await fs.mkdir('/eff/abc'); await fs.mkdir('/eff/0012')
+    expect(await allocateRunId(fs, '/eff')).toBe('013') // 'abc' ignored; '0012' parses as 12 → next is 13
+    const broken: FsLike = { ...memFs(), async readdir() { throw new Error('EACCES') }, async exists() { return true } }
+    // An unreadable-but-present root must NOT look empty: handing out 001 would
+    // overwrite an existing run's tree.
+    await expect(allocateRunId(broken, '/eff')).rejects.toThrow('EACCES')
+    const missing: FsLike = { ...memFs(), async readdir() { throw new Error('ENOENT') }, async exists() { return false } }
+    expect(await allocateRunId(missing, '/eff')).toBe('001')
+  })
+
+  it('slugify never escapes the run dir and never ends on a separator', () => {
+    expect(slugify('../../../etc/passwd')).toBe('etc-passwd')
+    expect(slugify('/absolute/path')).toBe('absolute-path')
+    expect(slugify('!!!???')).toBe('node')
+    expect(slugify('x'.repeat(39) + '🎉' + 'y'.repeat(10))).not.toMatch(/-$/)
+    expect(slugify('中文标题测试')).toBe('中文标题测试')
+  })
 })
