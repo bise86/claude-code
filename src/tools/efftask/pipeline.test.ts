@@ -3,7 +3,7 @@ import { describe, expect, it } from 'bun:test'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap } from './stateMachine.js'
-import { PipelineCtx, stepStart, stepExecute, stepIntegrate } from './pipeline.js'
+import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 
 // Verdict prompts carry a per-call random tag; a cooperative reviewer answers under THAT tag.
@@ -11,13 +11,36 @@ import type { RunAgentFn } from './roundtable.js'
 const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
 const NOW = '2026-07-25T00:00:00Z'
 const cfg: EffTaskConfig = { goalPrompt: 'g', parallelism: DEFAULT_PARALLELISM, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS } }
+/**
+ * The REAL token semantics, not a permissive stub: the node-count cap is enforced through
+ * this seam now, so a no-op fake here would quietly disable every cap assertion in this file.
+ * `reserved()` lets a test prove no slot leaked on any exit path.
+ */
+function makeReserver(byId: Map<string, TaskNode>, config: EffTaskConfig) {
+  let reserved = 0
+  return {
+    reserved: () => reserved,
+    reserveNodes: (count: number) => {
+      if (byId.size + reserved + count > config.caps.maxNodes) return null
+      reserved += count
+      let released = false
+      return { release: () => { if (released) return; released = true; reserved -= count } }
+    },
+  }
+}
+
 function ctxFor(
   nodes: TaskNode[],
   runAgent: RunAgentFn,
   config: EffTaskConfig = cfg,
   signal: AbortSignal = new AbortController().signal,
-): PipelineCtx {
-  return { config, byId: byIdMap(nodes), runAgent, persist: async () => {}, now: () => NOW, signal, onUpdate: () => {} }
+): PipelineCtx & { reserved: () => number } {
+  const byId = byIdMap(nodes)
+  const r = makeReserver(byId, config)
+  return {
+    config, byId, runAgent, persist: async () => {}, now: () => NOW, signal, onUpdate: () => {},
+    reserveNodes: r.reserveNodes, reserved: r.reserved,
+  }
 }
 const root = () => createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
 
@@ -446,5 +469,63 @@ describe('pipeline', () => {
     }
     await stepExecute(n, ctxFor([n], runAgent))
     expect(n.status).toBe('ACCEPTED')
+  })
+})
+
+describe('the node-count cap must hold when decompositions overlap', () => {
+  const kids = (...titles: string[]) => titles.map(t => ({ title: t, deps: [] as string[] }))
+  const twoLeaves = (parent: string) => {
+    const p = createNode({ id: parent, title: parent, parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    p.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    return p
+  }
+
+  it('two concurrent decompositions cannot together exceed maxNodes', async () => {
+    // check-then-act: the old code compared byId.size against the cap, awaited persist, and
+    // only then inserted. Two nodes decomposing at once both measured the same stale size,
+    // both passed, and the tree ended over the cap — the safety valve silently off.
+    // maxNodes = 5: root + a + b already exist, so exactly ONE batch of two can still fit.
+    const nodes = [root(), twoLeaves('a'), twoLeaves('b')]
+    const ctx = ctxFor(nodes, (async () => '') as RunAgentFn, { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 5 } })
+    const results = await Promise.all([
+      createChildren(ctx.byId.get('a')!, kids('a1', 'a2'), ctx),
+      createChildren(ctx.byId.get('b')!, kids('b1', 'b2'), ctx),
+    ])
+    expect(results.filter(r => r.ok)).toHaveLength(1)
+    expect(ctx.byId.size).toBeLessThanOrEqual(5)
+    expect(ctx.reserved()).toBe(0)
+  })
+
+  it('a THROW inside createChildren does not leak reserved slots', async () => {
+    // After the reserve, createChildren calls RAW ctx.now() (not nowSafe) inside the
+    // specs.map that mints the children — an exit path a per-return-path release misses.
+    // A leaked slot permanently overstates the tree, so a LATER decomposition that genuinely
+    // fits is refused and BLOCKED: the safety valve corrupted in the other direction.
+    const nodes = [root(), twoLeaves('a')]
+    const ctx = ctxFor(nodes, (async () => '') as RunAgentFn, { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 50 } })
+    ;(ctx as { now: () => string }).now = () => { throw new Error('clock died') }
+    await expect(createChildren(ctx.byId.get('a')!, kids('x'), ctx)).rejects.toThrow('clock died')
+    expect(ctx.reserved()).toBe(0)
+  })
+
+  it('releases the slots on every ordinary refusal too', async () => {
+    const nodes = [root(), twoLeaves('a')]
+    const ctx = ctxFor(nodes, (async () => '') as RunAgentFn, { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 50 } })
+    expect((await createChildren(ctx.byId.get('a')!, kids('dup', 'dup'), ctx)).ok).toBe(false)
+    expect(ctx.reserved()).toBe(0)
+    const cyc = [{ title: 'p', deps: ['q'] }, { title: 'q', deps: ['p'] }]
+    expect((await createChildren(ctx.byId.get('a')!, cyc, ctx)).ok).toBe(false)
+    expect(ctx.reserved()).toBe(0)
+  })
+
+  it('a released reservation cannot be released twice', async () => {
+    // A double release would UNDER-enforce maxNodes; clamping at zero would hide it.
+    const nodes = [root()]
+    const ctx = ctxFor(nodes, (async () => '') as RunAgentFn, { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 10 } })
+    const slots = ctx.reserveNodes(3)!
+    slots.release()
+    slots.release()
+    slots.release()
+    expect(ctx.reserved()).toBe(0)
   })
 })

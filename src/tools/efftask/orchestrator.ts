@@ -70,9 +70,27 @@ export class EffTaskOrchestrator {
     return this.lastNow
   }
 
+  /**
+   * Node-count budget held by decompositions that have been authorised but whose children
+   * are not yet in `byId`. Counted alongside byId.size so the cap holds across concurrent
+   * decompositions — the old inline check compared against byId.size and then awaited.
+   */
+  private reserved = 0
+  /** Test/diagnostic view of the outstanding reservation; must return to 0 on every path. */
+  reservedCount(): number { return this.reserved }
+  private reserveNodes = (count: number): { release: () => void } | null => {
+    if (this.byId.size + this.reserved + count > this.cfg.caps.maxNodes) return null
+    this.reserved += count
+    // Single-shot: a double release would UNDER-enforce maxNodes, and clamping at zero
+    // would hide the bug rather than surface it.
+    let released = false
+    return { release: () => { if (released) return; released = true; this.reserved -= count } }
+  }
+
   private ctx(): PipelineCtx {
     return {
       config: this.cfg,
+      reserveNodes: this.reserveNodes,
       byId: this.byId,
       runAgent: this.deps.runAgent,
       persist: this.deps.persist,

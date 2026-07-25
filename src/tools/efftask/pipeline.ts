@@ -6,6 +6,9 @@ import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 
+/** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
+export type NodeSlots = { release: () => void }
+
 export interface PipelineCtx {
   config: EffTaskConfig
   byId: Map<string, TaskNode>
@@ -14,6 +17,19 @@ export interface PipelineCtx {
   now: () => string
   signal: AbortSignal
   onUpdate: () => void
+  /**
+   * Claim `count` node slots, or return null when the cap would be exceeded.
+   *
+   * SYNCHRONOUS on purpose: the cap check and the claim must not be separated by an await.
+   * The old inline `byId.size + specs.length > maxNodes` check was followed by an await
+   * before the insert, so two concurrent decompositions both measured the same stale size,
+   * both passed, and the tree ran past the cap — the safety valve silently off.
+   *
+   * Returns a TOKEN rather than a boolean so release is structurally single-shot and pairs
+   * with try/finally. A plain `releaseNodes(count)` invites a double release, and clamping
+   * that at zero would silently UNDER-enforce maxNodes instead of failing loudly.
+   */
+  reserveNodes: (count: number) => NodeSlots | null
 }
 
 /**
@@ -354,66 +370,79 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
 
 type CreateResult = { ok: true } | { ok: false; reason: string; retryable: boolean }
 
-async function createChildren(node: TaskNode, specs: { title: string; deps: string[] }[], ctx: PipelineCtx): Promise<CreateResult> {
+export async function createChildren(node: TaskNode, specs: { title: string; deps: string[] }[], ctx: PipelineCtx): Promise<CreateResult> {
   // Node-count cap: if creating these children would exceed maxNodes, create NONE
   // (never silently truncate). Not retryable — replanning can't create budget.
-  if (ctx.byId.size + specs.length > ctx.config.caps.maxNodes) {
+  // Reserved ATOMICALLY (see PipelineCtx.reserveNodes): the old check compared against
+  // byId.size and then awaited before inserting, so two concurrent decompositions both
+  // passed against the same stale size and the tree ran past the cap.
+  const slots = ctx.reserveNodes(specs.length)
+  if (!slots) {
     return { ok: false, reason: '节点数超过上限', retryable: false }
   }
-  // Sibling deps are written as TITLES, so duplicate titles make every reference to them
-  // ambiguous — including "does this node depend on itself?". Don't guess: hand it back as
-  // a planning error the model can fix, the same way a dependency cycle is handled.
-  const titles = specs.map(c => c.title)
-  if (new Set(titles).size !== titles.length) {
-    return { ok: false, reason: '子任务标题重复,依赖只能按标题引用,请给出互不相同的子任务标题', retryable: true }
-  }
-  // Map each dep title to the sibling's INDEX; resolving by index (not id) makes the
-  // self-reference check exact.
-  const titleToIndex = new Map<string, number>()
-  specs.forEach((c, i) => titleToIndex.set(c.title, i))
-  // Build the group in a LOCAL array first. Nothing touches ctx.byId / node.childIds until
-  // the cycle guard passes, so a rejected group leaves ZERO partial state behind.
-  const created: TaskNode[] = specs.map((c, i) => {
-    const id = childId(node.id, i + 1, c.title)
-    const deps = c.deps
-      .map(t => titleToIndex.get(t))
-      .filter((di): di is number => di !== undefined && di !== i) // unknown title / self-reference
-      .map(di => childId(node.id, di + 1, specs[di].title))
-    return createNode({
-      id,
-      title: c.title,
-      // Children inherit a COMPOSED goal. A bare title strips all parent context and the
-      // child then replans the wrong thing from nothing.
-      goal: `${node.goal}\n> 上级方案要点: ${(node.plan.keyPoints || node.plan.solution).slice(0, 500)}\n> 本子任务: ${c.title}`,
-      parentId: node.id,
-      deps,
-      depth: node.depth + 1,
-      phaseRoles: node.phaseRoles,
-      now: ctx.now(),
-    })
-  })
-  // Cycle guard: sibling deps only reference siblings. A cyclic group is a PLANNING error,
-  // so hand it back as retryable feedback instead of killing the branch.
-  if (hasCycle(created)) {
-    return { ok: false, reason: '子任务依赖成环,请重新给出无环的子任务依赖', retryable: true }
-  }
-  // Persist the whole group BEFORE attaching any of it. Attaching first and writing inside
-  // the loop meant a failure on child 2 of 3 left a half-attached subtree in ctx.byId and
-  // node.childIds — the exact partial state the local-array staging above exists to prevent.
-  for (const child of created) {
-    try {
-      await ctx.persist(child)
-    } catch (e) {
-      return { ok: false, reason: `子节点持久化失败: ${e instanceof Error ? e.message : String(e)}`, retryable: false }
+  try {
+    // Sibling deps are written as TITLES, so duplicate titles make every reference to them
+    // ambiguous — including "does this node depend on itself?". Don't guess: hand it back as
+    // a planning error the model can fix, the same way a dependency cycle is handled.
+    const titles = specs.map(c => c.title)
+    if (new Set(titles).size !== titles.length) {
+      return { ok: false, reason: '子任务标题重复,依赖只能按标题引用,请给出互不相同的子任务标题', retryable: true }
     }
+    // Map each dep title to the sibling's INDEX; resolving by index (not id) makes the
+    // self-reference check exact.
+    const titleToIndex = new Map<string, number>()
+    specs.forEach((c, i) => titleToIndex.set(c.title, i))
+    // Build the group in a LOCAL array first. Nothing touches ctx.byId / node.childIds until
+    // the cycle guard passes, so a rejected group leaves ZERO partial state behind.
+    const created: TaskNode[] = specs.map((c, i) => {
+      const id = childId(node.id, i + 1, c.title)
+      const deps = c.deps
+        .map(t => titleToIndex.get(t))
+        .filter((di): di is number => di !== undefined && di !== i) // unknown title / self-reference
+        .map(di => childId(node.id, di + 1, specs[di].title))
+      return createNode({
+        id,
+        title: c.title,
+        // Children inherit a COMPOSED goal. A bare title strips all parent context and the
+        // child then replans the wrong thing from nothing.
+        goal: `${node.goal}\n> 上级方案要点: ${(node.plan.keyPoints || node.plan.solution).slice(0, 500)}\n> 本子任务: ${c.title}`,
+        parentId: node.id,
+        deps,
+        depth: node.depth + 1,
+        phaseRoles: node.phaseRoles,
+        now: ctx.now(),
+      })
+    })
+    // Cycle guard: sibling deps only reference siblings. A cyclic group is a PLANNING error,
+    // so hand it back as retryable feedback instead of killing the branch.
+    if (hasCycle(created)) {
+      return { ok: false, reason: '子任务依赖成环,请重新给出无环的子任务依赖', retryable: true }
+    }
+    // Persist the whole group BEFORE attaching any of it. Attaching first and writing inside
+    // the loop meant a failure on child 2 of 3 left a half-attached subtree in ctx.byId and
+    // node.childIds — the exact partial state the local-array staging above exists to prevent.
+    for (const child of created) {
+      try {
+        await ctx.persist(child)
+      } catch (e) {
+        return { ok: false, reason: `子节点持久化失败: ${e instanceof Error ? e.message : String(e)}`, retryable: false }
+      }
+    }
+    for (const child of created) {
+      ctx.byId.set(child.id, child)
+      node.childIds.push(child.id)
+    }
+    // The parent's own durable point is the commit(WAITING_CHILDREN) that follows.
+    safeUpdate(ctx)
+    return { ok: true }
+  } finally {
+    // UNCONDITIONAL. Once the children are in byId they are counted by byId.size, so the
+    // reservation is always handed back here. Releasing per-return-path instead would miss
+    // the THROW out of the raw ctx.now() inside the specs.map — and a leaked slot
+    // permanently overstates the tree, so a LATER decomposition that genuinely fits gets
+    // refused and BLOCKED: the safety valve corrupted in the other direction, silently.
+    slots.release()
   }
-  for (const child of created) {
-    ctx.byId.set(child.id, child)
-    node.childIds.push(child.id)
-  }
-  // The parent's own durable point is the commit(WAITING_CHILDREN) that follows.
-  safeUpdate(ctx)
-  return { ok: true }
 }
 
 export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<void> {
