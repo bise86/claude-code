@@ -35,6 +35,7 @@ import {
 } from '../../tools/efftask/startupConfirm.js'
 import { buildStartupCard, sendFeishuStartupCard } from '../../tools/efftask/feishuStartupCard.js'
 import { buildConflictCard } from '../../tools/efftask/conflictEscalation.js'
+import { buildBlockCard, createEscalationLimiter } from '../../tools/efftask/escalation.js'
 import { ConfirmStartup } from './ConfirmStartup.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import { hasPermissionsToUseTool } from '../../utils/permissions/permissions.js'
@@ -390,6 +391,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // The run's root node, minted ONCE. Re-minting per draft would give the run a different
   // createdAt on every re-draft and discard the plan the previous pass wrote into it.
   const rootRef = React.useRef<TaskNode | null>(null)
+  // Per-run escalation budget (see createEscalationLimiter). A ref, not state: it must not
+  // reset on re-render, and nothing renders from it.
+  const cardLimit = React.useRef(createEscalationLimiter())
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
@@ -467,7 +471,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       const validated = validateLoadedNodes(raw, {
         goal: recovered.goalPrompt, phaseRoles: recovered.phaseRoles, now,
       })
-      const reseated = reseatTransientNodes(validated.nodes, now, recovered.caps)
+      const reseated = reseatTransientNodes(validated.nodes, now, recovered.caps, {
+        retryBlocked: props.resumeArgs.retryBlocked,
+      })
       if (cancelled) return
       if (reseated.nodes.length === 0) {
         setFatal(`run ${runId} 里没有可恢复的节点`)
@@ -505,6 +511,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         repairs: validated.repairs,
         reseated: reseated.reseated,
         exhausted: reseated.exhausted,
+        retried: reseated.retried,
         degraded,
         loadErrors: errors.map(e => `${e.path}: ${e.message}`),
         inheritedGuidance: inherited,
@@ -589,6 +596,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           const client = store.getState().feishuClient
           if (!client) return
           void client.sendCard(buildConflictCard(e, runId ?? undefined)).catch(err => {
+            logError(err instanceof Error ? err : new Error(String(err)))
+          })
+        },
+        // 触阀升级 (spec §9/§11). Same shared client, read at escalation time. Rate-limited,
+        // and the suppression is ANNOUNCED on the last card that gets through — silently
+        // dropping notifications is the same failure as never sending them.
+        onBlocked: info => {
+          const client = store.getState().feishuClient
+          if (!client) return
+          const { send, note } = cardLimit.current.admit()
+          if (!send) return
+          const card = buildBlockCard(info, runId ?? undefined) as { elements: { text: { content: string } }[] }
+          if (note) card.elements[0].text.content += `\n- ${note}`
+          void client.sendCard(card).catch(err => {
             logError(err instanceof Error ? err : new Error(String(err)))
           })
         },

@@ -201,3 +201,86 @@ describe('reseatTransientNodes returns killed-mid-phase nodes to a re-enterable 
     expect(out.nodes[0].updatedAt).toBe(NOW)
   })
 })
+
+describe('--retry-blocked:触阀后的人工重试', () => {
+  const capped = (over: Partial<TaskNode> = {}): TaskNode => mk({
+    id: 'root/01-a', parentId: 'root', depth: 1, kind: 'executable',
+    status: 'BLOCKED', blockedReason: '验收迭代超限(3): 缺测试', capBlocked: true,
+    iteration: { planReview: 0, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    ...over,
+  })
+
+  it('does NOTHING without the flag — a valve must not re-arm itself', () => {
+    const n = capped()
+    const r = reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('BLOCKED')
+    expect(r.retried).toEqual([])
+  })
+
+  it('reopens the node AND resets the budget of the phase it re-enters', () => {
+    // Without the reset the node is reseated and instantly re-exhausted by the budget check —
+    // the flag would be inert and the card naming it would describe a no-op.
+    const n = capped()
+    const r = reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.status).toBe('READY')
+    expect(n.iteration.acceptance).toBe(0)
+    expect(n.blockedReason).toBe('')
+    expect(r.retried).toEqual(['root/01-a'])
+    expect(r.exhausted).toEqual([])
+  })
+
+  it('resets the RIGHT counter for the phase the node actually re-enters', () => {
+    const planning = capped({ kind: 'unknown', iteration: { planReview: 3, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 } })
+    reseatTransientNodes([planning], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(planning.status).toBe('CREATED')
+    expect(planning.iteration.planReview).toBe(0)
+
+    const integrating = capped({ childIds: ['root/01-a/01-x'], iteration: { planReview: 0, acceptance: 0, integration: 3, scoring: 0, mergeResolve: 0 } })
+    reseatTransientNodes([integrating], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(integrating.status).toBe('WAITING_CHILDREN')
+    expect(integrating.iteration.integration).toBe(0)
+  })
+
+  it('clears the marker, so a LATER plain resume does not keep re-arming it', () => {
+    const n = capped()
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(n.capBlocked).toBe(false)
+  })
+
+  it('reopens the propagated-blocked chain above it, or the seat is unreachable', () => {
+    // The scheduler refuses any node with a BLOCKED ancestor, so reopening the leaf alone
+    // makes the flag look like it worked while the run issues zero model calls.
+    const parent = mk({ id: 'root', status: 'BLOCKED', blockedReason: '子节点阻断', childIds: ['root/01-a'], kind: 'decompose' })
+    const n = capped()
+    reseatTransientNodes([parent, n], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(parent.status).toBe('WAITING_CHILDREN')
+    expect(parent.blockedReason).toBe('')
+  })
+
+  it('NEVER resurrects a node blocked because its disk state is unusable', () => {
+    // validateLoadedNodes writes these with capBlocked untouched. Re-running them would
+    // execute work whose upstream cannot be verified while the run reported success.
+    const broken = mk({
+      id: 'root/01-a', parentId: 'root', depth: 1, status: 'BLOCKED',
+      blockedReason: '依赖节点缺失(root/09-x)', interrupted: false,
+    })
+    const cyc = mk({ id: 'root/02-b', parentId: 'root', depth: 1, status: 'BLOCKED', blockedReason: '依赖成环,无法确定执行顺序' })
+    const r = reseatTransientNodes([broken, cyc], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(broken.status).toBe('BLOCKED')
+    expect(cyc.status).toBe('BLOCKED')
+    expect(r.retried).toEqual([])
+  })
+
+  it('does not touch a merge-conflict block, which has its own path and its own card', () => {
+    const conflicted = mk({
+      id: 'root/01-a', parentId: 'root', depth: 1, kind: 'executable', status: 'BLOCKED',
+      mergeConflict: true, blockedReason: '合并冲突,已保留工作区待人工处理',
+      iteration: { planReview: 0, acceptance: 2, integration: 0, scoring: 0, mergeResolve: 1 },
+    })
+    const r = reseatTransientNodes([conflicted], NOW, DEFAULT_CAPS, { retryBlocked: true })
+    // It IS reopened (that path always was), but as a merge resume — not as a budget reset.
+    expect(r.retried).toEqual([])
+    expect(conflicted.iteration.acceptance).toBe(2)
+    expect(conflicted.mergeConflict).toBe(true)
+  })
+})

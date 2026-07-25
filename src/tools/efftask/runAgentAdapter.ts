@@ -9,6 +9,20 @@ import { runWithCwdOverride } from '../../utils/cwd.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { RoleBinding } from './types.js'
 
+/**
+ * caps.nodeTimeoutMs tripped (spec §11 的第四个阀).
+ *
+ * A CLASS, not a message match: the pipeline escalates a timeout differently from every other
+ * phase failure (提高 nodeTimeoutMs / 拆小节点, rather than "read the reviewer's blockers"),
+ * and this reason's text is user-facing Chinese prose that will be reworded.
+ */
+export class PhaseTimeoutError extends Error {
+  constructor(public readonly limitMs: number) {
+    super(`阶段调用超时(${limitMs} ms),已中止`)
+    this.name = 'PhaseTimeoutError'
+  }
+}
+
 export function collectText(messages: Message[]): string {
   let out = ''
   for (const m of messages) {
@@ -180,7 +194,7 @@ export function makeRunAgentFn(deps: {
     }
     // Report the deadline rather than returning a truncated answer that the phase would
     // parse as a real (empty) reply.
-    if (timedOut) throw new Error(`阶段调用超时(${limitMs} ms),已中止`)
+    if (timedOut) throw new PhaseTimeoutError(limitMs ?? 0)
     return collectText(collected)
   }
 }

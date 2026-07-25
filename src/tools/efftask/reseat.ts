@@ -21,6 +21,14 @@ export interface ReseatResult {
   reseated: string[]
   /** Ids blocked because the phase they would re-enter has no budget left. */
   exhausted: string[]
+  /**
+   * Ids reopened by `--retry-blocked` — nodes a safety valve had stopped.
+   *
+   * Reported separately because the resume gate must SAY it: re-arming a valve is the one
+   * thing on this path that spends budget the run had already refused to spend, and a user
+   * who typed the flag from a card needs to see how many nodes it actually reached.
+   */
+  retried: string[]
 }
 
 /**
@@ -51,7 +59,23 @@ export interface ReseatResult {
  * Re-entry means the interrupted step runs again, possibly repeating a model call. That is
  * the deliberate trade: redo work rather than let half-finished work pass as finished.
  */
-export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps): ReseatResult {
+export function reseatTransientNodes(
+  nodes: TaskNode[], now: string, caps: Caps,
+  /**
+   * `--retry-blocked` (spec §9/§11): ALSO reopen nodes a safety valve stopped, and give each
+   * a fresh budget for the phase it re-enters.
+   *
+   * Opt-in, and gated on the structural `capBlocked` flag rather than on reason text, so it
+   * can never resurrect a node blocked by 依赖节点缺失 / 子节点缺失 / 依赖成环 — those are
+   * unusable disk states, and re-running them would execute work whose upstream cannot be
+   * verified while the run reported success.
+   *
+   * The budget RESET is the point: without it the node is reseated and instantly re-exhausted
+   * by the check below, so the flag would be inert and the escalation card that names it
+   * would be describing a command that does nothing.
+   */
+  opts: { retryBlocked?: boolean } = {},
+): ReseatResult {
   // A node blocked ONLY because something below it failed. propagateBlocked writes this
   // reason on the way up and — unlike the abort path — never sets `interrupted`, so the
   // ancestors of a reopened node stayed BLOCKED. The scheduler then refuses to pick any node
@@ -76,14 +100,17 @@ export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps)
 
   const reseated: string[] = []
   const exhausted: string[] = []
+  const retried: string[] = []
   for (const n of nodes) {
     const wasInterrupted = n.status === 'BLOCKED' && n.interrupted === true
+    // 触阀后的人工重试. Only with the explicit flag, and only for nodes a VALVE stopped.
+    const retryValve = opts.retryBlocked === true && n.status === 'BLOCKED' && n.capBlocked === true
     // A conflict block is a VERDICT, so interrupted is false — yet it is the one blocked
     // state the user is explicitly invited to resume, because the card tells them to fix the
     // conflict and re-run. Without this the invitation was false: reseat skipped it and the
     // resumed run reported the identical block having made zero model calls.
     const awaitingHumanMerge = n.status === 'BLOCKED' && n.mergeConflict === true
-    if (!ACTIVE.has(n.status) && !wasInterrupted && !awaitingHumanMerge) continue
+    if (!ACTIVE.has(n.status) && !wasInterrupted && !awaitingHumanMerge && !retryValve) continue
     // Re-entry for this node is the ACCEPTANCE+merge path in stepExecute, which the flag
     // itself selects; the READY seat below is only how the scheduler picks it up again.
 
@@ -96,6 +123,18 @@ export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps)
     // a node going back to CREATED re-enters plan→review, so planReview is what binds.
     // Without this the resume spends a real write-capable execute call and a full acceptance
     // roundtable before discovering the cap — paying for a repo mutation nothing will consume.
+    // The retry the human explicitly asked for BUYS a fresh budget for the phase this node
+    // re-enters. Reseating without the reset would trip the exhausted check one line below —
+    // the flag would be inert and the card naming it would describe a no-op.
+    if (retryValve) {
+      if (target === 'READY') n.iteration.acceptance = 0
+      else if (target === 'CREATED') n.iteration.planReview = 0
+      else n.iteration.integration = 0
+      // Cleared so the NEXT valve trip is a fresh decision, and so a later plain `--resume`
+      // does not silently keep offering a retry the user did not ask for again.
+      n.capBlocked = false
+      retried.push(n.id)
+    }
     const spent =
       target === 'READY' ? n.iteration.acceptance
       : target === 'CREATED' ? n.iteration.planReview
@@ -136,5 +175,5 @@ export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps)
     n.updatedAt = now
     reseated.push(n.id)
   }
-  return { nodes, reseated, exhausted }
+  return { nodes, reseated, exhausted, retried }
 }

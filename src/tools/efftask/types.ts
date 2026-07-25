@@ -56,6 +56,21 @@ export interface TaskNode {
    */
   mergeConflict?: boolean
   /**
+   * BLOCKED because a SAFETY VALVE tripped (spec §11) — an iteration/rework limit, the node
+   * cap, a phase timeout, or reviewers that could never be reached. Never because the tree
+   * itself is damaged.
+   *
+   * WHY a field rather than matching blockedReason text: `/et --resume <id> --retry-blocked`
+   * reopens exactly this set, and it must be impossible for it to resurrect a node blocked by
+   * 依赖节点缺失 / 子节点缺失 / 依赖成环 — those are unrecoverable disk states that
+   * validateLoadedNodes wrote, and re-running them would execute work whose upstream cannot
+   * be verified. A shared string literal between two modules is not an interface.
+   *
+   * Assigned in BOTH directions, like `interrupted`: a node that later fails for a structural
+   * reason must not keep a stale flag that makes a retry offer it.
+   */
+  capBlocked?: boolean
+  /**
    * 启动关口第三关(spec §2)确认过的首层拆分。
    *
    * Its PRESENCE means "the plan already in this node was put in front of a human and

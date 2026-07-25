@@ -145,6 +145,8 @@ export interface ResumeSummary {
   reseated: string[]
   /** reseatTransientNodes: ids blocked because the phase they would re-enter has no budget. */
   exhausted: string[]
+  /** reseatTransientNodes: ids reopened by `--retry-blocked` (触阀后的人工重试). */
+  retried?: string[]
   /** readRunManifest: config that could not be recovered. */
   degraded: string[]
   /** loadRun: node files that could not be parsed. */
@@ -165,6 +167,15 @@ export function resumeSummarySections(s: ResumeSummary): SummarySection[] {
   })
   if (s.reseated.length > 0) {
     out.push({ heading: `重新排队 ${s.reseated.length} 个节点`, lines: s.reseated.slice(0, 8).map(x => clip(x)), tone: 'info' })
+  }
+  if (s.retried && s.retried.length > 0) {
+    // Loud, and its own section. This is the one resume action that re-arms a safety valve —
+    // it spends budget the run had already refused to spend, so the gate must not let it
+    // slide by inside the ordinary 重新排队 count.
+    out.push({
+      heading: `--retry-blocked:重开 ${s.retried.length} 个被安全阀停下的节点(该阶段预算已重置)`,
+      lines: s.retried.slice(0, 8).map(x => clip(x)), tone: 'warn',
+    })
   }
   if (s.exhausted.length > 0) {
     out.push({ heading: `${s.exhausted.length} 个节点预算已耗尽,不再重试`, lines: s.exhausted.slice(0, 8).map(x => clip(x)), tone: 'warn' })

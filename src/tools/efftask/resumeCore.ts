@@ -129,6 +129,10 @@ export function validateLoadedNodes(
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>
     if (typeof n.title !== 'string' || n.title.length === 0) n.title = n.id
     if (typeof n.goal !== 'string' || n.goal.length === 0) n.goal = n.title
+    // `--retry-blocked` keys on this EXACT boolean. run.md and node.md are hand-editable, and
+    // a truthy non-boolean (`capBlocked: "yes"`) would let the retry path reopen a node no
+    // valve ever stopped. Only a real `true` counts; everything else means "not a valve".
+    if (n.capBlocked !== undefined && n.capBlocked !== true) n.capBlocked = false
     // 根方案关口 (spec §2 第三关) 的确认结果。Reachable on disk when the run was aborted
     // before the root's first commit consumed it, so it must survive — but it is also the one
     // field that SKIPS the plan phase, and a malformed one would send an empty plan straight

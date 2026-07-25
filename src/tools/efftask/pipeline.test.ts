@@ -6,6 +6,7 @@ import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap } from './stateMachine.js'
 import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
+import { PhaseTimeoutError } from './runAgentAdapter.js'
 
 // Verdict prompts carry a per-call random tag; a cooperative reviewer answers under THAT tag.
 // Anything else in the reply is quoted context, which parseVerdict deliberately refuses.
@@ -1178,5 +1179,141 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     await stepExecute(n, ctx)
     expect(n.status).toBe('ACCEPTED')
     expect(n.worktree).toBeUndefined()
+  })
+})
+
+describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
+  type Fired = { id: string; category: string; reason: string }
+  function ctxWithBlocks(nodes: TaskNode[], runAgent: RunAgentFn, config: EffTaskConfig = cfg, signal?: AbortSignal) {
+    const c = ctxFor(nodes, runAgent, config, signal)
+    const fired: Fired[] = []
+    c.onBlocked = info => { fired.push({ id: info.node.id, category: info.category, reason: info.reason }) }
+    return { ctx: c, fired }
+  }
+  const rejectAll = (req: { phase: string; prompt: string }) =>
+    req.phase === 'plan'
+      ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      : vtag(req) + '\n{"pass":false,"blocking":["还差得远"],"comments":""}\n```'
+
+  it('评审迭代超限 → cap-iteration', async () => {
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async req => rejectAll(req))
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(fired).toHaveLength(1)
+    expect(fired[0].category).toBe('cap-iteration')
+    expect(fired[0].reason).toContain('评审迭代超限')
+    // The structural marker `--retry-blocked` keys on. Without it the card names a command
+    // that reopens nothing.
+    expect(n.capBlocked).toBe(true)
+  })
+
+  it('验收迭代超限 → rework (spec §9 就叫"连续返工超限")', async () => {
+    const n = root()
+    n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"改了点东西"}\n```'
+        : vtag(req) + '\n{"pass":false,"blocking":["缺测试"],"comments":""}\n```')
+    await stepExecute(n, ctx)
+    expect(fired.map(f => f.category)).toEqual(['rework'])
+    expect(n.capBlocked).toBe(true)
+  })
+
+  it('执行阶段反复空产出 → rework', async () => {
+    const n = root()
+    n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks([n], async () => '```json\n{"execStatus":""}\n```')
+    await stepExecute(n, ctx)
+    expect(fired.map(f => f.category)).toEqual(['rework'])
+  })
+
+  it('集成验收迭代超限 → rework', async () => {
+    const p = root()
+    p.kind = 'decompose'
+    p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const { ctx, fired } = ctxWithBlocks([p, kid], async req => vtag(req) + '\n{"pass":false,"blocking":["没串起来"],"comments":""}\n```')
+    await stepIntegrate(p, ctx)
+    expect(fired.map(f => f.category)).toEqual(['rework'])
+  })
+
+  it('节点数超上限 → cap-nodes,而不是跟磁盘故障混为一谈', async () => {
+    const tiny: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 1 } }
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"decompose","solution":"s","keyPoints":"","risks":"","acceptance":"","children":[{"title":"AA","deps":[]}]}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```', tiny)
+    await stepStart(n, ctx)
+    expect(fired.map(f => f.category)).toEqual(['cap-nodes'])
+  })
+
+  it('子节点落盘失败不是安全阀 —— 不发卡,也不提供重试', async () => {
+    // A disk failure is not a budget decision. Offering `--retry-blocked` for it would send
+    // the user to re-run a node whose children cannot be written either way.
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"decompose","solution":"s","keyPoints":"","risks":"","acceptance":"","children":[{"title":"AA","deps":[]}]}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```')
+    ctx.persist = async node => { if (node.id !== 'root') throw new Error('磁盘满了') }
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(fired).toEqual([])
+    expect(n.capBlocked).toBe(false)
+  })
+
+  it('阶段超时 → timeout', async () => {
+    const n = root()
+    n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks([n], async () => { throw new PhaseTimeoutError(600_000) })
+    await stepExecute(n, ctx)
+    expect(fired.map(f => f.category)).toEqual(['timeout'])
+    expect(fired[0].reason).toContain('阶段调用超时')
+  })
+
+  it('普通的模型调用失败不是超时,给的建议也不一样', async () => {
+    const n = root()
+    n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks([n], async () => { throw new Error('502 bad gateway') })
+    await stepExecute(n, ctx)
+    expect(fired).toEqual([])
+  })
+
+  it('角色连续调用失败 → infra', async () => {
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+        : (() => { throw new Error('provider down') })())
+    await stepStart(n, ctx)
+    expect(fired.map(f => f.category)).toEqual(['infra'])
+  })
+
+  it('用户自己按了取消,绝不发卡', async () => {
+    // The user is standing at the keyboard. A card saying 已暂停等待人工 would contradict the
+    // run's own 已取消 in the same second — the same rule the conflict path follows.
+    const ac = new AbortController()
+    const n = root()
+    n.kind = 'executable'
+    let round = 0
+    const { ctx, fired } = ctxWithBlocks([n], async req => {
+      if (req.phase === 'execute') { if (++round >= 2) ac.abort(); return '```json\n{"execStatus":"做了"}\n```' }
+      return vtag(req) + '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+    }, cfg, ac.signal)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(fired).toEqual([])
+  })
+
+  it('一个发通知失败的回调不会改变运行的裁决', async () => {
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async req => rejectAll(req))
+    ctx.onBlocked = () => { fired.push({ id: n.id, category: 'x', reason: 'x' }); throw new Error('飞书炸了') }
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('评审迭代超限')
   })
 })

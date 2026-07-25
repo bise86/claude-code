@@ -42,6 +42,8 @@ export async function runOrchestrator(
     worktrees?: WorktreePool
     /** 升级人工 (spec §8): a conflict the node could not resolve itself. */
     onEscalate?: PipelineCtx['onEscalate']
+    /** 触阀升级 (spec §9/§11): a node stopped by a safety valve or a rework limit. */
+    onBlocked?: PipelineCtx['onBlocked']
     /**
      * 后台任务登记 (spec §10): make this run visible in `/tasks` and the footer pill, with
      * live counts, and stoppable from there through the run's OWN controller.
@@ -111,6 +113,7 @@ export async function runOrchestrator(
         now,
         worktrees: args.worktrees,
         onEscalate: args.onEscalate,
+        onBlocked: args.onBlocked,
         onUpdate: nodes => {
           setNodes([...nodes])
           touch(nodes)

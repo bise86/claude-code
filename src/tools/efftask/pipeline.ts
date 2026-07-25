@@ -6,6 +6,8 @@ import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
+import type { BlockCategory } from './escalation.js'
+import { PhaseTimeoutError } from './runAgentAdapter.js'
 
 /** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
 export type NodeSlots = { release: () => void }
@@ -53,6 +55,15 @@ export interface PipelineCtx {
     state: { markers: boolean; staged: boolean; stale: boolean }
     integrationBranch?: string
   }) => void
+  /**
+   * 触阀升级 (spec §9/§11): a node stopped because a SAFETY VALVE tripped.
+   *
+   * Separate from onEscalate because the two carry different facts and prescribe different
+   * actions — a conflict hands the user a worktree to fix, a valve asks whether to spend more
+   * budget. Sharing one payload would have meant one card describing both, with half its
+   * fields empty for whichever case it wasn't.
+   */
+  onBlocked?: (info: { node: TaskNode; reason: string; category: BlockCategory }) => void
 }
 
 /**
@@ -87,7 +98,7 @@ function safeUpdate(ctx: PipelineCtx): void {
 // `text` rides along on the FAILURE branch too: the execute phase runs with write-capable
 // tools, so an abort that arrives after the executor answered may be discarding the only
 // record of changes already made to the repo.
-type PhaseResult = { ok: true; text: string } | { ok: false; reason: string; text?: string }
+type PhaseResult = { ok: true; text: string } | { ok: false; reason: string; text?: string; timeout?: boolean }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
 // which records it into node.blockedReason and BLOCKs the node.
@@ -97,14 +108,19 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promi
     if (ctx.signal.aborted) return { ok: false, reason: '已中断', text }
     return { ok: true, text }
   } catch (e) {
-    return { ok: false, reason: e instanceof Error ? e.message : String(e) }
+    // caps.nodeTimeoutMs is a safety VALVE (spec §11) and escalates differently from an
+    // ordinary provider failure, so it travels as a flag rather than as prose to grep.
+    return { ok: false, reason: e instanceof Error ? e.message : String(e), timeout: e instanceof PhaseTimeoutError }
   }
 }
 
 // Records WHY the node died in its own field. It must NOT touch node.execStatus, which may
 // hold real completed-work evidence that acceptance/audit still needs.
-async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx): Promise<void> {
+async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx, category?: BlockCategory): Promise<void> {
   node.blockedReason = reason
+  // Assigned in BOTH directions, like `interrupted`: a node that previously tripped a valve
+  // and is now blocked for a structural reason must not keep a flag that offers a retry.
+  node.capBlocked = category !== undefined
   // Structural, not textual: if the run is aborting, this block is an interruption rather
   // than a judgement about the work, and resume must be able to reopen exactly these nodes.
   // Assigned in BOTH directions on purpose — a node reseated by an earlier resume carries a
@@ -113,6 +129,12 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx)
   // which is exactly the set this line covers.)
   node.interrupted = ctx.signal.aborted
   await commit(node, 'BLOCKED', ctx)
+  // A cancel must never page a human — same rule the conflict path follows. The user is
+  // standing at the keyboard, and a card saying 已暂停等待人工 would contradict the run's own
+  // 已取消 in the same second. Fired AFTER the commit so the card and the tree agree.
+  if (category !== undefined && !ctx.signal.aborted) {
+    try { ctx.onBlocked?.({ node, reason, category }) } catch { /* a notification failure must not change the verdict */ }
+  }
 }
 
 // True when a round failed only because reviewer CALLS failed, not because anyone judged
@@ -388,7 +410,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       if (!(await commit(node, 'PLANNING', ctx))) return
       const planTag = answerTag(ANSWER_TAGS.plan)
       const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, ctx, planTag, feedback), signal: ctx.signal })
-      if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
+      if (!res.ok) { await blockWithReason(node, res.reason, ctx, res.timeout ? 'timeout' : undefined); return }
       const parsed = parsePlanOutput(res.text, planTag)
       node.kind = parsed.kind
       node.plan = parsed.plan
@@ -406,14 +428,14 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {
       // Nobody judged the plan — say that rather than blaming the plan.
-      await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
+      await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, 'infra')
       return
     }
     if (!rec.synthesized.pass) {
       node.iteration.planReview++
       feedback = rec.synthesized.blockingSummary
       if (node.iteration.planReview >= caps.maxIterations) {
-        await blockWithReason(node, `评审迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
+        await blockWithReason(node, `评审迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx, 'cap-iteration')
         return
       }
       continue
@@ -446,17 +468,22 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     if (created.ok) { await commit(node, 'WAITING_CHILDREN', ctx); return }
     // Node-count cap and persist failures are fatal (retrying can't make room or fix the
     // disk); a dependency cycle is a planning mistake the model can correct.
-    if (!created.retryable) { await blockWithReason(node, created.reason, ctx); return }
+    if (!created.retryable) { await blockWithReason(node, created.reason, ctx, created.cap ? 'cap-nodes' : undefined); return }
     node.iteration.planReview++
     feedback = created.reason
     if (node.iteration.planReview >= caps.maxIterations) {
-      await blockWithReason(node, `拆分迭代超限(${caps.maxIterations}): ${created.reason}`, ctx)
+      await blockWithReason(node, `拆分迭代超限(${caps.maxIterations}): ${created.reason}`, ctx, 'cap-iteration')
       return
     }
   }
 }
 
-type CreateResult = { ok: true } | { ok: false; reason: string; retryable: boolean }
+type CreateResult =
+  | { ok: true }
+  // `cap` marks the node-count valve specifically. The caller used to compare the reason
+  // against a string literal to tell it from a persist failure — two modules sharing a
+  // sentence is not an interface, and the two need different cards.
+  | { ok: false; reason: string; retryable: boolean; cap?: boolean }
 
 export async function createChildren(node: TaskNode, specs: { title: string; deps: string[] }[], ctx: PipelineCtx): Promise<CreateResult> {
   // Node-count cap: if creating these children would exceed maxNodes, create NONE
@@ -466,7 +493,7 @@ export async function createChildren(node: TaskNode, specs: { title: string; dep
   // passed against the same stale size and the tree ran past the cap.
   const slots = ctx.reserveNodes(specs.length)
   if (!slots) {
-    return { ok: false, reason: '节点数超过上限', retryable: false }
+    return { ok: false, reason: '节点数超过上限', retryable: false, cap: true }
   }
   try {
     // Sibling deps are written as TITLES, so duplicate titles make every reference to them
@@ -879,7 +906,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // write tools, so discarding this can leave the repo changed with no record of it.
       const partial = res.text ? parseExecOutput(res.text, execTag).execStatus.trim() : ''
       if (partial) node.execStatus = `${partial}\n(注:本轮在完成前被中断,以上为中断时已报告的产出)`
-      await blockWithReason(node, res.reason, ctx)
+      await blockWithReason(node, res.reason, ctx, res.timeout ? 'timeout' : undefined)
       return
     }
     const out = parseExecOutput(res.text, execTag)
@@ -891,7 +918,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       emptyReports++
       node.iteration.acceptance++
       if (node.iteration.acceptance >= caps.maxIterations) {
-        await blockWithReason(node, `执行阶段未报告任何产出(第 ${emptyReports} 次),已达迭代上限 ${caps.maxIterations}`, ctx)
+        await blockWithReason(node, `执行阶段未报告任何产出(第 ${emptyReports} 次),已达迭代上限 ${caps.maxIterations}`, ctx, 'rework')
         return
       }
       feedback = '上一轮执行没有报告任何产出。请真正执行任务,并在 execStatus 里写明具体做了什么、结果如何。'
@@ -937,7 +964,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {
       // Nobody ever judged the work — say that, rather than blaming the work.
-      await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
+      await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, 'infra')
       return
     }
     if (rec.synthesized.pass) {
@@ -958,7 +985,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     }
     node.iteration.acceptance++
     if (node.iteration.acceptance >= caps.maxIterations) {
-      await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
+      await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx, 'rework')
       return
     }
     // Keep the REAL blockers: overwriting them with a generic message would send the rework
@@ -998,13 +1025,13 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     if (infraExhausted) {
       // A decompose node whose children ALL succeeded must not be thrown away because the
       // reviewer's connection failed three times.
-      await blockWithReason(node, `集成验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
+      await blockWithReason(node, `集成验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, 'infra')
       return
     }
     if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
     node.iteration.integration++
     if (node.iteration.integration >= caps.maxIterations) {
-      await blockWithReason(node, `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
+      await blockWithReason(node, `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx, 'rework')
       return
     }
     feedback = rec.synthesized.blockingSummary

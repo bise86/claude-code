@@ -27,6 +27,12 @@ export interface OrchestratorDeps {
    * escalation injected it into a hand-built ctx and so passed over a severed wire.
    */
   onEscalate?: PipelineCtx['onEscalate']
+  /**
+   * 触阀升级 (spec §9/§11). Same wire, same warning as onEscalate above: it must be declared
+   * HERE and copied in ctx() below, or the callback is undefined in every real run and the
+   * whole feature is dead while its unit tests pass over a hand-built ctx.
+   */
+  onBlocked?: PipelineCtx['onBlocked']
   runAgent: RunAgentFn
   persist: (n: TaskNode) => Promise<void>
   now: () => string
@@ -106,6 +112,7 @@ export class EffTaskOrchestrator {
       reserveNodes: this.reserveNodes,
       worktrees: this.deps.worktrees,
       onEscalate: this.deps.onEscalate,
+      onBlocked: this.deps.onBlocked,
       byId: this.byId,
       runAgent: this.deps.runAgent,
       persist: this.deps.persist,

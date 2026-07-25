@@ -230,3 +230,27 @@ describe('handoffLines 告诉用户工作在哪,以及怎么处置', () => {
     expect(text).toContain('salvage')
   })
 })
+
+describe('resumeSummarySections 对 --retry-blocked 要说清楚', () => {
+  const base = {
+    runId: '003',
+    counts: { accepted: 2, blocked: 1, pending: 3, total: 6 },
+    repairs: [], reseated: [], exhausted: [], degraded: [], loadErrors: [],
+  }
+  it('gives the valve retry its OWN loud section, not a line inside 重新排队', () => {
+    // This is the one resume action that re-arms a safety valve: it spends budget the run
+    // already refused to spend. Folding it into the ordinary reseat count would let it pass
+    // the gate unread.
+    const s = resumeSummarySections({ ...base, retried: ['root/01-a', 'root/02-b'] })
+    const sec = s.find(x => x.heading.includes('--retry-blocked'))
+    expect(sec).toBeDefined()
+    expect(sec!.heading).toContain('2 个')
+    expect(sec!.heading).toContain('预算已重置')
+    expect(sec!.tone).toBe('warn')
+    expect(sec!.lines).toEqual(['root/01-a', 'root/02-b'])
+  })
+  it('says nothing when the flag was not used', () => {
+    expect(resumeSummarySections({ ...base, retried: [] }).some(x => x.heading.includes('retry'))).toBe(false)
+    expect(resumeSummarySections(base).some(x => x.heading.includes('retry'))).toBe(false)
+  })
+})

@@ -3,7 +3,7 @@ import { parseResumeArgs } from './parseResumeArgs.js'
 
 describe('parseResumeArgs', () => {
   it('a plain prompt stays a new run', () => {
-    expect(parseResumeArgs('做个登录功能')).toEqual({ mode: 'new', guidance: '', rest: '做个登录功能' })
+    expect(parseResumeArgs('做个登录功能')).toEqual({ mode: 'new', guidance: '', rest: '做个登录功能', retryBlocked: false })
   })
 
   it('preserves the new-run prompt byte for byte', () => {
@@ -19,7 +19,7 @@ describe('parseResumeArgs', () => {
   })
 
   it('--resume alone means "let me pick"', () => {
-    expect(parseResumeArgs('--resume')).toEqual({ mode: 'resume', guidance: '', rest: '' })
+    expect(parseResumeArgs('--resume')).toEqual({ mode: 'resume', guidance: '', rest: '', retryBlocked: false })
     expect(parseResumeArgs('  --resume  ').runId).toBeUndefined()
   })
 
@@ -49,5 +49,37 @@ describe('parseResumeArgs', () => {
     const got = parseResumeArgs('--resume 先从简')
     expect(got.runId).toBeUndefined()
     expect(got).toMatchObject({ mode: 'resume', guidance: '先从简' })
+  })
+})
+
+describe('--retry-blocked (触阀后人工重试, spec §9/§11)', () => {
+  it('is off unless asked for — a valve must not re-arm itself', () => {
+    expect(parseResumeArgs('--resume 003').retryBlocked).toBe(false)
+    expect(parseResumeArgs('--resume 003 先做鉴权').retryBlocked).toBe(false)
+  })
+
+  it('is recognised after the run id, and does not become guidance', () => {
+    // Guidance is interpolated into every later plan/execute prompt. A flag left in it would
+    // reach the model as an instruction.
+    const r = parseResumeArgs('--resume 003 --retry-blocked 先做鉴权')
+    expect(r).toMatchObject({ mode: 'resume', runId: '003', guidance: '先做鉴权', retryBlocked: true })
+  })
+
+  it('is recognised BEFORE the run id too — the card shows one order, users type another', () => {
+    expect(parseResumeArgs('--resume --retry-blocked 003')).toMatchObject({ runId: '003', retryBlocked: true })
+  })
+
+  it('works with no id and no guidance', () => {
+    expect(parseResumeArgs('--resume --retry-blocked')).toEqual({ mode: 'resume', guidance: '', rest: '', retryBlocked: true })
+  })
+
+  it('works with latest', () => {
+    expect(parseResumeArgs('--resume latest --retry-blocked')).toMatchObject({ runId: 'latest', retryBlocked: true })
+  })
+
+  it('does not touch a NEW run whose prompt happens to contain the words', () => {
+    // rest becomes goalPrompt verbatim — the root node's goal, title, and every plan prompt.
+    const raw = '给 /et 加一个 --retry-blocked 参数'
+    expect(parseResumeArgs(raw)).toEqual({ mode: 'new', guidance: '', rest: raw, retryBlocked: false })
   })
 })

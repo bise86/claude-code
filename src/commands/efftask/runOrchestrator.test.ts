@@ -238,3 +238,30 @@ describe('后台任务条目 (spec §10) 真的被接上', () => {
     expect(outcomes).toEqual([{ status: 'blocked', reason: '已中断' }])
   })
 })
+
+describe('触阀升级 (spec §9/§11) 真的被接上', () => {
+  it('a valve trip inside the run reaches the caller\'s onBlocked', async () => {
+    // THE wire. onEscalate was added to PipelineCtx and to this function but NOT to
+    // OrchestratorDeps/ctx(), so it was undefined in every real run while five unit tests
+    // passed over a hand-built ctx. This asserts the same wire for onBlocked at the level
+    // that owns it.
+    const fired: { category: string; reason: string }[] = []
+    const ac = new AbortController()
+    // A reviewer that always blocks: the run drives the root to 评审迭代超限.
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+        : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+          '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: memFs(), runAgent, signal: ac.signal,
+        onBlocked: info => fired.push({ category: info.category, reason: info.reason }),
+      },
+      () => {}, () => {}, () => {},
+    )
+    expect(fired).toHaveLength(1)
+    expect(fired[0].category).toBe('cap-iteration')
+    expect(fired[0].reason).toContain('评审迭代超限')
+  })
+})
