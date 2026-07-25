@@ -100,7 +100,9 @@ export async function runOrchestrator(
   }
   const settle = (o: Outcome): void => {
     if (!taskId || !entry) return
-    try { finishEffTaskRun(taskId, entry.setAppState, o) } catch { /* panel only */ }
+    // The SIGNAL decides whether this was a user stop — not the reason text, which can be the
+    // literal '已中断' recovered from a previous session's node.md while nobody touched this run.
+    try { finishEffTaskRun(taskId, entry.setAppState, o, args.signal.aborted) } catch { /* panel only */ }
   }
   try {
     const persist = (n: TaskNode) => writeNode(args.fs, args.runDir, n)

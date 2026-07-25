@@ -132,8 +132,13 @@ export function reseatTransientNodes(
     // justifies duplicating a subtree. Believed unreachable today (a node that passed review
     // has planReview < cap, and growTree refuses PLAN_REVIEW targets), but the ordering is
     // what makes that a guarantee rather than an observation.
+    //
+    // Keyed on the RECORDED category, not on a fresh comparison against caps: the escalation
+    // card tells the user to raise caps.maxIterations, run.md is where that lands, and reseat
+    // reads run.md — so a derived check evaluated false exactly for the user who followed the
+    // advice, and handed a thrice-rejected plan to a write-capable executor.
     const reviewExhausted =
-      retryValve && n.childIds.length === 0 && n.iteration.planReview >= caps.maxIterations
+      retryValve && n.childIds.length === 0 && n.capCategory === 'cap-iteration'
     const target: NodeStatus =
       n.childIds.length > 0 ? 'WAITING_CHILDREN'
       : reviewExhausted ? 'CREATED'
@@ -149,8 +154,15 @@ export function reseatTransientNodes(
     // the flag would be inert and the card naming it would describe a no-op.
     if (retryValve) {
       if (target === 'READY') n.iteration.acceptance = 0
-      else if (target === 'CREATED') n.iteration.planReview = 0
-      else n.iteration.integration = 0
+      else if (target === 'CREATED') {
+        // ALL of them. A node sent back to CREATED replays plan → review → execute → accept,
+        // so leaving `acceptance` at the cap made the resume spend a real write-capable
+        // execute call and a full acceptance roundtable and THEN discover it had no budget —
+        // paying for a repo mutation nothing would consume. That is the exact waste the
+        // budget check below was written to prevent.
+        n.iteration.planReview = 0
+        n.iteration.acceptance = 0
+      } else n.iteration.integration = 0
       // Cleared so the NEXT valve trip is a fresh decision, and so a later plain `--resume`
       // does not silently keep offering a retry the user did not ask for again.
       n.capBlocked = false

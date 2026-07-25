@@ -43,6 +43,18 @@ export interface BlockEscalation {
   /** The reason as recorded on the node — quoted, never paraphrased. */
   reason: string
   category: BlockCategory
+  /**
+   * Did this trip actually STOP the node?
+   *
+   * Not derivable from the category alone. `cap-nodes` stops a node when it trips during
+   * decomposition (stepStart blocks) but NOT when it trips during dynamic growth (growTree
+   * refuses the graft and the node carries on to ACCEPTED). Measured: the growth path sent a
+   * card reading 该节点已停…以「被阻断」收场 for a node whose real state was ACCEPTED with an
+   * empty blockedReason, and told the user to run `--retry-blocked`, which matched nothing.
+   *
+   * Defaults from the category when the caller does not say.
+   */
+  stopped?: boolean
 }
 
 const TITLE: Record<BlockCategory, string> = {
@@ -100,12 +112,14 @@ export function blockEscalationLines(e: BlockEscalation, runId?: string): string
     // it here would give the card and node.md two different accounts of the same event.
     `原因: ${e.reason}`,
   ]
-  if (!stopsTheNode(e.category)) {
-    // The depth valve does NOT stop anything. Saying 已暂停 here would send the user to fix a
-    // run that is still working, and `--retry-blocked` would not match this node at all.
+  if (!(e.stopped ?? stopsTheNode(e.category))) {
+    // This trip did NOT stop the node. Saying 已暂停 here would send the user to fix a run
+    // that is still working, and `--retry-blocked` would not match this node at all.
     return [
       ...head,
-      '状态: 该节点不再拆分,planner 要的子任务已折进它自己的方案里,继续执行。本次运行没有停。',
+      e.category === 'cap-depth'
+        ? '状态: 该节点不再拆分,planner 要的子任务已折进它自己的方案里,继续执行。本次运行没有停。'
+        : '状态: 这次加子节点的请求被拒绝了,但该节点本身没有停,会带着这条拒绝记录继续执行和验收。',
       `记录: ${recordPath(e.node, runId)}`,
       `处理方式: ${REMEDY[e.category]}`,
     ]
@@ -129,7 +143,10 @@ export function blockEscalationLines(e: BlockEscalation, runId?: string): string
     `重试(会重开本次运行中所有被安全阀停下的节点,本节点将重跑「${retryTarget(e.node)}」): /et --resume ${id} --retry-blocked`,
     // NOT `/et --resume` — that is not a read-only operation. It takes the run lock, reseats
     // every interrupted node and issues real write-capable model calls.
-    '只看结果、不重跑: 直接读 run.md(上面路径的上一级目录)。',
+    // The PATH, not a relative direction. node.md lives at <runDir>/<node.id>/node.md and
+    // node.id contains slashes, so run.md is two or three levels up depending on depth —
+    // "上一级目录" was wrong for every node in the tree, including root.
+    `只看结果、不重跑: 直接读 ${runId ? `.claude/efftask/${runId}/run.md` : '该 run 目录下的 run.md'}。`,
   ]
 }
 
@@ -141,7 +158,7 @@ export function buildBlockCard(e: BlockEscalation, runId?: string): object {
       // personally unblock. This is a valve — the run protected itself and is asking whether
       // to spend more. Two different asks should not look identical in a chat window.
       // The depth valve is blue: nothing is wrong and nothing is waiting on anyone.
-      template: stopsTheNode(e.category) ? 'orange' : 'blue',
+      template: (e.stopped ?? stopsTheNode(e.category)) ? 'orange' : 'blue',
       title: { tag: 'plain_text', content: `高效任务模式 · ${TITLE[e.category]}` },
     },
     elements: [

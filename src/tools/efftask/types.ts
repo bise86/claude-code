@@ -82,6 +82,19 @@ export interface TaskNode {
    */
   capBlocked?: boolean
   /**
+   * WHICH valve stopped it. Recorded at block time, never re-derived.
+   *
+   * `--retry-blocked` decides where the node re-enters from this. Deriving it instead — by
+   * comparing `iteration.planReview >= caps.maxIterations` at resume time — was defeated by
+   * the escalation card's OWN advice: the card says "提高 caps.maxIterations 后再重试", the
+   * user does exactly that, run.md now carries the bigger cap, the comparison turns false,
+   * and a plan the roundtable rejected three times goes straight to a write-capable executor
+   * with zero plan calls and zero reviews. Measured.
+   *
+   * Persisted with the rest of the node (serializeNode spreads the whole object).
+   */
+  capCategory?: string
+  /**
    * 启动关口第三关(spec §2)确认过的首层拆分。
    *
    * Its PRESENCE means "the plan already in this node was put in front of a human and

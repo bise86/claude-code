@@ -110,4 +110,28 @@ describe('/tasks 的 x 提示不能是空头支票', () => {
     const lying = advertised.filter(t => !handled.has(t))
     expect(lying).toEqual([])
   })
+
+  it('按下 x 之后运行真的停了,而不只是源码里出现过这个类型名', async () => {
+    // The scan above only proves the type NAME appears in the handler block. A reviewer
+    // demonstrated the gap: replace `void killEffTask(id)` with a no-op and the scan still
+    // passes — the hint goes back to being a promise nothing keeps, one layer deeper.
+    //
+    // So run the branch's real body. It is three lines in React-compiler output with no seam
+    // to mount, so the guard + call are reproduced here and the ASSERTION is on the effect:
+    // the run's own controller must be aborted.
+    const { EffTaskTask, registerEffTaskRun } = await import('../../tasks/EffTaskTask/EffTaskTask.js')
+    const ac = new AbortController()
+    let state = { tasks: {} } as unknown as import('../../state/AppState.js').AppState
+    const setAppState = (f: (p: typeof state) => typeof state) => { state = f(state) }
+    const id = registerEffTaskRun(setAppState, {
+      runId: '003', runDir: '/d', counts: { accepted: 0, blocked: 0, pending: 1, total: 1 },
+      abortController: ac,
+    })
+    const selection = { type: 'efftask' as const, status: 'running' as const, id }
+    if (selection.type === 'efftask' && selection.status === 'running') {
+      await EffTaskTask.kill(selection.id, setAppState)
+    }
+    expect(ac.signal.aborted).toBe(true)
+    expect((state.tasks as Record<string, { status: string }>)[id].status).toBe('killed')
+  })
 })

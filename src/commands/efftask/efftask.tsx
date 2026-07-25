@@ -708,11 +708,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    */
   const rootDecided = React.useRef(false)
   const onRootDecision = React.useCallback((d: RootPlanDecision): void => {
-    // 'redraft' may legitimately happen many times; only 'start'/'cancel' are terminal.
-    if (d.action !== 'redraft') {
-      if (rootDecided.current) return
-      rootDecided.current = true
-    }
+    // Once the run has started, EVERY further decision is refused — including 'redraft'.
+    // Letting redraft through after a start pulled the phase back to 'drafting' while the
+    // orchestrator was already running: the user landed on a gate whose keys were all latched
+    // shut, with a run they could no longer see working behind it.
+    if (rootDecided.current) return
+    // 'redraft' is repeatable until then; only 'start'/'cancel' latch.
+    if (d.action !== 'redraft') rootDecided.current = true
     if (d.action === 'cancel') { props.abort(); props.onExit(null); return }
     if (d.action === 'redraft') {
       redraftFeedback.current = d.feedback

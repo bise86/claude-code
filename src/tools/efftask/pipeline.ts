@@ -63,7 +63,7 @@ export interface PipelineCtx {
    * budget. Sharing one payload would have meant one card describing both, with half its
    * fields empty for whichever case it wasn't.
    */
-  onBlocked?: (info: { node: TaskNode; reason: string; category: BlockCategory }) => void
+  onBlocked?: (info: { node: TaskNode; reason: string; category: BlockCategory; stopped?: boolean }) => void
   /**
    * The run id, when the caller knows it.
    *
@@ -107,6 +107,8 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
  * flattened, not merely that the run succeeded.
  */
 function notifyValve(node: TaskNode, reason: string, category: BlockCategory, ctx: PipelineCtx): void {
+  // stopped: false — EVERY caller of this helper leaves its node running. blockWithReason is
+  // the one that stops nodes, and it sends its own payload.
   // Same rule as blockWithReason: a cancel must never page a human.
   //
   // NOT COVERED BY A TEST, and recorded rather than faked: both call sites sit behind an
@@ -115,7 +117,7 @@ function notifyValve(node: TaskNode, reason: string, category: BlockCategory, ct
   // this line. Removing this guard leaves the suite green. It is defence for a race the
   // current control flow makes very narrow — keep it, but do not claim it is tested.
   if (ctx.signal.aborted) return
-  try { ctx.onBlocked?.({ node, reason, category }) } catch { /* a notification failure must not change the run */ }
+  try { ctx.onBlocked?.({ node, reason, category, stopped: false }) } catch { /* a notification failure must not change the run */ }
 }
 
 // A crashing renderer must never take the run down with it.
@@ -152,6 +154,8 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx,
   // Assigned in BOTH directions, like `interrupted`: a node that previously tripped a valve
   // and is now blocked for a structural reason must not keep a flag that offers a retry.
   node.capBlocked = category !== undefined
+  // Recorded, not re-derived. See TaskNode.capCategory.
+  node.capCategory = category
   // Structural, not textual: if the run is aborting, this block is an interruption rather
   // than a judgement about the work, and resume must be able to reopen exactly these nodes.
   // Assigned in BOTH directions on purpose — a node reseated by an earlier resume carries a
@@ -166,7 +170,7 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx,
   if (category !== undefined && !ctx.signal.aborted) {
     // The RAW reason: buildBlockCard renders its own 处理方式 line, and passing the already-
     // decorated text would print the remedy twice on one card.
-    try { ctx.onBlocked?.({ node, reason, category }) } catch { /* a notification failure must not change the verdict */ }
+    try { ctx.onBlocked?.({ node, reason, category, stopped: true }) } catch { /* a notification failure must not change the verdict */ }
   }
 }
 
@@ -457,7 +461,12 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     // Falling back to a normal plan call is the honest degradation — it is what the run did
     // before this gate existed.
     if (confirmed && (
-      (node.kind === 'decompose' && confirmed.children.length === 0) ||
+      // NOT `kind === 'decompose'`: a node.md carrying `kind: unknown` with an empty child
+      // list passes validateLoadedNodes untouched (an empty array is legal) and then skipped
+      // the plan call outright — measured 0 plan calls, root left READY/unknown, and the run
+      // ended '存在无法推进的阻断节点' with an empty blockedReason. Only an EXECUTABLE node
+      // legitimately has no children.
+      (node.kind !== 'executable' && confirmed.children.length === 0) ||
       node.childIds.length > 0
     )) {
       confirmed = undefined

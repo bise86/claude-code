@@ -50,8 +50,31 @@ describe('触阀升级卡 (spec §9/§11)', () => {
     // /et --resume takes the run lock, reseats every interrupted node and issues real
     // write-capable model calls. Offering it as "只看结果" invited a full re-run.
     const t = lines('rework')
-    expect(t).toContain('只看结果、不重跑: 直接读 run.md')
     expect(t).not.toMatch(/只看结果[^\n]*--resume/)
+    // The PATH, not a relative direction. node.md is at <runDir>/<node.id>/node.md and node.id
+    // contains slashes, so "上一级目录" was wrong for every node in the tree — root included.
+    expect(t).toContain('只看结果、不重跑: 直接读 .claude/efftask/007/run.md')
+  })
+
+  it('cap-nodes 从动态生长撞上来时,不能说节点已经停了', () => {
+    // growTree only refuses the graft and the node carries on to ACCEPTED. Measured: the card
+    // said 该节点已停…以「被阻断」收场 for a node whose real state was ACCEPTED with an empty
+    // blockedReason, and offered --retry-blocked, which matched nothing at all.
+    const t = blockEscalationLines(
+      { node: node(), reason: '向 root 加子节点失败: 节点数超过上限', category: 'cap-nodes', stopped: false },
+      '007',
+    ).join('\n')
+    expect(t).toContain('该节点本身没有停')
+    expect(t).not.toContain('不会自动重试')
+    expect(t).not.toContain('--retry-blocked')
+    expect(t).toContain('caps.maxNodes') // the remedy still applies
+  })
+
+  it('同一个类别,停了和没停用不同颜色', () => {
+    const stopped = buildBlockCard({ node: node(), reason: 'r', category: 'cap-nodes' }, '1') as { header: { template: string } }
+    const running = buildBlockCard({ node: node(), reason: 'r', category: 'cap-nodes', stopped: false }, '1') as { header: { template: string } }
+    expect(stopped.header.template).toBe('orange')
+    expect(running.header.template).toBe('blue')
   })
 
   it('says the retry is RUN-scoped, because that is what --retry-blocked does', () => {

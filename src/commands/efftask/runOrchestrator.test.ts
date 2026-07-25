@@ -219,7 +219,10 @@ describe('后台任务条目 (spec §10) 真的被接上', () => {
       // catch — the one exit the success path's settle() never covers.
       () => { throw new Error('渲染器炸了') }, () => {}, () => {},
     )
-    expect(s.only().status).toBe('failed')
+    // TERMINAL is the property. This fixture aborts the signal, so the user-stop reading is
+    // correct; what must never happen is the row staying at 运行中 for a run that is over.
+    expect(['killed', 'failed']).toContain(s.only().status)
+    expect(s.only().endTime).toBeGreaterThan(0)
   })
 
   it('a crashing store never takes the run down with it', async () => {
@@ -332,5 +335,42 @@ describe('实时计数这条线也得是通的', () => {
     )
     const manifest = fs2.files.get('/r/run.md') ?? ''
     expect(manifest).toContain('/et --resume 011 --retry-blocked')
+  })
+})
+
+describe('/tasks 行的"用户停的"判定必须来自信号', () => {
+  function store3() {
+    let state = { tasks: {} } as unknown as AppState
+    return {
+      setAppState: (f: (prev: AppState) => AppState) => { state = f(state) },
+      only: () => Object.values(state.tasks as Record<string, EffTaskTaskState>)[0],
+    }
+  }
+
+  it('没人按停、但理由恰好是"已中断"的运行,记成失败', async () => {
+    // '已中断' can survive on disk from a PREVIOUS session's Esc: validateLoadedNodes keeps
+    // root.blockedReason (`|| why`) and the orchestrator reports the root's reason as the
+    // run's. Matching that text would relabel a real failure as the user's own stop, and
+    // notified:true then evicts it silently.
+    const s = store3()
+    const ac = new AbortController() // NEVER aborted
+    const fs2 = memFs()
+    // A root with a dangling dep can never advance → run ends blocked, reason from the root.
+    const seed = [{
+      ...(await import('../../tools/efftask/types.js')).createNode({
+        id: 'root', title: 'r', parentId: null, deps: [], depth: 0,
+        phaseRoles: (await import('../../tools/efftask/types.js')).emptyPhaseRoles(), now: 'x',
+      }),
+      status: 'BLOCKED' as const, blockedReason: '已中断',
+    }]
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: fs2, runAgent: async () => '', signal: ac.signal, seed,
+        taskEntry: { runId: '1', runDir: '/r', setAppState: s.setAppState, abortController: ac },
+      },
+      () => {}, () => {}, () => {},
+    )
+    expect(ac.signal.aborted).toBe(false)
+    expect(s.only().status).toBe('failed') // NOT killed
   })
 })

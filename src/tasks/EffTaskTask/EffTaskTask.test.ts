@@ -103,6 +103,24 @@ describe('高效任务的后台任务条目 (spec §10)', () => {
     expect(s.task(id).reason).toBe('已中断')
   })
 
+  it('用户停止与否看信号,不看理由文本', () => {
+    // '已中断' can legitimately be the reason for a run NOBODY stopped: an earlier session's
+    // Esc writes that text into root.blockedReason, validateLoadedNodes keeps it on the next
+    // resume (`n.blockedReason = n.blockedReason || why`), and the orchestrator reports the
+    // root's reason as the whole run's. Measured: signal.aborted === false and the panel said
+    // 已中断. So the caller passes the SIGNAL, and the text has no vote.
+    const s = store()
+    const id = registerEffTaskRun(s.setAppState, { runId: '1', runDir: '/d', counts: counts(), abortController: new AbortController() })
+    finishEffTaskRun(id, s.setAppState, { status: 'blocked', reason: '已中断' }, false)
+    expect(s.task(id).status).toBe('failed')
+
+    const s2 = store()
+    const id2 = registerEffTaskRun(s2.setAppState, { runId: '2', runDir: '/d', counts: counts(), abortController: new AbortController() })
+    // …and a genuine user stop is 'killed' whatever the reason text happens to say.
+    finishEffTaskRun(id2, s2.setAppState, { status: 'blocked', reason: '根任务被阻断' }, true)
+    expect(s2.task(id2).status).toBe('killed')
+  })
+
   it('the abort that follows a kill does not relabel it as a failure', () => {
     const s = store()
     const ac = new AbortController()
@@ -110,7 +128,7 @@ describe('高效任务的后台任务条目 (spec §10)', () => {
     void EffTaskTask.kill(id, s.setAppState)
     // The run observes the abort and reports blocked/已中断 a moment later. That is the
     // user's own stop arriving back — not a new fact about the work.
-    finishEffTaskRun(id, s.setAppState, { status: 'blocked', reason: '已中断' })
+    finishEffTaskRun(id, s.setAppState, { status: 'blocked', reason: '已中断' }, true)
     expect(s.task(id).status).toBe('killed')
   })
 

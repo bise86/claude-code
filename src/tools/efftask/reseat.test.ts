@@ -293,7 +293,7 @@ describe('--retry-blocked 不能让被否掉的方案绕过评审', () => {
     // and --retry-blocked handed a unanimously-refused plan straight to a write-capable
     // executor with zero plan calls and zero reviews.
     const n = mk({
-      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true,
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true, capCategory: 'cap-iteration',
       blockedReason: '评审迭代超限(3): 方案不可行',
       iteration: { planReview: 3, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
     })
@@ -326,7 +326,7 @@ describe('--retry-blocked 不能让被否掉的方案绕过评审', () => {
     // The distinction that matters: this node's PLAN was approved; only its execution kept
     // failing. Sending it back to CREATED would discard a reviewed plan for no reason.
     const n = mk({
-      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true,
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true, capCategory: 'rework',
       blockedReason: '验收迭代超限(3): 缺测试',
       iteration: { planReview: 1, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
     })
@@ -365,13 +365,33 @@ describe('--retry-blocked 的边界:不能凭"评审失败"复制一整棵子树
 
   it('两个计数都到顶的无子节点则回 CREATED —— 方案是根源', () => {
     const n = mk({
-      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true,
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true, capCategory: 'cap-iteration',
       blockedReason: '评审迭代超限(3)',
       iteration: { planReview: 3, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
     })
     reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
     expect(n.status).toBe('CREATED')
     expect(n.iteration.planReview).toBe(0)
+    // ALL of them. A node re-entering at CREATED replays plan → review → execute → accept, so
+    // leaving acceptance at the cap made the resume spend a real write-capable execute call
+    // and a full acceptance roundtable and THEN discover it had no budget — exactly the waste
+    // the budget check exists to prevent.
+    expect(n.iteration.acceptance).toBe(0)
+  })
+
+  it('用户照卡片提高了 caps.maxIterations,守卫依然成立', () => {
+    // THE regression. The card says "提高 caps.maxIterations 后再重试"; run.md is where that
+    // lands; reseat reads run.md. A guard derived as `planReview >= caps.maxIterations`
+    // therefore evaluated FALSE for precisely the user who followed the advice, and handed a
+    // thrice-rejected plan to a write-capable executor. Keyed on the recorded category, the
+    // cap value cannot reach it.
+    const n = mk({
+      id: 'root', kind: 'executable', status: 'BLOCKED', capBlocked: true, capCategory: 'cap-iteration',
+      blockedReason: '评审迭代超限(3)',
+      iteration: { planReview: 3, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, { ...DEFAULT_CAPS, maxIterations: 5 }, { retryBlocked: true })
+    expect(n.status).toBe('CREATED')
   })
 })
 

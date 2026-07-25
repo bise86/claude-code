@@ -105,6 +105,16 @@ export function finishEffTaskRun(
   taskId: string,
   setAppState: SetAppState,
   outcome: { status: 'completed' | 'blocked'; reason?: string },
+  /**
+   * Did the user actually stop this run? Read from the run's own AbortSignal, never inferred
+   * from `reason`.
+   *
+   * `reason` can be the string '已中断' for a run nobody touched: an earlier session's Esc
+   * writes that text into root.blockedReason, validateLoadedNodes keeps it on the next resume
+   * (`n.blockedReason = n.blockedReason || why`), and the orchestrator reports the root's
+   * reason as the whole run's. Measured: signal.aborted === false and the panel said 已中断.
+   */
+  cancelled = false,
 ): void {
   updateTaskState<EffTaskTaskState>(taskId, setAppState, task => {
     // A killed run must stay killed: `kill` already aborted it, and the abort then surfaces
@@ -116,7 +126,6 @@ export function finishEffTaskRun(
     // controller directly, so the run reports {blocked, '已中断'} with the task still
     // 'running' and it was written up as 失败. Two ways to stop the same run, two different
     // words for it, one of them wrong.
-    const cancelled = outcome.status === 'blocked' && outcome.reason === '已中断'
     return {
       ...task,
       status: outcome.status === 'completed' ? 'completed' : cancelled ? 'killed' : 'failed',

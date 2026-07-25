@@ -1598,3 +1598,90 @@ describe('触阀升级:被变异测试指出的 4 个没人管的调用点', () 
     expect(n.blockedReason).toContain('/et --resume 007 --retry-blocked')
   })
 })
+
+describe('升级通知要说清楚"节点停没停"', () => {
+  function ctxWithBlocks2(nodes: TaskNode[], runAgent: RunAgentFn, config: EffTaskConfig = cfg) {
+    const c = ctxFor(nodes, runAgent, config)
+    const fired: { category: string; stopped?: boolean }[] = []
+    c.onBlocked = info => { fired.push({ category: info.category, stopped: info.stopped }) }
+    return { ctx: c, fired }
+  }
+  const etag3 = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+
+  it('动态生长撞上节点数上限:节点没停,通知也不能说它停了', async () => {
+    // Measured: the card said 该节点已停…以「被阻断」收场 for a node whose real state was
+    // ACCEPTED with an empty blockedReason, and offered --retry-blocked, which matched nothing.
+    const tiny: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 1 } }
+    const n = root(); n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks2([n], async req =>
+      req.phase === 'execute'
+        ? etag3(req) + '\n{"execStatus":"做了一半,发现要先建表","newChildren":[{"title":"建表","deps":[]}]}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```', tiny)
+    await stepExecute(n, ctx)
+    expect(fired).toEqual([{ category: 'cap-nodes', stopped: false }])
+    // …and the node really did carry on, which is what makes stopped:false the true answer.
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.blockedReason).toBe('')
+  })
+
+  it('深度阀同样是"没停"', async () => {
+    const shallow: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxDepth: 1 } }
+    const n = root(); n.depth = 1
+    const { ctx, fired } = ctxWithBlocks2([n], async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"decompose","solution":"s","keyPoints":"","risks":"","acceptance":"","children":[{"title":"AA","deps":[]}]}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```', shallow)
+    await stepStart(n, ctx)
+    expect(fired).toEqual([{ category: 'cap-depth', stopped: false }])
+  })
+
+  it('真正的阻断说"停了"', async () => {
+    const n = root(); n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks2([n], async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"改了点东西"}\n```'
+        : vtag(req) + '\n{"pass":false,"blocking":["缺测试"],"comments":""}\n```')
+    await stepExecute(n, ctx)
+    expect(fired).toEqual([{ category: 'rework', stopped: true }])
+    expect(n.status).toBe('BLOCKED')
+  })
+})
+
+describe('确认草稿:只有可执行节点才配没有子任务', () => {
+  it('kind 是 unknown 且草稿为空时,回落到真正的 plan 调用', async () => {
+    // A node.md carrying `kind: unknown` with an empty child list passes validateLoadedNodes
+    // untouched (an empty array is legal), and the old guard only covered `decompose` — so it
+    // skipped the plan call outright: measured 0 plan calls, root left READY/unknown, and the
+    // run ended '存在无法推进的阻断节点' with an empty blockedReason.
+    const n = root()
+    n.kind = 'unknown'
+    n.confirmedDraft = { children: [] }
+    const calls: string[] = []
+    const ctx = ctxFor([n], async req => {
+      calls.push(req.phase)
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    })
+    await stepStart(n, ctx)
+    expect(calls[0]).toBe('plan')
+    expect(n.status).toBe('READY')
+    expect(n.kind).toBe('executable')
+  })
+
+  it('可执行节点的空草稿是合法的确认,不该被回落', async () => {
+    const n = root()
+    n.kind = 'executable'
+    n.confirmedDraft = { children: [] }
+    n.plan = { solution: '用户确认的:直接做', keyPoints: '', risks: '', acceptance: 'a' }
+    const calls: string[] = []
+    const ctx = ctxFor([n], async req => {
+      calls.push(req.phase)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    })
+    await stepStart(n, ctx)
+    expect(calls).not.toContain('plan')
+    expect(n.plan.solution).toBe('用户确认的:直接做')
+    expect(n.status).toBe('READY')
+  })
+})
