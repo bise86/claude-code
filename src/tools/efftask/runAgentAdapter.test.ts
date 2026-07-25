@@ -346,3 +346,47 @@ describe('a reviewer must not get its own MCP tools back after the read-only gat
     expect((mcpAgent as { mcpServers?: unknown[] }).mcpServers).toHaveLength(1)
   })
 })
+
+describe('the phase deadline follows the RUN config, not a frozen default', () => {
+  it('reads the getter at call time, so a later config change takes effect', async () => {
+    // The seam is built in call(), before any config exists. On resume the caps come back
+    // off run.md — which is hand-editable — so capturing a number here would let the
+    // manifest declare one deadline while the run enforced another.
+    let limit = 60_000
+    async function* neverYields(args: any): AsyncGenerator<any> {
+      args.override.abortController.signal.addEventListener('abort', () => {})
+      await new Promise(() => {})
+      yield { type: 'assistant', message: { content: [] } }
+    }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as any,
+      canUseTool: (async () => ({ behavior: 'allow' })) as any,
+      availableTools: [] as any,
+      readOnlyTools: [] as any,
+      activeAgents: [],
+      mainModelDefault: { agentType: 'main' } as any,
+      timeoutMs: () => limit,
+      runAgentImpl: neverYields as any,
+    })
+    limit = 60 // the config resolved after the seam was built
+    const started = Date.now()
+    await expect(
+      fn({ phase: 'execute', node: {} as any, role: null, system: 's', prompt: 'p', signal: new AbortController().signal }),
+    ).rejects.toThrow('超时(60 ms)')
+    expect(Date.now() - started).toBeLessThan(3000)
+  })
+
+  it('still accepts a plain number', async () => {
+    async function* quick(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } }
+    }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as any,
+      canUseTool: (async () => ({ behavior: 'allow' })) as any,
+      availableTools: [] as any, readOnlyTools: [] as any, activeAgents: [],
+      mainModelDefault: { agentType: 'main' } as any,
+      timeoutMs: 5000, runAgentImpl: quick as any,
+    })
+    expect(await fn({ phase: 'plan', node: {} as any, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })).toBe('ok')
+  })
+})

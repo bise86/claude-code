@@ -65,6 +65,10 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   const active: { runId: string | null; runDir: string | null; resumed: boolean } = {
     runId: null, runDir: null, resumed: resumeArgs.mode === 'resume',
   }
+  // The phase deadline must follow the RUN's caps, not a frozen default: on resume they come
+  // back off run.md, which is hand-editable. The seam below is built before any config
+  // exists, so it reads this holder at call time instead of capturing a number now.
+  const capsRef: { nodeTimeoutMs: number } = { nodeTimeoutMs: DEFAULT_CAPS.nodeTimeoutMs }
 
   if (resumeArgs.mode === 'new') {
     // Local fs scan only — no model call, no tokens, sub-millisecond. Everything that COSTS
@@ -114,7 +118,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     mainModelDefault,
     // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded
     // axis left. The extraction seam below gets it too.
-    timeoutMs: DEFAULT_CAPS.nodeTimeoutMs,
+    timeoutMs: () => capsRef.nodeTimeoutMs,
   })
   // Separate NO-TOOLS seam for the one-shot config extraction: it only rewrites text into
   // JSON, so it needs neither read nor write tools. This is the ONLY place that passes [].
@@ -125,7 +129,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     readOnlyTools: [],
     activeAgents,
     mainModelDefault,
-    timeoutMs: DEFAULT_CAPS.nodeTimeoutMs,
+    timeoutMs: () => capsRef.nodeTimeoutMs,
   })
 
   const knownRoles = activeAgents.map(a => a.agentType)
@@ -148,6 +152,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       resumeArgs={resumeArgs}
       effRoot={effRoot}
       active={active}
+      capsRef={capsRef}
       fs={fs}
       runAgent={runAgent}
       signal={signal}
@@ -301,6 +306,8 @@ type RunnerProps = {
   effRoot: string
   /** Mutated once the run is identified, so call()'s onExit closure can release the right lock. */
   active: { runId: string | null; runDir: string | null; resumed: boolean }
+  /** Written when the config resolves; the runAgent seam reads it for each phase deadline. */
+  capsRef: { nodeTimeoutMs: number }
   fs: FsLike
   runAgent: RunAgentFn
   signal: AbortSignal
@@ -420,6 +427,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       // Re-resolve the roster against THIS session: a role recorded on disk may no longer
       // exist, and pickAgentDefinition would silently fall back to the main model while the
       // gate still displayed the old name — the exact dishonesty fixed for new runs.
+      // The recovered caps are the run's caps — run.md is hand-editable, so a manifest that
+      // declares a different nodeTimeoutMs must actually get it.
+      props.capsRef.nodeTimeoutMs = withGuidance.caps.nodeTimeoutMs
       setConfig(annotateRoleModels(withGuidance, props.agentModels, props.mainModel))
       setSeed(reseated.nodes)
       setSummary({
@@ -455,6 +465,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // parseDirectives only ever sees role NAMES, so the roster it produces cannot say
         // which model each one runs on. Resolve that here — this is the only layer that can
         // see the agent definitions and the session model.
+        props.capsRef.nodeTimeoutMs = cfg.caps.nodeTimeoutMs
         setConfig(annotateRoleModels(cfg, agentModels, mainModel))
         setPhase('confirm')
       })

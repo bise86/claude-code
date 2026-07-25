@@ -55,8 +55,13 @@ export function makeRunAgentFn(deps: {
    * without ever rejecting has no bound at all: the pipeline parks in `await`, the tree
    * shows 运行中 forever, and even an abort cannot unstick it because nothing is polling.
    * 0 disables it.
+   *
+   * A FUNCTION is allowed because this seam is built in call(), before the run's config
+   * exists: on resume the caps come back off run.md, which is hand-editable. Reading a fixed
+   * DEFAULT_CAPS here would let the manifest declare one deadline while the run enforced
+   * another — config saying one thing and behaviour doing another.
    */
-  timeoutMs?: number
+  timeoutMs?: number | (() => number)
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
@@ -106,8 +111,9 @@ export function makeRunAgentFn(deps: {
     // The deadline aborts the sub-agent the same way a user Esc does, so a hung provider
     // ends the phase instead of parking the pipeline forever.
     let timedOut = false
-    const timer = deps.timeoutMs && deps.timeoutMs > 0
-      ? setTimeout(() => { timedOut = true; inner.abort() }, deps.timeoutMs)
+    const limitMs = typeof deps.timeoutMs === 'function' ? deps.timeoutMs() : deps.timeoutMs
+    const timer = limitMs && limitMs > 0
+      ? setTimeout(() => { timedOut = true; inner.abort() }, limitMs)
       : undefined
 
     const collected: Message[] = []
@@ -174,7 +180,7 @@ export function makeRunAgentFn(deps: {
     }
     // Report the deadline rather than returning a truncated answer that the phase would
     // parse as a real (empty) reply.
-    if (timedOut) throw new Error(`阶段调用超时(${deps.timeoutMs} ms),已中止`)
+    if (timedOut) throw new Error(`阶段调用超时(${limitMs} ms),已中止`)
     return collectText(collected)
   }
 }
