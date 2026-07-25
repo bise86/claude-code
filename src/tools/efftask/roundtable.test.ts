@@ -54,4 +54,17 @@ describe('roundtable', () => {
     expect(boom.blocking[0]).toContain('角色调用失败')
     expect(rec.synthesized.pass).toBe(false) // synthesized reflects the failing reviewer
   })
+  it('an already-aborted signal dispatches nothing and fails closed', async () => {
+    // First-party logic in the acceptance gate: without it, aborting would still spend a
+    // whole roundtable of model calls and could synthesize a PASS from partial output.
+    let calls = 0
+    const runAgent: RunAgentFn = async () => { calls++; return '```json\n{"pass":true,"blocking":[]}\n```' }
+    const ac = new AbortController()
+    ac.abort()
+    const rec = await runRoundtable({ phase: 'accept', node: node(), roles: [{ roleName: 'a' }, { roleName: 'b' }], round: 2, system: 's', prompt: 'p', runAgent, signal: ac.signal })
+    expect(calls).toBe(0)
+    expect(rec.round).toBe(2)
+    expect(rec.synthesized.pass).toBe(false)
+    expect(rec.synthesized.blockingSummary).toContain('已中断')
+  })
 })
