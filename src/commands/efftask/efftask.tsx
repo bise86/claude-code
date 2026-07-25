@@ -7,9 +7,9 @@ import type { LocalJSXCommandCall } from '../../types/command.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from '../../Tool.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
-import { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
-import { allocateRunId, writeNode, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
+import { runOrchestrator, type Outcome } from './runOrchestrator.js'
+import { allocateRunId, type FsLike } from '../../tools/efftask/persistence.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
@@ -27,7 +27,6 @@ import { useAppStateStore } from '../../state/AppState.js'
 import { getCwd } from '../../utils/cwd.js'
 import { logError } from '../../utils/log.js'
 
-type Outcome = { status: 'completed' | 'blocked'; reason?: string }
 type Phase = 'parsing' | 'confirm' | 'running' | 'done'
 
 // Read-only tool pool for plan/review/accept/observer: they must be able to READ the repo
@@ -424,49 +423,3 @@ function DoneView(props: {
   )
 }
 
-async function runOrchestrator(
-  args: { config: EffTaskConfig; runDir: string; fs: FsLike; runAgent: RunAgentFn; signal: AbortSignal },
-  setNodes: (n: TaskNode[]) => void,
-  setOutcome: (o: Outcome) => void,
-  setPhase: (p: Phase) => void,
-): Promise<void> {
-  // Serialize run.md writes. onUpdate fires on EVERY state transition; firing writeFile
-  // unawaited each time lets concurrent writes to the same path interleave into a corrupt
-  // manifest. One promise queue ⇒ strictly ordered, last-write-wins.
-  let manifestQueue: Promise<void> = Promise.resolve()
-  const queueManifest = (nodes: TaskNode[], result?: Outcome): Promise<void> => {
-    manifestQueue = manifestQueue
-      .then(() => writeRunManifest(args.fs, args.runDir, args.config, nodes, result))
-      .catch(logError)
-    return manifestQueue
-  }
-  try {
-    const persist = (n: TaskNode) => writeNode(args.fs, args.runDir, n)
-    const now = () => new Date().toISOString()
-    const orch = new EffTaskOrchestrator(
-      args.config,
-      {
-        runAgent: args.runAgent,
-        persist,
-        now,
-        onUpdate: nodes => {
-          setNodes([...nodes])
-          void queueManifest(nodes)
-        },
-      },
-      args.signal,
-    )
-    setNodes(orch.nodes()) // seed with the root so the tree isn't blank on first paint
-    void queueManifest(orch.nodes()) // run.md exists from the first frame, not just at the end
-    const result = await orch.run() // { status, reason }
-    setNodes([...orch.nodes()])
-    recordOutcome(result)
-    await queueManifest(orch.nodes(), result) // final manifest records {status, reason}
-  } catch (e) {
-    // run() is not supposed to reject (the orchestrator catches per-step), but if it ever
-    // does, the UI must NOT wedge on 'running' with no way out.
-    recordOutcome({ status: 'blocked', reason: e instanceof Error ? e.message : String(e) })
-  } finally {
-    setPhase('done') // the done view is ALWAYS reached
-  }
-}
