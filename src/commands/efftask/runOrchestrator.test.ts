@@ -416,3 +416,24 @@ describe('子 agent 实时输出 (spec §10.2) 真的被接上', () => {
     expect(texts.some(t => t.startsWith('review') || t.startsWith('accept'))).toBe(true)
   })
 })
+
+
+describe('并行占用的 reader 真的被交出去了', () => {
+  it('onPool 恰好被调用一次,给出的 reader 能读到真实占用', async () => {
+    // Mutation-proved gap: deleting the onPool call left the suite green.
+    const readers: (() => { inUse: number; limit: number })[] = []
+    const ac = new AbortController()
+    ac.abort()
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: memFs(), runAgent: async () => '', signal: ac.signal,
+        onPool: read => readers.push(read),
+      },
+      () => {}, () => {}, () => {},
+    )
+    expect(readers).toHaveLength(1)
+    const u = readers[0]()
+    expect(u.limit).toBe(5)          // the run's configured parallelism
+    expect(u.inUse).toBe(0)          // settled after the run
+  })
+})

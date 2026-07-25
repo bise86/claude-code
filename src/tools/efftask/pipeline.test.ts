@@ -1850,3 +1850,90 @@ describe('评分和合并是各自独立的阶段,面板不该把它们显示成
     expect(seen).not.toContain('MERGE')
   })
 })
+
+describe('MERGE 必须在评分之后', () => {
+  it('低分返工时,磁盘上不能留下一个"已进入 MERGE"却从未合并的节点', async () => {
+    // The order is load-bearing and was NOT locked: moving the MERGE commit above scoreNode
+    // left the suite green. scoreNode can send the node back to REWORK, and reseat re-seats
+    // from exactly that status — so a premature MERGE stamp claims a merge that never ran.
+    const scored: EffTaskConfig = {
+      ...cfg,
+      caps: { ...DEFAULT_CAPS, scoreThreshold: 80 },
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.phaseRoles = { ...emptyPhaseRoles(), observer: [{ roleName: 'scorer' }] }
+    const seen: string[] = []
+    let merges = 0
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
+      if (req.phase === 'observer') {
+        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        // Low the first time (forces REWORK), high the second.
+        const s = seen.filter(x => x === 'SCORING').length <= 1 ? 10 : 95
+        return '```' + tag + `\n{"plan":{"score":${s},"rationale":"r"},"exec":{"score":${s},"rationale":"r"}}\n` + '```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    }, scored)
+    ctx.persist = async node => { seen.push(node.status) }
+    ctx.worktrees = {
+      acquire: async (x: TaskNode) => ({ path: '/wt/' + x.id, branch: 'b', gitRoot: '/r' }),
+      commitAndMerge: async () => { merges++; return { ok: true, merged: true } },
+      release: async () => ({ removed: true }),
+      refreshFromIntegration: async () => ({ ok: true, updated: false }),
+      conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+      mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      integrationPath: '/wt/i', integrationBranchName: 'i',
+    } as never
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    // The rework round scored and went back — it must NOT have stamped MERGE on the way.
+    const firstMerge = seen.indexOf('MERGE')
+    const rework = seen.indexOf('REWORK')
+    expect(rework).toBeGreaterThan(-1)
+    expect(firstMerge).toBeGreaterThan(rework)   // MERGE only after the LAST scoring
+    expect(merges).toBe(1)                        // and the merge itself ran exactly once
+  })
+})
+
+
+describe('集成路径的评分也要在面板上现身', () => {
+  it('decompose 节点评分时落 SCORING,而不是一直显示 INTEGRATION_ACCEPT', async () => {
+    // The leaf path got its SCORING commit; the integrate path scored silently — so the ROOT,
+    // i.e. the run's own final score, was computed while the panel still said
+    // INTEGRATION_ACCEPT. That is exactly the "看不出它在干嘛" this change set out to kill.
+    const p = root()
+    p.kind = 'decompose'
+    p.childIds = ['root/01-a']
+    p.phaseRoles = { ...emptyPhaseRoles(), observer: [{ roleName: 'scorer' }] }
+    const kid = createNode({ id: 'root/01-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const seen: string[] = []
+    const ctx = ctxFor([p, kid], async req => {
+      if (req.phase === 'observer') {
+        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        return '```' + tag + '\n{"plan":{"score":90,"rationale":"r"},"exec":{"score":90,"rationale":"r"}}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    })
+    ctx.persist = async n => { seen.push(n.status) }
+    await stepIntegrate(p, ctx)
+    expect(p.status).toBe('ACCEPTED')
+    expect(seen).toContain('SCORING')
+    expect(seen.indexOf('INTEGRATION_ACCEPT')).toBeLessThan(seen.indexOf('SCORING'))
+  })
+
+  it('没有观察角色的 decompose 节点不假装在评分', async () => {
+    const p = root()
+    p.kind = 'decompose'
+    p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const seen: string[] = []
+    const ctx = ctxFor([p, kid], async req => vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```')
+    ctx.persist = async n => { seen.push(n.status) }
+    await stepIntegrate(p, ctx)
+    expect(seen).not.toContain('SCORING')
+  })
+})

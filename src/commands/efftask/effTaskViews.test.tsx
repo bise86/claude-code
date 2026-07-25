@@ -91,3 +91,39 @@ describe('运行中的面板把输出缓冲交到详情视图手里', () => {
     expect(f).not.toContain('子 agent 输出')
   })
 })
+
+
+describe('并行占用 (spec §10.1) 的最后一跳', () => {
+  it('RunningView 把 pool reader 交给面板', async () => {
+    // Four mutations on this wire were green: slotUsage() returning zeros, runOrchestrator not
+    // calling onPool, efftask.tsx not storing the reader, and RunningView not passing it. Only
+    // the panel's own formatting was covered, and it reads a test-injected fake. This is the
+    // same shape this repo has cut five times (onEscalate, roster, onChunk x2, pool).
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(RunningView as never, {
+        nodes: [node({ status: 'EXECUTING' })], runId: '003',
+        pool: () => ({ inUse: 3, limit: 5 }),
+        onAbort: () => {},
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).toContain('并行 3/5')
+    app.unmount()
+  })
+
+  it('没有 pool 时 RunningView 照常渲染', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(RunningView as never, {
+        nodes: [node({ status: 'EXECUTING' })], runId: '003', onAbort: () => {},
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).toContain('根任务')
+    expect(t.lastFrame()).not.toContain('并行 ')
+    app.unmount()
+  })
+})

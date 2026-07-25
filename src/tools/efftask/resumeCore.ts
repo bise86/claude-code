@@ -1,6 +1,6 @@
 import { parse as yamlParse } from 'yaml'
 import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
-import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, TaskNode } from './types.js'
+import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
 
 const LEGAL_STATUS = new Set<string>([
@@ -57,6 +57,34 @@ export function depCycleMembers(nodes: TaskNode[]): Set<string> {
     }
   }
   return new Set([...ids].filter(id => !settled.has(id)))
+}
+
+/** One roundtable record, with every field the writers dereference guaranteed present. */
+function roundArray(v: unknown): RoundtableRecord[] {
+  if (!Array.isArray(v)) return []
+  return v
+    .filter((r): r is Record<string, unknown> => !!r && typeof r === 'object')
+    .map(r => ({
+      round: Number.isFinite(r.round) ? (r.round as number) : 0,
+      verdicts: Array.isArray(r.verdicts)
+        ? r.verdicts
+            .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
+            .map(x => ({
+              role: typeof x.role === 'string' ? x.role : 'unknown',
+              pass: x.pass === true,
+              blocking: strArray(x.blocking),
+              comments: typeof x.comments === 'string' ? x.comments : '',
+              ...(x.infra === true ? { infra: true as const } : {}),
+              ...(x.timeout === true ? { timeout: true as const } : {}),
+            }))
+        : [],
+      synthesized: {
+        pass: (r.synthesized as { pass?: unknown } | undefined)?.pass === true,
+        blockingSummary: typeof (r.synthesized as { blockingSummary?: unknown } | undefined)?.blockingSummary === 'string'
+          ? ((r.synthesized as { blockingSummary: string }).blockingSummary)
+          : '',
+      },
+    }))
 }
 
 export interface ValidateResult { nodes: TaskNode[]; repairs: string[] }
@@ -135,8 +163,15 @@ export function validateLoadedNodes(
     else for (const k of ['solution', 'keyPoints', 'risks', 'acceptance'] as const) {
       if (typeof n.plan[k] !== 'string') n.plan[k] = ''
     }
-    if (!Array.isArray(n.reviewLog)) n.reviewLog = []
-    if (!Array.isArray(n.acceptLog)) n.acceptLog = []
+    // Entries, not just the array. serializeNode's body now walks `r.verdicts` and
+    // `v.blocking`, so a half-written entry — exactly what a crash leaves behind — makes
+    // every persist THROW. commit() catches it and blocks the node with a bare JS TypeError
+    // as its reason, and because each commit reproduces it, every later --resume dies the
+    // same way. Measured: '状态持久化失败: undefined is not an object (evaluating
+    // r.verdicts.map)'. This function already normalises iteration/plan/phaseRoles for the
+    // same reason; the logs were the gap.
+    n.reviewLog = roundArray(n.reviewLog)
+    n.acceptLog = roundArray(n.acceptLog)
     if (!n.score || typeof n.score !== 'object') n.score = {}
     const pr = (n.phaseRoles ?? {}) as Record<string, unknown>
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>

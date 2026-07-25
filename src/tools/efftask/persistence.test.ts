@@ -316,3 +316,44 @@ describe('路径即 id (spec §5)', () => {
     expect(errors.some(e => e.message.includes('不一致'))).toBe(true)
   })
 })
+
+
+describe('正文里的模型作者文本要有上限,控制字节要剥干净', () => {
+  const withBig = (n = 4000) => {
+    const node = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'x' })
+    node.reviewLog = [{
+      round: 1,
+      verdicts: [{ role: 'a', pass: false, blocking: ['x'.repeat(n)], comments: '' }],
+      synthesized: { pass: false, blockingSummary: 's' },
+    }]
+    return node
+  }
+
+  it('单条意见按码点截断,并指向 frontmatter', () => {
+    // blocking[] length and each entry's length are both model-authored, and this was the one
+    // body surface with no cap — measured 73.8K of body for 3 rounds x 5 roles x 6 blockings.
+    const body = serializeNode(withBig())
+    expect(body).toContain('完整内容见 frontmatter')
+    // …and the full value is still in the frontmatter, so nothing is actually lost.
+    expect(parseNodeFile(body).reviewLog[0].verdicts[0].blocking[0].length).toBe(4000)
+  })
+
+  it('短的意见不被截断', () => {
+    expect(serializeNode(withBig(10))).not.toContain('完整内容见 frontmatter')
+  })
+
+  it('角色名、意见、评分数字里的控制字节全部剥掉', () => {
+    // Every one of these comes off yamlParse, and validateLoadedNodes only checks that
+    // `score` is an object — a hand-edited node.md can put ESC[2J in the NUMBER.
+    const esc = String.fromCharCode(27)
+    const node = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'x' })
+    node.reviewLog = [{
+      round: 1,
+      verdicts: [{ role: 'a' + esc + '[2Jb', pass: false, blocking: ['c' + esc + '[31md'], comments: '' }],
+      synthesized: { pass: false, blockingSummary: 's' },
+    }]
+    node.score = { plan: { role: 'r' + esc + 'x', score: ('9' + esc + '[2J9') as never, rationale: 'e' + esc + 'f' } }
+    const body = serializeNode(node)
+    expect(body.slice(body.indexOf('## 评审记录'))).not.toContain(esc)
+  })
+})

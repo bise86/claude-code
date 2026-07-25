@@ -98,14 +98,24 @@ export async function allocateRunId(fs: FsLike, effRoot: string): Promise<string
  * body is the part a human reads, and "为什么没通过" is exactly the question they open this
  * file to answer.
  */
+/** Per-line cap for model-authored body text. Frontmatter keeps the full value. */
+const MAX_BODY_LINE = 400
+const clipBody = (s: string): string => {
+  const cps = Array.from(s)
+  return cps.length > MAX_BODY_LINE ? `${cps.slice(0, MAX_BODY_LINE).join('')}…(完整内容见 frontmatter)` : s
+}
+
 function roundtableBody(log: TaskNode['reviewLog']): string {
   if (log.length === 0) return ''
+  // DEFENSIVE on purpose, even though validateLoadedNodes now normalises these. This runs on
+  // EVERY commit; a throw here blocks the node with a raw TypeError as its reason and repeats
+  // on every resume. A body section is never worth a dead run.
   return log.map(r => {
-    const head = `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${stripControl(r.synthesized.blockingSummary)}`
-    const roles = r.verdicts.map(v => {
-      const detail = v.blocking.length > 0 ? v.blocking.join('; ') : v.comments
-      const mark = v.infra ? 'CALL-FAILED' : v.pass ? 'pass' : 'FAIL'
-      return `  - [${stripControl(v.role)}] ${mark}${detail ? ': ' + stripControl(detail) : ''}`
+    const head = `- round ${stripControl(String(r?.round ?? '?'))}: ${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
+    const roles = (r?.verdicts ?? []).map(v => {
+      const detail = (v?.blocking ?? []).length > 0 ? (v.blocking ?? []).join('; ') : (v?.comments ?? '')
+      const mark = v?.infra ? 'CALL-FAILED' : v?.pass ? 'pass' : 'FAIL'
+      return `  - [${stripControl(String(v?.role ?? 'unknown'))}] ${mark}${detail ? ': ' + clipBody(stripControl(detail)) : ''}`
     })
     return [head, ...roles].join('\n')
   }).join('\n')
@@ -114,7 +124,9 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
 /** 评分 with the REASONS. The number alone does not say why, and §4.2 lists rationale. */
 function scoreBody(node: TaskNode): string {
   const line = (label: string, s?: { role: string; score: number; rationale: string }): string =>
-    s ? `${label}: ${s.score} [${stripControl(s.role)}]${s.rationale ? ' — ' + stripControl(s.rationale) : ''}` : `${label}: -`
+    // `score` is stripped too: it comes straight off yamlParse and validateLoadedNodes only
+    // checks that `score` is an object, so a hand-edited node.md can put ESC[2J in the NUMBER.
+    s ? `${label}: ${stripControl(String(s.score))} [${stripControl(String(s.role))}]${s.rationale ? ' — ' + clipBody(stripControl(s.rationale)) : ''}` : `${label}: -`
   return [line('plan', node.score.plan), line('exec', node.score.exec)].join('\n')
 }
 

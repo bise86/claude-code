@@ -422,7 +422,9 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
 
 // P1 runs a single planner/executor even if several are configured; only review and
 // accept fan out into a roundtable. Extra plan/execute roles are deliberately ignored.
-function firstRole(node: TaskNode, phase: 'plan' | 'execute') {
+// 'observer' is a real caller (scoreNode, and the two SCORING commits). The narrower literal
+// union was simply wrong, and with no typecheck in this repo nothing said so.
+function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
   return node.phaseRoles[phase][0] ?? null
 }
 
@@ -1216,6 +1218,9 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       // so every decompose node, and therefore the ROOT (the run's own verdict), was never
       // scored at all. The observer's rework signal is deliberately NOT honoured here: a
       // decompose node has no execute phase to redo, and its children are already ACCEPTED.
+      // Committed as SCORING for the same reason the leaf path does: otherwise the panel
+      // shows INTEGRATION_ACCEPT while the run's FINAL score is being computed.
+      if (firstRole(node, 'observer') && !(await commit(node, 'SCORING', ctx))) return
       await scoreNode(node, ctx)
       await commit(node, 'ACCEPTED', ctx)
       return

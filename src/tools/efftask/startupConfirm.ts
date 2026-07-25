@@ -312,7 +312,10 @@ export function resumeSummarySections(s: ResumeSummary): SummarySection[] {
     out.push({ heading: `校验修复 ${s.repairs.length} 处`, lines: s.repairs.slice(0, 8).map(l => clip(l, 100)), tone: 'warn' })
   }
   if (s.loadErrors.length > 0) {
-    out.push({ heading: `${s.loadErrors.length} 个节点文件无法读取`, lines: s.loadErrors.slice(0, 5).map(l => clip(l, 100)), tone: 'warn' })
+    // NOT "无法读取": loadRun reports id/directory mismatches through the same channel, and
+    // those files read perfectly well. One heading for two different facts sent users looking
+    // for a corrupt file that is not corrupt.
+    out.push({ heading: `${s.loadErrors.length} 个节点文件有问题(无法读取或 id 与目录不符)`, lines: s.loadErrors.slice(0, 5).map(l => clip(l, 100)), tone: 'warn' })
   }
   if (s.degraded.length > 0) {
     out.push({ heading: '配置未能完整恢复', lines: s.degraded.map(l => clip(l, 100)), tone: 'warn' })

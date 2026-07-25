@@ -461,3 +461,43 @@ describe('全局并发池必须同时约束"步"和"圆桌里的角色" (spec §
     expect(node.reviewLog[0].verdicts.map(v => v.role)).toEqual(['r0', 'r1', 'r2', 'r3'])
   })
 })
+
+
+describe('slotUsage:状态条读的那个数', () => {
+  it('报告的是池子的真实占用,而不是恒零', async () => {
+    // Mutation-proved: making slotUsage() return {inUse:0,limit:0} left the whole suite green.
+    const roles = [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }]
+    const cfg2: EffTaskConfig = {
+      goalPrompt: 'g', parallelism: 3,
+      phaseRoles: { ...emptyPhaseRoles(), review: roles, accept: roles },
+      caps: { ...DEFAULT_CAPS }, notices: [],
+    }
+    let seenPeak = 0
+    let orch: EffTaskOrchestrator
+    const runAgent: RunAgentFn = async req => {
+      seenPeak = Math.max(seenPeak, orch.slotUsage().inUse)
+      await new Promise(r => setTimeout(r, 3))
+      if (req.phase === 'plan') return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+      if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"done"}\n\u0060\u0060\u0060'
+      const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
+      return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'
+    }
+    orch = new EffTaskOrchestrator(cfg2, {
+      runAgent, persist: async () => {}, now: () => new Date().toISOString(), onUpdate: () => {},
+    }, new AbortController().signal)
+    expect(orch.slotUsage()).toEqual({ inUse: 0, limit: 3 })
+    await orch.run()
+    expect(seenPeak).toBeGreaterThan(0)      // it MOVES
+    expect(seenPeak).toBeLessThanOrEqual(3)  // and never exceeds the cap
+    expect(orch.slotUsage().inUse).toBe(0)   // and settles back at the end
+  })
+
+  it('limit 至少是 1,即使 config 说 0', () => {
+    const orch = new EffTaskOrchestrator(
+      { goalPrompt: 'g', parallelism: 0, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [] },
+      { runAgent: async () => '', persist: async () => {}, now: () => 'x', onUpdate: () => {} },
+      new AbortController().signal,
+    )
+    expect(orch.slotUsage().limit).toBe(1)
+  })
+})

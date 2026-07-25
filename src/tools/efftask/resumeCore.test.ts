@@ -401,3 +401,62 @@ describe('恢复:mergeConflict 也是一把不需要 flag 的钥匙', () => {
     expect(back.status).toBe('BLOCKED')
   })
 })
+
+
+describe('半截的 reviewLog 不能把整个 Run 打死', () => {
+  const mkn = (over = {}) => ({
+    ...createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+  const o = { goal: 'g', phaseRoles: emptyPhaseRoles(), now: NOW }
+
+  it('缺 verdicts 的记录被补齐,serializeNode 不再抛', async () => {
+    // serializeNode's body walks r.verdicts and v.blocking. A half-written entry — exactly what
+    // a crash leaves behind — made EVERY persist throw; commit() caught it and blocked the node
+    // with a raw JS TypeError as its reason, and because each commit reproduced it, every later
+    // --resume died the same way. Measured:
+    // '状态持久化失败: undefined is not an object (evaluating r.verdicts.map)'.
+    const { serializeNode } = await import('./persistence.js')
+    const n = mkn({ reviewLog: [{ round: 1, synthesized: { pass: false, blockingSummary: 'x' } }] })
+    const { nodes } = validateLoadedNodes([n], o)
+    expect(nodes[0].reviewLog[0].verdicts).toEqual([])
+    expect(() => serializeNode(nodes[0])).not.toThrow()
+  })
+
+  it('缺 blocking 的裁决也被补齐', async () => {
+    const { serializeNode } = await import('./persistence.js')
+    const n = mkn({ reviewLog: [{ round: 1, verdicts: [{ role: 'a', pass: false }], synthesized: { pass: false, blockingSummary: '' } }] })
+    const { nodes } = validateLoadedNodes([n], o)
+    expect(nodes[0].reviewLog[0].verdicts[0].blocking).toEqual([])
+    expect(() => serializeNode(nodes[0])).not.toThrow()
+  })
+
+  it('verdicts 不是数组、synthesized 整个缺失,都收得住', async () => {
+    const { serializeNode } = await import('./persistence.js')
+    const n = mkn({ reviewLog: [{ round: 'x', verdicts: 'nope' }, null, 42], acceptLog: 'nope' })
+    const { nodes } = validateLoadedNodes([n], o)
+    expect(nodes[0].reviewLog).toHaveLength(1)
+    expect(nodes[0].reviewLog[0].synthesized.pass).toBe(false)
+    expect(nodes[0].acceptLog).toEqual([])
+    expect(() => serializeNode(nodes[0])).not.toThrow()
+  })
+
+  it('完好的记录原样保留,包括 infra 标记', () => {
+    const n = mkn({ reviewLog: [{
+      round: 2,
+      verdicts: [{ role: 'qa', pass: false, blocking: ['缺测试'], comments: 'c', infra: true }],
+      synthesized: { pass: false, blockingSummary: '[qa] 缺测试' },
+    }] })
+    const back = validateLoadedNodes([n], o).nodes[0].reviewLog[0]
+    expect(back.round).toBe(2)
+    expect(back.verdicts[0]).toMatchObject({ role: 'qa', pass: false, blocking: ['缺测试'], comments: 'c', infra: true })
+    expect(back.synthesized.blockingSummary).toBe('[qa] 缺测试')
+  })
+
+  it('即便校验器被绕过,writer 自己也不该炸', async () => {
+    // Belt AND braces: this runs on every commit, and a body section is never worth a dead run.
+    const { serializeNode } = await import('./persistence.js')
+    const raw = mkn({ reviewLog: [{ round: 1 }] })
+    expect(() => serializeNode(raw)).not.toThrow()
+  })
+})
