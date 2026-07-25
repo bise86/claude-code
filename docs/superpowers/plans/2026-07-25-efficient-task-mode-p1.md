@@ -2464,6 +2464,7 @@ import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import type { Message } from '../../types/message.js'
 import type { ModelAlias } from '../../utils/model/aliases.js'
 import { createUserMessage } from '../../utils/messages.js'
+import { runWithCwdOverride } from '../../utils/cwd.js'
 import type { RunAgentFn } from './roundtable.js'
 
 export function collectText(messages: Message[]): string {
@@ -2507,25 +2508,53 @@ export function makeRunAgentFn(deps: {
     const promptMessages: Message[] = [
       createUserMessage({ content: [{ type: 'text', text: `${req.system}\n\n${req.prompt}` }] }),
     ]
+    // Forward cancellation INTO the sub-agent instead of only polling between messages:
+    // otherwise an abort is invisible until the next yield, so a stall before the first
+    // message is never noticed and a cancelled run keeps a live agent working.
+    const inner = new AbortController()
+    const relay = (): void => inner.abort()
+    if (req.signal.aborted) inner.abort()
+    else req.signal.addEventListener('abort', relay, { once: true })
+
     const collected: Message[] = []
-    for await (const message of run({
-      agentDefinition,
-      promptMessages,
-      toolUseContext: deps.toolUseContext,
-      canUseTool: deps.canUseTool,
-      isAsync: false,
-      querySource: 'agent:custom',
-      // NOT validated: an unrecognized alias simply falls through to runAgent's own model
-      // resolution (which applies its default). We do not pre-check the string here.
-      model: (req.role?.model as ModelAlias | undefined) ?? undefined,
-      availableTools: tools,
-      // runAgent has NO `cwd` param — the real field is `worktreePath`. P1 always passes
-      // undefined (shared cwd); mapping it keeps the seam honest for P2's worktrees.
-      worktreePath: req.cwd,
-    })) {
-      collected.push(message)
-      if (req.onChunk && message.type === 'assistant') req.onChunk(collectText([message]))
-      if (req.signal.aborted) break
+    const invoke = (): AsyncGenerator<Message, void> =>
+      run({
+        agentDefinition,
+        promptMessages,
+        toolUseContext: deps.toolUseContext,
+        canUseTool: deps.canUseTool,
+        isAsync: false,
+        querySource: 'agent:custom',
+        // NOT validated: an unrecognized alias simply falls through to runAgent's own model
+        // resolution (which applies its default). We do not pre-check the string here.
+        model: req.role?.model as ModelAlias | undefined,
+        availableTools: tools,
+        // runAgent's `worktreePath` is METADATA ONLY — it is recorded for resume and does
+        // NOT change the sub-agent's cwd (AgentTool does that separately via
+        // runWithCwdOverride). So we both record it AND actually switch the cwd below;
+        // passing it alone would let P2's worktree executor write into the shared tree.
+        worktreePath: req.cwd,
+        override: { abortController: inner },
+      })
+
+    // The WHOLE consumption must run inside the cwd override, not just the call that
+    // creates the generator: runWithCwdOverride is AsyncLocalStorage-based, and a generator
+    // body does not execute until its first next() — by which time a wrapper around the
+    // factory call has already exited and pwd() would resolve to the shared cwd again.
+    const consume = async (): Promise<void> => {
+      for await (const message of invoke()) {
+        collected.push(message)
+        if (req.onChunk && message.type === 'assistant') {
+          // A crashing renderer must not take the run down (same rule as pipeline/orchestrator).
+          try { req.onChunk(collectText([message])) } catch { /* ignore */ }
+        }
+        if (req.signal.aborted) break
+      }
+    }
+    try {
+      await (req.cwd ? runWithCwdOverride(req.cwd, consume) : consume())
+    } finally {
+      req.signal.removeEventListener('abort', relay)
     }
     return collectText(collected)
   }
