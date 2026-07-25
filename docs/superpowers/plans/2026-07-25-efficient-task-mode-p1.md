@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 交付 `/et` 高效任务模式的可运行骨架:命令入口 + 启动确认(终端+飞书)+ 任务树/节点模型 + md 持久化 + **串行**执行 + **单角色**(主模型)方案制定/评审/执行/验收 + 基础只读实时树。
+**Goal:** 交付 `/et` 高效任务模式的可运行骨架:命令入口 + 启动确认(终端+飞书)+ 任务树/节点模型 + md 持久化 + **串行**执行 + **多角色圆桌**方案制定/评审/执行/验收(settings 里有角色时按阶段名册并行扇出;无角色则退化为主模型单角色)+ 基础只读实时树。
 
 **Architecture:** 一个确定性 TS 编排引擎(`EffTaskOrchestrator`)拥有任务树、依赖门控、md 持久化;每个节点的阶段(plan/review/execute/accept)通过一个**注入的 `RunAgentFn` 接缝**调用模型(P1 用主模型),接缝背后是对现有 `runAgent()` 的适配器。引擎与所有纯逻辑用假 `RunAgentFn`/假 fs 单测,不打真模型。
 
-**Tech Stack:** Bun + TypeScript,Ink TUI,`yaml`(^2.8.3,已在依赖),现有 `runAgent()` / `FeishuClient` / `getFeishuConfig` / `createUserMessage` / `hasPermissionsToUseTool`;命令层的 `FsLike` 直连 `node:fs/promises`。测试 `bun test`,测试文件与源码同目录 `*.test.ts`。
+**Tech Stack:** Bun + TypeScript,Ink TUI,`yaml`(^2.8.3,已在依赖),现有 `runAgent()` / `createUserMessage` / `hasPermissionsToUseTool`;飞书侧**复用 `useFeishuBridge` 已建好的共享 `FeishuClient` + `FeishuPermissionCallbacks`**(从 `AppState` 取,不自建连接);命令层的 `FsLike` 直连 `node:fs/promises`。测试 `bun test`,测试文件与源码同目录 `*.test.ts`。
 
 ## Global Constraints
 
@@ -14,13 +14,17 @@
 - 不 `feature()` 门控:`/et` 及相关代码直接生效(本 fork 运行时 `feature()` 恒 false,门控=死代码)。
 - 所有人工确认走同一路径:终端 + 飞书卡片竞速,首个响应者胜出并同步另一端;不新造确认通道。
 - 确定性硬控制:依赖门控(节点仅当 `deps` 全 `ACCEPTED` 才可开始)由 TS 引擎保证,不交给模型。
-- 圆桌合成 = 独立并行 + 全票通过:任一角色 `pass=false` 或 `blocking` 非空即不通过。P1 单角色即退化为该角色说了算。
-- 不静默截断:触发安全阀(深度/节点数/迭代上限;超时 tree-kill 属 P3,P1 定义 `nodeTimeoutMs` 但不强制)一律 `BLOCKED` + 升级(P1 至少记录并停,飞书升级在 §Task 10 之后可用)。
+- 圆桌合成 = 独立并行 + 全票通过:任一角色 `pass=false` 或 `blocking` 非空即不通过。阶段名册为空时退化为单个主模型角色说了算。
+- 不静默截断:触发安全阀(深度/节点数/迭代上限;超时 tree-kill 属 P3,P1 定义 `nodeTimeoutMs` 但不强制)一律 `BLOCKED` + 记录 `blockedReason`,并在末态视图展示。**安全阀触发时的飞书升级卡片 DEFERRED→P2**(P1 只记录 + 终端展示,不主动推飞书)。
 - TUI-only。
 - 测试文件与源码同目录,命名 `*.test.ts`;`bun test` 运行;不打真模型、不动真 git、不写真磁盘(注入假 fs)。
 
-**P1 范围边界(明确不在 P1):** 并行执行、git worktree 隔离、多角色(>1)、观察评分、执行中动态加子节点(runtime `addChild`)、交互式展开/详情面板。这些在 P2/P3。P1 的"子节点"仅来自 **plan 阶段声明的 decompose 子节点**;P1 的实时树是**只读**的。
+**P1 范围边界(明确不在 P1):** 并行执行、git worktree 隔离、**每节点角色覆盖**(节点级 `phaseRoles` 改写)、观察评分(observer 阶段)、执行中动态加子节点(runtime `addChild`)、交互式展开/详情面板。这些在 P2/P3。P1 的"子节点"仅来自 **plan 阶段声明的 decompose 子节点**;P1 的实时树是**只读**的。
+- **多角色圆桌在 P1 是真的**:`parseDirectives` 会把提示词里的角色名对照 settings 的 `roles` 解析成阶段名册,`runRoundtable` 对名册并行扇出、全票才通过。P1 缺的是**节点级角色覆盖**与**观察评分**,不是多角色本身。
 - **DEFERRED→P2:启动第 3 关(执行前预览/编辑根方案 + 顶层拆分)。** P1 的启动确认只覆盖 **名册(roster)+ 并行数 + 目标回显**(approve=用建议值 / cancel=退出),不做根方案/顶层拆分的预览编辑。
+- **DEFERRED→P2:后台任务注册(spec §10)。** P1 不调 `registerAsyncAgent`、`/tasks` 里看不到 `/et` 运行;整轮编排跑在 `/et` 命令组件自身的生命周期内(离开该视图即随 `AbortController` 中断)。
+- **DEFERRED→P2:安全阀触发时的飞书升级卡片。** P1 只把原因写进 `node.blockedReason` + `run.md`,并在 `done` 视图展示,不向飞书推升级卡。
+- **只读工具边界**:`plan`/`review`/`accept`/`observer` 阶段以**真只读工具池**(`Read`/`Glob`/`Grep`)运行——能读仓库但不能改;只有 `execute` 阶段拿到完整可写工具池。一次性的配置抽取调用不给任何工具。
 - **非 git 仓库降级在 P1 为 N/A**:P1 串行、共享 `cwd`、无 worktree 隔离,不涉及 git 分支操作,故无需降级路径(该问题在 P2 引入 worktree 时才出现)。
 - **`caps.nodeTimeoutMs` 在 P1 已定义但不强制执行**:节点级超时 tree-kill 属 P3(见交接)。P1 仅定义字段并落盘,不据此中断节点。
 
@@ -42,7 +46,7 @@
 
 **集成/UI(真实代码,手动/UAT 验证,无单测——沿用本仓 Ink 组件无单测的惯例):**
 - `src/tools/efftask/runAgentAdapter.ts` — 用 `ToolUseContext` 构造真实 `RunAgentFn`(仿 `executeForkedSlashCommand`)。
-- `src/tools/efftask/startupConfirm.ts`(纯竞速原语,有单测)+ `src/tools/efftask/feishuStartupCard.ts`(飞书卡片 surface,集成)+ `src/commands/efftask/ConfirmStartup.tsx` — 启动确认(终端 Ink + 飞书卡片竞速;P1 呈现名册/并行数/目标回显,启动第 3 关方案预览编辑 P2)。
+- `src/tools/efftask/startupConfirm.ts`(纯竞速原语 + `rosterLines`,有单测)+ `src/tools/efftask/feishuStartupCard.ts`(飞书卡片 surface,集成;骑在共享 `FeishuClient`/callbacks 上)+ `src/commands/efftask/ConfirmStartup.tsx` — 启动确认(终端 Ink + 飞书卡片竞速;P1 呈现**真实名册**/并行数/安全阀/目标回显,启动第 3 关方案预览编辑 P2)。
 - `src/commands/efftask/index.ts` — 命令元数据(local-jsx),注册进 `src/commands.ts`。
 - `src/commands/efftask/efftask.tsx` — `call()`:解析→确认→起编排器(后台任务)→渲染只读树。
 - `src/commands/efftask/TaskTreePanel.tsx` — 只读实时树(状态着色 + 耗时)。
@@ -75,8 +79,16 @@ describe('createNode', () => {
     expect(n.childIds).toEqual([])
     expect(n.iteration).toEqual({ planReview: 0, acceptance: 0 })
     expect(n.plan.solution).toBe('')
+    expect(n.blockedReason).toBe('') // blocking reason lives in its own field, not execStatus
     expect(n.createdAt).toBe('2026-07-25T00:00:00Z')
     expect(n.updatedAt).toBe('2026-07-25T00:00:00Z')
+  })
+  it('does not alias the phaseRoles object across nodes', () => {
+    const roles = emptyPhaseRoles()
+    const a = createNode({ id: 'a', title: 'a', parentId: null, deps: [], depth: 0, phaseRoles: roles, now: '2026-07-25T00:00:00Z' })
+    const b = createNode({ id: 'b', title: 'b', parentId: null, deps: [], depth: 0, phaseRoles: roles, now: '2026-07-25T00:00:00Z' })
+    a.phaseRoles.review = [{ roleName: 'arch' }]
+    expect(b.phaseRoles.review).toEqual([]) // shallow copy: mutating one node never leaks to another
   })
   it('DEFAULT_CAPS and PHASE_NAMES are stable', () => {
     expect(DEFAULT_CAPS.maxDepth).toBe(5)
@@ -125,6 +137,9 @@ export interface TaskNode {
   phaseRoles: Record<PhaseName, RoleBinding[]>
   plan: NodePlan
   execStatus: string
+  // Why a separate field: execStatus may hold real completed-work evidence that the
+  // acceptance roundtable still needs to see. Blocking must never overwrite it.
+  blockedReason: string
   reviewLog: RoundtableRecord[]
   acceptLog: RoundtableRecord[]
   score: { plan?: ScoreRecord; exec?: ScoreRecord }
@@ -172,9 +187,10 @@ export function createNode(args: {
     deps: args.deps,
     kind: 'unknown',
     status: 'CREATED',
-    phaseRoles: args.phaseRoles,
+    phaseRoles: { ...args.phaseRoles }, // shallow copy: nodes must not alias one shared roster object
     plan: emptyPlan(),
     execStatus: '',
+    blockedReason: '',
     reviewLog: [],
     acceptLog: [],
     score: {},
@@ -189,7 +205,7 @@ export function createNode(args: {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/types.test.ts`
-Expected: PASS。
+Expected: PASS(3 条:默认值(含 `blockedReason:''`)/ 常量稳定 / `phaseRoles` 不共享)。
 
 - [ ] **Step 5: 提交**
 
@@ -251,6 +267,10 @@ describe('stateMachine', () => {
     child.status = 'EXECUTING'
     expect(advanceableKind(p, byIdMap([p, child]))).toBe(null)
   })
+  it('advanceableKind: WAITING_CHILDREN with ZERO children => null (nothing to integrate)', () => {
+    const p = mk('p', { status: 'WAITING_CHILDREN', childIds: [] })
+    expect(advanceableKind(p, byIdMap([p]))).toBe(null)
+  })
   it('uiStatus maps statuses to 4 buckets', () => {
     expect(uiStatus('ACCEPTED')).toBe('done')
     expect(uiStatus('EXECUTING')).toBe('running')
@@ -308,7 +328,9 @@ export type AdvanceKind = 'start' | 'execute' | 'integrate' | null
 export function advanceableKind(node: TaskNode, byId: Map<string, TaskNode>): AdvanceKind {
   if (node.status === 'CREATED' && depsSatisfied(node, byId)) return 'start'
   if (node.status === 'READY' && node.kind === 'executable' && depsSatisfied(node, byId)) return 'execute'
-  if (node.status === 'WAITING_CHILDREN' && childrenAllAccepted(node, byId)) return 'integrate'
+  // WAITING_CHILDREN with ZERO children has nothing to integrate — returning 'integrate'
+  // would spin the orchestrator on an empty roundtable. Treat it as not advanceable.
+  if (node.status === 'WAITING_CHILDREN' && node.childIds.length > 0 && childrenAllAccepted(node, byId)) return 'integrate'
   return null
 }
 
@@ -353,7 +375,7 @@ export function hasCycle(nodes: TaskNode[]): boolean {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/stateMachine.test.ts`
-Expected: PASS。
+Expected: PASS(8 条:含新增的"`WAITING_CHILDREN` 零子节点 ⇒ null")。
 
 - [ ] **Step 5: 提交**
 
@@ -374,6 +396,7 @@ git commit -m "feat(efftask): state-machine predicates & dependency gating"
 - Consumes: `NodeKind`, `NodePlan`, `Verdict`(Task 1)。
 - Produces: `extractJsonBlock(text): unknown | null`, `parsePlanOutput(text): { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] }`, `parseVerdict(text, role): Verdict`, `parseExecOutput(text): { execStatus: string }`。
 - 契约:阶段 agent 被要求返回一个 ```json ...``` 代码块(或裸 JSON 对象);解析器容错——找不到/字段缺失时给安全默认(plan→executable 空方案;verdict→pass:false 带一条"无法解析裁决"的 blocking;exec→用整段文本当 execStatus)。
+- **LAST-FENCE 规则**:`extractJsonBlock` 扫描全部 ``` 围栏并**从后往前**尝试解析,取第一个能解析的;全部失败才回退"首个 `{` 到末个 `}`"的裸切片。理由:多轮转写里模型常先复述含 JSON 的提示词再作答,**本阶段的答案总在最后**;取第一个围栏会解析到被回显的旧方案。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -391,6 +414,16 @@ describe('parseOutput', () => {
   })
   it('extractJsonBlock returns null when none', () => {
     expect(extractJsonBlock('no json here')).toBeNull()
+  })
+  it('extractJsonBlock prefers the LAST parseable fence when there are two', () => {
+    const text = 'blah\n```json\n{"a":1}\n```\nmiddle\n```json\n{"a":2}\n```\ntail'
+    expect(extractJsonBlock(text)).toEqual({ a: 2 })
+  })
+  it('extractJsonBlock: echoed plan fence then verdict fence => verdict wins', () => {
+    const text =
+      '我先回顾一下上一阶段的方案:\n```json\n{"kind":"executable","solution":"旧方案"}\n```\n' +
+      '基于以上,我的裁决是:\n```json\n{"pass":false,"blocking":["缺验收点"],"comments":""}\n```'
+    expect(extractJsonBlock(text)).toEqual({ pass: false, blocking: ['缺验收点'], comments: '' })
   })
   it('parsePlanOutput decompose with children', () => {
     const out = parsePlanOutput('```json\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a","children":[{"title":"c1","deps":[]},{"title":"c2","deps":["c1"]}]}\n```')
@@ -430,15 +463,20 @@ Expected: FAIL。
 // src/tools/efftask/parseOutput.ts
 import type { NodeKind, NodePlan, Verdict } from './types.js'
 
+// LAST-FENCE RULE: a phase transcript is multi-turn and the model routinely ECHOES the
+// prompt (which itself contains a JSON plan/verdict) before answering. The phase's actual
+// answer is therefore the LAST fenced block, not the first. Scan every fence and try them
+// from last to first; only if no fence parses do we fall back to the bare
+// first-brace..last-brace slice.
 export function extractJsonBlock(text: string): unknown | null {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)
-  const candidates: string[] = []
-  if (fenced) candidates.push(fenced[1])
+  const fences = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(m => m[1])
+  for (let i = fences.length - 1; i >= 0; i--) {
+    try { return JSON.parse(fences[i].trim()) } catch { /* try the previous fence */ }
+  }
   const first = text.indexOf('{')
   const last = text.lastIndexOf('}')
-  if (first !== -1 && last > first) candidates.push(text.slice(first, last + 1))
-  for (const c of candidates) {
-    try { return JSON.parse(c.trim()) } catch { /* try next */ }
+  if (first !== -1 && last > first) {
+    try { return JSON.parse(text.slice(first, last + 1).trim()) } catch { /* fall through */ }
   }
   return null
 }
@@ -485,7 +523,7 @@ export function parseExecOutput(text: string): { execStatus: string } {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/parseOutput.test.ts`
-Expected: PASS。
+Expected: PASS(10 条:含新增的两条 LAST-FENCE 断言)。
 
 - [ ] **Step 5: 提交**
 
@@ -623,7 +661,7 @@ export async function parseDirectives(
 - [ ] **Step 4: 运行确认通过**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/parseDirectives.test.ts`
-Expected: PASS。
+Expected: PASS(5 条)。
 
 - [ ] **Step 5: 提交**
 
@@ -651,9 +689,11 @@ git commit -m "feat(efftask): prompt→config directive parsing"
   - `writeNode(fs, runDir, node): Promise<void>`（写 `runDir/<node.id>/node.md`)
   - `readNode(fs, runDir, nodeId): Promise<TaskNode>`
   - `loadRun(fs, runDir): Promise<{ nodes: TaskNode[] }>`（递归遍历 run 目录、读每个 `node.md`(经 `parseNodeFile`),返回全部节点;供 resume/审计)
-  - `writeRunManifest(fs, runDir, cfg, nodes): Promise<void>`（写 `runDir/run.md`;frontmatter 存 run 级 `createdAt`(取 root 节点 createdAt)+ cfg)
+  - `writeRunManifest(fs, runDir, cfg, nodes, result?): Promise<void>`（写 `runDir/run.md`;frontmatter 存 run 级 `createdAt`(取 root 节点 createdAt)+ cfg;`result`(可选,`{status, reason}`)只在收尾那次调用时传,把最终结局记进清单)
   - `renderTreeSnapshot(nodes): string`
 - 说明:`node.id` 即相对路径(root='root',子='root/01-slug')。fs 注入,测试用内存假实现。
+- **交接:`loadRun` / `readNode` 在 P1 只被产出+单测覆盖,真正的消费方是 P2 的 resume(崩溃恢复)路径。**故意在 P1 就把它们写完并测好,免得崩溃恢复能力被悄悄丢掉;P2 接线时须先做 `parseNodeFile` 的字段校验(见实现内注释)。
+- **并发写序:** `run.md` 会被每次 `onUpdate` 触发重写。Task 11 必须把这些写串成**单条 promise 队列**(见 Task 11),不得对同一路径并发 `writeFile`。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -699,7 +739,11 @@ describe('persistence', () => {
   it('serialize/parse node round-trips machine state', () => {
     const n = createNode({ id: 'root/01-x', title: 'X', parentId: 'root', deps: ['root/02-y'], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
     n.status = 'ACCEPTED'; n.kind = 'executable'; n.plan.solution = '方案文本'; n.score = { exec: { role: 'main', score: 88, rationale: 'ok' } }
-    const parsed = parseNodeFile(serializeNode(n))
+    n.blockedReason = '评审迭代超限(3): [main] 缺验收点'
+    const text = serializeNode(n)
+    expect(text).toContain('## 阻断原因') // rendered in the body only when non-empty
+    const parsed = parseNodeFile(text)
+    expect(parsed.blockedReason).toBe('评审迭代超限(3): [main] 缺验收点')
     expect(parsed.id).toBe('root/01-x')
     expect(parsed.goal).toBe('X') // immutable goal round-trips via frontmatter {...node}
     expect(parsed.deps).toEqual(['root/02-y'])
@@ -748,6 +792,11 @@ describe('persistence', () => {
     expect(text).toContain(NOW) // run-level createdAt taken from the root node
     expect(text).toContain('goalPrompt')
     expect(text).toContain('parallelism: 3')
+    // final call carries the run outcome
+    await writeRunManifest(fs, '/eff/001', cfg, [root], { status: 'blocked', reason: '评审迭代超限' })
+    const final = fs.store.get('/eff/001/run.md')!
+    expect(final).toContain('status: blocked')
+    expect(final).toContain('评审迭代超限')
   })
 })
 ```
@@ -763,7 +812,6 @@ Expected: FAIL。
 // src/tools/efftask/persistence.ts
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { createNode, emptyPhaseRoles } from './types.js'
 import { uiStatus } from './stateMachine.js'
 
 export interface FsLike {
@@ -776,7 +824,9 @@ export interface FsLike {
 
 export function slugify(title: string): string {
   const s = title.toLowerCase().replace(/[^a-z0-9一-龥]+/g, '-').replace(/^-+|-+$/g, '')
-  return (s || 'node').slice(0, 40)
+  // Array.from + slice on CODE POINTS: a plain .slice(0,40) can cut a surrogate pair in
+  // half and produce a lone surrogate in a filesystem path.
+  return Array.from(s || 'node').slice(0, 40).join('')
 }
 
 export function childId(parentId: string, index: number, title: string): string {
@@ -805,6 +855,7 @@ export function serializeNode(node: TaskNode): string {
     `## 风险点\n${node.plan.risks}\n\n` +
     `## 验收点\n${node.plan.acceptance}\n\n` +
     `## 执行状态\n${node.execStatus}\n\n` +
+    (node.blockedReason ? `## 阻断原因\n${node.blockedReason}\n\n` : '') +
     `## 评审记录\n${node.reviewLog.map(r => `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${r.synthesized.blockingSummary}`).join('\n')}\n\n` +
     `## 验收记录\n${node.acceptLog.map(r => `- round ${r.round}: ${r.synthesized.pass ? 'PASS' : 'FAIL'} ${r.synthesized.blockingSummary}`).join('\n')}\n\n` +
     `## 评分\nplan: ${node.score.plan?.score ?? '-'} / exec: ${node.score.exec?.score ?? '-'}\n`
@@ -814,6 +865,11 @@ export function serializeNode(node: TaskNode): string {
 export function parseNodeFile(text: string): TaskNode {
   const m = text.match(/^---\n([\s\S]*?)\n---/)
   if (!m) throw new Error('efftask: node.md missing frontmatter')
+  // UNVALIDATED CAST: yamlParse returns `any`-shaped data straight off disk. P1 only
+  // round-trips files it wrote itself, so this is safe here. P2's resume path reads
+  // user-editable / possibly-stale files and MUST validate (status is a legal NodeStatus,
+  // deps/childIds are string[], iteration counters are numbers) BEFORE feeding the state
+  // machine — a malformed status would silently deadlock or skip the dependency gate.
   return yamlParse(m[1]) as TaskNode
 }
 
@@ -852,22 +908,33 @@ export function renderTreeSnapshot(nodes: TaskNode[]): string {
   return `# Efficient Task Run\n\n${lines.join('\n')}\n`
 }
 
-export async function writeRunManifest(fs: FsLike, runDir: string, cfg: EffTaskConfig, nodes: TaskNode[]): Promise<void> {
+export async function writeRunManifest(
+  fs: FsLike,
+  runDir: string,
+  cfg: EffTaskConfig,
+  nodes: TaskNode[],
+  // Final run outcome, written only on the last call so run.md records how the run ended.
+  result?: { status: 'completed' | 'blocked'; reason?: string },
+): Promise<void> {
   // run-level createdAt from the root node (fallback: first node) for a stable manifest timestamp.
   const createdAt = nodes.find(n => n.parentId === null)?.createdAt ?? nodes[0]?.createdAt ?? ''
-  const header = `---\n${yamlStringify({ createdAt, parallelism: cfg.parallelism, phaseRoles: cfg.phaseRoles, caps: cfg.caps, goalPrompt: cfg.goalPrompt })}---\n\n`
+  const header = `---\n${yamlStringify({
+    createdAt,
+    parallelism: cfg.parallelism,
+    phaseRoles: cfg.phaseRoles,
+    caps: cfg.caps,
+    goalPrompt: cfg.goalPrompt,
+    ...(result ? { status: result.status, reason: result.reason ?? '' } : {}),
+  })}---\n\n`
   await fs.mkdir(runDir)
   await fs.writeFile(`${runDir}/run.md`, header + renderTreeSnapshot(nodes))
 }
-
-// re-export helpers used by orchestrator
-export { createNode, emptyPhaseRoles }
 ```
 
 - [ ] **Step 4: 运行确认通过**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/persistence.test.ts`
-Expected: PASS。
+Expected: PASS(7 条:含 `blockedReason` 往返 + `## 阻断原因` 正文 + `run.md` 最终 `{status,reason}`)。
 
 - [ ] **Step 5: 提交**
 
@@ -911,6 +978,13 @@ describe('roundtable', () => {
     const s = synthesizeVerdicts([{ role: 'a', pass: true, blocking: [], comments: '' }, { role: 'b', pass: false, blocking: ['X 缺失'], comments: '' }])
     expect(s.pass).toBe(false)
     expect(s.blockingSummary).toContain('X 缺失')
+  })
+  it('synthesizeVerdicts: fail with NO blocking items falls back to comments (never empty)', () => {
+    const s = synthesizeVerdicts([{ role: 'a', pass: false, blocking: [], comments: '方案太粗,缺落地步骤' }])
+    expect(s.pass).toBe(false)
+    expect(s.blockingSummary).toContain('方案太粗') // empty feedback => identical re-prompt => burned iterations
+    const s2 = synthesizeVerdicts([{ role: 'a', pass: false, blocking: [], comments: '   ' }])
+    expect(s2.blockingSummary.length).toBeGreaterThan(0) // still non-empty even without comments
   })
   it('runRoundtable with empty roles uses a single main reviewer', async () => {
     const calls: (string | null)[] = []
@@ -973,7 +1047,16 @@ export function synthesizeVerdicts(verdicts: Verdict[]): { pass: boolean; blocki
   const failing = verdicts.filter(v => !v.pass || v.blocking.length > 0)
   const pass = verdicts.length > 0 && failing.length === 0
   const blockingSummary = failing
-    .flatMap(v => v.blocking.map(b => `[${v.role}] ${b}`))
+    .flatMap(v =>
+      // A verdict can fail (pass:false) with an EMPTY blocking list. Falling back to its
+      // comments keeps blockingSummary non-empty — otherwise the revision loop re-prompts
+      // with identical text and deterministically burns every iteration for nothing.
+      v.blocking.length > 0
+        ? v.blocking.map(b => `[${v.role}] ${b}`)
+        : v.comments.trim()
+          ? [`[${v.role}] ${v.comments.trim()}`]
+          : [`[${v.role}] 未通过但未给出具体阻断项`],
+    )
     .join('; ')
   return { pass, blockingSummary }
 }
@@ -988,6 +1071,11 @@ export async function runRoundtable(args: {
   runAgent: RunAgentFn
   signal: AbortSignal
 }): Promise<RoundtableRecord> {
+  // Already aborted → don't burn a real model call; synthesize a failing record instead.
+  if (args.signal.aborted) {
+    const verdicts: Verdict[] = [{ role: 'main', pass: false, blocking: ['已中断'], comments: '' }]
+    return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts) }
+  }
   // Empty roster => a single main-model reviewer (role=null). Independent & parallel.
   const roster: (RoleBinding | null)[] = args.roles.length > 0 ? args.roles : [null]
   // Promise.allSettled so a single reviewer's runAgent REJECTION does not throw out
@@ -1012,7 +1100,7 @@ export async function runRoundtable(args: {
 - [ ] **Step 4: 运行确认通过**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/roundtable.test.ts`
-Expected: PASS。
+Expected: PASS(6 条:含新增的"失败但无 blocking ⇒ 回退 comments,摘要永不为空")。
 
 - [ ] **Step 5: 提交**
 
@@ -1030,13 +1118,22 @@ git commit -m "feat(efftask): roundtable synthesis (independent + unanimous)"
 - Test: `src/tools/efftask/pipeline.test.ts`
 
 **Interfaces:**
-- Consumes: 全部前序类型;`parsePlanOutput`/`parseExecOutput`(Task 3);`runRoundtable`/`RunAgentFn`(Task 6);`childId`(Task 5)。
+- Consumes: 全部前序类型;`parsePlanOutput`/`parseExecOutput`(Task 3);`runRoundtable`/`RunAgentFn`(Task 6);`childId`(Task 5);**`hasCycle`(Task 2)**;`createNode`(Task 1)。
 - Produces:
   - `interface PipelineCtx { config: EffTaskConfig; byId: Map<string, TaskNode>; runAgent: RunAgentFn; persist: (n: TaskNode) => Promise<void>; now: () => string; signal: AbortSignal; onUpdate: () => void }`
-  - `stepStart(node, ctx): Promise<void>` — 主模型或 plan 角色出方案 → `parsePlanOutput` → 写 `plan/kind`;圆桌评审(review 角色);不通过且 `iteration.planReview < caps.maxIterations` → 回 PLANNING 记录反馈重出方案;耗尽 → BLOCKED。通过后:decompose→**若 `depth+1 > caps.maxDepth` 则强制 executable→READY(不建子节点)**,否则创建声明的子节点(`childId`,deps 映射到兄弟 id)、父置 WAITING_CHILDREN;executable→置 READY。**硬化:开头 abort 检查;`ctx.runAgent`(plan)包 try/catch,抛错或调用后 `signal.aborted` → 记 `execStatus='已阻断: <reason>'` 并 BLOCKED 返回。**
-  - `stepExecute(node, ctx): Promise<void>` — EXECUTING:execute 角色/主模型执行(P1 共享 cwd)→`parseExecOutput`→EXECUTED→圆桌验收(accept 角色);不通过且未耗尽迭代→REWORK 重执行;耗尽→BLOCKED;通过→(P1 跳过 observer 评分)→(P1 MERGE 为 noop)→ACCEPTED。**硬化:开头 abort 检查;`ctx.runAgent`(execute)包 try/catch,抛错或 abort → `execStatus='已阻断: <reason>'` + BLOCKED。**
-  - `stepIntegrate(node, ctx): Promise<void>` — 开头 abort 检查;INTEGRATION_ACCEPT:对"子结果整体达成父目标"圆桌验收(accept 角色);通过→ACCEPTED;不通过→BLOCKED(P1;P2 再引入重分解)。
-- 说明:每步内部在关键状态转移后调用 `ctx.persist(node)` + `ctx.onUpdate()`。子节点 deps 映射:plan 输出的 child.deps 是**兄弟标题**,创建时映射为对应兄弟的 id(找不到的标题丢弃;等于自身 id 的自引用也丢弃)。**重复子标题按 title 绑依赖时绑到最后一个同名子(minor,已接受)。** `createChildren` 硬阀:创建前 `byId.size + specs.length > caps.maxNodes` → 父置 BLOCKED(reason `节点数超过上限`)、不建任何子;建完后用 `hasCycle`(Task 2)检测新兄弟组是否成环,成环则整组子节点置 BLOCKED(reason `依赖成环`)。`node.md` 的 Markdown 正文仅供展示,frontmatter 才是权威状态。
+  - `stepStart(node, ctx): Promise<void>` — 主模型或 plan 角色出方案 → `parsePlanOutput` → 写 `plan/kind`;圆桌评审(review 角色);不通过且 `iteration.planReview < caps.maxIterations` → 回 PLANNING 带**上一版方案 + 阻断意见**重出方案;耗尽 → `blockWithReason(评审迭代超限(N): …)`。通过后:decompose→**若 `depth+1 > caps.maxDepth` 则把子标题折进 `plan.solution` 后强制 executable→READY(不建子节点)**,否则创建声明的子节点(`childId`,deps 映射到兄弟 id)、父置 WAITING_CHILDREN;executable→置 READY。**硬化:开头 abort 检查;`ctx.runAgent`(plan)包 try/catch,抛错或调用后 `signal.aborted` → `blockWithReason` 返回。**
+  - `stepExecute(node, ctx): Promise<void>` — EXECUTING:execute 角色/主模型执行(P1 共享 cwd)→`parseExecOutput`→EXECUTED→圆桌验收(accept 角色);不通过且未耗尽迭代→REWORK 重执行(**把 `blockingSummary` + 上一轮 `execStatus` 喂回执行提示词**);耗尽→`blockWithReason(验收迭代超限(N): …)`;通过→(P1 跳过 observer 评分)→(P1 MERGE 为 noop)→ACCEPTED。**硬化:开头 abort 检查;`ctx.runAgent`(execute)包 try/catch,抛错或 abort → `blockWithReason`。**
+  - `stepIntegrate(node, ctx): Promise<void>` — 开头 abort 检查;INTEGRATION_ACCEPT:用**专用的 `integratePrompt`**(父目标 + 父验收点 + 每个子节点的 `{title, status, execStatus, acceptance}` 证据块)做圆桌验收(accept 角色);通过→ACCEPTED;**不通过→与 `stepExecute` 同形的有界重试**(`iteration.acceptance++`,未耗尽则带失败反馈重跑集成圆桌),耗尽才 `blockWithReason(集成验收迭代超限(N): …)`。
+  - 内部:`planPrompt(node, ctx, feedback?)` / `executePrompt(node, ctx, feedback?)` / `reviewPrompt(node)` / `acceptPrompt(node)` / `integratePrompt(node, ctx, feedback?)` / `depsSection(node, ctx)` / `blockWithReason(node, reason, ctx)` / `createChildren(node, specs, ctx): Promise<CreateResult>`。
+- 说明:每步内部在关键状态转移后调用 `ctx.persist(node)` + `ctx.onUpdate()`。
+- **`blockWithReason` 只写 `node.blockedReason`,绝不覆盖 `node.execStatus`**——execStatus 里可能存着已完成工作的证据,验收/审计都要用。
+- **依赖可见性:** `planPrompt`/`executePrompt` 对有 `deps` 的节点追加一段依赖清单(经 `ctx.byId` 查出每个 dep 的 `{title, execStatus}`),让节点知道上游产出了什么;因此这两个提示词函数签名都带 `ctx`。
+- **子节点继承目标:** `createChildren` 给子节点传**组合目标**(父目标 + 上级方案要点截断 500 字 + 本子任务标题),而不是光秃秃的 title。
+- 子节点 deps 映射:plan 输出的 child.deps 是**兄弟标题**,创建时映射为对应兄弟的 id(找不到的标题丢弃;等于自身 id 的自引用也丢弃)。**重复子标题按 title 绑依赖时绑到最后一个同名子(minor,已接受)。**
+- `createChildren` 返回 `{ok:true} | {ok:false, reason, retryable}`,**失败时一个子节点都不写进 `ctx.byId`/`node.childIds`**(先在本地数组建好、过闸后才落库,零残留):
+  - `byId.size + specs.length > caps.maxNodes` → `{ok:false, reason:'节点数超过上限', retryable:false}` → 父节点直接 BLOCKED。
+  - `hasCycle(created)`(Task 2)→ `{ok:false, reason:'子任务依赖成环,请重新给出无环的子任务依赖', retryable:true}` → **不杀 run**:按"评审失败"处理,`iteration.planReview++` 并把该 reason 当 feedback 回到 plan 循环重新拆分;只有迭代上限耗尽才把父节点 BLOCKED(reason 含 `依赖成环`)。
+- `node.md` 的 Markdown 正文仅供展示,frontmatter 才是权威状态。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1051,8 +1148,13 @@ import type { RunAgentFn } from './roundtable.js'
 
 const NOW = '2026-07-25T00:00:00Z'
 const cfg: EffTaskConfig = { goalPrompt: 'g', parallelism: DEFAULT_PARALLELISM, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS } }
-function ctxFor(nodes: TaskNode[], runAgent: RunAgentFn, config: EffTaskConfig = cfg): PipelineCtx {
-  return { config, byId: byIdMap(nodes), runAgent, persist: async () => {}, now: () => NOW, signal: new AbortController().signal, onUpdate: () => {} }
+function ctxFor(
+  nodes: TaskNode[],
+  runAgent: RunAgentFn,
+  config: EffTaskConfig = cfg,
+  signal: AbortSignal = new AbortController().signal,
+): PipelineCtx {
+  return { config, byId: byIdMap(nodes), runAgent, persist: async () => {}, now: () => NOW, signal, onUpdate: () => {} }
 }
 const root = () => createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
 
@@ -1086,7 +1188,21 @@ describe('pipeline', () => {
     expect(bb.depth).toBe(1)
   })
 
-  it('stepStart review fails until iterations exhausted => BLOCKED', async () => {
+  it('createChildren: child goal composes the PARENT goal, not just the child title', async () => {
+    const n = createNode({ id: 'root', title: 'r', goal: '交付高效任务模式骨架', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"decompose","solution":"s","keyPoints":"要点K","risks":"","acceptance":"","children":[{"title":"AA","deps":[]}]}\n```'
+        : '```json\n{"pass":true,"blocking":[],"comments":""}\n```'
+    const ctx = ctxFor([n], runAgent)
+    await stepStart(n, ctx)
+    const aa = ctx.byId.get('root/01-aa')!
+    expect(aa.goal).toContain('交付高效任务模式骨架') // parent goal inherited, not lost
+    expect(aa.goal).toContain('要点K') // parent plan key points carried down
+    expect(aa.goal).toContain('AA') // plus this child's own slice
+  })
+
+  it('stepStart review fails until iterations exhausted => BLOCKED with a reason', async () => {
     const n = root()
     const runAgent: RunAgentFn = async req =>
       req.phase === 'plan'
@@ -1096,6 +1212,9 @@ describe('pipeline', () => {
     await stepStart(n, ctx)
     expect(n.status).toBe('BLOCKED')
     expect(n.iteration.planReview).toBe(DEFAULT_CAPS.maxIterations)
+    expect(n.blockedReason).toContain('评审迭代超限') // reason recorded, execStatus untouched
+    expect(n.blockedReason).toContain('缺验收点')
+    expect(n.execStatus).toBe('')
   })
 
   it('stepExecute executable => execute + accept pass => ACCEPTED', async () => {
@@ -1111,14 +1230,16 @@ describe('pipeline', () => {
     expect(n.acceptLog).toHaveLength(1)
   })
 
-  it('stepExecute accept fails until exhausted => BLOCKED', async () => {
+  it('stepExecute accept fails until exhausted => BLOCKED, execStatus evidence preserved', async () => {
     const n = root(); n.kind = 'executable'; n.status = 'READY'
     const runAgent: RunAgentFn = async req =>
-      req.phase === 'execute' ? '```json\n{"execStatus":"x"}\n```' : '```json\n{"pass":false,"blocking":["回归失败"],"comments":""}\n```'
+      req.phase === 'execute' ? '```json\n{"execStatus":"改了 foo.ts"}\n```' : '```json\n{"pass":false,"blocking":["回归失败"],"comments":""}\n```'
     const ctx = ctxFor([n], runAgent)
     await stepExecute(n, ctx)
     expect(n.status).toBe('BLOCKED')
     expect(n.iteration.acceptance).toBe(DEFAULT_CAPS.maxIterations)
+    expect(n.blockedReason).toContain('验收迭代超限')
+    expect(n.execStatus).toBe('改了 foo.ts') // completed-work evidence NOT clobbered by the block
   })
 
   it('stepStart: runAgent throws in plan phase => node BLOCKED with recorded reason', async () => {
@@ -1127,14 +1248,42 @@ describe('pipeline', () => {
     const ctx = ctxFor([n], runAgent)
     await stepStart(n, ctx)
     expect(n.status).toBe('BLOCKED')
-    expect(n.execStatus).toContain('已阻断')
+    expect(n.blockedReason).toContain('模型调用失败')
   })
 
-  it('stepStart: depth cap forces decompose→executable (no children) => READY', async () => {
-    const n = root() // depth 0
+  it('stepStart: pre-aborted signal => BLOCKED with the abort reason, no model call', async () => {
+    const n = root()
+    const ac = new AbortController()
+    ac.abort()
+    let calls = 0
+    const runAgent: RunAgentFn = async () => { calls++; return '' }
+    const ctx = ctxFor([n], runAgent, cfg, ac.signal)
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toBe('已中断')
+    expect(calls).toBe(0) // aborted before spending a single token
+  })
+
+  it('stepStart: node-count cap => parent BLOCKED with 节点数超过上限, no children created', async () => {
+    const n = root()
     const runAgent: RunAgentFn = async req =>
       req.phase === 'plan'
         ? '```json\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":[]}]}\n```'
+        : '```json\n{"pass":true,"blocking":[],"comments":""}\n```'
+    const capped: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 1 } } // 1 (root) + 1 child > 1
+    const ctx = ctxFor([n], runAgent, capped)
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('节点数超过上限')
+    expect(n.childIds).toEqual([])
+    expect(ctx.byId.size).toBe(1) // never silently truncate: zero partial children
+  })
+
+  it('stepStart: depth cap forces decompose→executable, child titles survive into plan.solution', async () => {
+    const n = root() // depth 0
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":[]},{"title":"BB","deps":[]}]}\n```'
         : '```json\n{"pass":true,"blocking":[],"comments":""}\n```'
     const capped: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxDepth: 0 } } // depth+1 (=1) > 0
     const ctx = ctxFor([n], runAgent, capped)
@@ -1142,28 +1291,35 @@ describe('pipeline', () => {
     expect(n.kind).toBe('executable')
     expect(n.status).toBe('READY')
     expect(n.childIds).toEqual([]) // no children created past the cap
+    expect(n.plan.solution).toContain('已达最大深度') // work folded in, not silently dropped
+    expect(n.plan.solution).toContain('AA')
+    expect(n.plan.solution).toContain('BB')
   })
 
-  it('stepStart: sibling dependency cycle => involved children BLOCKED', async () => {
+  it('stepStart: sibling dependency cycle replans (bounded), exhausted => parent BLOCKED, zero children', async () => {
     const n = root()
-    const runAgent: RunAgentFn = async req =>
-      req.phase === 'plan'
-        ? '```json\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":["BB"]},{"title":"BB","deps":["AA"]}]}\n```'
-        : '```json\n{"pass":true,"blocking":[],"comments":""}\n```'
+    const planPrompts: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return '```json\n{"pass":true,"blocking":[],"comments":""}\n```'
+      planPrompts.push(req.prompt)
+      return '```json\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":["BB"]},{"title":"BB","deps":["AA"]}]}\n```'
+    }
     const ctx = ctxFor([n], runAgent)
     await stepStart(n, ctx)
-    const aa = ctx.byId.get('root/01-aa')!
-    const bb = ctx.byId.get('root/02-bb')!
-    expect(aa.status).toBe('BLOCKED')
-    expect(bb.status).toBe('BLOCKED')
-    expect(aa.execStatus).toContain('依赖成环')
+    expect(n.status).toBe('BLOCKED')
+    expect(n.iteration.planReview).toBe(DEFAULT_CAPS.maxIterations) // replanned until the cap
+    expect(n.blockedReason).toContain('依赖成环')
+    expect(n.childIds).toEqual([])
+    expect(ctx.byId.size).toBe(1) // NO partial children left behind on a rejected group
+    expect(planPrompts[1]).toContain('成环') // the cycle was fed back as revision feedback
   })
 
-  it('stepStart: review fails once then passes => READY (executable)', async () => {
+  it('stepStart: review fails once then passes => READY, revision prompt shows the previous plan', async () => {
     const n = root()
     let reviewCalls = 0
+    const planPrompts: string[] = []
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"do","acceptance":"a"}\n```'
+      if (req.phase === 'plan') { planPrompts.push(req.prompt); return '```json\n{"kind":"executable","solution":"写入 hello.txt","acceptance":"a"}\n```' }
       reviewCalls++
       return reviewCalls === 1
         ? '```json\n{"pass":false,"blocking":["补充验收点"],"comments":""}\n```'
@@ -1174,13 +1330,16 @@ describe('pipeline', () => {
     expect(n.status).toBe('READY')
     expect(n.iteration.planReview).toBe(1) // one failed round before passing
     expect(n.reviewLog).toHaveLength(2)
+    expect(planPrompts[1]).toContain('补充验收点') // blocking feedback threaded in
+    expect(planPrompts[1]).toContain('写入 hello.txt') // ...alongside the plan being revised
   })
 
-  it('stepExecute: accept fails once (REWORK) then passes => ACCEPTED', async () => {
+  it('stepExecute: accept fails once (REWORK) then passes => ACCEPTED, rework prompt carries feedback + prior execStatus', async () => {
     const n = root(); n.kind = 'executable'; n.status = 'READY'
     let acceptCalls = 0
+    const execPrompts: string[] = []
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'execute') return '```json\n{"execStatus":"x"}\n```'
+      if (req.phase === 'execute') { execPrompts.push(req.prompt); return '```json\n{"execStatus":"改了 foo.ts"}\n```' }
       acceptCalls++
       return acceptCalls === 1
         ? '```json\n{"pass":false,"blocking":["回归失败"],"comments":""}\n```'
@@ -1191,15 +1350,39 @@ describe('pipeline', () => {
     expect(n.status).toBe('ACCEPTED')
     expect(n.iteration.acceptance).toBe(1) // one REWORK round before acceptance
     expect(n.acceptLog).toHaveLength(2)
+    expect(execPrompts[1]).toContain('回归失败') // rework knows WHAT to fix
+    expect(execPrompts[1]).toContain('改了 foo.ts') // ...and what was already done
   })
 
-  it('stepIntegrate: integration acceptance fails => BLOCKED', async () => {
-    const n = root(); n.status = 'WAITING_CHILDREN'
-    const runAgent: RunAgentFn = async () => '```json\n{"pass":false,"blocking":["子结果未达成父目标"],"comments":""}\n```'
-    const ctx = ctxFor([n], runAgent)
+  it('stepIntegrate: sees child evidence and passes => ACCEPTED', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.plan.acceptance = '父验收点X'
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    const ctx = ctxFor([n, child], runAgent)
+    await stepIntegrate(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.acceptLog).toHaveLength(1)
+    expect(prompts[0]).toContain('AA') // integratePrompt renders each child…
+    expect(prompts[0]).toContain('子任务产出Y') // …with its execStatus evidence
+    expect(prompts[0]).toContain('父验收点X') // …against the parent's acceptance criteria
+  })
+
+  it('stepIntegrate: integration acceptance fails until iterations exhausted => BLOCKED', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return '```json\n{"pass":false,"blocking":["子结果未达成父目标"],"comments":""}\n```' }
+    const ctx = ctxFor([n, child], runAgent)
     await stepIntegrate(n, ctx)
     expect(n.status).toBe('BLOCKED')
-    expect(n.acceptLog).toHaveLength(1)
+    expect(n.iteration.acceptance).toBe(DEFAULT_CAPS.maxIterations) // retried, not one-shot
+    expect(n.acceptLog).toHaveLength(DEFAULT_CAPS.maxIterations)
+    expect(n.blockedReason).toContain('集成验收迭代超限')
+    expect(prompts[1]).toContain('子结果未达成父目标') // failure feedback appended on retry
   })
 })
 ```
@@ -1239,8 +1422,8 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
 
 type PhaseResult = { ok: true; text: string } | { ok: false; reason: string }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
-// after the call yields ok:false with a reason; the caller records it into
-// node.execStatus (prefixed `已阻断:`) and BLOCKs the node.
+// after the call yields ok:false with a reason; the caller hands it to blockWithReason,
+// which records it into node.blockedReason and BLOCKs the node.
 async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promise<PhaseResult> {
   try {
     const text = await ctx.runAgent(req)
@@ -1251,15 +1434,35 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promi
   }
 }
 
+// Records WHY the node died in its own field. It must NOT touch node.execStatus, which may
+// hold real completed-work evidence that acceptance/audit still needs.
 async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx): Promise<void> {
-  node.execStatus = `已阻断: ${reason}`
+  node.blockedReason = reason
   await commit(node, 'BLOCKED', ctx)
 }
 
-function planPrompt(node: TaskNode, feedback: string): string {
+// A node with deps must SEE what its dependencies produced, otherwise it replans from
+// scratch and redoes upstream work.
+function depsSection(node: TaskNode, ctx: PipelineCtx): string {
+  if (node.deps.length === 0) return ''
+  const lines = node.deps.map(id => {
+    const d = ctx.byId.get(id)
+    return d ? `- ${d.title}(${d.status}): ${d.execStatus || '(尚无执行状态)'}` : `- ${id}: (依赖节点缺失)`
+  })
+  return `已完成的依赖任务及其产出(基于这些结果继续,不要重复它们的工作):\n${lines.join('\n')}\n`
+}
+
+function planPrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
+  const caps = ctx.config.caps
   return (
     `任务:${node.title}\n目标:${ctxGoal(node)}\n` +
-    (feedback ? `上一轮评审阻断意见,请针对性修订:\n${feedback}\n` : '') +
+    depsSection(node, ctx) +
+    // The depth budget lives IN THE PROMPT so the model self-limits, instead of us
+    // silently discarding the children it asked for once it hits the cap.
+    `当前深度 ${node.depth}/上限 ${caps.maxDepth};已达上限时必须返回 kind=executable,不得再拆分。\n` +
+    (feedback
+      ? `上一版方案(就是它需要被修订):\n${JSON.stringify(node.plan)}\n上一轮评审阻断意见,请针对性修订:\n${feedback}\n`
+      : '') +
     `请输出一个 json 代码块:{ "kind":"decompose"|"executable", "solution", "keyPoints", "risks", "acceptance", "children":[{"title","deps":["兄弟标题"]}] }。` +
     `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。`
   )
@@ -1271,11 +1474,36 @@ function ctxGoal(node: TaskNode): string { return node.goal }
 function reviewPrompt(node: TaskNode): string {
   return `请评审以下方案是否可执行、完整、无重大风险。方案:\n${JSON.stringify(node.plan)}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。`
 }
-function executePrompt(node: TaskNode): string {
-  return `按以下方案执行任务并完成实际改动。方案:\n${JSON.stringify(node.plan)}\n完成后输出 json:{ "execStatus":"做了什么、结果如何" }。`
+function executePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
+  return (
+    `按以下方案执行任务并完成实际改动。方案:\n${JSON.stringify(node.plan)}\n` +
+    depsSection(node, ctx) +
+    // REWORK path: show the acceptance blockers AND what the previous round already did,
+    // so the rerun is a targeted fix rather than a blind repeat.
+    (feedback
+      ? `上一轮验收未通过,阻断意见:\n${feedback}\n上一轮执行状态:\n${node.execStatus}\n请针对性返工。\n`
+      : '') +
+    `完成后输出 json:{ "execStatus":"做了什么、结果如何" }。`
+  )
 }
 function acceptPrompt(node: TaskNode): string {
   return `请验收执行结果是否达成验收点。验收点:${node.plan.acceptance}\n执行状态:${node.execStatus}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。`
+}
+// Integration acceptance judges CHILD evidence against the parent goal. acceptPrompt would
+// show only the parent's own execStatus — which for a decompose node is empty.
+function integratePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
+  const children = node.childIds
+    .map(id => ctx.byId.get(id))
+    .filter((c): c is TaskNode => c !== undefined)
+    .map(c => `### ${c.title}\n- 状态: ${c.status}\n- 执行状态: ${c.execStatus || '(无)'}\n- 验收点: ${c.plan.acceptance || '(无)'}`)
+    .join('\n')
+  return (
+    `请验收"全部子任务的结果合起来是否达成本节点目标"。\n` +
+    `父目标:${ctxGoal(node)}\n父验收点:${node.plan.acceptance || '(无)'}\n\n` +
+    `子任务结果:\n${children || '(无子任务)'}\n\n` +
+    (feedback ? `上一轮集成验收阻断意见,请复核是否已解决:\n${feedback}\n\n` : '') +
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。`
+  )
 }
 
 function firstRole(node: TaskNode, phase: 'plan' | 'execute') {
@@ -1286,85 +1514,112 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
   let feedback = ''
-  let lastChildren: { title: string; deps: string[] }[] = []
-  // plan → review loop
+  // plan → review loop. A rejected child GROUP (dependency cycle) re-enters this same
+  // loop, so replanning is bounded by the SAME maxIterations budget — a cycle costs a
+  // retry, it does not instantly kill the run.
   for (;;) {
     await commit(node, 'PLANNING', ctx)
-    const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, feedback), signal: ctx.signal })
+    const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, ctx, feedback), signal: ctx.signal })
     if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
     const parsed = parsePlanOutput(res.text)
     node.kind = parsed.kind
     node.plan = parsed.plan
-    lastChildren = parsed.children
+    const lastChildren = parsed.children
     await commit(node, 'PLAN_REVIEW', ctx)
     const rec = await runRoundtable({ phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1, system: 'review', prompt: reviewPrompt(node), runAgent: ctx.runAgent, signal: ctx.signal })
     node.reviewLog.push(rec)
-    if (rec.synthesized.pass) break
-    node.iteration.planReview++
-    feedback = rec.synthesized.blockingSummary
-    if (node.iteration.planReview >= caps.maxIterations) { await commit(node, 'BLOCKED', ctx); return }
-  }
-  if (node.kind === 'decompose') {
-    // Depth cap: if decomposing would exceed maxDepth, force this node to be
-    // executable (do NOT create children) so it runs directly and goes READY.
+    if (!rec.synthesized.pass) {
+      node.iteration.planReview++
+      feedback = rec.synthesized.blockingSummary
+      if (node.iteration.planReview >= caps.maxIterations) {
+        await blockWithReason(node, `评审迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
+        return
+      }
+      continue
+    }
+
+    if (node.kind !== 'decompose') { await commit(node, 'READY', ctx); return }
+
+    // Depth cap: force this node executable rather than decomposing. Do NOT silently drop
+    // the children the model asked for — fold their titles into the solution so the work
+    // survives as an in-node checklist.
     if (node.depth + 1 > caps.maxDepth) {
+      if (lastChildren.length > 0) {
+        node.plan.solution += `\n\n已达最大深度,不得再拆分,请在本节点内依次完成:${lastChildren.map(c => c.title).join('、')}`
+      }
       node.kind = 'executable'
       await commit(node, 'READY', ctx)
       return
     }
-    await createChildren(node, lastChildren, ctx)
-    // createChildren may set this node to BLOCKED (node-count cap). Only advance to
-    // WAITING_CHILDREN when it wasn't blocked (cycle guard blocks the CHILDREN, not
-    // the parent, so a cyclic group still transitions to WAITING_CHILDREN and the
-    // orchestrator later propagates BLOCKED upward).
-    if (node.status !== 'BLOCKED') await commit(node, 'WAITING_CHILDREN', ctx)
-  } else {
-    await commit(node, 'READY', ctx)
+
+    const created = await createChildren(node, lastChildren, ctx)
+    if (created.ok) { await commit(node, 'WAITING_CHILDREN', ctx); return }
+    // Node-count cap is fatal (retrying can't make room); a dependency cycle is not.
+    if (!created.retryable) { await blockWithReason(node, created.reason, ctx); return }
+    node.iteration.planReview++
+    feedback = created.reason
+    if (node.iteration.planReview >= caps.maxIterations) {
+      await blockWithReason(node, `评审迭代超限(${caps.maxIterations}): ${created.reason}`, ctx)
+      return
+    }
   }
 }
 
-async function createChildren(node: TaskNode, specs: { title: string; deps: string[] }[], ctx: PipelineCtx): Promise<void> {
-  // Node-count cap: if creating these children would exceed maxNodes, create NONE and
-  // block this node instead (never silently truncate).
+type CreateResult = { ok: true } | { ok: false; reason: string; retryable: boolean }
+
+async function createChildren(node: TaskNode, specs: { title: string; deps: string[] }[], ctx: PipelineCtx): Promise<CreateResult> {
+  // Node-count cap: if creating these children would exceed maxNodes, create NONE
+  // (never silently truncate). Not retryable — replanning can't create budget.
   if (ctx.byId.size + specs.length > ctx.config.caps.maxNodes) {
-    await blockWithReason(node, '节点数超过上限', ctx)
-    return
+    return { ok: false, reason: '节点数超过上限', retryable: false }
   }
   // child.deps reference SIBLING TITLES; map each to the sibling's id (drop unknown titles).
   // NOTE: duplicate child titles bind dep-by-title to the LAST duplicate (minor, accepted).
   const titleToId = new Map<string, string>()
   specs.forEach((c, i) => titleToId.set(c.title, childId(node.id, i + 1, c.title)))
-  const created: TaskNode[] = []
-  specs.forEach((c, i) => {
+  // Build the group in a LOCAL array first. Nothing touches ctx.byId / node.childIds until
+  // the cycle guard passes, so a rejected group leaves ZERO partial state behind.
+  const created: TaskNode[] = specs.map((c, i) => {
     const id = childId(node.id, i + 1, c.title)
     // map sibling titles → ids; drop unknown titles AND any self-reference (child depping on itself).
     const deps = c.deps.map(t => titleToId.get(t)).filter((x): x is string => !!x && x !== id)
-    const child = createNode({ id, title: c.title, parentId: node.id, deps, depth: node.depth + 1, phaseRoles: node.phaseRoles, now: ctx.now() })
-    ctx.byId.set(id, child)
-    node.childIds.push(id)
-    created.push(child)
+    return createNode({
+      id,
+      title: c.title,
+      // Children inherit a COMPOSED goal. A bare title strips all parent context and the
+      // child then replans the wrong thing from nothing.
+      goal: `${node.goal}\n> 上级方案要点: ${(node.plan.keyPoints || node.plan.solution).slice(0, 500)}\n> 本子任务: ${c.title}`,
+      parentId: node.id,
+      deps,
+      depth: node.depth + 1,
+      phaseRoles: node.phaseRoles,
+      now: ctx.now(),
+    })
   })
-  // Cycle guard: sibling deps only reference siblings; if the freshly-created group has a
-  // dependency cycle, block the whole group (P1 keeps it simple/conservative) with 依赖成环
-  // rather than leaving them CREATED (which would deadlock the run silently).
+  // Cycle guard: sibling deps only reference siblings. A cyclic group is a PLANNING error,
+  // so hand it back as retryable feedback instead of killing the branch.
   if (hasCycle(created)) {
-    for (const child of created) {
-      child.execStatus = '已阻断: 依赖成环'
-      child.status = 'BLOCKED'
-      child.updatedAt = ctx.now()
-      await ctx.persist(child)
-    }
-    ctx.onUpdate()
+    return { ok: false, reason: '子任务依赖成环,请重新给出无环的子任务依赖', retryable: true }
+  }
+  for (const child of created) {
+    ctx.byId.set(child.id, child)
+    node.childIds.push(child.id)
+    await ctx.persist(child)
   }
   await ctx.persist(node)
+  ctx.onUpdate()
+  return { ok: true }
 }
 
 export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
+  let feedback = '' // previous round's acceptance blockingSummary; drives the REWORK prompt
   for (;;) {
     await commit(node, 'EXECUTING', ctx)
-    const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node), cwd: node.worktree?.path, signal: ctx.signal })
+    // node.execStatus still holds the PREVIOUS round's result here (it's overwritten below),
+    // which is exactly what executePrompt renders on rework.
+    const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, feedback), cwd: node.worktree?.path, signal: ctx.signal })
     if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
     node.execStatus = parseExecOutput(res.text).execStatus
     await commit(node, 'ACCEPTANCE', ctx)
@@ -1372,24 +1627,45 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     node.acceptLog.push(rec)
     if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
     node.iteration.acceptance++
-    if (node.iteration.acceptance >= caps.maxIterations) { await commit(node, 'BLOCKED', ctx); return }
+    if (node.iteration.acceptance >= caps.maxIterations) {
+      await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
+      return
+    }
+    feedback = rec.synthesized.blockingSummary
     await commit(node, 'REWORK', ctx)
   }
 }
 
 export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
-  await commit(node, 'INTEGRATION_ACCEPT', ctx)
-  const rec = await runRoundtable({ phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1, system: 'integrate', prompt: acceptPrompt(node), runAgent: ctx.runAgent, signal: ctx.signal })
-  node.acceptLog.push(rec)
-  await commit(node, rec.synthesized.pass ? 'ACCEPTED' : 'BLOCKED', ctx)
+  const caps = ctx.config.caps
+  let feedback = ''
+  // Same bounded-retry shape as stepExecute: a single failed integration verdict must not
+  // be terminal (the roundtable may simply have misread the evidence).
+  for (;;) {
+    await commit(node, 'INTEGRATION_ACCEPT', ctx)
+    const rec = await runRoundtable({
+      phase: 'accept', node, roles: node.phaseRoles.accept,
+      round: node.iteration.acceptance + 1, system: 'integrate',
+      prompt: integratePrompt(node, ctx, feedback), // child evidence, NOT acceptPrompt
+      runAgent: ctx.runAgent, signal: ctx.signal,
+    })
+    node.acceptLog.push(rec)
+    if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
+    node.iteration.acceptance++
+    if (node.iteration.acceptance >= caps.maxIterations) {
+      await blockWithReason(node, `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
+      return
+    }
+    feedback = rec.synthesized.blockingSummary
+  }
 }
 ```
 
 - [ ] **Step 4: 运行确认通过**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/pipeline.test.ts`
-Expected: PASS(全部 11 条:原 5 条 + 错误→BLOCKED / 深度上限 / 兄弟成环 + 评审失败一次后通过 / 验收失败 REWORK 后通过 / 集成验收失败→BLOCKED)。
+Expected: PASS(全部 **15** 条:executable→READY / decompose 建子 / **子目标继承父目标** / 评审耗尽→BLOCKED(带 reason)/ execute+accept→ACCEPTED / 验收耗尽→BLOCKED(execStatus 保留)/ plan 抛错→BLOCKED / **预置 abort→BLOCKED 且零调用** / **节点数上限→BLOCKED 且零残留子** / 深度上限→executable **且子标题进 solution** / **兄弟成环有界重拆→耗尽才 BLOCKED、零残留子** / 评审失败一次后通过(修订提示词带上一版方案)/ 验收 REWORK 后通过(返工提示词带反馈+上轮 execStatus)/ **集成验收看到子证据并通过** / **集成验收耗尽→BLOCKED**)。
 
 - [ ] **Step 5: 提交**
 
@@ -1407,11 +1683,11 @@ git commit -m "feat(efftask): per-node pipeline (plan/review, execute/accept, in
 - Test: `src/tools/efftask/orchestrator.test.ts`
 
 **Interfaces:**
-- Consumes: 全部前序;`advanceableKind`(Task 2);`stepStart`/`stepExecute`/`stepIntegrate`/`PipelineCtx`(Task 7)。
+- Consumes: 全部前序;`advanceableKind`/`byIdMap`/**`isTerminal`**(Task 2);`stepStart`/`stepExecute`/`stepIntegrate`/`PipelineCtx`(Task 7);`createNode`/`emptyPhaseRoles`(Task 1,**直接从 `./types.js` 导入**——`persistence.ts` 不再做 re-export)。
 - Produces:
   - `interface OrchestratorDeps { runAgent: RunAgentFn; persist: (n: TaskNode) => Promise<void>; now: () => string; onUpdate: (nodes: TaskNode[]) => void }`
   - `class EffTaskOrchestrator { constructor(cfg: EffTaskConfig, deps: OrchestratorDeps, signal: AbortSignal); nodes(): TaskNode[]; run(): Promise<{ status: 'completed' | 'blocked'; reason?: string }> }`
-  - 驱动:创建 root(id `'root'`,title 取 `cfg.goalPrompt` 首行/截断);循环 `advanceableKind` 选**第一个**可推进节点(串行)→ 按 kind 调 step*(包 try/catch:step 抛错→仅把该节点置 BLOCKED、不崩整轮);无可推进且 root 未 ACCEPTED → 死锁 → **先把 BLOCKED 向上传播到 WAITING_CHILDREN 祖先 / 依赖被阻断的 CREATED 节点(让树面板红得准确)**→ 返回 `{ status:'blocked', reason }`;root ACCEPTED → `{ status:'completed' }`;`signal.aborted` → `{ status:'blocked', reason:'已中断' }`。节点数上限在 pipeline `createChildren` 前由 `byId.size` 检查(Task 7),超限即把待展开节点置 BLOCKED。
+  - 驱动:创建 root(id `'root'`,title 取 `cfg.goalPrompt` 首行/截断);循环 `advanceableKind` 选**第一个**可推进节点(串行,排序用**逐码点比较**而非 `localeCompare`,避免依赖 locale/ICU)→ 按 kind 调 step*(包 try/catch:step 抛错→记 `blockedReason`;**若该节点是 `WAITING_CHILDREN` 且尚有非终态子节点,则保留其状态、不置 BLOCKED**(否则会误杀仍在推进的子树);其余情况置 BLOCKED,均不崩整轮);无可推进且 root 未 ACCEPTED → 死锁 → **先把 BLOCKED 向上传播:WAITING_CHILDREN 祖先 / 依赖被阻断的节点 / 依赖 id 在 `byId` 中缺失的悬垂节点(让树面板红得准确)**→ 返回 `{ status:'blocked', reason }`(reason 取 `root.blockedReason`);root ACCEPTED → `{ status:'completed' }`;`signal.aborted` → 先把 `PLANNING`/`EXECUTING`/`READY`/`CREATED` 这些非终态节点扫成 BLOCKED(reason `已中断`,末态树不留幻影 running)→ `{ status:'blocked', reason:'已中断' }`。节点数上限在 pipeline `createChildren` 前由 `byId.size` 检查(Task 7),超限即把待展开节点置 BLOCKED。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1513,7 +1789,7 @@ Expected: FAIL。
 // src/tools/efftask/orchestrator.ts
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { createNode, emptyPhaseRoles } from './types.js'
-import { advanceableKind, byIdMap } from './stateMachine.js'
+import { advanceableKind, byIdMap, isTerminal } from './stateMachine.js'
 import { stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 
@@ -1554,17 +1830,18 @@ export class EffTaskOrchestrator {
 
   async run(): Promise<{ status: 'completed' | 'blocked'; reason?: string }> {
     for (;;) {
-      if (this.signal.aborted) { await this.propagateBlocked(); return { status: 'blocked', reason: '已中断' } }
+      if (this.signal.aborted) { await this.propagateBlocked(true); return { status: 'blocked', reason: '已中断' } }
       const root = this.byId.get('root')!
       if (root.status === 'ACCEPTED') return { status: 'completed' }
-      // pick the first advanceable node (serial). Deterministic order by id.
-      const ordered = [...this.byId.values()].sort((a, b) => a.id.localeCompare(b.id))
+      // pick the first advanceable node (serial). Deterministic order by id — a plain
+      // codepoint compare, NOT localeCompare (which is locale/ICU-dependent).
+      const ordered = [...this.byId.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
       const next = ordered.find(n => advanceableKind(n, this.byId) !== null)
       if (!next) {
         // deadlock: nothing advanceable and root not accepted. Surface WHY the tree is
         // dead by propagating BLOCKED upward before returning.
-        await this.propagateBlocked()
-        const reason = root.status === 'BLOCKED' ? (root.execStatus || '根任务被阻断') : '存在无法推进的阻断节点'
+        await this.propagateBlocked(false)
+        const reason = root.status === 'BLOCKED' ? (root.blockedReason || '根任务被阻断') : '存在无法推进的阻断节点'
         return { status: 'blocked', reason }
       }
       const kind = advanceableKind(next, this.byId)
@@ -1575,9 +1852,16 @@ export class EffTaskOrchestrator {
         else if (kind === 'integrate') await stepIntegrate(next, ctx)
       } catch (e) {
         // A step should not normally throw (pipeline catches runAgent errors), but if one
-        // does (e.g. persist failure), block just this node and keep the run alive.
-        next.execStatus = `已阻断: ${e instanceof Error ? e.message : String(e)}`
-        next.status = 'BLOCKED'
+        // does (e.g. persist failure), record the reason and keep the run alive.
+        next.blockedReason = e instanceof Error ? e.message : String(e)
+        // Do NOT clobber a parent whose subtree is still alive — BLOCKing it would strand
+        // children that are still advanceable. Keep WAITING_CHILDREN only while at least
+        // one child is non-terminal; otherwise this node would be re-picked forever.
+        const subtreeAlive =
+          next.status === 'WAITING_CHILDREN' &&
+          next.childIds.length > 0 &&
+          next.childIds.some(id => { const c = this.byId.get(id); return c !== undefined && !isTerminal(c.status) })
+        if (!subtreeAlive) next.status = 'BLOCKED'
         next.updatedAt = this.deps.now()
         await this.deps.persist(next)
         this.deps.onUpdate(this.nodes())
@@ -1586,19 +1870,34 @@ export class EffTaskOrchestrator {
   }
 
   // Fixpoint BLOCKED propagation: a non-terminal node with any BLOCKED child
-  // (WAITING_CHILDREN ancestor) or any BLOCKED dep (CREATED node that can never
-  // start) becomes BLOCKED. Repeat until stable so death propagates up the tree.
-  private async propagateBlocked(): Promise<void> {
+  // (WAITING_CHILDREN ancestor), any BLOCKED dep, or any DANGLING dep (CREATED node that
+  // can never start) becomes BLOCKED. Repeat until stable so death propagates up the tree.
+  // `aborted` additionally sweeps mid-flight nodes so the final tree shows no phantom
+  // "running" rows after an interrupt.
+  private async propagateBlocked(aborted: boolean): Promise<void> {
+    if (aborted) {
+      for (const n of this.byId.values()) {
+        if (n.status === 'PLANNING' || n.status === 'EXECUTING' || n.status === 'READY' || n.status === 'CREATED') {
+          n.status = 'BLOCKED'
+          if (!n.blockedReason) n.blockedReason = '已中断'
+          n.updatedAt = this.deps.now()
+          await this.deps.persist(n)
+        }
+      }
+    }
     let changed = true
     while (changed) {
       changed = false
       for (const n of this.byId.values()) {
         if (n.status === 'ACCEPTED' || n.status === 'BLOCKED') continue
         const childBlocked = n.childIds.some(id => this.byId.get(id)?.status === 'BLOCKED')
+        // A dep id MISSING from byId is a dangling edge that can never resolve — treat it
+        // like a blocked dep instead of leaving the node queued forever.
+        const depDangling = n.deps.some(id => !this.byId.has(id))
         const depBlocked = n.deps.some(id => this.byId.get(id)?.status === 'BLOCKED')
-        if (childBlocked || depBlocked) {
+        if (childBlocked || depBlocked || depDangling) {
           n.status = 'BLOCKED'
-          if (!n.execStatus) n.execStatus = childBlocked ? '已阻断: 子节点阻断' : '已阻断: 依赖阻断'
+          if (!n.blockedReason) n.blockedReason = childBlocked ? '子节点阻断' : depDangling ? '依赖节点缺失' : '依赖阻断'
           n.updatedAt = this.deps.now()
           await this.deps.persist(n)
           changed = true
@@ -1637,7 +1936,8 @@ Expected: 前 8 个测试文件全绿。
 - Produces:
   - `pickAgentDefinition(role, activeAgents, mainModelDefault): AgentDefinition` — role 为 null → 主模型默认 agent def;否则从 `activeAgents` 按 `agentType===role.roleName` 找,找不到回退主模型默认。
   - `collectText(messages): string` — 从 runAgent 产出的 assistant 文本拼接。
-  - `makeRunAgentFn(deps): RunAgentFn` — 用 `ToolUseContext` + `canUseTool` 包装 `runAgent()`,把每次调用的 assistant 文本收集返回;`promptMessages` 用 `createUserMessage`(`src/utils/messages.ts`)构造(无 `as unknown as` cast);`onChunk` 在收到文本增量时回调(供 P3 实时视图);`role.model` 传给 `runAgent` 的 `model`。**deps 含 `availableTools` 与 `readOnlyTools`(P1 传 `[]`):按阶段选工具——`execute` 用 `availableTools`,其余阶段(plan/review/accept/observer + 配置抽取)用 `readOnlyTools`,即只读跑。** deps 还有可选 `runAgentImpl`(默认真实 `runAgent`),供测试注入假异步生成器。
+  - `makeRunAgentFn(deps): RunAgentFn` — 用 `ToolUseContext` + `canUseTool` 包装 `runAgent()`,把每次调用的 assistant 文本收集返回;`promptMessages` 用 `createUserMessage`(`src/utils/messages.ts`)构造(无 `as unknown as` cast);`onChunk` 在收到文本增量时回调(供 P3 实时视图);`role.model` 传给 `runAgent` 的 `model`。**deps 含 `availableTools` 与 `readOnlyTools`:按阶段选工具——`execute` 用 `availableTools`(可写全池),其余阶段(plan/review/accept/observer)用 `readOnlyTools`,即"能读仓库、不能改仓库"。`readOnlyTools` 由调用方(Task 11)从 `context.options.tools` 里按名字筛出真只读工具(`Read`/`Glob`/`Grep`),不是空数组**——评审/验收若连仓库都读不到,裁决就只能凭空猜。**唯一传 `[]`(完全无工具)的是一次性的 `parseDirectives` 配置抽取调用**,它由 Task 11 另建一个 no-tools 的 `RunAgentFn` 承担。 deps 还有可选 `runAgentImpl`(默认真实 `runAgent`),供测试注入假异步生成器。
+  - `req.cwd` → `runAgent` 的 **`worktreePath`**:`runAgent()` 没有 `cwd` 形参,只有 `worktreePath`。P1 恒为 `undefined`(共享 cwd),但接缝必须映射到真实字段,否则 P2 接 worktree 时会发现这是个哑参。
 
 - [ ] **Step 1: 写失败测试(纯函数)**
 
@@ -1675,8 +1975,8 @@ describe('runAgentAdapter helpers', () => {
     const fn = makeRunAgentFn({
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
-      availableTools: [] as any,
-      readOnlyTools: [] as any,
+      availableTools: [] as any, // fixture only: the injected runAgentImpl ignores tools
+      readOnlyTools: [] as any, // (real wiring passes Read/Glob/Grep — see Task 11)
       activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fakeRun as any,
@@ -1695,8 +1995,8 @@ describe('runAgentAdapter helpers', () => {
     const fn = makeRunAgentFn({
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
-      availableTools: [] as any,
-      readOnlyTools: [] as any,
+      availableTools: [] as any, // fixture only: the injected runAgentImpl ignores tools
+      readOnlyTools: [] as any, // (real wiring passes Read/Glob/Grep — see Task 11)
       activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fakeRun as any,
@@ -1749,7 +2049,11 @@ export function makeRunAgentFn(deps: {
   toolUseContext: ToolUseContext
   canUseTool: CanUseToolFn
   availableTools: Tools
-  readOnlyTools: Tools // P1: pass [] — plan/review/accept/observer + config-extraction run with NO write tools
+  // REAL read-only tools (Read/Glob/Grep), filtered from the parent pool by the caller.
+  // NOT [] — plan/review/accept/observer must be able to READ the repo to judge anything;
+  // they just must not be able to WRITE it. (The one-shot config-extraction call is the
+  // only no-tools caller, and it gets its own RunAgentFn.)
+  readOnlyTools: Tools
   activeAgents: AgentDefinition[]
   mainModelDefault: AgentDefinition
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
@@ -1770,8 +2074,13 @@ export function makeRunAgentFn(deps: {
       canUseTool: deps.canUseTool,
       isAsync: false,
       querySource: 'agent:custom',
+      // NOT validated: an unrecognized alias simply falls through to runAgent's own model
+      // resolution (which applies its default). We do not pre-check the string here.
       model: (req.role?.model as ModelAlias | undefined) ?? undefined,
       availableTools: tools,
+      // runAgent has NO `cwd` param — the real field is `worktreePath`. P1 always passes
+      // undefined (shared cwd); mapping it keeps the seam honest for P2's worktrees.
+      worktreePath: req.cwd,
     })) {
       collected.push(message)
       if (req.onChunk && message.type === 'assistant') req.onChunk(collectText([message]))
@@ -1787,7 +2096,7 @@ export function makeRunAgentFn(deps: {
 - [ ] **Step 4: 运行确认通过 + 类型检查**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/runAgentAdapter.test.ts`
-Expected: PASS(4 条:`collectText`/`pickAgentDefinition` 两个纯函数 + `makeRunAgentFn` 两条契约测)。
+Expected: PASS(**5** 条:`collectText` 1 条 + `pickAgentDefinition` 2 条 + `makeRunAgentFn` 2 条契约测)。
 另:确保 `makeRunAgentFn` 通过 bun 运行(type-only import 被擦除;真实 `Message`/`AgentDefinition` 类型对齐见上)——源码内不得留 `as unknown as` / `as any` 掩盖(测试文件里给假 `deps`/messages 的 `as any` 属测试夹具,允许)。
 
 - [ ] **Step 5: 提交**
@@ -1803,26 +2112,31 @@ git commit -m "feat(efftask): runAgent adapter (RunAgentFn seam)"
 
 **Files:**
 - Create: `src/tools/efftask/startupConfirm.ts`(纯竞速/合成逻辑,单测)
-- Create: `src/tools/efftask/feishuStartupCard.ts`(飞书启动卡片 surface,集成代码,touches `FeishuClient`,无单测——沿用本仓集成代码惯例)
+- Create: `src/tools/efftask/feishuStartupCard.ts`(飞书启动卡片 surface,集成代码,**复用 `AppState` 里的共享 `FeishuClient` + callbacks,不自建连接**,无单测——沿用本仓集成代码惯例)
 - Create: `src/commands/efftask/ConfirmStartup.tsx`(Ink UI,手动验证)
 - Test: `src/tools/efftask/startupConfirm.test.ts`
 
 **Interfaces:**
-- Consumes: `EffTaskConfig`(Task 1);`FeishuClient`/`getFeishuConfig`(`src/services/feishu/*`)。
+- Consumes: `EffTaskConfig`, `PhaseName`, `PHASE_NAMES`(Task 1);`FeishuClient`(`src/services/feishu/FeishuClient.ts`,**仅取类型 + `sendCard`/`updateCard`**);`FeishuPermissionCallbacks`(`src/services/feishu/feishuPermissions.ts`);`logError`(`src/utils/log.ts`)。(`requestId` 由调用方 Task 11 用 `randomUUID()` 铸造后传进来。)
 - Produces:
   - `interface StartupDecision { parallelism: number; approved: boolean }`
   - `createResolveOnce<T>(): { claim(): boolean; resolve(v: T): void; promise: Promise<T> }` — 单次胜出竞速原语(镜像 interactiveHandler 的 racer 语义)。
-  - `raceConfirm(surfaces: Array<(claimAndResolve: (d: StartupDecision) => void) => (() => void)>): Promise<StartupDecision>` — 启动各 surface(终端/飞书),首个 `claimAndResolve` 胜出,其余被要求 teardown(返回的清理函数被调用)。**在 Task 11 以 `[terminalSurface, feishuSurface?]` 接线**(有飞书配置才把飞书 surface 放进竞速)。
-  - (in `feishuStartupCard.ts`) `buildStartupCard(config): object` — 最小可交互卡片(标题 + 确认/取消按钮,按钮 `value.action` 为 `'confirm'`/`'cancel'`)。
-  - (in `feishuStartupCard.ts`) `sendFeishuStartupCard(deps: { client: FeishuClient; config: EffTaskConfig; cardContent: object }, claimAndResolve: (d: StartupDecision) => void): () => void` — (a) 经 `FeishuClient.sendCard` 发卡;(b) `client.onCardAction(e => claimAndResolve(decisionFromEvent(e)))`;(c) 返回 teardown,best-effort 把卡片 `updateCard` 成"已在终端处理"的已解决态。**创建前由调用方用 `getFeishuConfig(settings)` 门控:返回 null 则根本不构造该 surface、不加入竞速。**
-- P1 说明:角色名册在 P1 恒为"全主模型"(无 role 绑定),确认卡片主要呈现 **并行数 + 根方案摘要**,用户可 approve/取消(P1 不做行内编辑并行数的复杂交互,提供 approve=用建议值 / cancel=退出;并行数编辑放 P2)。飞书卡片复用 `FeishuClient.sendCard`,动作回传经 `onCardAction` 触发 `claimAndResolve`。**飞书确认在 P1 即交付(不再是"若时间不足可 P2 补")。**
+  - `rosterLines(config): string[]` — 把 `config.phaseRoles` 渲染成"阶段: 角色名"逐行文本(该阶段无绑定则为 `主模型`);终端卡片与飞书卡片共用同一份,保证两端名册一致(**spec gate-1 角色名册**)。
+  - `raceConfirm(surfaces: Array<(claimAndResolve: (d: StartupDecision) => void) => (() => void)>): Promise<StartupDecision>` — 启动各 surface(终端/飞书),首个 `claimAndResolve` 胜出,其余被要求 teardown(返回的清理函数被调用)。**每个 `surface(...)` 调用单独包 try/catch:某个 surface 构造时抛错不得掀翻整场竞速,成功的那些照常收集 teardown。** **在 Task 11 以 `[terminalSurface, feishuSurface?]` 接线**。
+  - (in `feishuStartupCard.ts`) `buildStartupCard(config, requestId): object` — 可交互卡片(目标 + 并行数 + 安全阀 + **真实角色名册**),按钮**镜像 `src/services/feishu/cards.ts` 的形状**:`behaviors: [{ type:'callback', value: { requestId, behavior:'allow'|'deny' } }]`——这正是 `useFeishuBridge` 里 `wireCardAction` 认识并路由的 payload。
+  - (in `feishuStartupCard.ts`) `sendFeishuStartupCard(deps: { client: FeishuClient; callbacks: FeishuPermissionCallbacks; requestId: string; cardContent: object; parallelism: number }, claimAndResolve): () => void` — (a) `callbacks.onResponse(requestId, r => claimAndResolve({ parallelism, approved: r.behavior === 'allow' }))` 注册响应;(b) 经**共享** `client.sendCard` 发卡;(c) 返回 teardown:`unsub()` + best-effort `updateCard` 成已解决态。
+- **架构红线(必须遵守):** `useFeishuBridge` 已经拥有**唯一一个**常驻 `FeishuClient` 和**唯一一个** `onCardAction` 处理槽。因此 `feishuStartupCard.ts` **绝不允许** `new FeishuClient(...)`、`client.connect()`、`client.close()`、`client.onCardAction(...)`——第二条连接会让事件投递错乱,而抢占 `onCardAction` 会直接踩掉权限确认桥。**多路复用发生在 callbacks 注册表这一层**:`wireCardAction` 按 `value.requestId` 把事件分发给 `callbacks.resolve(requestId, ...)`,我们只需用一个新的 `requestId`(`randomUUID()`)去 `onResponse` 上挂一个处理器即可。
+- **门控(Task 11):** 用 `AppState` 里的 `feishuClient` **和** `feishuPermissionCallbacks` 双双存在来门控(不是 `getFeishuConfig`)——两者由 `useFeishuBridge` 一并写入;缺任一就干脆不把飞书 surface 加进竞速。
+- P1 说明:确认卡片呈现 **目标回显 + 并行数 + 安全阀 + 真实角色名册**,用户可 approve/取消(P1 不做行内编辑并行数的复杂交互,提供 approve=用建议值 / cancel=退出;并行数编辑放 P2)。**飞书确认在 P1 即交付(不再是"若时间不足可 P2 补")。**
 
 - [ ] **Step 1: 写失败测试**
 
 ```ts
 // src/tools/efftask/startupConfirm.test.ts
 import { describe, expect, it } from 'bun:test'
-import { createResolveOnce, raceConfirm } from './startupConfirm.js'
+import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
+import type { EffTaskConfig } from './types.js'
+import { createResolveOnce, raceConfirm, rosterLines } from './startupConfirm.js'
 
 describe('startupConfirm racer', () => {
   it('createResolveOnce: only first claim wins', async () => {
@@ -1841,6 +2155,25 @@ describe('startupConfirm racer', () => {
     expect(decision.approved).toBe(true)
     expect(torn).toContain('B') // loser torn down
   })
+  it('raceConfirm: a THROWING surface does not kill the race', async () => {
+    const torn: string[] = []
+    const decision = await raceConfirm([
+      () => { throw new Error('飞书 surface 构造失败') },
+      (car) => { setTimeout(() => car({ parallelism: 3, approved: true }), 1); return () => torn.push('B') },
+    ])
+    expect(decision.parallelism).toBe(3) // the surviving surface still wins
+    expect(torn).toEqual(['B']) // only the surfaces that constructed successfully are torn down
+  })
+  it('rosterLines renders the REAL roster, 主模型 for phases with no bindings', () => {
+    const cfg: EffTaskConfig = {
+      goalPrompt: 'g', parallelism: 5, caps: { ...DEFAULT_CAPS },
+      phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: 'arch' }, { roleName: 'sec' }] },
+    }
+    const lines = rosterLines(cfg)
+    expect(lines).toHaveLength(5) // one line per PHASE_NAMES entry
+    expect(lines).toContain('评审: arch、sec')
+    expect(lines).toContain('方案: 主模型')
+  })
 })
 ```
 
@@ -1853,7 +2186,24 @@ Expected: FAIL。
 
 ```ts
 // src/tools/efftask/startupConfirm.ts
+import { PHASE_NAMES } from './types.js'
+import type { EffTaskConfig, PhaseName } from './types.js'
+
 export interface StartupDecision { parallelism: number; approved: boolean }
+
+const PHASE_LABEL: Record<PhaseName, string> = {
+  plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
+}
+
+// The ACTUAL roster (spec gate-1 角色名册): each phase → its bound role names, or 主模型
+// when the phase has no bindings. Shared by the terminal card AND the Feishu card so the
+// two surfaces can never disagree about who is on the panel.
+export function rosterLines(config: EffTaskConfig): string[] {
+  return PHASE_NAMES.map(p => {
+    const names = config.phaseRoles[p].map(r => r.roleName)
+    return `${PHASE_LABEL[p]}: ${names.length > 0 ? names.join('、') : '主模型'}`
+  })
+}
 
 export function createResolveOnce<T>(): { claim(): boolean; resolve(v: T): void; promise: Promise<T> } {
   let claimed = false
@@ -1872,7 +2222,11 @@ export async function raceConfirm(
   const once = createResolveOnce<StartupDecision>()
   const teardowns: Array<() => void> = []
   const claimAndResolve = (d: StartupDecision) => { if (once.claim()) once.resolve(d) }
-  for (const surface of surfaces) teardowns.push(surface(claimAndResolve))
+  for (const surface of surfaces) {
+    // A surface that throws while constructing (e.g. Feishu send blows up) must NOT kill
+    // the race — the other surfaces can still win. Only successful ones get a teardown.
+    try { teardowns.push(surface(claimAndResolve)) } catch { /* skip this surface */ }
+  }
   const decision = await once.promise
   for (const t of teardowns) { try { t() } catch { /* ignore */ } }
   return decision
@@ -1882,7 +2236,7 @@ export async function raceConfirm(
 - [ ] **Step 4: 运行确认通过**
 
 Run: `export PATH="$HOME/.bun/bin:$PATH" && bun test src/tools/efftask/startupConfirm.test.ts`
-Expected: PASS。
+Expected: PASS(4 条:`createResolveOnce` / 竞速胜出+teardown / **抛错 surface 不掀翻竞速** / **`rosterLines` 渲染真实名册**)。
 
 - [ ] **Step 5: 实现 Ink 确认组件(手动验证)**
 
@@ -1891,7 +2245,7 @@ Expected: PASS。
 import * as React from 'react'
 import { Box, Text, useInput } from 'ink'
 import type { EffTaskConfig } from '../../tools/efftask/types.js'
-import type { StartupDecision } from '../../tools/efftask/startupConfirm.js'
+import { rosterLines, type StartupDecision } from '../../tools/efftask/startupConfirm.js'
 
 export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: StartupDecision) => void }): React.ReactElement {
   useInput((input, key) => {
@@ -1903,7 +2257,9 @@ export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: S
       <Text bold>高效任务模式 · 启动确认</Text>
       <Text>目标: {props.config.goalPrompt.split('\n')[0].slice(0, 80)}</Text>
       <Text>并行数: {props.config.parallelism}（P1 串行执行,此值 P2 生效）</Text>
-      <Text>角色: 全部使用主模型（P1）</Text>
+      {/* Real roster from config.phaseRoles — settings roles DO take effect in P1. */}
+      <Text bold>角色名册:</Text>
+      {rosterLines(props.config).map(line => <Text key={line}>  {line}</Text>)}
       <Text>安全阀: 深度{props.config.caps.maxDepth} / 节点{props.config.caps.maxNodes} / 迭代{props.config.caps.maxIterations}</Text>
       <Text dimColor>回车/y 开始 · Esc/n 取消</Text>
     </Box>
@@ -1915,25 +2271,45 @@ export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: S
 
 ```ts
 // src/tools/efftask/feishuStartupCard.ts
-// Integration surface — touches FeishuClient, so no unit test (repo convention).
-// The pure racer/合成 primitives stay in startupConfirm.ts.
-import type { CardActionEvent, FeishuClient } from '../../services/feishu/FeishuClient.js'
+// Integration surface — rides the SHARED always-on FeishuClient + permission callbacks
+// owned by useFeishuBridge, so no unit test (repo convention).
+// The pure racer / roster primitives stay in startupConfirm.ts.
+//
+// HARD RULE: never `new FeishuClient`, never connect()/close(), never onCardAction().
+// useFeishuBridge owns the single connection AND the single onCardAction handler slot
+// (which routes permission prompts). A second connection mis-routes events; re-registering
+// onCardAction would silently clobber the permission bridge. Multiplexing already exists
+// one layer up: wireCardAction dispatches by value.requestId into
+// FeishuPermissionCallbacks.resolve(...), so we just claim our own requestId.
+import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
+import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig } from './types.js'
-import type { StartupDecision } from './startupConfirm.js'
+import { rosterLines, type StartupDecision } from './startupConfirm.js'
+import { logError } from '../../utils/log.js'
 
-// Minimal interactive card: title + confirm/cancel buttons carrying value.action.
-export function buildStartupCard(config: EffTaskConfig): object {
+// Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
+// { requestId, behavior }, which is exactly what wireCardAction reads.
+function button(content: string, type: string, value: Record<string, unknown>) {
+  return { tag: 'button', text: { tag: 'plain_text', content }, type, behaviors: [{ type: 'callback', value }] }
+}
+
+export function buildStartupCard(config: EffTaskConfig, requestId: string): object {
   const goal = config.goalPrompt.split('\n')[0].slice(0, 80)
+  const body =
+    `**目标**: ${goal}\n` +
+    `**并行数**: ${config.parallelism}（P1 串行,值 P2 生效）\n` +
+    `**安全阀**: 深度${config.caps.maxDepth} / 节点${config.caps.maxNodes} / 迭代${config.caps.maxIterations}\n` +
+    `**角色名册**:\n${rosterLines(config).map(l => `- ${l}`).join('\n')}`
   return {
     config: { wide_screen_mode: true },
     header: { title: { tag: 'plain_text', content: '高效任务模式 · 启动确认' } },
     elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**目标**: ${goal}\n**并行数**: ${config.parallelism}（P1 串行,值 P2 生效）\n**角色**: 全部主模型（P1）` } },
+      { tag: 'div', text: { tag: 'lark_md', content: body } },
       {
         tag: 'action',
         actions: [
-          { tag: 'button', text: { tag: 'plain_text', content: '开始' }, type: 'primary', value: { action: 'confirm' } },
-          { tag: 'button', text: { tag: 'plain_text', content: '取消' }, type: 'danger', value: { action: 'cancel' } },
+          button('开始', 'primary', { requestId, behavior: 'allow' }),
+          button('取消', 'danger', { requestId, behavior: 'deny' }),
         ],
       },
     ],
@@ -1942,28 +2318,36 @@ export function buildStartupCard(config: EffTaskConfig): object {
 
 function resolvedCard(): object {
   return {
+    config: { wide_screen_mode: true },
     header: { title: { tag: 'plain_text', content: '高效任务模式 · 启动确认' } },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content: '已在终端处理。' } }],
   }
 }
 
-function decisionFromEvent(e: CardActionEvent, parallelism: number): StartupDecision {
-  const value = (e.action?.value ?? {}) as { action?: string; approved?: boolean }
-  const approved = value.action === 'confirm' || value.approved === true
-  return { parallelism, approved }
-}
-
 export function sendFeishuStartupCard(
-  deps: { client: FeishuClient; config: EffTaskConfig; cardContent: object },
+  deps: {
+    client: FeishuClient // the SHARED, already-connected client from AppState
+    callbacks: FeishuPermissionCallbacks // the SHARED registry from AppState
+    requestId: string // randomUUID() minted by the caller; also embedded in cardContent
+    cardContent: object
+    parallelism: number // echoed back in the decision (the card has no inline editor in P1)
+  },
   claimAndResolve: (d: StartupDecision) => void,
 ): () => void {
   let messageId: string | undefined
-  deps.client.onCardAction(e => claimAndResolve(decisionFromEvent(e, deps.config.parallelism)))
-  // fire-and-forget send; capture messageId for the teardown card update
-  void deps.client.sendCard(deps.cardContent).then(id => { messageId = id }).catch(() => {})
-  // teardown (loser cleanup): best-effort flip the card to a resolved state
+  // Register on the shared registry — NOT client.onCardAction (single slot, already taken).
+  const unsub = deps.callbacks.onResponse(deps.requestId, r =>
+    claimAndResolve({ parallelism: deps.parallelism, approved: r.behavior === 'allow' }),
+  )
+  // fire-and-forget send on the shared client; capture messageId for the teardown update
+  void deps.client.sendCard(deps.cardContent).then(id => { messageId = id }).catch(logError)
+  // teardown (loser cleanup): unsubscribe, then best-effort flip the card to a resolved state.
   return () => {
-    if (messageId) void deps.client.updateCard(messageId, resolvedCard())
+    unsub()
+    // If the terminal wins BEFORE sendCard resolves, messageId is still undefined and the
+    // card stays interactive. Harmless: unsub() already removed the handler, and any late
+    // click is swallowed by once.claim() in raceConfirm.
+    if (messageId) void deps.client.updateCard(messageId, resolvedCard()).catch(logError)
   }
 }
 ```
@@ -1987,8 +2371,16 @@ git commit -m "feat(efftask): startup confirmation racer (terminal + feishu surf
 - 验证:手动跑 `/et`(无单测——Ink 命令沿用本仓惯例)。
 
 **Interfaces:**
-- Consumes: `EffTaskOrchestrator`/`OrchestratorDeps`(Task 8);`parseDirectives`(Task 4);`makeRunAgentFn`(Task 9);`ConfirmStartup`/`raceConfirm`(Task 10 纯逻辑)/`buildStartupCard`/`sendFeishuStartupCard`(Task 10 飞书 surface);持久化(Task 5);`getFeishuConfig`/`FeishuClient`(`src/services/feishu/*`);`hasPermissionsToUseTool`(`src/utils/permissions/permissions.js`);`AgentDefinition`(`src/tools/AgentTool/loadAgentsDir.js`);命令类型 `LocalJSXCommandCall`(`src/types/command.ts`);`node:fs/promises` + `node:path`(fsAdapter 直连,**不再用 `getFsImplementation()`**);`useAppStateStore`(读 settings 做飞书门控)。
-- Produces: 一个可 `/et <prompt>` 触发的 local-jsx 命令;`EffTaskRunner` 为 `confirm | running | done` 三态;`done` 态渲染只读树 + 完成/阻断摘要(含 reason)+ `useInput` 退出键。
+- Consumes: `EffTaskOrchestrator`/`OrchestratorDeps`(Task 8);`parseDirectives`(Task 4);`makeRunAgentFn`(Task 9);`ConfirmStartup`/`raceConfirm`/`rosterLines`(Task 10 纯逻辑)/`buildStartupCard`/`sendFeishuStartupCard`(Task 10 飞书 surface);持久化 `allocateRunId`/`writeNode`/`writeRunManifest`/`FsLike`(Task 5);`hasPermissionsToUseTool`(`src/utils/permissions/permissions.js`);`AgentDefinition`(`src/tools/AgentTool/loadAgentsDir.js`);命令类型 `LocalJSXCommandCall`(`src/types/command.ts`);`node:fs/promises` + `node:path`(fsAdapter 直连,**不再用 `getFsImplementation()`**);`randomUUID`(`node:crypto`);`logError`(`src/utils/log.js`);`useAppStateStore`(读 `feishuClient` / `feishuPermissionCallbacks` 做飞书门控)。**不再 import `getFeishuConfig` / `FeishuClient`。**
+- Produces: 一个可 `/et <prompt>` 触发的 local-jsx 命令;`READ_ONLY_TOOL_NAMES`;`EffTaskRunner` 为 `parsing | confirm | running | done` 四态;`running` 态渲染实时树 + `Esc 中断`;`done` 态渲染只读树 + 完成/阻断摘要(含 reason)+ `useInput` 退出键。
+- 关键约束:
+  - `call()` **立即返回 JSX**;`parseDirectives`(一次模型调用)搬进组件的 `parsing` 态(渲染 `正在解析需求…`),不得在 `call()` 里 await——否则终端在花掉 token 期间毫无界面。`args` 为空则直接渲染用法提示 + `onDone`。
+  - **工具池**:`readOnlyTools = context.options.tools.filter(t => READ_ONLY_TOOL_NAMES.has(t.name))`,`READ_ONLY_TOOL_NAMES = new Set(['Read','Glob','Grep'])`;只有一次性的配置抽取用**另建的 no-tools `RunAgentFn`**(`availableTools: []` + `readOnlyTools: []`)。
+  - **飞书门控**:`feishuClient && feishuPermissionCallbacks` 双双存在才把飞书 surface 加入竞速(不是 `getFeishuConfig`)。
+  - **中断**:命令自己持有一个 `AbortController`(并链到 `context.abortController.signal`),`running` 视图的 Esc/q 调它;编排器的 `{status:'blocked', reason:'已中断'}` 随后流到 `done` 视图。
+  - **`run()` 绝不能把 UI 卡死**:`runOrchestrator` 全身包 `try/catch/finally`,`finally` 里必定 `setPhase('done')`。
+  - **`run.md` 写入串行化**:所有 `writeRunManifest` 走单条 promise 队列;收尾那次带上 `{status, reason}`。
+  - **`decision.parallelism` 必须落到 config**(P1 串行驱动里是惰性的,但不许被悄悄丢掉)。
 
 - [ ] **Step 1: 命令元数据**
 
@@ -2041,7 +2433,13 @@ function elapsed(node: TaskNode, nowMs: number): string {
 }
 
 export function TaskTreePanel(props: { nodes: TaskNode[]; runId: string }): React.ReactElement {
-  const nowMs = Date.now()
+  // Tick once a second so elapsed times keep moving even when no node transitions —
+  // otherwise the panel only repaints on onUpdate and looks frozen during a long phase.
+  const [nowMs, setNowMs] = React.useState(() => Date.now())
+  React.useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [])
   const byDepth = [...props.nodes].sort((a, b) => a.id.localeCompare(b.id))
   const counts = { done: 0, running: 0, queued: 0, failed: 0 as number }
   for (const n of props.nodes) counts[uiStatus(n.status)]++
@@ -2083,54 +2481,81 @@ import { ConfirmStartup } from './ConfirmStartup.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import { hasPermissionsToUseTool } from '../../utils/permissions/permissions.js'
-import { getFeishuConfig } from '../../services/feishu/config.js'
-import { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import { useAppStateStore } from '../../state/AppState.js'
+import { randomUUID } from 'node:crypto'
+import { logError } from '../../utils/log.js'
 
 type Outcome = { status: 'completed' | 'blocked'; reason?: string }
+type Phase = 'parsing' | 'confirm' | 'running' | 'done'
+
+// Read-only tool pool for plan/review/accept/observer: they must be able to READ the repo
+// to judge anything, they just must not be able to WRITE it.
+const READ_ONLY_TOOL_NAMES = new Set(['Read', 'Glob', 'Grep'])
 
 // 集成接线,无单测;手动跑 /et 验证。
-// 构造顺序:fs → runId → runAgent(RunAgentFn) → 用 runAgent 解析配置 → 渲染。
+// 构造顺序:fs → runId → runAgent 接缝 → 立刻返回 JSX(解析在组件内 parsing 态跑)。
 export const call: LocalJSXCommandCall = async (onDone, context, args) => {
+  // Empty prompt: there is nothing to plan. Show a hint instead of planning nothing.
+  if (!args.trim()) {
+    return <HintAndExit text="用法: /et <任务提示词>" onExit={() => onDone('已取消', { display: 'system' })} />
+  }
   const cwd = process.cwd()
   const fs = fsAdapter()
   const effRoot = `${cwd}/.claude/efftask`
+  // Local fs scan only — no model call, no tokens, sub-millisecond. Everything that COSTS
+  // something (parseDirectives) happens inside the component.
   const runId = await allocateRunId(fs, effRoot)
   const runDir = `${effRoot}/${runId}`
-  const signal = context.abortController.signal
+
+  // The command owns its own AbortController so the running view's Esc can stop the run;
+  // it chains off the parent signal so a REPL-level abort still tears everything down.
+  const runController = new AbortController()
+  if (context.abortController.signal.aborted) runController.abort()
+  else context.abortController.signal.addEventListener('abort', () => runController.abort(), { once: true })
+  const signal = runController.signal
 
   const activeAgents: AgentDefinition[] = context.options.agentDefinitions?.activeAgents ?? []
   const allAgents: AgentDefinition[] = context.options.agentDefinitions?.allAgents ?? activeAgents
   // canUseTool falls back to hasPermissionsToUseTool (same fallback processSlashCommand's
   // local-jsx branch uses for executeForkedSlashCommand).
   const canUseTool = context.canUseTool ?? hasPermissionsToUseTool
+  const mainModelDefault = pickMainAgentDefinition(allAgents)
+  // REAL read-only pool (NOT []): a reviewer that cannot read the repo can only guess.
+  const readOnlyTools = context.options.tools.filter(t => READ_ONLY_TOOL_NAMES.has(t.name))
   const runAgent: RunAgentFn = makeRunAgentFn({
-    toolUseContext: context,
-    canUseTool,
-    availableTools: context.options.tools,
-    readOnlyTools: [], // P1: non-execute phases (plan/review/accept/observer + config extraction) run read-only
-    activeAgents,
-    mainModelDefault: pickMainAgentDefinition(allAgents),
+    toolUseContext: context, canUseTool,
+    availableTools: context.options.tools, // execute phase only
+    readOnlyTools, // plan / review / accept / observer
+    activeAgents, mainModelDefault,
+  })
+  // Separate NO-TOOLS seam for the one-shot config extraction: it only rewrites text into
+  // JSON, so it needs neither read nor write tools. This is the ONLY place that passes [].
+  const extractAgent: RunAgentFn = makeRunAgentFn({
+    toolUseContext: context, canUseTool,
+    availableTools: [], readOnlyTools: [],
+    activeAgents, mainModelDefault,
   })
 
-  // 用 runAgent 抽取配置;parseDirectives 内部已对 modelJson 抛错/非法做默认回退。
   const knownRoles = activeAgents.map(a => a.agentType)
-  const config: EffTaskConfig = await parseDirectives(args, {
-    knownRoles,
-    modelJson: prompt => runAgent({ phase: 'plan', node: stubNode(), role: null, system: '', prompt, signal }),
-  })
-
   return (
     <EffTaskRunner
-      config={config}
+      args={args}
+      knownRoles={knownRoles}
+      extractJson={prompt => extractAgent({ phase: 'plan', node: stubNode(), role: null, system: '', prompt, signal })}
       runId={runId}
       runDir={runDir}
       fs={fs}
       runAgent={runAgent}
       signal={signal}
+      abort={() => runController.abort()}
       onExit={() => onDone('高效任务结束', { display: 'system' })}
     />
   )
+}
+
+function HintAndExit(props: { text: string; onExit: () => void }): React.ReactElement {
+  React.useEffect(() => { props.onExit() }, [])
+  return <Text dimColor>{props.text}</Text>
 }
 
 // 一次性配置抽取用的占位节点(不入树,只是给 RunAgentFn 一个合法 node 形参)。
@@ -2139,10 +2564,16 @@ function stubNode(): TaskNode {
 }
 
 // Reuse a REAL built-in AgentDefinition as the P1 main-model default so system prompt /
-// source / baseDir are all valid (NO `as unknown as` cast). Prefer general-purpose, else
-// the first agent in the roster; the minimal fallback only fires if the roster is empty.
+// source / baseDir are all valid (NO `as unknown as` cast).
+// WHY the fallback is picky instead of `allAgents[0]`: the roster also contains agents that
+// came from settings roles, and one of those can be a cli / other-provider agent (e.g. one
+// carrying `execMode`). Grabbing an arbitrary entry would silently route every un-roled
+// phase — plan, review, accept — through someone else's provider. So: prefer
+// general-purpose; else the first BUILT-IN, non-exec-mode agent; else a minimal literal.
 function pickMainAgentDefinition(allAgents: AgentDefinition[]): AgentDefinition {
-  const preferred = allAgents.find(a => a.agentType === 'general-purpose') ?? allAgents[0]
+  const preferred =
+    allAgents.find(a => a.agentType === 'general-purpose') ??
+    allAgents.find(a => a.source === 'built-in' && !('execMode' in a))
   if (preferred) return preferred
   const fallback: AgentDefinition = {
     agentType: 'general-purpose',
@@ -2166,48 +2597,93 @@ function fsAdapter(): FsLike {
 }
 
 function EffTaskRunner(props: {
-  config: EffTaskConfig; runId: string; runDir: string; fs: FsLike; runAgent: RunAgentFn; signal: AbortSignal; onExit: () => void
+  args: string
+  knownRoles: string[]
+  extractJson: (prompt: string) => Promise<string>
+  runId: string; runDir: string; fs: FsLike; runAgent: RunAgentFn
+  signal: AbortSignal; abort: () => void; onExit: () => void
 }): React.ReactElement {
-  const [phase, setPhase] = React.useState<'confirm' | 'running' | 'done'>('confirm')
+  const [phase, setPhase] = React.useState<Phase>('parsing')
+  const [config, setConfig] = React.useState<EffTaskConfig | null>(null)
   const [nodes, setNodes] = React.useState<TaskNode[]>([])
   const [outcome, setOutcome] = React.useState<Outcome | null>(null)
   const store = useAppStateStore()
   // Terminal surface stashes its claimAndResolve here so the rendered ConfirmStartup can call it.
   const terminalResolve = React.useRef<(d: StartupDecision) => void>(() => {})
 
+  // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
+  // call(), which would freeze the terminal with no UI while spending tokens.
   React.useEffect(() => {
+    let cancelled = false
+    void parseDirectives(props.args, { knownRoles: props.knownRoles, modelJson: props.extractJson })
+      .catch(() => parseDirectives(props.args, { knownRoles: props.knownRoles })) // belt & braces: fall back to defaults
+      .then(cfg => { if (!cancelled) { setConfig(cfg); setPhase('confirm') } })
+    return () => { cancelled = true }
+  }, [])
+
+  React.useEffect(() => {
+    if (phase !== 'confirm' || !config) return
     let cancelled = false
     const surfaces: Array<(claimAndResolve: (d: StartupDecision) => void) => () => void> = [
       car => { terminalResolve.current = car; return () => {} }, // terminalSurface (ConfirmStartup render)
     ]
-    // feishuSurface only when getFeishuConfig(settings) is non-null.
-    const feishuCfg = getFeishuConfig(store.getState().settings)
-    if (feishuCfg) {
-      const cardContent = buildStartupCard(props.config)
-      surfaces.push(car => {
-        const client = new FeishuClient(feishuCfg) // dedicated short-lived client for the startup card
-        void client.connect()
-        const teardown = sendFeishuStartupCard({ client, config: props.config, cardContent }, car)
-        return () => { teardown(); void client.close() }
-      })
+    // Gate on the SHARED client + callbacks written by useFeishuBridge — NOT on
+    // getFeishuConfig. We never construct/connect/close a client of our own; the startup
+    // card multiplexes onto the existing bridge via its own requestId.
+    const { feishuClient, feishuPermissionCallbacks } = store.getState()
+    if (feishuClient && feishuPermissionCallbacks) {
+      const requestId = randomUUID()
+      const cardContent = buildStartupCard(config, requestId)
+      surfaces.push(car =>
+        sendFeishuStartupCard(
+          { client: feishuClient, callbacks: feishuPermissionCallbacks, requestId, cardContent, parallelism: config.parallelism },
+          car,
+        ),
+      )
     }
     // Race [terminalSurface, feishuSurface?]: first responder wins, the other is torn down.
-    void raceConfirm(surfaces).then(decision => {
-      if (cancelled) return
-      if (!decision.approved) { props.onExit(); return }
-      setPhase('running')
-      void runOrchestrator(props, setNodes, setOutcome, () => setPhase('done'))
-    })
+    void raceConfirm(surfaces)
+      .then(decision => {
+        if (cancelled) return
+        if (!decision.approved) { props.onExit(); return }
+        // Apply the confirmed parallelism. It is inert in P1's serial driver, but it must
+        // NOT be silently discarded — P2's pool reads it straight off the config.
+        const effectiveConfig: EffTaskConfig = { ...config, parallelism: decision.parallelism }
+        setPhase('running')
+        void runOrchestrator({ ...props, config: effectiveConfig }, setNodes, setOutcome, setPhase)
+      })
+      .catch(e => {
+        // A broken race must land on the done view, not hang on 'confirm'.
+        if (cancelled) return
+        setOutcome({ status: 'blocked', reason: e instanceof Error ? e.message : String(e) })
+        setPhase('done')
+      })
     return () => { cancelled = true }
-  }, [])
+  }, [phase, config])
 
+  if (phase === 'parsing' || !config) {
+    return <Text dimColor>正在解析需求…</Text>
+  }
   if (phase === 'confirm') {
-    return <ConfirmStartup config={props.config} onDecision={d => terminalResolve.current(d)} />
+    return <ConfirmStartup config={config} onDecision={d => terminalResolve.current(d)} />
   }
   if (phase === 'running') {
-    return <TaskTreePanel nodes={nodes} runId={props.runId} />
+    return <RunningView nodes={nodes} runId={props.runId} onAbort={props.abort} />
   }
   return <DoneView nodes={nodes} runId={props.runId} outcome={outcome} onExit={props.onExit} />
+}
+
+// 'running' phase: live tree + an interrupt affordance. Esc/q aborts the controller the
+// command owns; the orchestrator then returns {status:'blocked', reason:'已中断'} and the
+// finally-block flips us to 'done'.
+function RunningView(props: { nodes: TaskNode[]; runId: string; onAbort: () => void }): React.ReactElement {
+  useInput((input, key) => { if (key.escape || input.toLowerCase() === 'q') props.onAbort() })
+  return (
+    <Box flexDirection="column">
+      <TaskTreePanel nodes={props.nodes} runId={props.runId} />
+      <Text dimColor>Esc 中断</Text>
+    </Box>
+  )
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
@@ -2230,24 +2706,42 @@ async function runOrchestrator(
   props: { config: EffTaskConfig; runDir: string; fs: FsLike; runAgent: RunAgentFn; signal: AbortSignal },
   setNodes: (n: TaskNode[]) => void,
   setOutcome: (o: Outcome) => void,
-  onFinished: () => void,
+  setPhase: (p: Phase) => void,
 ): Promise<void> {
-  const persist = (n: TaskNode) => writeNode(props.fs, props.runDir, n)
-  const now = () => new Date().toISOString()
-  const orch = new EffTaskOrchestrator(
-    props.config,
-    { runAgent: props.runAgent, persist, now, onUpdate: nodes => { setNodes([...nodes]); void writeRunManifest(props.fs, props.runDir, props.config, nodes) } },
-    props.signal,
-  )
-  const result = await orch.run() // { status, reason }
-  await writeRunManifest(props.fs, props.runDir, props.config, orch.nodes())
-  setNodes([...orch.nodes()])
-  setOutcome(result)
-  onFinished() // → EffTaskRunner switches to 'done', rendering the summary + exit affordance
+  // Serialize run.md writes. onUpdate fires on EVERY state transition; firing writeFile
+  // unawaited each time lets concurrent writes to the same path interleave into a corrupt
+  // manifest. One promise queue ⇒ strictly ordered, last-write-wins.
+  let manifestQueue: Promise<void> = Promise.resolve()
+  const queueManifest = (nodes: TaskNode[], result?: Outcome): Promise<void> => {
+    manifestQueue = manifestQueue
+      .then(() => writeRunManifest(props.fs, props.runDir, props.config, nodes, result))
+      .catch(logError)
+    return manifestQueue
+  }
+  try {
+    const persist = (n: TaskNode) => writeNode(props.fs, props.runDir, n)
+    const now = () => new Date().toISOString()
+    const orch = new EffTaskOrchestrator(
+      props.config,
+      { runAgent: props.runAgent, persist, now, onUpdate: nodes => { setNodes([...nodes]); void queueManifest(nodes) } },
+      props.signal,
+    )
+    setNodes(orch.nodes()) // seed with the root so the tree isn't blank on first paint
+    const result = await orch.run() // { status, reason }
+    setNodes([...orch.nodes()])
+    setOutcome(result)
+    await queueManifest(orch.nodes(), result) // final manifest records {status, reason}
+  } catch (e) {
+    // run() is not supposed to reject (the orchestrator catches per-step), but if it ever
+    // does, the UI must NOT wedge on 'running' with no way out.
+    setOutcome({ status: 'blocked', reason: e instanceof Error ? e.message : String(e) })
+  } finally {
+    setPhase('done') // the done view is ALWAYS reached
+  }
 }
 ```
 
-> **Task 11 是集成任务(无单测,手动跑 `/et` 验证)。** 上面的代码已消除全部 `as unknown as` 逃逸口:(1) `pickMainAgentDefinition(allAgents)` 复用真实内置 `AgentDefinition`(优先 `general-purpose`,否则 roster 首个;仅在 roster 为空时用最小内置 fallback),system prompt / source / baseDir 都合法;(2) `fsAdapter()` 直接用 `node:fs/promises`(`readFile/writeFile/mkdir/readdir/access` + `node:path` 的 `dirname`),不再经 `getFsImplementation()`;(3) `canUseTool = context.canUseTool ?? hasPermissionsToUseTool`(与 `processSlashCommand.tsx` 的 local-jsx 分支同一 fallback,导入自 `../../utils/permissions/permissions.js`)。`context` 的字段(`context.canUseTool`、`context.options.tools`、`context.options.agentDefinitions?.{activeAgents,allAgents}`、`context.abortController.signal`)以真实 `ToolUseContext & LocalJSXCommandContext` 类型为准——若字段名不符,按真实类型改,不得用 `any`/`as unknown as` 掩盖。`src/tools/efftask/` 与 `src/commands/efftask/` 落地后不得残留任何逃逸 cast(测试夹具里给假对象的 `as any` 除外)。
+> **Task 11 是集成任务(无单测,手动跑 `/et` 验证)。** 上面的代码已消除全部 `as unknown as` 逃逸口:(1) `pickMainAgentDefinition(allAgents)` 复用真实内置 `AgentDefinition`(优先 `general-purpose`,否则第一个 `source==='built-in'` 且不带 `execMode` 的 agent;仅在都找不到时用最小内置 fallback——**绝不取 `allAgents[0]`**,那可能是 settings 里配的 cli/他家 provider 角色),system prompt / source / baseDir 都合法;(2) `fsAdapter()` 直接用 `node:fs/promises`(`readFile/writeFile/mkdir/readdir/access` + `node:path` 的 `dirname`),不再经 `getFsImplementation()`;(3) `canUseTool = context.canUseTool ?? hasPermissionsToUseTool`(与 `processSlashCommand.tsx` 的 local-jsx 分支同一 fallback,导入自 `../../utils/permissions/permissions.js`)。`context` 的字段(`context.canUseTool`、`context.options.tools`、`context.options.agentDefinitions?.{activeAgents,allAgents}`、`context.abortController.signal`)以真实 `ToolUseContext & LocalJSXCommandContext` 类型为准——若字段名不符,按真实类型改,不得用 `any`/`as unknown as` 掩盖。`src/tools/efftask/` 与 `src/commands/efftask/` 落地后不得残留任何逃逸 cast(测试夹具里给假对象的 `as any` 除外)。
 
 - [ ] **Step 5: 手动验证(冒烟)**
 
@@ -2255,8 +2749,10 @@ async function runOrchestrator(
 1. 配置一个最小 `.claude/settings.json`(可留空 roles)。
 2. 启动本 CLI(`bun run ./bin/claude-haha`)。
 3. 输入 `/et 写一个 hello.txt,内容为 hi`。
-4. 期望:出现启动确认卡片 → 回车 → 出现任务树面板 → root 走 plan→review→execute→accept → 变绿 ACCEPTED;末态显示"✓ 高效任务完成"摘要且可按回车/q/Esc 退出;`.claude/efftask/001/root/node.md` 存在且含方案与执行状态;`hello.txt` 被创建。
-5. 若配置了飞书(`.claude/settings.json` 的 `feishu.enabled=true` + 凭据),确认卡片应同时出现在飞书,**任一端(终端或飞书卡片)点击都能推进**(P1 已交付飞书 surface 接线 `sendFeishuStartupCard`,经 `raceConfirm([terminalSurface, feishuSurface])` 竞速,首个响应者胜出、另一端 teardown 更新为"已在终端处理")。
+4. 期望:先看到 `正在解析需求…` → 启动确认卡片(**含真实角色名册**)→ 回车 → 出现任务树面板(**首帧就有 root 行,耗时每秒跳动,底部 `Esc 中断`**)→ root 走 plan→review→execute→accept → 变绿 ACCEPTED;末态显示"✓ 高效任务完成"摘要且可按回车/q/Esc 退出;`.claude/efftask/001/root/node.md` 存在且含方案与执行状态;`.claude/efftask/001/run.md` 的 frontmatter 含最终 `status`;`hello.txt` 被创建。
+5. 空参数:直接输入 `/et`(无提示词)→ 只显示用法提示并退出,不发起任何模型调用。
+6. 中断:在 running 态按 Esc → 立刻进 done 态,摘要为"✗ 高效任务被阻断 / 原因: 已中断",树里没有残留的黄色 running 行。
+7. 若配置了飞书(`.claude/settings.json` 的 `feishu.enabled=true` + 凭据,且 `useFeishuBridge` 已挂载出 `feishuClient`/`feishuPermissionCallbacks`),确认卡片应同时出现在飞书,**任一端(终端或飞书卡片)点击都能推进**(经 `raceConfirm([terminalSurface, feishuSurface])` 竞速,首个响应者胜出、另一端 teardown 更新为"已在终端处理")。**同时验证权限确认桥未被踩坏**:`/et` 跑起来后再触发一次普通工具权限飞书卡片,应仍能正常允许/拒绝(证明我们没有抢占 `onCardAction`)。
 
 - [ ] **Step 6: 全量回归 + 提交**
 
@@ -2271,14 +2767,18 @@ Expected: efftask 逻辑测试全绿;`/et` 冒烟通过。
 
 ## P1 完成标准(Definition of Done)
 
-1. **`bun test src/tools/efftask/` 全绿**,共 **10 个测试文件**(types / stateMachine / parseOutput / parseDirectives / persistence / roundtable / pipeline / orchestrator / runAgentAdapter / startupConfirm;`feishuStartupCard.ts` 为集成 surface,touches `FeishuClient`,无单测)。相对初版新增的断言:types 的 goal 默认、stateMachine 的 `hasCycle`、roundtable 的 allSettled 失败合成、pipeline 增至 11 条(错误→BLOCKED / 深度上限 / 兄弟成环 / 评审失败一次后过 / 验收失败 REWORK 后过 / 集成验收失败→BLOCKED)、orchestrator 增至 5 条(BLOCKED 向上传播)、persistence 的 `loadRun` 往返 + `writeRunManifest`、runAgentAdapter 的 `makeRunAgentFn` 契约测(注入 `runAgentImpl` + abort 停止)。
+1. **`bun test src/tools/efftask/` 全绿**,共 **10 个测试文件 / 合计 68 个 `it`**:types 3 / stateMachine 8 / parseOutput 10 / parseDirectives 5 / persistence 7 / roundtable 6 / pipeline 15 / orchestrator 5 / runAgentAdapter 5 / startupConfirm 4。(`feishuStartupCard.ts` 为集成 surface,复用共享 `FeishuClient`,无单测。)相对初版新增的断言:types 的 goal 默认 + `blockedReason` + `phaseRoles` 不共享、stateMachine 的 `hasCycle` + 零子节点不可集成、parseOutput 的 **LAST-FENCE** 规则、roundtable 的 allSettled 失败合成 + **空 blocking 回退 comments**、pipeline 15 条、orchestrator 5 条(BLOCKED 向上传播)、persistence 的 `loadRun` 往返 + `writeRunManifest`(含最终 `{status,reason}`)、runAgentAdapter 的 `makeRunAgentFn` 契约测、startupConfirm 的抛错 surface + `rosterLines`。
 2. **零逃逸 cast**:`src/tools/efftask/` 与 `src/commands/efftask/` 的源码文件不含任何 `as unknown as` 逃逸 cast(已全部消除:adapter 用 `createUserMessage` + 正确 type-only import;Task 11 用真实 `AgentDefinition`、`node:fs/promises`、`hasPermissionsToUseTool` fallback)。测试夹具里给假对象的 `as any` 不算。**不要求全仓 `tsc` 通过**——本 fork 的 phantom `message.ts` / `querySource.ts` 让全量类型检查预先就是红的;以 `bun test` 通过为准。
-3. **Task 11 冒烟验收**:`/et 写一个 hello.txt` → root 变 `ACCEPTED` + `hello.txt` 被创建 + `.claude/efftask/001/root/node.md` 落盘且含 **方案 + 执行状态** + 末态显示完成/阻断 **terminal summary(带 reason)** 且可按键退出(`onDone`)。
-4. **确定性硬控制全覆盖(有测试)**:依赖门控(deps 未 ACCEPTED 不执行)+ 迭代上限→BLOCKED(评审/验收超 `maxIterations`)+ 深度上限(decompose→executable)+ 节点数上限→BLOCKED + 兄弟依赖成环→BLOCKED + runAgent 抛错/abort→BLOCKED,均由单测覆盖;死锁时 BLOCKED 向上传播使树面板红得准确。
-5. **未触碰 P2/P3 范围**(无并行、无 worktree、无多角色>1、无评分、无 runtime 动态加节点、无交互展开/详情、无启动第 3 关方案编辑)。
+3. **Task 11 冒烟验收**:`/et 写一个 hello.txt` → root 变 `ACCEPTED` + `hello.txt` 被创建 + `.claude/efftask/001/root/node.md` 落盘且含 **方案 + 执行状态** + `run.md` frontmatter 含最终 `status` + 末态显示完成/阻断 **terminal summary(带 reason)** 且可按键退出(`onDone`);`running` 态可按 Esc 中断并落到 done 态。
+4. **确定性硬控制全覆盖(有测试)**:依赖门控(deps 未 ACCEPTED 不执行)+ 迭代上限→BLOCKED(评审/验收/集成验收超 `maxIterations`,reason 写进 `blockedReason`)+ 深度上限(decompose→executable,**子标题折进 `plan.solution` 不丢**)+ **节点数上限→BLOCKED(`节点数超过上限`,零残留子节点)** + 兄弟依赖成环→有界重拆、耗尽才 BLOCKED + **预置 `AbortSignal`→BLOCKED(`已中断`,零模型调用)** + runAgent 抛错→BLOCKED,均由单测覆盖;死锁时 BLOCKED 向上传播(含悬垂依赖)使树面板红得准确。
+5. **多角色圆桌在 P1 生效**:settings 里配了角色时,`parseDirectives` 解析出阶段名册、`runRoundtable` 并行扇出、全票才通过;`ConfirmStartup` 与飞书启动卡片都**渲染真实名册**(spec gate-1 角色名册)。**只读边界**:plan/review/accept/observer 拿 `Read`/`Glob`/`Grep`(能读仓库、不能改),仅 execute 拿可写全池,仅配置抽取无工具。
+6. **未触碰 P2/P3 范围**(无并行执行、无 worktree、无**节点级角色覆盖**、无观察评分、无 runtime 动态加节点、无交互展开/详情、无启动第 3 关方案编辑、无后台任务注册、无飞书升级卡片)。
 
 ## 交接到 P2/P3
 
 P1 合并后,基于真实接口再写:
-- **P2 计划**:并发池(`parallelism` 生效)+ 跨分支依赖调度 + git worktree 隔离(`src/tools/efftask/worktree.ts`)+ 合并回集成分支 + finishing-a-development-branch 收口 + 启动确认支持并行数编辑 + 飞书推进 surface 完整接线。
-- **P3 计划**:多角色(>1)圆桌全链路 + 观察评分 + 执行中 runtime `addChild` 动态生长 + 全部安全阀(节点数/超时 tree-kill)+ 交互式树面板(展开/折叠 + Enter 进 `NodeDetailView` + 子 agent 实时终端)。
+- **P2 计划**:并发池(`parallelism` 生效——P1 已把启动确认里的值落进 config,只是串行驱动不读它)+ 跨分支依赖调度 + git worktree 隔离(`src/tools/efftask/worktree.ts`;P1 已把 `RunAgentFn.cwd` 映射到 `runAgent` 的 `worktreePath`,接缝可直接用)+ 合并回集成分支 + finishing-a-development-branch 收口 + 启动确认支持并行数编辑 + 飞书推进 surface 完整接线。
+- **P2 计划(补):崩溃恢复 resume**——`loadRun` / `readNode` 在 P1 已产出并单测覆盖,但**尚无消费方**;P2 接线时须先给 `parseNodeFile` 加字段校验(它现在是无校验的 `as TaskNode`),再把恢复出的节点喂进状态机。
+- **P2 计划(补):后台任务注册(spec §10)**——`registerAsyncAgent` + `/tasks` 可见性;P1 的编排跑在 `/et` 命令组件内,离开视图即中断。
+- **P2 计划(补):安全阀升级卡片**——安全阀触发时向飞书推升级卡;P1 只把原因写进 `blockedReason` + `run.md` 并在 done 视图展示。
+- **P3 计划**:节点级角色覆盖 + 观察评分(observer 阶段)+ 执行中 runtime `addChild` 动态生长 + 剩余安全阀(节点超时 tree-kill)+ 交互式树面板(展开/折叠 + Enter 进 `NodeDetailView` + 子 agent 实时终端)。
