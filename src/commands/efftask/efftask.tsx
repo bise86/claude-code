@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, readdir, rmdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { LocalJSXCommandCall } from '../../types/command.js'
@@ -150,7 +150,15 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
         const how = outcome
           ? outcome.status === 'completed' ? '完成' : `被阻断(${outcome.reason ?? '未知原因'})`
           : tornDown ? '因界面重建而中断' : '已取消'
-        onDone(`高效任务 ${runId} ${how} · .claude/efftask/${runId}/run.md`, { display: 'system' })
+        // allocateRunId RESERVES the id by creating the directory, so a gate cancelled before
+        // the run wrote anything leaves an empty dir behind — and the pointer below would aim
+        // at a run.md that was never written. Release the reservation instead.
+        // NON-recursive rmdir on purpose: it fails on a directory with content, so this path
+        // is structurally incapable of deleting a run that produced anything.
+        void rmdir(runDir).then(
+          () => onDone(`高效任务 ${runId} ${how}`, { display: 'system' }),
+          () => onDone(`高效任务 ${runId} ${how} · .claude/efftask/${runId}/run.md`, { display: 'system' }),
+        )
       })}
     />
   )

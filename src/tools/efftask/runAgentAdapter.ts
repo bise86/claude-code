@@ -120,6 +120,14 @@ export function makeRunAgentFn(deps: {
         if (req.signal.aborted || timedOut) break
       }
     }
+    // Hoisted so the outer finally can clear it on EVERY exit path. It used to be cleared by
+    // `void work.finally(...)`, but `.finally()` returns a DERIVED promise: when `work`
+    // rejected, that derived promise rejected with nothing attached to it. The caller still
+    // saw the real error (Promise.race observes `work` itself), so nothing looked wrong —
+    // meanwhile every provider 5xx raised a process-level unhandled rejection and was filed
+    // as crash telemetry. Awaiting the derived promise instead would be worse: it would make
+    // the poller outlive the race it exists to serve.
+    let poll: ReturnType<typeof setInterval> | undefined
     try {
       // Race the consumption against the deadline: a generator that never yields would
       // otherwise never observe the abort, which is exactly the hang this bounds.
@@ -128,14 +136,14 @@ export function makeRunAgentFn(deps: {
         await Promise.race([
           work,
           new Promise<void>(resolve => {
-            const check = setInterval(() => { if (timedOut) { clearInterval(check); resolve() } }, 50)
-            void work.finally(() => clearInterval(check))
+            poll = setInterval(() => { if (timedOut) resolve() }, 50)
           }),
         ])
       } else {
         await work
       }
     } finally {
+      if (poll) clearInterval(poll)
       if (timer) clearTimeout(timer)
       req.signal.removeEventListener('abort', relay)
     }

@@ -244,3 +244,41 @@ describe('a hung provider is bounded by the phase deadline', () => {
     expect(await fn({ phase: 'plan', node: {} as any, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })).toBe('done')
   })
 })
+
+describe('the deadline must not turn a provider error into a crash report', () => {
+  it('a rejecting provider under an active deadline emits no unhandled rejection', async () => {
+    // The deadline branch once polled with `void work.finally(() => clearInterval(check))`.
+    // `.finally()` returns a DERIVED promise; when `work` rejects, that derived promise
+    // rejects too, with nothing attached to it. The caller still saw the error (the race
+    // observed `work` itself), so nothing looked broken — but the process-level handler
+    // logged a crash-telemetry event for every provider 5xx. Real wiring always passes
+    // caps.nodeTimeoutMs, so this fired on every failed phase call.
+    const seen: unknown[] = []
+    const onUnhandled = (e: unknown): void => { seen.push(e) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      async function* explodes(): AsyncGenerator<any> {
+        yield { type: 'assistant', message: { content: [{ type: 'text', text: 'partial' }] } }
+        throw new Error('provider exploded (503)')
+      }
+      const fn = makeRunAgentFn({
+        toolUseContext: {} as any,
+        canUseTool: (async () => ({ behavior: 'allow' })) as any,
+        availableTools: [] as any,
+        readOnlyTools: [] as any,
+        activeAgents: [],
+        mainModelDefault: { agentType: 'main' } as any,
+        timeoutMs: 600_000, // the value the real command passes
+        runAgentImpl: explodes as any,
+      })
+      await expect(
+        fn({ phase: 'execute', node: {} as any, role: null, system: 's', prompt: 'p', signal: new AbortController().signal }),
+      ).rejects.toThrow('provider exploded')
+      // Unhandled rejections are reported a turn of the event loop later, not synchronously.
+      await new Promise(r => setTimeout(r, 60))
+      expect(seen).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+})
