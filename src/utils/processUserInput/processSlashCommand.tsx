@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import { setPromptId } from 'src/bootstrap/state.js';
 import { builtInCommandNames, type Command, type CommandBase, findCommand, getCommand, getCommandName, hasCommand, type PromptCommand } from 'src/commands.js';
 import { NO_CONTENT_MESSAGE } from 'src/constants/messages.js';
+import { allowsPermissionDialogs } from 'src/utils/processUserInput/localJsxDialogs.js';
 import type { SetToolJSXFn, ToolUseContext } from 'src/Tool.js';
 import type { AssistantMessage, AttachmentMessage, Message, NormalizedUserMessage, ProgressMessage, UserMessage } from 'src/types/message.js';
 import { addInvokedSkill, getSessionId } from '../../bootstrap/state.js';
@@ -632,7 +633,10 @@ async function getMessagesForSlashCommand(commandName: string, args: string, set
                 shouldHidePromptInput: true,
                 showSpinner: false,
                 isLocalJSXCommand: true,
-                isImmediate: command.immediate === true
+                isImmediate: command.immediate === true,
+                // Commands that dispatch sub-agents must let the permission queue through —
+                // see allowsPermissionDialogs for what the missing flag cost.
+                shouldContinueAnimation: allowsPermissionDialogs(command)
               });
             }).catch(e => {
               // If load()/call() throws and onDone never fired, the outer

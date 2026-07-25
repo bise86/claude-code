@@ -149,6 +149,23 @@ type LocalJSXCommand = {
    * This defers loading heavy dependencies until the command is invoked.
    */
   load: () => Promise<LocalJSXCommandModule>
+  /**
+   * This command keeps its UI on screen while dispatching sub-agents that may need tool
+   * permission — so permission dialogs must be allowed to render on top of it.
+   *
+   * REPL computes `allowDialogsWithAnimation = !toolJSX || toolJSX.shouldContinueAnimation`
+   * and gates `tool-permission`, `prompt`, `elicitation` and the worker-sandbox prompt on it.
+   * A local-jsx command sets `toolJSX` WITHOUT that flag, so for as long as its panel is
+   * mounted the confirm queue is invisible. For an ordinary dialog command that is right —
+   * nothing of its own is asking. For one like `/et`, which hands `canUseTool` to
+   * write-capable execute agents, it means the first tool needing approval enqueues a request
+   * the terminal can never render: with a Feishu bridge the run silently degrades to
+   * approve-from-phone, and with no bridge it waits forever.
+   *
+   * Opt-in rather than the default, because painting a permission dialog over a command that
+   * owns the screen is only correct when that command is genuinely waiting on one.
+   */
+  spawnsSubagents?: boolean
 }
 
 /**

@@ -10,6 +10,12 @@ const efftask = {
   argumentHint: '<任务提示词> | --resume [运行ID] [--retry-blocked] [续跑指引]',
   userInvocable: true,
   disableModelInvocation: true,
+  // The execute phase hands the session's real `canUseTool` to write-capable sub-agents
+  // (efftask.tsx passes context.canUseTool straight through). Without this the confirm queue
+  // stays invisible for as long as the task panel is mounted, so the first Edit/Write/Bash
+  // needing approval hangs the run: with a Feishu bridge it silently degrades to
+  // approve-from-phone, with none it never returns. See LocalJSXCommand.spawnsSubagents.
+  spawnsSubagents: true,
   load: () => import('./efftask.js'),
 } satisfies Command
 
