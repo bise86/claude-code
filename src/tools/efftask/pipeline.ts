@@ -1375,6 +1375,27 @@ type ReviseOutcome =
  *
  * Runs at the cap rather than every round, and at most once per node — see TaskNode.revised
  * for why that bound is the whole cost argument.
+ *
+ * KNOWN NARROWING, recorded rather than papered over. This implements 修订 as "append
+ * corrective children", which is a proper SUBSET of what the word can mean:
+ *
+ *   - it cannot CHANGE the existing decomposition — no re-splitting a wrong child, no
+ *     re-wiring sibling deps, no turning the node executable;
+ *   - it cannot revise `plan.acceptance`, so the next integration roundtable still judges
+ *     against the same 父验收点 it just rejected. When the real fault is "the acceptance
+ *     criteria were wrong", three extra siblings cannot express that fix and the node blocks
+ *     anyway, one round later;
+ *   - the proposal rides an individual verdict, so on a multi-role panel one dissenting
+ *     reviewer's titles become real nodes without the others having agreed. §7's roundtable
+ *     contract governs the PASS/FAIL synthesis, which is untouched — but this is genuinely a
+ *     channel that goes around it.
+ *
+ * The wider reading — re-run the node's PLAN phase and put the result through PLAN_REVIEW —
+ * covers all three, and costs one plan call plus a full review roundtable per revision. It
+ * also needs `kind` pinned, because parsePlanOutput flips a childless reply to `executable`
+ * and a node that already has children would land in a state `advanceableKind` refuses.
+ * Appending is what §4's 「二者都可在后续再追加」 already sanctions; going wider is a product
+ * decision about cost, not a defect to fix quietly.
  */
 async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: PipelineCtx): Promise<ReviseOutcome> {
   if (node.revised === true) return { kind: 'no' }
