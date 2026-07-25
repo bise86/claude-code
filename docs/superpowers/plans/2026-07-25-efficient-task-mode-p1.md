@@ -524,7 +524,10 @@ type Candidate = { obj: Record<string, unknown>; tagged: boolean }
  * verdicts have no fallback (see pickAnswer's requireTag) that reads as "no verdict" and
  * blocks a node whose reviewer actually passed it.
  */
-const FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n([\s\S]*?)\n[ \t]*```/g
+// The ANCHOR is the load-bearing part. The surrounding newlines stay OPTIONAL: requiring
+// them rejects single-line fences and fences opened after a colon, which are normal
+// markdown and which the prompt no longer discourages either way.
+const FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)\n?[ \t]*```/g
 
 /**
  * First balanced `{...}` that is NOT nested inside an array, or null.
@@ -1803,7 +1806,9 @@ async function roundtableWithInfraRetry(args: {
 // Name the tag ONCE. Repeating it invites the model to write a paragraph about the format
 // first, and any stray ``` in that preamble used to swallow the real answer's fence.
 function answerRule(tag: string): string {
-  return `\n\n严格要求:回复的最后必须是一个 \`\`\`${tag} 代码块,内含本次回答的 JSON,块前不要出现其它代码块。`
+  // Also state the single-block rule: parseVerdict fails closed on two tagged blocks, so
+  // leaving it unsaid would reject a reply for a constraint it was never told about.
+  return `\n\n严格要求:回复的最后必须是一个 \`\`\`${tag} 代码块,内含本次回答的 JSON;整条回复中只能有这一个 \`\`\`${tag} 块。`
 }
 
 /**

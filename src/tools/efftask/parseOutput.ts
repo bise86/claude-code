@@ -48,7 +48,10 @@ type Candidate = { obj: Record<string, unknown>; tagged: boolean }
  * verdicts have no fallback (see pickAnswer's requireTag) that reads as "no verdict" and
  * blocks a node whose reviewer actually passed it.
  */
-const FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n([\s\S]*?)\n[ \t]*```/g
+// The ANCHOR is the load-bearing part. The surrounding newlines stay OPTIONAL: requiring
+// them rejects single-line fences and fences opened after a colon, which are normal
+// markdown and which the prompt no longer discourages either way.
+const FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)\n?[ \t]*```/g
 
 /**
  * First balanced `{...}` that is NOT nested inside an array, or null.

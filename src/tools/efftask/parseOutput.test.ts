@@ -196,6 +196,8 @@ describe('verdict tag discipline', () => {
       `\`\`\`bash\nbun test\n\`\`\`\n通过。\n\`\`\`${tag}\n${V}\n\`\`\``,
       `  \`\`\`${tag}\n  ${V}\n  \`\`\``, // indented
       `结论如下\r\n\`\`\`${tag}\r\n${V}\r\n\`\`\``, // CRLF
+      `\`\`\`${tag} ${V} \`\`\``, // single-line fence
+      `结论:\n\`\`\`${tag}\n${V}\`\`\``, // no newline before the closing fence
     ]
     for (const r of replies) expect(parseVerdict(r, 'main', tag).pass).toBe(true)
   })
