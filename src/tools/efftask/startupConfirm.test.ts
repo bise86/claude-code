@@ -229,6 +229,41 @@ describe('handoffLines 告诉用户工作在哪,以及怎么处置', () => {
     expect(text).toContain('仍有未合入的内容')
     expect(text).toContain('salvage')
   })
+
+  it('丢弃命令必须先移除集成工作区,否则 git 会拒绝', () => {
+    // Verified against real git, not assumed: the integration branch is CHECKED OUT in the
+    // integration worktree, which nothing ever reclaims (dispose() walks only the nodes it is
+    // handed, and the next run re-adopts this one). git therefore refuses:
+    //   error: cannot delete branch 'efftask/001/integration' used by worktree at '…'
+    // So the one-liner this used to print could never work. Printing a command that always
+    // fails is worse than printing none — the user reads it as the supported way out.
+    const text = handoffLines({
+      branch: 'efftask/001/integration', commits: 7, kept: [], salvage: [],
+      integrationPath: '/repo/.efftask-worktrees/integration',
+    }).join('\n')
+    expect(text).toContain('git worktree remove /repo/.efftask-worktrees/integration')
+    // …and in that exact order, before the branch delete.
+    expect(text).toMatch(/git worktree remove \S+ && git branch -D efftask\/001\/integration/)
+  })
+
+  it('集成工作区的存在本身要说出来 —— 它建在用户仓库里,而且比 run 活得久', () => {
+    const text = handoffLines({
+      branch: 'b', commits: 0, kept: [], salvage: [],
+      integrationPath: '/repo/.efftask-worktrees/integration',
+    }).join('\n')
+    // Even with nothing to discard: this directory is created inside the user's repo, is
+    // reused by the next run, and nothing anywhere else ever mentions it.
+    expect(text).toContain('/repo/.efftask-worktrees/integration')
+  })
+
+  it('没有集成工作区路径时,丢弃命令要自己说清可能会被拒', () => {
+    // handoff() always supplies it now, but the field is optional and a resumed/degraded run
+    // can reach here without one. Silently printing the old broken one-liner would put us
+    // back exactly where we started.
+    const text = handoffLines({ branch: 'b', commits: 3, kept: [], salvage: [] }).join('\n')
+    expect(text).toContain('git branch -D b')
+    expect(text).toContain('worktree')
+  })
 })
 
 describe('resumeSummarySections 对 --retry-blocked 要说清楚', () => {

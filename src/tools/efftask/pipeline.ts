@@ -410,9 +410,35 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
         : `### ${quote(id)}\n- 状态: (节点缺失,无法核实其结果)`
     })
     .join('\n')
+  /**
+   * The node's OWN execution output — and the reason this section exists at all.
+   *
+   * A node that grows children mid-execute takes stepExecute's early return (:1118-1126):
+   * it merges its real repo writes into the integration branch and leaves BEFORE the
+   * ACCEPTANCE roundtable. From then on it only ever reaches ACCEPTED through stepIntegrate —
+   * and this prompt rendered the parent goal and the CHILDREN's results only. So the
+   * executor's own changes were merged and then accepted with **no role having ever looked
+   * at them**, while the run reported completed. That is the one outcome the Global
+   * Constraints forbid ("不谎报完成"), and spec §8 states the rule it broke: 验收 + 评分通过
+   * 后才进入 MERGE.
+   *
+   * Judging it HERE rather than adding an acceptance round before the merge is deliberate:
+   * the work is half-finished by construction (that is why it grew children), so accepting
+   * it on its own would be judging an incomplete thing against the node's acceptance
+   * criteria. Together with the children is exactly when it becomes judgeable.
+   *
+   * Empty for a pure decompose node, which never executes — so this adds nothing to the
+   * prompt for the ordinary case.
+   */
+  const ownWork = node.execStatus.trim().length > 0
+    ? `本节点自己的执行产出(已合入集成分支,同样需要你验收):\n${quote(node.execStatus)}\n\n`
+    : ''
   return (
-    `请验收"全部子任务的结果合起来是否达成本节点目标"。\n` +
+    (ownWork
+      ? `请验收"本节点自己的执行产出 + 全部子任务的结果,合起来是否达成本节点目标"。\n`
+      : `请验收"全部子任务的结果合起来是否达成本节点目标"。\n`) +
     `父目标:${quote(ctxGoal(node))}\n父验收点:${quote(node.plan.acceptance) || '(无)'}\n\n` +
+    ownWork +
     `子任务结果:\n${children || '(无子任务)'}\n\n` +
     (feedback ? `上一轮集成验收阻断意见,请复核是否已解决:\n${quote(feedback)}\n\n` : '') +
     `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +

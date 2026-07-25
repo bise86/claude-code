@@ -1218,6 +1218,44 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     await stepExecute(n, ctx)
     expect(n.status).toBe('WAITING_CHILDREN')
     expect(merged).toBe(true)
+    // …and the work it just merged is still UNACCEPTED at this point. The early return skips
+    // the ACCEPTANCE roundtable entirely, so the only remaining chance to judge it is
+    // stepIntegrate — see the next test.
+    expect(n.acceptLog).toHaveLength(0)
+  })
+
+  it('执行中长出子节点的节点,它自己的产出必须被集成验收看到', async () => {
+    // The worst outcome this module can produce, through the one door still open.
+    //
+    // stepExecute's growth branch merges the executor's REAL repo writes and returns before
+    // ACCEPTANCE (:1118-1126). From then on the node only reaches ACCEPTED via stepIntegrate,
+    // and integratePrompt rendered the parent goal plus the CHILDREN's results only — so
+    // those writes were merged and then accepted with no role having ever seen them, while
+    // the run reported completed. spec §8: 验收 + 评分通过后才进入 MERGE.
+    const n = root(); n.kind = 'decompose'; n.status = 'WAITING_CHILDREN'
+    n.childIds = ['root/01-aa']
+    n.execStatus = '我改了 src/login.ts,但还差一个迁移子任务'
+    const child = createNode({ id: 'root/01-aa', title: '先补迁移', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '迁移写好了'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    expect(n.status).toBe('ACCEPTED')
+    expect(prompts[0]).toContain('我改了 src/login.ts') // the node's own writes are on trial…
+    expect(prompts[0]).toContain('迁移写好了') // …alongside the children's
+    expect(prompts[0]).toContain('本节点自己的执行产出')
+  })
+
+  it('纯 decompose 节点没有自己的产出,提示词里就不该多出这一段', async () => {
+    // execStatus is empty for a node that never executed; the extra section would be an empty
+    // heading inviting reviewers to judge work that does not exist.
+    const n = root(); n.kind = 'decompose'; n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    expect(prompts[0]).not.toContain('本节点自己的执行产出')
   })
 
   it('an un-isolated run merges nothing and still works', async () => {

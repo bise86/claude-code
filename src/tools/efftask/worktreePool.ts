@@ -331,6 +331,7 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       commits: number
       kept: { path: string; why: string }[]
       salvage: string[]
+      integrationPath: string
     }> {
       const count = await git(['rev-list', '--count', `HEAD..${intBranch}`], gitRoot)
       const salv = await git(
@@ -347,6 +348,13 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         commits: Number.parseInt(count.stdout.trim(), 10) || 0,
         kept,
         salvage: salv.stdout.split('\n').map(s => s.trim()).filter(Boolean),
+        // Reported because the branch above CANNOT BE DELETED while this worktree holds it,
+        // and nothing ever reclaims it: `dispose()` walks only the NODES it is handed, and
+        // the next run deliberately re-adopts this one rather than rebuilding it. The exit
+        // report printed `丢弃: git branch -D <branch>`, which git refuses outright —
+        // "cannot delete branch … used by worktree at …". The user needs this path both to
+        // make that command work and to know the directory is there at all.
+        integrationPath: intPath,
       }
     },
 

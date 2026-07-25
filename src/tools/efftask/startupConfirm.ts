@@ -381,6 +381,17 @@ export interface HandoffSummary {
   commits: number
   kept: { path: string; why: string }[]
   salvage: string[]
+  /**
+   * Where the integration branch is checked out — and why the user has to be told.
+   *
+   * The integration worktree is deliberately never reclaimed (`dispose()` only walks the
+   * NODES it is handed, and the next run re-adopts this one instead of paying to rebuild it).
+   * A checked-out branch cannot be deleted, so the `丢弃:` line below handed the user a
+   * command that FAILS — measured against real git:
+   *   error: cannot delete branch 'efftask/001/integration' used by worktree at '…'
+   * They were also never told this directory exists at all.
+   */
+  integrationPath?: string
 }
 
 /**
@@ -427,8 +438,19 @@ export function handoffLines(h: HandoffSummary): string[] {
       : `本次没有产生任何改动;分支 ${h.branch} 与起点相同`,
   ]
   if (h.commits > 0) {
-    out.push(`查看: git log ${h.branch}   合并: git merge ${h.branch}   丢弃: git branch -D ${h.branch}`)
+    out.push(`查看: git log ${h.branch}   合并: git merge ${h.branch}`)
+    // 丢弃 gets its own line because it needs TWO commands. The branch is checked out in the
+    // integration worktree, and git refuses to delete a checked-out branch — so the old
+    // one-liner `git branch -D <branch>` printed here always failed. Verified against real
+    // git: "error: cannot delete branch … used by worktree at …". Printing a command that
+    // cannot work is worse than printing none: the user reads it as the supported way out.
+    out.push(h.integrationPath
+      ? `丢弃: git worktree remove ${h.integrationPath} && git branch -D ${h.branch}`
+      : `丢弃: git branch -D ${h.branch}(若提示分支被 worktree 占用,先 git worktree remove 该路径)`)
   }
+  // Said out loud even when there is nothing to discard: this directory is created inside the
+  // user's repo and outlives every run, and nothing else ever mentions it.
+  if (h.integrationPath) out.push(`集成工作区(下次运行会复用): ${h.integrationPath}`)
   for (const k of h.kept) out.push(`保留的工作区(${k.why}): ${k.path}`)
   for (const s of h.salvage) out.push(`中断时抢救出的提交: ${s}`)
   return out
