@@ -45,6 +45,16 @@ export interface TaskNode {
    * merely interrupted. Cleared the moment the node is reseated.
    */
   interrupted?: boolean
+  /**
+   * BLOCKED because its worktree would not merge, and a human was asked to fix it.
+   *
+   * Distinct from `interrupted`: a conflict block is a VERDICT, so interrupted is false and
+   * reseat would skip it forever — the escalation card told the user to run `/et --resume`
+   * and the node came back untouched, zero model calls. This flag is what makes that
+   * instruction true. It also protects the worktree reference from resume's stale-path
+   * sweep, because for THIS node the path is where the human's resolution lives.
+   */
+  mergeConflict?: boolean
   reviewLog: RoundtableRecord[]
   acceptLog: RoundtableRecord[]
   score: { plan?: ScoreRecord; exec?: ScoreRecord }

@@ -13,6 +13,15 @@ export type ConflictEscalation = {
   branch: string
   path: string
   files: string[]
+  /**
+   * Whether an automatic resolution was attempted IN THIS RUN.
+   *
+   * Not derivable from the node: `iteration.mergeResolve` is persisted, so a resumed node
+   * whose one attempt was spent in an earlier session carries `mergeResolve === 1` while
+   * making no attempt at all. A card claiming 已自动尝试解决一次 there would be describing a
+   * previous session — or, after an interrupt, an attempt that never finished.
+   */
+  attempted: boolean
 }
 
 /**
@@ -29,8 +38,15 @@ export function escalationLines(e: ConflictEscalation, runId?: string): string[]
     `工作区: ${e.path}`,
     // The file list is what turns "there is a conflict" into "open these".
     e.files.length > 0 ? `冲突文件: ${e.files.join('、')}` : '冲突文件: (未能读出文件列表)',
-    '该节点已自动尝试解决一次未成功,现已暂停等待人工。',
-    `处理方式: 进入上面的工作区解决冲突并提交,然后用 /et --resume ${runId ?? '<运行 ID>'} 继续。`,
+    e.attempted
+      ? '该节点已自动尝试解决一次未成功,现已暂停等待人工。'
+      : '该节点的自动解决机会已在此前用完,本次未再尝试,现已暂停等待人工。',
+    // The conflict is LEFT IN PLACE in that worktree (markers and MERGE_HEAD), which is the
+    // only reason this instruction is actionable. An earlier version pointed here while the
+    // conflict lived — and was then reset away — in the SHARED integration worktree, so a user
+    // who followed it found a clean directory with nothing in it to fix.
+    `处理方式: cd 到上面的工作区,那里就是冲突现场(带 <<<<<<< 标记),解决后 git add 并 git commit;` +
+      `然后用 /et --resume ${runId ?? '<运行 ID>'} 继续,恢复后会重跑验收再合并。`,
   ]
 }
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 import { EffTaskOrchestrator } from './orchestrator.js'
 import { validateLoadedNodes } from './resumeCore.js'
 import { reseatTransientNodes } from './reseat.js'
+import { parseNodeFile, serializeNode } from './persistence.js'
 
 import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, type EffTaskConfig, type TaskNode } from './types.js'
 import type { RunAgentFn } from './roundtable.js'
@@ -41,6 +42,108 @@ function cooperative(plan: string): RunAgentFn {
 }
 
 const EXECUTABLE_PLAN = '{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}'
+
+describe('人工解决合并冲突后,--resume 真的接手', () => {
+  // The escalation card tells the user: fix the conflict in the worktree, then run
+  // `/et --resume <id>`. That sentence was FALSE — a conflict block has interrupted===false,
+  // reseat skipped it, and the resumed run returned the identical block having made zero
+  // model calls. This test goes through the real disk round trip, the real validator, the
+  // real reseat and a SECOND real orchestrator, because every one of those was a step where
+  // the node silently fell out.
+  const pool = (over: Record<string, unknown> = {}) => ({
+    init: async () => ({ ok: true }),
+    acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'efftask/001/n-' + n.id, gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/pay.ts'] }),
+    release: async () => ({ removed: false, keptBecause: '冲突未解决' }),
+    dispose: async () => ({ kept: [] }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
+    integrationPath: '/wt/integration',
+    mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/pay.ts'] }),
+    integrationBranchName: 'efftask/001/integration',
+    ...over,
+  })
+
+  async function blockedRun() {
+    const o = new EffTaskOrchestrator(cfg(), { ...deps(cooperative(EXECUTABLE_PLAN)), worktrees: pool() as never }, new AbortController().signal)
+    await o.run()
+    return o.nodes()
+  }
+
+  it('reopens the node, re-accepts the human fix, merges it, and ACCEPTS', async () => {
+    const first = await blockedRun()
+    const before = first.find(n => n.id === 'root')!
+    expect(before.status).toBe('BLOCKED')
+    expect(before.mergeConflict).toBe(true)
+    expect(before.worktree?.path).toBe('/wt/root')
+
+    // Real disk round trip: the flag and the worktree must survive YAML, not just memory.
+    const onDisk = first.map(n => parseNodeFile(serializeNode(n)))
+    const { nodes, repairs } = validateLoadedNodes(onDisk, { goal: cfg().goalPrompt, phaseRoles: emptyPhaseRoles(), now: new Date().toISOString() })
+    // The stale-path sweep must NOT eat this one — that path holds the human's resolution.
+    expect(nodes.find(n => n.id === 'root')!.worktree?.path).toBe('/wt/root')
+    expect(repairs.join()).toContain('保留冲突工作区')
+
+    const { reseated } = reseatTransientNodes(nodes, new Date().toISOString(), cfg().caps)
+    expect(reseated).toContain('root')
+
+    // Second run: the human has fixed it, so this pool's merge succeeds.
+    let executes = 0
+    let merges = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'execute') executes++
+      const tag = req.prompt.match(/必须是一个 \`\`\`([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      const body = req.phase === 'plan' ? EXECUTABLE_PLAN
+        : req.phase === 'execute' ? '{"execStatus":"改完"}'
+        : '{"pass":true,"blocking":[],"comments":"ok"}'
+      return '\`\`\`' + tag + '\n' + body + '\n\`\`\`'
+    }) as unknown as RunAgentFn
+    const o2 = new EffTaskOrchestrator(
+      cfg(),
+      { ...deps(agent), worktrees: pool({ commitAndMerge: async () => { merges++; return { ok: true, merged: true } }, release: async () => ({ removed: true }) }) as never },
+      new AbortController().signal,
+      nodes,
+    )
+    await o2.run()
+    const after = o2.nodes().find(n => n.id === 'root')!
+
+    expect(after.status).toBe('ACCEPTED')
+    expect(merges).toBe(1)
+    // The executor must NOT run again: it would overwrite the human's resolution with a
+    // fresh attempt at the same conflict.
+    expect(executes).toBe(0)
+    // The human's edit is new, unreviewed code — it gets judged before it merges.
+    expect(after.acceptLog.length).toBeGreaterThan(before.acceptLog.length)
+  })
+
+  it('blocks again — without discarding the fix — when the human resolution fails acceptance', async () => {
+    const first = await blockedRun()
+    const onDisk = first.map(n => parseNodeFile(serializeNode(n)))
+    const { nodes } = validateLoadedNodes(onDisk, { goal: cfg().goalPrompt, phaseRoles: emptyPhaseRoles(), now: new Date().toISOString() })
+    reseatTransientNodes(nodes, new Date().toISOString(), cfg().caps)
+
+    let merges = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      const tag = req.prompt.match(/必须是一个 \`\`\`([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      const body = req.phase === 'plan' ? EXECUTABLE_PLAN
+        : req.phase === 'execute' ? '{"execStatus":"改完"}'
+        : '{"pass":false,"blocking":["人工解决时删掉了退款分支"],"comments":""}'
+      return '\`\`\`' + tag + '\n' + body + '\n\`\`\`'
+    }) as unknown as RunAgentFn
+    const o2 = new EffTaskOrchestrator(
+      cfg(), { ...deps(agent), worktrees: pool({ commitAndMerge: async () => { merges++; return { ok: true, merged: true } } }) as never },
+      new AbortController().signal, nodes,
+    )
+    await o2.run()
+    const after = o2.nodes().find(n => n.id === 'root')!
+
+    expect(after.status).toBe('BLOCKED')
+    expect(after.blockedReason).toContain('人工解决冲突后验收未通过')
+    expect(after.blockedReason).toContain('退款分支') // the real objection, not a generic message
+    expect(merges).toBe(0)                            // a rejected resolution is never merged
+    expect(after.worktree?.path).toBe('/wt/root')     // and their work is still findable
+  })
+})
 
 describe('interrupt → validate → reseat → resume actually continues the work', () => {
   it('a run killed mid-flight resumes and reaches completion', async () => {

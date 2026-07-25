@@ -47,7 +47,7 @@ export interface PipelineCtx {
    * command layer — the same rule the confirmation card follows. Absent in tests and in runs
    * with no Feishu bridge; the node still blocks with the details in blockedReason either way.
    */
-  onEscalate?: (info: { node: TaskNode; branch: string; path: string; files: string[] }) => void
+  onEscalate?: (info: { node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean }) => void
 }
 
 /**
@@ -634,47 +634,82 @@ async function growTree(
  * An un-isolated run short-circuits to true: there is nothing to merge, the executor wrote
  * straight into the shared tree.
  */
-async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
+async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = false): Promise<boolean> {
   if (!ctx.worktrees || !node.worktree) return true
   const res = await ctx.worktrees.commitAndMerge(node)
   if (!res.ok) {
     if (res.kind === 'conflict') {
-      // spec §8: 触发一次"合并解决" —— the node's own execute role gets ONE shot at fixing the
-      // conflict inside its worktree, because it is the only agent that knows what its change
-      // meant. Bounded to one: an unbounded resolve loop would spend write-capable calls on a
-      // merge that keeps failing, and each attempt starts from a tree the previous one edited.
+      // A cancel must never page a human. The user is standing at the keyboard; the node is
+      // reopened by --resume on its own, and a card saying "现已暂停等待人工" would contradict
+      // the run's own "已取消" in the same second.
+      if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
+
+      // spec §8: 触发一次"合并解决". Bounded to one — an unbounded loop spends write-capable
+      // calls on a merge that keeps failing, each attempt starting from a tree the last one
+      // already edited. Tested BEFORE the increment, so a resumed node gets no second attempt.
+      let attempted = triedThisRun
       if (node.iteration.mergeResolve < 1) {
         node.iteration.mergeResolve += 1
+        attempted = true
+        // Put the conflict INTO this node's own worktree first. Without this the resolver is
+        // sent to a clean directory (see mergeIntegrationIntoNode) and can only pretend.
+        const local = await ctx.worktrees.mergeIntegrationIntoNode(node)
+        if (!local.ok) {
+          await blockWithReason(node, `合并失败(基础设施):无法在节点工作区重现冲突: ${local.message}`, ctx)
+          return false
+        }
+        if (!local.conflicted) {
+          // The other side moved on and the merge is now clean — nothing to resolve. Retry.
+          return mergeAndRelease(node, ctx, true)
+        }
         const tag = answerTag(ANSWER_TAGS.exec)
         const resolve = await runPhase(ctx, {
           phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute',
           prompt:
-            `你的改动与集成分支冲突了。请在当前工作目录内解决冲突,保留双方的意图,不要简单丢弃任何一边。\n` +
-            `冲突文件:\n${res.files.map(f => '- ' + quote(f)).join('\n')}\n` +
+            `已把集成分支 ${quote(ctx.worktrees.integrationBranchName)} 合并进你的工作区,产生了冲突。` +
+            `当前工作目录里就是冲突现场(带 <<<<<<< / >>>>>>> 标记)。\n` +
+            `请解决冲突,保留双方的意图,不要简单丢弃任何一边;解决后 git add 冲突文件即可,不要提交。\n` +
+            `冲突文件:\n${local.files.map(f => '- ' + quote(f)).join('\n')}\n` +
             `解决后输出:{ "execStatus":"如何解决的" }。` + answerRule(tag),
           cwd: node.worktree.path, signal: ctx.signal,
         })
-        if (resolve.ok) {
+        if (!resolve.ok) {
+          // Record WHY. Every other runPhase failure in this file reports its reason; letting
+          // this one fall silently into the generic conflict message hid timeouts entirely.
+          node.execStatus = `${node.execStatus}\n(自动解决冲突未能完成: ${resolve.reason})`
+        } else {
           node.execStatus = `${node.execStatus}\n(合并冲突解决)${parseExecOutput(resolve.text, tag).execStatus}`
-          // 重跑验收 (spec §8, second half). A conflict resolution is NEW CODE that no
-          // reviewer has seen — it chose, by hand, which side of every hunk survives. Merging
-          // it because the ORIGINAL work passed acceptance would let the one edit most likely
-          // to silently drop a feature be the one edit nobody checks.
+          if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
+          // 重跑验收 (spec §8, second half). A conflict resolution is NEW CODE nobody has
+          // reviewed — it chose, by hand, which side of every hunk survives. Merging it on the
+          // strength of the ORIGINAL acceptance would make the edit likeliest to silently drop
+          // a feature the one edit nobody checks.
+          //
+          // Charged to the acceptance counter so the record does not carry two "第 1 轮" lines,
+          // one PASS and one FAIL, for two different judgements.
+          node.iteration.acceptance++
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
-            phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
+            phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance,
             system: 'accept', buildPrompt: t => acceptPrompt(node, t), ctx, cwd: node.worktree.path,
           })
           node.acceptLog.push(rec)
-          if (!infraExhausted && rec.synthesized.pass) return mergeAndRelease(node, ctx)
-          // The resolution broke the work, or nobody could judge it. Either way a human has
-          // to look — falling through to escalation is the honest outcome.
+          if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
+          if (!infraExhausted && rec.synthesized.pass) return mergeAndRelease(node, ctx, true)
           node.execStatus = `${node.execStatus}\n(冲突解决后验收未通过: ${rec.synthesized.blockingSummary || '验收角色调用失败'})`
         }
       }
+      // Marks this as a HUMAN-RESUMABLE block. Without it reseat skips the node on every
+      // later --resume, which made the escalation card's instructions untrue.
+      node.mergeConflict = true
       const detail = `合并冲突,已保留工作区待人工处理。分支 ${node.worktree.branch};路径 ${node.worktree.path};冲突文件: ${res.files.join('、')}`
       // Escalate BEFORE blocking, so the card carries the same facts the tree will show.
+      // `attempted` is threaded through the recursion rather than derived from
+      // iteration.mergeResolve, which is PERSISTED: a node resumed with its one attempt
+      // already spent makes none this run, and a card claiming "已自动尝试解决一次" would be
+      // describing something that happened in a previous session — or, after an interrupt,
+      // something that never finished at all.
       try {
-        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files: res.files })
+        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files: res.files, attempted })
       } catch { /* a notification failure must not change the run's verdict */ }
       await blockWithReason(node, detail, ctx)
       return false
@@ -712,6 +747,30 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       return
     }
     node.worktree = { branch: lease.branch, path: lease.path }
+  }
+  // 人工解决冲突后的续跑 (spec §8 "等人工处理" → the user acts → `/et --resume`).
+  //
+  // Re-enters at ACCEPTANCE, never at execute: the human already did the work, and re-running
+  // the executor would overwrite their resolution with a fresh attempt at the same conflict.
+  // Their edit is also NEW, UNREVIEWED CODE that chose by hand which side of every hunk
+  // survives — so it is judged before it merges, exactly as an auto-resolution is.
+  if (node.mergeConflict && node.worktree) {
+    node.mergeConflict = false
+    if (!(await commit(node, 'ACCEPTANCE', ctx))) return
+    const { rec, infraExhausted } = await roundtableWithInfraRetry({
+      phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
+      system: 'accept', buildPrompt: t => acceptPrompt(node, t), ctx, cwd: node.worktree.path,
+    })
+    node.acceptLog.push(rec)
+    if (!infraExhausted && rec.synthesized.pass) {
+      if (!(await mergeAndRelease(node, ctx))) return
+      await commit(node, 'ACCEPTED', ctx)
+      return
+    }
+    // No REWORK: a human is in this loop, and sending their resolution back to the executor
+    // would discard it. Block again with what the reviewers actually said.
+    await blockWithReason(node, `人工解决冲突后验收未通过: ${rec.synthesized.blockingSummary || '验收角色调用失败'}`, ctx)
+    return
   }
   const caps = ctx.config.caps
   // previous round's acceptance blockingSummary; drives the REWORK prompt. Seeded from the

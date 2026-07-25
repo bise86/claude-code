@@ -136,8 +136,17 @@ export function validateLoadedNodes(
     // a dead path, or against a base that never saw its dependencies' merges. Clearing it
     // forces a fresh acquire, which is also what re-bases the worktree.
     if (n.worktree !== undefined) {
-      repairs.push(`节点 ${n.id}:清除陈旧的隔离工作区引用,恢复时将重新分配`)
-      n.worktree = undefined
+      // EXCEPT for a conflict block. There the path is not stale bookkeeping — it is where
+      // the human was told to go and fix things. Clearing it forces a fresh acquire(), whose
+      // `checkout -B <branch> <integration>` resets the node branch and parks the human's
+      // commit on a salvage ref: measured, the fix left the tree entirely and was never
+      // merged. Keeping the reference is also what lets handoff() report the worktree.
+      if (n.mergeConflict === true) {
+        repairs.push(`节点 ${n.id}:保留冲突工作区 ${n.worktree.path},恢复后将重跑验收并重试合并`)
+      } else {
+        repairs.push(`节点 ${n.id}:清除陈旧的隔离工作区引用,恢复时将重新分配`)
+        n.worktree = undefined
+      }
     }
   }
 

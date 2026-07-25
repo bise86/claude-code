@@ -935,6 +935,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
+    mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
     integrationBranchName: 'efftask/001/integration',
     ...over,
   })
@@ -1023,6 +1024,10 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     expect(merges).toBe(2)              // the second merge is the retry
     expect(cwds).toEqual(['/wt/root', '/wt/root'])  // resolved IN the worktree, not the user's tree
     expect(prompts[1]).toContain('src/a.ts')        // and it was told which files conflicted
+    // Naming the other side is load-bearing: without the merge into this worktree the
+    // resolver stood in a clean directory with nothing to fix.
+    expect(prompts[1]).toContain('efftask/001/integration')
+    expect(prompts[1]).toContain('冲突现场')
     expect(n.execStatus).toContain('合并冲突解决')   // the record says a resolution happened
   })
 
@@ -1091,10 +1096,10 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     // attempt starting from a tree the last one already edited.
     const n = root()
     let merges = 0
-    const escalations: { node: TaskNode; branch: string; path: string; files: string[] }[] = []
+    const escalations: { node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean }[] = []
     const ctx = {
       ...ctxFor([n], okAgent()),
-      onEscalate: (i: { node: TaskNode; branch: string; path: string; files: string[] }) => { escalations.push(i) },
+      onEscalate: (i: { node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean }) => { escalations.push(i) },
       worktrees: fakePool({
         commitAndMerge: async () => { merges++; return { ok: false, kind: 'conflict', files: ['src/a.ts'] } },
       }) as never,
@@ -1109,7 +1114,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     // 升级人工: the card carries the same facts the tree shows, so the user can act from either.
     expect(escalations.length).toBe(1)
     expect(escalations[0]!.node).toBe(n) // the card names the node, not just a path
-    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'] })
+    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'], attempted: true })
   })
 
   it('a failing escalation channel does not change the run verdict', async () => {

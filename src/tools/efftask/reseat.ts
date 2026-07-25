@@ -56,7 +56,14 @@ export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps)
   const exhausted: string[] = []
   for (const n of nodes) {
     const wasInterrupted = n.status === 'BLOCKED' && n.interrupted === true
-    if (!ACTIVE.has(n.status) && !wasInterrupted) continue
+    // A conflict block is a VERDICT, so interrupted is false — yet it is the one blocked
+    // state the user is explicitly invited to resume, because the card tells them to fix the
+    // conflict and re-run. Without this the invitation was false: reseat skipped it and the
+    // resumed run reported the identical block having made zero model calls.
+    const awaitingHumanMerge = n.status === 'BLOCKED' && n.mergeConflict === true
+    if (!ACTIVE.has(n.status) && !wasInterrupted && !awaitingHumanMerge) continue
+    // Re-entry for this node is the ACCEPTANCE+merge path in stepExecute, which the flag
+    // itself selects; the READY seat below is only how the scheduler picks it up again.
 
     const target: NodeStatus =
       n.childIds.length > 0 ? 'WAITING_CHILDREN'

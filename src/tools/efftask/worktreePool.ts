@@ -307,6 +307,44 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * clean -fd deleted its scratch files. Serialising execute used to keep that to one
      * writer; lifting the lock made it N.
      */
+    /**
+     * Bring the integration branch INTO the node's own worktree, leaving any conflict there.
+     *
+     * This exists because the obvious design is wrong. `commitAndMerge` merges in the SHARED
+     * integration worktree and, on conflict, ends with `reset --hard` + `clean -fd` there —
+     * so at the moment a conflict is reported, the node's own worktree is CLEAN: no
+     * MERGE_HEAD, no markers, only its own side of the change. Sending a resolver (or a human)
+     * to that path to "解决冲突" pointed both of them at a directory with nothing to resolve.
+     * Measured: the resolve call found nothing, acceptance rubber-stamped, the second merge
+     * conflicted identically, and the node's work never reached the integration branch.
+     *
+     * Merging the other direction puts the conflict where it can actually be worked on, in a
+     * worktree only this node owns, and leaves it in place — markers, MERGE_HEAD and all —
+     * so a human who follows the escalation card finds exactly what the card describes.
+     * Once resolved and committed, the integration merge becomes a fast-forward.
+     */
+    async mergeIntegrationIntoNode(node: TaskNode): Promise<{ ok: true; conflicted: false } | { ok: true; conflicted: true; files: string[] } | { ok: false; message: string }> {
+      const path = pathFor(node)
+      // Commit whatever the executor left loose first: `git merge` refuses to start on a
+      // dirty tree, and that refusal would read as an infrastructure failure.
+      const add = await git(['add', '-A'], path)
+      if (add.code !== 0) return { ok: false, message: `git add 失败: ${add.stderr.trim()}` }
+      const staged = await git(['diff', '--cached', '--quiet'], path)
+      if (staged.code !== 0) {
+        const c = await git(['commit', '--no-verify', '-m', `efftask: ${node.title}`], path)
+        if (c.code !== 0) return { ok: false, message: `提交失败: ${c.stderr.trim() || c.stdout.trim()}` }
+      }
+      const merge = await git(['merge', '--no-edit', intBranch], path)
+      if (merge.code === 0) return { ok: true, conflicted: false }
+      const u = await git(['diff', '--name-only', '--diff-filter=U'], path)
+      const files = u.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+      // NOT aborted on purpose — the conflicted state IS the deliverable here.
+      if (files.length > 0) return { ok: true, conflicted: true, files }
+      // No unmerged paths and a non-zero exit is not a conflict; leave nothing half-done.
+      await git(['merge', '--abort'], path)
+      return { ok: false, message: merge.stderr.trim() || merge.stdout.trim() || '合并未生效' }
+    },
+
     withIntegrationRead<T>(fn: () => Promise<T>): Promise<T> {
       return mergeLock(fn)
     },

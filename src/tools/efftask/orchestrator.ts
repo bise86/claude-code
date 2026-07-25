@@ -17,6 +17,16 @@ export interface OrchestratorDeps {
    * user's real checkout while the code claimed otherwise.
    */
   worktrees?: WorktreePool
+  /**
+   * 升级人工 (spec §8) — forwarded to PipelineCtx, and the forwarding is the whole feature.
+   *
+   * It was added to PipelineCtx and to runOrchestrator but NOT to this interface or to
+   * ctx() below, so `ctx.onEscalate` was undefined in every real run: the conflict blocked,
+   * the reason was written, and the human was never told. Excess-property checking would
+   * have caught the runOrchestrator call; this repo has no typecheck. Every test asserting
+   * escalation injected it into a hand-built ctx and so passed over a severed wire.
+   */
+  onEscalate?: PipelineCtx['onEscalate']
   runAgent: RunAgentFn
   persist: (n: TaskNode) => Promise<void>
   now: () => string
@@ -103,6 +113,7 @@ export class EffTaskOrchestrator {
       config: this.cfg,
       reserveNodes: this.reserveNodes,
       worktrees: this.deps.worktrees,
+      onEscalate: this.deps.onEscalate,
       byId: this.byId,
       runAgent: this.deps.runAgent,
       persist: this.deps.persist,

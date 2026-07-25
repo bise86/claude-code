@@ -9,7 +9,7 @@ const node = () =>
 describe('冲突升级卡', () => {
   it('carries every fact the human needs to act, without hunting for the run', () => {
     const lines = escalationLines(
-      { node: node(), branch: 'efftask/007/n-ab12cd34', path: '/repo/.efftask-worktrees/n-ab12cd34', files: ['src/pay.ts', 'src/api.ts'] },
+      { node: node(), branch: 'efftask/007/n-ab12cd34', path: '/repo/.efftask-worktrees/n-ab12cd34', files: ['src/pay.ts', 'src/api.ts'], attempted: true },
       '007',
     )
     const text = lines.join('\n')
@@ -26,21 +26,40 @@ describe('冲突升级卡', () => {
     expect(text).toContain('已自动尝试解决一次未成功')
   })
 
+  it('does NOT claim an attempt that this run never made', () => {
+    // iteration.mergeResolve is persisted, so after a --resume the budget reads as spent
+    // while nothing was tried. Saying 已自动尝试解决一次未成功 there describes a PREVIOUS
+    // session; the user reads it as 'the machine just tried' and stops looking for the
+    // interrupt that actually consumed the attempt.
+    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: ['a'], attempted: false }, '1').join('\n')
+    expect(text).not.toContain('已自动尝试解决一次未成功')
+    expect(text).toContain('自动解决机会已在此前用完,本次未再尝试')
+  })
+
+  it('sends the human to the conflict, not to a clean directory', () => {
+    // The original instruction said 进入上面的工作区解决冲突 while the conflict lived — and was
+    // immediately reset away — in the SHARED integration worktree. Measured: that path had no
+    // MERGE_HEAD, no markers, and only the node's own side of the change.
+    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: ['a'], attempted: true }, '1').join('\n')
+    expect(text).toContain('冲突现场')
+    expect(text).toContain('<<<<<<<')
+    expect(text).toContain('重跑验收再合并')
+  })
   it('still names the run even when the id was not threaded through', () => {
     // A placeholder is honest; silently omitting the resume step is not.
-    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: ['a'] }).join('\n')
+    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: ['a'], attempted: true }).join('\n')
     expect(text).toContain('/et --resume <运行 ID>')
   })
 
   it('says so when the conflict file list could not be read', () => {
     // An empty "冲突文件:" line reads as "no files conflicted", which would be a lie about
     // the one thing the user is being woken up for.
-    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: [] }, '1').join('\n')
+    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: [], attempted: true }, '1').join('\n')
     expect(text).toContain('未能读出文件列表')
   })
 
   it('renders a red-header card whose body is the same lines', () => {
-    const e = { node: node(), branch: 'b', path: '/p', files: ['x.ts'] }
+    const e = { node: node(), branch: 'b', path: '/p', files: ['x.ts'], attempted: true }
     const card = buildConflictCard(e, '007') as {
       header: { template: string; title: { content: string } }
       elements: { text: { content: string } }[]

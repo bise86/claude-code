@@ -61,6 +61,58 @@ describe('runOrchestrator reports the run it just drove', () => {
     expect(manifest).toContain('已中断')
   })
 
+  it('delivers a conflict escalation THROUGH the real orchestrator to the real callback', async () => {
+    // REGRESSION, and the same shape as the one above: onEscalate existed on PipelineCtx and
+    // on runOrchestrator's args, but OrchestratorDeps and ctx() never carried it — so
+    // ctx.onEscalate was undefined in every real run. The node blocked correctly and the
+    // human was simply never told. Five pipeline tests passed because each one hand-built a
+    // ctx and injected the callback itself, testing the function while the WIRE was cut.
+    //
+    // This test therefore refuses to construct a PipelineCtx. It goes in at runOrchestrator
+    // and asserts at the callback the product actually registers.
+    const memfs = memFs()
+    const escalations: { branch: string; path: string; files: string[] }[] = []
+    let merges = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        return '\`\`\`' + (req.prompt.match(/必须是一个 \`\`\`(plan[a-z]+) 代码块/)?.[1] ?? 'plan') +
+          '\n{"kind":"executable","goal":"g","acceptance":["a"],"children":[]}\n\`\`\`'
+      }
+      if (req.phase === 'execute') return '\`\`\`json\n{"execStatus":"做完了"}\n\`\`\`'
+      const tag = req.prompt.match(/必须是一个 \`\`\`(verdict[a-z]+) 代码块/)?.[1] ?? 'verdict'
+      return '\`\`\`' + tag + '\n{"pass":true,"blocking":[],"comments":"ok"}\n\`\`\`'
+    }
+    const pool = {
+      init: async () => ({ ok: true }),
+      acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'efftask/001/n-' + n.id, gitRoot: '/repo' }),
+      // Always conflicts: one auto-resolve, one re-acceptance, then a human is owed a card.
+      commitAndMerge: async () => { merges++; return { ok: false, kind: 'conflict', files: ['src/pay.ts'] } },
+      release: async () => ({ removed: false, keptBecause: '冲突未解决' }),
+      dispose: async () => ({ kept: [] }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
+      integrationPath: '/wt/integration',
+      mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/pay.ts'] }),
+    integrationBranchName: 'efftask/001/integration',
+    }
+    const outcomes: Outcome[] = []
+
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/001', fs: memfs, runAgent, signal: new AbortController().signal,
+        worktrees: pool as never,
+        onEscalate: e => { escalations.push({ branch: e.branch, path: e.path, files: e.files }) },
+      },
+      () => {},
+      o => outcomes.push(o),
+      () => {},
+    )
+
+    expect(merges).toBe(2) // original + the one bounded retry
+    expect(escalations).toEqual([{ branch: 'efftask/001/n-root', path: '/wt/root', files: ['src/pay.ts'] }])
+    expect(outcomes[0]?.status).toBe('blocked')
+  })
+
   it('an orchestrator that rejects still yields an outcome and reaches the done view', async () => {
     // The catch arm is the one that ran INSIDE a throw last time; if it is broken the UI
     // wedges on 'running' with no key that can free it.

@@ -524,7 +524,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // init() is async, so the effect can be torn down while it runs. Without this the
         // pool it just created (a real branch and a real worktree on disk) would be
         // unreachable and never disposed.
-        if (cancelled) { void iso.pool?.dispose([]); return }
+        // NOTE: nothing is reclaimed here. dispose() only inspects the nodes it is handed, so
+        // dispose([]) would be a no-op — measured against real git, the integration branch and
+        // its worktree both survive it. They are left in place deliberately: init() is
+        // re-entrant and never moves an existing integration branch, so the next run adopts
+        // them rather than paying to build them again.
+        if (cancelled) return
         poolRef.current = iso.pool
         setIsolation(iso.pool ? 'worktree' : 'none')
         if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
