@@ -62,4 +62,15 @@ describe('stateMachine', () => {
     const e = mk('e', { deps: ['nonexistent'] })
     expect(hasCycle([e])).toBe(false) // edge to node outside the set is ignored
   })
+  it('hasCycle handles self-loops and duplicate dep edges', () => {
+    // A child that lists itself as a dependency can never satisfy deps, so it must
+    // be reported as a cycle rather than silently deadlocking the scheduler.
+    expect(hasCycle([mk('a', { deps: ['a'] })])).toBe(true)
+    // Duplicate edges must not double-count in-degree: Kahn increments and
+    // decrements them in lock-step, so an acyclic group stays acyclic. A false
+    // positive here would block a healthy sibling group.
+    const c = mk('c', { deps: [] })
+    const d = mk('d', { deps: ['c', 'c'] })
+    expect(hasCycle([c, d])).toBe(false)
+  })
 })
