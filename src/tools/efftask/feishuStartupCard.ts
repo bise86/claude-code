@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig } from './types.js'
-import { goalLine, noticeLines, rosterLines, type ConfirmWinner, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { goalLine, noticeLines, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -20,7 +20,13 @@ function button(content: string, type: string, value: Record<string, unknown>) {
   return { tag: 'button', text: { tag: 'plain_text', content }, type, behaviors: [{ type: 'callback', value }] }
 }
 
-export function buildStartupCard(config: EffTaskConfig, requestId: string): object {
+/**
+ * @param resume when present the card is a RESUME confirmation: the header says so and the
+ * recovery summary is rendered from the SAME shared sections the terminal view uses. Without
+ * it a Feishu approver would sanction a resume seeing only a normal startup card — no counts,
+ * no repairs — i.e. approving something different from what the terminal describes.
+ */
+export function buildStartupCard(config: EffTaskConfig, requestId: string, resume?: ResumeSummary): object {
   const goal = goalLine(config.goalPrompt)
   const body =
     `**目标**: ${goal}\n` +
@@ -31,16 +37,21 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string): obje
     // the card would answer the user's "确认有多少角色、各自承担什么" with a half-truth.
     (noticeLines(config).length > 0
       ? `\n\n**以下请求不会生效**:\n${noticeLines(config).map(l => `- ${l}`).join('\n')}`
+      : '') +
+    (resume
+      ? '\n\n' + resumeSummarySections(resume)
+          .map(sec => `**${sec.tone === 'warn' ? '⚠ ' : ''}${sec.heading}**\n${sec.lines.map(l => `- ${l}`).join('\n')}`)
+          .join('\n\n')
       : '')
   return {
     config: { wide_screen_mode: true },
-    header: { title: { tag: 'plain_text', content: '高效任务模式 · 启动确认' } },
+    header: { title: { tag: 'plain_text', content: resume ? '高效任务模式 · 恢复确认' : '高效任务模式 · 启动确认' } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: body } },
       {
         tag: 'action',
         actions: [
-          button('开始', 'primary', { requestId, behavior: 'allow' }),
+          button(resume ? '继续执行' : '开始', 'primary', { requestId, behavior: 'allow' }),
           button('取消', 'danger', { requestId, behavior: 'deny' }),
         ],
       },

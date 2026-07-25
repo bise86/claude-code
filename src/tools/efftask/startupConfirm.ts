@@ -124,3 +124,61 @@ export async function raceConfirm(
     opts.signal?.removeEventListener('abort', onAbort)
   }
 }
+
+/**
+ * Everything the resume gate must disclose, gathered from the four channels the recovery
+ * pipeline produces. §17.2 requires the validation summary be shown to the user.
+ *
+ * It is ONE shape shared by the terminal view and the Feishu card for the same reason
+ * `rosterLines` is shared: a Feishu approver who sanctions a resume without seeing what was
+ * repaired is approving something different from what the terminal describes.
+ */
+export interface ResumeSummary {
+  runId: string
+  counts: { accepted: number; blocked: number; pending: number; total: number }
+  /** validateLoadedNodes: what was repaired or blocked. */
+  repairs: string[]
+  /** reseatTransientNodes: ids returned to a runnable state. */
+  reseated: string[]
+  /** reseatTransientNodes: ids blocked because the phase they would re-enter has no budget. */
+  exhausted: string[]
+  /** readRunManifest: config that could not be recovered. */
+  degraded: string[]
+  /** loadRun: node files that could not be parsed. */
+  loadErrors: string[]
+  /** Guidance carried over from a previous resume, when this invocation supplied none. */
+  inheritedGuidance?: string
+}
+
+export interface SummarySection { heading: string; lines: string[]; tone: 'info' | 'warn' }
+
+/** Sections for both surfaces. Empty channels are omitted rather than rendered as headings with nothing under them. */
+export function resumeSummarySections(s: ResumeSummary): SummarySection[] {
+  const out: SummarySection[] = []
+  out.push({
+    heading: '恢复自 run ' + s.runId,
+    lines: [`已验收 ${s.counts.accepted} · 已阻断 ${s.counts.blocked} · 待处理 ${s.counts.pending} · 共 ${s.counts.total}`],
+    tone: 'info',
+  })
+  if (s.reseated.length > 0) {
+    out.push({ heading: `重新排队 ${s.reseated.length} 个节点`, lines: s.reseated.slice(0, 8).map(x => clip(x)), tone: 'info' })
+  }
+  if (s.exhausted.length > 0) {
+    out.push({ heading: `${s.exhausted.length} 个节点预算已耗尽,不再重试`, lines: s.exhausted.slice(0, 8).map(x => clip(x)), tone: 'warn' })
+  }
+  if (s.repairs.length > 0) {
+    out.push({ heading: `校验修复 ${s.repairs.length} 处`, lines: s.repairs.slice(0, 8).map(l => clip(l, 100)), tone: 'warn' })
+  }
+  if (s.loadErrors.length > 0) {
+    out.push({ heading: `${s.loadErrors.length} 个节点文件无法读取`, lines: s.loadErrors.slice(0, 5).map(l => clip(l, 100)), tone: 'warn' })
+  }
+  if (s.degraded.length > 0) {
+    out.push({ heading: '配置未能完整恢复', lines: s.degraded.map(l => clip(l, 100)), tone: 'warn' })
+  }
+  if (s.inheritedGuidance) {
+    // Say it out loud: guidance persists in run.md, so a later `--resume` with no guidance
+    // silently re-applies the previous one to everything still unfinished.
+    out.push({ heading: '沿用上次的续跑指引', lines: [clip(s.inheritedGuidance, 100)], tone: 'info' })
+  }
+  return out
+}

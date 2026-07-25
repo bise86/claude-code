@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -117,5 +117,42 @@ describe('startupConfirm racer', () => {
     const line = rosterLines(cfg).find(l => l.startsWith('验收: '))!
     expect(Array.from(line).length).toBeLessThanOrEqual(84) // label + 80 budget
     expect(line.endsWith('…')).toBe(true)
+  })
+})
+
+describe('resumeSummarySections tells the user what recovery actually did', () => {
+  const base = {
+    runId: '003',
+    counts: { accepted: 2, blocked: 1, pending: 3, total: 6 },
+    repairs: [], reseated: [], exhausted: [], degraded: [], loadErrors: [],
+  }
+  it('always leads with where it is resuming from and the counts', () => {
+    const s = resumeSummarySections(base)
+    expect(s[0].heading).toContain('003')
+    expect(s[0].lines[0]).toContain('已验收 2')
+    expect(s[0].lines[0]).toContain('共 6')
+  })
+  it('omits channels that have nothing in them', () => {
+    expect(resumeSummarySections(base)).toHaveLength(1)
+  })
+  it('surfaces all four recovery channels when they are non-empty', () => {
+    // §17.2 requires the validation summary reach the user; dropping any of these means
+    // approving a resume without seeing what it silently changed.
+    const s = resumeSummarySections({
+      ...base,
+      reseated: ['root/01-a'], exhausted: ['root/02-b'],
+      repairs: ['节点 x:依赖节点缺失'], loadErrors: ['root/03/node.md: 解析失败'],
+      degraded: ['run.md 无法读取'],
+    })
+    const text = s.map(x => `${x.heading} ${x.lines.join(' ')}`).join(' | ')
+    expect(text).toContain('root/01-a')
+    expect(text).toContain('预算已耗尽')
+    expect(text).toContain('依赖节点缺失')
+    expect(text).toContain('无法读取')
+    expect(s.filter(x => x.tone === 'warn').length).toBeGreaterThanOrEqual(4)
+  })
+  it('announces guidance inherited from a previous resume', () => {
+    const s = resumeSummarySections({ ...base, inheritedGuidance: '先从简' })
+    expect(s.map(x => x.heading).join(' ')).toContain('沿用')
   })
 })

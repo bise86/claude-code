@@ -1,0 +1,186 @@
+/**
+ * Mounts the resume views through the VENDORED renderer (src/ink.ts), not npm ink.
+ *
+ * Same reason as ConfirmStartup.test.tsx: both renderers emit identical frames, but
+ * `useInput` only works against the app's own StdinContext. A gate that paints correctly and
+ * ignores every key is indistinguishable from a working one on screen — and because
+ * useCancelRequest disables Esc/Ctrl+C while a local-jsx dialog is mounted, an unanswerable
+ * gate wedges the whole session.
+ */
+import { describe, expect, it } from 'bun:test'
+import * as React from 'react'
+import { EventEmitter } from 'node:events'
+import { render } from '../../ink.js'
+import { ResumePicker } from './ResumePicker.js'
+import { ConfirmResume } from './ConfirmResume.js'
+import { DEFAULT_CAPS, emptyPhaseRoles } from '../../tools/efftask/types.js'
+import type { EffTaskConfig } from '../../tools/efftask/types.js'
+import type { ResumeSummary } from '../../tools/efftask/startupConfirm.js'
+import type { RunSummary } from '../../tools/efftask/runRegistry.js'
+
+function fakeTty() {
+  let pending: string | null = null
+  const stdin = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    setRawMode() {}, resume() {}, pause() {}, setEncoding() {}, unref() {}, ref() {},
+    read: () => { const v = pending; pending = null; return v },
+    press(seq: string) { pending = seq; stdin.emit('readable') },
+  })
+  let frame = ''
+  const stdout = Object.assign(new EventEmitter(), {
+    isTTY: true, columns: 100, rows: 30,
+    write: (s: string) => { frame += s; return true },
+  })
+  // Cursor-move sequences ARE the spacing, so they become a space; the bare ESC byte
+  // that precedes them must then be removed or it lands between every pair of words.
+  const plain = (): string => frame.replace(/\[[0-9;>?]*[a-zA-Z]/g, ' ').replace(/\u001b/g, '')
+  return { stdin, stdout, lastFrame: plain }
+}
+
+const ESC = String.fromCharCode(27)
+const tick = (): Promise<void> => new Promise(r => setTimeout(r, 10))
+// A lone ESC is buffered by the tokenizer until it can rule out an escape sequence, so an
+// Esc assertion has to outwait that window — this is the renderer behaving correctly.
+const tickEsc = (): Promise<void> => new Promise(r => setTimeout(r, 250))
+
+const runs: RunSummary[] = [
+  { runId: '003', goalLine: '重构支付', updatedAt: 'b', counts: { accepted: 1, blocked: 0, pending: 2, total: 3 }, degraded: false },
+  { runId: '001', goalLine: '打通登录', updatedAt: 'a', counts: { accepted: 4, blocked: 1, pending: 0, total: 5 }, degraded: true },
+]
+
+describe('ResumePicker (vendored renderer)', () => {
+  it('lists the recoverable runs and answers real keypresses', async () => {
+    const picked: string[] = []
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ResumePicker, { runs, onPick: id => picked.push(id), onCancel: () => {} }),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const frame = lastFrame()
+    expect(frame).toContain('003')
+    expect(frame).toContain('重构支付')
+    expect(frame).toContain('配置不完整') // the degraded run is flagged, not silently listed
+
+    stdin.press('\r') // Enter picks the run under the cursor
+    await tick()
+    expect(picked).toEqual(['003'])
+    app.unmount()
+  })
+
+  it('moves the cursor before picking', async () => {
+    const picked: string[] = []
+    const { stdin, stdout } = fakeTty()
+    const app = await render(
+      React.createElement(ResumePicker, { runs, onPick: id => picked.push(id), onCancel: () => {} }),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press('j') // down
+    await tick()
+    stdin.press('\r')
+    await tick()
+    expect(picked).toEqual(['001'])
+    app.unmount()
+  })
+
+  it('cancels on Esc rather than trapping the session', async () => {
+    let cancelled = false
+    const { stdin, stdout } = fakeTty()
+    const app = await render(
+      React.createElement(ResumePicker, { runs, onPick: () => {}, onCancel: () => { cancelled = true } }),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press(ESC)
+    await tickEsc()
+    expect(cancelled).toBe(true)
+    app.unmount()
+  })
+
+  it('an empty list says so and is still dismissible', async () => {
+    let cancelled = false
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ResumePicker, { runs: [], onPick: () => {}, onCancel: () => { cancelled = true } }),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(lastFrame()).toContain('没有可恢复的 run')
+    stdin.press('q')
+    await tick()
+    expect(cancelled).toBe(true)
+    app.unmount()
+  })
+})
+
+const config: EffTaskConfig = {
+  goalPrompt: '打通登录接口',
+  parallelism: 3,
+  phaseRoles: emptyPhaseRoles(),
+  caps: { ...DEFAULT_CAPS },
+  notices: [],
+  mainModel: 'claude-opus-4-8',
+}
+
+const summary: ResumeSummary = {
+  runId: '003',
+  counts: { accepted: 2, blocked: 1, pending: 3, total: 6 },
+  repairs: ['节点 root/02-b:依赖节点缺失(root/01-a)'],
+  reseated: ['root/03-c'],
+  exhausted: ['root/04-d'],
+  degraded: [],
+  loadErrors: [],
+  inheritedGuidance: '先从简',
+}
+
+describe('ConfirmResume (vendored renderer)', () => {
+  it('shows what recovery actually did before asking for approval', async () => {
+    // §17.2 requires the validation summary reach the user. Approving a resume without
+    // seeing what was repaired or re-queued is approving something you were not shown.
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, onDecision: () => {} }),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const frame = lastFrame()
+    expect(frame).toContain('恢复确认')
+    expect(frame).toContain('已验收 2')
+    expect(frame).toContain('依赖节点缺失')
+    expect(frame).toContain('预算已耗尽')
+    expect(frame).toContain('沿用') // inherited guidance is disclosed, not applied silently
+    expect(frame).toContain('主模型(claude-opus-4-8)') // the roster still names its models
+    app.unmount()
+  })
+
+  it('approves on Enter and refuses on Esc', async () => {
+    const decisions: { approved: boolean }[] = []
+    for (const [key, approved] of [['\r', true], [ESC, false]] as const) {
+      const { stdin, stdout } = fakeTty()
+      const app = await render(
+        React.createElement(ConfirmResume, { config, summary, onDecision: d => decisions.push(d) }),
+        { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      stdin.press(key)
+      await (key === ESC ? tickEsc() : tick())
+      expect(decisions[decisions.length - 1]?.approved).toBe(approved)
+      app.unmount()
+    }
+  })
+
+  it('"v" is view-only: it declines without being a cancellation the user did not intend', async () => {
+    const decisions: { approved: boolean }[] = []
+    const { stdin, stdout } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, onDecision: d => decisions.push(d) }),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press('v')
+    await tick()
+    expect(decisions).toEqual([{ parallelism: 3, approved: false }])
+    app.unmount()
+  })
+})

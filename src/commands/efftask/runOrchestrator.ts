@@ -7,6 +7,15 @@ import { logError } from '../../utils/log.js'
 export type Outcome = { status: 'completed' | 'blocked'; reason?: string }
 
 /**
+ * The runner view's phases. Declared HERE rather than in efftask.tsx because runOrchestrator
+ * takes a setPhase callback and efftask.tsx imports this module — one definition, no cycle.
+ * A second copy silently drifts the moment a phase is added.
+ */
+export type Phase =
+  | 'parsing' | 'picking' | 'recovering'
+  | 'confirm' | 'confirmResume' | 'running' | 'done' | 'fatal'
+
+/**
  * Drive one run to completion and report it.
  *
  * Lives outside efftask.tsx (which is JSX + React) because it is neither: it is the seam
@@ -15,10 +24,10 @@ export type Outcome = { status: 'completed' | 'blocked'; reason?: string }
  * module is deliberately importable and directly testable without mounting anything.
  */
 export async function runOrchestrator(
-  args: { config: EffTaskConfig; runDir: string; fs: FsLike; runAgent: RunAgentFn; signal: AbortSignal },
+  args: { config: EffTaskConfig; runDir: string; fs: FsLike; runAgent: RunAgentFn; signal: AbortSignal; seed?: TaskNode[] },
   setNodes: (n: TaskNode[]) => void,
   setOutcome: (o: Outcome) => void,
-  setPhase: (p: 'parsing' | 'confirm' | 'running' | 'done') => void,
+  setPhase: (p: Phase) => void,
 ): Promise<void> {
   // Serialize run.md writes. onUpdate fires on EVERY state transition; firing writeFile
   // unawaited each time lets concurrent writes to the same path interleave into a corrupt
@@ -45,6 +54,7 @@ export async function runOrchestrator(
         },
       },
       args.signal,
+      args.seed, // resume: adopt the recovered tree instead of minting a fresh root
     )
     setNodes(orch.nodes()) // seed with the root so the tree isn't blank on first paint
     void queueManifest(orch.nodes()) // run.md exists from the first frame, not just at the end
