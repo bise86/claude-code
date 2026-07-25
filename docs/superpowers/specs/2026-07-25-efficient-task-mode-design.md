@@ -287,7 +287,7 @@ Run 目录:`.claude/efftask/<run-id>/`(`run-id` = 扫描 `.claude/efftask/` 下�
 
 每期结束都能独立 `bun test` 通过并可跑:
 
-- **P1 骨架**:`/et` 命令 + 启动确认三关(终端+飞书)+ 树/节点内存模型 + md 持久化 + **串行**执行 + **单角色** plan/review/execute/accept(角色=主模型)+ **基础只读实时树**(状态着色 + 耗时,不含展开/详情)。
+- **P1 骨架**:`/et` 命令 + 启动确认三关(终端+飞书)+ 树/节点内存模型 + md 持久化 + **串行**执行 + **单角色** plan/review/execute/accept(角色=主模型)+ **基础只读实时树**(状态着色 + 耗时,不含展开/详情)+ **断点续跑**(见 §17)。
 - **P2 并行 + 隔离**:并发池(默认 5)+ 依赖门控 + git worktree 隔离 + 合并回集成分支 + 收口(finishing-a-development-branch)。
 - **P3 多角色 + 动态生长 + 评分 + 完整交互视图**:多角色圆桌评审/验收(独立并行+全票)+ 观察评分 + 执行中动态加子节点 + 全部安全阀 + 交互式树面板(展开/折叠 + Enter 进节点详情 + 子 agent 实时终端,见 §10)。
 
@@ -308,4 +308,35 @@ Run 目录:`.claude/efftask/<run-id>/`(`run-id` = 扫描 `.claude/efftask/` 下�
 - **OpenAI↔Anthropic 角色协议**:执行/评审用 openai 协议 role 时复用已完成的 `openaiCompat` 转换层(已测)。
 - **阶段产出结构化解析**:模型不总返回规整结构。缓解:每阶段用明确 schema 提示 + 解析失败按阶段失败(可迭代),不崩溃。
 - **长时 Run 的上下文/成本**:安全阀 + 实时可中断 + 每节点独立子 agent(不污染主上下文)。
-- **恢复**:Run 状态全落盘 `.claude/efftask/<run-id>/`;`loadRun` 可从磁盘恢复(崩溃/重启后可续)。
+- **恢复**:Run 状态全落盘 `.claude/efftask/<run-id>/`;`loadRun` 可从磁盘恢复(崩溃/重启后可续)。完整续跑设计见 §17。
+
+## 17. 断点续跑(终端重启后恢复并继续)
+
+**目标:** 终端退出/崩溃/重启后,用一条命令把任务树和每个节点的状态原样恢复出来,再用一段提示词让它从断点继续执行。Run 目录本身就是完整的持久化状态,不依赖任何内存或会话残留。
+
+### 17.1 入口
+
+- `/et --resume` — 扫描 `.claude/efftask/`,列出全部 run(编号、目标首行、状态计数、最后更新时间),让用户选一个。
+- `/et --resume <runId>` — 直接恢复指定 run(如 `/et --resume 003`)。
+- `/et --resume <runId> <继续提示词>` — 恢复并附带一段**续跑指引**(见 17.4)。`--resume latest` 取最新一个。
+
+### 17.2 恢复三步:读取 → 校验 → 重入归位
+
+1. **读取**:`loadRun(fs, runDir)` 取回全部 `node.md`(已实现,崩溃容错:坏文件进 `errors` 不影响其余节点);`readRunManifest(fs, runDir)` 从 `run.md` frontmatter 取回 `EffTaskConfig`(并行数/角色名册/安全阀/原始目标)。清单缺失或损坏 → 回退默认配置并在确认界面标注。
+2. **校验(必须,不可跳过)**:`node.md` 是磁盘上的文本,可能被手工编辑或写坏。`validateLoadedNodes(nodes)` 逐节点检查 `status` 是合法 `NodeStatus`、`kind` 合法、`deps`/`childIds` 为字符串数组、`iteration` 计数为数字、`depth` 为数字;并做**引用完整性**修复:丢弃指向不存在节点的 `deps`/`childIds`,重建 `parentId` 与 `childIds` 的双向一致性。校验失败且无法修复的节点 → 标 `BLOCKED` 并记 `blockedReason`,**不得**把非法状态喂进状态机(非法 `status` 会让依赖门控静默失效)。校验结果汇总展示给用户。
+3. **重入归位(reseat)**:进程被杀时正处于活动态的节点,实际上并没有在跑。`reseatTransientNodes(nodes)` 把它们退回可安全重入的静止态:`PLANNING`/`PLAN_REVIEW` → `CREATED`;`EXECUTING`/`EXECUTED`/`ACCEPTANCE`/`REWORK`/`SCORING`/`MERGE` → `READY`;`INTEGRATION_ACCEPT` → `WAITING_CHILDREN`。`CREATED`/`READY`/`WAITING_CHILDREN`/`ACCEPTED`/`BLOCKED` 原样保留。每个被归位的节点在 `execStatus` 追加一行"上次运行在 <阶段> 中断,已重新排队",**不清空已有的执行证据**。
+   - 重入代价:被中断的那一步会重跑一次(可能重复一次模型调用),但绝不会让"半完成"冒充"已完成"。这是刻意的取舍——宁可重做,不可谎报。
+
+### 17.3 恢复后的确认关口
+
+恢复后进入与新建 run 相同的确认界面,但内容为:恢复出的任务树(状态着色)、节点计数(已完成/排队/失败)、校验与归位摘要(哪些节点被修复、哪些被重新排队)、恢复出的角色名册与并行数(可改),以及是否继续。同样走终端 + 飞书竞速。用户可选择"继续执行"或"仅查看后退出"。
+
+### 17.4 续跑提示词
+
+`/et --resume <runId> <继续提示词>` 里的提示词作为 `resumeGuidance` 存入 Run,并追加进后续所有 `plan`/`execute` 阶段的提示词(位于目标之后、答案纪律之前),例如"跳过压测部分,先把 API 打通"或"之前的方案太复杂,后面从简"。它**不修改已 ACCEPTED 的节点**,只影响尚未完成的部分。为空则纯粹按原计划继续。
+
+### 17.5 与安全阀/幂等的关系
+
+- 恢复不重置 `iteration` 计数:一个已经烧掉 2 轮评审预算的节点,续跑后只剩 1 轮,防止"重启即刷新预算"绕过上限。
+- 恢复后 `runId` 不变,继续写同一个 Run 目录;`run.md` 追加一条恢复记录(时间、归位节点数)。
+- 同一个 Run 不允许并发续跑(两个终端同时 resume 会互相覆盖 `node.md`)。P1 用一个轻量锁文件 `run.lock` 记录 pid + 时间戳,发现活跃锁则提示用户;锁陈旧(进程已不存在)则接管。
