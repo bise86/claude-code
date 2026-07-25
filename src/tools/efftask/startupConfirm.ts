@@ -199,5 +199,14 @@ export const clampParallelism = (n: number): number =>
  */
 export function parallelismLine(config: EffTaskConfig, opts: { editable: boolean }): string {
   const hint = opts.editable ? ' · ←/→ 调整' : ''
-  return `并行数: ${config.parallelism}（读取/评审/验收阶段并行;执行阶段串行,隔离能力见 P2b）${hint}`
+  // Name the phases THIS product has (方案/评审/执行/验收/观察 — see PHASE_LABEL above), and
+  // only the ones measurably parallel:
+  //   方案 / 评审  → stepStart, dispatched straight into the pool                → parallel
+  //   执行 / 验收  → BOTH live in stepExecute's execute→accept→rework for(;;) loop,
+  //                  and that whole loop is what goes on the serial chain          → serial
+  //   集成验收     → stepIntegrate, in the pool, but only for decompose nodes
+  // An earlier wording said "读取…验收阶段并行". 读取 is not a phase of this product at all
+  // (it was a mistranslation of "read-only phases"), and 验收 is serial for every executable
+  // leaf — measured peak accept concurrency 1 at parallelism 20.
+  return `并行数: ${config.parallelism}（方案/评审阶段并行;执行与叶子验收串行,隔离见 P2b 计划)${hint}`
 }

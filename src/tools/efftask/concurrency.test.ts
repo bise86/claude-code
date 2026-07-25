@@ -136,27 +136,21 @@ describe('a failing step must not take the run down with it', () => {
     expect(orch.nodes().map(x => x.blockedReason).join(' | ')).toContain('clock died')
   })
 
-  it('a rejecting step does not poison the execute chain into a busy-loop', async () => {
-    // A rejected task can permanently poison the execute chain: every later link rejects
-    // immediately, so Promise.race resolves within a microtask and the loop spins forever.
-    // Measured on the broken form: 200,000 iterations while a pending 30 ms timer NEVER
-    // fired — no I/O, no timers, the process hung.
-    //
-    // The detector is the HANG itself, raced against a wall clock. A "did this timer fire"
-    // check is not a detector: a healthy run finishes in well under the timer's delay, so
-    // it reports failure on correct code and says nothing about starvation.
-    let n = 0
-    const inner = cooperative({ delay: 3 })
-    const orch = new EffTaskOrchestrator(cfg({ parallelism: 3 }), deps((async (req: { phase: string }) => {
-      if (req.phase === 'execute' && ++n === 1) throw new Error('boom')
-      return (inner as (r: unknown) => Promise<string>)(req)
-    }) as unknown as RunAgentFn), new AbortController().signal)
-    const outcome = await Promise.race([
-      orch.run().then(r => r.status),
-      tick(2000).then(() => 'HUNG' as const),
-    ])
-    expect(outcome).not.toBe('HUNG')
-  })
+  // NOT COVERED BY A TEST, and recorded rather than faked — same standard as the budget
+  // note above.
+  //
+  // `executeChain.then(step, step)` uses the same handler on both settle paths so one
+  // rejection cannot poison every later link. A poisoned chain makes Promise.race resolve in
+  // a microtask forever (a review measured 200k iterations with a pending 30 ms timer never
+  // firing). But it is UNREACHABLE defence: runStep catches everything, so no step can
+  // reject, so the chain cannot be poisoned. Mutating the second handler away leaves the
+  // suite green — correctly, because nothing can exercise it.
+  //
+  // The previous test here claimed to guard this and could not fail: it fed a throwing
+  // runAgent, which runPhase swallows inside the pipeline (see the clock-failure test above
+  // for the only path that actually reaches runStep's catch). Keep the second handler as
+  // belt-and-braces; do not pretend it is tested.
+
 })
 
 describe('an interrupt must not declare a verdict while work is still landing', () => {
@@ -194,6 +188,26 @@ describe('an interrupt must not declare a verdict while work is still landing', 
     await tick(120) // outlast the slow siblings
     expect(late).toEqual([])
     for (const n of orch.nodes()) expect(n.status).toBe('BLOCKED')
+  })
+})
+
+describe('what is and is not parallel — pinned, because the gate tells the user', () => {
+  it('leaf acceptance is SERIAL: it lives inside the execute loop', async () => {
+    // The acceptance roundtable for an executable leaf runs inside stepExecute's
+    // execute→accept→rework for(;;) loop, and that whole loop is what goes on the serial
+    // chain. So the globally-serialised region is not one execute call — it is execute plus
+    // leaf acceptance plus every rework round, up to maxIterations.
+    //
+    // This is pinned because the confirmation gate makes a claim about it to the user, and
+    // an earlier wording said 验收阶段并行, which is false.
+    const m = phaseMeter()
+    const orch = new EffTaskOrchestrator(
+      cfg({ parallelism: 20 }), deps(m.wrap(cooperative({ delay: 10 }))), new AbortController().signal)
+    expect((await orch.run()).status).toBe('completed')
+    expect(m.peak.plan).toBeGreaterThan(1)   // 方案 fans out
+    expect(m.peak.review).toBeGreaterThan(1) // 评审 fans out
+    expect(m.peak.execute).toBe(1)           // 执行 does not
+    expect(m.peak.accept).toBe(1)            // …and neither does leaf 验收
   })
 })
 

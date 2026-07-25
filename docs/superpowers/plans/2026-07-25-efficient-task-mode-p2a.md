@@ -2,9 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 让任务树的**非写阶段**(plan / review / accept 圆桌)并行推进,把并行数交给用户在关口修改,并堵上评审员绕过只读闸门的口子。**`execute` 阶段严格串行**,直到 P2b 的 worktree 隔离落地。
+**Goal:** 让任务树的**方案与评审阶段**并行推进,把并行数交给用户在关口修改,并堵上评审员绕过只读闸门的口子。**`execute` 阶段严格串行**,直到 P2b 的 worktree 隔离落地。
 
-**Architecture:** 串行 `run()` 换成并发池:扫描出所有可推进节点 → 取到并发预算 → 同时推进 → 任一完成即回扫补位。`execute` 单独走一条串行链,**且不占用并发预算**。节点额度改为原子令牌预留。
+**Architecture:** 串行 `run()` 换成并发池:扫描出所有可推进节点 → 取到并发预算 → 同时推进 → 任一完成即回扫补位。`stepExecute` 单独走一条串行链,**且不占用并发预算**。节点额度改为原子令牌预留。
+
+> **并行的确切边界(实测,勿再写错):** `stepExecute` 是一个 `execute → accept → rework` 的
+> `for(;;)` 循环,把它挂上串行链意味着**执行、叶子验收、以及每一轮返工**整体串行。因此:
+>
+> | 阶段 | 是否并行 |
+> |---|---|
+> | 方案(plan,在 stepStart 内) | ✅ |
+> | 评审(review,在 stepStart 内) | ✅ |
+> | 执行(execute) | ❌ 串行 |
+> | **叶子节点的验收(accept)** | ❌ 串行 —— 它在 stepExecute 循环内 |
+> | 分解节点的集成验收(integrate) | ✅ |
+>
+> 实测 parallelism=20、8 个独立叶子:`peak = {plan:8, review:8, execute:1, accept:1}`。
+> 早期版本的 Goal、关口文案与提交信息都写成"plan / review / accept 圆桌并行",对叶子
+> 验收而言是**假的**;已由 `concurrency.test.ts` 的 "what is and is not parallel" 固化。
 
 **Tech Stack:** 与前期同。测试 `bun test`。
 
@@ -711,8 +726,21 @@ git commit -m "feat(efftask): 并发调度池(execute 严格串行)、每节点�
   - spec §8 的集成分支、冲突自动解决、飞书升级卡、收口(finishing-a-development-branch)→ 同属 P2b。
   - P1 遗留项 4(确认竞速原语重复):Task 18 会新增关口交互,是抽取共用原语的合适时机,但本期不强制;若 P2b 再加关口则必须先抽。
   - P1 遗留项 5(`run.md` 全量重写):并发下写入更频繁,但已被 promise 队列串行化,是浪费不是错误 → P3。
-  - P1 交接清单里的「启动第 3 关(根方案预览/编辑)」「后台任务注册 + /tasks 可见性」「安全阀触发的飞书升级卡」→ 仍未排期,登记在此以免再次遗失。
+  - P1 交接清单里仍未排期、登记在此以免再次遗失:
+    - 「启动第 3 关(根方案预览/编辑)」
+    - 「后台任务注册 + /tasks 可见性」
+    - 「安全阀触发的飞书升级卡」
+    - 「飞书推进 surface 完整接线」—— 已核实未实现:efftask 的飞书只有启动/恢复确认卡,
+      运行期没有任何进度推送
+    - 「跨分支依赖调度」
+    (后两项此前只存活在被标 ⛔ 不可实施的 p2.md 里,那不算登记处。)
+  - **确认关口的并行数编辑与飞书竞速之间没有通道**:终端用户调到 9 但未回车、飞书审批者
+    先点「开始」,则那次编辑被静默丢弃(`efftask.tsx` 在开关口时快照 config)。已在代码
+    注释中登记,修复留待抽取共用确认原语时一并处理。
 - **已知局限(写进代码注释,不隐瞒)**:
   - 兄弟节点失败不会即时阻断同层其他节点(`propagateBlocked` 只在死锁/中断时跑),因此注定失败的子树仍会继续烧模型调用;并发放大了这个浪费。
   - 有真实延迟时,推进顺序与"谁输掉 maxNodes 竞争"都不可复现。
-  - 墙钟上限按每次调用生效,一个节点最坏可占用一个并发名额约 `maxIterations × nodeTimeoutMs`。
+  - 墙钟上限按**每次调用**生效,而串行链锁住的是整个 `execute → accept → rework` 循环。
+    所以一个卡住的节点阻塞的不是"池里的一个名额",而是**全树的执行与叶子验收**;最坏时长
+    约 `maxIterations ×(execute + accept)× nodeTimeoutMs`,按默认值(3 轮、600s)量级在
+    一小时以上。这是 P2b 隔离落地前的固有代价。

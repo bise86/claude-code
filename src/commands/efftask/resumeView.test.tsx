@@ -250,8 +250,12 @@ describe('the gate lets the user CHANGE the parallelism (用户第四句)', () =
       )
       await tick()
       const frame = lastFrame()
-      expect(frame).toContain('执行阶段串行')
+      expect(frame).toContain('方案/评审阶段并行')
+      expect(frame).toContain('执行与叶子验收串行')
       expect(frame).not.toContain('P1 串行执行')
+      // 读取 is not one of this product's phases; naming it here once put a row on the gate
+      // that has no counterpart in the roster three lines below.
+      expect(frame).not.toContain('读取')
       app.unmount()
     })
   }

@@ -507,8 +507,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           props.onExit(null) // cancelled at the gate: no run outcome to report
           return
         }
-        // Apply the confirmed parallelism. It is inert in P1's serial driver, but it must
-        // NOT be silently discarded — P2's pool reads it straight off the config.
+        // Apply the confirmed parallelism — the pool reads it straight off the config.
+        // KNOWN GAP: this snapshots config at gate-open, so a value the terminal user dialled
+        // but had not yet committed is discarded if the FEISHU surface wins the race. There
+        // is no channel from the gate's React state to the Feishu surface.
         const effectiveConfig: EffTaskConfig = { ...config, parallelism: decision.parallelism }
         setPhase('running')
         void runOrchestrator(

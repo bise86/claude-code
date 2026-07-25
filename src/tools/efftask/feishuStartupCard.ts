@@ -80,7 +80,8 @@ export function sendFeishuStartupCard(
     callbacks: FeishuPermissionCallbacks // the SHARED registry from AppState
     requestId: string // randomUUID() minted by the caller; also embedded in cardContent
     cardContent: object
-    parallelism: number // echoed back in the decision (the card has no inline editor in P1)
+    parallelism: number // echoed back in the decision — the card has allow/deny buttons only,
+                      // so a Feishu approver cannot change it; the terminal gate can.
   },
   claim: (winner: ConfirmWinner, d: StartupDecision) => void,
   onTeardown: (fn: SurfaceTeardown) => void,
