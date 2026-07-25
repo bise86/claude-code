@@ -134,6 +134,8 @@ async function roundtableWithInfraRetry(args: {
   system: string
   buildPrompt: (tag: string) => string
   ctx: PipelineCtx
+  /** Where the reviewers should read from — the node's worktree when it is isolated. */
+  cwd?: string
 }): Promise<{ rec: RoundtableRecord; infraExhausted: boolean }> {
   // At least one attempt regardless of a programmatically-supplied cap: zero attempts would
   // leave `rec` undefined and every caller dereferences it.
@@ -146,7 +148,7 @@ async function roundtableWithInfraRetry(args: {
     rec = await runRoundtable({
       phase: args.phase, node: args.node, roles: args.roles, round: args.round,
       system: args.system, prompt: args.buildPrompt(tag),
-      runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag,
+      runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
     })
     if (args.ctx.signal.aborted) return { rec, infraExhausted: false }
     if (!isInfraOnlyFailure(rec)) return { rec, infraExhausted: false }
@@ -509,6 +511,7 @@ async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
   const tag = answerTag(ANSWER_TAGS.score)
   const res = await runPhase(ctx, {
     phase: 'observer', node, role, system: 'observer', prompt: scorePrompt(node, tag), signal: ctx.signal,
+    cwd: node.worktree?.path,
   })
   if (!res.ok) {
     // A failed scoring call must NOT fail the node: acceptance already passed, and scoring is
@@ -670,7 +673,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
-      system: 'accept', buildPrompt: tag => acceptPrompt(node, tag), ctx,
+      system: 'accept', buildPrompt: tag => acceptPrompt(node, tag), ctx, cwd: node.worktree?.path,
     })
     node.acceptLog.push(rec)
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }

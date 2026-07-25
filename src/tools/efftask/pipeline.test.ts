@@ -867,3 +867,52 @@ describe('生长的可寻址性、并发安全与阈值入口', () => {
     expect(cfg.caps.maxDepth).toBe(3)
   })
 })
+
+describe('隔离下,验收与评分必须读到被验收的工作', () => {
+  // Reviewers used to get NO cwd, so the accept roundtable read the main working tree while
+  // the change lived only in the node's worktree. They could do nothing but rubber-stamp the
+  // executor's own prose — "a reviewer that cannot see the change is not a reviewer".
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+
+  it('accept and observer both run in the node worktree', async () => {
+    const seen: { phase: string; cwd?: string }[] = []
+    const n = createNode({
+      id: 'root', title: 'r', parentId: null, deps: [], depth: 0,
+      phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] }, now: NOW,
+    })
+    n.worktree = { branch: 'worktree-efftask-001-deadbeef', path: '/tmp/wt/efftask-001-deadbeef' }
+    const agent = (async (req: { phase: string; prompt: string; cwd?: string }) => {
+      seen.push({ phase: req.phase, cwd: req.cwd })
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      if (req.phase === 'observer') {
+        const tag = req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score'
+        return '```' + tag + '\n{"plan":{"score":90,"rationale":"ok"},"exec":{"score":90,"rationale":"ok"}}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = ctxFor([n], agent)
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    const cwdOf = (p: string) => seen.filter(s => s.phase === p).map(s => s.cwd)
+    expect(cwdOf('execute')).toEqual(['/tmp/wt/efftask-001-deadbeef'])
+    expect(cwdOf('accept')).toEqual(['/tmp/wt/efftask-001-deadbeef'])
+    expect(cwdOf('observer')).toEqual(['/tmp/wt/efftask-001-deadbeef'])
+  })
+
+  it('an un-isolated node passes no cwd at all — it runs where the session is', async () => {
+    const seen: (string | undefined)[] = []
+    const n = root()
+    const agent = (async (req: { phase: string; prompt: string; cwd?: string }) => {
+      if (req.phase === 'accept') seen.push(req.cwd)
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = ctxFor([n], agent)
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(seen).toEqual([undefined])
+  })
+})

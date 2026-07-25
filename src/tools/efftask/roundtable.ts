@@ -42,6 +42,14 @@ export async function runRoundtable(args: {
   signal: AbortSignal
   // Per-call answer tag the prompt demanded; verdicts are only trusted under THIS tag.
   answerTag?: string
+  /**
+   * Working directory for every reviewer in this roundtable.
+   *
+   * Without it the accept roundtable reads the MAIN working tree while the work it is judging
+   * lives only in the node's worktree — reviewers can then do nothing but rubber-stamp the
+   * executor's own prose. A reviewer that cannot see the change is not a reviewer.
+   */
+  cwd?: string
 }): Promise<RoundtableRecord> {
   // Already aborted → don't burn a real model call; synthesize a failing record instead.
   if (args.signal.aborted) {
@@ -55,7 +63,9 @@ export async function runRoundtable(args: {
   // reviewer is synthesized into a failing verdict instead.
   const settled = await Promise.allSettled(
     roster.map(role =>
-      args.runAgent({ phase: args.phase, node: args.node, role, system: args.system, prompt: args.prompt, signal: args.signal }),
+      // cwd goes to EVERY reviewer: the work under review lives in the node's worktree, and a
+      // reviewer reading the main tree can only rubber-stamp the executor's own prose.
+      args.runAgent({ phase: args.phase, node: args.node, role, system: args.system, prompt: args.prompt, signal: args.signal, cwd: args.cwd }),
     ),
   )
   const verdicts: Verdict[] = settled.map((res, i) => {
