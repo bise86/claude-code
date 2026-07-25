@@ -215,13 +215,22 @@ export const MAX_ESCALATION_CARDS = 8
  * notifications is the same failure as never sending them.
  */
 export function createEscalationLimiter(max = MAX_ESCALATION_CARDS): {
-  admit: () => { send: boolean; note?: string }
+  admit: (stopped?: boolean) => { send: boolean; note?: string }
   suppressed: () => number
 } {
   let sent = 0
   let dropped = 0
   return {
-    admit() {
+    /**
+     * `stopped` splits the budget. A deep tree that folds eight branches would otherwise spend
+     * the whole quota on blue "nothing stopped" cards and suppress the ONE orange card asking a
+     * human whether to spend more — measured: the node that actually stopped got {send:false}.
+     * Information-only notices get half; a card that needs a decision always gets through
+     * until the full cap.
+     */
+    admit(stopped = true) {
+      const ceiling = stopped ? max : Math.floor(max / 2)
+      if (sent >= ceiling) { dropped++; return { send: false } }
       if (sent < max - 1) { sent++; return { send: true } }
       if (sent === max - 1) {
         sent++

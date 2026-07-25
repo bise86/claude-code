@@ -104,6 +104,12 @@ export function validateLoadedNodes(
     // exactly the failure --retry-blocked exists to fix — and n.blockedReason = '' erased the
     // original diagnosis on the way.
     n.capBlocked = false
+    // …and the same for mergeConflict, which is an EQUIVALENT key and needs no flag at all:
+    // reseat reopens any BLOCKED node carrying it. Measured: a conflict node that this pass
+    // then blocked for a missing dependency was still reseated to READY, the gate reported
+    // "重新排队 1 个节点", the run made zero model calls, and blockedReason was cleared on the
+    // way — erasing both the conflict diagnosis and the 依赖节点缺失 that replaced it.
+    n.mergeConflict = false
     repairs.push(`节点 ${n.id}:${why}`)
   }
 

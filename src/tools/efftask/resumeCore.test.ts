@@ -377,3 +377,27 @@ describe('恢复:capCategory 也必须校验', () => {
     expect(validateLoadedNodes([b({ capBlocked: true, capCategory: true })], o).nodes[0].capCategory).toBeUndefined()
   })
 })
+
+
+describe('恢复:mergeConflict 也是一把不需要 flag 的钥匙', () => {
+  const b2 = (over = {}) => ({
+    ...createNode({ id: 'root/01-a', title: 'a', parentId: null, deps: ['root/99-gone'], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+
+  it('因磁盘状态不可用而阻断时,mergeConflict 必须被关掉', () => {
+    // reseat reopens ANY blocked node carrying mergeConflict, with no flag required — so this
+    // door had to close alongside capBlocked. Measured: a conflict node this pass then blocked
+    // for a missing dependency was still reseated to READY, the gate said "重新排队 1 个节点",
+    // the run made zero model calls, and blockedReason was cleared on the way — erasing both
+    // the conflict diagnosis and the 依赖节点缺失 that replaced it.
+    const n = b2({ status: 'BLOCKED', mergeConflict: true, worktree: { branch: 'b', path: '/wt/a' } })
+    const { nodes } = validateLoadedNodes([n], { goal: 'g', phaseRoles: emptyPhaseRoles(), now: NOW })
+    const back = nodes.find(x => x.id === 'root/01-a')
+    expect(back.blockedReason).toContain('依赖节点缺失')
+    expect(back.mergeConflict).toBe(false)
+    const r = reseatTransientNodes(nodes, NOW, DEFAULT_CAPS, { retryBlocked: true })
+    expect(r.reseated).toEqual([])
+    expect(back.status).toBe('BLOCKED')
+  })
+})

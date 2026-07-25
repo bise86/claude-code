@@ -149,7 +149,15 @@ export function reseatTransientNodes(
         (n.capCategory === undefined && n.iteration.planReview >= caps.maxIterations)
       )
     const target: NodeStatus =
-      n.childIds.length > 0 ? 'WAITING_CHILDREN'
+      // A node awaiting a human merge must go back to READY even when it has children: the
+      // ONLY code that clears mergeConflict, re-runs acceptance and retries the merge lives in
+      // stepExecute, and WAITING_CHILDREN routes to stepIntegrate instead. Measured: a node
+      // that grew children and then hit a conflict came back from every later --resume having
+      // made zero model calls and zero git operations, forever; and when its children happened
+      // to be runnable, the run reported COMPLETED with that node ACCEPTED and its own commits
+      // never merged into the integration branch.
+      awaitingHumanMerge ? 'READY'
+      : n.childIds.length > 0 ? 'WAITING_CHILDREN'
       : reviewExhausted ? 'CREATED'
       : n.kind === 'executable' ? 'READY'
       : 'CREATED'

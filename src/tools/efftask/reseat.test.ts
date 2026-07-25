@@ -470,3 +470,33 @@ describe('capCategory:落盘、校验、和旧版本 node.md 的兼容', () => {
     expect(n.status).toBe('READY')
   })
 })
+
+
+describe('动态生长的节点撞上合并冲突', () => {
+  it('有子节点也要回 READY —— 只有 stepExecute 会解冲突', () => {
+    // Measured: a node that grew children and then failed to merge came back from every later
+    // --resume having made ZERO model calls and zero git operations, forever. The only code
+    // that clears mergeConflict, re-runs acceptance and retries the merge lives in
+    // stepExecute; WAITING_CHILDREN routes to stepIntegrate instead, so rule 1 winning here
+    // made the escalation card's instruction permanently false.
+    const n = mk({
+      id: 'root', kind: 'decompose', status: 'BLOCKED', mergeConflict: true,
+      childIds: ['root/01-a'], blockedReason: '合并冲突,已保留工作区待人工处理',
+      worktree: { branch: 'b', path: '/wt/root' },
+    })
+    const kid = mk({ id: 'root/01-a', parentId: 'root', depth: 1, status: 'ACCEPTED', kind: 'executable' })
+    const r = reseatTransientNodes([n, kid], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('READY')
+    expect(n.mergeConflict).toBe(true)   // still the flag stepExecute selects on
+    expect(r.reseated).toContain('root')
+  })
+
+  it('没有冲突的 WAITING_CHILDREN 节点仍然按规则 1 落座', () => {
+    const n = mk({
+      id: 'root', kind: 'decompose', status: 'BLOCKED', interrupted: true,
+      childIds: ['root/01-a'], blockedReason: '已中断',
+    })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('WAITING_CHILDREN')
+  })
+})

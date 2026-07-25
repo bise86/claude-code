@@ -1685,3 +1685,39 @@ describe('确认草稿:只有可执行节点才配没有子任务', () => {
     expect(n.status).toBe('READY')
   })
 })
+
+describe('长了子节点又没合上的节点,不能靠子任务成绩验收通过', () => {
+  it('stepIntegrate 拒绝一个仍带 mergeConflict 的节点', async () => {
+    // Measured before this guard: outcome 'completed', the node ACCEPTED, and its own commits
+    // never reached the integration branch — the run reported success for work it had lost.
+    const p = root()
+    p.kind = 'decompose'
+    p.childIds = ['root/01-a']
+    p.mergeConflict = true
+    p.worktree = { branch: 'b/root', path: '/wt/root' }
+    const kid = createNode({ id: 'root/01-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const phases: string[] = []
+    const ctx = ctxFor([p, kid], async req => {
+      phases.push(req.phase)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    })
+    await stepIntegrate(p, ctx)
+    expect(p.status).toBe('BLOCKED')
+    expect(p.blockedReason).toContain('尚未合入集成分支')
+    expect(p.blockedReason).toContain('/wt/root')
+    // …and it did not spend a roundtable to arrive there.
+    expect(phases).toEqual([])
+  })
+
+  it('没有冲突的 decompose 节点照常集成验收', async () => {
+    const p = root()
+    p.kind = 'decompose'
+    p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const ctx = ctxFor([p, kid], async req => vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```')
+    await stepIntegrate(p, ctx)
+    expect(p.status).toBe('ACCEPTED')
+  })
+})

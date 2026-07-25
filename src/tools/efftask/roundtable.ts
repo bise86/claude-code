@@ -1,6 +1,7 @@
 // src/tools/efftask/roundtable.ts
 import type { PhaseName, RoleBinding, RoundtableRecord, TaskNode, Verdict } from './types.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
+import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { parseVerdict } from './parseOutput.js'
 
 export type RunAgentFn = (req: {
@@ -53,6 +54,13 @@ export async function runRoundtable(args: {
   cwd?: string
   /** 子 agent 实时输出 (spec §10.2). Every reviewer in the roundtable streams into it. */
   onChunk?: (t: string) => void
+  /**
+   * 全局并发池 (spec §6). Reviewers beyond the first take a slot from it.
+   *
+   * Absent = unbounded fan-out, which is what shipped: parallelism 2 with a 3-role panel
+   * measured a peak of 6 concurrent runAgent calls, and the default 5 with 3 roles is 15.
+   */
+  slots?: SlotPool
 }): Promise<RoundtableRecord> {
   // Already aborted → don't burn a real model call; synthesize a failing record instead.
   if (args.signal.aborted) {
@@ -64,12 +72,13 @@ export async function runRoundtable(args: {
   // Promise.allSettled so a single reviewer's runAgent REJECTION does not throw out
   // of the whole roundtable. Fulfilled path is identical (parseVerdict); a rejected
   // reviewer is synthesized into a failing verdict instead.
-  const settled = await Promise.allSettled(
-    roster.map(role =>
+  const settled = await mapWithinPool(
+    roster,
+    role =>
       // cwd goes to EVERY reviewer: the work under review lives in the node's worktree, and a
       // reviewer reading the main tree can only rubber-stamp the executor's own prose.
       args.runAgent({ phase: args.phase, node: args.node, role, system: args.system, prompt: args.prompt, signal: args.signal, cwd: args.cwd, onChunk: args.onChunk }),
-    ),
+    args.slots,
   )
   const verdicts: Verdict[] = settled.map((res, i) => {
     const role = roster[i]

@@ -640,7 +640,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         onBlocked: info => {
           const client = store.getState().feishuClient
           if (!client) return
-          const { send, note } = cardLimit.current.admit()
+          const { send, note } = cardLimit.current.admit(info.stopped !== false)
           props.cardLimitOut.current = cardLimit.current.suppressed()
           if (!send) return
           const card = buildBlockCard(info, runId ?? undefined) as { elements: { text: { content: string } }[] }

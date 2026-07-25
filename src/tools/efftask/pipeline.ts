@@ -6,6 +6,7 @@ import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
+import type { SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, type BlockCategory } from './escalation.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 
@@ -82,6 +83,13 @@ export interface PipelineCtx {
    * no caller is exactly the dead wire this project keeps finding.
    */
   onChunk?: (nodeId: string, text: string) => void
+  /**
+   * 全局并发池 (spec §6): "评审/验收的多角色调用…受同一全局池约束,避免总并发爆炸".
+   *
+   * The step already holds a slot; the roundtable's extra reviewers lease from the same pool,
+   * so the number at the confirmation gate is the real ceiling rather than a per-step one.
+   */
+  slots?: SlotPool
 }
 
 /**
@@ -271,6 +279,7 @@ async function roundtableWithInfraRetry(args: {
       system: args.system, prompt: args.buildPrompt(tag),
       runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
       onChunk: args.ctx.onChunk ? t => args.ctx.onChunk!(args.node.id, t) : undefined,
+      slots: args.ctx.slots,
     })
     if (args.ctx.signal.aborted) return { rec, infraExhausted: false }
     if (!isInfraOnlyFailure(rec)) return { rec, infraExhausted: false }
@@ -483,10 +492,12 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // ended '存在无法推进的阻断节点' with an empty blockedReason. Only an EXECUTABLE node
       // legitimately has no children.
       (node.kind !== 'executable' && confirmed.children.length === 0) ||
-      // …and the mirror image: an EXECUTABLE node with children in its draft. stepStart's
-      // executable branch commits READY and returns, so the approved children are consumed
-      // and dropped — measured phases ["review"], childIds [], one node in the tree.
-      (node.kind === 'executable' && confirmed.children.length > 0) ||
+      // …and the mirror image: any NON-decompose node with children in its draft. stepStart's
+      // non-decompose branch commits READY and returns, so the approved children are consumed
+      // and dropped — measured phases ["review"], childIds [], one node in the tree. Written as
+      // `!== 'decompose'` rather than `=== 'executable'` because validateLoadedNodes resets an
+      // illegal kind to 'unknown', which is the same shape through a different door.
+      (node.kind !== 'decompose' && confirmed.children.length > 0) ||
       node.childIds.length > 0
     )) {
       confirmed = undefined
@@ -1145,6 +1156,20 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
 export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
+  // A node that grew children mid-execute and then FAILED to merge arrives here still holding
+  // an unresolved conflict. Integration acceptance judges its children's evidence and would
+  // hand it an ACCEPTED — while its own commits sit on a branch that never reached the
+  // integration branch. Measured: outcome 'completed', node ACCEPTED, no COMMIT+MERGE for it.
+  // "不谎报完成" means this has to stop here.
+  if (node.mergeConflict === true) {
+    await blockWithReason(
+      node,
+      `该节点自己的改动尚未合入集成分支(合并冲突未解决),不能仅凭子任务结果验收通过。` +
+      (node.worktree ? `请到 ${node.worktree.path} 解决冲突后 /et --resume 继续。` : '请解决冲突后 /et --resume 继续。'),
+      ctx,
+    )
+    return
+  }
   const caps = ctx.config.caps
   let feedback = ''
   // Same bounded-retry shape as stepExecute: a single failed integration verdict must not

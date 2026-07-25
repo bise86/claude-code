@@ -6,6 +6,7 @@ import { stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipel
 import type { RunAgentFn } from './roundtable.js'
 import type { WorktreePool } from './worktreePool.js'
 import { makeRootNode } from './rootPlan.js'
+import { createSlotPool } from './slotPool.js'
 
 export interface OrchestratorDeps {
   /**
@@ -116,6 +117,13 @@ export class EffTaskOrchestrator {
     return { release: () => { if (released) return; released = true; this.reserved -= count } }
   }
 
+  /**
+   * 全局并发池 (spec §6). Held by the orchestrator so BOTH the scheduler's steps and the
+   * roundtables inside them draw from one budget — the second half of that clause was missing
+   * and a 3-role panel multiplied the user's number by three.
+   */
+  private slots = createSlotPool(() => Math.max(1, this.cfg.parallelism))
+
   private ctx(): PipelineCtx {
     return {
       config: this.cfg,
@@ -125,6 +133,7 @@ export class EffTaskOrchestrator {
       onBlocked: this.deps.onBlocked,
       runId: this.deps.runId,
       onChunk: this.deps.onChunk,
+      slots: this.slots,
       byId: this.byId,
       runAgent: this.deps.runAgent,
       persist: this.deps.persist,
@@ -146,7 +155,10 @@ export class EffTaskOrchestrator {
      * inFlight: a queued execute holds no resource, and charging it would let a tree with
      * more ready executables than `parallelism` starve every other phase.
      */
-    let running = 0
+    // Occupancy is now the POOL's, not a private counter: a reviewer holding a slot has to
+    // shrink the scheduler's budget too, or the two halves would each honour the cap alone
+    // and together exceed it.
+    const running = (): number => this.slots.inUse()
     /**
      * execute is STRICTLY serial in P2a. It is the only phase with write-capable tools, and
      * two executors in one working tree overwrite each other's edits while BOTH report
@@ -161,11 +173,12 @@ export class EffTaskOrchestrator {
     const launch = (n: TaskNode, kind: Advanceable['kind']): Promise<void> => {
       const before = n.status
       const step = async (): Promise<void> => {
-        running++
+        // Unconditional: pickBatch already budgeted for this step against the same pool.
+        const slot = this.slots.take()
         try {
           await this.runStep(n, kind) // never rejects — see runStep
         } finally {
-          running--
+          slot.release()
         }
         // Bookkeeping runs on the failure path too, because runStep absorbs its own errors.
         // Hanging it off .then(onFulfilled) alone would skip it exactly when a step fails,
@@ -212,7 +225,7 @@ export class EffTaskOrchestrator {
         return { status: 'blocked', reason: '已中断' }
       }
 
-      const budget = Math.max(1, this.cfg.parallelism) - running
+      const budget = Math.max(1, this.cfg.parallelism) - running()
       // NO await between pickBatch and the dispatch loop — that is what makes the dependency
       // check atomic (see pickBatch's contract).
       const batch = pickBatch(this.nodes(), this.byId, new Set(inFlight.keys()), budget)

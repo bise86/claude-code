@@ -407,3 +407,26 @@ describe('确认草稿的另一半对称情况', () => {
     expect(root.childIds.length).toBeGreaterThan(0)
   })
 })
+
+
+describe('确认草稿守卫的第三档', () => {
+  it('kind 是 unknown 却带着子任务的草稿,同样回落到 plan 调用', async () => {
+    // validateLoadedNodes resets an illegal kind to 'unknown', so this is the same shape as
+    // the executable case through a different door: measured 0 plan calls, root left
+    // READY/unknown with an empty blockedReason, run ended 存在无法推进的阻断节点.
+    const root = makeRootNode(cfg(), NOW)
+    root.kind = 'unknown'
+    root.confirmedDraft = { children: [{ title: '甲', deps: [] }] }
+    const calls = []
+    const ctx = ctxFor([root], async req => {
+      calls.push(req.phase)
+      return req.phase === 'plan'
+        ? PLAN_REPLY
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n' + "```"
+    })
+    await stepStart(root, ctx)
+    expect(calls[0]).toBe('plan')
+    expect(root.status).toBe('WAITING_CHILDREN')
+    expect(root.childIds.length).toBeGreaterThan(0)
+  })
+})

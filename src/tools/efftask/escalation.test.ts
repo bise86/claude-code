@@ -233,3 +233,30 @@ describe('run.md 也得带着处置办法', () => {
     expect(blockReasonWithRemedy('r', 'timeout')).toContain('/et --resume <运行 ID> --retry-blocked')
   })
 })
+
+
+describe('限流:信息类通知不能吃掉决策类的额度', () => {
+  it('折树的蓝卡发满一半之后,真正停机的橙卡仍然发得出去', () => {
+    // Measured: a deep tree folding eight branches spent the whole quota on blue
+    // "nothing stopped" notices and the ONE orange card asking a human whether to spend more
+    // came back {send:false}. That card is the only one that needs an answer.
+    const l = createEscalationLimiter(8)
+    for (let i = 0; i < 8; i++) l.admit(false)   // information-only
+    const stopped = l.admit(true)
+    expect(stopped.send).toBe(true)
+  })
+
+  it('信息类只拿到一半额度', () => {
+    const l = createEscalationLimiter(8)
+    let sent = 0
+    for (let i = 0; i < 20; i++) if (l.admit(false).send) sent++
+    expect(sent).toBe(4)
+  })
+
+  it('决策类仍然用满整个额度', () => {
+    const l = createEscalationLimiter(8)
+    let sent = 0
+    for (let i = 0; i < 20; i++) if (l.admit(true).send) sent++
+    expect(sent).toBe(8)
+  })
+})

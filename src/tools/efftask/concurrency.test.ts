@@ -350,3 +350,114 @@ describe('隔离可用时才解除 execute 串行(用户第一句的后半)', ()
     expect(m.peakAny()).toBeLessThanOrEqual(2)
   })
 })
+
+
+describe('全局并发池必须同时约束"步"和"圆桌里的角色" (spec §6)', () => {
+  /**
+   * The existing fixtures in this file all use emptyPhaseRoles(), and runRoundtable collapses
+   * an empty roster to a single main-model reviewer — so no test here could ever OBSERVE the
+   * fan-out. Measured before this fixture existed: parallelism 2 with a 3-role panel peaked at
+   * 6 concurrent runAgent calls, and the shipped default of 5 with 3 roles is 15. A user who
+   * lowers the number to control spend was getting |roles|x what they asked for.
+   */
+  const withRoles = (n: number) => {
+    const roles = [...Array(n)].map((_, i) => ({ roleName: 'r' + i }))
+    return { ...emptyPhaseRoles(), review: roles, accept: roles }
+  }
+
+  it('并行数 2 + 3 角色圆桌:峰值并发不超过 2', async () => {
+    let live = 0
+    let peak = 0
+    const cfg2: EffTaskConfig = {
+      goalPrompt: 'g', parallelism: 2, phaseRoles: withRoles(3),
+      caps: { ...DEFAULT_CAPS }, notices: [],
+    }
+    let plans = 0
+    const runAgent: RunAgentFn = async req => {
+      live++
+      peak = Math.max(peak, live)
+      await new Promise(r => setTimeout(r, 5))
+      live--
+      if (req.phase === 'plan') {
+        // Decompose ONCE. Returning 'decompose' for every plan call recurses to the depth cap
+        // and turns this into a test about maxDepth instead of about concurrency.
+        plans++
+        return plans === 1
+          ? '\u0060\u0060\u0060json\n{"kind":"decompose","solution":"s","keyPoints":"","risks":"","acceptance":"","children":[{"title":"A","deps":[]},{"title":"B","deps":[]},{"title":"C","deps":[]}]}\n\u0060\u0060\u0060'
+          : '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+      }
+      if (req.phase === 'execute') {
+        return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
+      }
+      const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
+      return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'
+    }
+    const orch = new EffTaskOrchestrator(cfg2, {
+      runAgent, persist: async () => {}, now: () => new Date().toISOString(), onUpdate: () => {},
+    }, new AbortController().signal)
+    const res = await orch.run()
+    expect(res.status).toBe('completed')
+    // The whole point. Before this, peak was parallelism x roles.
+    expect(peak).toBeLessThanOrEqual(2)
+    expect(peak).toBeGreaterThan(0)
+  })
+
+  it('并行数 1 时圆桌退化为串行,而不是死锁', async () => {
+    // The deadlock this design exists to avoid: a step holds the only slot while its own
+    // reviewers wait for one. The first reviewer rides the step's slot; the rest run after.
+    let live = 0
+    let peak = 0
+    const cfg1: EffTaskConfig = {
+      goalPrompt: 'g', parallelism: 1, phaseRoles: withRoles(4),
+      caps: { ...DEFAULT_CAPS }, notices: [],
+    }
+    const runAgent: RunAgentFn = async req => {
+      live++
+      peak = Math.max(peak, live)
+      await new Promise(r => setTimeout(r, 2))
+      live--
+      if (req.phase === 'plan') {
+        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+      }
+      if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
+      const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
+      return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'
+    }
+    const orch = new EffTaskOrchestrator(cfg1, {
+      runAgent, persist: async () => {}, now: () => new Date().toISOString(), onUpdate: () => {},
+    }, new AbortController().signal)
+    const res = await orch.run()
+    expect(res.status).toBe('completed')  // it terminates — no deadlock
+    expect(peak).toBe(1)
+  })
+
+  it('每个角色仍然都被派出去了 —— 限流不是丢人', async () => {
+    // Bounding concurrency must not silently drop reviewers: a roundtable is unanimous-pass,
+    // so a missing verdict would change the verdict.
+    const seen: string[] = []
+    const cfg3: EffTaskConfig = {
+      goalPrompt: 'g', parallelism: 1, phaseRoles: withRoles(4),
+      caps: { ...DEFAULT_CAPS }, notices: [],
+    }
+    const runAgent: RunAgentFn = async req => {
+      if (req.role) seen.push(req.phase + ':' + req.role.roleName)
+      if (req.phase === 'plan') {
+        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+      }
+      if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
+      const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
+      return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'
+    }
+    const orch = new EffTaskOrchestrator(cfg3, {
+      runAgent, persist: async () => {}, now: () => new Date().toISOString(), onUpdate: () => {},
+    }, new AbortController().signal)
+    await orch.run()
+    for (const i of [0, 1, 2, 3]) {
+      expect(seen).toContain('review:r' + i)
+      expect(seen).toContain('accept:r' + i)
+    }
+    // …and the record keeps them in roster order.
+    const node = orch.nodes()[0]
+    expect(node.reviewLog[0].verdicts.map(v => v.role)).toEqual(['r0', 'r1', 'r2', 'r3'])
+  })
+})
