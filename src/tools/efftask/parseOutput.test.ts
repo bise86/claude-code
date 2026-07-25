@@ -46,4 +46,47 @@ describe('parseOutput', () => {
     expect(parseExecOutput('did the thing').execStatus).toContain('did the thing')
     expect(parseExecOutput('```json\n{"execStatus":"done X"}\n```').execStatus).toBe('done X')
   })
+
+  // Recency alone is not a safe selector: models recap context AFTER answering just
+  // as often as they echo it before. Each parser must take the newest block that
+  // matches ITS shape, so a trailing distractor of a different shape is skipped.
+  it('parseVerdict: real verdict first, trailing plan recap => still the verdict', () => {
+    const text =
+      '我的裁决:\n```json\n{"pass":false,"blocking":["仍缺压测数据"],"comments":"不通过"}\n```\n' +
+      '供参考,本节点的方案是:\n```json\n{"solution":"旧方案","acceptance":"a"}\n```'
+    const v = parseVerdict(text, 'sec')
+    expect(v.pass).toBe(false)
+    expect(v.blocking).toEqual(['仍缺压测数据'])
+  })
+  it('parsePlanOutput: real plan first, trailing goal echo => still the plan', () => {
+    const text =
+      '方案如下:\n```json\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":[]}]}\n```\n' +
+      '再贴一下目标供参考:\n```json\n{"goal":"把功能做完","owner":"me"}\n```'
+    const out = parsePlanOutput(text)
+    expect(out.kind).toBe('decompose')
+    expect(out.plan.solution).toBe('s')
+    expect(out.children).toEqual([{ title: 'AA', deps: [] }])
+  })
+  it('parseExecOutput: real status first, trailing template echo => still the status', () => {
+    const text =
+      '```json\n{"execStatus":"已完成:实现缓存层,单测全通过"}\n```\n' +
+      '(模板提醒)\n```json\n{"note":"请按上面格式填写"}\n```'
+    expect(parseExecOutput(text).execStatus).toBe('已完成:实现缓存层,单测全通过')
+  })
+  it('prefers an explicitly json-tagged fence over a stray code fence that parses', () => {
+    const text =
+      '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```\n' +
+      '附上工具输出:\n```bash\n{"pass":false,"blocking":["来自无关的日志"]}\n```'
+    const v = parseVerdict(text, 'main')
+    expect(v.pass).toBe(true)
+  })
+  it('never throws on empty or whitespace input', () => {
+    for (const t of ['', '   \n\t ']) {
+      expect(() => parsePlanOutput(t)).not.toThrow()
+      expect(() => parseVerdict(t, 'r')).not.toThrow()
+      expect(() => parseExecOutput(t)).not.toThrow()
+      expect(extractJsonBlock(t)).toBeNull()
+    }
+    expect(parseVerdict('', 'r').pass).toBe(false) // fails closed
+  })
 })

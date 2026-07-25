@@ -469,20 +469,52 @@ Expected: FAIL。
 // src/tools/efftask/parseOutput.ts
 import type { NodeKind, NodePlan, Verdict } from './types.js'
 
-// LAST-FENCE RULE: a phase transcript is multi-turn and the model routinely ECHOES the
-// prompt (which itself contains a JSON plan/verdict) before answering. The phase's actual
-// answer is therefore the LAST fenced block, not the first. Scan every fence and try them
-// from last to first; only if no fence parses do we fall back to the bare
-// first-brace..last-brace slice.
-export function extractJsonBlock(text: string): unknown | null {
-  const fences = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(m => m[1])
-  for (let i = fences.length - 1; i >= 0; i--) {
-    try { return JSON.parse(fences[i].trim()) } catch { /* try the previous fence */ }
+/**
+ * Candidate JSON objects found in a phase transcript, best-first.
+ *
+ * A phase transcript is multi-turn and messy. Models ECHO the prompt (which itself
+ * contains a JSON plan/verdict) before answering, and just as often RECAP context
+ * AFTER answering. So "the last thing that happens to parse as JSON" is not a safe
+ * selector on its own: picking a trailing recap over the real verdict silently
+ * flips a fail into a pass. Callers therefore ask for the newest candidate that
+ * MATCHES THE SHAPE THEY EXPECT (see pickShaped) rather than taking whatever parses.
+ *
+ * Ordering: json-tagged fences newest-first, then untagged fences newest-first,
+ * then the bare first-brace..last-brace slice as a last resort.
+ */
+export function extractJsonCandidates(text: string): unknown[] {
+  const tagged: string[] = []
+  const untagged: string[] = []
+  for (const m of text.matchAll(/```(json)?[ \t]*\r?\n?([\s\S]*?)```/gi)) {
+    ;(m[1] ? tagged : untagged).push(m[2])
   }
+  const out: unknown[] = []
+  const tryPush = (raw: string): void => {
+    try { out.push(JSON.parse(raw.trim())) } catch { /* not JSON; skip this candidate */ }
+  }
+  for (let i = tagged.length - 1; i >= 0; i--) tryPush(tagged[i])
+  for (let i = untagged.length - 1; i >= 0; i--) tryPush(untagged[i])
   const first = text.indexOf('{')
   const last = text.lastIndexOf('}')
-  if (first !== -1 && last > first) {
-    try { return JSON.parse(text.slice(first, last + 1).trim()) } catch { /* fall through */ }
+  if (first !== -1 && last > first) tryPush(text.slice(first, last + 1))
+  return out
+}
+
+/** The best candidate with no shape requirement. Prefer pickShaped when you know the shape. */
+export function extractJsonBlock(text: string): unknown | null {
+  return extractJsonCandidates(text)[0] ?? null
+}
+
+/**
+ * Newest candidate that looks like the object the caller is asking for. Without the
+ * shape guard, a trailing echo of the *goal* would be accepted as a *plan*, and a
+ * recap of a *previous* verdict would be accepted as *this* verdict.
+ */
+function pickShaped(text: string, matches: (o: Record<string, unknown>) => boolean): Record<string, unknown> | null {
+  for (const c of extractJsonCandidates(text)) {
+    if (c && typeof c === 'object' && !Array.isArray(c) && matches(c as Record<string, unknown>)) {
+      return c as Record<string, unknown>
+    }
   }
   return null
 }
@@ -492,7 +524,8 @@ function str(v: unknown, fallback = ''): string {
 }
 
 export function parsePlanOutput(text: string): { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] } {
-  const obj = extractJsonBlock(text) as Record<string, unknown> | null
+  // A plan must carry at least one plan-ish key; a bare echo of the goal has none.
+  const obj = pickShaped(text, o => 'solution' in o || 'kind' in o || 'children' in o)
   const plan: NodePlan = {
     solution: str(obj?.solution, text.trim()),
     keyPoints: str(obj?.keyPoints),
@@ -511,8 +544,11 @@ export function parsePlanOutput(text: string): { kind: NodeKind; plan: NodePlan;
 }
 
 export function parseVerdict(text: string, role: string): Verdict {
-  const obj = extractJsonBlock(text) as Record<string, unknown> | null
-  if (!obj || typeof obj.pass !== 'boolean') {
+  // Only an object with a boolean `pass` is a verdict. Anything else (an echoed
+  // plan, a restated goal) must NOT be read as one — falling through to the
+  // unparseable branch fails closed instead of inventing a pass.
+  const obj = pickShaped(text, o => typeof o.pass === 'boolean')
+  if (!obj) {
     return { role, pass: false, blocking: ['无法解析该角色的裁决输出;按不通过处理'], comments: text.trim().slice(0, 2000) }
   }
   const blocking = Array.isArray(obj.blocking) ? (obj.blocking as unknown[]).map(b => str(b)).filter(Boolean) : []
@@ -520,8 +556,8 @@ export function parseVerdict(text: string, role: string): Verdict {
 }
 
 export function parseExecOutput(text: string): { execStatus: string } {
-  const obj = extractJsonBlock(text) as Record<string, unknown> | null
-  if (obj && typeof obj.execStatus === 'string') return { execStatus: obj.execStatus }
+  const obj = pickShaped(text, o => typeof o.execStatus === 'string')
+  if (obj) return { execStatus: str(obj.execStatus) }
   return { execStatus: text.trim() }
 }
 ```
@@ -1458,6 +1494,16 @@ function depsSection(node: TaskNode, ctx: PipelineCtx): string {
   return `已完成的依赖任务及其产出(基于这些结果继续,不要重复它们的工作):\n${lines.join('\n')}\n`
 }
 
+// OUTPUT DISCIPLINE — append to EVERY phase prompt. parseOutput picks the newest
+// candidate block that matches the expected SHAPE, so a differently-shaped
+// distractor is skipped. But a SAME-shaped distractor (the model answers, then
+// recaps last round's verdict JSON "for reference") is structurally
+// indistinguishable — the only defence is telling the model to emit exactly one
+// block, last. Without this, a recap can silently flip a fail into a pass.
+const ONE_FENCE_RULE =
+  '\n\n严格要求:整条回复中只允许出现一个 json 代码块,且必须位于回复的最末尾;' +
+  '不要在它之后再复述、总结或附带任何其它代码块。'
+
 function planPrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
   const caps = ctx.config.caps
   return (
@@ -1470,7 +1516,8 @@ function planPrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
       ? `上一版方案(就是它需要被修订):\n${JSON.stringify(node.plan)}\n上一轮评审阻断意见,请针对性修订:\n${feedback}\n`
       : '') +
     `请输出一个 json 代码块:{ "kind":"decompose"|"executable", "solution", "keyPoints", "risks", "acceptance", "children":[{"title","deps":["兄弟标题"]}] }。` +
-    `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。`
+    `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。` +
+    ONE_FENCE_RULE
   )
 }
 // Reference the IMMUTABLE node goal (set at creation), not the mutable plan.solution —
@@ -1478,7 +1525,7 @@ function planPrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
 function ctxGoal(node: TaskNode): string { return node.goal }
 
 function reviewPrompt(node: TaskNode): string {
-  return `请评审以下方案是否可执行、完整、无重大风险。方案:\n${JSON.stringify(node.plan)}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。`
+  return `请评审以下方案是否可执行、完整、无重大风险。方案:\n${JSON.stringify(node.plan)}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` + ONE_FENCE_RULE
 }
 function executePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
   return (
@@ -1489,11 +1536,11 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string 
     (feedback
       ? `上一轮验收未通过,阻断意见:\n${feedback}\n上一轮执行状态:\n${node.execStatus}\n请针对性返工。\n`
       : '') +
-    `完成后输出 json:{ "execStatus":"做了什么、结果如何" }。`
+    `完成后输出 json:{ "execStatus":"做了什么、结果如何" }。` + ONE_FENCE_RULE
   )
 }
 function acceptPrompt(node: TaskNode): string {
-  return `请验收执行结果是否达成验收点。验收点:${node.plan.acceptance}\n执行状态:${node.execStatus}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。`
+  return `请验收执行结果是否达成验收点。验收点:${node.plan.acceptance}\n执行状态:${node.execStatus}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` + ONE_FENCE_RULE
 }
 // Integration acceptance judges CHILD evidence against the parent goal. acceptPrompt would
 // show only the parent's own execStatus — which for a decompose node is empty.
@@ -1508,7 +1555,8 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): strin
     `父目标:${ctxGoal(node)}\n父验收点:${node.plan.acceptance || '(无)'}\n\n` +
     `子任务结果:\n${children || '(无子任务)'}\n\n` +
     (feedback ? `上一轮集成验收阻断意见,请复核是否已解决:\n${feedback}\n\n` : '') +
-    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。`
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +
+    ONE_FENCE_RULE
   )
 }
 
