@@ -40,6 +40,8 @@ export async function runRoundtable(args: {
   prompt: string
   runAgent: RunAgentFn
   signal: AbortSignal
+  // Per-call answer tag the prompt demanded; verdicts are only trusted under THIS tag.
+  answerTag?: string
 }): Promise<RoundtableRecord> {
   // Already aborted → don't burn a real model call; synthesize a failing record instead.
   if (args.signal.aborted) {
@@ -59,7 +61,7 @@ export async function runRoundtable(args: {
   const verdicts: Verdict[] = settled.map((res, i) => {
     const role = roster[i]
     const roleName = role ? role.roleName : 'main'
-    if (res.status === 'fulfilled') return parseVerdict(res.value, roleName)
+    if (res.status === "fulfilled") return parseVerdict(res.value, roleName, args.answerTag)
     const reason = res.reason instanceof Error ? res.reason.message : String(res.reason)
     // infra: the reviewer never judged anything, the CALL failed. Flagged so the caller
     // retries the review instead of reading it as a rejection and redoing real work.

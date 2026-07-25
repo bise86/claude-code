@@ -5,6 +5,9 @@ import type { EffTaskConfig } from './types.js'
 import { EffTaskOrchestrator } from './orchestrator.js'
 import type { RunAgentFn } from './roundtable.js'
 
+// Verdict prompts carry a per-call random tag; a cooperative reviewer answers under THAT tag.
+// Anything else in the reply is quoted context, which parseVerdict deliberately refuses.
+const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
 const NOW = '2026-07-25T00:00:00Z'
 const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({ goalPrompt: '构建功能', parallelism: DEFAULT_PARALLELISM, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, ...over })
 const deps = (runAgent: RunAgentFn) => ({ runAgent, persist: async () => {}, now: () => NOW, onUpdate: () => {} })
@@ -14,7 +17,7 @@ describe('EffTaskOrchestrator (serial)', () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
       if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
-      return '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     const result = await orch.run()
@@ -30,7 +33,7 @@ describe('EffTaskOrchestrator (serial)', () => {
         return '```json\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
       }
       if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
-      return '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     const result = await orch.run()
@@ -49,7 +52,7 @@ describe('EffTaskOrchestrator (serial)', () => {
         return '```json\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
       }
       if (req.phase === 'execute') { execOrder.push(req.node.id); return '```json\n{"execStatus":"done"}\n```' }
-      return '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     await orch.run()
@@ -58,7 +61,7 @@ describe('EffTaskOrchestrator (serial)', () => {
 
   it('blocked plan (review always fails) => run returns blocked', async () => {
     const runAgent: RunAgentFn = async req =>
-      req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"weak"}\n```' : '```json\n{"pass":false,"blocking":["no"],"comments":""}\n```'
+      req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"weak"}\n```' : vtag(req) + '\n{"pass":false,"blocking":["no"],"comments":""}\n```'
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     expect((await orch.run()).status).toBe('blocked')
   })
@@ -69,9 +72,9 @@ describe('EffTaskOrchestrator (serial)', () => {
         if (req.node.id === 'root') return '```json\n{"kind":"decompose","solution":"s","children":[{"title":"only","deps":[]}]}\n```'
         return '```json\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
       }
-      if (req.phase === 'review') return '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```' // plans pass review
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' // plans pass review
       if (req.phase === 'execute') return '```json\n{"execStatus":"did"}\n```'
-      return '```json\n{"pass":false,"blocking":["永远不过"],"comments":""}\n```' // child acceptance always fails → BLOCKED after maxIterations
+      return vtag(req) + '\n{"pass":false,"blocking":["永远不过"],"comments":""}\n```' // child acceptance always fails → BLOCKED after maxIterations
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     const result = await orch.run()
@@ -87,7 +90,7 @@ describe('EffTaskOrchestrator (serial)', () => {
   const allPass: RunAgentFn = async req => {
     if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
     if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
-    return '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
   }
 
   it('a pre-aborted run resolves as blocked without dispatching anything', async () => {
@@ -185,9 +188,9 @@ describe('EffTaskOrchestrator (serial)', () => {
         return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"A","deps":[]},{"title":"B","deps":[]}]}\n```'
       }
       if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
-      if (req.phase === 'review') return '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
       if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
-      return '```verdict\n{"pass":false,"blocking":["不过"],"comments":""}\n```'
+      return vtag(req) + '\n{"pass":false,"blocking":["不过"],"comments":""}\n```'
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     const result = await orch.run()
@@ -203,8 +206,8 @@ describe('EffTaskOrchestrator (serial)', () => {
       if (calls > 200) throw new Error('runaway loop')
       if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
       if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
-      if (req.phase === 'review') return '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
-      return '```verdict\n{"pass":false,"blocking":["永远不过"],"comments":""}\n```'
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      return vtag(req) + '\n{"pass":false,"blocking":["永远不过"],"comments":""}\n```'
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     const result = await orch.run()

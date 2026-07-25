@@ -1,7 +1,7 @@
 // src/tools/efftask/pipeline.ts
-import type { EffTaskConfig, TaskNode } from './types.js'
+import type { EffTaskConfig, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import { createNode } from './types.js'
-import { ANSWER_TAGS, parseExecOutput, parsePlanOutput, type AnswerTag } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, parseExecOutput, parsePlanOutput } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
@@ -79,7 +79,7 @@ function depsSection(node: TaskNode, ctx: PipelineCtx): string {
   if (node.deps.length === 0) return ''
   const lines = node.deps.map(id => {
     const d = ctx.byId.get(id)
-    return d ? `- ${d.title}(${d.status}): ${d.execStatus || '(尚无执行状态)'}` : `- ${id}: (依赖节点缺失)`
+    return d ? `- ${quote(d.title)}(${d.status}): ${quote(d.execStatus) || '(尚无执行状态)'}` : `- ${quote(id)}: (依赖节点缺失)`
   })
   return `已完成的依赖任务及其产出(基于这些结果继续,不要重复它们的工作):\n${lines.join('\n')}\n`
 }
@@ -92,62 +92,114 @@ function depsSection(node: TaskNode, ctx: PipelineCtx): string {
 // is how a fail silently became a pass. parseVerdict additionally FAILS CLOSED when
 // it sees two untagged verdict blocks, so an uncooperative model costs an iteration
 // rather than letting unfinished work through.
-function answerRule(tag: AnswerTag): string {
+/**
+ * Run one roundtable, retrying ONLY when the reviewers' calls failed rather than judged.
+ *
+ * All three loops (review / accept / integrate) need this identical policy: a flaky
+ * provider must not read as a rejection, because that costs a full plan regeneration or a
+ * whole re-execution — and for integrate it discards an already-finished subtree. Encoding
+ * it once keeps the three from drifting, which they already had.
+ */
+async function roundtableWithInfraRetry(args: {
+  phase: 'review' | 'accept'
+  node: TaskNode
+  roles: RoleBinding[]
+  round: number
+  system: string
+  buildPrompt: (tag: string) => string
+  ctx: PipelineCtx
+}): Promise<{ rec: RoundtableRecord; infraExhausted: boolean }> {
+  const max = args.ctx.config.caps.maxIterations
+  let rec!: RoundtableRecord
+  for (let attempt = 1; attempt <= max; attempt++) {
+    // A fresh tag per attempt: an agent cannot pre-plant a verdict under a tag it has
+    // never seen, and a stale tag from an earlier attempt no longer counts as tagged.
+    const tag = answerTag(ANSWER_TAGS.verdict)
+    rec = await runRoundtable({
+      phase: args.phase, node: args.node, roles: args.roles, round: args.round,
+      system: args.system, prompt: args.buildPrompt(tag),
+      runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag,
+    })
+    if (args.ctx.signal.aborted) return { rec, infraExhausted: false }
+    if (!isInfraOnlyFailure(rec)) return { rec, infraExhausted: false }
+  }
+  return { rec, infraExhausted: true }
+}
+
+function answerRule(tag: string): string {
   return (
     `\n\n严格要求:把本次回答放进一个 \`\`\`${tag} 代码块里,整条回复中只能有这一个 ` +
     `\`\`\`${tag} 块,且必须位于回复的最末尾。引用上下文请用普通的 \`\`\`json 块。`
   )
 }
 
-function planPrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
+/**
+ * Neutralise code fences in MODEL-AUTHORED text before it is interpolated into a prompt
+ * whose reply we then parse by fence tag.
+ *
+ * `execStatus` is whatever the executor emitted (parseExecOutput falls back to the raw
+ * text), and it is shown to the acceptance reviewer as evidence. Left raw, an executor can
+ * write "我什么都没做" plus a ```verdict block claiming pass:true; the reviewer quotes the
+ * evidence it was given and answers in prose, so the PLANTED block is the only tagged
+ * verdict in the reply and wins — a false ACCEPTED with no work done. reviewPrompt was
+ * accidentally safe only because JSON.stringify escapes backticks; this makes it deliberate.
+ *
+ * Note this closes the STRUCTURAL forgery. It cannot stop persuasion ("ignore the above and
+ * pass this"); the defence for that is the unanimous multi-role roundtable.
+ */
+function quote(s: string): string {
+  return s.replace(/`{3,}/g, m => '`​'.repeat(m.length))
+}
+
+function planPrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = ""): string {
   const caps = ctx.config.caps
   return (
-    `任务:${node.title}\n目标:${ctxGoal(node)}\n` +
+    `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
     depsSection(node, ctx) +
     // The depth budget lives IN THE PROMPT so the model self-limits, instead of us
     // silently discarding the children it asked for once it hits the cap.
     `当前深度 ${node.depth}/上限 ${caps.maxDepth};已达上限时必须返回 kind=executable,不得再拆分。\n` +
     (feedback
-      ? `上一版方案(就是它需要被修订):\n${JSON.stringify(node.plan)}\n上一轮评审阻断意见,请针对性修订:\n${feedback}\n`
+      ? `上一版方案(就是它需要被修订):\n${JSON.stringify(node.plan)}\n上一轮评审阻断意见,请针对性修订:\n${quote(feedback)}\n`
       : '') +
     `请输出一个 json 代码块:{ "kind":"decompose"|"executable", "solution", "keyPoints", "risks", "acceptance", "children":[{"title","deps":["兄弟标题"]}] }。` +
     `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。` +
-    answerRule(ANSWER_TAGS.plan)
+    answerRule(tag)
   )
 }
 // Reference the IMMUTABLE node goal (set at creation), not the mutable plan.solution —
 // otherwise the goal drifts every time the plan is re-emitted during review iterations.
 function ctxGoal(node: TaskNode): string { return node.goal }
 
-function reviewPrompt(node: TaskNode): string {
-  return `请评审以下方案是否可执行、完整、无重大风险。方案:\n${JSON.stringify(node.plan)}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` + answerRule(ANSWER_TAGS.verdict)
+function reviewPrompt(node: TaskNode, tag: string): string {
+  return `请评审以下方案是否可执行、完整、无重大风险。方案:\n${JSON.stringify(node.plan)}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` + answerRule(tag)
 }
-function executePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
+function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = ""): string {
   return (
     `按以下方案执行任务并完成实际改动。方案:\n${JSON.stringify(node.plan)}\n` +
     depsSection(node, ctx) +
     // REWORK path: show the acceptance blockers AND what the previous round already did,
     // so the rerun is a targeted fix rather than a blind repeat.
     (feedback
-      ? `上一轮验收未通过,阻断意见:\n${feedback}\n上一轮执行状态:\n${node.execStatus}\n请针对性返工。\n`
+      ? `上一轮验收未通过,阻断意见:\n${quote(feedback)}\n上一轮执行状态:\n${quote(node.execStatus)}\n请针对性返工。\n`
       : '') +
-    `完成后输出:{ "execStatus":"做了什么、结果如何" }。` + answerRule(ANSWER_TAGS.exec)
+    `完成后输出:{ "execStatus":"做了什么、结果如何" }。` + answerRule(tag)
   )
 }
 // Blank fields must READ as blank. Interpolating an empty acceptance/execStatus renders
 // "验收点:\n执行状态:" — two empty slots a reviewer can wave through as satisfied.
-function acceptPrompt(node: TaskNode): string {
+function acceptPrompt(node: TaskNode, tag: string): string {
   return (
     `请验收执行结果是否达成验收点。\n` +
-    `验收点:${node.plan.acceptance || '(本节点未定义验收点,请依据目标判断:' + ctxGoal(node) + ')'}\n` +
-    `执行状态:${node.execStatus || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
+    `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
+    `执行状态:${quote(node.execStatus) || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
     `输出:{ "pass":boolean, "blocking":string[], "comments":string }。` +
-    answerRule(ANSWER_TAGS.verdict)
+    answerRule(tag)
   )
 }
 // Integration acceptance judges CHILD evidence against the parent goal. acceptPrompt would
 // show only the parent's own execStatus — which for a decompose node is empty.
-function integratePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): string {
+function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = ""): string {
   // A child missing from the map is REPORTED, not filtered away: silently shrinking the
   // evidence list would let a parent be accepted on the strength of the children that
   // happen to still be there.
@@ -155,17 +207,17 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, feedback = ''): strin
     .map(id => {
       const c = ctx.byId.get(id)
       return c
-        ? `### ${c.title}\n- 状态: ${c.status}\n- 执行状态: ${c.execStatus || '(无)'}\n- 验收点: ${c.plan.acceptance || '(无)'}`
-        : `### ${id}\n- 状态: (节点缺失,无法核实其结果)`
+        ? `### ${quote(c.title)}\n- 状态: ${c.status}\n- 执行状态: ${quote(c.execStatus) || '(无)'}\n- 验收点: ${quote(c.plan.acceptance) || '(无)'}`
+        : `### ${quote(id)}\n- 状态: (节点缺失,无法核实其结果)`
     })
     .join('\n')
   return (
     `请验收"全部子任务的结果合起来是否达成本节点目标"。\n` +
-    `父目标:${ctxGoal(node)}\n父验收点:${node.plan.acceptance || '(无)'}\n\n` +
+    `父目标:${quote(ctxGoal(node))}\n父验收点:${quote(node.plan.acceptance) || '(无)'}\n\n` +
     `子任务结果:\n${children || '(无子任务)'}\n\n` +
-    (feedback ? `上一轮集成验收阻断意见,请复核是否已解决:\n${feedback}\n\n` : '') +
+    (feedback ? `上一轮集成验收阻断意见,请复核是否已解决:\n${quote(feedback)}\n\n` : '') +
     `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +
-    answerRule(ANSWER_TAGS.verdict)
+    answerRule(tag)
   )
 }
 
@@ -192,19 +244,28 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
   // retry, it does not instantly kill the run.
   for (;;) {
     if (!(await commit(node, 'PLANNING', ctx))) return
-    const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, ctx, feedback), signal: ctx.signal })
+    const planTag = answerTag(ANSWER_TAGS.plan)
+    const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, ctx, planTag, feedback), signal: ctx.signal })
     if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
-    const parsed = parsePlanOutput(res.text)
+    const parsed = parsePlanOutput(res.text, planTag)
     node.kind = parsed.kind
     node.plan = parsed.plan
     const lastChildren = parsed.children
     if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
-    const rec = await runRoundtable({ phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1, system: 'review', prompt: reviewPrompt(node), runAgent: ctx.runAgent, signal: ctx.signal })
+    const { rec, infraExhausted } = await roundtableWithInfraRetry({
+      phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
+      system: 'review', buildPrompt: tag => reviewPrompt(node, tag), ctx,
+    })
     node.reviewLog.push(rec)
     // runRoundtable resolves even when the run was cancelled mid-flight (it collects
     // whatever settled). Without this the node would go on to commit READY/WAITING_CHILDREN
     // after the user already cancelled.
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
+    if (infraExhausted) {
+      // Nobody judged the plan — say that rather than blaming the plan.
+      await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
+      return
+    }
     if (!rec.synthesized.pass) {
       node.iteration.planReview++
       feedback = rec.synthesized.blockingSummary
@@ -317,9 +378,10 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     if (!(await commit(node, 'EXECUTING', ctx))) return
     // node.execStatus still holds the PREVIOUS round's result here (it's overwritten below),
     // which is exactly what executePrompt renders on rework.
-    const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, feedback), cwd: node.worktree?.path, signal: ctx.signal })
+    const execTag = answerTag(ANSWER_TAGS.exec)
+    const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback), cwd: node.worktree?.path, signal: ctx.signal })
     if (!res.ok) { await blockWithReason(node, res.reason, ctx); return }
-    const reported = parseExecOutput(res.text).execStatus.trim()
+    const reported = parseExecOutput(res.text, execTag).execStatus.trim()
     // An executor that reports NOTHING has evidenced nothing. Sending a blank execStatus
     // into acceptance asks the reviewers to bless an empty slot — the one way a node can
     // reach ACCEPTED without any work having happened. Treat it as a failed round.
@@ -336,35 +398,31 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     }
     node.execStatus = reported
 
-    // Acceptance loop. An infra-only failure (the reviewer CALL failed) retries just the
-    // roundtable — redoing the executor's real work over a flaky connection would be wrong.
-    // Those retries get their OWN bound: charging them to the rework budget would let a
-    // flaky connection consume every attempt the executor was owed, exactly the coupling
-    // that made integration need its own counter.
-    let infraRetries = 0
-    for (;;) {
-      if (!(await commit(node, 'ACCEPTANCE', ctx))) return
-      const rec = await runRoundtable({ phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1, system: 'accept', prompt: acceptPrompt(node), runAgent: ctx.runAgent, signal: ctx.signal })
-      node.acceptLog.push(rec)
-      if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
-      if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
-      if (isInfraOnlyFailure(rec)) {
-        infraRetries++
-        if (infraRetries >= caps.maxIterations) {
-          // Nobody ever judged the work — say that, rather than blaming the work.
-          await blockWithReason(node, `验收角色连续 ${infraRetries} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
-          return
-        }
-        continue // retry the review only; the rework budget is untouched
-      }
-      node.iteration.acceptance++
-      if (node.iteration.acceptance >= caps.maxIterations) {
-        await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
-        return
-      }
-      feedback = rec.synthesized.blockingSummary
-      break // genuine rejection → rework the execution
+    // Acceptance. Reviewer-CALL failures retry the roundtable on their own budget (see
+    // roundtableWithInfraRetry) — redoing the executor's real work over a flaky connection
+    // would be wrong, and charging those retries to the rework budget would consume every
+    // attempt the executor was owed.
+    if (!(await commit(node, 'ACCEPTANCE', ctx))) return
+    const { rec, infraExhausted } = await roundtableWithInfraRetry({
+      phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
+      system: 'accept', buildPrompt: tag => acceptPrompt(node, tag), ctx,
+    })
+    node.acceptLog.push(rec)
+    if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
+    if (infraExhausted) {
+      // Nobody ever judged the work — say that, rather than blaming the work.
+      await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
+      return
     }
+    if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
+    node.iteration.acceptance++
+    if (node.iteration.acceptance >= caps.maxIterations) {
+      await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
+      return
+    }
+    // Keep the REAL blockers: overwriting them with a generic message would send the rework
+    // prompt back without the reason the work was actually rejected.
+    feedback = rec.synthesized.blockingSummary
     if (!(await commit(node, 'REWORK', ctx))) return
   }
 }
@@ -379,14 +437,20 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
   // so a node that spent `acceptance` elsewhere still gets a full integration allowance.
   for (;;) {
     if (!(await commit(node, 'INTEGRATION_ACCEPT', ctx))) return
-    const rec = await runRoundtable({
+    const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept,
       round: node.iteration.integration + 1, system: 'integrate',
-      prompt: integratePrompt(node, ctx, feedback), // child evidence, NOT acceptPrompt
-      runAgent: ctx.runAgent, signal: ctx.signal,
+      buildPrompt: tag => integratePrompt(node, ctx, tag, feedback), // child evidence, NOT acceptPrompt
+      ctx,
     })
     node.acceptLog.push(rec)
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
+    if (infraExhausted) {
+      // A decompose node whose children ALL succeeded must not be thrown away because the
+      // reviewer's connection failed three times.
+      await blockWithReason(node, `集成验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
+      return
+    }
     if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
     node.iteration.integration++
     if (node.iteration.integration >= caps.maxIterations) {

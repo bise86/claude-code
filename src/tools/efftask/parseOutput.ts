@@ -14,6 +14,24 @@ import type { NodeKind, NodePlan, Verdict } from './types.js'
 export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec' } as const
 export type AnswerTag = (typeof ANSWER_TAGS)[keyof typeof ANSWER_TAGS]
 
+/**
+ * A per-call answer tag: the base tag plus random letters, e.g. `verdictqxrtplbz`.
+ *
+ * Defence in depth against a planted verdict. Evidence shown to a reviewer is written by
+ * another agent, so a plain `verdict` tag is guessable and forgeable: an executor can embed
+ * a ```verdict block claiming pass:true, and if the reviewer answers in prose that planted
+ * block is the only tagged verdict in the reply. An agent cannot plant a tag it has never
+ * seen. (Fences are also neutralised on the way in — see quote() in pipeline.ts — so this
+ * is the second lock, not the only one.)
+ *
+ * Letters only: FENCE_RE captures `[A-Za-z]+`.
+ */
+export function answerTag(base: AnswerTag): string {
+  let n = ''
+  for (let i = 0; i < 8; i++) n += String.fromCharCode(97 + Math.floor(Math.random() * 26))
+  return `${base}${n}`
+}
+
 type Candidate = { obj: Record<string, unknown>; tagged: boolean }
 
 /** Every fenced block plus the bare-brace slice, parsed; unparseable ones dropped. */
@@ -56,7 +74,7 @@ function sliceTopLevelObject(t: string): string | null {
   return null
 }
 
-function collectCandidates(text: string, preferTag?: AnswerTag): Candidate[] {
+function collectCandidates(text: string, preferTag?: string): Candidate[] {
   const tagged: string[] = []
   const generic: string[] = []
   for (const m of text.matchAll(FENCE_RE)) {
@@ -112,11 +130,18 @@ export function extractJsonBlock(text: string): unknown | null {
  */
 function pickAnswer(
   text: string,
-  tag: AnswerTag,
+  tag: string,
   matches: (o: Record<string, unknown>) => boolean,
+  // When true, ONLY a block carrying `tag` counts. Used for verdicts, where the prompt
+  // hands the model an unguessable per-call tag: anything else in the reply is quoted
+  // context, and quoted context is attacker-controlled (a node's execStatus is written by
+  // another agent and shown to the reviewer as evidence). Falling back to "any object of
+  // the right shape anywhere in the reply" lets that evidence BE the verdict.
+  requireTag = false,
 ): { obj: Record<string, unknown> | null; ambiguous: boolean } {
   const candidates = collectCandidates(text, tag).filter(c => matches(c.obj))
   const tagged = candidates.filter(c => c.tagged)
+  if (requireTag) return { obj: tagged[0]?.obj ?? null, ambiguous: tagged.length > 1 }
   // Duplicates are ambiguous in BOTH groups. The tag says "this is my answer", so
   // two of them is still two answers — a model that re-tags a recap of a stale
   // verdict would otherwise win on recency, which is the exact failure this tag
@@ -134,10 +159,10 @@ function str(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback
 }
 
-export function parsePlanOutput(text: string): { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] } {
+export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] } {
   // A plan carries at least one plan-ish key; a bare echo of the goal has none.
   // Ambiguity is tolerated here: a wrong plan is caught by the review roundtable.
-  const { obj } = pickAnswer(text, ANSWER_TAGS.plan, o => 'solution' in o || 'kind' in o || 'children' in o)
+  const { obj } = pickAnswer(text, tag, o => 'solution' in o || 'kind' in o || 'children' in o)
   const plan: NodePlan = {
     solution: str(obj?.solution, text.trim()),
     keyPoints: str(obj?.keyPoints),
@@ -155,20 +180,32 @@ export function parsePlanOutput(text: string): { kind: NodeKind; plan: NodePlan;
   return { kind, plan, children }
 }
 
-export function parseVerdict(text: string, role: string): Verdict {
+export function parseVerdict(text: string, role: string, tag?: string): Verdict {
   // FAIL CLOSED. A verdict is the one output where guessing wrong in the "pass"
   // direction lets unfinished work through, so anything short of one unmistakable
   // verdict — none found, or two same-shaped blocks we cannot rank — is a rejection.
   // Costing an iteration is recoverable; silently accepting a stale pass is not.
-  const { obj, ambiguous } = pickAnswer(text, ANSWER_TAGS.verdict, o => typeof o.pass === 'boolean')
+  //
+  // When the caller supplied a per-call tag, the prompt told the reviewer that exact,
+  // unguessable string, so ONLY a block carrying it is this reviewer's answer. Everything
+  // else in the reply is quoted context — and context is attacker-controlled: a node's
+  // execStatus is written by another agent and shown to the reviewer as evidence, so a
+  // planted `{"pass":true}` there would otherwise be read as the verdict itself.
+  const expected = tag ?? ANSWER_TAGS.verdict
+  const { obj, ambiguous } = pickAnswer(text, expected, o => typeof o.pass === 'boolean', tag !== undefined)
   if (!obj) {
-    return { role, pass: false, blocking: ['无法解析该角色的裁决输出;按不通过处理'], comments: text.trim().slice(0, 2000) }
+    return {
+      role,
+      pass: false,
+      blocking: [`未找到本轮的 \`\`\`${expected} 裁决块;按不通过处理`],
+      comments: text.trim().slice(0, 2000),
+    }
   }
   if (ambiguous) {
     return {
       role,
       pass: false,
-      blocking: [`回复中有多个裁决块,无法判定哪个是本轮结论;请只输出一个 \`\`\`${ANSWER_TAGS.verdict} 块,且位于回复末尾`],
+      blocking: [`回复中有多个裁决块,无法判定哪个是本轮结论;请只输出一个 \`\`\`${expected} 块,且位于回复末尾`],
       comments: text.trim().slice(0, 2000),
     }
   }
@@ -176,8 +213,8 @@ export function parseVerdict(text: string, role: string): Verdict {
   return { role, pass: obj.pass === true && blocking.length === 0, blocking, comments: str(obj.comments) }
 }
 
-export function parseExecOutput(text: string): { execStatus: string } {
-  const { obj } = pickAnswer(text, ANSWER_TAGS.exec, o => typeof o.execStatus === 'string')
+export function parseExecOutput(text: string, tag: string = ANSWER_TAGS.exec): { execStatus: string } {
+  const { obj } = pickAnswer(text, tag, o => typeof o.execStatus === 'string')
   if (obj) return { execStatus: str(obj.execStatus) }
   return { execStatus: text.trim() }
 }
