@@ -282,3 +282,67 @@ describe('the deadline must not turn a provider error into a crash report', () =
     }
   })
 })
+
+describe('a reviewer must not get its own MCP tools back after the read-only gate', () => {
+  const mcpAgent = {
+    agentType: 'sec',
+    mcpServers: [{ name: 'writer', command: 'x' }],
+  } as unknown as import('../AgentTool/loadAgentsDir.js').AgentDefinition
+
+  /**
+   * NOTE the seam. Asserting on the FINAL availableTools cannot detect this: the MCP merge
+   * happens inside the real runAgent, which the injected runAgentImpl replaces, so such an
+   * assertion is green on unfixed code. The observable at this layer is the agentDefinition
+   * handed to runAgent — if it still carries mcpServers, runAgent will merge those tools
+   * back in after the per-phase filter.
+   */
+  const seenDefs: Record<string, unknown> = {}
+  const fnFor = () => {
+    async function* fake(args: { agentDefinition: { agentType: string; mcpServers?: unknown } }): AsyncGenerator<any> {
+      seenDefs[args.agentDefinition.agentType] = args.agentDefinition.mcpServers
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }
+    }
+    return makeRunAgentFn({
+      toolUseContext: {} as any,
+      canUseTool: (async () => ({ behavior: 'allow' })) as any,
+      availableTools: [{ name: 'Write' }] as any,
+      readOnlyTools: [{ name: 'Read' }] as any,
+      activeAgents: [mcpAgent],
+      mainModelDefault: { agentType: 'main' } as any,
+      runAgentImpl: fake as any,
+    })
+  }
+
+  it('strips mcpServers for every non-execute phase', async () => {
+    // Otherwise runAgent merges agentMcpTools back AFTER the per-phase filter, so a
+    // review/accept role reaches its own (possibly write-capable) MCP tools and can fix the
+    // work itself before passing it — the executor/reviewer separation bypassed.
+    for (const phase of ['plan', 'review', 'accept', 'observer'] as const) {
+      seenDefs.sec = 'unset'
+      await fnFor()({
+        phase, node: {} as any, role: { roleName: 'sec' }, system: 's', prompt: 'p',
+        signal: new AbortController().signal,
+      })
+      expect(`${phase}:${seenDefs.sec}`).toBe(`${phase}:undefined`)
+    }
+  })
+
+  it('leaves the execute phase untouched — that role is SUPPOSED to change the repo', async () => {
+    seenDefs.sec = 'unset'
+    await fnFor()({
+      phase: 'execute', node: {} as any, role: { roleName: 'sec' }, system: 's', prompt: 'p',
+      signal: new AbortController().signal,
+    })
+    expect(Array.isArray(seenDefs.sec)).toBe(true)
+  })
+
+  it('does not mutate the shared agent definition', async () => {
+    // activeAgents is the session-wide roster; clobbering it would disable MCP for every
+    // later AgentTool call in the session.
+    await fnFor()({
+      phase: 'review', node: {} as any, role: { roleName: 'sec' }, system: 's', prompt: 'p',
+      signal: new AbortController().signal,
+    })
+    expect((mcpAgent as { mcpServers?: unknown[] }).mcpServers).toHaveLength(1)
+  })
+})

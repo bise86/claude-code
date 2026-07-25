@@ -208,5 +208,5 @@ export function parallelismLine(config: EffTaskConfig, opts: { editable: boolean
   // An earlier wording said "读取…验收阶段并行". 读取 is not a phase of this product at all
   // (it was a mistranslation of "read-only phases"), and 验收 is serial for every executable
   // leaf — measured peak accept concurrency 1 at parallelism 20.
-  return `并行数: ${config.parallelism}（方案/评审阶段并行;执行与叶子验收串行,隔离见 P2b 计划)${hint}`
+  return `并行数: ${config.parallelism}（方案/评审阶段并行;执行与叶子验收串行,隔离见 P2b 计划）${hint}`
 }

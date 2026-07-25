@@ -65,9 +65,34 @@ export function makeRunAgentFn(deps: {
     // next phase call still launches a real, tool-bearing agent (write-capable in the
     // execute phase). runRoundtable guards the same way for the same reason.
     if (req.signal.aborted) return ''
-    const agentDefinition = pickAgentDefinition(req.role, deps.activeAgents, deps.mainModelDefault)
+    const picked = pickAgentDefinition(req.role, deps.activeAgents, deps.mainModelDefault)
     // Per-phase tool gating: only the execute phase gets the write-capable tool pool.
     const tools: Tools = req.phase === 'execute' ? deps.availableTools : deps.readOnlyTools
+    /**
+     * Strip the role's OWN MCP servers outside the execute phase.
+     *
+     * The tool gating above is applied by runAgent via resolveAgentTools — and then runAgent
+     * merges `agentMcpTools` back in AFTERWARDS (runAgent.ts, `uniqBy([...resolvedTools,
+     * ...agentMcpTools])`). So a custom agent that declares `mcpServers` and is bound as a
+     * review/accept role gets its own, possibly write-capable, MCP tools back: that
+     * "reviewer" can fix the problem itself and then pass the work — exactly what separating
+     * executor from reviewer exists to prevent.
+     *
+     * Done HERE, caller-side, rather than by changing runAgent: `initializeAgentMcpServers`
+     * early-returns `tools: []` when `mcpServers` is empty, so the hole closes completely
+     * while every other AgentTool caller keeps its current contract. It also avoids spawning
+     * arbitrary MCP server processes for a read-only reviewer.
+     *
+     * Honest cost: this also denies reviewers any READ-ONLY MCP tools. And the practical
+     * severity today is moderated by canUseTool still prompting — fully silent self-approval
+     * needs bypassPermissions or an already-allowlisted MCP tool.
+     *
+     * `disallowedTools` was the obvious alternative and does NOT work: it is consumed only
+     * inside resolveAgentTools, which runs BEFORE the MCP merge, and filterToolsForAgent
+     * returns true unconditionally for any `mcp__*` name.
+     */
+    const agentDefinition: AgentDefinition =
+      req.phase === 'execute' ? picked : { ...picked, mcpServers: undefined }
     const promptMessages: Message[] = [
       createUserMessage({ content: [{ type: 'text', text: `${req.system}\n\n${req.prompt}` }] }),
     ]
