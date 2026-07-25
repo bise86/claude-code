@@ -81,12 +81,23 @@ export function serializeNode(node: TaskNode): string {
 export function parseNodeFile(text: string): TaskNode {
   const m = text.match(/^---\n([\s\S]*?)\n---/)
   if (!m) throw new Error('efftask: node.md missing frontmatter')
-  // UNVALIDATED CAST: yamlParse returns `any`-shaped data straight off disk. P1 only
-  // round-trips files it wrote itself, so this is safe here. P2's resume path reads
-  // user-editable / possibly-stale files and MUST validate (status is a legal NodeStatus,
-  // deps/childIds are string[], iteration counters are numbers) BEFORE feeding the state
-  // machine — a malformed status would silently deadlock or skip the dependency gate.
-  return yamlParse(m[1]) as TaskNode
+  // MOSTLY-UNVALIDATED CAST: yamlParse returns `any`-shaped data straight off disk. The
+  // resume path reads user-editable / possibly-stale files and must still validate the
+  // rest (status is a legal NodeStatus, deps/childIds are string[]) before feeding the
+  // state machine — a malformed status would silently deadlock or skip the dependency gate.
+  const node = yamlParse(m[1]) as TaskNode
+  // Counters are normalised HERE because they are the one field whose absence is actively
+  // dangerous rather than merely wrong: a file written by an older build has no
+  // `integration` counter, and `undefined + 1` is NaN, which never satisfies
+  // `>= maxIterations` — turning a bounded retry loop into an unbounded one that keeps
+  // issuing real model calls. Missing counters read as 0, not as "no limit".
+  const it = (node.iteration ?? {}) as Partial<TaskNode['iteration']>
+  node.iteration = {
+    planReview: Number.isFinite(it.planReview) ? (it.planReview as number) : 0,
+    acceptance: Number.isFinite(it.acceptance) ? (it.acceptance as number) : 0,
+    integration: Number.isFinite(it.integration) ? (it.integration as number) : 0,
+  }
+  return node
 }
 
 function nodeMdPath(runDir: string, nodeId: string): string {

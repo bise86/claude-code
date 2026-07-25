@@ -108,12 +108,26 @@ describe('persistence', () => {
     n.execStatus = '改了文件\n---\n# 标题\n```json\n{"a":1}\n```\n\t制表符 🎉 中文'
     n.plan = { solution: '---\n方案', keyPoints: '&anchor', risks: '2026-07-25', acceptance: 'yes' }
     n.worktree = { branch: 'efftask/001/root-01-x', path: '/tmp/wt' }
-    n.iteration = { planReview: 2, acceptance: 1 }
+    n.iteration = { planReview: 2, acceptance: 1, integration: 0 }
     n.reviewLog = [{ round: 1, verdicts: [{ role: 'arch', pass: false, blocking: ['缺验收点'], comments: 'c' }], synthesized: { pass: false, blockingSummary: '[arch] 缺验收点' } }]
     n.acceptLog = []
     n.score = { plan: { role: 'obs', score: 88, rationale: 'ok' }, exec: { role: 'obs', score: 91, rationale: 'good' } }
     const back = parseNodeFile(serializeNode(n))
     expect(back).toEqual(n) // every field survives, byte-for-byte
+  })
+
+  it('normalises missing iteration counters to 0 when reading an older node.md', async () => {
+    // A file written by an earlier build has no `integration` counter. Left undefined it
+    // would make `undefined + 1 === NaN`, and `NaN >= maxIterations` is false — turning a
+    // bounded retry loop into an unbounded one issuing real model calls.
+    const n = createNode({ id: 'root', title: 'T', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    const text = serializeNode(n).replace(/\n {2}integration: 0/, '')
+    expect(text).not.toContain('integration')
+    const back = parseNodeFile(text)
+    expect(back.iteration).toEqual({ planReview: 0, acceptance: 0, integration: 0 })
+    // and a garbage counter is not trusted either
+    const junk = parseNodeFile(serializeNode(n).replace('planReview: 0', 'planReview: "many"'))
+    expect(junk.iteration.planReview).toBe(0)
   })
 
   it('loadRun keeps the nodes it can read when one node.md is corrupt', async () => {

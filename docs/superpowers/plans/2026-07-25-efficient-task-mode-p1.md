@@ -1036,12 +1036,23 @@ export function serializeNode(node: TaskNode): string {
 export function parseNodeFile(text: string): TaskNode {
   const m = text.match(/^---\n([\s\S]*?)\n---/)
   if (!m) throw new Error('efftask: node.md missing frontmatter')
-  // UNVALIDATED CAST: yamlParse returns `any`-shaped data straight off disk. P1 only
-  // round-trips files it wrote itself, so this is safe here. P2's resume path reads
-  // user-editable / possibly-stale files and MUST validate (status is a legal NodeStatus,
-  // deps/childIds are string[], iteration counters are numbers) BEFORE feeding the state
-  // machine — a malformed status would silently deadlock or skip the dependency gate.
-  return yamlParse(m[1]) as TaskNode
+  // MOSTLY-UNVALIDATED CAST: yamlParse returns `any`-shaped data straight off disk. The
+  // resume path reads user-editable / possibly-stale files and must still validate the
+  // rest (status is a legal NodeStatus, deps/childIds are string[]) before feeding the
+  // state machine — a malformed status would silently deadlock or skip the dependency gate.
+  const node = yamlParse(m[1]) as TaskNode
+  // Counters are normalised HERE because they are the one field whose absence is actively
+  // dangerous rather than merely wrong: a file written by an older build has no
+  // `integration` counter, and `undefined + 1` is NaN, which never satisfies
+  // `>= maxIterations` — turning a bounded retry loop into an unbounded one that keeps
+  // issuing real model calls. Missing counters read as 0, not as "no limit".
+  const it = (node.iteration ?? {}) as Partial<TaskNode['iteration']>
+  node.iteration = {
+    planReview: Number.isFinite(it.planReview) ? (it.planReview as number) : 0,
+    acceptance: Number.isFinite(it.acceptance) ? (it.acceptance as number) : 0,
+    integration: Number.isFinite(it.integration) ? (it.integration as number) : 0,
+  }
+  return node
 }
 
 function nodeMdPath(runDir: string, nodeId: string): string {
@@ -1611,7 +1622,7 @@ import { createNode } from './types.js'
 import { ANSWER_TAGS, parseExecOutput, parsePlanOutput, type AnswerTag } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
-import { hasCycle } from './stateMachine.js'
+import { hasCycle, isTerminal } from './stateMachine.js'
 
 export interface PipelineCtx {
   config: EffTaskConfig
@@ -1783,9 +1794,10 @@ function firstRole(node: TaskNode, phase: 'plan' | 'execute') {
 }
 
 // Re-entering a finished node would append a second verdict log and could flip a BLOCKED
-// node to ACCEPTED. Terminal means terminal.
+// node to ACCEPTED. Terminal means terminal. (isTerminal is the state machine's own rule —
+// don't restate it here, or the two definitions will drift.)
 function isFinished(node: TaskNode): boolean {
-  return node.status === 'ACCEPTED' || node.status === 'BLOCKED'
+  return isTerminal(node.status)
 }
 
 export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void> {
@@ -1918,6 +1930,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
   let feedback = '' // previous round's acceptance blockingSummary; drives the REWORK prompt
+  let emptyReports = 0
   for (;;) {
     if (!(await commit(node, 'EXECUTING', ctx))) return
     // node.execStatus still holds the PREVIOUS round's result here (it's overwritten below),
@@ -1929,9 +1942,10 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // into acceptance asks the reviewers to bless an empty slot — the one way a node can
     // reach ACCEPTED without any work having happened. Treat it as a failed round.
     if (reported === '') {
+      emptyReports++
       node.iteration.acceptance++
       if (node.iteration.acceptance >= caps.maxIterations) {
-        await blockWithReason(node, `执行阶段连续 ${caps.maxIterations} 次未报告任何产出`, ctx)
+        await blockWithReason(node, `执行阶段未报告任何产出(第 ${emptyReports} 次),已达迭代上限 ${caps.maxIterations}`, ctx)
         return
       }
       feedback = '上一轮执行没有报告任何产出。请真正执行任务,并在 execStatus 里写明具体做了什么、结果如何。'
@@ -1942,18 +1956,30 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
 
     // Acceptance loop. An infra-only failure (the reviewer CALL failed) retries just the
     // roundtable — redoing the executor's real work over a flaky connection would be wrong.
+    // Those retries get their OWN bound: charging them to the rework budget would let a
+    // flaky connection consume every attempt the executor was owed, exactly the coupling
+    // that made integration need its own counter.
+    let infraRetries = 0
     for (;;) {
       if (!(await commit(node, 'ACCEPTANCE', ctx))) return
       const rec = await runRoundtable({ phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1, system: 'accept', prompt: acceptPrompt(node), runAgent: ctx.runAgent, signal: ctx.signal })
       node.acceptLog.push(rec)
       if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
       if (rec.synthesized.pass) { await commit(node, 'ACCEPTED', ctx); return }
+      if (isInfraOnlyFailure(rec)) {
+        infraRetries++
+        if (infraRetries >= caps.maxIterations) {
+          // Nobody ever judged the work — say that, rather than blaming the work.
+          await blockWithReason(node, `验收角色连续 ${infraRetries} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx)
+          return
+        }
+        continue // retry the review only; the rework budget is untouched
+      }
       node.iteration.acceptance++
       if (node.iteration.acceptance >= caps.maxIterations) {
         await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx)
         return
       }
-      if (isInfraOnlyFailure(rec)) continue // retry the review only
       feedback = rec.synthesized.blockingSummary
       break // genuine rejection → rework the execution
     }
