@@ -36,7 +36,8 @@ function fakeTty() {
   // Cursor-move sequences ARE the spacing, so they become a space; the bare ESC byte that
   // precedes them must then be removed or it lands between every pair of words.
   const plain = (): string => frame.replace(/\[[0-9;>?]*[a-zA-Z]/g, ' ').replace(/\u001b/g, '')
-  return { stdin, stdout, lastFrame: plain, reset: () => { frame = '' } }
+  // rawFrame KEEPS the escape codes — `plain` strips exactly what a colour assertion needs.
+  return { stdin, stdout, lastFrame: plain, rawFrame: () => frame, reset: () => { frame = '' } }
 }
 
 const mk = (over: Partial<TaskNode> = {}): TaskNode => ({
@@ -181,6 +182,101 @@ describe('TaskTreePanel is navigable with real keypresses (vendored renderer)', 
     stdin.press(ESC); await tickEsc()
     expect(exits).toBe(0)
     expect(lastFrame()).not.toContain('回车看详情')
+    app.unmount()
+  })
+})
+
+describe('status colours must be real theme keys, not bare colour names', () => {
+  // A review caught the whole efftask UI rendering monochrome. 'green'/'red'/'yellow'/'gray'
+  // are NOT colours to this renderer: ThemedText.resolveColor passes anything that is not
+  // rgb()/#/ansi256()/ansi: through as a THEME KEY, the theme has no such keys, so it
+  // resolved to undefined and emitted nothing. Measured: color="green" → 0 SGR codes;
+  // color="success" → ESC[32m.
+  //
+  // Asserting on emitted escape codes turned out to be the wrong probe — the renderer decides
+  // colour support at module load, so under `bun test` it emits none and the assertion
+  // passes for the wrong reason. Checking the NAMES against the real theme is env-independent
+  // and lands exactly on the defect.
+  it('every colour this UI asks for exists in the theme', async () => {
+    const { getTheme } = await import('../../utils/theme.js')
+    const theme = getTheme() as unknown as Record<string, unknown>
+    const used = ['success', 'warning', 'inactive', 'error']
+    for (const key of used) {
+      expect(`${key}:${typeof theme[key]}`).toBe(`${key}:string`)
+    }
+    // …and the names that silently did nothing must not come back.
+    for (const bad of ['green', 'red', 'yellow', 'gray', 'cyan']) {
+      expect(`${bad}:${theme[bad] === undefined}`).toBe(`${bad}:true`)
+    }
+  })
+
+  it('no efftask component passes a bare colour name', async () => {
+    const files = [
+      'TaskTreePanel.tsx', 'NodeDetail.tsx', 'ConfirmStartup.tsx',
+      'ConfirmResume.tsx', 'ResumePicker.tsx', 'efftask.tsx',
+    ]
+    const fs = await import('node:fs/promises')
+    for (const f of files) {
+      const src = await fs.readFile(new URL(f, import.meta.url), 'utf-8')
+      for (const bad of ['green', 'red', 'yellow', 'gray', 'cyan']) {
+        expect(`${f}/${bad}:${src.includes(`color="${bad}"`) || src.includes(`'${bad}'`)}`)
+          .toBe(`${f}/${bad}:false`)
+      }
+    }
+  })
+})
+
+describe('评分必须在界面上可见(spec §10.1 / §10.2)', () => {
+  // It was computed, persisted to node.md's frontmatter, and shown NOWHERE — a user who
+  // configured an observer got a number that only existed on disk.
+  const scored = (): TaskNode[] => {
+    const t = tree()
+    t[2].score = { plan: { role: 'w', score: 88, rationale: '方案清楚' }, exec: { role: 'w', score: 71, rationale: '测试偏少' } }
+    return t
+  }
+
+  it('shows the WORST dimension inline on the row', async () => {
+    // One number fits a row; showing the flattering one would hide exactly the case a
+    // threshold exists to catch.
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel, { nodes: scored(), runId: '003', interactive: true } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).toContain('★71')
+    app.unmount()
+  })
+
+  it('shows both dimensions AND their reasons in the detail view', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel, { nodes: scored(), runId: '003', interactive: true } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    for (let i = 0; i < 2; i++) { t.stdin.press(DOWN); await tick() } // → 写 schema
+    t.reset()
+    t.stdin.press('\r')
+    await tick()
+    const d = t.lastFrame()
+    expect(d).toContain('评分')
+    expect(d).toContain('88')
+    expect(d).toContain('方案清楚')
+    expect(d).toContain('测试偏少')
+    app.unmount()
+  })
+
+  it('an unscored node adds no empty 评分 section', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel, { nodes: tree(), runId: '003', interactive: true } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    expect(t.lastFrame()).not.toContain('评分')
     app.unmount()
   })
 })

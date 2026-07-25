@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
 import type { EffTaskConfig } from '../../tools/efftask/types.js'
-import { clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, type StartupDecision } from '../../tools/efftask/startupConfirm.js'
+import { capsLine, clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, type StartupDecision } from '../../tools/efftask/startupConfirm.js'
 
 export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: StartupDecision) => void }): React.ReactElement {
   // 用户原话:"默认5个,需求提示词可指定,可跟用户确认修改" —— the fourth clause. Both
@@ -23,11 +23,11 @@ export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: S
       {rosterLines(props.config).map(line => <Text key={line}>  {line}</Text>)}
       {noticeLines(props.config).length > 0 && (
         <Box flexDirection="column">
-          <Text color="yellow">你的请求中有以下部分不会生效:</Text>
-          {noticeLines(props.config).map(l => <Text key={l} color="yellow">  · {l}</Text>)}
+          <Text color="warning">你的请求中有以下部分不会生效:</Text>
+          {noticeLines(props.config).map(l => <Text key={l} color="warning">  · {l}</Text>)}
         </Box>
       )}
-      <Text>安全阀: 深度{props.config.caps.maxDepth} / 节点{props.config.caps.maxNodes} / 迭代{props.config.caps.maxIterations}</Text>
+      <Text>{capsLine(props.config)}</Text>
       <Text dimColor>回车/y 开始 · Esc/n 取消</Text>
     </Box>
   )

@@ -38,15 +38,15 @@ export function ConfirmResume(props: {
       {rosterLines(props.config).map(line => <Text key={line}>  {line}</Text>)}
       {noticeLines(props.config).length > 0 && (
         <Box flexDirection="column">
-          <Text color="yellow">以下请求不会生效:</Text>
-          {noticeLines(props.config).map(l => <Text key={l} color="yellow">  · {l}</Text>)}
+          <Text color="warning">以下请求不会生效:</Text>
+          {noticeLines(props.config).map(l => <Text key={l} color="warning">  · {l}</Text>)}
         </Box>
       )}
       {sections.map(sec => (
         <Box key={sec.heading} flexDirection="column">
-          <Text color={sec.tone === 'warn' ? 'yellow' : undefined} bold>{sec.heading}</Text>
+          <Text color={sec.tone === 'warn' ? 'warning' : undefined} bold>{sec.heading}</Text>
           {sec.lines.map(l => (
-            <Text key={l} color={sec.tone === 'warn' ? 'yellow' : undefined} dimColor={sec.tone !== 'warn'}>  · {l}</Text>
+            <Text key={l} color={sec.tone === 'warn' ? 'warning' : undefined} dimColor={sec.tone !== 'warn'}>  · {l}</Text>
           ))}
         </Box>
       ))}

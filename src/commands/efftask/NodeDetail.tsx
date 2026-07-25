@@ -3,7 +3,7 @@ import { Box, Text } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus } from '../../tools/efftask/stateMachine.js'
 
-const COLOR = { done: 'green', running: 'yellow', queued: 'gray', failed: 'red' } as const
+const COLOR = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' } as const
 
 /** Clip to CODE POINTS and cap the line count so one huge plan cannot push the tree off screen. */
 function block(text: string, maxLines = 12, width = 100): string[] {
@@ -37,6 +37,19 @@ function Section(props: { title: string; body: string; color?: string }): React.
  * (persistence.stripControl); this renders the in-memory node, so it clips by code points
  * rather than trusting either the width or the length of any field.
  */
+/**
+ * 观察评分, with the reasons — spec §10.2 lists 评分 among the detail view's contents.
+ *
+ * It was computed, persisted to node.md's frontmatter and then shown NOWHERE: the tree row
+ * omitted it and this view omitted it, so a user who configured an observer got a number
+ * that only existed on disk. Section() drops an empty body, so an unscored node adds nothing.
+ */
+function scoreBody(n: TaskNode): string {
+  const line = (label: string, s?: { score: number; rationale: string }): string =>
+    s ? `${label}: ${s.score}${s.rationale ? ' — ' + s.rationale : ''}` : ''
+  return [line('方案质量', n.score.plan), line('执行质量', n.score.exec)].filter(Boolean).join('\n')
+}
+
 export function NodeDetail(props: { node: TaskNode; elapsed: string }): React.ReactElement {
   const n = props.node
   const ui = uiStatus(n.status)
@@ -56,7 +69,8 @@ export function NodeDetail(props: { node: TaskNode; elapsed: string }): React.Re
       <Section title="风险点" body={n.plan.risks} />
       <Section title="验收点" body={n.plan.acceptance} />
       <Section title="执行状态" body={n.execStatus} />
-      <Section title="阻断原因" body={n.blockedReason} color="red" />
+      <Section title="阻断原因" body={n.blockedReason} color="error" />
+      <Section title="评分" body={scoreBody(n)} />
       <Section title="评审记录" body={rounds(n.reviewLog)} />
       <Section title="验收记录" body={rounds(n.acceptLog)} />
       {n.worktree ? <Section title="隔离工作区" body={`${n.worktree.branch}\n${n.worktree.path}`} /> : null}

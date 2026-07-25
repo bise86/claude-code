@@ -33,7 +33,7 @@ export function ResumePicker(props: {
     return (
       <Box flexDirection="column" borderStyle="round" paddingX={1}>
         <Text bold>高效任务模式 · 选择要恢复的 run</Text>
-        <Text color="yellow">没有可恢复的 run（.claude/efftask/ 下没有包含任何节点的目录）</Text>
+        <Text color="warning">没有可恢复的 run（.claude/efftask/ 下没有包含任何节点的目录）</Text>
         <Text dimColor>Esc/q 退出</Text>
       </Box>
     )
@@ -44,15 +44,15 @@ export function ResumePicker(props: {
       {runs.map((r, i) => {
         const active = i === cursor
         return (
-          <Text key={r.runId} color={active ? 'cyan' : undefined} bold={active}>
+          <Text key={r.runId} inverse={active} bold={active}>
             {active ? '❯' : ' '} {i < 9 ? `${i + 1}.` : '  '} {r.runId}  {clip(r.goalLine, 44)}
             {'  '}
-            <Text color="green">✓{r.counts.accepted}</Text>
+            <Text color="success">✓{r.counts.accepted}</Text>
             {' '}
-            <Text color="red">✗{r.counts.blocked}</Text>
+            <Text color="error">✗{r.counts.blocked}</Text>
             {' '}
             <Text dimColor>…{r.counts.pending}</Text>
-            {r.degraded ? <Text color="yellow">  (配置不完整)</Text> : null}
+            {r.degraded ? <Text color="warning">  (配置不完整)</Text> : null}
           </Text>
         )
       })}

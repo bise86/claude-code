@@ -213,3 +213,17 @@ export function parallelismLine(config: EffTaskConfig, opts: { editable: boolean
   // leaf — measured peak accept concurrency 1 at parallelism 20.
   return `并行数: ${config.parallelism}（方案/评审阶段并行;执行与叶子验收串行,隔离见 P2b 计划）${hint}`
 }
+
+/**
+ * 安全阀 line. scoreThreshold is included because it CHANGES BEHAVIOUR: a prompt saying
+ * "打分严格些" can turn 观察评分 from record-only into "低分返工一轮", and the gate said
+ * nothing about it. A gate that hides a behaviour switch is the failure this gate exists to
+ * prevent.
+ */
+export function capsLine(config: EffTaskConfig): string {
+  const c = config.caps
+  const score = c.scoreThreshold === undefined
+    ? '评分不触发返工'
+    : `评分低于 ${c.scoreThreshold} 触发一轮返工`
+  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}`
+}

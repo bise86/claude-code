@@ -4,7 +4,7 @@ import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus, type UiStatus } from '../../tools/efftask/stateMachine.js'
 import { NodeDetail } from './NodeDetail.js'
 
-const COLOR: Record<UiStatus, string> = { done: 'green', running: 'yellow', queued: 'gray', failed: 'red' }
+const COLOR: Record<UiStatus, string> = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' }
 const GLYPH: Record<UiStatus, string> = { done: '●', running: '◐', queued: '○', failed: '✗' }
 
 /**
@@ -146,8 +146,8 @@ export function TaskTreePanel(props: {
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>
         高效任务 · run {props.runId}{'  '}
-        <Text color="green">✓{counts.done}</Text> <Text color="yellow">◐{counts.running}</Text>{' '}
-        <Text color="gray">○{counts.queued}</Text> <Text color="red">✗{counts.failed}</Text>
+        <Text color="success">✓{counts.done}</Text> <Text color="warning">◐{counts.running}</Text>{' '}
+        <Text color="inactive">○{counts.queued}</Text> <Text color="error">✗{counts.failed}</Text>
       </Text>
       {rows.map(({ node: n, depth, hasKids }, i) => {
         const ui = uiStatus(n.status)
@@ -160,7 +160,7 @@ export function TaskTreePanel(props: {
             {'  '.repeat(depth)}
             {fold} {GLYPH[ui]} {n.title}{' '}
             <Text dimColor>
-              [{n.status}] {elapsed(n, nowMs)}{hidden}
+              [{n.status}] {elapsed(n, nowMs)}{scoreTag(n)}{hidden}
             </Text>
           </Text>
         )
@@ -170,6 +170,17 @@ export function TaskTreePanel(props: {
       ) : null}
     </Box>
   )
+}
+
+/**
+ * The inline score badge (spec §10.1 lists 评分 in the row format).
+ *
+ * The WORST of the two dimensions: a row has space for one number, and showing the flattering
+ * one would hide exactly the case a threshold is meant to catch.
+ */
+function scoreTag(n: TaskNode): string {
+  const s = [n.score.plan?.score, n.score.exec?.score].filter((x): x is number => typeof x === 'number')
+  return s.length > 0 ? ` ★${Math.min(...s)}` : ''
 }
 
 /** How many descendants a collapsed node is hiding — otherwise folding silently loses them. */

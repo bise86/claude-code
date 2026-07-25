@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -154,5 +154,26 @@ describe('resumeSummarySections tells the user what recovery actually did', () =
   it('announces guidance inherited from a previous resume', () => {
     const s = resumeSummarySections({ ...base, inheritedGuidance: '先从简' })
     expect(s.map(x => x.heading).join(' ')).toContain('沿用')
+  })
+})
+
+describe('capsLine discloses the scoring threshold, which CHANGES behaviour', () => {
+  const base: EffTaskConfig = {
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [],
+  }
+  it('says scoring will not rework when no threshold is set', () => {
+    expect(capsLine(base)).toContain('评分不触发返工')
+  })
+  it('names the threshold when one is set', () => {
+    // A prompt saying 打分严格些 can flip 观察评分 from record-only to "低分返工一轮".
+    // A gate that hides a behaviour switch is the failure this gate exists to prevent.
+    expect(capsLine({ ...base, caps: { ...DEFAULT_CAPS, scoreThreshold: 80 } }))
+      .toContain('评分低于 80 触发一轮返工')
+  })
+  it('still shows the other valves', () => {
+    expect(capsLine(base)).toContain('深度5')
+    expect(capsLine(base)).toContain('节点100')
+    expect(capsLine(base)).toContain('迭代3')
   })
 })

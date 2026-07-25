@@ -552,7 +552,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // Every branch below needs a key handler of its own: while a local-jsx dialog is mounted
   // the REPL disables Esc/Ctrl+C, so any view without one can wedge the whole session.
   if (phase === 'fatal') {
-    return <MessageView title="高效任务无法继续" body={fatal ?? '未知错误'} tone="red" onDismiss={bail} />
+    return <MessageView title="高效任务无法继续" body={fatal ?? '未知错误'} tone="error" onDismiss={bail} />
   }
   if (phase === 'picking') {
     if (!runs) return <MessageView title="高效任务 · 恢复" body="正在扫描可恢复的 run…" tone="dim" onDismiss={bail} />
@@ -584,7 +584,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
 
 /** A one-line status/error screen that can always be dismissed. */
 function MessageView(props: {
-  title: string; body: string; tone: 'red' | 'dim'; onDismiss: () => void
+  title: string; body: string; tone: 'error' | 'dim'; onDismiss: () => void
 }): React.ReactElement {
   useInput((input, key) => {
     if (key.return || key.escape || input.toLowerCase() === 'q') props.onDismiss()
@@ -592,7 +592,7 @@ function MessageView(props: {
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>{props.title}</Text>
-      <Text color={props.tone === 'red' ? 'red' : undefined} dimColor={props.tone === 'dim'}>{props.body}</Text>
+      <Text color={props.tone === 'error' ? 'error' : undefined} dimColor={props.tone === 'dim'}>{props.body}</Text>
       <Text dimColor>回车 / q / Esc 退出</Text>
     </Box>
   )
@@ -641,7 +641,7 @@ function DoneView(props: {
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">
-        <Text bold color={ok ? 'green' : 'red'}>
+        <Text bold color={ok ? 'success' : 'error'}>
           {ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
         </Text>
         {props.outcome?.reason ? <Text dimColor>原因: {props.outcome.reason}</Text> : null}
