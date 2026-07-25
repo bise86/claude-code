@@ -85,9 +85,20 @@ export function EffTaskDetailDialog({ task, onDone, onBack, onKill }: Props): Re
           </Text>
           <Box flexDirection="column">
             <Text dimColor>任务树与全部记录: {task.runDir}/run.md</Text>
-            {/* Resumability is the point of the run id; say the command rather than making
-                the user reconstruct it. */}
-            <Text dimColor>继续: /et --resume {task.runId}</Text>
+            {/* ONLY for a run that stopped without finishing, and it names BOTH commands.
+                A bare `继续: /et --resume <id>` was untrue twice over: for a COMPLETED run
+                there is nothing to continue (root is ACCEPTED, `run()` returns immediately),
+                and for a run stopped by a safety valve a plain `--resume` reopens nothing —
+                reseatTransientNodes only reseats interrupted / merge-conflict nodes, so it
+                reproduces the identical block having made zero model calls. */}
+            {task.status === 'failed' || task.status === 'killed' ? (
+              <>
+                <Text dimColor>继续未完成的部分: /et --resume {task.runId}</Text>
+                <Text dimColor>
+                  若有节点被安全阀停下(迭代/返工/超时上限): /et --resume {task.runId} --retry-blocked
+                </Text>
+              </>
+            ) : null}
           </Box>
         </Box>
       </Dialog>

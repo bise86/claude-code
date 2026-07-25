@@ -290,6 +290,11 @@ export function BackgroundTasksDialog({
         killMonitorMcp(currentSelection_0.id, setAppState);
       } else if (currentSelection_0.type === 'dream' && currentSelection_0.status === 'running') {
         void killDreamTask(currentSelection_0.id);
+      } else if (currentSelection_0.type === 'efftask' && currentSelection_0.status === 'running') {
+        // The `x → stop` hint below already lists 'efftask'. Without this branch the hint was
+        // false: selecting a 高效任务 row and pressing x did nothing, and the user had to
+        // discover that Enter → detail view was the only place the key worked.
+        void killEffTask(currentSelection_0.id);
       } else if (currentSelection_0.type === 'remote_agent' && currentSelection_0.status === 'running') {
         if (currentSelection_0.task.isUltraplan) {
           void stopUltraplan(currentSelection_0.id, currentSelection_0.task.sessionId, setAppState);
