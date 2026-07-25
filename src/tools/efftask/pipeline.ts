@@ -72,6 +72,16 @@ export interface PipelineCtx {
    * by hand; absent, the text degrades to a placeholder rather than to nothing.
    */
   runId?: string
+  /**
+   * 子 agent 实时输出 (spec §10.2). Every phase call streams its assistant messages here,
+   * tagged with the node they belong to.
+   *
+   * The plumbing already existed and was tested — `RunAgentFn` has taken an `onChunk` since
+   * P1 and runAgentAdapter implements it — but NOTHING in production ever passed one, so the
+   * detail view had no output to show. A declared-and-implemented-and-tested parameter with
+   * no caller is exactly the dead wire this project keeps finding.
+   */
+  onChunk?: (nodeId: string, text: string) => void
 }
 
 /**
@@ -134,7 +144,12 @@ type PhaseResult = { ok: true; text: string } | { ok: false; reason: string; tex
 // which records it into node.blockedReason and BLOCKs the node.
 async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promise<PhaseResult> {
   try {
-    const text = await ctx.runAgent(req)
+    // Tagged with the node so the detail view can show the right stream. A caller-supplied
+    // onChunk wins, so this never silently replaces a more specific one.
+    const text = await ctx.runAgent({
+      ...req,
+      onChunk: req.onChunk ?? (ctx.onChunk ? t => ctx.onChunk!(req.node.id, t) : undefined),
+    })
     if (ctx.signal.aborted) return { ok: false, reason: '已中断', text }
     return { ok: true, text }
   } catch (e) {
@@ -255,6 +270,7 @@ async function roundtableWithInfraRetry(args: {
       phase: args.phase, node: args.node, roles: args.roles, round: args.round,
       system: args.system, prompt: args.buildPrompt(tag),
       runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
+      onChunk: args.ctx.onChunk ? t => args.ctx.onChunk!(args.node.id, t) : undefined,
     })
     if (args.ctx.signal.aborted) return { rec, infraExhausted: false }
     if (!isInfraOnlyFailure(rec)) return { rec, infraExhausted: false }

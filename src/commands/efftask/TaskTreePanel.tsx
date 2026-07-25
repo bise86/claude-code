@@ -3,6 +3,7 @@ import { Box, Text, useInput } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus, type UiStatus } from '../../tools/efftask/stateMachine.js'
 import { NodeDetail } from './NodeDetail.js'
+import type { ChunkStore } from '../../tools/efftask/chunkBuffer.js'
 
 const COLOR: Record<UiStatus, string> = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' }
 const GLYPH: Record<UiStatus, string> = { done: '●', running: '◐', queued: '○', failed: '✗' }
@@ -95,6 +96,15 @@ export function TaskTreePanel(props: {
   /** Rows of tree drawn at once; the rest scrolls with the cursor. */
   maxRows?: number
   onExitKey?: () => void
+  /**
+   * 子 agent 实时输出 (spec §10.2). Read on demand by the detail view.
+   *
+   * A live store rather than React state on purpose: the stream fires once per assistant
+   * message for EVERY node in flight, and mirroring that into state would repaint the whole
+   * tree on each one. The panel already re-renders once a second while anything is running,
+   * which is the refresh rate a scrolling log needs.
+   */
+  chunks?: ChunkStore
 }): React.ReactElement {
   // Tick once a second so elapsed times keep moving even when no node transitions —
   // otherwise the panel only repaints on onUpdate and looks frozen during a long phase.
@@ -160,7 +170,19 @@ export function TaskTreePanel(props: {
     }
   }, { isActive: props.interactive === true })
 
-  if (detail) return <NodeDetail node={detail} elapsed={elapsed(detail, nowMs)} />
+  if (detail) {
+    return (
+      <NodeDetail
+        node={detail}
+        elapsed={elapsed(detail, nowMs)}
+        // 子 agent 实时输出 (spec §10.2). Read at RENDER time from the live store, not copied
+        // into React state: the stream fires per assistant message across every node in
+        // flight, and mirroring it into state would re-render the whole tree on each one.
+        output={props.chunks?.lines(detail.id)}
+        outputDropped={props.chunks?.dropped(detail.id)}
+      />
+    )
+  }
 
   const view = viewport(rows, idx, height)
   const counts: Record<UiStatus, number> = { done: 0, running: 0, queued: 0, failed: 0 }

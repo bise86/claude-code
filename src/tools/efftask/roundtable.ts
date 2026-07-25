@@ -51,6 +51,8 @@ export async function runRoundtable(args: {
    * executor's own prose. A reviewer that cannot see the change is not a reviewer.
    */
   cwd?: string
+  /** 子 agent 实时输出 (spec §10.2). Every reviewer in the roundtable streams into it. */
+  onChunk?: (t: string) => void
 }): Promise<RoundtableRecord> {
   // Already aborted → don't burn a real model call; synthesize a failing record instead.
   if (args.signal.aborted) {
@@ -66,7 +68,7 @@ export async function runRoundtable(args: {
     roster.map(role =>
       // cwd goes to EVERY reviewer: the work under review lives in the node's worktree, and a
       // reviewer reading the main tree can only rubber-stamp the executor's own prose.
-      args.runAgent({ phase: args.phase, node: args.node, role, system: args.system, prompt: args.prompt, signal: args.signal, cwd: args.cwd }),
+      args.runAgent({ phase: args.phase, node: args.node, role, system: args.system, prompt: args.prompt, signal: args.signal, cwd: args.cwd, onChunk: args.onChunk }),
     ),
   )
   const verdicts: Verdict[] = settled.map((res, i) => {

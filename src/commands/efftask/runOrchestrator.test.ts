@@ -374,3 +374,45 @@ describe('/tasks 行的"用户停的"判定必须来自信号', () => {
     expect(s.only().status).toBe('failed') // NOT killed
   })
 })
+
+describe('子 agent 实时输出 (spec §10.2) 真的被接上', () => {
+  it('每个阶段的输出都带着节点 id 流到调用方', async () => {
+    // THE wire, and it is the THIRD callback to travel this exact path. onEscalate and
+    // onBlocked were each declared on PipelineCtx and on runOrchestrator but missed on
+    // OrchestratorDeps/ctx(), and were dead in every real run while their unit tests passed
+    // over the cut. `onChunk` had it worse: RunAgentFn has accepted one since P1 and the
+    // adapter implements and tests it, but NOTHING in production ever passed one — so spec
+    // §10.2's live output pane had nothing to show.
+    const seen: { nodeId: string; text: string }[] = []
+    const ac = new AbortController()
+    const runAgent: RunAgentFn = async req => {
+      // A real adapter streams assistant messages through onChunk before resolving.
+      req.onChunk?.(`${req.phase} 在干活`)
+      if (req.phase === 'plan') {
+        return '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
+          '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      }
+      if (req.phase === 'execute') {
+        return '```' + (req.prompt.match(/```(exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
+      }
+      return '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+        '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    }
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: memFs(), runAgent, signal: ac.signal,
+        onChunk: (nodeId, text) => seen.push({ nodeId, text }),
+      },
+      () => {}, () => {}, () => {},
+    )
+    expect(seen.length).toBeGreaterThan(0)
+    // Tagged with the node, or the detail view cannot tell whose stream it is showing.
+    expect(seen.every(s => s.nodeId === 'root')).toBe(true)
+    // BOTH kinds of phase: runPhase (plan/execute) and runRoundtable (review/accept) are two
+    // separate call paths and each had to be wired.
+    const texts = seen.map(s => s.text)
+    expect(texts).toContain('plan 在干活')
+    expect(texts).toContain('execute 在干活')
+    expect(texts.some(t => t.startsWith('review') || t.startsWith('accept'))).toBe(true)
+  })
+})

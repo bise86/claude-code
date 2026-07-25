@@ -35,6 +35,14 @@ export interface OrchestratorDeps {
   onBlocked?: PipelineCtx['onBlocked']
   /** Run id, used only to write an actionable retry command into `blockedReason`. */
   runId?: string
+  /**
+   * 子 agent 实时输出 (spec §10.2) — forwarded to PipelineCtx.
+   *
+   * THIRD callback to travel this exact path. The first two (onEscalate, onBlocked) were each
+   * declared on PipelineCtx and on runOrchestrator but missed HERE and in ctx() below, and
+   * were therefore dead in every real run while their unit tests passed over the cut wire.
+   */
+  onChunk?: PipelineCtx['onChunk']
   runAgent: RunAgentFn
   persist: (n: TaskNode) => Promise<void>
   now: () => string
@@ -116,6 +124,7 @@ export class EffTaskOrchestrator {
       onEscalate: this.deps.onEscalate,
       onBlocked: this.deps.onBlocked,
       runId: this.deps.runId,
+      onChunk: this.deps.onChunk,
       byId: this.byId,
       runAgent: this.deps.runAgent,
       persist: this.deps.persist,

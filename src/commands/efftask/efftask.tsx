@@ -43,6 +43,7 @@ import { hasPermissionsToUseTool } from '../../utils/permissions/permissions.js'
 import { useAppStateStore, useSetAppState } from '../../state/AppState.js'
 import { getCwd } from '../../utils/cwd.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
+import { createChunkStore, type ChunkStore } from '../../tools/efftask/chunkBuffer.js'
 import { logError } from '../../utils/log.js'
 
 
@@ -417,6 +418,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // Per-run escalation budget (see createEscalationLimiter). A ref, not state: it must not
   // reset on re-render, and nothing renders from it.
   const cardLimit = React.useRef(createEscalationLimiter())
+  // 子 agent 实时输出 (spec §10.2). One bounded ring buffer per node for the whole run.
+  const chunks = React.useRef(createChunkStore())
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
@@ -611,6 +614,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         taskEntry: runId && runDir
           ? { runId, runDir, setAppState, abortController: props.controller }
           : undefined,
+        // 子 agent 实时输出 (spec §10.2). The buffer is bounded, so a long run cannot grow it
+        // without limit; the detail view reads it directly at render time.
+        onChunk: (nodeId, text) => chunks.current.push(nodeId, text),
         // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
         // read at escalation time, not at gate time, because the bridge may connect
         // after the run starts. Absent bridge => no card; the node still blocks with
@@ -863,9 +869,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'running') {
-    return <RunningView nodes={nodes} runId={runId ?? ''} onAbort={props.abort} />
+    return <RunningView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} onAbort={props.abort} />
   }
-  return <DoneView nodes={nodes} runId={runId ?? ''} outcome={outcome} handoff={handoff} onExit={props.onExit} />
+  return <DoneView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} outcome={outcome} handoff={handoff} onExit={props.onExit} />
 }
 
 /** A one-line status/error screen that can always be dismissed. */
@@ -900,18 +906,19 @@ function ParsingView(props: { onCancel: () => void }): React.ReactElement {
 // 'running' phase: live tree + an interrupt affordance. Esc/q aborts the controller the
 // command owns; the orchestrator then returns {status:'blocked', reason:'已中断'} and the
 // finally-block flips us to 'done'.
-function RunningView(props: { nodes: TaskNode[]; runId: string; onAbort: () => void }): React.ReactElement {
+function RunningView(props: { nodes: TaskNode[]; runId: string; chunks?: ChunkStore; onAbort: () => void }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
   // different things at once (abort the run vs leave the detail view). The panel owns the
   // keyboard and calls back for exit.
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive chunks={props.chunks} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
 function DoneView(props: {
   nodes: TaskNode[]
   runId: string
+  chunks?: ChunkStore
   outcome: Outcome | null
   handoff: HandoffSummary | null
   onExit: (outcome: Outcome | null) => void
@@ -925,6 +932,8 @@ function DoneView(props: {
         nodes={props.nodes}
         runId={props.runId}
         interactive
+        // "完成后保留最终输出" — the buffer outlives the run, so the done view keeps it.
+        chunks={props.chunks}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">

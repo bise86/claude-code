@@ -380,3 +380,94 @@ describe('视口:大树不得把光标和表头挤出屏幕', () => {
     app.unmount()
   })
 })
+
+describe('节点详情里的子 agent 实时输出 (spec §10.2)', () => {
+  const store = (lines: string[], dropped = 0) => ({
+    push: () => {}, lines: () => lines, dropped: () => dropped, nodes: () => ['n'],
+  })
+
+  it('shows the stream for the node being viewed', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: mk({ id: 'n', title: '打通接口', status: 'EXECUTING', kind: 'executable' }),
+        elapsed: '1m',
+        output: ['正在改 src/login.ts', '跑测试:12 通过'],
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    expect(f).toContain('子 agent 输出')
+    expect(f).toContain('正在改 src/login.ts')
+    expect(f).toContain('跑测试:12 通过')
+    app.unmount()
+  })
+
+  it('keeps the TAIL — a live log is read from its newest line', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: mk({ id: 'n', status: 'EXECUTING', kind: 'executable' }),
+        elapsed: '1m', maxLines: 24,
+        output: [...Array(60)].map((_, i) => `行 ${i}`),
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    // The newest line must be on screen; the oldest must not push it off.
+    expect(t.lastFrame()).toContain('行 59')
+    expect(t.lastFrame()).not.toContain('行 0 ')
+    app.unmount()
+  })
+
+  it('says how much scrolled out of the buffer instead of implying it shows everything', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: mk({ id: 'n', status: 'EXECUTING', kind: 'executable' }),
+        elapsed: '1m', output: ['最后一行'], outputDropped: 143,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).toContain('143')
+    expect(t.lastFrame()).toContain('已滚出缓冲')
+    app.unmount()
+  })
+
+  it('renders nothing at all when the node never produced output', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, { node: mk({ id: 'n' }), elapsed: '1m', output: [] } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).not.toContain('子 agent 输出')
+    app.unmount()
+  })
+
+  it('the panel hands the RIGHT node\'s stream to the detail view', async () => {
+    // Two nodes with output; opening one must not show the other's. The store is read at
+    // render time by node id, so a wrong id here silently shows someone else's log.
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel as never, {
+        nodes: tree(), runId: '003', interactive: true,
+        // Every node has DISTINCT output, keyed by id. A panel that passed a fixed id — or the
+        // wrong node's id — would show someone else's log with no visible sign of it.
+        chunks: { push: () => {}, nodes: () => [], dropped: () => 0, lines: (id: string) => ['输出属于 ' + id] },
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    // Move OFF root first, or a hard-coded 'root' would pass by accident.
+    t.stdin.press(DOWN)
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    expect(t.lastFrame()).toContain('输出属于 root/01-甲')
+    expect(t.lastFrame()).not.toContain('输出属于 root ')
+    app.unmount()
+  })
+})

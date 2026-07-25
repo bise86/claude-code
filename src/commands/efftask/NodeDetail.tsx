@@ -64,7 +64,15 @@ function scoreBody(n: TaskNode): string {
   return [line('方案质量', n.score.plan), line('执行质量', n.score.exec)].filter(Boolean).join('\n')
 }
 
-export function NodeDetail(props: { node: TaskNode; elapsed: string; maxLines?: number }): React.ReactElement {
+export function NodeDetail(props: {
+  node: TaskNode
+  elapsed: string
+  maxLines?: number
+  /** 子 agent 实时输出 (spec §10.2), oldest first. Empty when nothing has streamed yet. */
+  output?: string[]
+  /** How many lines the ring buffer dropped. Shown, so the pane cannot imply it holds all of it. */
+  outputDropped?: number
+}): React.ReactElement {
   const n = props.node
   // Per-section clipping was not enough: eight sections at 12 lines each is ~127 lines in
   // a 40-line terminal, and this view does not scroll, so the title and goal were the first
@@ -93,6 +101,22 @@ export function NodeDetail(props: { node: TaskNode; elapsed: string; maxLines?: 
       <Section maxLines={perSection} title="评审记录" body={rounds(n.reviewLog)} />
       <Section maxLines={perSection} title="验收记录" body={rounds(n.acceptLog)} />
       {n.worktree ? <Section maxLines={perSection} title="隔离工作区" body={`${n.worktree.branch}\n${n.worktree.path}`} /> : null}
+      {/* 子 agent 实时终端 (spec §10.2). The TAIL, because this is a live stream and the newest
+          line is the one being waited on — the opposite of the plan sections above, which are
+          documents. Kept after the run ends too ("完成后保留最终输出"). */}
+      {props.output && props.output.length > 0 ? (
+        <Box flexDirection="column">
+          <Text bold color={ui === 'running' ? 'warning' : undefined}>
+            子 agent 输出{ui === 'running' ? '(进行中)' : ''}
+          </Text>
+          {(props.outputDropped ?? 0) > 0 ? (
+            <Text dimColor>  … 更早的 {props.outputDropped} 行已滚出缓冲</Text>
+          ) : null}
+          {props.output.slice(-Math.max(3, perSection * 2)).map((l, i) => (
+            <Text key={`out-${i}`} dimColor>  {Array.from(l).slice(0, 100).join('')}</Text>
+          ))}
+        </Box>
+      ) : null}
       <Text dimColor>回车 / Esc / q 返回任务树</Text>
     </Box>
   )
