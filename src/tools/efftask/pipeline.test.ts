@@ -916,3 +916,113 @@ describe('隔离下,验收与评分必须读到被验收的工作', () => {
     expect(seen).toEqual([undefined])
   })
 })
+
+describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后一步', () => {
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+  const okAgent = (seen?: string[]) => (async (req: { phase: string; prompt: string }) => {
+    seen?.push(req.phase)
+    if (req.phase === 'plan') return leafPlan
+    if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+    return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+  }) as RunAgentFn
+
+  const fakePool = (over: Record<string, unknown> = {}) => ({
+    acquire: async (n: TaskNode) => ({ path: `/wt/${n.id}`, branch: `worktree-${n.id}`, gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: true, merged: true }),
+    release: async () => ({ removed: true }),
+    dispose: async () => ({ kept: [] }),
+    init: async () => ({ ok: true }),
+    integrationPath: '/wt/integration',
+    integrationBranchName: 'efftask/001/integration',
+    ...over,
+  })
+
+  it('REFUSES to execute when isolation is on but no worktree can be had', async () => {
+    // The alternative is running a write-capable executor in the user's real checkout — and,
+    // once the execute mutex is lifted, several of them at once. Degrading node by node and
+    // saying so is the only safe answer.
+    const n = root()
+    const seen: string[] = []
+    const ctx = { ...ctxFor([n], okAgent(seen)), worktrees: fakePool({ acquire: async () => ({ error: '磁盘满' }) }) as never }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('拒绝在共享工作区执行')
+    expect(n.blockedReason).toContain('磁盘满')
+    expect(seen).not.toContain('execute') // it never ran anywhere
+  })
+
+  it('merges AFTER scoring, and only then accepts', async () => {
+    const order: string[] = []
+    const n = createNode({
+      id: 'root', title: 'r', parentId: null, deps: [], depth: 0,
+      phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'w' }] }, now: NOW,
+    })
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      order.push(req.phase)
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完"}\n```'
+      if (req.phase === 'observer') {
+        const tag = req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score'
+        return '```' + tag + '\n{"plan":{"score":90,"rationale":"ok"},"exec":{"score":90,"rationale":"ok"}}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({ commitAndMerge: async () => { order.push('MERGE'); return { ok: true, merged: true } } }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    // Scoring can send the node back to REWORK; a node that had already merged would then be
+    // reworking on top of work the integration branch has taken.
+    expect(order.indexOf('observer')).toBeLessThan(order.indexOf('MERGE'))
+  })
+
+  it('a merge CONFLICT blocks the node and keeps the worktree findable', async () => {
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], okAgent()),
+      worktrees: fakePool({ commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }) }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('合并冲突')
+    expect(n.blockedReason).toContain('src/a.ts')
+    expect(n.blockedReason).toContain('/wt/root') // the path the user has to go to
+  })
+
+  it('a node that grows children still merges — that path had NO merge step at all', async () => {
+    // The growth early-return leaves via stepIntegrate later, which never passes through the
+    // merge on the acceptance path. Its worktree holds the executor's real writes.
+    let merged = false
+    const n = root()
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        const tag = req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec'
+        return '```' + tag + '\n{"execStatus":"做了一半,还需要先补个子任务","newChildren":[{"title":"先补迁移","deps":[]}]}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({ commitAndMerge: async () => { merged = true; return { ok: true, merged: true } } }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(merged).toBe(true)
+  })
+
+  it('an un-isolated run merges nothing and still works', async () => {
+    const n = root()
+    const ctx = ctxFor([n], okAgent())
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.worktree).toBeUndefined()
+  })
+})

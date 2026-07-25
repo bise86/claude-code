@@ -5,6 +5,7 @@ import { ANSWER_TAGS, answerTag, parseExecOutput, parsePlanOutput, parseScoreOut
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
+import type { WorktreePool } from './worktreePool.js'
 
 /** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
 export type NodeSlots = { release: () => void }
@@ -30,6 +31,15 @@ export interface PipelineCtx {
    * that at zero would silently UNDER-enforce maxNodes instead of failing loudly.
    */
   reserveNodes: (count: number) => NodeSlots | null
+  /**
+   * Per-node git isolation, or undefined when the run is not isolated.
+   *
+   * Its PRESENCE is the switch: when it is set, a node that cannot get a worktree must be
+   * blocked, never executed. Falling back to the shared tree would run a write-capable
+   * executor in the user's real checkout — and, with the execute mutex lifted, several of
+   * them concurrently. That is the exact outcome isolation exists to prevent.
+   */
+  worktrees?: WorktreePool
 }
 
 /**
@@ -606,9 +616,55 @@ async function growTree(
   return { grown, refusals }
 }
 
+/**
+ * Merge the node's worktree into the integration branch, then release it.
+ *
+ * Returns false when the node must NOT be accepted — a conflict or an infrastructure failure.
+ * A conflict keeps the worktree: it is the only place the user can fix it, and the reason
+ * carries the path, branch and files so they can act without hunting.
+ *
+ * An un-isolated run short-circuits to true: there is nothing to merge, the executor wrote
+ * straight into the shared tree.
+ */
+async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
+  if (!ctx.worktrees || !node.worktree) return true
+  const res = await ctx.worktrees.commitAndMerge(node)
+  if (!res.ok) {
+    if (res.kind === 'conflict') {
+      await blockWithReason(
+        node,
+        `合并冲突,已保留工作区待人工处理。分支 ${node.worktree.branch};路径 ${node.worktree.path};冲突文件: ${res.files.join('、')}`,
+        ctx,
+      )
+      return false
+    }
+    await blockWithReason(node, `合并失败(基础设施): ${res.message}`, ctx)
+    return false
+  }
+  const rel = await ctx.worktrees.release(node)
+  // A kept worktree is NOT a failure — release refuses to delete anything holding real work.
+  // Record it so the user can find it rather than discovering a stray directory later.
+  if (!rel.removed && rel.keptBecause) {
+    node.execStatus = `${node.execStatus}\n(注:隔离工作区已保留 —— ${rel.keptBecause};路径 ${node.worktree.path})`
+  }
+  return true
+}
+
 export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
+  // Isolation is a HARD gate, not a preference. Without a worktree this node would execute
+  // with write tools in the user's real checkout — concurrently with others once the execute
+  // mutex is lifted. Refusing is the only safe answer; the run degrades node by node, and
+  // says so, instead of silently writing where it promised not to.
+  if (ctx.worktrees && !node.worktree) {
+    const lease = await ctx.worktrees.acquire(node)
+    if ('error' in lease) {
+      await blockWithReason(node, `无法为该节点准备隔离工作区,拒绝在共享工作区执行: ${lease.error}`, ctx)
+      return
+    }
+    node.worktree = { branch: lease.branch, path: lease.path }
+  }
   const caps = ctx.config.caps
   // previous round's acceptance blockingSummary; drives the REWORK prompt. Seeded from the
   // persisted log so a resumed node does not repeat work that was already rejected.
@@ -660,6 +716,10 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // acceptance must wait for them. Returning here is what the spec's "恢复" means: the
       // scheduler picks it up again for integration once every child is ACCEPTED.
       if (grown.includes(node.id)) {
+        // This node now waits on children, and stepIntegrate will later accept it — a path
+        // that never passes through the merge above. Its worktree holds the executor's real
+        // writes, so merge NOW or that work never reaches the integration branch at all.
+        if (!(await mergeAndRelease(node, ctx))) return
         await ctx.persist(node)
         safeUpdate(ctx)
         return
@@ -690,6 +750,11 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         if (!(await commit(node, 'REWORK', ctx))) return
         continue
       }
+      // MERGE is the last step before ACCEPTED (spec §8: 验收 + 评分通过后进入 MERGE).
+      // It runs AFTER scoring on purpose: scoring can send the node back to REWORK, and a
+      // node that had already merged would then be reworking on top of work the integration
+      // branch has taken — with its worktree possibly already released.
+      if (!(await mergeAndRelease(node, ctx))) return
       await commit(node, 'ACCEPTED', ctx)
       return
     }
