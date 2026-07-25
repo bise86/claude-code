@@ -424,6 +424,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [phase, setPhase] = React.useState<Phase>(isResume ? 'picking' : 'parsing')
   const [config, setConfig] = React.useState<EffTaskConfig | null>(null)
   const [nodes, setNodes] = React.useState<TaskNode[]>([])
+  // 仅查看后退出 (spec §17.3): the done view is reused as a read-only browser, and must not
+  // claim the run was blocked when the user simply chose not to continue it.
+  const [viewOnly, setViewOnly] = React.useState(false)
   const [outcome, setOutcome] = React.useState<Outcome | null>(null)
   const [runs, setRuns] = React.useState<RunSummary[] | null>(null)
   const [seed, setSeed] = React.useState<TaskNode[] | null>(null)
@@ -835,6 +838,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           )
         }
         if (!decision.approved) {
+          // 仅查看后退出 (spec §17.3): the third answer, which used to be a synonym for Esc.
+          // The recovered tree is already in state — the gate rendered its counts from it — so
+          // hand it to the read-only browser rather than exiting on a key that promised a view.
+          if (decision.viewOnly && isResumeGate) { setViewOnly(true); setPhase('done'); return }
           props.onExit(null) // cancelled at the gate: no run outcome to report
           return
         }
@@ -939,7 +946,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   if (phase === 'running') {
     return <RunningView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} pool={poolRead.current ?? undefined} onAbort={props.abort} />
   }
-  return <DoneView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} outcome={outcome} handoff={handoff} onExit={props.onExit} />
+  return <DoneView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} outcome={outcome} handoff={handoff} viewOnly={viewOnly} onExit={props.onExit} />
 }
 
 /** A one-line status/error screen that can always be dismissed. */
@@ -992,6 +999,12 @@ export function DoneView(props: {
   chunks?: ChunkStore
   outcome: Outcome | null
   handoff: HandoffSummary | null
+  /**
+   * 仅查看后退出 (spec §17.3): this view is doubling as a read-only browser for a run the user
+   * chose NOT to continue. Nothing ran, so the summary must not say 被阻断 — that would report
+   * a failure the user's own keystroke caused, about a run that is still perfectly resumable.
+   */
+  viewOnly?: boolean
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -1008,10 +1021,13 @@ export function DoneView(props: {
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">
-        <Text bold color={ok ? 'success' : 'error'}>
-          {ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
+        <Text bold color={props.viewOnly ? 'warning' : ok ? 'success' : 'error'}>
+          {props.viewOnly ? '仅查看:本次没有继续执行' : ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
         </Text>
-        {props.outcome?.reason ? <Text dimColor>原因: {props.outcome.reason}</Text> : null}
+        {props.viewOnly
+          ? <Text dimColor>这个 run 原样留在盘上,想继续跑: /et --resume {props.runId}</Text>
+          : null}
+        {!props.viewOnly && props.outcome?.reason ? <Text dimColor>原因: {props.outcome.reason}</Text> : null}
         {props.handoff
           ? handoffLines(props.handoff).map(l => <Text key={l} dimColor>{l}</Text>)
           : null}

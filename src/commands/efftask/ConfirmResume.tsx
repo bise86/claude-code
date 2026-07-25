@@ -13,7 +13,13 @@ import {
  *
  * 仅查看后退出 is a real third answer, not a synonym for cancel: a user who ran `--resume`
  * to inspect a crashed run should be able to read the tree without being asked whether to
- * spend money on it. It resolves the gate as not-approved, exactly like Esc.
+ * spend money on it.
+ *
+ * It USED to be a synonym — `v` sent the byte-identical `{parallelism, approved: false}` that
+ * Esc sends, and this comment's own last sentence said so ("exactly like Esc") while the key
+ * on screen said 仅查看后退出. Nothing was ever viewed. The recovered tree is already in
+ * memory at that point (this gate renders its counts from it), so the answer now carries
+ * `viewOnly` and the command hands that tree to the read-only browser instead of exiting.
  */
 export function ConfirmResume(props: {
   config: EffTaskConfig
@@ -27,7 +33,8 @@ export function ConfirmResume(props: {
     if (key.leftArrow || input === '-') { setParallelism(p => clampParallelism(p - 1)); return }
     if (key.rightArrow || input === '+' || input === '=') { setParallelism(p => clampParallelism(p + 1)); return }
     if (key.return || k === 'y') props.onDecision({ parallelism, approved: true })
-    else if (key.escape || k === 'n' || k === 'v') props.onDecision({ parallelism, approved: false })
+    else if (k === 'v') props.onDecision({ parallelism, approved: false, viewOnly: true })
+    else if (key.escape || k === 'n') props.onDecision({ parallelism, approved: false })
   })
   const sections = resumeSummarySections(props.summary)
   return (

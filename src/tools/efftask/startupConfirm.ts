@@ -12,6 +12,18 @@ export interface StartupDecision {
    * Absent means "unchanged", so a Feishu approval keeps exactly the roster its card showed.
    */
   phaseRoles?: Record<PhaseName, RoleBinding[]>
+  /**
+   * 仅查看后退出 (spec §17.3) — a THIRD answer at the resume gate, not a synonym for cancel.
+   *
+   * It was implemented as a synonym: `v` sent the byte-identical
+   * `{ parallelism, approved: false }` that Esc sends, so a key labelled 「仅查看后退出」
+   * exited without ever showing anything. The recovered tree was already in memory at that
+   * moment — the gate renders its counts — and the user who ran `--resume` specifically to
+   * inspect a crashed run got a bare 已取消.
+   *
+   * Only meaningful on the resume gate; the startup gate has no tree to show yet.
+   */
+  viewOnly?: boolean
 }
 
 const PHASE_LABEL: Record<PhaseName, string> = {

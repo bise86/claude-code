@@ -127,3 +127,40 @@ describe('并行占用 (spec §10.1) 的最后一跳', () => {
     app.unmount()
   })
 })
+
+describe('仅查看后退出 (spec §17.3):只读浏览,不能报成"被阻断"', () => {
+  it('viewOnly 时说的是"没有继续执行",并给出继续的命令', async () => {
+    // 用户按 v 是自己选择不继续,run 原封不动留在盘上、完全可以续跑。把这说成
+    // 「✗ 高效任务被阻断」,是把用户的一次按键报成一次失败 —— 而"被阻断"在这个产品里
+    // 有确切含义(有节点触阀/失败),会把人送去查一个根本不存在的故障。
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(DoneView as never, {
+        nodes: [node({ status: 'READY' })], runId: '003',
+        outcome: null, handoff: null, viewOnly: true, onExit: () => {},
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    expect(f).toContain('仅查看')
+    expect(f).not.toContain('被阻断')
+    expect(f).toContain('--resume 003')
+    app.unmount()
+  })
+
+  it('真的被阻断时照旧说被阻断', async () => {
+    // 反向守卫:上一条不能是靠"永远不说被阻断"过的。
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(DoneView as never, {
+        nodes: [node({ status: 'BLOCKED' })], runId: '003',
+        outcome: { status: 'blocked', reason: '存在无法推进的阻断节点' }, handoff: null, onExit: () => {},
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).toContain('被阻断')
+    app.unmount()
+  })
+})

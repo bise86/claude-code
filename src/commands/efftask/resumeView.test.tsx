@@ -170,8 +170,11 @@ describe('ConfirmResume (vendored renderer)', () => {
     }
   })
 
-  it('"v" is view-only: it declines without being a cancellation the user did not intend', async () => {
-    const decisions: { approved: boolean }[] = []
+  it('"v" is view-only: it declines, and says so DISTINCTLY from a cancellation', async () => {
+    // This used to assert the byte-identical payload Esc sends — which is precisely what made
+    // the key a lie: it is labelled 仅查看后退出 and nothing was ever viewed. The distinction
+    // has to reach the caller, or the command cannot tell "show me the tree" from "forget it".
+    const decisions: { approved: boolean; viewOnly?: boolean }[] = []
     const { stdin, stdout } = fakeTty()
     const app = await render(
       React.createElement(ConfirmResume, { config, summary, onDecision: d => decisions.push(d) }),
@@ -180,8 +183,26 @@ describe('ConfirmResume (vendored renderer)', () => {
     await tick()
     stdin.press('v')
     await tick()
-    expect(decisions).toEqual([{ parallelism: 3, approved: false }])
+    expect(decisions).toEqual([{ parallelism: 3, approved: false, viewOnly: true }])
     app.unmount()
+  })
+
+  it('Esc / n 仍然是纯取消 —— 不能带 viewOnly', async () => {
+    // 否则每一次取消都会打开一个用户没要的树浏览器,上一条的区分也就成了摆设。
+    for (const key of [ESC, 'n']) {
+      const decisions: { approved: boolean; viewOnly?: boolean }[] = []
+      const { stdin, stdout } = fakeTty()
+      const app = await render(
+        React.createElement(ConfirmResume, { config, summary, onDecision: d => decisions.push(d) }),
+        { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      stdin.press(key)
+      await (key === ESC ? tickEsc() : tick())
+      expect(decisions[decisions.length - 1]?.approved).toBe(false)
+      expect(decisions[decisions.length - 1]?.viewOnly).toBeUndefined()
+      app.unmount()
+    }
   })
 })
 
