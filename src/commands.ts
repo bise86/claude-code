@@ -19,6 +19,7 @@ import cost from './commands/cost/index.js'
 import diff from './commands/diff/index.js'
 import ctx_viz from './commands/ctx_viz/index.js'
 import doctor from './commands/doctor/index.js'
+import efftask from './commands/efftask/index.js'
 import memory from './commands/memory/index.js'
 import help from './commands/help/index.js'
 import ide from './commands/ide/index.js'
@@ -273,6 +274,7 @@ const COMMANDS = memoize((): Command[] => [
   cost,
   diff,
   doctor,
+  efftask,
   effort,
   exit,
   fast,
