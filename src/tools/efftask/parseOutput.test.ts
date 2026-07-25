@@ -107,6 +107,33 @@ describe('parseOutput', () => {
     )
     expect(exec.execStatus).toBe('真实状态')
   })
+  it('parseVerdict: TWO tagged verdict blocks are ambiguous too => fails closed', () => {
+    // A tag means "this is my answer"; two of them is two answers. Without this the
+    // newer one wins on recency, so re-tagging a stale pass would override a real fail.
+    const text =
+      '```verdict\n{"pass":false,"blocking":["真实阻断"],"comments":""}\n```\n' +
+      '上一轮结论重贴:\n```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    const v = parseVerdict(text, 'sec')
+    expect(v.pass).toBe(false)
+    expect(v.blocking.length).toBeGreaterThan(0)
+  })
+  it('parseVerdict: a malformed tagged block degrades to the untagged tolerance', () => {
+    const text =
+      '```verdict\n{"pass": tru,,,}\n```\n' +
+      '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    expect(parseVerdict(text, 'main').pass).toBe(true) // one usable block, unambiguous
+  })
+  it('parseVerdict: uppercase fence tag still counts as tagged', () => {
+    const text = '```VERDICT\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    expect(parseVerdict(text, 'main').pass).toBe(true)
+  })
+  it('a verdict block and a plan block in one reply do not contaminate each other', () => {
+    const text =
+      '```plan\n{"kind":"executable","solution":"方案"}\n```\n' +
+      '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    expect(parseVerdict(text, 'main').pass).toBe(true)
+    expect(parsePlanOutput(text).plan.solution).toBe('方案')
+  })
   it('ignores a stray non-json code fence that happens to parse', () => {
     const text =
       '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```\n' +
