@@ -4,11 +4,14 @@ import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBindin
 import type { FsLike } from './persistence.js'
 import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
 
-const LEGAL_STATUS = new Set<string>([
+// Exported because they ARE the post-condition: whatever this module hands back, every reader
+// downstream may assume is one of these. hostileDisk.test.ts asserts against them rather than
+// keeping a second copy that could drift the day a status is added.
+export const LEGAL_STATUS = new Set<string>([
   'CREATED', 'PLANNING', 'PLAN_REVIEW', 'READY', 'EXECUTING', 'EXECUTED', 'ACCEPTANCE',
   'REWORK', 'WAITING_CHILDREN', 'INTEGRATION_ACCEPT', 'SCORING', 'MERGE', 'ACCEPTED', 'BLOCKED',
 ])
-const LEGAL_KIND = new Set<string>(['decompose', 'executable', 'unknown'])
+export const LEGAL_KIND = new Set<string>(['decompose', 'executable', 'unknown'])
 
 const strArray = (v: unknown): string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
@@ -221,19 +224,50 @@ export function validateLoadedNodes(
     if (!LEGAL_KIND.has(n.kind as string)) { repairs.push(`节点 ${n.id} 的 kind 非法,重置为 unknown`); n.kind = 'unknown' as NodeKind }
     n.deps = strArray(n.deps)
     n.childIds = strArray(n.childIds)
-    if (typeof n.depth !== 'number' || !Number.isFinite(n.depth)) { repairs.push(`节点 ${n.id} 的 depth 非法,重置为 0`); n.depth = 0 }
+    // NEGATIVE counts as illegal, not just NaN. renderTreeSnapshot indents orphans with
+    // `'  '.repeat(n.depth)` — and orphans are precisely a resume artefact — so a hand-edited
+    // `depth: -1` throws RangeError out of the run.md writer on every commit. It also buys
+    // extra decomposition levels: the cap is `node.depth + 1 > caps.maxDepth`.
+    if (typeof n.depth !== 'number' || !Number.isFinite(n.depth) || n.depth < 0) {
+      repairs.push(`节点 ${n.id} 的 depth 非法,重置为 0`)
+      n.depth = 0
+    } else n.depth = Math.trunc(n.depth)
     const it = (n.iteration ?? {}) as Partial<TaskNode['iteration']>
     // A missing counter reads as 0, never as "no limit": undefined + 1 is NaN, which never
     // satisfies >= maxIterations and would turn a bounded retry loop into an unbounded one.
+    //
+    // FLOORED AT ZERO for the same reason, through the other door. Every budget check is
+    // `spent >= caps.maxIterations`, so a hand-edited `planReview: -5` buys 8 rounds where the
+    // caps say 3 — and the caps are exactly what the escalation card invites the user to edit,
+    // in the same file, one key away. NaN was covered; a negative number was not.
+    const count = (v: unknown): number => (Number.isFinite(v) ? Math.max(0, Math.trunc(v as number)) : 0)
     n.iteration = {
-      planReview: Number.isFinite(it.planReview) ? (it.planReview as number) : 0,
-      acceptance: Number.isFinite(it.acceptance) ? (it.acceptance as number) : 0,
-      integration: Number.isFinite(it.integration) ? (it.integration as number) : 0,
-      scoring: Number.isFinite(it.scoring) ? (it.scoring as number) : 0,
-      mergeResolve: Number.isFinite(it.mergeResolve) ? (it.mergeResolve as number) : 0,
+      planReview: count(it.planReview),
+      acceptance: count(it.acceptance),
+      integration: count(it.integration),
+      scoring: count(it.scoring),
+      mergeResolve: count(it.mergeResolve),
     }
     if (typeof n.execStatus !== 'string') n.execStatus = ''
     if (typeof n.blockedReason !== 'string') n.blockedReason = ''
+    // The two timestamps were the only persisted fields this pass never touched. Both feed
+    // `Date.parse`, which COERCES rather than throwing — `updatedAt: 123` renders a terminal
+    // node's 耗时 as 0s, and every reader that survives it today does so by carrying its own
+    // `typeof` guard (TaskTreePanel, runRegistry). Two guards in two modules is not an
+    // invariant, it is a record of who got bitten. Normalise once, here.
+    for (const k of ['createdAt', 'updatedAt'] as const) {
+      if (typeof n[k] !== 'string' || n[k].length === 0) {
+        repairs.push(`节点 ${n.id} 的 ${k} 非法,已重置为恢复时刻`)
+        n[k] = opts.now
+      }
+    }
+    // startedAt is optional, so a bad value is DROPPED rather than invented: reseat stamps it
+    // on the next active phase, and pretending the node started now would report a duration
+    // that never happened.
+    if (n.startedAt !== undefined && (typeof n.startedAt !== 'string' || n.startedAt.length === 0)) {
+      repairs.push(`节点 ${n.id} 的 startedAt 非法,已清除(耗时将从恢复后的首个活动阶段重新计时)`)
+      n.startedAt = undefined
+    }
     if (!n.plan || typeof n.plan !== 'object') n.plan = emptyPlan()
     else for (const k of ['solution', 'keyPoints', 'risks', 'acceptance'] as const) {
       if (typeof n.plan[k] !== 'string') n.plan[k] = ''
@@ -307,6 +341,18 @@ export function validateLoadedNodes(
       // returned null, propagateBlocked had nothing to blame, and the run ended
       // '存在无法推进的阻断节点' with a grey root and no explanation — reproducibly, on every
       // later resume. Measured: planCalls = 0.
+      //
+      // `kids.length > 0` is what separates that from a LITERAL `children: []`, which is
+      // legal and must survive: `applyRootDraft` writes exactly that for an EXECUTABLE root —
+      // "presence of the field is the signal, not its length" — so an empty list means the
+      // user confirmed "one task, no decomposition". Dropping it would silently discard a
+      // gate decision they made and pay for a re-draft. (Tried it; `resumeCore.test.ts`'s
+      // 一个空 children 列表本身是合法的 went red, correctly.)
+      //
+      // The genuinely dangerous shape — an empty list on a node that is NOT executable — is
+      // refused one layer down, in stepStart's `confirmed` guard, because only there is
+      // `node.kind` meaningful. A reader of `children[0]` must therefore handle empty; that
+      // is a property of the field, not a hole in this validator.
       const lostChildren = clean !== null && clean.length === 0 && Array.isArray(kids) && kids.length > 0
       if (clean === null || lostChildren) {
         repairs.push(`节点 ${n.id}:根方案确认记录已损坏,恢复后将由 plan 角色重新起草`)
