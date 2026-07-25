@@ -275,6 +275,53 @@ describe('pipeline', () => {
     expect(prompts[1]).toContain('子结果未达成父目标') // failure feedback appended on retry
   })
 
+  it('stepIntegrate: 续跑时从盘上的日志把上一轮阻断意见捡回来', async () => {
+    // `--resume` reseats INTEGRATION_ACCEPT back to WAITING_CHILDREN (reseat.ts's ACTIVE set),
+    // so the node re-enters stepIntegrate with a FRESH local `feedback`. stepStart:472 and
+    // stepExecute:1037 both seed theirs from the log; this one did not, so the resumed
+    // roundtable re-judged the same evidence having forgotten why it refused it — one round
+    // of budget poorer, every time.
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.iteration.integration = 1 // one integration round already spent, and it failed
+    n.acceptLog = [{
+      round: 1,
+      verdicts: [{ role: 'architect', pass: false, blocking: ['缺少回滚脚本'], comments: '' }],
+      synthesized: { pass: false, blockingSummary: '[architect] 缺少回滚脚本' },
+    }]
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    expect(prompts[0]).toContain('缺少回滚脚本')
+    expect(prompts[0]).toContain('上一轮集成验收阻断意见')
+  })
+
+  it('stepIntegrate: acceptLog 里的叶子验收记录不能被当成集成阻断意见', async () => {
+    // acceptLog is NOT an integration-only log. An executable node whose first acceptance
+    // round failed pushes a LEAF verdict; if its next execute grows children it becomes a
+    // decompose node and arrives here with that leaf record still last. Rendering it as
+    // 上一轮集成验收阻断意见 tells THIS roundtable — the one that decides the run's final
+    // verdict on root — to re-check a complaint about something else entirely.
+    // The integration counter is what separates the two: nothing but stepIntegrate's own loop
+    // increments it, so 0 means no integration round has ever failed here.
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.iteration.acceptance = 1 // the LEAF round that failed…
+    n.iteration.integration = 0 // …and no integration round has run at all
+    n.acceptLog = [{
+      round: 1,
+      verdicts: [{ role: 'architect', pass: false, blocking: ['本节点自己的测试没跑'], comments: '' }],
+      synthesized: { pass: false, blockingSummary: '[architect] 本节点自己的测试没跑' },
+    }]
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    expect(prompts[0]).not.toContain('本节点自己的测试没跑')
+    expect(prompts[0]).not.toContain('上一轮集成验收阻断意见')
+  })
+
   // ---- regression tests for the acceptance-review findings ----
 
   it('an executor that reports nothing is reworked, never accepted', async () => {

@@ -1193,7 +1193,25 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     return
   }
   const caps = ctx.config.caps
-  let feedback = ''
+  /**
+   * The blockers this node already earned, recovered from disk — the third consumer of
+   * `lastFailureFeedback`, and the one that was missed.
+   *
+   * `stepStart:472` and `stepExecute:1037` both seed from the log; this one started blank, so
+   * a node reseated out of INTEGRATION_ACCEPT — which is exactly what `--resume` does, see
+   * reseat.ts's ACTIVE set — re-entered with empty feedback and `integratePrompt` dropped its
+   * 上一轮集成验收阻断意见 section entirely. The roundtable then re-judged the same evidence
+   * with no memory of why it had refused it, one round of budget poorer.
+   *
+   * GUARDED on the integration counter, which nothing but the loop below increments.
+   * `acceptLog` is NOT an integration-only log: an executable node whose first acceptance
+   * round fails pushes a LEAF verdict (:1138), and if its next execute grows children (:1098)
+   * it becomes a decompose node and arrives here with that leaf record still last;
+   * mergeAndRelease pushes there too (:900). Rendering either one as 上一轮集成验收阻断意见
+   * would tell this roundtable — the one that decides the run's final verdict on root — to
+   * re-check a complaint about something else entirely.
+   */
+  let feedback = node.iteration.integration > 0 ? lastFailureFeedback(node.acceptLog) : ''
   // Same bounded-retry shape as stepExecute: a single failed integration verdict must not
   // be terminal (the roundtable may simply have misread the evidence). Uses its OWN budget
   // so a node that spent `acceptance` elsewhere still gets a full integration allowance.
