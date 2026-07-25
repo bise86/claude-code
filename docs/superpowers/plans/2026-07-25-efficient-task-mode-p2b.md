@@ -1,4 +1,38 @@
-# 高效任务模式 — P2b worktree 隔离与集成 实施计划 (v2)
+# 高效任务模式 — P2b worktree 隔离 (v2 亦被否)
+
+> ## ⛔ v2 经圆桌评审否决,10 条阻断。**不可实施。**
+>
+> 三轮累计 36 条阻断(v1-14 / P2b-v1-12 / P2b-v2-10),绝大多数在一次性 git 仓库里实测复现。
+>
+> **评审确认修对了的**(不必再动):B1 的 `merge-base --is-ancestor` 判据(五种并发失败模式零误判)、
+> B3 的 release 双条件、失败清理用 `reset --hard && clean -fd`(实测能解开 `merge --abort` 解不开的卡死)、
+> Task 21 的 slug 设计、以及"`add -A` 不触发钩子"这半条。
+>
+> **v2 错在另一类地方:git 原语选对了,却搞错了它作用的状态。**
+>
+> | # | 实测失败 |
+> |---|---|
+> | B2-a | 执行者**自己在 worktree 里提交**时(我们的工作流要求频繁提交),`add -A` 无暂存 → 判空 → **合并从不执行**,集成分支静默缺失该节点全部工作,而节点 ACCEPTED。判空必须是"无暂存 **且** `is-ancestor` 为真" |
+> | B2-b | `performPostCreationSetup` 把 `core.hooksPath` 指向主仓 hooks 并写进**共享的 .git/config**,用户的 pre-commit 钩子会在每个 agent worktree 里触发。钩子拒绝是确定性的,而 v2 把非零一律当 infra 重试 → 永远重试、永不合并 |
+> | B2-c | 同一函数把 `.claude/settings.local.json` 复制进每个 worktree。本仓它只被用户**全局** gitignore 忽略;在没有该全局忽略的机器/CI 上,`add -A` 会把明文 token 合并进那条要交给用户 push 的分支。这是交付物正确性问题,不是被豁免的"安全摩擦" |
+> | B4 | 复用的 worktree **本来就在** `worktreeBranchName(slug)` 上,"先提交再 `checkout -B` 同一分支"把该分支重置掉:抢救提交 `for-each-ref --contains` = **0 个 ref**,可被 gc,而 `release` 还会 `branch -D`。违反"宁可保留垃圾,不可删掉工作" |
+> | B5 | acquire **永久失败**的节点会在用户真实工作树里执行(`pipeline.ts` 传 `cwd: node.worktree?.path`,未设即回落);而锁按 init 结果解除,于是多个这样的节点**并发写用户的树** —— 比 P2a 更危险的新回归 |
+> | 6-a | `stepIntegrate` 在共享集成 worktree 里做验收,与合并**无锁竞争**:实测验收者读到 `v0`、并发合并落地、重读变成 `v-X CHANGED`;失败清理的 `clean -fd` 还删掉了它的临时文件与 coverage 目录 |
+> | 6-b | 动态生长的提前返回让节点经 `stepIntegrate` 走到 ACCEPTED,**那条路径上没有任何合并步骤**,其 worktree 里的真实改动从不进集成分支。`blockWithReason` 的各个出口同样未定义何时 merge/release |
+> | 8 | `GitRunner` —— 整个测试策略赖以成立的注入接缝 —— **全仓零命中且无任务定义它**;`<wtBranch>` 用了 4 次却从未定义(而它恰好决定 B4 会不会孤儿化抢救提交);Task 22 是全部风险所在却**零可执行步骤**;Task 21 让人"照抄已作废文档";24-27 是一句 TBD |
+>
+> ## 结论:换做法
+>
+> 三轮都是"先写方案 → 送评审 → 被实测推翻",每轮推翻的都是**我对既有 git 助手行为的假设**,而不是设计思路。继续这个循环只会有第四轮。
+>
+> **应当先做实验再写方案**:在一次性仓库里把 `worktreePool` 对着**真 git** 实现出来,把
+> `createAgentWorktree` / `performPostCreationSetup` / 钩子 / 复用路径 / 并发合并的真实行为全部
+> 测出来,然后**从实测结果反写方案**。前三轮已经积累了大量这类事实(见上表与前两版文档),
+> 它们本该是实验的产出,而不是评审的产出。
+
+---
+
+## 以下为 v2 原文(留档)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
