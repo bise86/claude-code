@@ -2669,7 +2669,6 @@ Expected: FAIL。
 - [ ] **Step 3: 实现(纯逻辑)**
 
 ```ts
-// src/tools/efftask/startupConfirm.ts
 import { PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, PhaseName } from './types.js'
 
@@ -2684,36 +2683,80 @@ const PHASE_LABEL: Record<PhaseName, string> = {
 // two surfaces can never disagree about who is on the panel.
 export function rosterLines(config: EffTaskConfig): string[] {
   return PHASE_NAMES.map(p => {
-    const names = config.phaseRoles[p].map(r => r.roleName)
-    return `${PHASE_LABEL[p]}: ${names.length > 0 ? names.join('、') : '主模型'}`
+    // Show the bound model too: this gate exists to let the user see exactly who is on the
+    // panel, and "coder" alone hides which model that role actually runs on.
+    const names = config.phaseRoles[p].map(r => (r.model ? `${r.roleName}(${r.model})` : r.roleName))
+    const joined = names.length > 0 ? names.join('、') : '主模型'
+    // Same 80-char budget the goal line uses, so one long roster can't wreck the layout.
+    const clipped = Array.from(joined).length > 80 ? `${Array.from(joined).slice(0, 79).join('')}…` : joined
+    return `${PHASE_LABEL[p]}: ${clipped}`
   })
 }
 
-export function createResolveOnce<T>(): { claim(): boolean; resolve(v: T): void; promise: Promise<T> } {
+/** Who answered first. Surfaces use it to render an accurate resolved state. */
+export type ConfirmWinner = 'terminal' | 'feishu' | 'cancelled'
+
+/** Told to every surface once the race ends, so each can show WHO decided and WHAT. */
+export type SurfaceTeardown = (winner: ConfirmWinner, decision: StartupDecision) => void
+
+/**
+ * A surface receives `claim` and a `onTeardown` collector.
+ *
+ * The collector exists so a surface can register cleanup INCREMENTALLY: if the factory
+ * throws halfway through, whatever it already registered (e.g. an entry in the shared
+ * Feishu callbacks registry) still gets unwound. Returning a teardown only at the end
+ * would leak those registrations into a registry the permission bridge also uses.
+ */
+export type ConfirmSurface = (
+  claim: (winner: ConfirmWinner, d: StartupDecision) => void,
+  onTeardown: (fn: SurfaceTeardown) => void,
+) => void
+
+// Single-shot claim. claim() both wins the race and delivers the value, so there is no
+// way to resolve without having claimed.
+export function createResolveOnce<T>(): { claim(v: T): boolean; promise: Promise<T> } {
   let claimed = false
   let resolveFn!: (v: T) => void
   const promise = new Promise<T>(res => { resolveFn = res })
   return {
-    claim() { if (claimed) return false; claimed = true; return true },
-    resolve(v) { resolveFn(v) },
+    claim(v) { if (claimed) return false; claimed = true; resolveFn(v); return true },
     promise,
   }
 }
 
 export async function raceConfirm(
-  surfaces: Array<(claimAndResolve: (d: StartupDecision) => void) => () => void>,
-): Promise<StartupDecision> {
-  const once = createResolveOnce<StartupDecision>()
-  const teardowns: Array<() => void> = []
-  const claimAndResolve = (d: StartupDecision) => { if (once.claim()) once.resolve(d) }
+  surfaces: ConfirmSurface[],
+  opts: { signal?: AbortSignal } = {},
+): Promise<{ winner: ConfirmWinner; decision: StartupDecision }> {
+  const once = createResolveOnce<{ winner: ConfirmWinner; decision: StartupDecision }>()
+  const teardowns: SurfaceTeardown[] = []
+  const claim = (winner: ConfirmWinner, decision: StartupDecision) => { once.claim({ winner, decision }) }
+  const collect = (fn: SurfaceTeardown) => { teardowns.push(fn) }
+
+  let started = 0
   for (const surface of surfaces) {
-    // A surface that throws while constructing (e.g. Feishu send blows up) must NOT kill
-    // the race — the other surfaces can still win. Only successful ones get a teardown.
-    try { teardowns.push(surface(claimAndResolve)) } catch { /* skip this surface */ }
+    // A surface that throws while constructing (e.g. the Feishu send blows up) must NOT
+    // kill the race — the others can still win. Anything it already registered via the
+    // collector is still torn down below.
+    try { surface(claim, collect); started++ } catch { /* skip this surface */ }
   }
-  const decision = await once.promise
-  for (const t of teardowns) { try { t() } catch { /* ignore */ } }
-  return decision
+
+  // Nothing is listening, so nothing can ever answer. Fail fast instead of awaiting a
+  // promise that no one can settle — raceConfirm is the only place that knows this.
+  if (started === 0) claim('cancelled', { parallelism: 0, approved: false })
+
+  const onAbort = () => claim('cancelled', { parallelism: 0, approved: false })
+  if (opts.signal) {
+    if (opts.signal.aborted) onAbort()
+    else opts.signal.addEventListener('abort', onAbort, { once: true })
+  }
+  try {
+    const result = await once.promise
+    for (const t of teardowns) { try { t(result.winner, result.decision) } catch { /* ignore */ } }
+    return result
+  } finally {
+    opts.signal?.removeEventListener('abort', onAbort)
+  }
 }
 ```
 
@@ -2754,7 +2797,6 @@ export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: S
 - [ ] **Step 6: 实现飞书启动卡片 surface(集成代码,无单测)**
 
 ```ts
-// src/tools/efftask/feishuStartupCard.ts
 // Integration surface — rides the SHARED always-on FeishuClient + permission callbacks
 // owned by useFeishuBridge, so no unit test (repo convention).
 // The pure racer / roster primitives stay in startupConfirm.ts.
@@ -2768,7 +2810,7 @@ export function ConfirmStartup(props: { config: EffTaskConfig; onDecision: (d: S
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig } from './types.js'
-import { rosterLines, type StartupDecision } from './startupConfirm.js'
+import { rosterLines, type ConfirmWinner, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -2800,11 +2842,16 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string): obje
   }
 }
 
-function resolvedCard(): object {
+// Mirrors buildResolvedCard in services/feishu/cards.ts: the card must say WHO decided and
+// WHAT was decided. A constant "handled elsewhere" text leaves a user who cancelled from
+// Feishu unable to tell whether the run started.
+const VIA: Record<ConfirmWinner, string> = { terminal: '终端', feishu: '飞书', cancelled: '系统' }
+function resolvedCard(winner: ConfirmWinner, decision: StartupDecision): object {
+  const label = winner === 'cancelled' ? '⏹ 已取消' : decision.approved ? '✅ 已开始' : '❌ 已取消'
   return {
     config: { wide_screen_mode: true },
     header: { title: { tag: 'plain_text', content: '高效任务模式 · 启动确认' } },
-    elements: [{ tag: 'div', text: { tag: 'lark_md', content: '已在终端处理。' } }],
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content: `${label}（${VIA[winner]}）` } }],
   }
 }
 
@@ -2816,22 +2863,43 @@ export function sendFeishuStartupCard(
     cardContent: object
     parallelism: number // echoed back in the decision (the card has no inline editor in P1)
   },
-  claimAndResolve: (d: StartupDecision) => void,
-): () => void {
+  claim: (winner: ConfirmWinner, d: StartupDecision) => void,
+  onTeardown: (fn: SurfaceTeardown) => void,
+): void {
   let messageId: string | undefined
+  let resolved: { winner: ConfirmWinner; decision: StartupDecision } | undefined
+
+  // Compensation patch, same shape as makeFeishuRacer: the card and the decision can land
+  // in either order, so flip it from BOTH sides. Without the post-send call, a terminal win
+  // that beats sendCard leaves a live 开始/取消 card in the chat forever, silently
+  // swallowing clicks.
+  const patchResolved = (): void => {
+    if (messageId && resolved) {
+      void deps.client.updateCard(messageId, resolvedCard(resolved.winner, resolved.decision))
+    }
+  }
+
   // Register on the shared registry — NOT client.onCardAction (single slot, already taken).
-  const unsub = deps.callbacks.onResponse(deps.requestId, r =>
-    claimAndResolve({ parallelism: deps.parallelism, approved: r.behavior === 'allow' }),
-  )
-  // fire-and-forget send on the shared client; capture messageId for the teardown update
-  void deps.client.sendCard(deps.cardContent).then(id => { messageId = id }).catch(logError)
-  // teardown (loser cleanup): unsubscribe, then best-effort flip the card to a resolved state.
-  return () => {
+  const unsub = deps.callbacks.onResponse(deps.requestId, r => {
+    const decision = { parallelism: deps.parallelism, approved: r.behavior === 'allow' }
+    claim('feishu', decision)
+  })
+  // Registered BEFORE anything that can throw, so a later failure still unwinds the entry
+  // out of the shared registry instead of poisoning it for the permission bridge.
+  onTeardown((winner, decision) => {
     unsub()
-    // If the terminal wins BEFORE sendCard resolves, messageId is still undefined and the
-    // card stays interactive. Harmless: unsub() already removed the handler, and any late
-    // click is swallowed by once.claim() in raceConfirm.
-    if (messageId) void deps.client.updateCard(messageId, resolvedCard()).catch(logError)
+    resolved = { winner, decision }
+    patchResolved()
+  })
+
+  try {
+    // fire-and-forget send on the shared client; the messageId arrives later.
+    void deps.client
+      .sendCard(deps.cardContent)
+      .then(id => { messageId = id; patchResolved() })
+      .catch(logError)
+  } catch (e) {
+    logError(e)
   }
 }
 ```
