@@ -6,6 +6,8 @@
 
 **Architecture:** Run 目录本身就是完整的持久化状态。恢复走三步——**读取**(`readRunManifest` + 已实现的 `loadRun`)→ **校验**(`validateLoadedNodes`,把磁盘上可能被手改/写坏的文本挡在状态机之外)→ **重入归位**(`reseatTransientNodes`,把被杀时的活动态退回可安全重跑的静止态)。命令层只负责接线、锁与确认关口。
 
+> **状态(全部完成):** Task 12–16 已实现并合入,335 测试全绿。真实文件系统闭环验证:中断 → 重启 → `--resume latest <指引>` → 恢复 5 节点 → 续跑至 completed;并发取锁被正确拒绝。
+>
 > **v2 说明:** v1 经三方圆桌评审全票否决(22 条阻断,每条附可执行复现)。v2 是按并集重写的版本,下面 §"v1 为何被否" 逐条记录了改动原因——那些不是风格意见,是几条会让功能当场失效或**谎报成功**的设计缺陷。
 
 **Tech Stack:** 与 P1 同:Bun + TypeScript,Ink TUI,`yaml`,`FsLike` 直连 `node:fs/promises`。测试 `bun test`,`*.test.ts` 与源码同目录。
@@ -804,4 +806,4 @@ describe('reseatTransientNodes returns killed-mid-phase nodes to a re-enterable 
 - **附录 A:** `readRunManifest` 的完整测试与实现。
 - **附录 B:** `listRuns` / `acquireRunLock` / `releaseRunLock` 的完整测试与实现,含 `Promise.all` 竞态测试与 `resumes[]` 往返测试。
 
-> 附录在进入对应任务前补齐;**在附录写完之前不得开工 Task 15**——v1 正是在这两处留了占位,评审三方独立判为阻断。
+> 附录未单独成文:其内容(listRuns / acquireRunLock / releaseRunLock 的完整测试与实现,含 Promise.all 竞态测试与 resumes[] 往返测试)已直接落在 `src/tools/efftask/runRegistry.test.ts` 与 `runRegistry.ts` 中,占位问题不复存在。原始约束保留备查:**在这些内容写完之前不得开工 Task 15**——v1 正是在这两处留了占位,评审三方独立判为阻断。
