@@ -50,6 +50,30 @@ describe('重开一个节点,却把它的上级留在阻断状态,等于什么�
     expect(root.blockedReason).toContain('缺少回滚设计')
   })
 
+  it('also reopens siblings that were only waiting on this node', () => {
+    // propagateBlocked writes 依赖阻断 on dependents, and NOTHING anywhere else ever clears a
+    // blockedReason. So after the human's fix merged and the conflict node reached ACCEPTED,
+    // the tree kept rendering "✗ 依赖阻断" for a node whose only dependency was now done.
+    const root = mk({ id: 'root', childIds: ['root/01', 'root/02'], kind: 'decompose', status: 'BLOCKED', blockedReason: '子节点阻断' })
+    const conflict = mk({
+      id: 'root/01', parentId: 'root', depth: 1, kind: 'executable', status: 'BLOCKED',
+      blockedReason: '合并冲突', mergeConflict: true, worktree: { branch: 'b', path: '/wt/1' },
+    })
+    const dependent = mk({ id: 'root/02', parentId: 'root', depth: 1, kind: 'executable', deps: ['root/01'], status: 'BLOCKED', blockedReason: '依赖阻断' })
+    reseatTransientNodes([root, conflict, dependent], NOW, DEFAULT_CAPS)
+    expect(dependent.status).toBe('READY')
+    expect(dependent.blockedReason).toBe('')
+  })
+
+  it('leaves a dependent alone when it failed on its own account', () => {
+    const root = mk({ id: 'root', childIds: ['root/01', 'root/02'], kind: 'decompose', status: 'BLOCKED', blockedReason: '子节点阻断' })
+    const conflict = mk({ id: 'root/01', parentId: 'root', depth: 1, kind: 'executable', status: 'BLOCKED', blockedReason: '合并冲突', mergeConflict: true, worktree: { branch: 'b', path: '/wt/1' } })
+    const dependent = mk({ id: 'root/02', parentId: 'root', depth: 1, kind: 'executable', deps: ['root/01'], status: 'BLOCKED', blockedReason: '验收迭代超限(3): [qa] 无用例' })
+    reseatTransientNodes([root, conflict, dependent], NOW, DEFAULT_CAPS)
+    expect(dependent.status).toBe('BLOCKED')
+    expect(dependent.blockedReason).toContain('无用例')
+  })
+
   it('walks the chain more than one level up', () => {
     const root = mk({ id: 'root', childIds: ['root/01'], kind: 'decompose', status: 'BLOCKED', blockedReason: '子节点阻断' })
     const mid = mk({ id: 'root/01', parentId: 'root', depth: 1, childIds: ['root/01/01'], kind: 'decompose', status: 'BLOCKED', blockedReason: '子节点阻断' })

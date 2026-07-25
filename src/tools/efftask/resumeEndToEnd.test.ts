@@ -117,6 +117,25 @@ describe('人工解决合并冲突后,--resume 真的接手', () => {
     expect(after.acceptLog.length).toBeGreaterThan(before.acceptLog.length)
   })
 
+  it('numbers the resumed acceptance round after the ones already on record', async () => {
+    // The record is what the escalation card sends the user to read ("请先看 node.md 的验收
+    // 记录"). It rendered 第 2 轮 twice — once before and once after 第 3 轮 — because this
+    // path numbered from iteration.acceptance, a counter neither conflict path increments.
+    const first = await blockedRun()
+    const onDisk = first.map(n => parseNodeFile(serializeNode(n)))
+    const { nodes } = validateLoadedNodes(onDisk, { goal: cfg().goalPrompt, phaseRoles: emptyPhaseRoles(), now: new Date().toISOString() })
+    reseatTransientNodes(nodes, new Date().toISOString(), cfg().caps)
+    const o2 = new EffTaskOrchestrator(
+      cfg(), { ...deps(cooperative(EXECUTABLE_PLAN)), worktrees: pool({ commitAndMerge: async () => ({ ok: true, merged: true }), release: async () => ({ removed: true }) }) as never },
+      new AbortController().signal, nodes,
+    )
+    await o2.run()
+    const rounds = o2.nodes().find(n => n.id === 'root')!.acceptLog.map(r => r.round)
+    expect(rounds.length).toBeGreaterThan(1)
+    expect(new Set(rounds).size).toBe(rounds.length)                     // no duplicates
+    expect([...rounds].sort((x, y) => x - y)).toEqual(rounds)            // and in order
+  })
+
   it('blocks again — without discarding the fix — when the human resolution fails acceptance', async () => {
     const first = await blockedRun()
     const onDisk = first.map(n => parseNodeFile(serializeNode(n)))

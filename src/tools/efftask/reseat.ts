@@ -58,11 +58,15 @@ export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps)
   // with a blocked ancestor, so the reopened child was unreachable and the run immediately
   // re-blocked it as 上级任务阻断: measured, a resume that reopened the right node still made
   // ZERO model calls and the human's merge fix never landed.
-  const DESCENDANT_BLOCK = new Set(['子节点阻断', '上级任务阻断'])
+  // All three are written BY propagateBlocked about someone else's failure — none is a
+  // verdict on the node itself, and nothing anywhere else ever clears a blockedReason. Leaving
+  // 依赖阻断 out meant a sibling stayed BLOCKED forever after the node it waited on reached
+  // ACCEPTED, still rendering "✗ 依赖阻断" in the tree.
+  const PROPAGATED = new Set(['子节点阻断', '上级任务阻断', '依赖阻断'])
   const byId = new Map(nodes.map(n => [n.id, n]))
   const reopenAncestors = (n: TaskNode): void => {
     let p = n.parentId === null ? undefined : byId.get(n.parentId)
-    while (p && p.status === 'BLOCKED' && DESCENDANT_BLOCK.has(p.blockedReason)) {
+    while (p && p.status === 'BLOCKED' && PROPAGATED.has(p.blockedReason)) {
       p.status = p.childIds.length > 0 ? 'WAITING_CHILDREN' : 'READY'
       p.blockedReason = ''
       p.updatedAt = now
@@ -109,6 +113,15 @@ export function reseatTransientNodes(nodes: TaskNode[], now: string, caps: Caps)
     n.interrupted = false
     // Reopen the chain above too, or this seat is unreachable.
     reopenAncestors(n)
+    // …and anything that was only waiting on this node. Same reason: the block was never
+    // about them.
+    for (const other of nodes) {
+      if (other.status === 'BLOCKED' && PROPAGATED.has(other.blockedReason) && other.deps.includes(n.id)) {
+        other.status = other.childIds.length > 0 ? 'WAITING_CHILDREN' : other.kind === 'executable' ? 'READY' : 'CREATED'
+        other.blockedReason = ''
+        other.updatedAt = now
+      }
+    }
     // It is no longer blocked, so the reason must not linger — it would render in the tree
     // and be read as a live failure.
     n.blockedReason = ''

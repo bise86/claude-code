@@ -29,7 +29,7 @@ export type ConflictEscalation = {
    * wrong description costs more than no description. Three states reach here and each needs
    * a different instruction; a single sentence about <<<<<<< markers was false in two of them.
    */
-  state: { markers: boolean; staged: boolean }
+  state: { markers: boolean; staged: boolean; stale?: boolean }
   /** The other side of the merge. Without it the user cannot reproduce the conflict at all. */
   integrationBranch?: string
 }
@@ -54,13 +54,20 @@ export function escalationLines(e: ConflictEscalation, runId?: string): string[]
     // Written from the measurement. `staged` in particular must not say "git add 并 commit":
     // what is staged there is the resolution acceptance JUST REJECTED, so that instruction
     // would have the user commit verbatim the code the reviewers refused.
-    e.state.staged
-      ? '处理方式: cd 到上面的工作区。自动解决已经改好并 git add 过,但验收未通过 —— ' +
-        '请先看 node.md 的验收记录,改正后再 git commit(不要直接提交现状)。'
-      : e.state.markers
-        ? '处理方式: cd 到上面的工作区,那里就是冲突现场(带 <<<<<<< 标记),解决后 git add 并 git commit。'
-        : '处理方式: cd 到上面的工作区。那里目前没有冲突现场 —— 请自行把集成分支合并进来' +
-          '(git merge <上面的集成分支>),解决冲突后提交。',
+    e.state.stale
+      ? '处理方式: cd 到上面的工作区。冲突标记(<<<<<<< / >>>>>>>)已经被提交进这个分支的文件里 —— ' +
+        '请清理掉残留标记并提交。注意直接 git merge 会回答 Already up to date,合并本身已经做过了。'
+      : e.state.staged
+        // Says only what is MEASURABLE. The earlier wording hard-coded 自动解决…验收未通过, but
+        // this state is also reached by a human who ran git merge and git add and forgot to
+        // commit — for whom every clause was false, including one that contradicted the line
+        // directly above it.
+        ? '处理方式: cd 到上面的工作区。那里有一个未提交完成的合并(改动已 git add,尚未 commit)。' +
+          '请核对内容确实保留了双方意图,再 git commit;若不确定,先看 node.md 的验收记录。'
+        : e.state.markers
+          ? '处理方式: cd 到上面的工作区,那里就是冲突现场(带 <<<<<<< 标记),解决后 git add 并 git commit。'
+          : '处理方式: cd 到上面的工作区。那里目前没有冲突现场 —— 请自行把集成分支合并进来' +
+            '(git merge <上面的集成分支>),解决冲突后提交。',
     `集成分支: ${e.integrationBranch ?? '(未知)'}`,
     `恢复: /et --resume ${runId ?? '<运行 ID>'};恢复后会重跑验收再合并。`,
   ]

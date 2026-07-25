@@ -235,12 +235,11 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         // without losing the case the scan exists for.
         const mergeCommits = await git(['rev-list', '--merges', `${intBranch}..HEAD`], path)
         if (mergeCommits.stdout.trim().length > 0) {
-          const incoming = await git(['diff', '-U0', `${intBranch}...HEAD`], path)
-          const marked = incoming.stdout.split('\n').some(l => /^\+(<{7} |>{7} |={7}$)/.test(l))
-          if (marked) {
-            const names = await git(['diff', '--name-only', `${intBranch}...HEAD`], path)
-            return { ok: false, kind: 'conflict', files: names.stdout.split('\n').map(l => l.trim()).filter(Boolean) }
-          }
+          // Same helper the card reads, so the refusal and the card never name different
+          // files. Reporting every file the branch touched listed two untouched files as
+          // 冲突文件 on a real card.
+          const marked = await this.markerFiles(node)
+          if (marked.length > 0) return { ok: false, kind: 'conflict', files: marked }
         }
 
         if (await isMerged(branch)) return { ok: true, merged: false }
@@ -378,16 +377,40 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * Never touches a worktree that already has a merge in progress: `mergeIntegrationIntoNode`
      * would commit the staged resolution before merging, which is the rejected work.
      */
-    async conflictState(node: TaskNode): Promise<{ markers: boolean; staged: boolean; files: string[] }> {
+    /** Files this branch would bring that still carry conflict-marker lines. */
+    async markerFiles(node: TaskNode): Promise<string[]> {
+      const path = pathFor(node)
+      // Gated the same way commitAndMerge is: marker TEXT is not evidence of a conflict, so a
+      // README about merge conflicts must not be reported as one.
+      const merges = await git(['rev-list', '--merges', `${intBranch}..HEAD`], path)
+      if (merges.stdout.trim().length === 0) return []
+      const diff = await git(['diff', '-U0', `${intBranch}...HEAD`], path)
+      const out: string[] = []
+      let current = ''
+      for (const line of diff.stdout.split('\n')) {
+        if (line.startsWith('+++ b/')) { current = line.slice('+++ b/'.length).trim(); continue }
+        if (current && /^\+(<{7} |>{7} |={7}$)/.test(line) && !out.includes(current)) out.push(current)
+      }
+      return out
+    },
+
+    async conflictState(node: TaskNode): Promise<{ markers: boolean; staged: boolean; stale: boolean; files: string[] }> {
       const path = pathFor(node)
       const u = await git(['diff', '--name-only', '--diff-filter=U'], path)
       const files = u.stdout.split('\n').map(l => l.trim()).filter(Boolean)
-      if (files.length > 0) return { markers: true, staged: false, files }
+      if (files.length > 0) return { markers: true, staged: false, stale: false, files }
       const mh = await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], path)
-      if (mh.code === 0) return { markers: false, staged: true, files: [] }
+      if (mh.code === 0) return { markers: false, staged: true, stale: false, files: [] }
+      // BEFORE trying to make a conflict: markers may already be sitting in COMMITTED content
+      // (a resolver that "resolved" by committing both sides). That worktree is clean and has
+      // no MERGE_HEAD, so every other probe calls it conflict-free — and the card then told the
+      // user 那里目前没有冲突现场 while <<<<<<< HEAD was literally in the file, and prescribed a
+      // `git merge` that answers "Already up to date."
+      const stale = await this.markerFiles(node)
+      if (stale.length > 0) return { markers: true, staged: false, stale: true, files: stale }
       const made = await this.mergeIntegrationIntoNode(node)
-      if (made.ok && made.conflicted) return { markers: true, staged: false, files: made.files }
-      return { markers: false, staged: false, files: [] }
+      if (made.ok && made.conflicted) return { markers: true, staged: false, stale: false, files: made.files }
+      return { markers: false, staged: false, stale: false, files: [] }
     },
 
     async mergeIntegrationIntoNode(node: TaskNode): Promise<{ ok: true; conflicted: false } | { ok: true; conflicted: true; files: string[] } | { ok: false; message: string }> {

@@ -50,7 +50,7 @@ export interface PipelineCtx {
   onEscalate?: (info: {
     node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean
     /** MEASURED state of that worktree, so the card can describe it instead of guessing. */
-    state: { markers: boolean; staged: boolean }
+    state: { markers: boolean; staged: boolean; stale: boolean }
     integrationBranch?: string
   }) => void
 }
@@ -718,15 +718,20 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
       // acceptance rejected, and merging would have committed exactly that.
       // Only the two booleans travel: conflictState also returns its own file list, and
       // shipping both would put two different answers to "which files" on one card.
-      let state = { markers: false, staged: false }
+      let state = { markers: false, staged: false, stale: false }
+      // res.files is whatever the FIRST merge attempt reported and is stale by construction:
+      // on the marker-scan path it is every file the branch touches, so a card listed two
+      // untouched files as 冲突文件. Prefer the measurement; fall back only if it fails.
+      let files = res.files
       try {
         const probed = await ctx.worktrees.conflictState(node)
-        state = { markers: probed.markers, staged: probed.staged }
+        state = { markers: probed.markers, staged: probed.staged, stale: probed.stale === true }
+        if (probed.files.length > 0) files = probed.files
       } catch { /* describe what we already know rather than swallowing the escalation */ }
       // Marks this as a HUMAN-RESUMABLE block. Without it reseat skips the node on every
       // later --resume, which made the escalation card's instructions untrue.
       node.mergeConflict = true
-      const detail = `合并冲突,已保留工作区待人工处理。分支 ${node.worktree.branch};路径 ${node.worktree.path};冲突文件: ${res.files.join('、')}`
+      const detail = `合并冲突,已保留工作区待人工处理。分支 ${node.worktree.branch};路径 ${node.worktree.path};冲突文件: ${files.join('、')}`
       // Escalate BEFORE blocking, so the card carries the same facts the tree will show.
       // `attempted` is threaded through the recursion rather than derived from
       // iteration.mergeResolve, which is PERSISTED: a node resumed with its one attempt
@@ -734,7 +739,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
       // describing something that happened in a previous session — or, after an interrupt,
       // something that never finished at all.
       try {
-        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files: res.files, attempted, state, integrationBranch: ctx.worktrees.integrationBranchName })
+        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files, attempted, state, integrationBranch: ctx.worktrees.integrationBranchName })
       } catch { /* a notification failure must not change the run's verdict */ }
       await blockWithReason(node, detail, ctx)
       return false
@@ -783,7 +788,11 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     node.mergeConflict = false
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
-      phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
+      // acceptLog.length + 1, like the other conflict path. iteration.acceptance is never
+      // incremented on either, so using it here reproduced a round number already in the log:
+      // 验收记录 rendered 第 2 轮 twice, once before and once after 第 3 轮 — and the card sends
+      // the user to exactly that record.
+      phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
       system: 'accept', buildPrompt: t => acceptPrompt(node, t), ctx, cwd: node.worktree.path,
     })
     node.acceptLog.push(rec)
@@ -797,6 +806,15 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // Keep the flag: the user can revise their resolution and resume again. Clearing it made
     // this a dead end — reseat skipped the node forever and no second card was ever sent.
     node.mergeConflict = true
+    // Send a card here as well. Keeping the node resumable without telling anyone left the
+    // user waiting on a run that was waiting on them.
+    try {
+      ctx.onEscalate?.({
+        node, branch: node.worktree.branch, path: node.worktree.path, files: [],
+        attempted: false, state: { markers: false, staged: true, stale: false },
+        integrationBranch: ctx.worktrees?.integrationBranchName,
+      })
+    } catch { /* a notification failure must not change the run's verdict */ }
     await blockWithReason(node, `人工解决冲突后验收未通过: ${rec.synthesized.blockingSummary || '验收角色调用失败'}`, ctx)
     return
   }

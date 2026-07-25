@@ -43,14 +43,27 @@ describe('冲突升级卡', () => {
     expect(text).toContain('efftask/007/integration') // the other side, or they cannot reproduce it
   })
 
-  it('does NOT tell the user to commit a resolution acceptance just rejected', () => {
-    // On the primary path the resolver already ran `git add`, so there are no markers left —
-    // what is staged is the code the reviewers refused. 'git add 并 git commit' would have the
-    // user commit exactly that, and the earlier card said precisely those words.
-    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: ['a'], attempted: true, state: { markers: false, staged: true } }, '1').join('\n')
-    expect(text).toContain('验收未通过')
-    expect(text).toContain('不要直接提交现状')
+  it('describes a staged merge without inventing who staged it or how it was judged', () => {
+    // This state is ALSO reached by a human who ran `git merge` + `git add` and forgot to
+    // commit before resuming. The earlier wording hard-coded 自动解决…验收未通过 and was false
+    // in every clause for them — including one that contradicted the line directly above it
+    // (本次未再尝试). Say only what was measured.
+    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: ['a'], attempted: false, state: { markers: false, staged: true } }, '1').join('\n')
+    expect(text).toContain('未提交完成的合并')
+    expect(text).not.toContain('自动解决已经改好')
+    expect(text).not.toContain('但验收未通过')
     expect(text).not.toContain('那里就是冲突现场')
+  })
+
+  it('names committed leftover markers instead of claiming there is no conflict', () => {
+    // A resolver that 'resolves' by committing both sides leaves a CLEAN worktree with no
+    // MERGE_HEAD. Every other probe calls that conflict-free, so the card said 那里目前没有
+    // 冲突现场 while <<<<<<< HEAD sat in the file, and prescribed a `git merge` that answers
+    // 'Already up to date.' — an instruction with no effect on a real problem it never named.
+    const text = escalationLines({ node: node(), branch: 'b', path: '/p', files: ['shared.txt'], attempted: true, state: { markers: true, staged: false, stale: true } }, '1').join('\n')
+    expect(text).toContain('已经被提交进这个分支的文件里')
+    expect(text).toContain('Already up to date')
+    expect(text).not.toContain('那里目前没有冲突现场')
   })
 
   it('admits when the worktree has no conflict in it at all', () => {

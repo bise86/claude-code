@@ -1115,7 +1115,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     // 升级人工: the card carries the same facts the tree shows, so the user can act from either.
     expect(escalations.length).toBe(1)
     expect(escalations[0]!.node).toBe(n) // the card names the node, not just a path
-    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'], attempted: true, state: { markers: true, staged: false }, integrationBranch: 'efftask/001/integration' })
+    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'], attempted: true, state: { markers: true, staged: false, stale: false }, integrationBranch: 'efftask/001/integration' })
   })
 
   it('a failing escalation channel does not change the run verdict', async () => {
