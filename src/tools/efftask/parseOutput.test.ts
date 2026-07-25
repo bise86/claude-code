@@ -73,12 +73,45 @@ describe('parseOutput', () => {
       '(模板提醒)\n```json\n{"note":"请按上面格式填写"}\n```'
     expect(parseExecOutput(text).execStatus).toBe('已完成:实现缓存层,单测全通过')
   })
-  it('prefers an explicitly json-tagged fence over a stray code fence that parses', () => {
+  // The decisive case: a recap has the SAME shape as the answer, so neither shape
+  // nor recency can rank them. The answer's own fence tag is what separates them.
+  it('parseVerdict: a ```verdict-tagged answer beats a same-shaped untagged recap', () => {
     const text =
-      '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```\n' +
-      '附上工具输出:\n```bash\n{"pass":false,"blocking":["来自无关的日志"]}\n```'
-    const v = parseVerdict(text, 'main')
+      '```verdict\n{"pass":false,"blocking":["仍缺压测数据"],"comments":"不通过"}\n```\n' +
+      '(供参考,上一轮的结论是)\n```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    const v = parseVerdict(text, 'sec')
+    expect(v.pass).toBe(false)
+    expect(v.blocking).toEqual(['仍缺压测数据'])
+  })
+  it('parseVerdict: two untagged same-shaped blocks are ambiguous => fails closed', () => {
+    const text =
+      '```json\n{"pass":false,"blocking":["缺压测"],"comments":""}\n```\n' +
+      '上一轮结论:\n```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    const v = parseVerdict(text, 'sec')
+    expect(v.pass).toBe(false) // never silently inherits the stale pass
+    expect(v.blocking.length).toBeGreaterThan(0)
+  })
+  it('parseVerdict: a single untagged verdict still works (tolerates an imperfect model)', () => {
+    const v = parseVerdict('```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```', 'main')
     expect(v.pass).toBe(true)
+  })
+  it('parsePlanOutput / parseExecOutput prefer their tagged answer over a later recap', () => {
+    const plan = parsePlanOutput(
+      '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"AA","deps":[]}]}\n```\n' +
+        '上一版:\n```json\n{"kind":"executable","solution":"旧"}\n```',
+    )
+    expect(plan.kind).toBe('decompose')
+    expect(plan.plan.solution).toBe('s')
+    const exec = parseExecOutput(
+      '```exec\n{"execStatus":"真实状态"}\n```\n```json\n{"execStatus":"模板占位"}\n```',
+    )
+    expect(exec.execStatus).toBe('真实状态')
+  })
+  it('ignores a stray non-json code fence that happens to parse', () => {
+    const text =
+      '```verdict\n{"pass":true,"blocking":[],"comments":"ok"}\n```\n' +
+      '附上工具输出:\n```bash\n{"pass":false,"blocking":["来自无关的日志"]}\n```'
+    expect(parseVerdict(text, 'main').pass).toBe(true)
   })
   it('never throws on empty or whitespace input', () => {
     for (const t of ['', '   \n\t ']) {
