@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, exitReportLine } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -252,5 +252,36 @@ describe('resumeSummarySections 对 --retry-blocked 要说清楚', () => {
   it('says nothing when the flag was not used', () => {
     expect(resumeSummarySections({ ...base, retried: [] }).some(x => x.heading.includes('retry'))).toBe(false)
     expect(resumeSummarySections(base).some(x => x.heading.includes('retry'))).toBe(false)
+  })
+})
+
+describe('exitReportLine:退出时留在 transcript 里的那一行', () => {
+  const h = { branch: 'efftask/007/integration', commits: 3, kept: [], salvage: [] }
+
+  it('names the run, how it ended, and where run.md is', () => {
+    // This line replaced a closure that referenced `handoffRef` — an identifier declared
+    // inside the React component, NOT inside call(). Every exit with a run id therefore threw
+    // ReferenceError from inside a .then(), onDone was never called, and
+    // processSlashCommand's promise stayed pending forever. A bare identifier is valid
+    // syntax, so the parse gate could not see it and the file has no other tests.
+    const l = exitReportLine({ runId: '007', how: '完成', resumed: false, withPath: true, handoff: null })
+    expect(l).toContain('高效任务 007')
+    expect(l).toContain('完成')
+    expect(l).toContain('.claude/efftask/007/run.md')
+  })
+
+  it('says 续跑 for a resumed run', () => {
+    expect(exitReportLine({ runId: '007', how: '完成', resumed: true, withPath: true, handoff: null })).toContain('续跑')
+  })
+
+  it('omits the path when the run directory was an unused reservation', () => {
+    const l = exitReportLine({ runId: '007', how: '已取消', resumed: false, withPath: false, handoff: null })
+    expect(l).not.toContain('run.md')
+  })
+
+  it('appends the handoff, which is the only place the branch is named', () => {
+    const l = exitReportLine({ runId: '007', how: '完成', resumed: false, withPath: true, handoff: h })
+    expect(l).toContain('efftask/007/integration')
+    expect(l).toContain('3 个提交')
   })
 })

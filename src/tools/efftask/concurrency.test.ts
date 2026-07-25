@@ -314,7 +314,7 @@ describe('隔离可用时才解除 execute 串行(用户第一句的后半)', ()
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
-    conflictState: async () => ({ markers: true, staged: false, files: ['src/pay.ts'] }),
+    conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/pay.ts'] }),
     refreshFromIntegration: async () => ({ ok: true, updated: false }),
     mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/pay.ts'] }),
     integrationBranchName: 'efftask/001/integration',

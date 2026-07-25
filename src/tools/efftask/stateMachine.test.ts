@@ -1,7 +1,8 @@
 // src/tools/efftask/stateMachine.test.ts
 import { describe, expect, it } from 'bun:test'
 import { createNode, emptyPhaseRoles } from './types.js'
-import { byIdMap, depsSatisfied, childrenAllAccepted, advanceableKind, isTerminal, uiStatus, hasCycle } from './stateMachine.js'
+import { byIdMap, countStatuses, depsSatisfied, childrenAllAccepted, advanceableKind, isTerminal, uiStatus, hasCycle } from './stateMachine.js'
+import type { TaskNode } from './types.js'
 
 const NOW = '2026-07-25T00:00:00Z'
 const mk = (id: string, over: Partial<ReturnType<typeof createNode>> = {}) =>
@@ -95,5 +96,33 @@ describe('the dependency gate holds on EVERY advanceable path', () => {
 
     dep.status = 'ACCEPTED'
     expect(advanceableKind(parent, byId)).toBe('integrate')
+  })
+})
+
+describe('countStatuses:三个界面共用的那一个计数', () => {
+  const mkN = (status: TaskNode['status']): TaskNode => ({
+    ...createNode({ id: status, title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    status,
+  })
+
+  it('counts accepted / blocked / everything-else', () => {
+    // Shared by the resume gate, the /tasks row and the footer pill. Three copies of "what
+    // counts as done" is how they start disagreeing.
+    const c = countStatuses([mkN('ACCEPTED'), mkN('ACCEPTED'), mkN('BLOCKED'), mkN('EXECUTING'), mkN('CREATED')])
+    expect(c).toEqual({ accepted: 2, blocked: 1, pending: 2, total: 5 })
+  })
+
+  it('an empty tree is 0/0, not NaN', () => {
+    expect(countStatuses([])).toEqual({ accepted: 0, blocked: 0, pending: 0, total: 0 })
+  })
+
+  it('every non-terminal status is pending — none is silently uncounted', () => {
+    // A whitelist here would drop a status added later, and the row would then under-report
+    // the work that is actually in flight.
+    const all: TaskNode['status'][] = ['CREATED', 'PLANNING', 'PLAN_REVIEW', 'READY', 'EXECUTING',
+      'EXECUTED', 'ACCEPTANCE', 'REWORK', 'WAITING_CHILDREN', 'INTEGRATION_ACCEPT', 'SCORING', 'MERGE']
+    const c = countStatuses(all.map(mkN))
+    expect(c.pending).toBe(all.length)
+    expect(c.accepted + c.blocked).toBe(0)
   })
 })

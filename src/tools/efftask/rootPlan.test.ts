@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { applyRootDraft, childLines, draftBlockers, draftRootPlan, makeRootNode, rootTitle, type RootDraft } from './rootPlan.js'
+import { applyRootDraft, buildRootPlanNoticeCard, childLines, draftBlockers, draftRootPlan, makeRootNode, rootTitle, type RootDraft } from './rootPlan.js'
 import { EffTaskOrchestrator } from './orchestrator.js'
 import { PipelineCtx, stepStart } from './pipeline.js'
 import { byIdMap } from './stateMachine.js'
@@ -332,5 +332,52 @@ describe('draftBlockers:整批被退回的两种草稿', () => {
   it('起草失败时任务树那一段不假装做过决定', () => {
     expect(childLines({ kind: 'unknown', plan: emptyPlan(), children: [] }, false))
       .toEqual(['(未能起草,运行时由 plan 角色重新拆分)'])
+  })
+})
+
+describe('第三关的飞书通知卡', () => {
+  const d: RootDraft = {
+    kind: 'decompose',
+    plan: { solution: '分三步走', keyPoints: 'K', risks: 'R', acceptance: '有集成测试' },
+    children: [{ title: '设计接口', deps: [] }, { title: '实现服务', deps: ['设计接口'] }],
+  }
+  const body = (over: Partial<Parameters<typeof buildRootPlanNoticeCard>[0]> = {}) => {
+    const card = buildRootPlanNoticeCard({ goalPrompt: '做一个支付回调', draft: d, drafted: true, runId: '007', ...over }) as {
+      header: { template: string; title: { content: string } }
+      elements: { text: { content: string } }[]
+    }
+    return { card, text: card.elements[0].text.content }
+  }
+
+  it('carries the plan and the tree the terminal is showing', () => {
+    // A user who approved gates 1 and 2 FROM FEISHU used to receive nothing further, and the
+    // run sat at this gate waiting for a keystroke nobody was present to press.
+    const { text } = body()
+    expect(text).toContain('做一个支付回调')
+    expect(text).toContain('分三步走')
+    expect(text).toContain('有集成测试')
+    expect(text).toContain('设计接口')
+    expect(text).toContain('实现服务')
+  })
+
+  it('says out loud that it cannot be answered here', () => {
+    // The decisive line. A card that merely showed the plan would leave the reader waiting
+    // for buttons that are never coming.
+    const { text } = body()
+    expect(text).toContain('只能在终端确认')
+    expect(text).toContain('回到终端')
+  })
+
+  it('does not look like the startup card, which IS answerable from Feishu', () => {
+    expect(body().card.header.template).toBe('blue')
+    expect(body().card.header.title.content).toContain('待确认')
+    expect(body().card.header.title.content).toContain('007')
+  })
+
+  it('a failed draft says so instead of showing an empty plan as if it were one', () => {
+    const { text } = body({ draft: { kind: 'unknown', plan: emptyPlan(), children: [] }, drafted: false })
+    expect(text).toContain('未能起草根方案')
+    expect(text).toContain('未能起草,运行时由 plan 角色重新拆分')
+    expect(text).not.toContain('不拆分,根任务直接执行')
   })
 })

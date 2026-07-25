@@ -116,6 +116,53 @@ export function applyRootDraft(root: TaskNode, draft: RootDraft, now: string): v
 }
 
 /**
+ * 第三关的飞书**通知**卡 —— 明确不是确认卡。
+ *
+ * The other two gates race a Feishu card because their decision is {approved, parallelism},
+ * two values a card action can carry. This gate's 修改 is free text, which the permission-
+ * callback protocol has no channel for. But saying nothing was worse: a user who approved
+ * gates 1 and 2 FROM FEISHU got no further messages at all, and the run sat at the third gate
+ * waiting for a keystroke nobody was there to press — the Feishu path simply dead-ended.
+ *
+ * So: send the plan and the tree, and say plainly that the answer has to come from the
+ * terminal. A notification that admits its own scope beats silence, and beats a card with
+ * buttons that decide something different from what the terminal offers.
+ */
+export function buildRootPlanNoticeCard(args: {
+  goalPrompt: string
+  draft: RootDraft
+  drafted: boolean
+  runId?: string
+}): object {
+  const { draft, drafted } = args
+  const clip = (s: string, max: number): string => {
+    const cps = Array.from(s)
+    return cps.length > max ? `${cps.slice(0, max - 1).join('')}…` : s
+  }
+  const section = (title: string, body: string): string =>
+    `**${title}**\n${clip(body.trim() || '(空)', 400)}`
+  const lines = [
+    `**目标**: ${clip(args.goalPrompt.split('\n').map(l => l.trim()).find(l => l.length > 0) ?? '', 120)}`,
+    drafted ? section('完整方案', draft.plan.solution) : '**未能起草根方案**,确认后将由 plan 角色在运行中自行起草。',
+    ...(drafted ? [section('验收点', draft.plan.acceptance)] : []),
+    `**初始任务树 · 第一层**(${drafted ? `${draft.children.length} 个` : '未起草'})\n` +
+      childLines(draft, drafted).map(l => `- ${l}`).join('\n'),
+    // The whole point of the card. Without this the reader waits for buttons that never come.
+    '⚠️ **本关口只能在终端确认**(可以改方案,是自由文本,飞书卡片没有这个通道)。请回到终端按回车确认、或按 e 提修改意见。',
+  ]
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      // Grey/blue: nothing is wrong and nothing is being asked OF the card. It must not look
+      // like the startup card, which IS answerable here.
+      template: 'blue',
+      title: { tag: 'plain_text', content: `高效任务模式 · 根方案待确认${args.runId ? ` (${args.runId})` : ''}` },
+    },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content: lines.join('\n\n') } }],
+  }
+}
+
+/**
  * Problems that make `createChildren` REJECT the whole batch, sending stepStart back to the
  * plan role — which discards the tree the user just approved and builds a different one.
  *

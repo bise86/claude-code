@@ -787,6 +787,15 @@ describe('跨分支依赖调度:一个节点看得见依赖合进来的东西吗
 
     await writeFile(join(la.path, 'mine.ts'), 'mine\n')
     expect(await p.refreshFromIntegration(a)).toEqual({ ok: true, updated: true })
+
+    // THE property, and it was never asserted: after refreshing, the node's branch CONTAINS
+    // the integration tip, so the merge is a fast-forward rather than a three-way merge over
+    // hunks neither side has seen. Without this the test passed with refreshFromIntegration
+    // gutted to a no-op — mine.ts and theirs.ts are different files and merge cleanly anyway.
+    const intTip = (await git(['rev-parse', 'efftask/001/integration'], gitRoot)).stdout.trim()
+    const contains = await git(['merge-base', '--is-ancestor', intTip, 'HEAD'], la.path)
+    expect(contains.code).toBe(0)
+
     expect(await p.commitAndMerge(a)).toEqual({ ok: true, merged: true })
     const intFile = await git(['show', `efftask/001/integration:mine.ts`], gitRoot)
     expect(intFile.stdout).toContain('mine')

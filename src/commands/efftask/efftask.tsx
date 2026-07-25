@@ -21,7 +21,7 @@ import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
-import { applyRootDraft, draftRootPlan, makeRootNode, type RootDraft } from '../../tools/efftask/rootPlan.js'
+import { applyRootDraft, buildRootPlanNoticeCard, draftRootPlan, makeRootNode, type RootDraft } from '../../tools/efftask/rootPlan.js'
 import { ConfirmRootPlan, type RootPlanDecision } from './ConfirmRootPlan.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import {
@@ -63,7 +63,12 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // painted for a single frame before exiting never reaches the transcript, so the user
   // would be left with a bare '已取消' and no idea what the command wanted.
   if (!args.trim()) {
-    onDone('用法: /et <任务提示词>', { display: 'system' })
+    onDone(
+      '用法: /et <任务提示词>\n' +
+      '  续跑: /et --resume [运行ID|latest] [续跑指引]\n' +
+      '  续跑并重开被安全阀停下的节点: /et --resume <运行ID> --retry-blocked',
+      { display: 'system' },
+    )
     return null
   }
   // getCwd(), NOT process.cwd(): a Bash-tool `cd` updates the session cwd WITHOUT calling
@@ -158,6 +163,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // ReferenceError from inside a .then(), onDone was never called, and processSlashCommand's
   // promise stayed pending forever.
   const handoffOut: { current: HandoffSummary | null } = { current: null }
+  // Same shape, same reason: onExit runs in THIS scope and must be able to report how many
+  // escalation cards were dropped.
+  const cardLimitOut: { current: number } = { current: 0 }
   return (
     <EffTaskRunner
       args={args}
@@ -188,6 +196,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       // claim they cancelled. It points at the run dir, which is exactly what resume reads.
       onTornDown={() => { tornDown = true }}
       handoffOut={handoffOut}
+      cardLimitOut={cardLimitOut}
       // The transcript is the only durable trace once the panel is gone: say how the run
       // ended and where its artifacts live, not just that it ended.
       // Latched: the done view's key handler fires per keypress, and the immediate-command
@@ -198,14 +207,19 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
           ? outcome.status === 'completed' ? '完成' : `被阻断(${outcome.reason ?? '未知原因'})`
           : tornDown ? '因界面重建而中断' : '已取消'
         const { runId, runDir, resumed } = active
+        // How many escalations were never sent. Suppression is announced on the LAST card
+        // that gets through, but that card cannot know the final number — this line can, and
+        // the transcript is where a user looks after the panel is gone.
+        const dropped = cardLimitOut.current
         // Never picked a run (cancelled at the picker, or resume failed before it resolved).
         if (!runId || !runDir) {
           onDone(`高效任务 ${how}`, { display: 'system' })
           return
         }
         const report = (withPath: boolean): void => {
+          const suppressed = dropped > 0 ? `\n(另有 ${dropped} 条升级通知因数量上限未发送,详见 run.md 的任务树)` : ''
           onDone(
-            exitReportLine({ runId, how, resumed, withPath, handoff: handoffOut.current }),
+            exitReportLine({ runId, how, resumed, withPath, handoff: handoffOut.current }) + suppressed,
             { display: 'system' },
           )
         }
@@ -364,6 +378,8 @@ type RunnerProps = {
   onTornDown: () => void
   /** call()-scoped holder for the handoff, read by onExit. See exitReportLine. */
   handoffOut: { current: HandoffSummary | null }
+  /** call()-scoped count of escalation cards the limiter dropped, read by onExit. */
+  cardLimitOut: { current: number }
   onExit: (outcome: Outcome | null) => void
 }
 
@@ -613,6 +629,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           const client = store.getState().feishuClient
           if (!client) return
           const { send, note } = cardLimit.current.admit()
+          props.cardLimitOut.current = cardLimit.current.suppressed()
           if (!send) return
           const card = buildBlockCard(info, runId ?? undefined) as { elements: { text: { content: string } }[] }
           if (note) card.elements[0].text.content += `\n- ${note}`
@@ -657,6 +674,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       } else {
         setDraftError(`未能起草根方案(${res.reason});确认后将由 plan 角色在运行中自行起草。`)
       }
+      // 第三关的飞书通知 (spec §9 "不新造确认通道" 的诚实边界)。A user who approved gates 1
+      // and 2 FROM FEISHU otherwise received nothing further and the run sat here waiting for
+      // a keystroke nobody was present to press. Notification only — it says so.
+      try {
+        const client = store.getState().feishuClient
+        if (client) {
+          void client.sendCard(buildRootPlanNoticeCard({
+            goalPrompt: approved.goalPrompt,
+            draft: res.ok ? res.draft : (draft ?? EMPTY_DRAFT),
+            drafted: res.ok || draft !== null,
+            runId: runId ?? undefined,
+          })).catch(err => logError(err instanceof Error ? err : new Error(String(err))))
+        }
+      } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
       setPhase('confirmRoot')
     })().catch(e => {
       if (cancelled) return

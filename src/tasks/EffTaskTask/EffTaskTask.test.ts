@@ -28,9 +28,12 @@ describe('高效任务的后台任务条目 (spec §10)', () => {
     expect(t).toBeDefined()
     expect(t.type).toBe('efftask')
     expect(t.status).toBe('running')
-    // isBackgroundTask is the gate for the footer pill AND the /tasks list. Failing it means
-    // the entry exists in state and is visible nowhere.
+    // isBackgroundTask gates the footer pill and the /tasks list — but it only looks at
+    // `status`, so asserting it on a freshly-registered task restates the line above. What it
+    // DOES pin is the terminal direction: a finished run must drop off both surfaces.
     expect(isBackgroundTask(t)).toBe(true)
+    finishEffTaskRun(id, s.setAppState, { status: 'completed' })
+    expect(isBackgroundTask(s.task(id))).toBe(false)
     expect(isEffTaskTask(t)).toBe(true)
   })
 

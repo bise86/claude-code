@@ -94,7 +94,7 @@ describe('runOrchestrator reports the run it just drove', () => {
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
       handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
       integrationPath: '/wt/integration',
-      conflictState: async () => ({ markers: true, staged: false, files: ['src/pay.ts'] }),
+      conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/pay.ts'] }),
       refreshFromIntegration: async () => ({ ok: true, updated: false }),
       mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/pay.ts'] }),
     integrationBranchName: 'efftask/001/integration',
@@ -266,5 +266,71 @@ describe('触阀升级 (spec §9/§11) 真的被接上', () => {
     expect(fired).toHaveLength(1)
     expect(fired[0].category).toBe('cap-iteration')
     expect(fired[0].reason).toContain('评审迭代超限')
+  })
+})
+
+describe('实时计数这条线也得是通的', () => {
+  function store2() {
+    let state = { tasks: {} } as unknown as AppState
+    return {
+      setAppState: (f: (prev: AppState) => AppState) => { state = f(state) },
+      only: () => Object.values(state.tasks as Record<string, EffTaskTaskState>)[0],
+    }
+  }
+
+  it('节点状态变化会更新 /tasks 那一行的计数', async () => {
+    // Mutation-proved gap: deleting `touch(nodes)` from runOrchestrator left the whole suite
+    // green. registerEffTaskRun and finishEffTaskRun each had a real wire test; the update in
+    // between did not, so the row would have sat at its initial counts forever.
+    const s = store2()
+    const ac = new AbortController()
+    // A run that actually advances: plan → review passes → executable leaf → execute →
+    // accept passes → ACCEPTED. The root ends accepted, so counts must move off 0.
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        return '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
+          '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      }
+      if (req.phase === 'execute') {
+        return '```' + (req.prompt.match(/```(exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
+      }
+      return '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+        '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    }
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: memFs(), runAgent, signal: ac.signal,
+        taskEntry: { runId: '009', runDir: '/r', setAppState: s.setAppState, abortController: ac },
+      },
+      () => {}, () => {}, () => {},
+    )
+    const t = s.only()
+    expect(t.status).toBe('completed')
+    expect(t.counts.accepted).toBe(1)
+    expect(t.counts.total).toBe(1)
+    // The description is what the /tasks row and the footer pill actually render.
+    expect(t.description).toContain('已完成 1/1')
+  })
+
+  it('阻断原因里带上真实的 run id,而不是占位符', async () => {
+    // run.md is where suppressed escalations have to stay actionable, so blockedReason must
+    // name the command that really works. The id reaches the pipeline through this wire.
+    const fs2 = memFs()
+    const ac = new AbortController()
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'plan'
+        ? '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
+          '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+        : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+          '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: fs2, runAgent, signal: ac.signal,
+        taskEntry: { runId: '011', runDir: '/r', setAppState: () => {}, abortController: ac },
+      },
+      () => {}, () => {}, () => {},
+    )
+    const manifest = fs2.files.get('/r/run.md') ?? ''
+    expect(manifest).toContain('/et --resume 011 --retry-blocked')
   })
 })

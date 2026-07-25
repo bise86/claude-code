@@ -7,7 +7,7 @@ const efftask = {
   name: 'et',
   aliases: ['efftask'],
   description: '高效任务模式:把提示词拆成可并行、带依赖、多角色评审/验收的任务树',
-  argumentHint: '<任务提示词>',
+  argumentHint: '<任务提示词> | --resume [运行ID] [--retry-blocked] [续跑指引]',
   userInvocable: true,
   disableModelInvocation: true,
   load: () => import('./efftask.js'),

@@ -431,6 +431,24 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * Here a conflict simply means "stay on the old base"; the merge at the end still catches
      * it and routes it through the tested §8 conflict path.
      */
+    /**
+     * MEASURED, and recorded so it is not re-litigated:
+     *
+     *  - NOT under `mergeLock`/`acquireLock`, and that is safe. This touches only the node's
+     *    OWN linked worktree (its per-worktree index, HEAD and MERGE_HEAD) plus one read of
+     *    the integration ref; it never touches `intPath`, where commitAndMerge does its
+     *    `reset --hard` + `clean -fd`. Verified against real git: 6 concurrent refreshes
+     *    racing a commitAndMerge, and 5 refreshes racing 5 acquires, produced no corruption,
+     *    no MERGE_HEAD residue and `git fsck` clean, with every file reaching integration.
+     *
+     *  - KNOWN GAP, bounded and deliberate: `git add -A` does not stage gitignored files, so
+     *    a SUCCESSFUL merge can overwrite one (measured: a build output was replaced with the
+     *    other side's content, leaving a clean `git status`). `release()` carries `--ignored`
+     *    precisely because build outputs are a real deliverable shape here. Not fixed: those
+     *    files cannot reach the integration branch under any path, and refusing to refresh
+     *    whenever a dist/ exists would disable this feature in most repos. Recorded rather
+     *    than pretended away.
+     */
     async refreshFromIntegration(node: TaskNode): Promise<
       | { ok: true; updated: boolean }
       // `dirty` means the rollback itself failed and the worktree is STILL conflicted. The
