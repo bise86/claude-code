@@ -1,5 +1,5 @@
 // src/tools/efftask/parseDirectives.ts
-import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES } from './types.js'
+import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 import { applyRoleDefsToPhases, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
@@ -12,9 +12,11 @@ const PHASE_LABEL: Record<PhaseName, string> = {
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { "plan"?: string[], "review"?: string[], "execute"?: string[], "accept"?: string[], "observer"?: string[] },
-  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number },
+  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number },
   "roles": [{ "name": "角色名", "stage": "plan|review|execute|accept|observer", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }] }
 phaseRoles 的值是**员工名**数组(可派发的身份)。
+caps.quorum 是圆桌通过所需的赞成**百分比**(1-100,默认 100 全票);「过半通过」= 50,「三分之二」= 67。
+caps.maxSeatsPerPhase 是每个阶段最多几席。
 roles 是**任务角色**定义 —— 指令里凡是描述了「某个角色在哪个阶段、产出什么、起什么作用、由谁担当」的,抽到这里。
 角色名可以任意(架构师、安全、前端);stage 必须是那五个之一;staff 填员工名,没说由谁担当就省略。
 只抽指令里真的写了的,不要替用户补 output/purpose —— 缺项的角色会被明确地判为不生效。未提及的字段省略。指令:\n`
@@ -50,7 +52,7 @@ export async function parseDirectives(
   // 只在抽取成功时才通,而抽取失败正是最常走到的退化路径。
   const applyDefs = (cfg: EffTaskConfig, defs: RoleDef[]): EffTaskConfig => {
     if (defs.length === 0) return cfg
-    const applied = applyRoleDefsToPhases(cfg.phaseRoles, defs)
+    const applied = applyRoleDefsToPhases(cfg.phaseRoles, defs, cfg.caps.maxSeatsPerPhase)
     cfg.phaseRoles = applied.phaseRoles
     cfg.notices.push(...applied.notices)
     cfg.roleDefs = defs
@@ -125,6 +127,10 @@ export async function parseDirectives(
   // back, so the "低分触发一次返工" half of 观察评分 was dead code on the normal path —
   // reachable only by hand-editing run.md and resuming.
   if (caps.scoreThreshold !== undefined) c.scoreThreshold = clampInt(caps.scoreThreshold, 0, 100, 0)
+  // 这两条同样需要入口:只有 readRunManifest 读回而没人写进去的话,它们只能靠手改
+  // run.md 再 --resume 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
+  if (caps.maxSeatsPerPhase !== undefined) c.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
+  if (caps.quorum !== undefined) c.quorum = clampInt(caps.quorum, 1, 100, 100)
   base.caps = c
 
   // 提示词里定义的角色,合并到配置文件那一层之上。放在 phaseRoles 解析**之后**,因为

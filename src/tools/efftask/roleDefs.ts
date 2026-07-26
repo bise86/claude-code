@@ -6,7 +6,7 @@
 // agentType,带自己的模型、apiUrl、工具集。角色 = 「架构师」「安全」,在某个阶段做某件事,
 // 由零个或多个员工担当。多对多:一个员工可以出现在多个角色里,一个角色可以有多个员工。
 import { PHASE_NAMES } from './types.js'
-import { MAIN_STAFF } from './types.js'
+import { DEFAULT_MAX_SEATS_PER_PHASE, MAIN_STAFF } from './types.js'
 import type { PhaseName, RoleBinding } from './types.js'
 
 export interface RoleDef {
@@ -315,6 +315,13 @@ export function mergeSeats(
 export function applyRoleDefsToPhases(
   phaseRoles: Record<PhaseName, RoleBinding[]>,
   defs: RoleDef[],
+  /**
+   * 一个阶段最多几席(caps.maxSeatsPerPhase),省略 = 默认值。
+   *
+   * 多对多把调用数乘起来:R 个角色 × 每角色 S 个员工 = R×S 次调用,每轮评审付一遍。
+   * 超出的席位**剔除并点名** —— 静默截断会让关口显示的名册和真正跑的不一致。
+   */
+  maxSeats: number = DEFAULT_MAX_SEATS_PER_PHASE,
 ): { phaseRoles: Record<PhaseName, RoleBinding[]>; notices: string[] } {
   const notices: string[] = []
   const out = {} as Record<PhaseName, RoleBinding[]>
@@ -328,6 +335,12 @@ export function applyRoleDefsToPhases(
     if (reason && seats.length > 1) {
       notices.push(`${PHASE_LABEL[p]}:${reason},仅 ${describeSeat(seats[0])} 生效,已忽略 ${seats.slice(1).map(describeSeat).join('、')}`)
       seats = seats.slice(0, 1)
+    }
+    // 席位上限。放在单席位裁剪之后,免得对 plan/execute/observer 报两遍同一件事。
+    const cap = Math.max(1, Math.round(maxSeats))
+    if (seats.length > cap) {
+      notices.push(`${PHASE_LABEL[p]}:席位上限 ${cap},已忽略 ${seats.slice(cap).map(describeSeat).join('、')}(可调 caps.maxSeatsPerPhase)`)
+      seats = seats.slice(0, cap)
     }
     out[p] = seats
   }

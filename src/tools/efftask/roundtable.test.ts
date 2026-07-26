@@ -1,7 +1,7 @@
 // src/tools/efftask/roundtable.test.ts
 import { describe, expect, it } from 'bun:test'
 import { createNode, emptyPhaseRoles, MAIN_STAFF } from './types.js'
-import type { RoleBinding } from './types.js'
+import type { RoleBinding, Verdict } from './types.js'
 import { synthesizeVerdicts, runRoundtable, RunAgentFn } from './roundtable.js'
 import { MAX_SUMMARY_CHARS } from './parseOutput.js'
 
@@ -182,5 +182,100 @@ describe('裁决的署名与角色归属', () => {
   it('没有角色标签的席位不会凭空多出一个 roleTag 字段', async () => {
     const rec = await run([{ roleName: 'opus-架构' }])
     expect('roleTag' in rec.verdicts[0]).toBe(false)
+  })
+})
+
+describe('法定人数(caps.quorum)', () => {
+  const v = (role: string, pass: boolean, extra: Partial<Verdict> = {}): Verdict =>
+    ({ role, pass, blocking: pass ? [] : ['不行'], comments: '', ...extra })
+
+  it('不传 quorum → 全票,和加这个参数之前逐字节相同', () => {
+    expect(synthesizeVerdicts([v('a', true), v('b', false)]).pass).toBe(false)
+    expect(synthesizeVerdicts([v('a', true), v('b', true)]).pass).toBe(true)
+    expect(synthesizeVerdicts([]).pass).toBe(false)
+  })
+
+  it('quorum=100 与不传等价', () => {
+    expect(synthesizeVerdicts([v('a', true), v('b', false)], 100).pass).toBe(false)
+    expect(synthesizeVerdicts([v('a', true), v('b', true)], 100).pass).toBe(true)
+  })
+
+  it('三席里两席赞成:quorum=60 通过,全票不通过', () => {
+    // 纯 AND 下加席位只能把通过变成不通过。每席独立 80% 的话,9 席全票通过只有 13%,
+    // 三轮用尽约 65% —— 不给这个旋钮,「一个角色多个员工」就是自我拆台。
+    const three = [v('a', true), v('b', true), v('c', false)]
+    expect(synthesizeVerdicts(three, 60).pass).toBe(true)
+    expect(synthesizeVerdicts(three).pass).toBe(false)
+  })
+
+  it('刚好卡在门槛上算通过', () => {
+    expect(synthesizeVerdicts([v('a', true), v('b', false)], 50).pass).toBe(true)
+  })
+
+  it('差一点就不通过', () => {
+    expect(synthesizeVerdicts([v('a', true), v('b', false)], 51).pass).toBe(false)
+  })
+
+  it('全票档:infra 仍然不通过 —— 否则 isInfraOnlyFailure 的重试永远不会触发', () => {
+    // 默认档必须和加 quorum 之前逐字节相同:一席没打通就重试,拿回完整的评审面板。
+    const withInfra = [v('a', true), v('b', true), v('c', false, { infra: true })]
+    expect(synthesizeVerdicts(withInfra, 100).pass).toBe(false)
+    expect(synthesizeVerdicts(withInfra).pass).toBe(false)
+  })
+
+  it('放宽档:infra 不进分母 —— 真阻断项按「判决过的席位」来量', () => {
+    // 这是放宽 quorum 真正要解决的浪费:混合失败(1 个真阻断 + N 个调用失败)在
+    // isInfraOnlyFailure 眼里不算基础设施失败(它要求**所有** failing 都是 infra),
+    // 于是被当成真阻断,烧掉一整轮真返工。席位越多,混合概率越高。
+    const mixed = [v('a', true), v('b', true), v('c', false), v('d', false, { infra: true })]
+    // 判决过的 3 席里 2 席赞成 = 67%。把 infra 算进分母则是 50%,会误判成不通过。
+    expect(synthesizeVerdicts(mixed, 60).pass).toBe(true)
+    expect(synthesizeVerdicts(mixed, 70).pass).toBe(false)
+  })
+
+  it('放宽档下带 infra 通过 = 面板不完整仍然放行,这是选用 quorum<100 的已知代价', () => {
+    const withInfra = [v('a', true), v('b', true), v('c', false, { infra: true })]
+    expect(synthesizeVerdicts(withInfra, 60).pass).toBe(true)
+  })
+
+  it('全是 infra → 不通过(分母为 0),交给重试而不是当成全票通过', () => {
+    expect(synthesizeVerdicts([v('a', false, { infra: true })], 60).pass).toBe(false)
+    expect(synthesizeVerdicts([v('a', false, { infra: true })], 100).pass).toBe(false)
+  })
+
+  it('达到法定人数时,少数派的阻断项照样全部汇总', () => {
+    // 没挡住 ≠ 不存在。静默丢弃少数派意见就是「不静默截断」要防的那件事。
+    const s = synthesizeVerdicts([v('a', true), v('b', true), v('c', false)], 60)
+    expect(s.pass).toBe(true)
+    expect(s.blockingSummary).toContain('[c] 不行')
+  })
+
+  it('越界的 quorum 被夹住,不会产生「零票也通过」', () => {
+    expect(synthesizeVerdicts([v('a', false)], 0).pass).toBe(false)
+    expect(synthesizeVerdicts([v('a', false)], -5).pass).toBe(false)
+    expect(synthesizeVerdicts([v('a', true)], 999).pass).toBe(true)
+  })
+})
+
+describe('法定人数一路接到圆桌上', () => {
+  // 上面那组直接调 synthesizeVerdicts,证明的是算法;这一组证明 runRoundtable 真的把
+  // quorum 传了下去 —— 少了那一跳,配置在 caps 里躺着,圆桌照旧全票。
+  const panel = async (quorum?: number) => runRoundtable({
+    phase: 'review', node: node(),
+    roles: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }],
+    round: 1, system: 's', prompt: () => 'p',
+    runAgent: (async (req: { role: { roleName: string } }) =>
+      req.role.roleName === 'c'
+        ? '```verdict\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+        : '```verdict\n{"pass":true,"blocking":[],"comments":""}\n```') as never,
+    signal: new AbortController().signal, answerTag: 'verdict', quorum,
+  })
+
+  it('三席两赞成:quorum=60 通过', async () => {
+    expect((await panel(60)).synthesized.pass).toBe(true)
+  })
+
+  it('同一批裁决在默认全票下不通过', async () => {
+    expect((await panel()).synthesized.pass).toBe(false)
   })
 })

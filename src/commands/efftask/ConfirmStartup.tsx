@@ -4,7 +4,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, costLine, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -134,6 +134,7 @@ export function ConfirmStartup(props: {
         </Box>
       )}
       <Text>{capsLine(props.config)}</Text>
+      <Text dimColor>{costLine(props.config)}</Text>
       {editing ? (
         <Text dimColor>
           {available.length > 0

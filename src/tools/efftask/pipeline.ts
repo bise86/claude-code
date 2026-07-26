@@ -364,6 +364,7 @@ async function roundtableWithInfraRetry(args: {
       phase: args.phase, node: args.node, roles: args.roles, round: args.round,
       system: args.system, prompt: (seat: RoleBinding | null) => args.buildPrompt(tag, seat),
       runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
+      quorum: args.ctx.config.caps.quorum,
       onChunk: args.ctx.onChunk ? t => args.ctx.onChunk!(args.node.id, t) : undefined,
       slots: args.ctx.slots,
     })

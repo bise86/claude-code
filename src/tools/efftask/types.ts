@@ -242,8 +242,30 @@ export interface TaskNode {
   startedAt?: string
 }
 
-export interface Caps { maxDepth: number; maxNodes: number; maxIterations: number; nodeTimeoutMs: number; scoreThreshold?: number }
+export interface Caps {
+  maxDepth: number; maxNodes: number; maxIterations: number; nodeTimeoutMs: number
+  scoreThreshold?: number
+  /**
+   * 一个阶段最多几席。超出的席位被剔除并点名。
+   *
+   * 多对多会把调用数乘起来:一个阶段 R 个角色、每个角色 S 个员工 = R×S 次调用,每轮
+   * 评审都要付一遍。这是唯一能同时按住成本乘子和阻断率的旋钮。
+   */
+  maxSeatsPerPhase?: number
+  /**
+   * 圆桌通过所需的**赞成比例**(1-100),默认 100 = 全票。
+   *
+   * 为什么需要这个旋钮:纯 AND 下加席位只能把「通过」变成「不通过」。每席独立 80% 通过
+   * 率的话,9 席全票通过的概率是 0.8^9 ≈ 13%,三轮都用尽的概率约 65% —— 不给这个旋钮,
+   * 「一个角色多个员工」就是自我拆台:配的人越多,越跑不完。
+   *
+   * 分母**不含 infra 失败**:调用没打通不是一票反对,那种情形由 isInfraOnlyFailure 走重试。
+   */
+  quorum?: number
+}
 export const DEFAULT_CAPS: Caps = { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 600_000 }
+/** 一个阶段的席位上限默认值。 */
+export const DEFAULT_MAX_SEATS_PER_PHASE = 5
 
 export const DEFAULT_PARALLELISM = 5
 export interface EffTaskConfig {

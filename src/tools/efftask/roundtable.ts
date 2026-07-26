@@ -15,9 +15,29 @@ export type RunAgentFn = (req: {
   onChunk?: (t: string) => void
 }) => Promise<string>
 
-export function synthesizeVerdicts(verdicts: Verdict[]): { pass: boolean; blockingSummary: string } {
+export function synthesizeVerdicts(
+  verdicts: Verdict[],
+  /**
+   * 通过所需的赞成比例(1-100)。省略 = 100 = 全票,行为与加这个参数之前逐字节相同。
+   *
+   * 分母**不含 infra 失败**:调用没打通不是一票反对。把它算进分母会让「3 席里 1 席
+   * 网络挂了」直接吃掉 33% 的赞成率,而那一席根本没有对工作做出任何判断 —— 那种情形
+   * 该走 isInfraOnlyFailure 的重试,不该被算成反对票。
+   */
+  quorum?: number,
+): { pass: boolean; blockingSummary: string } {
   const failing = verdicts.filter(v => !v.pass || v.blocking.length > 0)
-  const pass = verdicts.length > 0 && failing.length === 0
+  // 判决过的席位(排除 infra)。全都是 infra → 分母为 0 → 不通过,交给重试逻辑。
+  const judged = verdicts.filter(v => !v.infra)
+  const approving = judged.filter(v => v.pass && v.blocking.length === 0).length
+  const need = Math.min(100, Math.max(1, Math.round(quorum ?? 100)))
+  // judged.length > 0 是**显式**的,而不是靠 0/0 = NaN 在下面的比较里恰好为假 —— 全是
+  // infra 时必须不通过,好让 isInfraOnlyFailure 去重试。
+  const pass = verdicts.length > 0 && judged.length > 0
+    && (need >= 100
+      // 全票走原来那条路径,避免浮点比例在「刚好全票」上出现意外。
+      ? failing.length === 0
+      : (approving * 100) / judged.length >= need)
   const blockingSummary = failing
     .flatMap(v =>
       // A verdict can fail (pass:false) with an EMPTY blocking list. Falling back to its
@@ -61,6 +81,8 @@ export async function runRoundtable(args: {
   signal: AbortSignal
   // Per-call answer tag the prompt demanded; verdicts are only trusted under THIS tag.
   answerTag?: string
+  /** 通过所需赞成比例(caps.quorum);省略 = 全票。 */
+  quorum?: number
   /**
    * Working directory for every reviewer in this roundtable.
    *
@@ -82,6 +104,7 @@ export async function runRoundtable(args: {
   // Already aborted → don't burn a real model call; synthesize a failing record instead.
   if (args.signal.aborted) {
     const verdicts: Verdict[] = [{ role: 'main', pass: false, blocking: ['已中断'], comments: '' }]
+    // 不传 quorum:中断是无条件的失败,不该因为法定人数放宽就变成通过。
     return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts) }
   }
   // Empty roster => a single main-model reviewer (role=null). Independent & parallel.
@@ -119,5 +142,6 @@ export async function runRoundtable(args: {
     const timedOut = res.reason instanceof PhaseTimeoutError
     return { role: roleName || 'main', ...tag, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true, ...(timedOut ? { timeout: true } : {}) }
   })
-  return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts) }
+  // 阻断项**照样全部汇总**,即使已经达到法定人数 —— 少数派的意见不因为没挡住就消失。
+  return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts, args.quorum) }
 }

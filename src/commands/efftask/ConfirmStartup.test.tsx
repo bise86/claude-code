@@ -359,3 +359,38 @@ describe('启动关口:每一种改动都要通知调用方', () => {
     }
   })
 })
+
+describe('ConfirmStartup 要显示多对多的代价', () => {
+  it('成本预估真的画在终端上,而不只是有个函数能算', async () => {
+    // 竞速器的前提是两端显示同一份配置。飞书那边已经钉住了这一行;终端这边如果只
+    // 「有个 costLine 函数」而没画出来,从终端批准的人批准的就是一份他没看全的配置。
+    const { stdin, stdout, lastFrame } = fakeTty()
+    await render(
+      React.createElement(ConfirmStartup, {
+        config: { ...config, phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: 'a' }, { roleName: 'b' }] } },
+        onDecision: () => {},
+      }),
+      // biome-ignore lint/suspicious/noExplicitAny: fake TTY streams for a headless render
+      { stdin: stdin as any, stdout: stdout as any, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    const frame = lastFrame()
+    expect(frame).toContain('次模型调用')
+    // 而且没把它说成并发 —— 并发上限是 parallelism,和这个数无关。
+    expect(frame).toContain('并发上限仍是 3')
+  })
+
+  it('不是全票时终端要说出来', async () => {
+    const { stdin, stdout, lastFrame } = fakeTty()
+    await render(
+      React.createElement(ConfirmStartup, {
+        config: { ...config, caps: { ...DEFAULT_CAPS, quorum: 60 } },
+        onDecision: () => {},
+      }),
+      // biome-ignore lint/suspicious/noExplicitAny: fake TTY streams for a headless render
+      { stdin: stdin as any, stdout: stdout as any, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    expect(lastFrame()).toContain('60% 通过')
+  })
+})

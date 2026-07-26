@@ -413,7 +413,30 @@ export function capsLine(config: EffTaskConfig): string {
   const score = c.scoreThreshold === undefined
     ? '评分不触发返工'
     : `评分低于 ${c.scoreThreshold} 触发一轮返工`
-  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}`
+  // 全票是默认;不是全票就必须说出来,这条直接改变「什么算通过」。
+  const quorum = c.quorum === undefined || c.quorum >= 100 ? '' : ` · 圆桌 ${c.quorum}% 通过`
+  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}`
+}
+
+/**
+ * 一次 run 最坏情况下要打多少次模型调用。
+ *
+ * 多对多把调用数**乘**起来,而关口此前只字未提:一个 review 角色配 3 个员工、再加一个
+ * accept 角色配 3 个,每个节点每轮就是 6 次而不是 2 次,乘上迭代上限和节点数。用户在
+ * 关口上批准的是一份自己看不出代价的配置。
+ *
+ * **刻意不叫「并发」。** 并发上限是 parallelism,和这个数无关 —— 把排队总量说成在飞数
+ * 会让用户以为自己要同时开 30 个连接,从而去调一个不解决问题的旋钮。
+ */
+export function costLine(config: EffTaskConfig): string {
+  const c = config.caps
+  const seats = (p: PhaseName) => config.phaseRoles[p].length
+  // 每个节点每轮:1 次方案 + 评审席位;执行轮:1 次执行 + 验收席位;打分一次。
+  const planRound = 1 + Math.max(1, seats('review'))
+  const execRound = 1 + Math.max(1, seats('accept'))
+  const perNode = c.maxIterations * (planRound + execRound) + seats('observer')
+  const worst = perNode * c.maxNodes
+  return `预估最多 ${worst} 次模型调用(每节点最多 ${perNode} 次 × 节点上限 ${c.maxNodes});并发上限仍是 ${config.parallelism}`
 }
 
 /**

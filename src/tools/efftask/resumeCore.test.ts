@@ -738,3 +738,27 @@ describe('角色定义必须能从 run.md 原样回来', () => {
     expect(degraded.filter(d => d.includes('角色'))).toEqual([])
   })
 })
+
+describe('新 caps 旋钮的读回与再校验', () => {
+  it('quorum 与 maxSeatsPerPhase 从 run.md 读回', async () => {
+    const md = '---\ngoalPrompt: g\ncaps:\n  quorum: 60\n  maxSeatsPerPhase: 3\n---\n\n'
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': md }), '/r')
+    expect(config.caps.quorum).toBe(60)
+    expect(config.caps.maxSeatsPerPhase).toBe(3)
+  })
+
+  it('手改 run.md 塞越界值 → 夹住,而不是绕开校验', async () => {
+    // readRunManifest 此前没有等价于 parseDirectives 的夹取,手改 run.md 是一条绕过
+    // 全部校验的路。quorum: 0 会让「零票也通过」。
+    const md = '---\ngoalPrompt: g\ncaps:\n  quorum: 0\n  maxSeatsPerPhase: 999\n---\n\n'
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': md }), '/r')
+    expect(config.caps.quorum).toBe(1)
+    expect(config.caps.maxSeatsPerPhase).toBe(20)
+  })
+
+  it('老 run.md 没有这两项 → 保持 undefined(全票、默认上限)', async () => {
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': '---\ngoalPrompt: g\n---\n\n' }), '/r')
+    expect(config.caps.quorum).toBeUndefined()
+    expect(config.caps.maxSeatsPerPhase).toBeUndefined()
+  })
+})

@@ -315,3 +315,40 @@ describe('提示词里可以定义角色,也可以改配置文件里的角色', 
     expect(cfg.roleDefs).toBeUndefined()
   })
 })
+
+describe('caps 里两个新旋钮要有正常入口', () => {
+  const json = (o: unknown) => async () => '```json\n' + JSON.stringify(o) + '\n```'
+  it('quorum 与 maxSeatsPerPhase 能从提示词抽出来并夹取', async () => {
+    // 只有 readRunManifest 读回而没人写进去的话,它们只能靠手改 run.md 再 --resume
+    // 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
+    const cfg = await parseDirectives('过半通过就行,每阶段最多 3 席', {
+      knownRoles: [], modelJson: json({ caps: { quorum: 50, maxSeatsPerPhase: 3 } }),
+    })
+    expect(cfg.caps.quorum).toBe(50)
+    expect(cfg.caps.maxSeatsPerPhase).toBe(3)
+  })
+  it('越界值被夹住', async () => {
+    const cfg = await parseDirectives('x', { knownRoles: [], modelJson: json({ caps: { quorum: 500, maxSeatsPerPhase: 99 } }) })
+    expect(cfg.caps.quorum).toBe(100)
+    expect(cfg.caps.maxSeatsPerPhase).toBe(20)
+  })
+  it('maxSeatsPerPhase 真的作用到席位上,不只是存进 caps', async () => {
+    // 只断言 caps 里的数值,等于只验证「配置被记下来了」;剪断传给 applyRoleDefsToPhases
+    // 的那一跳,数值还在、席位照旧超编。
+    const cfg = await parseDirectives('评审用四个人,但每阶段最多 2 席', {
+      knownRoles: ['a', 'b', 'c', 'd'],
+      modelJson: json({
+        caps: { maxSeatsPerPhase: 2 },
+        roles: [{ name: '评审团', stage: 'review', output: 'o', purpose: 'p', staff: ['a', 'b', 'c', 'd'] }],
+      }),
+    })
+    expect(cfg.phaseRoles.review).toHaveLength(2)
+    expect(cfg.notices.join('\n')).toContain('席位上限 2')
+  })
+
+  it('不提就不设,老配置形状不变', async () => {
+    const cfg = await parseDirectives('x', { knownRoles: [], modelJson: json({ parallelism: 2 }) })
+    expect(cfg.caps.quorum).toBeUndefined()
+    expect(cfg.caps.maxSeatsPerPhase).toBeUndefined()
+  })
+})

@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
+import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
@@ -584,6 +584,9 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
       rebuilt.scoreThreshold = Math.trunc(t)
     }
   }
+  // 手改 run.md 是一条绕开 parseDirectives 全部校验的路,所以这里重做同样的夹取。
+  if (caps.maxSeatsPerPhase !== undefined) rebuilt.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
+  if (caps.quorum !== undefined) rebuilt.quorum = clampInt(caps.quorum, 1, 100, 100)
   base.caps = rebuilt
 
   const pr = (fm.phaseRoles ?? {}) as Record<string, unknown>

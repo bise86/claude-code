@@ -2786,3 +2786,29 @@ describe('简报到达剩下那几个调用点', () => {
     expect(seen).toContain('作答;裁决格式仍按下面的要求。\n\n请评审')
   })
 })
+
+describe('caps.quorum 一路接到节点的评审上', () => {
+  // roundtable.test.ts 证明了 runRoundtable 会用 quorum;这一条证明 pipeline 真的把
+  // config.caps.quorum 交给了它 —— 少了那一跳,用户在 caps 里配的法定人数毫无作用。
+  const twoOfThree = (n: TaskNode): RunAgentFn => async req => {
+    if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    return req.role?.roleName === 'c'
+      ? vtag(req) + '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+      : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+  }
+  const roster = { ...emptyPhaseRoles(), review: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
+
+  it('quorum=60 时三席两赞成 → 方案通过,进入 READY', async () => {
+    const n = root()
+    n.phaseRoles = roster
+    await stepStart(n, ctxFor([n], twoOfThree(n), { ...cfg, phaseRoles: roster, caps: { ...DEFAULT_CAPS, quorum: 60 } }))
+    expect(n.status).toBe('READY')
+  })
+
+  it('同一批裁决在默认全票下回到 PLANNING 返工', async () => {
+    const n = root()
+    n.phaseRoles = roster
+    await stepStart(n, ctxFor([n], twoOfThree(n), { ...cfg, phaseRoles: roster }))
+    expect(n.status).not.toBe('READY')
+  })
+})

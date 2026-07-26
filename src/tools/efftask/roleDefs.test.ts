@@ -366,3 +366,44 @@ describe('mergeRoleDefs 的替换语义(提示词覆盖配置文件那一跳)', 
     expect(defs[0].staff).toEqual(['opus-架构', 'gpt-前端', 'ds-安全'])
   })
 })
+
+describe('席位上限(caps.maxSeatsPerPhase)', () => {
+  const empty = (): Record<string, RoleBinding[]> =>
+    ({ plan: [], review: [], execute: [], accept: [], observer: [] })
+  const many = (n: number): RoleDef[] =>
+    [{ name: '评审团', stage: 'review', output: 'o', purpose: 'p', staff: Array.from({ length: n }, (_, i) => `s${i}`) }] as RoleDef[]
+
+  it('默认上限 5', () => {
+    const { phaseRoles, notices } = applyRoleDefsToPhases(empty() as never, many(8))
+    expect(phaseRoles.review).toHaveLength(5)
+    expect(notices.join('\n')).toContain('席位上限 5')
+  })
+
+  it('剔除的席位被点名,不是静默截断', () => {
+    // 静默截断会让关口显示的名册和真正跑的不一致 —— 而关口存在的意义就是别撒谎。
+    const { notices } = applyRoleDefsToPhases(empty() as never, many(7), 5)
+    expect(notices.join('\n')).toContain('评审团(s5)')
+    expect(notices.join('\n')).toContain('评审团(s6)')
+    expect(notices.join('\n')).toContain('caps.maxSeatsPerPhase')
+  })
+
+  it('自定义上限生效', () => {
+    expect(applyRoleDefsToPhases(empty() as never, many(8), 2).phaseRoles.review).toHaveLength(2)
+  })
+
+  it('没超上限时不说废话', () => {
+    expect(applyRoleDefsToPhases(empty() as never, many(3), 5).notices).toEqual([])
+  })
+
+  it('上限 0 被夹到 1 —— 不能把一个阶段清空成没人跑', () => {
+    expect(applyRoleDefsToPhases(empty() as never, many(3), 0).phaseRoles.review).toHaveLength(1)
+  })
+
+  it('单席位阶段不会为同一件事报两遍', () => {
+    const defs = [{ name: '写手', stage: 'execute', output: 'o', purpose: 'p', staff: ['a', 'b', 'c'] }] as RoleDef[]
+    const { phaseRoles, notices } = applyRoleDefsToPhases(empty() as never, defs, 5)
+    expect(phaseRoles.execute).toHaveLength(1)
+    expect(notices.filter(n => n.includes('已忽略'))).toHaveLength(1)
+    expect(notices.join('\n')).not.toContain('席位上限')
+  })
+})

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -697,5 +697,45 @@ describe('关口编辑器与角色席位', () => {
     ).find(l => l.includes('方案'))!
     expect(line).not.toContain('(主模型):')
     expect(line).toContain('主设计')
+  })
+})
+
+describe('关口要说出多对多的代价', () => {
+  const mk = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], ...over,
+  })
+
+  it('席位变多,预估调用数跟着变多', () => {
+    // 多对多把调用数**乘**起来,而关口此前只字未提 —— 用户批准的是一份自己看不出代价
+    // 的配置。
+    const one = costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: 'a' }] } }))
+    const three = costLine(mk({ phaseRoles: { ...emptyPhaseRoles(),
+      review: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] } }))
+    const n = (s: string) => Number(s.match(/预估最多 (\d+) 次/)![1])
+    expect(n(three)).toBeGreaterThan(n(one))
+  })
+
+  it('**不**把它说成并发 —— 并发上限是 parallelism,和这个数无关', () => {
+    // 把排队总量说成在飞数,用户会以为自己要同时开几十个连接,从而去调一个不解决问题
+    // 的旋钮。
+    const line = costLine(mk({ parallelism: 5 }))
+    expect(line).toContain('次模型调用')
+    expect(line).toContain('并发上限仍是 5')
+    expect(line).not.toMatch(/预估最多 \d+ 个?并发/)
+  })
+
+  it('空名册也给得出一个数(每阶段至少主模型一次)', () => {
+    expect(costLine(mk())).toMatch(/预估最多 \d+ 次模型调用/)
+  })
+
+  it('不是全票时安全阀行必须说出来', () => {
+    // 这条直接改变「什么算通过」,藏起来就是关口在撒谎。
+    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, quorum: 60 } }))).toContain('60% 通过')
+  })
+
+  it('全票是默认,不啰嗦', () => {
+    expect(capsLine(mk())).not.toContain('通过')
+    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, quorum: 100 } }))).not.toContain('% 通过')
   })
 })

@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig } from './types.js'
-import { capsLine, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { capsLine, costLine, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -40,6 +40,7 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
     // shown on THIS card. Say that, instead of inviting the edit that will be thrown away.
     `（在此批准 = 就用本卡片显示的并行数与名册;若要改动,请改在终端确认界面并在终端按回车)\n` +
     `**${capsLine(config)}**\n` +
+    `${costLine(config)}\n` +
     `**角色名册**:\n${rosterLines(config).map(l => `- ${l}`).join('\n')}` +
     // The roster says who WILL run; this says whose request was dropped and why. Without it
     // the card would answer the user's "确认有多少角色、各自承担什么" with a half-truth.
