@@ -7,6 +7,8 @@ import type { LocalJSXCommandCall } from '../../types/command.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from '../../Tool.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
+import { collectRoleDefs } from '../../tools/efftask/roleDefsFromSettings.js'
+import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
@@ -204,6 +206,14 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       args={args}
       knownRoles={knownRoles}
       unsupportedRoles={unsupportedRoles}
+      // settings.json 里配好的角色定义。读在这里而不是 parseDirectives 里面,是因为那个
+      // 文件是纯函数、不碰全局状态,整套解析/合并/展平才能不搭环境地测。
+      baseRoleDefs={
+        collectRoleDefs({
+          knownStaff: new Set(knownRoles),
+          unsupportedStaff: new Set(unsupportedRoles),
+        }).defs
+      }
       // The roster must say which model each seat runs on, and that answer lives in the
       // agent definitions + the session model — neither of which parseDirectives can see.
       agentModels={activeAgents}
@@ -399,6 +409,8 @@ function fsAdapter(): FsLike {
 type RunnerProps = {
   args: string
   knownRoles: string[]
+  /** settings.json 里配好的角色定义;提示词里的同名角色会覆盖它。 */
+  baseRoleDefs?: RoleDef[]
   unsupportedRoles: string[]
   agentModels: AgentModelInfo[]
   mainModel: string
@@ -607,17 +619,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: run once per phase entry
   }, [phase, runId])
 
-  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel } = props
+  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
   // call(), which would freeze the terminal with no UI while spending tokens.
   React.useEffect(() => {
     if (isResume) return // resume recovers its config from run.md; no model call, no roster overwrite
     let cancelled = false
-    void parseDirectives(args, { knownRoles, unsupportedRoles, modelJson: extractJson })
+    void parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, modelJson: extractJson })
       // belt & braces: parseDirectives already swallows extraction failures, but a rejection
       // here would otherwise strand the UI on 'parsing' forever. Keep unsupportedRoles here
       // too: dropping it would let a cli-mode role back onto the roster unannounced.
-      .catch(() => parseDirectives(args, { knownRoles, unsupportedRoles }))
+      .catch(() => parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs }))
       .then(async cfg => {
         if (cancelled) return
         // parseDirectives only ever sees role NAMES, so the roster it produces cannot say
@@ -654,7 +666,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return () => {
       cancelled = true
     }
-  }, [args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel])
+  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, extractJson, agentModels, mainModel])
 
   /**
    * Hand the confirmed run to the orchestrator. ONE definition, because two gates now reach

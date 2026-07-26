@@ -573,3 +573,61 @@ describe('名册只在用户真改了的时候才写回节点', () => {
     expect(rosterEquals(emptyPhaseRoles(), emptyPhaseRoles())).toBe(true)
   })
 })
+
+describe('关口名册要如实说出角色与员工', () => {
+  const cfg = (phaseRoles: Partial<Record<PhaseName, RoleBinding[]>>, mainModel?: string): EffTaskConfig =>
+    ({ goalPrompt: 'g', parallelism: 2, caps: { ...DEFAULT_CAPS }, notices: [], mainModel,
+       phaseRoles: { ...emptyPhaseRoles(), ...phaseRoles } })
+
+  it('带角色标签的席位:角色和员工都说出来', () => {
+    const line = rosterLines(cfg({ review: [{ roleName: 'opus-架构', model: 'claude-opus-4-8', roleTag: '架构师' }] }))
+      .find(l => l.startsWith('评审'))!
+    expect(line).toContain('架构师')
+    expect(line).toContain('opus-架构')
+    expect(line).toContain('claude-opus-4-8')
+  })
+
+  it('主模型兼任的席位不会渲染成一个光秃秃的括号', () => {
+    // roleName 是空串。直接插值曾经产出 `验收: 验收官←(claude-opus-4-8)` —— 一个没有
+    // 名字的括号,读起来像是配置坏了。
+    const line = rosterLines(cfg({ accept: [{ roleName: '', roleTag: '验收官' }] }, 'claude-opus-4-8'))
+      .find(l => l.startsWith('验收'))!
+    expect(line).toContain('验收官')
+    expect(line).toContain('主模型')
+    expect(line).not.toMatch(/←\(/)
+    expect(line).not.toMatch(/^验收: \(/)
+  })
+
+  it('没有角色标签的席位照旧只显示员工与模型', () => {
+    const line = rosterLines(cfg({ review: [{ roleName: 'opus-架构', model: 'm' }] })).find(l => l.startsWith('评审'))!
+    expect(line).toBe('评审: opus-架构(m)')
+  })
+
+  it('同一员工兼两角 → 名册上两席都点名各自的角色', () => {
+    const line = rosterLines(cfg({
+      review: [
+        { roleName: 'ds-安全', model: 'm', roleTag: '架构师' },
+        { roleName: 'ds-安全', model: 'm', roleTag: '安全' },
+      ],
+    })).find(l => l.startsWith('评审'))!
+    // 不点名角色的话用户会看到两个一模一样的 `ds-安全(m)`,分不清是配置生效了还是 bug。
+    expect(line).toContain('架构师')
+    expect(line).toContain('安全')
+  })
+})
+
+describe('rosterEquals 必须把角色归属算进去', () => {
+  it('员工与模型都一样、只有角色不同 → 不算相等', () => {
+    // 判成相等,applyRosterToNodes 就被跳过,节点上留着旧的角色标签,每一席收到的
+    // 职责简报是上一次那份 —— 名册看起来变了,模型收到的没变。
+    const a = { ...emptyPhaseRoles(), review: [{ roleName: 'opus-架构', model: 'm', roleTag: '架构师' }] }
+    const b = { ...emptyPhaseRoles(), review: [{ roleName: 'opus-架构', model: 'm', roleTag: '安全' }] }
+    expect(rosterEquals(a, b)).toBe(false)
+  })
+
+  it('完全一样 → 相等(否则每次恢复都白写一遍 node.md)', () => {
+    const a = { ...emptyPhaseRoles(), review: [{ roleName: 'opus-架构', model: 'm', roleTag: '架构师' }] }
+    const b = { ...emptyPhaseRoles(), review: [{ roleName: 'opus-架构', model: 'm', roleTag: '架构师' }] }
+    expect(rosterEquals(a, b)).toBe(true)
+  })
+})

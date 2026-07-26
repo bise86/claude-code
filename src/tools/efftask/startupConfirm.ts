@@ -169,7 +169,14 @@ export function rosterLines(config: EffTaskConfig): string[] {
     }
     // Show the bound model too: this gate exists to let the user see exactly who is on the
     // panel, and "coder" alone hides which model that role actually runs on.
-    const names = config.phaseRoles[p].map(r => (r.model ? `${r.roleName}(${r.model})` : r.roleName))
+    const names = config.phaseRoles[p].map(r => {
+      // 「主模型兼任」的席位 roleName 是空串,直接插值会渲染出一个光秃秃的 `(模型名)`。
+      // 而带角色标签的席位要把角色说出来 —— 用户配的是「架构师」,只看到员工名的话,
+      // 关口就没回答「有多少角色、承担什么」里的前半个问题。
+      const who = r.roleName || (config.mainModel ? `主模型(${config.mainModel})` : '主模型')
+      const withModel = r.roleName && r.model ? `${r.roleName}(${r.model})` : who
+      return r.roleTag ? `${r.roleTag}←${withModel}` : withModel
+    })
     // An un-roled phase runs on the session's main model — name it. "主模型" alone is the
     // same omission as a bare role name: it says a model was chosen without saying which.
     const bare = config.mainModel ? `主模型(${config.mainModel})` : '主模型'
@@ -457,7 +464,11 @@ export function rosterEquals(
   return PHASE_NAMES.every(p => {
     const x = a[p] ?? []
     const y = b[p] ?? []
-    return x.length === y.length && x.every((r, i) => r.roleName === y[i].roleName && r.model === y[i].model)
+    // roleTag 也要比:两份名册可以员工名、模型完全相同而角色归属不同(把「架构师」改配
+    // 给同一个员工的另一个角色)。漏掉它,rosterEquals 会判定「一样」→ applyRosterToNodes
+    // 被跳过 → 节点上留着旧标签 → 每一席收到的职责简报是上一次的。
+    return x.length === y.length
+      && x.every((r, i) => r.roleName === y[i].roleName && r.model === y[i].model && r.roleTag === y[i].roleTag)
   })
 }
 

@@ -124,3 +124,23 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
   })
 
 })
+
+describe('角色定义的接线', () => {
+  it('settings.json 里的角色定义真的被读进来了', () => {
+    // 剪断它:配置文件里配好的角色一条都到不了 —— 而「在配置文件里面可以配置指定」
+    // 正是这个特性被要求的两条录入路径之一。没有运行时接缝能发现这一刀。
+    expect(element('EffTaskRunner')).toContain('baseRoleDefs={')
+    expect(SRC).toContain('collectRoleDefs({')
+  })
+
+  it('读进来的角色定义传给了 parseDirectives —— 两条调用路径都要传', () => {
+    // parseDirectives 在这里被调两次:正常一次、抽取失败兜底一次。只在正常那次传,
+    // 抽取失败(最常走到的退化路径)就会静默丢掉全部配置文件角色。
+    expect(occurrences('baseRoleDefs, modelJson: extractJson')).toBe(1)
+    expect(occurrences('unsupportedRoles, baseRoleDefs }')).toBe(1)
+  })
+
+  it('baseRoleDefs 在 effect 依赖里 —— 否则它变了也不会重新解析', () => {
+    expect(SRC).toContain('baseRoleDefs, extractJson, agentModels, mainModel]')
+  })
+})
