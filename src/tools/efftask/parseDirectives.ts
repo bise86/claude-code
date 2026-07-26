@@ -89,7 +89,10 @@ export async function parseDirectives(
     // Only review and accept fan out into a roundtable. plan and execute run ONE agent, so
     // listing extra seats there would put names on the confirmation roster that never get
     // called — the gate must show who actually runs.
-    if ((phase === 'plan' || phase === 'execute') && usable.length > 1) {
+    // plan 不再裁剪:它走顺序精化(第一位起草,后面每一位在前一稿上修订),多员工是
+    // 支持的形态,不是配置错误。execute 仍然只能一个 —— 那是物理约束:pathFor(node)
+    // 不含员工维度,两个员工会拿到同一个 worktree 路径。
+    if (phase === 'execute' && usable.length > 1) {
       trimNotices.push(`${PHASE_LABEL[phase]}:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
       usable = usable.slice(0, 1)
     }

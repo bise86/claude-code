@@ -2812,3 +2812,105 @@ describe('caps.quorum 一路接到节点的评审上', () => {
     expect(n.status).not.toBe('READY')
   })
 })
+
+describe('方案阶段的多员工:顺序精化,只有一个产出', () => {
+  // 用户要的是「一个角色有多个员工其必须过圆桌评审达成一致,只有一个结论方案或产出」。
+  // 裁决类阶段靠合成规则收敛;方案类没法机械合并,所以是顺序精化:第一位起草,后面
+  // 每一位在前一稿上修订。全程只有一份稿子 —— 「只有一个产出」是结构保证的。
+  const draft = (solution: string, children: string[] = []) =>
+    '```json\n' + JSON.stringify({
+      kind: children.length > 0 ? 'decompose' : 'executable',
+      solution, keyPoints: 'k', risks: 'r', acceptance: 'a',
+      children: children.map(t => ({ title: t, deps: [] })),
+    }) + '\n```'
+  const threeSeat = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
+
+  it('三个员工依次出手,最终方案是最后一位的', async () => {
+    const calls: { role: string | undefined; sawPrior: boolean }[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      calls.push({ role: req.role?.roleName, sawPrior: req.prompt.includes('在它的基础上修订') })
+      return draft(`第 ${calls.length} 稿`)
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, { ...cfg, phaseRoles: threeSeat }))
+    expect(calls.map(c => c.role)).toEqual(['a', 'b', 'c'])
+    expect(n.plan.solution).toBe('第 3 稿')
+  })
+
+  it('第二位起收到前一稿并被要求修订而不是重写', async () => {
+    let secondPrompt = ''
+    let i = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      i++
+      if (i === 2) secondPrompt = req.prompt
+      return draft(i === 1 ? '甲的方案要点' : '乙改过的')
+    }
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }] }
+    await stepStart(n, ctxFor([n], runAgent, { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(secondPrompt).toContain('甲的方案要点')
+    expect(secondPrompt).toContain('不要推倒重写')
+  })
+
+  it('第一位就调用失败 → 照旧阻断,不会拿一个空方案往下走', async () => {
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') throw new Error('provider down')
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }] }
+    await stepStart(n, ctxFor([n], runAgent, { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(n.status).toBe('BLOCKED')
+  })
+
+  it('后面的人失败 → 用前一稿继续,但必须留痕', async () => {
+    // 静默降级成「少一位修订者」正是不静默截断要防的:用户配了三个人,只有一个跑成了,
+    // 而方案照常通过评审 —— 盘上没有任何地方说得出这件事。
+    let i = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      i++
+      if (i >= 2) throw new Error('provider down')
+      return draft('甲的稿')
+    }
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }] }
+    await stepStart(n, ctxFor([n], runAgent, { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(n.plan.solution).toBe('甲的稿')
+    expect(n.status).not.toBe('BLOCKED')
+    expect(n.execStatus).toContain('方案精化第 2 位')
+    expect(n.execStatus).toContain('b')
+  })
+
+  it('空名册 → 主模型一席,和引入精化之前完全一样', async () => {
+    const calls: (string | undefined)[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      calls.push(req.role?.roleName)
+      return draft('唯一一稿')
+    }
+    const n = root()
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(calls).toEqual([undefined])
+    expect(n.plan.solution).toBe('唯一一稿')
+  })
+
+  it('最后一稿的子任务拆分才算数,不会把前几稿的子任务也建出来', async () => {
+    // 「只有一个产出」对子节点同样成立 —— 每一稿都建一批子节点就是三份产出。
+    let i = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      i++
+      return draft('稿', i === 1 ? ['甲一', '甲二'] : ['最终一'])
+    }
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }] }
+    const ctx = ctxFor([n], runAgent, { ...cfg, phaseRoles: n.phaseRoles })
+    await stepStart(n, ctx)
+    const titles = [...ctx.byId.values()].filter(x => x.parentId === n.id).map(x => x.title)
+    expect(titles).toEqual(['最终一'])
+  })
+})

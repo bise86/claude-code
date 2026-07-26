@@ -43,7 +43,8 @@ export const MULTI_SEAT_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['re
  * 留在名册上,关口就会列出永远不跑的名字 —— 而关口存在的唯一意义就是别撒谎。
  */
 const SINGLE_SEAT_REASON: Partial<Record<PhaseName, string>> = {
-  plan: '方案阶段只跑一个 agent',
+  // plan 不在这里:它支持**顺序精化**(第一位起草,后面每一位在前一稿上修订),
+  // 全程只有一份稿子,所以「只有一个产出」成立。见 pipeline.runPlanRefinement。
   execute: '执行阶段只跑一个 agent(两个带写工具的执行器会落在同一个 worktree 上)',
   observer: '观察阶段只跑一个 agent(node.score 每个维度只有一条记录)',
 }

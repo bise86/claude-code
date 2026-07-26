@@ -586,6 +586,54 @@ function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
 }
 
 /**
+ * 方案阶段的「多员工达成一致」:**顺序精化**,不是投票。
+ *
+ * 用户的要求是「一个角色有多个员工其必须过圆桌评审达成一致,只有一个结论方案或产出」。
+ * 裁决类阶段(评审/验收)天然可合成 —— 全票/法定人数就是合成规则。方案类不行:两份
+ * 方案没法机械合并,而「各自出稿再投票」要新 schema、新 answerTag、新解析器、新聚合
+ * (argmax 而不是 AND),还要在 node 上给落选稿找地方放 —— 放不下就是静默丢弃(§11)。
+ *
+ * 顺序精化是唯一物理上成立的形态:第一位起草,后面每一位在**前一稿上修订**。全程只有
+ * 一份稿子在走,所以「只有一个产出」是结构保证的,不是靠事后挑。代价是 N 次串行调用
+ * —— 这正是关口的 costLine 要把调用数显示出来的原因。
+ */
+async function runPlanRefinement(
+  node: TaskNode, ctx: PipelineCtx, feedback: string,
+): Promise<{ ok: true; parsed: ReturnType<typeof parsePlanOutput> } | { ok: false; reason: string; timeout?: boolean }> {
+  // 空名册 = 主模型一席,与引入本函数之前完全一样。
+  const seats: (RoleBinding | null)[] = node.phaseRoles.plan.length > 0 ? node.phaseRoles.plan : [null]
+  let parsed!: ReturnType<typeof parsePlanOutput>
+  for (let i = 0; i < seats.length; i++) {
+    const seat = seats[i]
+    const tag = answerTag(ANSWER_TAGS.plan)
+    // 第二位起,把前一稿原样交出去并要求**修订**而不是重写。quote() 中和围栏,免得
+    // 上一稿里的代码块提前关掉本次的答案围栏。
+    const priorDraft = i === 0 ? '' : (
+      '已有一份同伴起草的方案,请在它的基础上修订(补漏、纠错、收敛),不要推倒重写;' +
+      '你认可的部分原样保留。\n上一稿方案:\n' + quote(JSON.stringify(parsed.plan)) + '\n' +
+      '上一稿的子任务拆分:' + quote(JSON.stringify(parsed.children)) + '\n\n'
+    )
+    const res = await runPhase(ctx, {
+      phase: 'plan', node, role: seat, system: 'plan',
+      prompt: planPrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, 'plan') + priorDraft),
+      signal: ctx.signal,
+    })
+    if (!res.ok) {
+      // 第一位就失败 → 手上没有任何稿子,照旧阻断。后面的人失败 → 已经有一份**解析通过**
+      // 的稿子,拿它继续走评审,比把前面的工作全丢掉更诚实 —— 评审那关照样会挡。
+      // 但必须留痕:静默降级成「少一位修订者」正是不静默截断要防的。
+      if (i === 0) return { ok: false, reason: res.reason, timeout: res.timeout }
+      node.execStatus = (node.execStatus ? node.execStatus + '\n' : '') +
+        ORCHESTRATOR_NOTE + '方案精化第 ' + (i + 1) + ' 位(' + (seat?.roleName || '主模型') +
+        ')调用失败,采用前一稿: ' + res.reason + ')'
+      break
+    }
+    parsed = parsePlanOutput(res.text, tag)
+  }
+  return { ok: true, parsed }
+}
+
+/**
  * 这一席的角色简报,已带好尾部空行 —— 角色的「产出什么、起什么作用」到达模型的唯一通道。
  *
  * 席位没有 roleTag(关口上手勾的员工、老 run.md 里的席位)就是空串,提示词退回原样。
@@ -692,11 +740,9 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     } else {
       if (!(await commit(node, 'PLANNING', ctx))) return
-      const planTag = answerTag(ANSWER_TAGS.plan)
-      const planSeat = firstRole(node, 'plan')
-      const res = await runPhase(ctx, { phase: 'plan', node, role: planSeat, system: 'plan', prompt: planPrompt(node, ctx, planTag, feedback, seatBrief(ctx, planSeat, 'plan')), signal: ctx.signal })
+      const res = await runPlanRefinement(node, ctx, feedback)
       if (!res.ok) { await blockWithReason(node, res.reason, ctx, res.timeout ? 'timeout' : undefined); return }
-      const parsed = parsePlanOutput(res.text, planTag)
+      const parsed = res.parsed
       node.kind = parsed.kind
       node.plan = parsed.plan
       lastChildren = parsed.children

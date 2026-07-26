@@ -107,17 +107,25 @@ describe('the roster must not promise what will not run', () => {
     expect(cfg.notices.join(' ')).toContain('CLI')
   })
 
-  it('keeps only the plan/execute role that actually runs, and says so', async () => {
-    // Only review and accept fan out; plan and execute run a single agent.
+  it('keeps only the execute role that actually runs, and says so', async () => {
+    // execute 只跑一个 agent,而且那是**物理约束**:pathFor(node) 不含员工维度,两个
+    // 员工会拿到同一个 worktree 路径。plan 不再裁剪 —— 见下一条。
     const cfg = await withRoles(
       { plan: ['p1', 'p2'], execute: ['e1', 'e2'], review: ['r1', 'r2'] },
       { knownRoles: ['p1', 'p2', 'e1', 'e2', 'r1', 'r2'] },
     )
-    expect(cfg.phaseRoles.plan).toEqual([{ roleName: 'p1' }])
     expect(cfg.phaseRoles.execute).toEqual([{ roleName: 'e1' }])
     expect(cfg.phaseRoles.review).toEqual([{ roleName: 'r1' }, { roleName: 'r2' }]) // roundtable keeps all
-    expect(cfg.notices.join(' ')).toContain('p2')
     expect(cfg.notices.join(' ')).toContain('e2')
+    expect(cfg.notices.join(' ')).not.toContain('p2')
+  })
+
+  it('plan 保留多个员工 —— 它走顺序精化,不是「多出来的名字永远不跑」', async () => {
+    // 第一位起草,后面每一位在前一稿上修订。全程只有一份稿子在走,所以用户要的
+    // 「只有一个结论方案或产出」是结构保证的。
+    const cfg = await withRoles({ plan: ['p1', 'p2'] }, { knownRoles: ['p1', 'p2'] })
+    expect(cfg.phaseRoles.plan).toEqual([{ roleName: 'p1' }, { roleName: 'p2' }])
+    expect(cfg.notices.join(' ')).not.toContain('p2')
   })
 
   it('seats the observer now that scoring actually runs', async () => {

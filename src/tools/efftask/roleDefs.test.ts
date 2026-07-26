@@ -279,7 +279,7 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
   const role = (name: string, stage: string, staff: string[]): RoleDef =>
     ({ name, stage, output: 'o', purpose: 'p', staff }) as RoleDef
 
-  it.each(['plan', 'execute', 'observer'])('%s:一个角色两个员工 → 一席,并点名被忽略的是谁', stage => {
+  it.each(['execute', 'observer'])('%s:一个角色两个员工 → 一席,并点名被忽略的是谁', stage => {
     const { phaseRoles, notices } = applyRoleDefsToPhases(
       empty() as never, [role('主设计', stage, ['opus-架构', 'ds-安全'])],
     )
@@ -290,7 +290,7 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
     expect(joined).toContain('已忽略 主设计(ds-安全)')
   })
 
-  it.each(['plan', 'execute', 'observer'])('%s:同阶段两个角色 → 一席,点名被忽略的那个角色', stage => {
+  it.each(['execute', 'observer'])('%s:同阶段两个角色 → 一席,点名被忽略的那个角色', stage => {
     const { phaseRoles, notices } = applyRoleDefsToPhases(
       empty() as never, [role('前端实现', stage, ['gpt-前端']), role('后端实现', stage, ['opus-架构'])],
     )
@@ -309,9 +309,9 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
   it('单席位阶段:角色席位赢过按名字直接指定的员工', () => {
     // 评审实测的那个「复现 C」:角色席位被追加在后面 → 第 [0] 席是按名字点的那个 →
     // 角色整体死掉,而真正跑的那一席连职责简报都没有。这个组合完全普通,不需要多员工。
-    const base = { ...empty(), plan: [{ roleName: 'gpt-前端' }] }
-    const { phaseRoles, notices } = applyRoleDefsToPhases(base as never, [role('主设计', 'plan', ['opus-架构'])])
-    expect(phaseRoles.plan).toEqual([{ roleName: 'opus-架构', roleTag: '主设计' }])
+    const base = { ...empty(), execute: [{ roleName: 'gpt-前端' }] }
+    const { phaseRoles, notices } = applyRoleDefsToPhases(base as never, [role('写手', 'execute', ['opus-架构'])])
+    expect(phaseRoles.execute).toEqual([{ roleName: 'opus-架构', roleTag: '写手' }])
     expect(notices.join('\n')).toContain('已忽略 gpt-前端')
   })
 
@@ -323,13 +323,21 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
 
   it('主模型兼任的席位被忽略时也称呼得出来', () => {
     const { notices } = applyRoleDefsToPhases(
-      empty() as never, [role('甲', 'plan', ['opus-架构']), role('乙', 'plan', [])],
+      empty() as never, [role('甲', 'observer', ['opus-架构']), role('乙', 'observer', [])],
     )
     expect(notices.join('\n')).toContain('已忽略 乙(主模型)')
   })
 
   it('正好一席时不说废话', () => {
-    const { notices } = applyRoleDefsToPhases(empty() as never, [role('主设计', 'plan', ['opus-架构'])])
+    const { notices } = applyRoleDefsToPhases(empty() as never, [role('写手', 'execute', ['opus-架构'])])
+    expect(notices).toEqual([])
+  })
+
+  it('plan 不在裁剪之列 —— 它走顺序精化,多员工是支持的形态', () => {
+    // 第一位起草,后面每一位在前一稿上修订,全程只有一份稿子,「只有一个产出」成立。
+    const { phaseRoles, notices } = applyRoleDefsToPhases(
+      empty() as never, [role('主设计', 'plan', ['opus-架构', 'ds-安全'])])
+    expect(phaseRoles.plan).toHaveLength(2)
     expect(notices).toEqual([])
   })
 })
