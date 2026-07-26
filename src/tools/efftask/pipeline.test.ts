@@ -3443,3 +3443,21 @@ describe('测试验证的返工路径(此前三条分支零覆盖)', () => {
     expect(node.blockedReason).toContain('未能取得任何裁决')
   })
 })
+
+describe('验证裁决在记录里能和验收区分开', () => {
+  it('测试验证那条记录带上 step,验收那条不带', async () => {
+    // 两者共用 acceptLog 和 iteration.acceptance,于是 node.md 的「## 验收记录」里会出现
+    // 两条 round 1 —— 而升级卡片写的正是「先看该节点的验收记录」。
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), verify: [{ roleName: 'tester' }] }
+    await stepExecute(n, ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(n.acceptLog.map(r => r.step)).toEqual(['verify', undefined])
+  })
+})

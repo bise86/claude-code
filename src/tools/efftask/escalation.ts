@@ -13,6 +13,7 @@
 //    the identical block having made zero model calls. `--retry-blocked` is the flag that
 //    makes the instruction true, and it exists because this card needed to be honest.
 import type { BlockCategory, TaskNode } from './types.js'
+import { PHASE_LABEL } from './types.js'
 export type { BlockCategory }
 
 /**
@@ -101,12 +102,25 @@ export function stopsTheNode(category: BlockCategory): boolean {
  * A card headed 安全阀 · 方案评审迭代超限 told the user the retry would keep the plan and
  * only re-run execution. Exactly backwards.
  */
+/**
+ * 重跑时这个节点会经过哪些环节。
+ *
+ * 措辞必须跟着环节表走(MUST mirror reseat.ts's seat rules):环节改名之后这里还写着
+ * 「方案制定 → 评审」,而且配了测试验证的节点实际是「执行 → 测试验证 → 验收」——
+ * 卡片上少一步,用户就会以为重试比实际便宜。
+ */
 function retryTarget(node: TaskNode, category: BlockCategory): string {
-  if (node.childIds.length > 0) return '集成验收'
+  if (node.childIds.length > 0) return PHASE_LABEL.integrate
   // reseat's `reviewExhausted`: a childless node whose REVIEW budget was the one that ran out
   // goes back to CREATED, whatever `kind` happens to say.
-  if (category === 'cap-iteration') return '方案制定 → 评审(方案会重新生成)'
-  return node.kind === 'executable' ? '执行 → 验收' : '方案制定 → 评审'
+  const plan = `${PHASE_LABEL.plan} → ${PHASE_LABEL.review}`
+  if (category === 'cap-iteration') return `${plan}(方案会重新生成)`
+  if (node.kind !== 'executable') return plan
+  // 只有真的配了测试验证席位才写它 —— 否则那一步整个不发生,写上去就是多报一步。
+  const steps = [PHASE_LABEL.execute,
+    ...((node.phaseRoles.verify ?? []).length > 0 ? [PHASE_LABEL.verify] : []),
+    PHASE_LABEL.accept]
+  return steps.join(' → ')
 }
 
 /**

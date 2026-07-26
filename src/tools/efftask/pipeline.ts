@@ -1485,7 +1485,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         buildPrompt: (tag, seat) => verifyPrompt(node, tag, seatBrief(ctx, seat, 'verify')),
         ctx, cwd: node.worktree?.path,
       })
-      node.acceptLog.push(v.rec)
+      node.acceptLog.push({ ...v.rec, step: 'verify' })
       const after = await verifySnapshot(node, ctx)
       if (before !== undefined && after !== undefined && before !== after) {
         // 它动了工作区。这一轮裁决作废:一个「跑完测试顺手把它改绿」的验证等于没有验证。

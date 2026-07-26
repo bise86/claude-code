@@ -155,7 +155,17 @@ export interface Verdict {
    */
   remedy?: { title: string; deps: string[] }[]
 }
-export interface RoundtableRecord { round: number; verdicts: Verdict[]; synthesized: { pass: boolean; blockingSummary: string } }
+export interface RoundtableRecord {
+  round: number; verdicts: Verdict[]; synthesized: { pass: boolean; blockingSummary: string }
+  /**
+   * 这一轮是**哪一关**开的。
+   *
+   * 测试验证和验收共用 acceptLog、也共用 iteration.acceptance 计数,于是 node.md 的
+   * 「## 验收记录」里会出现两条 `round 1`,没有任何标记说明哪条是测试验证 —— 而升级
+   * 卡片写的正是「先看该节点的验收记录」。省略 = 验收(老 node.md 的形状不变)。
+   */
+  step?: PhaseName
+}
 export interface ScoreRecord {
   role: string; score: number; rationale: string
   /**

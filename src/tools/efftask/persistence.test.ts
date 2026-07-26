@@ -414,3 +414,27 @@ describe('spec §13:renderTreeSnapshot 的输出必须稳定', () => {
     expect(out.indexOf('BBB')).toBeLessThan(out.indexOf('AAA'))
   })
 })
+
+describe('验收记录要说清哪一轮是哪一关', () => {
+  // 测试验证和验收共用 acceptLog、也共用 iteration.acceptance 计数,于是「## 验收记录」
+  // 里会出现两条 `round 1`,而升级卡片写的正是「先看该节点的验收记录」。
+  const rec = (over: object = {}) => ({
+    round: 1, verdicts: [{ role: 'r', pass: true, blocking: [], comments: '' }],
+    synthesized: { pass: true, blockingSummary: '' }, ...over,
+  })
+
+  it('测试验证那一轮被标出来', () => {
+    const n = createNode({ id: 'n', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'NOW' })
+    n.acceptLog = [rec({ step: 'verify' }), rec()] as never
+    const body = serializeNode(n)
+    expect(body).toContain('[测试验证] round 1')
+    // 验收那一轮不加前缀 —— 老 node.md 的形状不变。
+    expect(body).toContain('- round 1')
+  })
+
+  it('没有 step 的老记录照旧渲染', () => {
+    const n = createNode({ id: 'n', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'NOW' })
+    n.acceptLog = [rec()] as never
+    expect(serializeNode(n)).toContain('- round 1: PASS')
+  })
+})

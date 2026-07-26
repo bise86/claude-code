@@ -9,7 +9,7 @@ import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { TaskTreePanel, visibleRows, viewport, elapsed } from './TaskTreePanel.js'
-import { NodeDetail } from './NodeDetail.js'
+import { NodeDetail, phaseTimeBody } from './NodeDetail.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
 
 const NOW = new Date().toISOString()
@@ -726,11 +726,11 @@ describe('spec §10.2:详情页要显示各阶段耗时', () => {
     })
     expect(f).toContain('各阶段耗时')
     expect(f).toContain('执行 120s')
-    expect(f).toContain('方案评审 45s')
+    expect(f).toContain('质疑讨论 45s')
     // 顺序:执行(120)必须排在方案评审(45)前面,方案评审又要排在验收(8)前面 ——
     // 读的人是来找"时间花哪了"的。
-    expect(f.indexOf('执行 120s')).toBeLessThan(f.indexOf('方案评审 45s'))
-    expect(f.indexOf('方案评审 45s')).toBeLessThan(f.indexOf('验收 8s'))
+    expect(f.indexOf('执行 120s')).toBeLessThan(f.indexOf('质疑讨论 45s'))
+    expect(f.indexOf('质疑讨论 45s')).toBeLessThan(f.indexOf('验收 8s'))
   })
 
   it('不足一秒的阶段不列 —— 一行 0s 只会让人以为那里出了问题', async () => {
@@ -755,5 +755,22 @@ describe('spec §10.2:详情页要显示各阶段耗时', () => {
     const f = await mountDetail({ node: mk({ id: 'n', title: '刚建好' }) })
     expect(f).not.toContain('各阶段耗时')
     expect(f).toContain('刚建好') // 正向锚点
+  })
+})
+
+describe('各阶段耗时不能把内部枚举名漏给用户', () => {
+  it('每个会计时的状态都有中文标签', () => {
+    // 漏一个,那一行就渲染成 `VERIFYING 5s` —— 内部枚举名直接摆到用户面前。
+    const n = tree()[0]
+    n.phaseMs = {
+      PLANNING: 1000, PLAN_REVIEW: 1000, EXECUTING: 1000, VERIFYING: 1000,
+      ACCEPTANCE: 1000, REWORK: 1000, INTEGRATION_ACCEPT: 1000, SCORING: 1000, MERGE: 1000,
+    } as never
+    const body = phaseTimeBody(n)
+    for (const st of ['PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'VERIFYING', 'ACCEPTANCE',
+                      'REWORK', 'INTEGRATION_ACCEPT', 'SCORING', 'MERGE']) {
+      expect(`${st}:${body.includes(st)}`).toBe(`${st}:false`)
+    }
+    expect(body).toContain('测试验证')
   })
 })

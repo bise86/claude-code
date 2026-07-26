@@ -1,4 +1,5 @@
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml'
+import { PHASE_LABEL } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { uiStatus } from './stateMachine.js'
 
@@ -111,7 +112,11 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
   // EVERY commit; a throw here blocks the node with a raw TypeError as its reason and repeats
   // on every resume. A body section is never worth a dead run.
   return log.map(r => {
-    const head = `- round ${stripControl(String(r?.round ?? '?'))}: ${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
+    // 标出是哪一关:测试验证和验收共用 acceptLog、也共用 iteration.acceptance,于是这一节
+    // 里会出现两条 `round 1`,而升级卡片写的正是「先看该节点的验收记录」。
+    // 省略 step = 验收(老 node.md 的形状不变)。
+    const step = r?.step && PHASE_LABEL[r.step] ? `[${PHASE_LABEL[r.step]}] ` : ''
+    const head = `- ${step}round ${stripControl(String(r?.round ?? '?'))}: ${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
     const roles = (r?.verdicts ?? []).map(v => {
       const detail = (v?.blocking ?? []).length > 0 ? (v.blocking ?? []).join('; ') : (v?.comments ?? '')
       const mark = v?.infra ? 'CALL-FAILED' : v?.pass ? 'pass' : 'FAIL'
