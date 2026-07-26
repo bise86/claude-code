@@ -1,34 +1,12 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
+import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
   capsLine, clampParallelism, goalLine, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
-
-/**
- * State that the key handler both READS and WRITES.
- *
- * A plain `useState` value is not enough here. The vendored renderer splits one stdin chunk
- * into several InputEvents and dispatches them SYNCHRONOUSLY, while `useInput`'s handler is
- * only swapped in a post-commit `useLayoutEffect` — so the second key of a chunk still runs
- * the previous render's closure. Measured: `↓` and `空格` arriving together bound the role to
- * 方案 while the cursor was rendered on 评审, and `→` + `回车` confirmed a parallelism one
- * lower than the screen showed.
- *
- * The ref is the source of truth for the handler; the state exists only to trigger a repaint.
- */
-function useLiveState<T>(initial: T): [T, (next: T | ((cur: T) => T)) => void, React.RefObject<T>] {
-  const [value, setValue] = React.useState(initial)
-  const ref = React.useRef(initial)
-  const set = React.useCallback((next: T | ((cur: T) => T)) => {
-    const resolved = typeof next === 'function' ? (next as (c: T) => T)(ref.current) : next
-    ref.current = resolved
-    setValue(resolved)
-  }, [])
-  return [value, set, ref as React.RefObject<T>]
-}
 
 export function ConfirmStartup(props: {
   config: EffTaskConfig

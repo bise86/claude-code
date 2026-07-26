@@ -901,7 +901,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return <ParsingView onCancel={bail} />
   }
   if (phase === 'confirmResume' && summary) {
-    return <ConfirmResume config={config} summary={summary} isolation={isolation} nodes={nodes} onDecision={d => terminalClaim.current?.('terminal', d)} />
+    return <ConfirmResume
+        config={config}
+        summary={summary}
+        isolation={isolation}
+        nodes={nodes}
+        // 名册可编辑 (spec §17.3). Same two props ConfirmStartup gets: only roles this session
+        // can actually dispatch, each rendered with the model it would run on.
+        availableRoles={dispatchableRoles(props.knownRoles, props.unsupportedRoles)}
+        roleModel={name => effectiveModel(props.agentModels.find(a => a.agentType === name), props.mainModel)}
+        onDecision={d => terminalClaim.current?.('terminal', d)}
+      />
   }
   if (phase === 'confirm') {
     return (

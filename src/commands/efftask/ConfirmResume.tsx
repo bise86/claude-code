@@ -1,9 +1,11 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
+import { PHASE_NAMES } from '../../tools/efftask/types.js'
+import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from '../../tools/efftask/types.js'
+import { useLiveState } from './useLiveState.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import {
-  clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections,
+  clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, rosterEditorLines, toggleRole, resumeSummarySections,
   type ResumeSummary, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -40,25 +42,72 @@ export function ConfirmResume(props: {
    * keyboard. Optional so the component still renders standalone.
    */
   nodes?: TaskNode[]
+  /**
+   * 名册可编辑 (spec §17.3: 「与新建 run **相同的**确认界面……角色名册与并行数(**可改**)」).
+   *
+   * Only parallelism was editable here. That is not a cosmetic gap: the roster comes back off
+   * run.md, and this command's own code notes that a role recorded on disk may no longer exist
+   * in this session and will be silently downgraded to the main model. The user saw that on the
+   * gate and had exactly two options — accept it, or cancel and hand-edit run.md.
+   */
+  availableRoles?: string[]
+  roleModel?: (roleName: string) => string | undefined
   onDecision: (d: StartupDecision) => void
 }): React.ReactElement {
-  const [parallelism, setParallelism] = React.useState(clampParallelism(props.config.parallelism))
+  const [parallelism, setParallelism, parRef] = useLiveState(clampParallelism(props.config.parallelism))
+  const [roster, setRoster, rosterRef] = useLiveState<Record<PhaseName, RoleBinding[]>>(
+    Object.fromEntries(PHASE_NAMES.map(p => [p, [...props.config.phaseRoles[p]]])) as Record<PhaseName, RoleBinding[]>,
+  )
+  const [editing, setEditing, editingRef] = useLiveState(false)
+  const [phaseIdx, setPhaseIdx, phaseRef] = useLiveState(0)
+  const [roleIdx, setRoleIdx, roleRef] = useLiveState(0)
+  const available = props.availableRoles ?? []
+
+  const decide = (d: Partial<StartupDecision> & { approved: boolean }): void =>
+    props.onDecision({ parallelism: parRef.current, phaseRoles: rosterRef.current, ...d })
+
   useInput((input, key) => {
     const k = input.toLowerCase()
-    if (key.leftArrow || input === '-') { setParallelism(p => clampParallelism(p - 1)); return }
-    if (key.rightArrow || input === '+' || input === '=') { setParallelism(p => clampParallelism(p + 1)); return }
-    if (key.return || k === 'y') props.onDecision({ parallelism, approved: true })
-    else if (k === 'v') props.onDecision({ parallelism, approved: false, viewOnly: true })
-    else if (key.escape || k === 'n') props.onDecision({ parallelism, approved: false })
+    if (editingRef.current) {
+      // Esc LEAVES the editor rather than cancelling the resume — losing the edits AND the
+      // gate to one keystroke is the same trap ConfirmStartup avoids.
+      if (key.escape) { setEditing(false); return }
+      if (key.upArrow || k === 'k') { setPhaseIdx((phaseRef.current + PHASE_NAMES.length - 1) % PHASE_NAMES.length); return }
+      if (key.downArrow || k === 'j') { setPhaseIdx((phaseRef.current + 1) % PHASE_NAMES.length); return }
+      if (available.length > 0) {
+        if (key.leftArrow || k === 'h') { setRoleIdx((roleRef.current + available.length - 1) % available.length); return }
+        if (key.rightArrow || k === 'l') { setRoleIdx((roleRef.current + 1) % available.length); return }
+        if (input === ' ') {
+          const name = available[roleRef.current]
+          setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name)))
+          return
+        }
+      }
+      if (key.return) decide({ approved: true })
+      return
+    }
+    if (key.leftArrow || input === '-') { setParallelism(clampParallelism(parRef.current - 1)); return }
+    if (key.rightArrow || input === '+' || input === '=') { setParallelism(clampParallelism(parRef.current + 1)); return }
+    if (k === 'r') { setEditing(true); return }
+    if (key.return || k === 'y') decide({ approved: true })
+    else if (k === 'v') decide({ approved: false, viewOnly: true })
+    else if (key.escape || k === 'n') decide({ approved: false })
   })
   const sections = resumeSummarySections(props.summary)
+  // What the roster lines describe must be the EDITED roster, not what came off disk —
+  // otherwise the gate shows one panel and resumes with another.
+  const shown: EffTaskConfig = { ...props.config, phaseRoles: roster }
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 恢复确认</Text>
       <Text>目标: {goalLine(props.config.goalPrompt)}</Text>
-      <Text>{parallelismLine({ ...props.config, parallelism }, { editable: true, isolation: props.isolation })}</Text>
-      <Text bold>角色名册:</Text>
-      {rosterLines(props.config).map(line => <Text key={line}>  {line}</Text>)}
+      <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: props.isolation })}</Text>
+      <Text bold>角色名册{editing ? '(编辑中)' : ''}:</Text>
+      {editing
+        ? rosterEditorLines(roster, available, phaseIdx, roleIdx).map((line, i) => (
+          <Text key={`ed-${i}`}>{'  '}{line}</Text>
+        ))
+        : rosterLines(shown).map(line => <Text key={line}>  {line}</Text>)}
       {noticeLines(props.config).length > 0 && (
         <Box flexDirection="column">
           <Text color="warning">以下请求不会生效:</Text>
@@ -92,7 +141,17 @@ export function ConfirmResume(props: {
           ) : null}
         </Box>
       ) : null}
-      <Text dimColor>回车/y 继续执行 · v 仅查看后退出 · Esc/n 取消</Text>
+      {editing ? (
+        <Text dimColor>
+          {available.length > 0
+            ? '↑/↓ 选阶段 · ←/→ 选角色 · 空格 增删 · 回车 确认并继续 · Esc 退出编辑'
+            // ←/→ and 空格 are gated on there being candidates; listing them with none
+            // available would advertise three dead keys.
+            : '回车 确认并继续 · Esc 退出编辑(没有可用角色,无法编辑)'}
+        </Text>
+      ) : (
+        <Text dimColor>回车/y 继续执行 · r 编辑角色名册 · ←/→ 调整并行数 · v 仅查看后退出 · Esc/n 取消</Text>
+      )}
     </Box>
   )
 }

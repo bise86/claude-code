@@ -26,6 +26,13 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     expect(SRC).toMatch(/<ConfirmResume[^>]*\bnodes=\{nodes\}/)
   })
 
+  it('恢复关口拿到了可编辑的角色名册 (spec §17.3)', () => {
+    // 剪断它:关口的 `r` 键进得去编辑器,但里面一个候选角色都没有 —— §17.3 的"名册可改"
+    // 退回成一句空话,而它要解决的正是"盘上记的角色本会话已不存在、会被静默降级"。
+    expect(SRC).toMatch(/<ConfirmResume[\s\S]{0,400}?availableRoles=\{dispatchableRoles\(/)
+    expect(SRC).toMatch(/<ConfirmResume[\s\S]{0,400}?roleModel=\{/)
+  })
+
   it('第三关起草拿到了隔离池 (spec §16)', () => {
     // 剪断它:关口上给用户看的那棵树是在**没有**冲突约束的情况下拆出来的,而 run 随后按
     // 有约束的规则跑 —— 用户批准的拆分和实际执行的规则不是一回事。

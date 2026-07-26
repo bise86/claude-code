@@ -34,7 +34,10 @@ function fakeTty() {
   // Cursor-move sequences ARE the spacing, so they become a space; the bare ESC byte
   // that precedes them must then be removed or it lands between every pair of words.
   const plain = (): string => frame.replace(/\[[0-9;>?]*[a-zA-Z]/g, ' ').replace(/\u001b/g, '')
-  return { stdin, stdout, lastFrame: plain }
+  // The vendored renderer paints INCREMENTAL diffs and this buffer accumulates every write,
+  // so lastFrame() is a transcript, not a screenshot. Any assertion about what the screen
+  // shows NOW has to reset first and then provoke a repaint.
+  return { stdin, stdout, lastFrame: plain, reset: () => { frame = '' } }
 }
 
 const mkNode = (o: { id: string; title: string }) =>
@@ -234,6 +237,87 @@ describe('ConfirmResume (vendored renderer)', () => {
     app.unmount()
   })
 
+  it('spec §17.3:恢复关口的名册可以改,改完随决策一起带出去', async () => {
+    // §17.3 写的是「与新建 run **相同的**确认界面……角色名册与并行数(**可改**)」。原本只有
+    // 并行数能改。这不是装饰性的缺口:名册是从 run.md 读回来的,而本命令自己的代码就注明
+    // 盘上记的角色在本会话可能已经不存在、会被静默降级成主模型 —— 用户在关口看见了,却只有
+    // 两个选择:接受,或者取消掉去手改 run.md。
+    const decisions: { phaseRoles?: Record<string, { roleName: string }[]> }[] = []
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, {
+        config, summary,
+        availableRoles: ['architect', 'qa'],
+        onDecision: (d: never) => decisions.push(d),
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(lastFrame()).toContain('r 编辑角色名册')
+    stdin.press('r'); await tick()
+    expect(lastFrame()).toContain('编辑中')
+    stdin.press(' '); await tick()   // 把光标所在角色绑到第一个阶段(plan)
+    stdin.press('\r'); await tick()  // 编辑器内回车 = 确认整个关口
+    expect(decisions).toHaveLength(1)
+    expect(decisions[0].phaseRoles?.plan).toEqual([{ roleName: 'architect' }])
+    app.unmount()
+  })
+
+  it('没有可用角色时不宣传三个按不动的键', async () => {
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, availableRoles: [], onDecision: () => {} } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press('r'); await tick()
+    const f = lastFrame()
+    expect(f).toContain('没有可用角色')
+    expect(f).not.toContain('空格 增删')
+    app.unmount()
+  })
+
+  it('编辑器里的 Esc 只退出编辑,不取消整个恢复', async () => {
+    // 一个键同时丢掉编辑内容和关口,是 ConfirmStartup 专门避开的坑。
+    const decisions: unknown[] = []
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, {
+        config, summary, availableRoles: ['architect'], onDecision: (d: never) => decisions.push(d),
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press('r'); await tick()
+    stdin.press(ESC); await tickEsc()
+    expect(decisions).toEqual([])                       // 没有做出任何决策
+    expect(lastFrame()).toContain('r 编辑角色名册')      // 回到了非编辑态
+    app.unmount()
+  })
+
+  it('退出编辑器后,名册那几行显示的是改过的名册,不是盘上那份', async () => {
+    // 关口显示一份、恢复时用另一份,是这个仓库反复在修的那类不一致。改完退出编辑器,
+    // 屏幕上就必须能看到改动 —— 否则用户无法确认自己改对了没有。
+    const { stdin, stdout, lastFrame, reset } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, {
+        config, summary, availableRoles: ['architect'], onDecision: () => {},
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(lastFrame()).not.toContain('architect') // 盘上那份是空名册
+    stdin.press('r'); await tick()
+    stdin.press(' '); await tick()   // 绑到 plan
+    // reset 必须放在退出编辑器**之前**:缓冲区累积的是每一次写入,编辑器自己那一帧里就有
+    // 'architect'(它是候选项),所以不 reset 的话这条断言无论渲染的是哪份名册都成立 ——
+    // 变异跑出来的,把 rosterLines(shown) 换成 rosterLines(props.config) 照样绿。
+    reset()
+    stdin.press(ESC); await tickEsc() // 退出编辑器 → 重绘只读名册
+    expect(lastFrame()).toContain('architect')
+    app.unmount()
+  })
+
   it('嵌进来的树不能把关口的键盘抢走', async () => {
     // TaskTreePanel 的 useInput 是按 `interactive` 门控的。忘了这一点的话,↑↓ 会同时滚树
     // 和调并行数,回车的含义也会有两个 —— 这个仓库为"两个 handler 抢同一个键"付过账。
@@ -255,7 +339,7 @@ describe('ConfirmResume (vendored renderer)', () => {
     expect(f).toContain('回车/y 继续执行')
     stdin.press('\r')
     await tick()
-    expect(decisions).toEqual([{ parallelism: 3, approved: true }])
+    expect(decisions).toEqual([{ parallelism: 3, approved: true, phaseRoles: emptyPhaseRoles() }])
     app.unmount()
   })
 
@@ -272,7 +356,7 @@ describe('ConfirmResume (vendored renderer)', () => {
     await tick()
     stdin.press('v')
     await tick()
-    expect(decisions).toEqual([{ parallelism: 3, approved: false, viewOnly: true }])
+    expect(decisions).toEqual([{ parallelism: 3, approved: false, viewOnly: true, phaseRoles: emptyPhaseRoles() }])
     app.unmount()
   })
 
