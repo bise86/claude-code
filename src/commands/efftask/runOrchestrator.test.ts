@@ -137,6 +137,77 @@ describe('runOrchestrator reports the run it just drove', () => {
     expect(outcomes).toHaveLength(1)
     expect(phases).toEqual(['done'])
   })
+
+  it('即使 run() 抛了,worktree 也要回收、收口信息也要给到用户', async () => {
+    // 收口原本坐在 `await orch.run()` **之后**、try 块**里面**,所以上面那条 catch 会把它
+    // 整个跳过。而那条 catch 存在的理由,正是 run() 可能会抛(尽管它自己说不会)。真走到
+    // 那条路时用户拿到的是最坏的组合:每个节点的 worktree 都泄漏、集成工作区无人回收、
+    // 而且**一条收口信息都没有** —— done 视图直接出现,连"改动在哪个分支"都不告诉他。
+    // 上面那条用例走的就是这条路,却对回收一个字都没断言。合规审计发现的。
+    const fs = memFs()
+    fs.writeFile = async () => { throw new Error('磁盘满') }
+    let disposed = 0
+    let handedOff = 0
+    const pool = {
+      init: async () => ({ ok: true }),
+      acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b', gitRoot: '/repo' }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
+      release: async () => ({ removed: true }),
+      dispose: async () => { disposed++; return { kept: [] } },
+      handoff: async () => { handedOff++; return { branch: 'efftask/002/integration', commits: 3, kept: [], salvage: [], integrationPath: '/wt/integration' } },
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      integrationPath: '/wt/integration',
+      integrationBranchName: 'efftask/002/integration',
+    }
+    const handoffs: { branch: string }[] = []
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/002', fs, runAgent: (async () => '') as RunAgentFn,
+        signal: new AbortController().signal, worktrees: pool as never,
+      },
+      () => { throw new Error('渲染崩溃') },
+      () => {},
+      () => {},
+      h => handoffs.push(h),
+    )
+    expect(disposed).toBe(1)
+    expect(handedOff).toBe(1)
+    expect(handoffs[0]?.branch).toBe('efftask/002/integration')
+  })
+
+  it('正常收尾时不会重复回收', async () => {
+    // finally 里那次是兜底,不能让顺利跑完的 run 把 dispose/handoff 做两遍 —— dispose 真的
+    // 会删 worktree,做两次意味着第二次对着已经不存在的路径跑 git。
+    let disposed = 0
+    const pool = {
+      init: async () => ({ ok: true }),
+      acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b', gitRoot: '/repo' }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
+      release: async () => ({ removed: true }),
+      dispose: async () => { disposed++; return { kept: [] } },
+      handoff: async () => ({ branch: 'b', commits: 0, kept: [], salvage: [], integrationPath: '/wt/integration' }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      integrationPath: '/wt/integration',
+      integrationBranchName: 'b',
+    }
+    const runAgent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') {
+        return '```' + (req.prompt.match(/必须是一个 ```(plan[a-z]+) 代码块/)?.[1] ?? 'plan') +
+          '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      }
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      const tag = req.prompt.match(/必须是一个 ```(verdict[a-z]+) 代码块/)?.[1] ?? 'verdict'
+      return '```' + tag + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/003', fs: memFs(), runAgent,
+        signal: new AbortController().signal, worktrees: pool as never,
+      },
+      () => {}, () => {}, () => {},
+    )
+    expect(disposed).toBe(1)
+  })
 })
 
 describe('后台任务条目 (spec §10) 真的被接上', () => {

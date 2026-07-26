@@ -108,6 +108,35 @@ export async function runOrchestrator(
     // literal '已中断' recovered from a previous session's node.md while nobody touched this run.
     try { finishEffTaskRun(taskId, entry.setAppState, o, args.signal.aborted) } catch { /* panel only */ }
   }
+  /**
+   * 收口 (spec §8): reclaim the worktrees and tell the user where their work landed.
+   *
+   * Hoisted out of the happy path and into `finally`, because it used to sit AFTER
+   * `await orch.run()` inside the try — so the `catch` below skipped it entirely. That catch
+   * exists precisely because run() might reject despite its own claim not to, and on that
+   * path the user got the worst possible outcome: every node worktree leaked, the integration
+   * worktree unreclaimed, and NO handoff at all — the done view appeared without even naming
+   * the branch holding their commits. Reported by a compliance audit; `runOrchestrator.test.ts`
+   * already drove that exact path and asserted nothing about disposal.
+   *
+   * Idempotent by construction: `ran` makes it a no-op the second time, so the finally block
+   * cannot double-dispose after the happy path already did it.
+   */
+  let ran = false
+  const reclaim = async (nodes: TaskNode[]): Promise<void> => {
+    if (ran || !args.worktrees) return
+    ran = true
+    try {
+      // dispose FIRST: it reclaims what is provably safe, so handoff then reports only the
+      // worktrees that genuinely still hold something. Reporting before reclaiming would list
+      // directories that are about to disappear.
+      await args.worktrees.dispose(nodes)
+      onHandoff?.(await args.worktrees.handoff(nodes))
+    } catch (e) {
+      logError(e instanceof Error ? e : new Error(String(e)))
+    }
+  }
+  let liveNodes: TaskNode[] = []
   try {
     const persist = (n: TaskNode) => writeNode(args.fs, args.runDir, n)
     const now = () => new Date().toISOString()
@@ -138,20 +167,10 @@ export async function runOrchestrator(
     args.onPool?.(() => orch.slotUsage())
     setNodes(orch.nodes()) // seed with the root so the tree isn't blank on first paint
     void queueManifest(orch.nodes()) // run.md exists from the first frame, not just at the end
+    liveNodes = orch.nodes()
     const result = await orch.run() // { status, reason }
-    // 收口: ask the pool where everything landed, while its worktrees still exist.
-    if (args.worktrees) {
-      try {
-        // dispose FIRST: it reclaims what is provably safe, so handoff then reports only the
-        // worktrees that genuinely still hold something. Reporting before reclaiming would
-        // list directories that are about to disappear.
-        await args.worktrees.dispose(orch.nodes())
-        const h = await args.worktrees.handoff(orch.nodes())
-        onHandoff?.(h)
-      } catch (e) {
-        logError(e instanceof Error ? e : new Error(String(e)))
-      }
-    }
+    liveNodes = orch.nodes()
+    await reclaim(orch.nodes())
     setNodes([...orch.nodes()])
     setOutcome(result)
     settle(result)
@@ -165,6 +184,8 @@ export async function runOrchestrator(
     // is the one that leaves a task with no other way to reach a terminal status.
     settle(failed)
   } finally {
+    // The reclaim the happy path may not have reached. A no-op when it did.
+    await reclaim(liveNodes)
     setPhase('done') // the done view is ALWAYS reached
   }
 }

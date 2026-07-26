@@ -313,7 +313,9 @@ describe('spec §17.2:手工写进 node.md 的 EXECUTED 必须能重新排队', 
     seed.status = 'EXECUTED'
     seed.kind = 'executable'
     seed.execStatus = '改了 src/login.ts,还没验收'
-    const parsed = parseNodeFile(serializeNode(seed), 'root')
+    // 一个参数。第二个实参是我写错的,而这个仓库没有 typecheck,所以它被静默忽略了 ——
+    // 合规审计翻出来的。`parses.test.ts` 自称"本仓库唯一的语法闸门",这就是它的边界。
+    const parsed = parseNodeFile(serializeNode(seed))
     expect(parsed.status).toBe('EXECUTED') // the disk really can carry it…
 
     const { nodes: validated, repairs } = validateLoadedNodes([parsed], {

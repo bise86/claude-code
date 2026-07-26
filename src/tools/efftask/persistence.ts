@@ -268,8 +268,21 @@ export function renderTreeSnapshot(nodes: TaskNode[]): string {
       if (child) emit(child, depth + 1)
     }
   }
-  for (const n of nodes) if (n.parentId === null) emit(n, 0)
-  for (const n of nodes) if (!seen.has(n.id)) emit(n, n.depth)
+  /**
+   * Roots and orphans are walked in ID order, not array order — spec §13 asks for
+   * 「renderTreeSnapshot 输出稳定」 and array order does not provide it.
+   *
+   * `loadRun` builds its list from `readdir`, which guarantees no ordering, so the SAME tree
+   * rendered on two resumes could emit its top-level rows in different sequences. Measured:
+   * `[root, orphan]` and `[orphan, root]` produce two different files. run.md is rewritten on
+   * every commit, so that turns into churn a reader cannot distinguish from real movement.
+   *
+   * CHILDREN keep `childIds` order, which is meaningful — it is creation order, and the `NN-`
+   * prefix in every child id encodes it.
+   */
+  const byIdOrder = (a: TaskNode, b: TaskNode): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  for (const n of [...nodes].sort(byIdOrder)) if (n.parentId === null) emit(n, 0)
+  for (const n of [...nodes].sort(byIdOrder)) if (!seen.has(n.id)) emit(n, n.depth)
   return `# Efficient Task Run\n\n${lines.join('\n')}\n`
 }
 

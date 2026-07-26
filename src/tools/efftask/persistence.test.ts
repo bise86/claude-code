@@ -376,3 +376,41 @@ describe('writer 自己也不能被坏数据打死', () => {
     expect(() => serializeNode(n)).not.toThrow()
   })
 })
+
+describe('spec §13:renderTreeSnapshot 的输出必须稳定', () => {
+  const nd = (id: string, title: string, over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id, title, parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+
+  it('同一棵树,节点数组顺序不同,快照必须一模一样', () => {
+    // §13 列了「renderTreeSnapshot 输出稳定」,而在此之前零覆盖。实测同一棵多根树
+    // `[root, orphan]` 和 `[orphan, root]` 会渲染出两个不同的文件 —— 而 loadRun 的节点
+    // 来自 readdir,顺序没有任何保证。run.md 每次 commit 都重写,于是这会变成读的人
+    // 分辨不出是不是真的动了的抖动。多根树正是恢复期的损坏形状,不是纸上谈兵。
+    // **两个**根级节点。第一版只放了一个根,于是第一趟遍历无论数组怎么排都只发出它一个,
+    // "顺序无关"是碰巧成立的 —— 把排序删掉照样绿(变异跑出来的)。多根正是 §17 恢复期真会
+    // 出现的形状:父指针指向一个没恢复出来的节点时,validateLoadedNodes 会把它提为根级。
+    const a = nd('root', 'A', { kind: 'decompose', childIds: ['root/01-x'] })
+    const kid = nd('root/01-x', 'X', { parentId: 'root', depth: 1 })
+    const b = nd('zz-second-root', 'B')
+    const orphan = nd('mm-orphan', 'C', { parentId: 'ghost', depth: 1 })
+    const s1 = renderTreeSnapshot([a, kid, b, orphan])
+    const s2 = renderTreeSnapshot([b, orphan, kid, a])
+    const s3 = renderTreeSnapshot([orphan, b, a, kid])
+    expect(s2).toBe(s1)
+    expect(s3).toBe(s1)
+    // …而且确实是按 id 排的,不是碰巧和某个输入顺序一致。
+    expect(s1.indexOf('A (')).toBeLessThan(s1.indexOf('B ('))
+  })
+
+  it('子节点仍按 childIds 的顺序,那个顺序是有含义的', () => {
+    // 子节点顺序是创建顺序,每个子 id 的 `NN-` 前缀就编码着它 —— 不能一起按 id 排掉,
+    // 那会把"先做哪个"这个信息抹平。这里故意让 childIds 的顺序和 id 的字典序相反。
+    const p = nd('root', 'P', { kind: 'decompose', childIds: ['root/02-b', 'root/01-a'] })
+    const b = nd('root/02-b', 'BBB', { parentId: 'root', depth: 1 })
+    const a = nd('root/01-a', 'AAA', { parentId: 'root', depth: 1 })
+    const out = renderTreeSnapshot([p, a, b])
+    expect(out.indexOf('BBB')).toBeLessThan(out.indexOf('AAA'))
+  })
+})
