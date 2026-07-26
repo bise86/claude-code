@@ -42,7 +42,21 @@ export async function runRoundtable(args: {
   roles: RoleBinding[]
   round: number
   system: string
-  prompt: string
+  /**
+   * The prompt for ONE seat — a function, not a string.
+   *
+   * It used to be a single string sent verbatim to every seat, and that is exactly what made a
+   * task ROLE (「架构师」, carrying its own 产出什么 / 起什么作用) impossible to express: the
+   * roster could name three different reviewers and all three received byte-identical
+   * instructions, so the only thing distinguishing them was which model answered. A role
+   * definition would have been parsed, validated, rendered at the gate — and then reached no
+   * model call at all. That is the dead-config shape this codebase keeps paying for, and here
+   * it would have sat in the middle of the feature.
+   *
+   * Taking the seat lets the caller append that seat's own brief. Callers with nothing
+   * seat-specific to say ignore the argument.
+   */
+  prompt: (seat: RoleBinding | null) => string
   runAgent: RunAgentFn
   signal: AbortSignal
   // Per-call answer tag the prompt demanded; verdicts are only trusted under THIS tag.
@@ -80,7 +94,7 @@ export async function runRoundtable(args: {
     role =>
       // cwd goes to EVERY reviewer: the work under review lives in the node's worktree, and a
       // reviewer reading the main tree can only rubber-stamp the executor's own prose.
-      args.runAgent({ phase: args.phase, node: args.node, role, system: args.system, prompt: args.prompt, signal: args.signal, cwd: args.cwd, onChunk: args.onChunk }),
+      args.runAgent({ phase: args.phase, node: args.node, role, system: args.system, prompt: args.prompt(role), signal: args.signal, cwd: args.cwd, onChunk: args.onChunk }),
     args.slots,
   )
   const verdicts: Verdict[] = settled.map((res, i) => {

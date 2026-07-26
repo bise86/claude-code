@@ -341,7 +341,12 @@ async function roundtableWithInfraRetry(args: {
   roles: RoleBinding[]
   round: number
   system: string
-  buildPrompt: (tag: string) => string
+  /**
+   * Per-SEAT prompt builder. The seat argument is what lets a task role carry its own brief
+   * into the model call — see runRoundtable.prompt for why a single shared string made role
+   * definitions unreachable.
+   */
+  buildPrompt: (tag: string, seat: RoleBinding | null) => string
   ctx: PipelineCtx
   /** Where the reviewers should read from — the node's worktree when it is isolated. */
   cwd?: string
@@ -356,7 +361,7 @@ async function roundtableWithInfraRetry(args: {
     const tag = answerTag(ANSWER_TAGS.verdict)
     rec = await runRoundtable({
       phase: args.phase, node: args.node, roles: args.roles, round: args.round,
-      system: args.system, prompt: args.buildPrompt(tag),
+      system: args.system, prompt: (seat: RoleBinding | null) => args.buildPrompt(tag, seat),
       runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
       onChunk: args.ctx.onChunk ? t => args.ctx.onChunk!(args.node.id, t) : undefined,
       slots: args.ctx.slots,
