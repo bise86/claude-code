@@ -366,9 +366,12 @@ describe('名册可编辑 (spec §2 第一关)', () => {
     let r = toggleRole(empty() as never, 'observer', 'w1')
     r = toggleRole(r, 'observer', 'w2')
     expect(r.observer.map(x => x.roleName)).toEqual(['w2'])
+    // plan 不在此列:它走顺序精化(第一位起草,后面每一位在前一稿上修订),多员工是
+    // 支持的形态。这条断言曾经写的是 ['a2'] —— 那是关口和流水线漂移出来的 bug:
+    // 用户连点两个方案员工,第二个把第一个顶掉且毫无提示。
     let p = toggleRole(empty() as never, 'plan', 'a1')
     p = toggleRole(p, 'plan', 'a2')
-    expect(p.plan.map(x => x.roleName)).toEqual(['a2'])
+    expect(p.plan.map(x => x.roleName)).toEqual(['a1', 'a2'])
     let e = toggleRole(empty() as never, 'execute', 'c1')
     e = toggleRole(e, 'execute', 'c2')
     expect(e.execute.map(x => x.roleName)).toEqual(['c2'])
@@ -385,8 +388,10 @@ describe('名册可编辑 (spec §2 第一关)', () => {
 
   it('单座位阶段的行上写明它是单选', () => {
     const lines = rosterEditorLines(empty() as never, ['a'], 0, 0)
-    expect(lines[0]).toContain('(单选)')  // 方案
-    expect(lines[1]).not.toContain('(单选)') // 评审
+    expect(lines[0]).not.toContain('(单选)') // 方案 —— 顺序精化,可多员工
+    expect(lines[1]).not.toContain('(单选)') // 评审 —— 圆桌
+    expect(lines[2]).toContain('(单选)')     // 执行 —— 物理约束,只能一个
+    expect(lines[4]).toContain('(单选)')     // 观察 —— node.score 每维一条记录
   })
 
   it('toggleRole 记住模型,否则只读名册会掉回裸名字', () => {
@@ -661,13 +666,13 @@ describe('关口编辑器与角色席位', () => {
 
   it('单席位阶段已被角色定义占满 → 编辑器改不动,名册原样返回', () => {
     // 硬加一席只会让名册多一个永远不跑的名字(pipeline 取第 [0] 席)。
-    const roster = R({ plan: [{ roleName: 'opus-架构', roleTag: '主设计' }] })
-    expect(toggleRole(roster, 'plan', 'ds-安全')).toBe(roster)
+    const roster = R({ execute: [{ roleName: 'opus-架构', roleTag: '写手' }] })
+    expect(toggleRole(roster, 'execute', 'ds-安全')).toBe(roster)
   })
 
   it('没有角色席位时单席位阶段照旧是替换', () => {
-    const roster = R({ plan: [{ roleName: 'opus-架构' }] })
-    expect(toggleRole(roster, 'plan', 'ds-安全').plan).toEqual([{ roleName: 'ds-安全' }])
+    const roster = R({ execute: [{ roleName: 'opus-架构' }] })
+    expect(toggleRole(roster, 'execute', 'ds-安全').execute).toEqual([{ roleName: 'ds-安全' }])
   })
 
   it('编辑器行把角色定义排的席位显示出来', () => {

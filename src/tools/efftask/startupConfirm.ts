@@ -1,4 +1,5 @@
 import { DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES } from './types.js'
+import { allowsMultipleSeats } from './roleDefs.js'
 import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
 
 export interface StartupDecision {
@@ -51,7 +52,16 @@ export function clip(s: string, max = 80): string {
  * roster that never get called — the gate must show who actually runs". The editor has to
  * honour the same invariant or it re-opens exactly that hole by hand.
  */
-export const MULTI_ROLE_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['review', 'accept'])
+/**
+ * 关口能不能给这个阶段追加席位 —— 从 roleDefs 的**唯一**那份规则推导,不再自己维护。
+ *
+ * 自己维护的那份和 roleDefs 漂移过:plan 支持顺序精化多员工(SINGLE_SEAT_REASON 明确
+ * 不含它),却不在这个集合里,于是 toggleRole 走「替换」分支 —— 用户在关口上连点两个
+ * 方案员工,第二个把第一个顶掉,而且一声不响。实测:toggle('plan','a') 再
+ * toggle('plan','b') 得到 [{roleName:'b'}]。
+ */
+export const MULTI_ROLE_PHASES: ReadonlySet<PhaseName> =
+  new Set<PhaseName>(PHASE_NAMES.filter(allowsMultipleSeats))
 
 /**
  * Toggle one role on a phase, returning a NEW roster.

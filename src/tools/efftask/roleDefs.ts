@@ -33,8 +33,31 @@ const PHASE_LABEL: Record<PhaseName, string> = {
   plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
 }
 
-/** 只有 review / accept 会开圆桌;其余阶段只跑一个 agent(见 pipeline.firstRole)。 */
-export const MULTI_SEAT_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['review', 'accept'])
+/**
+ * 每个阶段能坐几个人、以什么方式坐 —— **唯一的一份**。
+ *
+ * 此前这条规则散在四处(本文件的 MULTI_SEAT_PHASES 与 SINGLE_SEAT_REASON、
+ * startupConfirm 的 MULTI_ROLE_PHASES、parseDirectives 的逐阶段裁剪),而且它们**已经
+ * 漂移了**:plan 支持顺序精化多员工,却不在任何一个 multi 集合里,于是关口的 toggleRole
+ * 走「替换」分支 —— 用户连点两个方案员工,第二个把第一个顶掉,一声不响。
+ * (这个仓库已经为两个 ACTIVE 列表漂移付过一次代价:38% 的阶段耗时无处可归。)
+ *
+ * - roundtable:并行独立出裁决,再按全票/法定人数合成(review / accept)
+ * - sequential:顺序精化,一份稿子从第一位传到最后一位(plan)
+ * - single:只跑一个 agent,多出来的席位永远不会被派发(execute / observer)
+ */
+export const PHASE_SEATING: Record<PhaseName, 'roundtable' | 'sequential' | 'single'> = {
+  plan: 'sequential', review: 'roundtable', execute: 'single', accept: 'roundtable', observer: 'single',
+}
+
+/** 这个阶段允许多个席位吗?圆桌与顺序精化都允许,只有 single 不允许。 */
+export function allowsMultipleSeats(p: PhaseName): boolean {
+  return PHASE_SEATING[p] !== 'single'
+}
+
+/** 只有这些阶段会开圆桌(并行独立裁决 + 合成)。 */
+export const MULTI_SEAT_PHASES: ReadonlySet<PhaseName> =
+  new Set<PhaseName>((Object.keys(PHASE_SEATING) as PhaseName[]).filter(p => PHASE_SEATING[p] === 'roundtable'))
 
 /**
  * 单席位阶段为什么只能有一席 —— 每条都是物理约束,不是策略。
@@ -327,10 +350,10 @@ export function applyRoleDefsToPhases(
   const notices: string[] = []
   const out = {} as Record<PhaseName, RoleBinding[]>
   for (const p of PHASE_NAMES) {
-    const merged = mergeSeats(phaseRoles[p] ?? [], seatsFor(defs, p), PHASE_LABEL[p], !MULTI_SEAT_PHASES.has(p))
+    const merged = mergeSeats(phaseRoles[p] ?? [], seatsFor(defs, p), PHASE_LABEL[p], !allowsMultipleSeats(p))
     notices.push(...merged.notices)
     let seats = merged.seats
-    const reason = SINGLE_SEAT_REASON[p]
+    const reason = allowsMultipleSeats(p) ? undefined : SINGLE_SEAT_REASON[p]
     // 裁剪放在合并**之后**:先合并再截断。反过来的话,按名字直接指定的员工会把角色
     // 席位挤掉,用户看到的是自己配的角色凭空消失,而且一声不响。
     if (reason && seats.length > 1) {
