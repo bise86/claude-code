@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import {
   EffTaskTask, effTaskDescription, finishEffTaskRun, isEffTaskTask,
-  registerEffTaskRun, updateEffTaskRun, type EffTaskTaskState,
+  markEffTaskPendingHandoff, registerEffTaskRun, updateEffTaskRun, type EffTaskTaskState,
 } from './EffTaskTask.js'
 import { isBackgroundTask } from '../types.js'
 import { getTaskByType } from '../../tasks.js'
@@ -146,5 +146,52 @@ describe('高效任务的后台任务条目 (spec §10)', () => {
     // Without this the type exists, renders, and cannot be stopped: stopTask throws
     // 'Unsupported task type' and the panel's `x` does nothing.
     expect(getTaskByType('efftask')).toBe(EffTaskTask)
+  })
+})
+
+describe('待收口要出现在 /tasks 那一行上', () => {
+  const done3 = { accepted: 3, blocked: 0, pending: 0, total: 3 }
+
+  it('描述里带上「待收口」和回来的命令', () => {
+    // 没有这句,用户没有任何理由回到这个 run —— 而集成分支就一直挂在那。
+    const d = effTaskDescription('003', done3, true)
+    expect(d).toContain('待收口')
+    expect(d).toContain('/et --resume 003')
+  })
+
+  it('没有待收口时一个字不多 —— 老行为不变', () => {
+    expect(effTaskDescription('003', done3)).toBe(effTaskDescription('003', done3, false))
+    expect(effTaskDescription('003', done3)).not.toContain('待收口')
+  })
+
+  const registered = () => {
+    const st = store()
+    const id = registerEffTaskRun(st.setAppState, {
+      runId: '003', runDir: '/d', counts: counts({ accepted: 3, pending: 0 }),
+      abortController: new AbortController(),
+    })
+    return { st, id }
+  }
+
+  it('**不**做成非终态:进程真的结束了,显示成运行中会多出一条杀不掉的活任务', () => {
+    // 用户选的是「持久化待收口 + 立刻还终端」。x 走 kill() 去 abort 一个早就没人监听的
+    // controller —— 那是另一种撒谎。
+    const { st, id } = registered()
+    finishEffTaskRun(id, st.setAppState, { status: 'completed' }, false, true)
+    expect(st.task(id).status).toBe('completed')
+    expect(st.task(id).description).toContain('待收口')
+    expect(isBackgroundTask(st.task(id))).toBe(false)
+  })
+
+  it('markEffTaskPendingHandoff 只改描述,不动已经终态的 status', () => {
+    // 异常路径上 settle() 在 catch 里跑、reclaim 在 finally 里,顺序正好反过来 ——
+    // 那条路上 /tasks 会显示一个跑完的 run,而没有任何地方告诉用户还有一条分支等着他。
+    const { st, id } = registered()
+    finishEffTaskRun(id, st.setAppState, { status: 'blocked', reason: '连续返工超限' })
+    expect(st.task(id).description).not.toContain('待收口')
+    markEffTaskPendingHandoff(id, st.setAppState)
+    expect(st.task(id).status).toBe('failed')
+    expect(st.task(id).reason).toBe('连续返工超限')
+    expect(st.task(id).description).toContain('待收口')
   })
 })

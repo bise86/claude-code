@@ -7,7 +7,7 @@ import { logError } from '../../utils/log.js'
 import type { WorktreePool } from '../../tools/efftask/worktreePool.js'
 import type { HandoffSummary } from '../../tools/efftask/startupConfirm.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
-import { finishEffTaskRun, registerEffTaskRun, updateEffTaskRun } from '../../tasks/EffTaskTask/EffTaskTask.js'
+import { finishEffTaskRun, markEffTaskPendingHandoff, registerEffTaskRun, updateEffTaskRun } from '../../tasks/EffTaskTask/EffTaskTask.js'
 import type { SetAppState } from '../../Task.js'
 
 export type Outcome = { status: 'completed' | 'blocked'; reason?: string }
@@ -108,7 +108,8 @@ export async function runOrchestrator(
     if (!taskId || !entry) return
     // The SIGNAL decides whether this was a user stop — not the reason text, which can be the
     // literal '已中断' recovered from a previous session's node.md while nobody touched this run.
-    try { finishEffTaskRun(taskId, entry.setAppState, o, args.signal.aborted) } catch { /* panel only */ }
+    // settle 可能在 reclaim **之前**跑(异常路径),所以这里读的是「此刻 config 上有没有」。
+    try { finishEffTaskRun(taskId, entry.setAppState, o, args.signal.aborted, !!args.config.pendingHandoff) } catch { /* panel only */ }
   }
   /**
    * 收口 (spec §8): reclaim the worktrees and tell the user where their work landed.
@@ -211,6 +212,11 @@ export async function runOrchestrator(
     // 于是 pendingHandoff 被设进 config、一次也没写出去,集成分支再没人处置。
     // 幂等:happy path 已经写过时这只是再写一遍同样的内容。
     if (args.config.pendingHandoff) await queueManifest(liveNodes, pendingOutcome)
+    // 面板同理:异常路径上 settle() 已经在 catch 里跑过了(那时 reclaim 还没发生),
+    // 所以「待收口」得在这里补一次。终态任务只改描述,不动 status。
+    if (args.config.pendingHandoff && taskId && entry) {
+      try { markEffTaskPendingHandoff(taskId, entry.setAppState) } catch { /* panel only */ }
+    }
     setPhase('done') // the done view is ALWAYS reached
   }
 }

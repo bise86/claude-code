@@ -50,9 +50,22 @@ export function isEffTaskTask(task: unknown): task is EffTaskTaskState {
 }
 
 /** One line for the list and the pill: what this run is doing right now. */
-export function effTaskDescription(runId: string, counts: EffTaskCounts): string {
+export function effTaskDescription(
+  runId: string, counts: EffTaskCounts,
+  /**
+   * run 跑完了,但集成分支还等着用户决定怎么处置(spec §8)。
+   *
+   * **不**做成非终态。用户选的是「持久化待收口 + 立刻还终端」,所以这个 run 的进程真的
+   * 已经结束了 —— 把它显示成「运行中」会让 `/tasks` 里出现一条杀不掉的活任务(`x` 走
+   * kill() 去 abort 一个早就没人监听的 controller),那是另一种撒谎。
+   *
+   * 诚实的做法:任务是终态,但那一行要说出「还有一件事等你」以及去哪儿做。
+   */
+  pendingHandoff?: boolean,
+): string {
   const parts = [`已完成 ${counts.accepted}/${counts.total}`]
   if (counts.blocked > 0) parts.push(`阻断 ${counts.blocked}`)
+  if (pendingHandoff) parts.push(`待收口(/et --resume ${runId})`)
   return `高效任务 ${runId} · ${parts.join(' · ')}`
 }
 
@@ -115,6 +128,8 @@ export function finishEffTaskRun(
    * reason as the whole run's. Measured: signal.aborted === false and the panel said 已中断.
    */
   cancelled = false,
+  /** 还有一条集成分支等着处置 —— 那一行必须说出来,否则用户没有任何理由回来。 */
+  pendingHandoff = false,
 ): void {
   updateTaskState<EffTaskTaskState>(taskId, setAppState, task => {
     // A killed run must stay killed: `kill` already aborted it, and the abort then surfaces
@@ -129,6 +144,7 @@ export function finishEffTaskRun(
     return {
       ...task,
       status: outcome.status === 'completed' ? 'completed' : cancelled ? 'killed' : 'failed',
+      description: effTaskDescription(task.runId, task.counts, pendingHandoff),
       reason: outcome.reason,
       endTime: Date.now(),
       // The run's own transcript line IS the user-facing notification (see efftask.tsx's
@@ -138,6 +154,22 @@ export function finishEffTaskRun(
       abortController: undefined,
     }
   })
+}
+
+/**
+ * 事后给一条**已经终态**的任务补上「待收口」。
+ *
+ * 需要它是因为时序:happy path 上 settle() 在 reclaim 之后跑,能看到 pendingHandoff;
+ * 异常路径上 settle() 在 catch 里、reclaim 在 finally 里,顺序正好反过来 —— 那条路上
+ * /tasks 会显示一个跑完的 run,而没有任何地方告诉用户还有一条分支等着他。
+ *
+ * 只改描述,不动 status:run 的进程确实结束了。
+ */
+export function markEffTaskPendingHandoff(taskId: string, setAppState: SetAppState): void {
+  updateTaskState<EffTaskTaskState>(taskId, setAppState, task => ({
+    ...task,
+    description: effTaskDescription(task.runId, task.counts, true),
+  }))
 }
 
 export const EffTaskTask: Task = {
