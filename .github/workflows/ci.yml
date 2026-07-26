@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # 钉死版本。这个仓库对 bun 的行为是有依赖的(打包器、vendored ink 的渲染时序、
+          # `import type` 被擦除因而没有类型检查),浮动版本会让 CI 和本地在不同的地基上跑。
+          bun-version: 1.3.14
+
+      - name: 安装依赖
+        # --frozen-lockfile:CI 不该悄悄改锁文件。锁文件对不上就红,而不是自己解决。
+        run: bun install --frozen-lockfile
+
+      - name: 跑测试
+        # `bun test` 是这个仓库**唯一**的门禁 —— 没有 typecheck(`import type` 被 bun 擦除),
+        # 所以一个类型层面的错误只有在跑起来时才会暴露。
+        run: bun test
+
+      - name: 打包能过
+        # 单独一步:打包会因为「源码里能跑、bundler 静态解析不了」的可选导入而失败,
+        # 而那种失败在 `bun test` 里完全看不见。
+        run: bun run build

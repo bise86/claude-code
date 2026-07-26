@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 建 Release 需要
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - run: bun install --frozen-lockfile
+
+      # 发布前照样跑门禁。打了 tag 不代表那个 commit 是绿的。
+      - run: bun test
+
+      - name: 打包
+        run: bun run build
+
+      - name: 组装可运行的发行包
+        # **不是单文件二进制。** 见 scripts/build.ts 顶部:bun 1.3.14 的打包器会打散
+        # zod v4 的循环 re-export(实测 `--help` 直接 ReferenceError),所以 zod 必须留在
+        # 外部,而 `--compile` 的 external 模块不会被嵌进单文件 —— 那条路现在走不通。
+        #
+        # 发行包 = 打包好的 cli.js + 它运行时真正需要的那几个外部模块。用户解压即用,
+        # 只需要机器上有 bun。
+        run: |
+          set -euo pipefail
+          PKG=claude-haha-${GITHUB_REF_NAME:-dev}
+          mkdir -p "$PKG"
+          cp dist/cli.js "$PKG"/
+          cp -r node_modules/zod "$PKG"/node_modules_zod_tmp 2>/dev/null || true
+          mkdir -p "$PKG/node_modules"
+          mv "$PKG/node_modules_zod_tmp" "$PKG/node_modules/zod"
+          cat > "$PKG/claude-haha" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          exec bun "$DIR/cli.js" "$@"
+          SH
+          chmod +x "$PKG/claude-haha"
+          tar czf "$PKG.tar.gz" "$PKG"
+          echo "PKG=$PKG" >> "$GITHUB_ENV"
+
+      - name: 冒烟测试 —— 发出去的东西必须能跑
+        # 不测就发,等于把「构建成功」当成「能用」。这个仓库刚刚才踩过:打包报告成功,
+        # 而产物一跑 `--help` 就 ReferenceError。
+        run: |
+          set -euo pipefail
+          tar xzf "$PKG.tar.gz" -C /tmp
+          /tmp/"$PKG"/claude-haha --version
+          /tmp/"$PKG"/claude-haha --help > /dev/null
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.PKG }}.tar.gz
+          generate_release_notes: true
