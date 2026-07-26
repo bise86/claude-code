@@ -84,6 +84,15 @@ export function NodeDetail(props: {
   output?: string[]
   /** How many lines the ring buffer dropped. Shown, so the pane cannot imply it holds all of it. */
   outputDropped?: number
+  /**
+   * Resolves a dependency id to its node, so 依赖 renders as titles and statuses.
+   *
+   * spec §10.2 lists 依赖 among what this pane must show; it rendered `· 依赖 2 个`. A count
+   * answers neither question the reader actually has — WHICH tasks, and are they finished —
+   * and this pane is exactly where someone goes to find out why a node has been sitting at
+   * READY. Optional, so the component still renders standalone.
+   */
+  resolveNode?: (id: string) => TaskNode | undefined
 }): React.ReactElement {
   const n = props.node
   // Per-section clipping was not enough: eight sections at 12 lines each is ~127 lines in
@@ -106,9 +115,25 @@ export function NodeDetail(props: {
       <Text bold color={COLOR[ui]}>{n.title}</Text>
       <Text dimColor>
         {n.id} · {n.status} · {props.elapsed}
-        {n.deps.length > 0 ? ` · 依赖 ${n.deps.length} 个` : ''}
+        {/* 依赖 used to be a bare count here. It now has its own section listing each one by
+            title and status, so a count on this line is duplication — and worse, it made the
+            section's own title untestable: an assertion for 「依赖」 matched this line whether
+            or not the section rendered at all. 子任务 keeps its count because children are
+            not listed anywhere in this pane. */}
         {n.childIds.length > 0 ? ` · 子任务 ${n.childIds.length} 个` : ''}
       </Text>
+      {/* 依赖 (spec §10.2). Missing deps are REPORTED, not hidden: a dangling id is why the
+          node is blocked, and silently shrinking the list would hide the cause. */}
+      <Section
+        maxLines={perSection}
+        title="依赖"
+        body={n.deps
+          .map(id => {
+            const d = props.resolveNode?.(id)
+            return d ? `${d.title}(${d.status})` : `${id}(节点缺失)`
+          })
+          .join('\n')}
+      />
       <Section maxLines={perSection} title="目标" body={n.goal} />
       <Section maxLines={perSection} title="完整方案" body={n.plan.solution} />
       <Section maxLines={perSection} title="重点" body={n.plan.keyPoints} />

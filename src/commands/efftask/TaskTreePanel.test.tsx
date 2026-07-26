@@ -487,6 +487,49 @@ describe('实时输出面板不能只交代一半的截断', () => {
     return f
   }
 
+  it('spec §10.2:依赖显示成标题和状态,不是"依赖 2 个"', async () => {
+    // 计数回答不了读的人真正的两个问题 —— 是**哪些**任务、它们跑完了没有 —— 而这个面板
+    // 正是有人来查"这个节点为什么一直停在 READY"的地方。
+    const dep = mk({ id: 'root/01-a', title: '建表', status: 'ACCEPTED' })
+    const f = await mountDetail({
+      node: mk({ id: 'root/02-b', title: '写接口', status: 'READY', deps: ['root/01-a', 'root/09-gone'] }),
+      resolveNode: (id: string) => (id === dep.id ? dep : undefined),
+    })
+    expect(f).toContain('依赖') // 小节标题本身 —— 少了它,下面的内容就没有归属
+    expect(f).toContain('建表')
+    expect(f).toContain('ACCEPTED')
+    // 缺失的依赖要报出来,不能悄悄缩短列表 —— 那恰恰是这个节点推不动的原因。
+    expect(f).toContain('节点缺失')
+  })
+
+  it('没有依赖时不渲染空的「依赖」小节', async () => {
+    const f = await mountDetail({ node: mk({ id: 'n', deps: [] }) })
+    expect(f).not.toContain('依赖')
+  })
+
+  it('面板真的把整棵树交给了详情 —— 否则依赖只能显示成 id', async () => {
+    // 上面那条把 resolveNode 直接喂给 NodeDetail,绕过了 TaskTreePanel 这一跳。而这个仓库
+    // 剪断过的正是这种线(chunks 传给了视图却没往下转、pool reader 同理)。这条从面板按键
+    // 进详情,把那一跳也钉住。
+    const a = mk({ id: 'root', title: '根任务', status: 'WAITING_CHILDREN', kind: 'decompose', childIds: ['root/01-a'] })
+    const dep = mk({ id: 'root/01-a', title: '建表', parentId: 'root', depth: 1, status: 'ACCEPTED' })
+    const b = mk({ id: 'root/02-b', title: '写接口', parentId: 'root', depth: 1, status: 'READY', deps: ['root/01-a'] })
+    a.childIds = ['root/01-a', 'root/02-b']
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel, { nodes: [a, dep, b], runId: '003', interactive: true } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(DOWN); await tick()  // → 建表
+    t.stdin.press(DOWN); await tick()  // → 写接口
+    t.reset()
+    t.stdin.press('\r'); await tick()  // 回车进详情
+    const f = t.lastFrame()
+    expect(f).toContain('建表(ACCEPTED)') // 标题+状态,只有拿到整棵树才渲染得出来
+    app.unmount()
+  })
+
   it('隐藏的行数把"滚出缓冲"和"没渲染"两部分都算进去', async () => {
     // Measured before: the buffer dropped 300 and the pane then rendered only its last 8, so a
     // user was told 300 were hidden while 492 were. Same "starts in the middle but looks

@@ -194,6 +194,9 @@ export function TaskTreePanel(props: {
         // flight, and mirroring it into state would re-render the whole tree on each one.
         output={props.chunks?.lines(detail.id)}
         outputDropped={props.chunks?.dropped(detail.id)}
+        // 依赖 (spec §10.2) needs the whole tree to turn ids into titles and statuses; the
+        // detail pane only ever holds one node.
+        resolveNode={id => props.nodes.find(x => x.id === id)}
       />
     )
   }
