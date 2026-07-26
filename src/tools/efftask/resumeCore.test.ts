@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { depCycleMembers, readRunManifest, validateLoadedNodes } from './resumeCore.js'
+import { depCycleMembers, LEGAL_STATUS, readRunManifest, validateLoadedNodes } from './resumeCore.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, type TaskNode } from './types.js'
 import { reseatTransientNodes } from './reseat.js'
 
@@ -196,7 +196,7 @@ describe('validateLoadedNodes guarantees the invariant run() asserts', () => {
 import { readRunManifest } from './resumeCore.js'
 import { writeRunManifest } from './persistence.js'
 import { roleBriefFor, type RoleDef } from './roleDefs.js'
-import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles } from './types.js'
+import { createNode, DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, NODE_STATUSES } from './types.js'
 import type { EffTaskConfig } from './types.js'
 import type { FsLike } from './persistence.js'
 
@@ -793,5 +793,37 @@ describe('待收口状态必须能从 run.md 读回', () => {
     const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': '---\ngoalPrompt: g\n---\n\n' }), '/r')
     expect(config.pendingHandoff).toBeUndefined()
     expect(degraded.filter(d => d.includes('收口'))).toEqual([])
+  })
+})
+
+describe('LEGAL_STATUS 必须覆盖每一个状态,否则节点会被永久判死', () => {
+  // 这份集合曾经是和 NodeStatus 类型完全脱钩的硬编码字面量。没有 typecheck,漏掉一个
+  // 新状态不会有任何东西报错 —— 而 validateLoadedNodes 对不认识的状态调 block(),
+  // block() 把 interrupted / capBlocked / mergeConflict 三个复活开关全部清零。
+  // 后果:进程在该状态期间被杀 → 下次 --resume 节点永久死亡,--retry-blocked 也救不回。
+  it('每个 NodeStatus 都是合法状态', () => {
+    for (const st of NODE_STATUSES) {
+      expect(`${st}:${LEGAL_STATUS.has(st)}`).toBe(`${st}:true`)
+    }
+  })
+
+  it('落盘在 VERIFYING 的节点能被恢复,而不是被判死', () => {
+    const now = '2026-07-26T00:00:00Z'
+    const n = createNode({ id: 'n1', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now })
+    n.status = 'VERIFYING'
+    n.interrupted = true
+    const { nodes, repairs } = validateLoadedNodes([n], { goal: 'g', phaseRoles: emptyPhaseRoles(), now })
+    expect(repairs.join('\n')).not.toContain('非法状态')
+    expect(nodes[0].status).toBe('VERIFYING')
+    // 复活开关没被清掉 —— 这是 --retry-blocked / reseat 能把它捞回来的前提。
+    expect(nodes[0].interrupted).toBe(true)
+  })
+
+  it('真正的非法状态仍然被拦住', () => {
+    const now = '2026-07-26T00:00:00Z'
+    const n = createNode({ id: 'n1', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now })
+    n.status = 'TOTALLY_MADE_UP' as never
+    const { repairs } = validateLoadedNodes([n], { goal: 'g', phaseRoles: emptyPhaseRoles(), now })
+    expect(repairs.join('\n')).toContain('非法状态')
   })
 })
