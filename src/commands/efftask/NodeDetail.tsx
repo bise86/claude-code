@@ -90,7 +90,12 @@ function iterationBody(n: TaskNode): string {
 export function phaseTimeBody(n: TaskNode): string {
   const LABEL: Partial<Record<string, string>> = {
     PLANNING: '方案', PLAN_REVIEW: '方案评审', EXECUTING: '执行', ACCEPTANCE: '验收',
-    REWORK: '返工', INTEGRATION_ACCEPT: '集成验收', SCORING: '观察评分', MERGE: '合并',
+    // NOT 「返工」. The REWORK window holds exactly one thing — `refreshFromIntegration`,
+    // pulling sibling merges into this node's worktree — and then commits EXECUTING; the
+    // actual rework effort is charged to that next EXECUTING round. A row reading 返工 45s
+    // directly beneath 迭代次数 · 验收返工 2 reads as "reworking took 45 seconds", and the
+    // two mislead each other.
+    REWORK: '返工前同步集成分支', INTEGRATION_ACCEPT: '集成验收', SCORING: '观察评分', MERGE: '合并',
   }
   return Object.entries(n.phaseMs ?? {})
     .filter(([, ms]) => Number.isFinite(ms) && ms >= 1000)

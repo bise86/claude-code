@@ -741,6 +741,16 @@ describe('spec §10.2:详情页要显示各阶段耗时', () => {
     expect(f).not.toContain('方案评审')
   })
 
+  it('REWORK 那一行不能叫"返工" —— 它量的不是返工', async () => {
+    // REWORK 的窗口里只有一件事:refreshFromIntegration,把兄弟节点已合入的改动拉进本节点
+    // 的 worktree,然后就 commit(EXECUTING) 了。真正的返工工作量记在下一轮 EXECUTING 名下。
+    // 一行「返工 45s」紧挨着「迭代次数 · 验收返工 2」印着,两个数字会互相误导。
+    const f = await mountDetail({ node: mk({ id: 'n', phaseMs: { REWORK: 45_000 } }) })
+    expect(f).toContain('45s')
+    expect(f).toContain('同步集成分支')
+    expect(f).not.toMatch(/[^前]返工 45s/)
+  })
+
   it('还没跑过的节点不渲染这一段', async () => {
     const f = await mountDetail({ node: mk({ id: 'n', title: '刚建好' }) })
     expect(f).not.toContain('各阶段耗时')

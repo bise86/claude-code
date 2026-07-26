@@ -265,6 +265,13 @@ export function reseatTransientNodes(
      * — 「耗时将从恢复后的首个活动阶段重新计时」.
      */
     n.startedAt = undefined
+    // NOTE the matching cost, recorded rather than glossed: the time this node spent in the
+    // phase it was killed in is DISCARDED, not banked. `phaseMs` accumulates inside commit()
+    // on the way out of a status, and a killed node never takes that exit — reseat writes
+    // `status` directly. So a node that ran 15 minutes before the crash comes back with those
+    // 15 minutes missing from 各阶段耗时. That is the deliberate side of the same trade as
+    // startedAt above: banking it would need a timestamp that survives the crash, and such a
+    // timestamp is exactly what would let downtime be counted as work.
     // Reopen the chain above too, or this seat is unreachable.
     reopenAncestors(n)
     // …and anything that was only waiting on this node. Same reason: the block was never
