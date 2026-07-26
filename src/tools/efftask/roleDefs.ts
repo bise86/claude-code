@@ -5,7 +5,7 @@
 // 员工 = settings.json 的 `roles[]` / `.claude/agents/*.md` / 内置 agent —— 任何可派发的
 // agentType,带自己的模型、apiUrl、工具集。角色 = 「架构师」「安全」,在某个阶段做某件事,
 // 由零个或多个员工担当。多对多:一个员工可以出现在多个角色里,一个角色可以有多个员工。
-import { PHASE_NAMES } from './types.js'
+import { PHASE_NAMES, PHASE_LABEL } from './types.js'
 import { DEFAULT_MAX_SEATS_PER_PHASE, MAIN_STAFF } from './types.js'
 import type { PhaseName, RoleBinding } from './types.js'
 
@@ -29,9 +29,6 @@ export interface RoleDef {
 }
 
 const PHASE_SET = new Set<string>(PHASE_NAMES)
-const PHASE_LABEL: Record<PhaseName, string> = {
-  plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
-}
 
 /**
  * 每个阶段能坐几个人、以什么方式坐 —— **唯一的一份**。

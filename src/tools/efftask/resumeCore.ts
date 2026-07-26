@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
+import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
@@ -8,10 +8,15 @@ import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from
 // Exported because they ARE the post-condition: whatever this module hands back, every reader
 // downstream may assume is one of these. hostileDisk.test.ts asserts against them rather than
 // keeping a second copy that could drift the day a status is added.
-export const LEGAL_STATUS = new Set<string>([
-  'CREATED', 'PLANNING', 'PLAN_REVIEW', 'READY', 'EXECUTING', 'EXECUTED', 'ACCEPTANCE',
-  'REWORK', 'WAITING_CHILDREN', 'INTEGRATION_ACCEPT', 'SCORING', 'MERGE', 'ACCEPTED', 'BLOCKED',
-])
+/**
+ * 这份集合曾经和 `NodeStatus` 类型**完全脱钩**,而这个仓库没有 typecheck —— 类型里加了
+ * 新状态却漏了这里,不会有任何东西报错。后果实测过:进程在该状态期间被杀 → 落盘 →
+ * 下次恢复走 validateLoadedNodes 的 block(),而它把 interrupted / capBlocked /
+ * mergeConflict 三个复活开关全部清零 → **节点永久死亡,连 --retry-blocked 都救不回**。
+ *
+ * 所以改成由 NODE_STATUSES 派生,不再手写字面量。
+ */
+export const LEGAL_STATUS = new Set<string>(NODE_STATUSES)
 export const LEGAL_KIND = new Set<string>(['decompose', 'executable', 'unknown'])
 
 const strArray = (v: unknown): string[] =>

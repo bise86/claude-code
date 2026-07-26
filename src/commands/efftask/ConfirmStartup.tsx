@@ -51,7 +51,9 @@ export function ConfirmStartup(props: {
   // spec §2 第一关:"名册可编辑后确认". It was rendered read-only, so a user who wanted a
   // different panel had to cancel, reword the prompt and start over.
   const [roster, setRoster, rosterRef] = useLiveState<Record<PhaseName, RoleBinding[]>>(
-    Object.fromEntries(PHASE_NAMES.map(p => [p, [...props.config.phaseRoles[p]]])) as Record<PhaseName, RoleBinding[]>,
+    // ?? []:老 run.md 或早于本版的配置缺新增的环节键,少一个就在这里抛 TypeError
+    // ——实测整个关口渲染成一屏红色堆栈。
+    Object.fromEntries(PHASE_NAMES.map(p => [p, [...(props.config.phaseRoles[p] ?? [])]])) as Record<PhaseName, RoleBinding[]>,
   )
   const [editing, setEditing, editingRef] = useLiveState(false)
   const [phaseIdx, setPhaseIdx, phaseRef] = useLiveState(0)

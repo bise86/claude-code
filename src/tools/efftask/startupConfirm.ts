@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES } from './types.js'
+import { DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES, PHASE_LABEL } from './types.js'
 import { allowsMultipleSeats } from './roleDefs.js'
 import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
 
@@ -27,9 +27,6 @@ export interface StartupDecision {
   viewOnly?: boolean
 }
 
-const PHASE_LABEL: Record<PhaseName, string> = {
-  plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
-}
 
 // The ACTUAL roster (spec gate-1 角色名册): each phase → its bound role names, or 主模型
 // when the phase has no bindings. Shared by the terminal card AND the Feishu card so the
@@ -212,7 +209,7 @@ export function rosterLines(config: EffTaskConfig): string[] {
     }
     // Show the bound model too: this gate exists to let the user see exactly who is on the
     // panel, and "coder" alone hides which model that role actually runs on.
-    const names = config.phaseRoles[p].map(r => {
+    const names = (config.phaseRoles[p] ?? []).map(r => {
       // 「主模型兼任」的席位 roleName 是空串,直接插值会渲染出一个光秃秃的 `(模型名)`。
       // 而带角色标签的席位要把角色说出来 —— 用户配的是「架构师」,只看到员工名的话,
       // 关口就没回答「有多少角色、承担什么」里的前半个问题。
@@ -457,7 +454,7 @@ export function capsLine(config: EffTaskConfig): string {
  */
 export function costLine(config: EffTaskConfig): string {
   const c = config.caps
-  const seats = (p: PhaseName) => config.phaseRoles[p].length
+  const seats = (p: PhaseName) => (config.phaseRoles[p] ?? []).length
   const It = Math.max(1, c.maxIterations)
   // 方案阶段是**顺序精化**:每一席都是一次串行调用(runPlanRefinement)。写死 1 的话,
   // 配 4 个方案员工在关口上是免费的 —— 而那正是精化要用户知道的代价。
@@ -589,7 +586,7 @@ export function applyRosterToNodes(
     // Fresh copies per node: sharing one array would make a later per-node override (§4.2)
     // silently edit every other node's roster.
     n.phaseRoles = Object.fromEntries(
-      PHASE_NAMES.map(p => [p, phaseRoles[p].map(r => ({ ...r }))]),
+      PHASE_NAMES.map(p => [p, (phaseRoles[p] ?? []).map(r => ({ ...r }))]),
     ) as Record<PhaseName, RoleBinding[]>
     changed++
   }

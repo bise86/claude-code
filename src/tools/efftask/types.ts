@@ -2,8 +2,48 @@
 // 所以这条反向依赖必须是 `import type`,否则就成了真实的运行期循环。
 import type { RoleDef } from './roleDefs.js'
 
-export type PhaseName = 'plan' | 'review' | 'execute' | 'accept' | 'observer'
-export const PHASE_NAMES: PhaseName[] = ['plan', 'review', 'execute', 'accept', 'observer']
+/**
+ * 一个**环节**(用户词汇里的「过程」)—— 流水线上一个真实的派发点。
+ *
+ * 自由的是角色,固定的是环节:角色名、由谁担当、产出与作用都可以任意写,唯独「这个角色
+ * 挂在哪个环节上」不自由。环节是状态机的骨架,它决定这一席什么时候被调用、能不能拿到
+ * 写工具、恢复之后还在不在。自由的环节名会被 Object.fromEntries(PHASE_NAMES.map(…))
+ * 直接删掉,而 makeRunAgentFn 按 phase === 'execute' 发写工具 —— 那就是「配得进去、
+ * 永远不跑」。
+ *
+ * 这个列表**会随版本增长**(这一版就从 5 个长到了 7 个)。承认这点比假装它固定要诚实。
+ */
+export type PhaseName =
+  | 'plan' | 'review' | 'execute'
+  // 测试验证:真的把测试跑起来,而不是读执行者的自述。
+  | 'verify'
+  | 'accept'
+  // 集成提交:拆分型节点在子任务全部完成后的那一场裁决(INTEGRATION_ACCEPT)。
+  // 此前它和叶子验收共用 phaseRoles.accept —— 用户只配「验收」,他的验收角色会被
+  // 悄悄拿去跑集成验收,而规范刚告诉他这是两个不同的环节。
+  | 'integrate'
+  | 'observer'
+export const PHASE_NAMES: PhaseName[] =
+  ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer']
+
+/** 环节的中文名 —— 用户文档、关口、错误信息都用它。内部 phase 名不对用户暴露。 */
+export const PHASE_LABEL: Record<PhaseName, string> = {
+  plan: '分析', review: '质疑讨论', execute: '执行',
+  verify: '测试验证', accept: '验收', integrate: '集成提交', observer: '观察',
+}
+
+/**
+ * 用户可以写的环节名 → 内部 phase 名。
+ *
+ * 落盘的永远是内部 phase 名(见 resumeCore 的读回校验),中文只是**输入别名**,解析时
+ * 立刻归一。两边都当 canonical 会让 run.md 里出现两种写法,而读回那侧只认一种。
+ */
+export const STEP_ALIASES: Record<string, PhaseName> = {
+  ...Object.fromEntries(PHASE_NAMES.map(p => [p, p])),
+  ...Object.fromEntries(PHASE_NAMES.map(p => [PHASE_LABEL[p], p])),
+  // 常见的另一种说法,收下比让用户猜要好。
+  方案: 'plan', 评审: 'review', 打分: 'observer', 评分: 'observer', 集成验收: 'integrate',
+}
 
 export type NodeKind = 'decompose' | 'executable' | 'unknown'
 
@@ -27,7 +67,22 @@ export type NodeStatus =
   | 'CREATED' | 'PLANNING' | 'PLAN_REVIEW'
   | 'READY' | 'EXECUTING' | 'EXECUTED' | 'ACCEPTANCE' | 'REWORK'
   | 'WAITING_CHILDREN' | 'INTEGRATION_ACCEPT'
+  // VERIFYING:测试验证环节。只在配了该环节角色时出现,否则这一步整个不存在。
+  | 'VERIFYING'
   | 'SCORING' | 'MERGE' | 'ACCEPTED' | 'BLOCKED'
+
+/**
+ * 全部合法状态的**运行期**清单。
+ *
+ * resumeCore 的 LEGAL_STATUS 从它派生,不再手写一份字面量 —— 那份和 NodeStatus 类型脱钩,
+ * 而这个仓库没有 typecheck:漏掉一个新状态不会有任何东西报错,后果是节点在恢复时被
+ * 永久判死。同一处真相,两个消费者。
+ */
+export const NODE_STATUSES: NodeStatus[] = [
+  'CREATED', 'PLANNING', 'PLAN_REVIEW', 'READY', 'EXECUTING', 'EXECUTED', 'ACCEPTANCE',
+  'REWORK', 'WAITING_CHILDREN', 'INTEGRATION_ACCEPT', 'VERIFYING', 'SCORING', 'MERGE',
+  'ACCEPTED', 'BLOCKED',
+]
 
 export interface RoleBinding {
   /**
@@ -370,7 +425,9 @@ export interface ResumeRecord {
 export const MAX_RECORDED_REPAIRS = 5
 
 export function emptyPhaseRoles(): Record<PhaseName, RoleBinding[]> {
-  return { plan: [], review: [], execute: [], accept: [], observer: [] }
+  // 从 PHASE_NAMES 派生,不写字面量:少一个键,下游那一串无保护的 phaseRoles[p]
+  // 会直接抛 TypeError(实测 createNode 的展开就先炸了)。
+  return Object.fromEntries(PHASE_NAMES.map(p => [p, [] as RoleBinding[]])) as Record<PhaseName, RoleBinding[]>
 }
 export function emptyPlan(): NodePlan {
   return { solution: '', keyPoints: '', risks: '', acceptance: '' }
@@ -401,7 +458,8 @@ export function createNode(args: {
     // from — sharing five array instances. P3's per-node role overrides edit a
     // node's roster in place; without this the edit would corrupt every sibling.
     phaseRoles: Object.fromEntries(
-      PHASE_NAMES.map(p => [p, [...args.phaseRoles[p]]]),
+      // ?? []:老 run.md / 手写双件可能缺新增的环节键,少一个就在这里抛 TypeError。
+      PHASE_NAMES.map(p => [p, [...(args.phaseRoles[p] ?? [])]]),
     ) as Record<PhaseName, RoleBinding[]>,
     plan: emptyPlan(),
     execStatus: '',

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { createNode, DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
+import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
@@ -84,9 +84,10 @@ describe('startupConfirm racer', () => {
       phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: 'arch' }, { roleName: 'sec', model: 'opus' }] },
     }
     const lines = rosterLines(cfg)
-    expect(lines).toHaveLength(5) // one line per PHASE_NAMES entry
-    expect(lines).toContain('评审: arch、sec(opus)') // the bound model is visible on the gate
-    expect(lines).toContain('方案: 主模型')
+    // 一个环节一行 —— 用 PHASE_NAMES.length 而不是写死的数字,这个列表会增长。
+    expect(lines).toHaveLength(PHASE_NAMES.length)
+    expect(lines).toContain('质疑讨论: arch、sec(opus)') // the bound model is visible on the gate
+    expect(lines).toContain('分析: 主模型')
   })
 
   it('clip/goalLine never emit a lone surrogate and skip leading blank lines', () => {
@@ -352,7 +353,7 @@ describe('名册可编辑 (spec §2 第一关)', () => {
   it('rosterEditorLines marks what is bound and where the cursor is', () => {
     const r = toggleRole(empty() as never, 'review', 'security')
     const lines = rosterEditorLines(r, ['architect', 'security'], 1, 1)
-    expect(lines[1]).toContain('▶')             // the focused phase
+    expect(lines[1]).toContain('▶')             // the focused phase (phaseIdx=1)
     expect(lines[1]).toContain('>[x]security')  // focused role, and it IS bound
     expect(lines[1]).toContain(' [ ]architect') // unfocused, unbound
     expect(lines[0]).not.toContain('▶')
@@ -388,10 +389,12 @@ describe('名册可编辑 (spec §2 第一关)', () => {
 
   it('单座位阶段的行上写明它是单选', () => {
     const lines = rosterEditorLines(empty() as never, ['a'], 0, 0)
-    expect(lines[0]).not.toContain('(单选)') // 方案 —— 顺序精化,可多员工
-    expect(lines[1]).not.toContain('(单选)') // 评审 —— 圆桌
-    expect(lines[2]).toContain('(单选)')     // 执行 —— 物理约束,只能一个
-    expect(lines[4]).toContain('(单选)')     // 观察 —— node.score 每维一条记录
+    // 按标签找,不按下标 —— 环节列表会增长,下标断言到时会静默错位到别的行。
+    const row = (label: string) => lines.find(l => l.includes(label))!
+    expect(row('分析')).not.toContain('(单选)')     // 顺序精化,可多员工
+    expect(row('质疑讨论')).not.toContain('(单选)') // 圆桌
+    expect(row('执行')).toContain('(单选)')         // 物理约束,只能一个
+    expect(row('观察')).toContain('(单选)')         // node.score 每维一条记录
   })
 
   it('toggleRole 记住模型,否则只读名册会掉回裸名字', () => {
@@ -436,8 +439,9 @@ describe('名册可编辑 (spec §2 第一关)', () => {
     // 观察 is opt-in and does NOT fall back to the main model; saying 主模型 there would
     // promise a scorer that never runs — the same distinction rosterLines already makes.
     const lines = rosterEditorLines(empty() as never, ['a'], 0, 0)
-    expect(lines[0]).toContain('(主模型)')
-    expect(lines[4]).toContain('(不评分)')
+    const row = (label: string) => lines.find(l => l.includes(label))!
+    expect(row('分析')).toContain('(主模型)')
+    expect(row('观察')).toContain('(不评分)')
   })
 
   it('says why the table is empty when settings has no roles at all', () => {
@@ -587,7 +591,7 @@ describe('关口名册要如实说出角色与员工', () => {
 
   it('带角色标签的席位:角色和员工都说出来', () => {
     const line = rosterLines(cfg({ review: [{ roleName: 'opus-架构', model: 'claude-opus-4-8', roleTag: '架构师' }] }))
-      .find(l => l.startsWith('评审'))!
+      .find(l => l.startsWith('质疑讨论'))!
     expect(line).toContain('架构师')
     expect(line).toContain('opus-架构')
     expect(line).toContain('claude-opus-4-8')
@@ -605,8 +609,8 @@ describe('关口名册要如实说出角色与员工', () => {
   })
 
   it('没有角色标签的席位照旧只显示员工与模型', () => {
-    const line = rosterLines(cfg({ review: [{ roleName: 'opus-架构', model: 'm' }] })).find(l => l.startsWith('评审'))!
-    expect(line).toBe('评审: opus-架构(m)')
+    const line = rosterLines(cfg({ review: [{ roleName: 'opus-架构', model: 'm' }] })).find(l => l.startsWith('质疑讨论'))!
+    expect(line).toBe('质疑讨论: opus-架构(m)')
   })
 
   it('同一员工兼两角 → 名册上两席都点名各自的角色', () => {
@@ -615,7 +619,7 @@ describe('关口名册要如实说出角色与员工', () => {
         { roleName: 'ds-安全', model: 'm', roleTag: '架构师' },
         { roleName: 'ds-安全', model: 'm', roleTag: '安全' },
       ],
-    })).find(l => l.startsWith('评审'))!
+    })).find(l => l.startsWith('质疑讨论'))!
     // 不点名角色的话用户会看到两个一模一样的 `ds-安全(m)`,分不清是配置生效了还是 bug。
     expect(line).toContain('架构师')
     expect(line).toContain('安全')
@@ -691,7 +695,7 @@ describe('关口编辑器与角色席位', () => {
       R({ review: [{ roleName: 'opus-架构', roleTag: '架构师' }, { roleName: 'ds-安全' }] }),
       ['opus-架构', 'ds-安全'], 1, 0,
     )
-    const line = lines.find(l => l.includes('评审'))!
+    const line = lines.find(l => l.includes('质疑讨论'))!
     expect(line).toContain('[ ]opus-架构')
     expect(line).toContain('[x]ds-安全')
     expect(line).toContain('架构师')
@@ -700,7 +704,7 @@ describe('关口编辑器与角色席位', () => {
   it('有角色席位时不说「(主模型)」', () => {
     const line = rosterEditorLines(
       R({ plan: [{ roleName: '', roleTag: '主设计' }] }), ['opus-架构'], 3, 0,
-    ).find(l => l.includes('方案'))!
+    ).find(l => l.includes('分析'))!
     expect(line).not.toContain('(主模型):')
     expect(line).toContain('主设计')
   })

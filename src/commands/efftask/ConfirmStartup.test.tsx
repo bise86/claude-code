@@ -152,7 +152,7 @@ describe('启动关口的角色名册真的能改 (spec §2 第一关)', () => {
     // A DISCRIMINATING substring. Plain 'architect' is printed by the EDITOR too (it lists
     // every candidate), and the frame buffer accumulates — so that assertion passed whether
     // or not the read-only roster reflected the edit. Only rosterLines produces this shape.
-    expect(m.lastFrame()).toContain('方案: architect')
+    expect(m.lastFrame()).toContain('分析: architect')
     m.app.unmount()
   })
 

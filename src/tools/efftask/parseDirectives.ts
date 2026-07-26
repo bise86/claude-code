@@ -1,14 +1,11 @@
 // src/tools/efftask/parseDirectives.ts
-import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES } from './types.js'
+import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES, PHASE_LABEL } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 import { applyRoleDefsToPhases, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
 
 export type ModelJsonFn = (prompt: string) => Promise<string>
 
-const PHASE_LABEL: Record<PhaseName, string> = {
-  plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
-}
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { "plan"?: string[], "review"?: string[], "execute"?: string[], "accept"?: string[], "observer"?: string[] },

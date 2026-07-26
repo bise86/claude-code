@@ -61,7 +61,7 @@ export function annotateRoleModels(
   const phaseRoles = Object.fromEntries(
     PHASE_NAMES.map(p => [
       p,
-      config.phaseRoles[p].map(
+      (config.phaseRoles[p] ?? []).map(
         (r): RoleBinding => ({ ...r, model: r.model ?? effectiveModel(byType.get(r.roleName), mainModel) }),
       ),
     ]),

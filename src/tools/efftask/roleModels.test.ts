@@ -55,7 +55,7 @@ describe('annotateRoleModels feeds the roster the fourth thing the gate was aske
   it('names the model of every bound role AND of the un-roled phases', () => {
     const out = annotateRoleModels(cfg({ review: [{ roleName: 'arch' }, { roleName: 'sec' }] }), agents, MAIN)
     const lines = rosterLines(out)
-    expect(lines).toContain(`评审: arch(${MAIN})、sec(gpt-4o)`)
+    expect(lines).toContain(`质疑讨论: arch(${MAIN})、sec(gpt-4o)`)
     // 不指定就用主模型 — and the gate must say WHICH main model, not just "主模型".
     expect(lines).toContain(`执行: 主模型(${MAIN})`)
     expect(lines).toContain('观察: (未配置,不评分)') // scoring is opt-in, and says so
