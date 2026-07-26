@@ -152,7 +152,21 @@ export function parseRoleDefs(
  * `staff`(角色声明「架构师由谁担当」)说的是同一件事的两个方向,用户两边都写了的时候
  * 意图是「都算上」,不是「后写的赢」。
  */
-export function mergeRoleDefs(base: RoleDef[], overlay: RoleDef[]): { defs: RoleDef[]; notices: string[] } {
+export function mergeRoleDefs(
+  base: RoleDef[],
+  overlay: RoleDef[],
+  /**
+   * overlay 明确写了 staff 时,**换掉**而不是并上 base 的员工。
+   *
+   * 用在提示词覆盖配置文件那一跳:那是两个不同的层,而提示词是更晚、更具体的意图。
+   * 用户说「架构师这次改由 ds-安全 担任」,并集会得到 opus-架构 + ds-安全 —— 「改由」
+   * 变成了「再加一个」,而这正是「任务需求提示词可更新改变这种配置」要的能力。
+   *
+   * 配置文件内部三份来源之间仍然取并集:角色侧的 staff 和员工侧的 efftaskRoles 是同一层
+   * 配置的两个方向,两边都写的时候意图是「都算上」。
+   */
+  overlayReplacesStaff = false,
+): { defs: RoleDef[]; notices: string[] } {
   const notices: string[] = []
   const out: RoleDef[] = base.map(d => ({ ...d, staff: [...d.staff] }))
   const index = new Map(out.map((d, i) => [`${d.stage}${KEY_SEP}${d.name}`, i]))
@@ -165,12 +179,15 @@ export function mergeRoleDefs(base: RoleDef[], overlay: RoleDef[]): { defs: Role
       continue
     }
     const prev = out[at]
-    const merged = [...new Set([...prev.staff, ...d.staff])]
-    const added = merged.filter(s => !prev.staff.includes(s))
-    if (added.length > 0 && prev.staff.length > 0) {
+    // overlay 没写 staff 就沿用 base 的 —— 只想改产出/作用的时候不该顺手把人清空。
+    const replacing = overlayReplacesStaff && d.staff.length > 0
+    const merged = replacing ? [...d.staff] : [...new Set([...prev.staff, ...d.staff])]
+    if (replacing && prev.staff.some(s => !merged.includes(s))) {
+      notices.push(`角色「${d.name}」的员工已按提示词改为 ${merged.join('、')}(原为 ${prev.staff.join('、')})`)
+    } else if (!replacing && merged.some(s => !prev.staff.includes(s)) && prev.staff.length > 0) {
       notices.push(`角色「${d.name}」的员工由两处共同指定,已合并:${merged.join('、')}`)
     }
-    out[at] = { ...d, staff: merged }
+    out[at] = { ...d, staff: merged.length > 0 ? merged : [...prev.staff] }
   }
   return { defs: out, notices }
 }

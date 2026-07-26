@@ -227,15 +227,28 @@ describe('提示词里可以定义角色,也可以改配置文件里的角色', 
     expect(cfg.phaseRoles.review).toEqual([{ roleName: '', roleTag: '架构师' }])
   })
 
-  it('提示词覆盖配置文件里同名角色的说法,员工取并集', async () => {
-    // 「任务需求提示词可更新改变这种配置」。
-    const cfg = await parseDirectives('架构师这次重点看回滚', {
+  it('提示词说「改由 X 担任」是真的改,不是再加一个', async () => {
+    // 「任务需求提示词可更新改变这种配置」。取并集的话,「架构师这次改由 ds-安全 担任」
+    // 会得到 opus-架构 + ds-安全 ——「改由」变成了「再加一个」,用户要换人就换不掉。
+    const cfg = await parseDirectives('架构师这次改由 ds-安全 担任,重点看回滚', {
       knownRoles: known,
       baseRoleDefs: [arch({ staff: ['opus-架构'] })],
       modelJson: json({ roles: [{ name: '架构师', stage: 'review', output: '裁决', purpose: '重点看回滚路径', staff: ['ds-安全'] }] }),
     })
     expect(cfg.roleDefs?.[0].purpose).toBe('重点看回滚路径')
-    expect(cfg.phaseRoles.review.map(s => s.roleName)).toEqual(['opus-架构', 'ds-安全'])
+    expect(cfg.phaseRoles.review.map(s => s.roleName)).toEqual(['ds-安全'])
+    expect(cfg.notices.join('\n')).toContain('已按提示词改为 ds-安全')
+    expect(cfg.notices.join('\n')).toContain('原为 opus-架构')
+  })
+
+  it('提示词只改产出/作用、没提员工 → 不清空配置文件里的人', async () => {
+    const cfg = await parseDirectives('架构师这次重点看回滚', {
+      knownRoles: known,
+      baseRoleDefs: [arch({ staff: ['opus-架构'] })],
+      modelJson: json({ roles: [{ name: '架构师', stage: 'review', output: '裁决', purpose: '重点看回滚路径' }] }),
+    })
+    expect(cfg.roleDefs?.[0].purpose).toBe('重点看回滚路径')
+    expect(cfg.phaseRoles.review.map(s => s.roleName)).toEqual(['opus-架构'])
   })
 
   it('配置文件里的角色在提示词没提它时照样生效', async () => {

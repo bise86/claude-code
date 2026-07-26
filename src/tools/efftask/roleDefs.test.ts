@@ -176,7 +176,7 @@ describe('roleBriefFor:职责说明到达模型的那一段', () => {
 describe('mergeRoleDefs / applyStaffDeclarations:双向配置', () => {
   const base: RoleDef[] = [{ name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['opus-架构'] }]
 
-  it('提示词里的同名角色覆盖产出/作用,员工取并集', () => {
+  it('默认(配置文件内部)员工取并集 —— 角色侧与员工侧是同一层的两个方向', () => {
     const { defs, notices } = mergeRoleDefs(base, [
       { name: '架构师', stage: 'review', output: '新产出', purpose: '新作用', staff: ['ds-安全'] },
     ])
@@ -331,5 +331,38 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
   it('正好一席时不说废话', () => {
     const { notices } = applyRoleDefsToPhases(empty() as never, [role('主设计', 'plan', ['opus-架构'])])
     expect(notices).toEqual([])
+  })
+})
+
+describe('mergeRoleDefs 的替换语义(提示词覆盖配置文件那一跳)', () => {
+  const base: RoleDef[] = [{ name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['opus-架构', 'gpt-前端'] }]
+
+  it('overlay 写了 staff → 换掉,并说明换前换后', () => {
+    const { defs, notices } = mergeRoleDefs(
+      base, [{ name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['ds-安全'] }], true)
+    expect(defs[0].staff).toEqual(['ds-安全'])
+    expect(notices.join('\n')).toContain('已按提示词改为 ds-安全')
+    expect(notices.join('\n')).toContain('原为 opus-架构、gpt-前端')
+  })
+
+  it('overlay 没写 staff → 沿用,不清空', () => {
+    // 只想改产出/作用的时候不该顺手把人清空 —— 那是一次用户没要求的静默降级。
+    const { defs, notices } = mergeRoleDefs(
+      base, [{ name: '架构师', stage: 'review', output: '新产出', purpose: 'p', staff: [] }], true)
+    expect(defs[0].staff).toEqual(['opus-架构', 'gpt-前端'])
+    expect(defs[0].output).toBe('新产出')
+    expect(notices).toEqual([])
+  })
+
+  it('替换成同一批人 → 不说废话', () => {
+    const { notices } = mergeRoleDefs(
+      base, [{ name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['opus-架构', 'gpt-前端'] }], true)
+    expect(notices).toEqual([])
+  })
+
+  it('不开替换时仍是并集 —— 配置文件内部两个方向的写法都算数', () => {
+    const { defs } = mergeRoleDefs(
+      base, [{ name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['ds-安全'] }])
+    expect(defs[0].staff).toEqual(['opus-架构', 'gpt-前端', 'ds-安全'])
   })
 })

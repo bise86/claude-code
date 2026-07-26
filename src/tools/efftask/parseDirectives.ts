@@ -133,7 +133,8 @@ export async function parseDirectives(
     knownStaff: known, unsupportedStaff: unsupported, source: '任务提示词',
   })
   base.notices.push(...fromPrompt.notices)
-  const merged = mergeRoleDefs(opts.baseRoleDefs ?? [], fromPrompt.defs)
+  // true:提示词是覆盖配置文件的那一层,「改由 X 担任」必须真的是「改」。
+  const merged = mergeRoleDefs(opts.baseRoleDefs ?? [], fromPrompt.defs, true)
   base.notices.push(...merged.notices)
   return applyDefs(base, merged.defs)
 }

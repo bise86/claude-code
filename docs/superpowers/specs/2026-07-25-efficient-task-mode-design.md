@@ -232,7 +232,7 @@ Run 目录:`.claude/efftask/<run-id>/`(`run-id` = 扫描 `.claude/efftask/` 下�
 
 `stage` 不能自由取名,原因比「配置得进去、永远不执行」更硬:`resumeCore` 和 `startupConfirm` 都用 `Object.fromEntries(PHASE_NAMES.map(…))` 重建 `phaseRoles`,未知阶段键第一次 `--resume` 就被删掉;而 `makeRunAgentFn` 按 `phase === 'execute'` 决定给不给写工具,自由阶段名永远只拿到只读工具集。
 
-**两条录入路径**,提示词覆盖配置文件(同名角色:产出/作用后写的赢,员工取**并集**):
+**两条录入路径**,提示词覆盖配置文件。同名角色:产出/作用后写的赢;员工在**配置文件内部**(角色侧 `staff` 与员工侧 `efftaskRoles`,同一层的两个方向)取**并集**,而**提示词指名员工时是替换** —— 「架构师这次改由 ds-安全 担任」必须真的是「改」,取并集会让它变成「再加一个」,用户就换不掉人。提示词没指名员工则沿用配置文件里的人。
 
 1. **配置文件** —— `settings.json` 顶层 `efftaskRoles`(角色侧),以及 `roles[].efftaskRoles`(员工侧,声明「我能担任哪些角色」)。两侧都受同样的校验,员工侧不是绕过校验的后门。
 2. **任务提示词** —— 凡是描述了「某角色在哪个阶段、产出什么、起什么作用、由谁担当」的,由 `parseDirectives` 抽出来。
