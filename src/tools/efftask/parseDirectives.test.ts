@@ -1,6 +1,7 @@
 // src/tools/efftask/parseDirectives.test.ts
 import { describe, expect, it } from 'bun:test'
 import { parseDirectives } from './parseDirectives.js'
+import type { RoleDef } from './roleDefs.js'
 import { DEFAULT_CAPS } from './types.js'
 
 describe('parseDirectives', () => {
@@ -200,5 +201,93 @@ describe('a notice must not describe a fallback that never happens', () => {
     })
     expect(cfg.notices.join(' ')).not.toContain('改用主模型')
     expect(cfg.phaseRoles.observer).toEqual([])
+  })
+})
+
+describe('提示词里可以定义角色,也可以改配置文件里的角色', () => {
+  const known = ['opus-架构', 'ds-安全']
+  const json = (o: unknown) => async () => '```json\n' + JSON.stringify(o) + '\n```'
+  const arch = (o: object = {}): RoleDef =>
+    ({ name: '架构师', stage: 'review', output: '裁决与阻断项', purpose: '把关可维护性', staff: [], ...o }) as RoleDef
+
+  it('提示词里定义的角色变成真席位,并带上角色标签', async () => {
+    const cfg = await parseDirectives('评审由架构师把关', {
+      knownRoles: known,
+      modelJson: json({ roles: [{ name: '架构师', stage: 'review', output: '裁决', purpose: '把关可维护性', staff: ['opus-架构'] }] }),
+    })
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: 'opus-架构', roleTag: '架构师' }])
+    expect(cfg.roleDefs?.[0].purpose).toBe('把关可维护性')
+  })
+
+  it('没写 staff 的角色 → 主模型兼任的一席,roleName 不是角色名', async () => {
+    const cfg = await parseDirectives('评审由架构师把关', {
+      knownRoles: known,
+      modelJson: json({ roles: [{ name: '架构师', stage: 'review', output: '裁决', purpose: '把关' }] }),
+    })
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: '', roleTag: '架构师' }])
+  })
+
+  it('提示词覆盖配置文件里同名角色的说法,员工取并集', async () => {
+    // 「任务需求提示词可更新改变这种配置」。
+    const cfg = await parseDirectives('架构师这次重点看回滚', {
+      knownRoles: known,
+      baseRoleDefs: [arch({ staff: ['opus-架构'] })],
+      modelJson: json({ roles: [{ name: '架构师', stage: 'review', output: '裁决', purpose: '重点看回滚路径', staff: ['ds-安全'] }] }),
+    })
+    expect(cfg.roleDefs?.[0].purpose).toBe('重点看回滚路径')
+    expect(cfg.phaseRoles.review.map(s => s.roleName)).toEqual(['opus-架构', 'ds-安全'])
+  })
+
+  it('配置文件里的角色在提示词没提它时照样生效', async () => {
+    const cfg = await parseDirectives('随便做点什么', {
+      knownRoles: known,
+      baseRoleDefs: [arch({ staff: ['opus-架构'] })],
+      modelJson: json({ parallelism: 3 }),
+    })
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: 'opus-架构', roleTag: '架构师' }])
+    expect(cfg.parallelism).toBe(3)
+  })
+
+  it('抽取模型挂了 → 配置文件里的角色仍然生效', async () => {
+    // 这条最要紧:抽取失败是最常走到的退化路径,而「在配置文件里配好角色」不该只在
+    // 抽取成功时才通。
+    const cfg = await parseDirectives('随便做点什么', {
+      knownRoles: known,
+      baseRoleDefs: [arch({ staff: ['opus-架构'] })],
+      modelJson: async () => { throw new Error('provider down') },
+    })
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: 'opus-架构', roleTag: '架构师' }])
+  })
+
+  it('根本没有抽取模型时也一样', async () => {
+    const cfg = await parseDirectives('x', { knownRoles: known, baseRoleDefs: [arch({ staff: ['opus-架构'] })] })
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: 'opus-架构', roleTag: '架构师' }])
+  })
+
+  it('缺 output/purpose 的角色不生效,并说明为什么', async () => {
+    const cfg = await parseDirectives('加个安全角色', {
+      knownRoles: known,
+      modelJson: json({ roles: [{ name: '安全', stage: 'review', staff: ['ds-安全'] }] }),
+    })
+    expect(cfg.phaseRoles.review).toEqual([])
+    expect(cfg.notices.join('\n')).toContain('安全')
+    expect(cfg.notices.join('\n')).toContain('不生效')
+  })
+
+  it('按名字指定的员工 + 同一员工的角色定义 → 一席,不是两席', async () => {
+    const cfg = await parseDirectives('评审用 opus-架构,架构师由 opus-架构 担当', {
+      knownRoles: known,
+      modelJson: json({
+        phaseRoles: { review: ['opus-架构'] },
+        roles: [{ name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['opus-架构'] }],
+      }),
+    })
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: 'opus-架构', roleTag: '架构师' }])
+    expect(cfg.notices.join('\n')).toContain('不再额外占一席')
+  })
+
+  it('没有任何角色定义时 roleDefs 不写进配置 —— 老 run.md 的形状不变', async () => {
+    const cfg = await parseDirectives('x', { knownRoles: known, modelJson: json({ parallelism: 2 }) })
+    expect(cfg.roleDefs).toBeUndefined()
   })
 })

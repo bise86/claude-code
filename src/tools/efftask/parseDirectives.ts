@@ -2,6 +2,7 @@
 import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
+import { applyRoleDefsToPhases, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
 
 export type ModelJsonFn = (prompt: string) => Promise<string>
 
@@ -11,8 +12,12 @@ const PHASE_LABEL: Record<PhaseName, string> = {
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { "plan"?: string[], "review"?: string[], "execute"?: string[], "accept"?: string[], "observer"?: string[] },
-  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number } }
-phaseRoles 的值是角色名数组。未提及的字段省略。指令:\n`
+  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number },
+  "roles": [{ "name": "角色名", "stage": "plan|review|execute|accept|observer", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }] }
+phaseRoles 的值是**员工名**数组(可派发的身份)。
+roles 是**任务角色**定义 —— 指令里凡是描述了「某个角色在哪个阶段、产出什么、起什么作用、由谁担当」的,抽到这里。
+角色名可以任意(架构师、安全、前端);stage 必须是那五个之一;staff 填员工名,没说由谁担当就省略。
+只抽指令里真的写了的,不要替用户补 output/purpose —— 缺项的角色会被明确地判为不生效。未提及的字段省略。指令:\n`
 
 function clampInt(v: unknown, min: number, max: number, fallback: number): number {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback
@@ -23,9 +28,15 @@ export async function parseDirectives(
   rawPrompt: string,
   opts: {
     modelJson?: ModelJsonFn
+    /** 可派发的**员工**名(agentType)。历史名字,语义就是员工。 */
     knownRoles: string[]
     /** Roles that exist but P1 cannot dispatch (execMode 'cli' goes through AgentTool, not runAgent). */
     unsupportedRoles?: string[]
+    /**
+     * 配置文件里已有的角色定义。提示词里的同名角色覆盖它的产出/作用,员工取并集
+     * ——「任务需求提示词可更新改变这种配置」。
+     */
+    baseRoleDefs?: RoleDef[]
   },
 ): Promise<EffTaskConfig> {
   const base: EffTaskConfig = {
@@ -35,14 +46,24 @@ export async function parseDirectives(
     caps: { ...DEFAULT_CAPS },
     notices: [],
   }
-  if (!opts.modelJson) return base
+  // 没有抽取模型时也要把配置文件里的角色接上 —— 否则「在配置文件里配好角色」这条路
+  // 只在抽取成功时才通,而抽取失败正是最常走到的退化路径。
+  const applyDefs = (cfg: EffTaskConfig, defs: RoleDef[]): EffTaskConfig => {
+    if (defs.length === 0) return cfg
+    const applied = applyRoleDefsToPhases(cfg.phaseRoles, defs)
+    cfg.phaseRoles = applied.phaseRoles
+    cfg.notices.push(...applied.notices)
+    cfg.roleDefs = defs
+    return cfg
+  }
+  if (!opts.modelJson) return applyDefs(base, opts.baseRoleDefs ?? [])
   let obj: Record<string, unknown> | null = null
   try {
     obj = extractJsonBlock(await opts.modelJson(EXTRACT_PROMPT + rawPrompt)) as Record<string, unknown> | null
   } catch {
-    return base
+    return applyDefs(base, opts.baseRoleDefs ?? [])
   }
-  if (!obj) return base
+  if (!obj) return applyDefs(base, opts.baseRoleDefs ?? [])
 
   if (obj.parallelism !== undefined) base.parallelism = clampInt(obj.parallelism, 1, 64, DEFAULT_PARALLELISM)
 
@@ -105,5 +126,14 @@ export async function parseDirectives(
   // reachable only by hand-editing run.md and resuming.
   if (caps.scoreThreshold !== undefined) c.scoreThreshold = clampInt(caps.scoreThreshold, 0, 100, 0)
   base.caps = c
-  return base
+
+  // 提示词里定义的角色,合并到配置文件那一层之上。放在 phaseRoles 解析**之后**,因为
+  // applyRoleDefsToPhases 要在已有名册的基础上并席位、并去掉重复派发的员工。
+  const fromPrompt = parseRoleDefs(obj.roles, {
+    knownStaff: known, unsupportedStaff: unsupported, source: '任务提示词',
+  })
+  base.notices.push(...fromPrompt.notices)
+  const merged = mergeRoleDefs(opts.baseRoleDefs ?? [], fromPrompt.defs)
+  base.notices.push(...merged.notices)
+  return applyDefs(base, merged.defs)
 }

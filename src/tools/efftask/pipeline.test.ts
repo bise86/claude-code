@@ -8,6 +8,7 @@ import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, pla
 import type { RunAgentFn } from './roundtable.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 import { reseatTransientNodes } from './reseat.js'
+import type { RoleDef } from './roleDefs.js'
 
 // Verdict prompts carry a per-call random tag; a cooperative reviewer answers under THAT tag.
 // Anything else in the reply is quoted context, which parseVerdict deliberately refuses.
@@ -2612,5 +2613,105 @@ describe('返工与集成验收这两个阶段同样要有账', () => {
     await stepIntegrate(n, { ...ctxFor([n, kid], agent), now: c.now })
     expect(n.status).toBe('ACCEPTED')
     expect(n.phaseMs?.INTEGRATION_ACCEPT).toBe(25_000)
+  })
+})
+
+describe('角色简报到达真实的模型调用(不是只显示在关口上)', () => {
+  // 这一组是整个「角色」概念的验收:一份填写完整的角色定义,如果只被解析、被校验、被
+  // 渲染在关口上,而一次模型调用都影响不到,那它就是死配置 —— 而这正是这个仓库反复在
+  // 修的那一类失败。所以这里断言的不是「解析对了」,是「模型收到了」。
+  const defs: RoleDef[] = [
+    { name: '架构师', stage: 'review', output: '通过/阻断裁决与具体阻断项', purpose: '把关可维护性与回滚路径', staff: ['opus-架构'] },
+    { name: '安全', stage: 'review', output: '安全裁决', purpose: '把关注入与越权', staff: ['ds-安全'] },
+    { name: '验收官', stage: 'accept', output: '验收裁决', purpose: '核对验收点逐条落实', staff: [] },
+    { name: '主设计', stage: 'plan', output: '一份可执行方案', purpose: '定拆分与边界', staff: ['opus-架构'] },
+  ]
+  const withDefs = (phaseRoles: EffTaskConfig['phaseRoles']): EffTaskConfig =>
+    ({ ...cfg, roleDefs: defs, phaseRoles })
+
+  it('评审圆桌:两个席位各收到自己那份职责,而不是同一段文字', async () => {
+    const seen: { role: string | undefined; prompt: string }[] = []
+    const runAgent: RunAgentFn = async req => {
+      seen.push({ role: req.role?.roleName, prompt: req.prompt })
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.phaseRoles = {
+      ...emptyPhaseRoles(),
+      review: [
+        { roleName: 'opus-架构', roleTag: '架构师' },
+        { roleName: 'ds-安全', roleTag: '安全' },
+      ],
+    }
+    await stepStart(n, ctxFor([n], runAgent, withDefs(n.phaseRoles)))
+
+    const reviews = seen.filter(s => s.role !== undefined)
+    expect(reviews).toHaveLength(2)
+    const arch = reviews.find(r => r.role === 'opus-架构')!.prompt
+    const sec = reviews.find(r => r.role === 'ds-安全')!.prompt
+    expect(arch).toContain('把关可维护性与回滚路径')
+    expect(arch).toContain('通过/阻断裁决与具体阻断项')
+    expect(sec).toContain('把关注入与越权')
+    // 关键的一条:两份提示词确实不同。上面两条各自也可能被一段共享的文字满足。
+    expect(arch).not.toContain('把关注入与越权')
+    expect(sec).not.toContain('把关可维护性与回滚路径')
+  })
+
+  it('方案阶段(单席位)同样收到简报', async () => {
+    let planPrompt = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') planPrompt = req.prompt
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: [{ roleName: 'opus-架构', roleTag: '主设计' }] }
+    await stepStart(n, ctxFor([n], runAgent, withDefs(n.phaseRoles)))
+    expect(planPrompt).toContain('定拆分与边界')
+    expect(planPrompt).toContain('一份可执行方案')
+  })
+
+  it('验收阶段主模型兼任的席位:简报到了,而且说的是「主模型兼任」不是一个空名字', async () => {
+    let acceptPrompt = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'accept') acceptPrompt = req.prompt
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'EXECUTED'
+    n.execStatus = '做完了'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: '', roleTag: '验收官' }] }
+    await stepExecute(n, ctxFor([n], runAgent, withDefs(n.phaseRoles)))
+    expect(acceptPrompt).toContain('核对验收点逐条落实')
+    expect(acceptPrompt).toContain('主模型兼任')
+  })
+
+  it('没有角色定义时提示词一字不多 —— 老 run 的行为不变', async () => {
+    const grab = (roleDefs?: RoleDef[]) => {
+      let p = ''
+      const runAgent: RunAgentFn = async req => {
+        if (req.phase === 'review') p = req.prompt
+        return req.phase === 'plan'
+          ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+          : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      }
+      const n = root()
+      n.phaseRoles = { ...emptyPhaseRoles(), review: [{ roleName: 'opus-架构' }] }
+      return stepStart(n, ctxFor([n], runAgent, { ...cfg, roleDefs, phaseRoles: n.phaseRoles })).then(() => p)
+    }
+    // 每次调用的答案围栏标签是随机的,归一化掉,否则两份提示词按构造就不可能逐字相同。
+    const norm = (s: string) => s.replace(/verdict[a-z0-9]+/g, 'TAG')
+    const withoutDefs = norm(await grab(undefined))
+    // roleTag 缺失(关口上手勾的员工、老 run.md 的席位)→ 即使有定义也不加简报。
+    const noTag = norm(await grab(defs))
+    expect(withoutDefs).toBe(noTag)
+    expect(withoutDefs).not.toContain('你的角色')
+    // 归一化本身别把断言变空:提示词确实带着一个标签。
+    expect(withoutDefs).toContain('TAG')
   })
 })

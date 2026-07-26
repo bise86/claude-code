@@ -18,6 +18,14 @@ const RoleSchema = z.object({
   args: z.array(z.string()).optional(),
   interactive: z.boolean().optional(),
   cwd: z.string().optional(),
+  /**
+   * 这个员工能担任哪些 /et 任务角色(双向配置的员工侧)。
+   *
+   * 必须声明在这里,不能靠 .passthrough:RoleSchema 是 .strict(),用户在员工上写一个
+   * 未声明的键会让**整条员工**校验失败并被跳过 —— 表现是「这个员工不存在」,而不是
+   * 「这个字段没生效」。角色的阶段/产出/作用只有角色侧有,所以这里只收角色名。
+   */
+  efftaskRoles: z.array(z.string()).optional(),
 }).strict().superRefine((r, ctx) => {
   // execMode-conditional requireds. Without this, a role missing these
   // fields would still parse (they're all individually optional above)

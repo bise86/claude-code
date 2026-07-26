@@ -245,3 +245,54 @@ export function seatSummaryLines(defs: RoleDef[]): string[] {
     .filter(([, roles]) => roles.length > 1)
     .map(([staff, roles]) => `${staff} 占 ${roles.length} 席:${roles.join('、')}`)
 }
+
+/**
+ * 把角色展平出来的席位并进「按名字直接指定的员工」那份名册。
+ *
+ * 两条配置路径可以同时存在:`评审用 opus-架构 和 ds-安全`(只给名字)和角色定义(给职责)。
+ * 同一个员工两边都出现时**只保留带角色标签的那一席** —— 否则它会被派发两次,在全票
+ * 门槛下等于给同一个员工两票,而关口上会看到两个一模一样的名字。
+ */
+export function mergeSeats(
+  existing: RoleBinding[],
+  fromDefs: RoleBinding[],
+  phaseLabel: string,
+): { seats: RoleBinding[]; notices: string[] } {
+  const notices: string[] = []
+  const tagged = new Set(fromDefs.map(s => s.roleName))
+  const kept = existing.filter(e => {
+    if (!e.roleTag && tagged.has(e.roleName)) {
+      notices.push(`${phaseLabel}:员工 ${e.roleName} 已由角色定义安排,不再额外占一席`)
+      return false
+    }
+    return true
+  })
+  const seen = new Set(kept.map(s => `${s.roleTag ?? ''}${KEY_SEP}${s.roleName}`))
+  const added = fromDefs.filter(s => {
+    const k = `${s.roleTag ?? ''}${KEY_SEP}${s.roleName}`
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
+  return { seats: [...kept, ...added], notices }
+}
+
+/**
+ * 角色定义 → 五个阶段的席位表,并进已有名册。
+ *
+ * 这是「配置了角色」和「真的会被派发」之间的那根线。少了它,roleDefs 就只是一份被解析、
+ * 被校验、被渲染在关口上的数据。
+ */
+export function applyRoleDefsToPhases(
+  phaseRoles: Record<PhaseName, RoleBinding[]>,
+  defs: RoleDef[],
+): { phaseRoles: Record<PhaseName, RoleBinding[]>; notices: string[] } {
+  const notices: string[] = []
+  const out = {} as Record<PhaseName, RoleBinding[]>
+  for (const p of PHASE_NAMES) {
+    const merged = mergeSeats(phaseRoles[p] ?? [], seatsFor(defs, p), PHASE_LABEL[p])
+    out[p] = merged.seats
+    notices.push(...merged.notices)
+  }
+  return { phaseRoles: out, notices }
+}

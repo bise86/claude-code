@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 import {
-  applyStaffDeclarations, mergeRoleDefs, parseRoleDefs, roleBriefFor, seatsFor, seatSummaryLines,
+  applyRoleDefsToPhases, applyStaffDeclarations, mergeRoleDefs, parseRoleDefs, roleBriefFor,
+  seatsFor, seatSummaryLines,
   type RoleDef,
 } from './roleDefs.js'
 import { MAIN_STAFF } from './types.js'
+import type { RoleBinding } from './types.js'
 
 const KNOWN = new Set(['opus-架构', 'ds-安全', 'gpt-前端'])
 const P = (raw: unknown, extra?: { unsupportedStaff?: Set<string> }) =>
@@ -232,5 +234,56 @@ describe('seatSummaryLines:一人多席要在关口说清楚', () => {
       { name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['a'] },
       { name: '安全', stage: 'review', output: 'o', purpose: 'p', staff: ['b'] },
     ])).toEqual([])
+  })
+})
+
+describe('applyRoleDefsToPhases:配置了角色 → 真的会被派发', () => {
+  const defs: RoleDef[] = [
+    { name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['opus-架构'] },
+    { name: '验收官', stage: 'accept', output: 'o', purpose: 'p', staff: [] },
+  ]
+  const empty = (): Record<string, RoleBinding[]> =>
+    ({ plan: [], review: [], execute: [], accept: [], observer: [] })
+
+  it('角色的席位进了对应阶段的名册', () => {
+    const { phaseRoles } = applyRoleDefsToPhases(empty() as never, defs)
+    expect(phaseRoles.review).toEqual([{ roleName: 'opus-架构', roleTag: '架构师' }])
+    expect(phaseRoles.accept).toEqual([{ roleName: MAIN_STAFF, roleTag: '验收官' }])
+    expect(phaseRoles.execute).toEqual([])
+  })
+
+  it('按名字直接指定的员工保留,和角色席位共存', () => {
+    const base = { ...empty(), review: [{ roleName: 'gpt-前端' }] }
+    const { phaseRoles } = applyRoleDefsToPhases(base as never, defs)
+    expect(phaseRoles.review).toEqual([
+      { roleName: 'gpt-前端' },
+      { roleName: 'opus-架构', roleTag: '架构师' },
+    ])
+  })
+
+  it('同一员工两边都写 → 只留带角色标签的那席,并说明', () => {
+    // 留两席等于给同一个员工两票(全票门槛下直接抬高了阻断率),而关口上会出现两个
+    // 一模一样的名字 —— 用户没法分辨那是配置生效了还是一个 bug。
+    const base = { ...empty(), review: [{ roleName: 'opus-架构' }] }
+    const { phaseRoles, notices } = applyRoleDefsToPhases(base as never, defs)
+    expect(phaseRoles.review).toEqual([{ roleName: 'opus-架构', roleTag: '架构师' }])
+    expect(notices.join('\n')).toContain('不再额外占一席')
+  })
+
+  it('同一员工担两角 → 两席都留下,这不是重复', () => {
+    const two: RoleDef[] = [
+      { name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['opus-架构'] },
+      { name: '安全', stage: 'review', output: 'o', purpose: 'p', staff: ['opus-架构'] },
+    ]
+    const { phaseRoles } = applyRoleDefsToPhases(empty() as never, two)
+    expect(phaseRoles.review).toHaveLength(2)
+    expect(phaseRoles.review.map(s => s.roleTag)).toEqual(['架构师', '安全'])
+  })
+
+  it('没有角色定义 → 名册原样不动', () => {
+    const base = { ...empty(), review: [{ roleName: 'gpt-前端' }] }
+    const { phaseRoles, notices } = applyRoleDefsToPhases(base as never, [])
+    expect(phaseRoles.review).toEqual([{ roleName: 'gpt-前端' }])
+    expect(notices).toEqual([])
   })
 })

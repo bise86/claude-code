@@ -1,5 +1,6 @@
 // src/tools/efftask/pipeline.ts
-import type { EffTaskConfig, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
+import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
+import { roleBriefFor } from './roleDefs.js'
 import { createNode } from './types.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
@@ -401,10 +402,11 @@ function quote(s: string): string {
   return s.replace(/`{3,}/g, m => '`​'.repeat(m.length))
 }
 
-export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = ''): string {
+export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = '', brief = ''): string {
   const caps = ctx.config.caps
   const isolated = ctx.worktrees !== undefined
   return (
+    brief +
     `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
@@ -469,11 +471,12 @@ function graftTargets(node: TaskNode, ctx: PipelineCtx): string {
 // otherwise the goal drifts every time the plan is re-emitted during review iterations.
 function ctxGoal(node: TaskNode): string { return node.goal }
 
-function reviewPrompt(node: TaskNode, tag: string): string {
-  return `请评审以下方案是否可执行、完整、无重大风险。方案:\n${quote(JSON.stringify(node.plan))}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` + answerRule(tag)
+function reviewPrompt(node: TaskNode, tag: string, brief = ''): string {
+  return brief + `请评审以下方案是否可执行、完整、无重大风险。方案:\n${quote(JSON.stringify(node.plan))}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` + answerRule(tag)
 }
-function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', syncNote = ''): string {
+function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', syncNote = '', brief = ''): string {
   return (
+    brief +
     `按以下方案执行任务并完成实际改动。方案:\n${quote(JSON.stringify(node.plan))}\n` +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
@@ -493,8 +496,9 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
 }
 // Blank fields must READ as blank. Interpolating an empty acceptance/execStatus renders
 // "验收点:\n执行状态:" — two empty slots a reviewer can wave through as satisfied.
-function acceptPrompt(node: TaskNode, tag: string): string {
+function acceptPrompt(node: TaskNode, tag: string, brief = ''): string {
   return (
+    brief +
     `请验收执行结果是否达成验收点。\n` +
     `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
     `执行状态:${quote(node.execStatus) || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
@@ -504,7 +508,7 @@ function acceptPrompt(node: TaskNode, tag: string): string {
 }
 // Integration acceptance judges CHILD evidence against the parent goal. acceptPrompt would
 // show only the parent's own execStatus — which for a decompose node is empty.
-function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = ''): string {
+function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', brief = ''): string {
   // A child missing from the map is REPORTED, not filtered away: silently shrinking the
   // evidence list would let a parent be accepted on the strength of the children that
   // happen to still be there.
@@ -552,6 +556,7 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
     ? `本节点自己的执行产出(已合入集成分支,同样需要你验收):\n${quote(realWork)}\n\n`
     : ''
   return (
+    brief +
     (ownWork
       ? `请验收"本节点自己的执行产出 + 全部子任务的结果,合起来是否达成本节点目标"。\n`
       : `请验收"全部子任务的结果合起来是否达成本节点目标"。\n`) +
@@ -577,6 +582,16 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
 // union was simply wrong, and with no typecheck in this repo nothing said so.
 function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
   return node.phaseRoles[phase][0] ?? null
+}
+
+/**
+ * 这一席的角色简报,已带好尾部空行 —— 角色的「产出什么、起什么作用」到达模型的唯一通道。
+ *
+ * 席位没有 roleTag(关口上手勾的员工、老 run.md 里的席位)就是空串,提示词退回原样。
+ */
+function seatBrief(ctx: { config: EffTaskConfig }, seat: RoleBinding | null, phase: PhaseName): string {
+  const b = roleBriefFor(ctx.config.roleDefs ?? [], seat, phase)
+  return b ? b + '\n\n' : ''
 }
 
 // Re-entering a finished node would append a second verdict log and could flip a BLOCKED
@@ -677,7 +692,8 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     } else {
       if (!(await commit(node, 'PLANNING', ctx))) return
       const planTag = answerTag(ANSWER_TAGS.plan)
-      const res = await runPhase(ctx, { phase: 'plan', node, role: firstRole(node, 'plan'), system: 'plan', prompt: planPrompt(node, ctx, planTag, feedback), signal: ctx.signal })
+      const planSeat = firstRole(node, 'plan')
+      const res = await runPhase(ctx, { phase: 'plan', node, role: planSeat, system: 'plan', prompt: planPrompt(node, ctx, planTag, feedback, seatBrief(ctx, planSeat, 'plan')), signal: ctx.signal })
       if (!res.ok) { await blockWithReason(node, res.reason, ctx, res.timeout ? 'timeout' : undefined); return }
       const parsed = parsePlanOutput(res.text, planTag)
       node.kind = parsed.kind
@@ -687,7 +703,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     }
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
-      system: 'review', buildPrompt: tag => reviewPrompt(node, tag), ctx,
+      system: 'review', buildPrompt: (tag, seat) => reviewPrompt(node, tag, seatBrief(ctx, seat, 'review')), ctx,
     })
     node.reviewLog.push(rec)
     // runRoundtable resolves even when the run was cancelled mid-flight (it collects
@@ -854,8 +870,9 @@ export async function createChildren(
   }
 }
 
-function scorePrompt(node: TaskNode, tag: string): string {
+function scorePrompt(node: TaskNode, tag: string, brief = ''): string {
   return (
+    brief +
     `请对这个已通过验收的任务打分。\n` +
     `目标:${quote(ctxGoal(node))}\n` +
     `方案:\n${quote(JSON.stringify(node.plan))}\n` +
@@ -880,7 +897,7 @@ async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
   if (!role) return false // opt-in: no observer, no scoring, no fallback to the main model
   const tag = answerTag(ANSWER_TAGS.score)
   const res = await runPhase(ctx, {
-    phase: 'observer', node, role, system: 'observer', prompt: scorePrompt(node, tag), signal: ctx.signal,
+    phase: 'observer', node, role, system: 'observer', prompt: scorePrompt(node, tag, seatBrief(ctx, role, 'observer')), signal: ctx.signal,
     cwd: node.worktree?.path,
   })
   if (!res.ok) {
@@ -1090,7 +1107,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           // told the user to resume it. The rework budget must mean rework.
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
             phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
-            system: 'accept', buildPrompt: t => acceptPrompt(node, t), ctx, cwd: node.worktree.path,
+            system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
           })
           node.acceptLog.push(rec)
           if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
@@ -1197,7 +1214,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // 验收记录 rendered 第 2 轮 twice, once before and once after 第 3 轮 — and the card sends
       // the user to exactly that record.
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
-      system: 'accept', buildPrompt: t => acceptPrompt(node, t), ctx, cwd: node.worktree.path,
+      system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
     })
     node.acceptLog.push(rec)
     if (!infraExhausted && rec.synthesized.pass) {
@@ -1257,7 +1274,8 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // node.execStatus still holds the PREVIOUS round's result here (it's overwritten below),
     // which is exactly what executePrompt renders on rework.
     const execTag = answerTag(ANSWER_TAGS.exec)
-    const res = await runPhase(ctx, { phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote), cwd: node.worktree?.path, signal: ctx.signal })
+    const execSeat = firstRole(node, 'execute')
+    const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatBrief(ctx, execSeat, 'execute')), cwd: node.worktree?.path, signal: ctx.signal })
     if (!res.ok) {
       // Keep whatever the executor managed to report before the interruption. It ran with
       // write tools, so discarding this can leave the repo changed with no record of it.
@@ -1324,7 +1342,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
-      system: 'accept', buildPrompt: tag => acceptPrompt(node, tag), ctx, cwd: node.worktree?.path,
+      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, tag, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree?.path,
     })
     node.acceptLog.push(rec)
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
@@ -1413,7 +1431,7 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     const runIntegrate = async () => roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept,
       round: node.iteration.integration + 1, system: 'integrate',
-      buildPrompt: tag => integratePrompt(node, ctx, tag, feedback), // child evidence, NOT acceptPrompt
+      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, 'accept')), // child evidence, NOT acceptPrompt
       ctx,
       // The INTEGRATION worktree, not the user's tree. This roundtable accepts every
       // decompose node — including root, i.e. the run's final verdict — and under isolation

@@ -1074,6 +1074,10 @@ export const SettingsSchema = lazySchema(() =>
         receiveId: z.string().optional(),
       }).optional(),
       roles: z.array(z.record(z.string(), z.unknown())).optional(),
+      // /et 的角色定义(任务里的一个职能:在哪个阶段、产出什么、起什么作用、由哪些员工
+      // 担当)。逐条校验在 efftask/roleDefs.ts —— 这里只保证它能到达那里,一条写坏的
+      // 角色不该让整份 settings.json 解析失败。
+      efftaskRoles: z.array(z.record(z.string(), z.unknown())).optional(),
     })
     .passthrough(),
 )
