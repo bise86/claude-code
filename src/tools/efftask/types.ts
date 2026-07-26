@@ -179,6 +179,18 @@ export interface TaskNode {
    * lower at the confirmation gate.
    */
   revised?: boolean
+  /**
+   * 各阶段耗时 (spec §10.2) — accumulated milliseconds per ACTIVE status.
+   *
+   * The detail pane showed one aggregate number, which cannot answer the question someone
+   * opens it with: a node that took 20 minutes because its executor is slow and one that took
+   * 20 minutes because it was reviewed four times look identical.
+   *
+   * Keyed by NodeStatus rather than PhaseName because that is what `commit` actually observes,
+   * and the two do not map one-to-one — REWORK and EXECUTING are both the execute phase but
+   * mean very different things to someone reading the number.
+   */
+  phaseMs?: Partial<Record<NodeStatus, number>>
   // Separate budgets. `acceptance` belongs to an executable node's accept loop and
   // `integration` to a decompose node's integrate loop; sharing one counter means a
   // resumed node could arrive at integration with its budget already spent elsewhere.

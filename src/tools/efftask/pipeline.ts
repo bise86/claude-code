@@ -105,6 +105,33 @@ export interface PipelineCtx {
 const ACTIVE_STATUSES = new Set(['PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'ACCEPTANCE', 'REWORK', 'INTEGRATION_ACCEPT'])
 
 async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineCtx): Promise<boolean> {
+  /**
+   * 各阶段耗时 (spec §10.2 lists it among what the node detail view must show).
+   *
+   * Accumulated on the way OUT of a status, measured from `updatedAt` — which every commit
+   * and every reseat already stamps. That is a correctness choice, not a convenience one: a
+   * dedicated "phase entered at" timestamp would keep running across a crash, so the hours
+   * while the terminal was closed would be booked to whichever phase happened to be in
+   * flight. That is precisely the defect that made the resume gate render 48 hours of
+   * "runtime" beside a queued node. reseat re-stamps `updatedAt`, so downtime lands in
+   * nobody's column.
+   *
+   * Only ACTIVE statuses are counted. Time at READY or WAITING_CHILDREN is spent waiting for
+   * the scheduler or for children — not work this node did — and counting it would make a
+   * dependency-starved leaf look like the slow one, the exact misdirection `startedAt` exists
+   * to prevent.
+   */
+  const prev = node.status
+  if (prev !== status && ACTIVE_STATUSES.has(prev)) {
+    const since = Date.parse(node.updatedAt)
+    const now = Date.parse(ctx.now())
+    // Both come off disk on a resumed node and either can be garbage. A NaN would poison the
+    // running total permanently; a negative delta (clock skew between machines that wrote the
+    // same run) would render a phase that finished before it started.
+    if (Number.isFinite(since) && Number.isFinite(now) && now > since) {
+      node.phaseMs = { ...(node.phaseMs ?? {}), [prev]: (node.phaseMs?.[prev] ?? 0) + (now - since) }
+    }
+  }
   node.status = status
   // Stamped ONCE, on the first active phase. Re-stamping would restart the clock on every
   // rework round and under-report exactly the nodes a user is looking for.
@@ -121,6 +148,15 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
   safeUpdate(ctx)
   return true
 }
+
+/**
+ * commit(), exposed for the phase-timing tests.
+ *
+ * The accumulation lives inside commit because every phase transition goes through it, and a
+ * separate helper would be a second list to keep in step. Driving it directly is the only way
+ * to control the clock precisely enough to assert on durations.
+ */
+export const commitForTest = commit
 
 /**
  * 触阀但不停机 (spec §11 的 maxDepth 分支)。

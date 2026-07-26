@@ -4,7 +4,7 @@ import { parseDirectives } from './parseDirectives.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap } from './stateMachine.js'
-import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, planPrompt } from './pipeline.js'
+import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, planPrompt, commitForTest } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 import { reseatTransientNodes } from './reseat.js'
@@ -2435,5 +2435,76 @@ describe('spec §16:方案阶段必须被告知"可能冲突的子任务要用�
     expect(p).not.toContain('合并冲突')
     // 但 schema 本身照旧,拆分能力不受影响。
     expect(p).toContain('"children"')
+  })
+})
+
+describe('spec §10.2:各阶段耗时要被累计下来', () => {
+  // 详情页原本只有一个总耗时,而它回答不了打开这个面板的人真正的问题:一个跑了 20 分钟
+  // 是因为执行器慢,另一个跑了 20 分钟是因为被评审打回了四次 —— 两者长得一模一样。
+  const clock = (times: string[]) => { let i = 0; return () => times[Math.min(i++, times.length - 1)] }
+
+  it('离开一个活动态时把停留时长记到那个阶段名下', async () => {
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], (async () => '') as RunAgentFn),
+      now: clock([
+        '2026-07-26T00:00:00.000Z', // commit(PLANNING) 的 updatedAt
+        '2026-07-26T00:00:00.000Z',
+        '2026-07-26T00:00:30.000Z', // commit(PLAN_REVIEW):离开 PLANNING,记 30s
+        '2026-07-26T00:00:30.000Z',
+      ]),
+    }
+    await commitForTest(n, 'PLANNING', ctx)
+    await commitForTest(n, 'PLAN_REVIEW', ctx)
+    expect(n.phaseMs?.PLANNING).toBe(30_000)
+  })
+
+  it('同一个阶段进出多次要累加,而不是覆盖', async () => {
+    // 返工循环会反复进出 EXECUTING;覆盖的话,一个被打回三次的节点看起来只跑了最后一轮。
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], (async () => '') as RunAgentFn),
+      now: clock([
+        '2026-07-26T00:00:00.000Z', '2026-07-26T00:00:00.000Z',
+        '2026-07-26T00:00:10.000Z', '2026-07-26T00:00:10.000Z', // 离开 EXECUTING:10s
+        '2026-07-26T00:00:20.000Z', '2026-07-26T00:00:20.000Z',
+        '2026-07-26T00:00:35.000Z', '2026-07-26T00:00:35.000Z', // 再离开 EXECUTING:15s
+      ]),
+    }
+    await commitForTest(n, 'EXECUTING', ctx)
+    await commitForTest(n, 'ACCEPTANCE', ctx)
+    await commitForTest(n, 'EXECUTING', ctx)
+    await commitForTest(n, 'ACCEPTANCE', ctx)
+    expect(n.phaseMs?.EXECUTING).toBe(25_000)
+  })
+
+  it('等待态不计入 —— 那不是这个节点在干活', async () => {
+    // READY 是在等调度器,WAITING_CHILDREN 是在等子节点。把它们算进去,一个被依赖饿着的
+    // 叶子看起来就成了最慢的那个 —— 正是 startedAt 当初要避免的误导。
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], (async () => '') as RunAgentFn),
+      now: clock([
+        '2026-07-26T00:00:00.000Z', '2026-07-26T00:00:00.000Z',
+        '2026-07-26T01:00:00.000Z', '2026-07-26T01:00:00.000Z', // 在 READY 待了一小时
+      ]),
+    }
+    await commitForTest(n, 'READY', ctx)
+    await commitForTest(n, 'EXECUTING', ctx)
+    expect(n.phaseMs?.READY).toBeUndefined()
+  })
+
+  it('时钟坏掉或倒流时不记账,而不是记一个负数/NaN', async () => {
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], (async () => '') as RunAgentFn),
+      now: clock([
+        '2026-07-26T00:01:00.000Z', '2026-07-26T00:01:00.000Z',
+        '2026-07-26T00:00:00.000Z', '2026-07-26T00:00:00.000Z', // 时间倒流
+      ]),
+    }
+    await commitForTest(n, 'EXECUTING', ctx)
+    await commitForTest(n, 'ACCEPTANCE', ctx)
+    expect(n.phaseMs?.EXECUTING).toBeUndefined()
   })
 })

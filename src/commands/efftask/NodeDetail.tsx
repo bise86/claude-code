@@ -76,6 +76,29 @@ function iterationBody(n: TaskNode): string {
   ].filter(Boolean).join(' · ')
 }
 
+/**
+ * 各阶段耗时 (spec §10.2), largest first.
+ *
+ * The pane showed a single aggregate, which cannot answer the question someone opens it with:
+ * a node that took 20 minutes because its executor is slow and one that took 20 minutes
+ * because it was reviewed four times render identically. Ordered by cost rather than by the
+ * state machine's sequence — the reader is looking for where the time went.
+ *
+ * Sub-second phases are dropped: they are noise beside a phase measured in minutes, and a row
+ * reading `0s` invites the reader to wonder what went wrong there.
+ */
+export function phaseTimeBody(n: TaskNode): string {
+  const LABEL: Partial<Record<string, string>> = {
+    PLANNING: '方案', PLAN_REVIEW: '方案评审', EXECUTING: '执行', ACCEPTANCE: '验收',
+    REWORK: '返工', INTEGRATION_ACCEPT: '集成验收', SCORING: '观察评分', MERGE: '合并',
+  }
+  return Object.entries(n.phaseMs ?? {})
+    .filter(([, ms]) => Number.isFinite(ms) && ms >= 1000)
+    .sort((a, b) => b[1] - a[1])
+    .map(([status, ms]) => `${LABEL[status] ?? status} ${Math.round(ms / 1000)}s`)
+    .join(' · ')
+}
+
 export function NodeDetail(props: {
   node: TaskNode
   elapsed: string
@@ -157,6 +180,9 @@ export function NodeDetail(props: {
       {/* 迭代次数 (spec §10.2 lists it). Zero counters render nothing — Section drops an
           empty body — so an untouched node stays uncluttered. */}
       <Section maxLines={perSection} title="迭代次数" body={iterationBody(n)} />
+      {/* 各阶段耗时 (spec §10.2). Empty until at least one phase has run for a second, so a
+          node that has barely started stays uncluttered. */}
+      <Section maxLines={perSection} title="各阶段耗时" body={phaseTimeBody(n)} />
       <Section maxLines={perSection} title="评审记录" body={rounds(n.reviewLog)} />
       <Section maxLines={perSection} title="验收记录" body={rounds(n.acceptLog)} />
       {n.worktree ? <Section maxLines={perSection} title="隔离工作区" body={`${n.worktree.branch}\n${n.worktree.path}`} /> : null}

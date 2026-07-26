@@ -704,3 +704,44 @@ describe('updatedAt 也要查类型', () => {
     expect(elapsed(n, Date.now())).not.toBe('0s')
   })
 })
+
+describe('spec §10.2:详情页要显示各阶段耗时', () => {
+  const mountDetail = async (props: Record<string, unknown>) => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, { elapsed: '1m', ...props } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    return f
+  }
+
+  it('按耗时从大到小列出,让人一眼看到时间花在哪', async () => {
+    const f = await mountDetail({
+      // 插入顺序**故意**和耗时顺序相反:第一版按 EXECUTING 最大且写在最前面构造,于是
+      // Object.entries 的天然顺序就已经满足断言,把 .sort() 删掉照样绿(变异跑出来的)。
+      node: mk({ id: 'n', phaseMs: { ACCEPTANCE: 8_000, PLAN_REVIEW: 45_000, EXECUTING: 120_000 } }),
+    })
+    expect(f).toContain('各阶段耗时')
+    expect(f).toContain('执行 120s')
+    expect(f).toContain('方案评审 45s')
+    // 顺序:执行(120)必须排在方案评审(45)前面,方案评审又要排在验收(8)前面 ——
+    // 读的人是来找"时间花哪了"的。
+    expect(f.indexOf('执行 120s')).toBeLessThan(f.indexOf('方案评审 45s'))
+    expect(f.indexOf('方案评审 45s')).toBeLessThan(f.indexOf('验收 8s'))
+  })
+
+  it('不足一秒的阶段不列 —— 一行 0s 只会让人以为那里出了问题', async () => {
+    const f = await mountDetail({ node: mk({ id: 'n', phaseMs: { EXECUTING: 60_000, SCORING: 300 } }) })
+    expect(f).toContain('执行 60s')
+    expect(f).not.toContain('观察评分')
+  })
+
+  it('还没跑过的节点不渲染这一段', async () => {
+    const f = await mountDetail({ node: mk({ id: 'n', title: '刚建好' }) })
+    expect(f).not.toContain('各阶段耗时')
+    expect(f).toContain('刚建好') // 正向锚点
+  })
+})

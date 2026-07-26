@@ -304,6 +304,18 @@ export function validateLoadedNodes(
     // hand-edited node.md) is not `=== true`, so the node would buy a SECOND corrective
     // subtree — which is the one bound the whole cost argument rests on.
     if (n.revised !== undefined && n.revised !== true) n.revised = false
+    // 各阶段耗时: a plain number map off disk, so every value needs the same treatment the
+    // iteration counters get. NaN would render as "NaNs" and a negative would render a phase
+    // that finished before it began; both are reachable by hand-editing node.md, and the
+    // renderer divides by 1000 rather than guarding.
+    if (n.phaseMs !== undefined) {
+      const raw = (n.phaseMs ?? {}) as Record<string, unknown>
+      const clean: Record<string, number> = {}
+      for (const [k, v] of Object.entries(raw)) {
+        if (LEGAL_STATUS.has(k) && Number.isFinite(v) && (v as number) >= 0) clean[k] = Math.trunc(v as number)
+      }
+      n.phaseMs = clean as TaskNode['phaseMs']
+    }
     const pr = (n.phaseRoles ?? {}) as Record<string, unknown>
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>
     if (typeof n.title !== 'string' || n.title.length === 0) n.title = n.id

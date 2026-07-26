@@ -83,6 +83,11 @@ const HOSTILE: unknown[] = [
   // past both the validator and this file's own post-condition, while every budget check is
   // `spent >= caps.maxIterations` — buying 8 rounds where the caps say 3.
   { planReview: -5, acceptance: -5, integration: -5, scoring: -5, mergeResolve: -5 },
+  // 各阶段耗时 is a plain number map on disk, so it takes garbage the same way iteration does.
+  { EXECUTING: 'nope' },
+  { EXECUTING: -1 },
+  { EXECUTING: Number.NaN },
+  { 不是状态: 5 },
 ]
 
 /** A fully-populated node — the field list comes from this, not from a hand-written array. */
@@ -102,6 +107,7 @@ function richNode(): TaskNode {
   // 补救拆分 already used once — the flag that stops it happening twice, which is the bound
   // the whole cost argument for that feature rests on.
   n.revised = true
+  n.phaseMs = { EXECUTING: 42_000, ACCEPTANCE: 7_000 }
   n.confirmedDraft = { children: [{ title: '甲', deps: [] }] }
   n.worktree = { branch: 'b', path: '/wt/root' }
   n.startedAt = NOW
@@ -196,6 +202,14 @@ async function driveRecovery(nodeMd: string, intactField?: keyof TaskNode): Prom
     // The three booleans reseat keys on, all matched with === true.
     for (const f of ['interrupted', 'mergeConflict', 'capBlocked'] as const) {
       expect(n[f] === undefined || typeof n[f] === 'boolean').toBe(true)
+    }
+    // 各阶段耗时 is divided by 1000 and rendered; NaN reads as "NaNs" and a negative reads as
+    // a phase that finished before it started. Unknown keys are dropped rather than shown —
+    // a row labelled with something that is not a status is not a phase.
+    for (const [k, v] of Object.entries(n.phaseMs ?? {})) {
+      expect(LEGAL_STATUS.has(k)).toBe(true)
+      expect(Number.isFinite(v)).toBe(true)
+      expect(v).toBeGreaterThanOrEqual(0)
     }
     // capCategory picks WHICH phase a retried node re-enters.
     expect(n.capCategory === undefined || BLOCK_CATEGORIES.has(n.capCategory)).toBe(true)
