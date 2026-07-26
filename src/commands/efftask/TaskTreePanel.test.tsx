@@ -734,9 +734,11 @@ describe('spec §10.2:详情页要显示各阶段耗时', () => {
   })
 
   it('不足一秒的阶段不列 —— 一行 0s 只会让人以为那里出了问题', async () => {
-    const f = await mountDetail({ node: mk({ id: 'n', phaseMs: { EXECUTING: 60_000, SCORING: 300 } }) })
+    // 用一个生产**真的会产出**的状态。第一版拿 SCORING 当样本 —— 而当时 SCORING 压根不在
+    // 白名单里、phaseMs 里永远不会出现它,所以那条断言测的是一个不存在的情况。
+    const f = await mountDetail({ node: mk({ id: 'n', phaseMs: { EXECUTING: 60_000, PLAN_REVIEW: 300 } }) })
     expect(f).toContain('执行 60s')
-    expect(f).not.toContain('观察评分')
+    expect(f).not.toContain('方案评审')
   })
 
   it('还没跑过的节点不渲染这一段', async () => {

@@ -334,10 +334,13 @@ describe('spec §8:隔离不可用时,关口把它呈现成一个选择', () => 
 
 
 describe('启动关口:每一种改动都要通知调用方', () => {
-  // 验收评审实测:删掉 '←' / '-' 上的 props.onEdited?.(),两个关口都不红 —— 只测了右方向键
-  // 和名册切换。调**小**并行数之后被飞书抢跑,就不会有那句你的修改没有生效。
-  it('左方向键也要通知', async () => {
-    for (const key of [String.fromCharCode(27) + '[D', '-']) {
+  // 三个通知点全部要守住。我上一轮以为右方向键和名册切换本来就有覆盖 —— 那是假的:
+  // 这个文件里 onEdited 只出现在这一条测试里,把那两处的 props.onEdited?.() 删掉全套照样
+  // 绿(验收评审的变异矩阵证实)。后果和这条 fix 本身要修的一模一样:改完之后被飞书抢跑,
+  // 不会有那句"你在终端里未提交的修改没有生效"。
+  const E = String.fromCharCode(27)
+  it('每一个改动入口都要通知', async () => {
+    for (const keys of [[E + '[D'], ['-'], [E + '[C'], ['+'], ['r', ' ']]) {
       let edited = 0
       const t = fakeTty()
       const app = await render(
@@ -347,8 +350,10 @@ describe('启动关口:每一种改动都要通知调用方', () => {
         { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
       )
       await new Promise(r => setTimeout(r, 20))
-      t.stdin.press(key)
-      await new Promise(r => setTimeout(r, 20))
+      for (const k of keys) {
+        t.stdin.press(k)
+        await new Promise(r => setTimeout(r, 20))
+      }
       expect(edited).toBeGreaterThan(0)
       app.unmount()
     }

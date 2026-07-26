@@ -2508,3 +2508,109 @@ describe('spec §10.2:各阶段耗时要被累计下来', () => {
     expect(n.phaseMs?.EXECUTING).toBeUndefined()
   })
 })
+
+describe('各阶段耗时的账目必须和总耗时对得上', () => {
+  it('走完整生命周期,每一段活动时间都要有归属', async () => {
+    // 这一条抵得上给白名单里每个状态各写一条:任何一个活动态被漏掉,和就对不上。
+    // 验收评审正是这么发现 SCORING/MERGE 被漏掉的 —— 实测 240s 的总耗时下面挂着一份
+    // 加起来只有 150s 的清单,38% 无处可去,而详情页把这两个数字上下并排印着。
+    //
+    // 之前那四条用例各自只驱动它点名的那个状态,所以删掉 REWORK 或 INTEGRATION_ACCEPT
+    // 全套照样绿(评审的变异矩阵证实)。
+    let t = 0
+    const clock = () => new Date(Date.parse('2026-07-26T00:00:00.000Z') + t).toISOString()
+    const bump = (ms: number) => { t += ms }
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] }
+    let merged = false
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') { bump(10_000); return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```' }
+      if (req.phase === 'execute') { bump(100_000); return '```json\n{"execStatus":"做完了"}\n```' }
+      if (req.phase === 'observer') {
+        bump(50_000)
+        const tag = req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score'
+        return '```' + tag + '\n{"plan":{"score":90,"rationale":"ok"},"exec":{"score":90,"rationale":"ok"}}\n```'
+      }
+      bump(20_000)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      now: clock,
+      worktrees: {
+        acquire: async () => ({ path: '/wt/root', branch: 'b', gitRoot: '/repo' }),
+        commitAndMerge: async () => { bump(40_000); merged = true; return { ok: true, merged: true } },
+        release: async () => ({ removed: true }),
+        withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      } as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(merged).toBe(true)
+
+    const sum = Object.values(n.phaseMs ?? {}).reduce((a, b) => a + b, 0)
+    // 观察评分(50s)和合并(40s)必须各自有账。
+    expect(n.phaseMs?.SCORING).toBe(50_000)
+    expect(n.phaseMs?.MERGE).toBe(40_000)
+    // 总账:节点从首个活动态到终态的墙钟,应当全部落进各阶段 —— 这条路径上没有等待态。
+    const wall = Date.parse(n.updatedAt) - Date.parse(n.startedAt!)
+    expect(sum).toBe(wall)
+  })
+})
+
+describe('返工与集成验收这两个阶段同样要有账', () => {
+  // 上面那条走的是一条"一次过"的叶子路径,碰不到 REWORK 和 INTEGRATION_ACCEPT ——
+  // 所以把它们从白名单里删掉,那条照样绿(评审的变异矩阵证实)。这两条把剩下的路径补上。
+  const mkClock = () => {
+    let t = 0
+    return { now: () => new Date(Date.parse('2026-07-26T00:00:00.000Z') + t).toISOString(), bump: (ms: number) => { t += ms } }
+  }
+
+  it('验收被打回一次,REWORK 那段时间要有归属', async () => {
+    const c = mkClock()
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    let accepts = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'execute') { c.bump(30_000); return '```json\n{"execStatus":"改了"}\n```' }
+      accepts++
+      c.bump(10_000)
+      return vtag(req) + (accepts === 1
+        ? '\n{"pass":false,"blocking":["缺测试"],"comments":""}\n```'
+        : '\n{"pass":true,"blocking":[],"comments":"ok"}\n```')
+    }) as RunAgentFn
+    // REWORK 窗口里真正发生的事是"把集成分支同步进本节点的 worktree",所以要给一个池。
+    // 否则那段窗口时长为 0,而 0 是不记账的(正确行为)—— 断言就永远证明不了白名单里
+    // 到底有没有 REWORK。
+    const ctx = {
+      ...ctxFor([n], agent),
+      now: c.now,
+      worktrees: {
+        acquire: async () => ({ path: '/wt/root', branch: 'b', gitRoot: '/repo' }),
+        commitAndMerge: async () => ({ ok: true, merged: true }),
+        release: async () => ({ removed: true }),
+        refreshFromIntegration: async () => { c.bump(5_000); return { ok: true, updated: true } },
+        withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      } as never,
+    }
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.iteration.acceptance).toBe(1)
+    expect(n.phaseMs?.REWORK).toBe(5_000)
+    expect(n.phaseMs?.EXECUTING).toBe(60_000) // 两轮执行各 30s,累加而非覆盖
+  })
+
+  it('decompose 节点的集成验收要有账', async () => {
+    const c = mkClock()
+    const n = root(); n.kind = 'decompose'; n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'; kid.execStatus = '做了 A'
+    const agent = (async (req: { prompt: string }) => {
+      c.bump(25_000)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    await stepIntegrate(n, { ...ctxFor([n, kid], agent), now: c.now })
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.phaseMs?.INTEGRATION_ACCEPT).toBe(25_000)
+  })
+})

@@ -101,8 +101,28 @@ export interface PipelineCtx {
  * would keep a stale (often transient) status forever. We mark it BLOCKED in memory so the
  * scheduler treats it as terminal rather than re-entering it every tick.
  */
-/** Statuses that mean the node is doing work, not waiting for its turn. */
-const ACTIVE_STATUSES = new Set(['PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'ACCEPTANCE', 'REWORK', 'INTEGRATION_ACCEPT'])
+/**
+ * Statuses that mean the node is doing work, not waiting for its turn.
+ *
+ * SCORING and MERGE belong here and were missing, which cost 各阶段耗时 38% of a measured
+ * lifecycle: SCORING runs a full observer model call (`scoreNode`), and MERGE runs a real git
+ * merge plus, on conflict, another WRITE-CAPABLE execute call to resolve it. Leaving them out
+ * put that time in nobody's column, so the detail pane printed a 240s aggregate above a
+ * per-phase list summing to 150s — two numbers on one screen contradicting each other.
+ *
+ * Three things already treated them as active while this list did not: `reseat.ts`'s own
+ * ACTIVE set contains both, spec §10.1 colours them 运行中, and `NodeDetail`'s label map had
+ * entries for both — labels production could never emit. The comment on the SCORING commit
+ * even says it exists because "a user watching a node sit for minutes could not tell which of
+ * the three it was in", which is precisely the question 各阶段耗时 answers.
+ *
+ * `startedAt` reads this set too, and is unaffected: both statuses are only ever reached after
+ * ACCEPTANCE or INTEGRATION_ACCEPT, so the first-active stamp has already happened.
+ */
+const ACTIVE_STATUSES = new Set([
+  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'ACCEPTANCE', 'REWORK', 'INTEGRATION_ACCEPT',
+  'SCORING', 'MERGE',
+])
 
 async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineCtx): Promise<boolean> {
   /**
