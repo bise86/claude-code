@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import { verifyToolPool } from '../../commands/efftask/efftask.js'
 import { collectText, pickAgentDefinition, makeRunAgentFn } from './runAgentAdapter.js'
 import { pwd } from '../../utils/cwd.js'
 
@@ -105,7 +106,7 @@ describe('runAgentAdapter helpers', () => {
 
   it('only the execute phase receives the write-capable tool pool', async () => {
     const seen: Record<string, string[]> = {}
-    for (const phase of ['plan', 'review', 'execute', 'accept', 'observer'] as const) {
+    for (const phase of ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer'] as const) {
       async function* fakeRun(args: any): AsyncGenerator<any> {
         seen[phase] = (args.availableTools as { name: string }[]).map(t => t.name)
         yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }
@@ -113,9 +114,26 @@ describe('runAgentAdapter helpers', () => {
       await makeRunAgentFn(baseDeps(fakeRun))(req({ phase }))
     }
     expect(seen.execute).toEqual(['Write'])
-    for (const phase of ['plan', 'review', 'accept', 'observer']) {
+    // 新增的两个环节也要在这条循环里 —— 漏掉它们,这条测试对它们一个字都没说。
+    for (const phase of ['plan', 'review', 'accept', 'integrate', 'observer']) {
       expect(seen[phase]).toEqual(['Read']) // may read the repo, may never write to it
     }
+    // verify 有自己的档位:deps 没给 verifyTools 时回落只读(这个 baseDeps 就没给)。
+    expect(seen.verify).toEqual(['Read'])
+  })
+
+  it('verify 拿的是 verifyTools,不是只读池', async () => {
+    // 删掉 runAgentAdapter 的 verify 分支,此前是全套测试全绿 —— 验证者静默退回只读,
+    // 跑不了任何命令,这个环节的全部存在理由就没了。
+    let got: string[] = []
+    // biome-ignore lint/suspicious/noExplicitAny: fake agent runner
+    async function* fakeRun(args: any): AsyncGenerator<any> {
+      got = (args.availableTools as { name: string }[]).map(t => t.name)
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }
+    }
+    const deps = { ...baseDeps(fakeRun), verifyTools: [{ name: 'Bash' }, { name: 'Read' }] as never }
+    await makeRunAgentFn(deps)(req({ phase: 'verify' }))
+    expect(got).toEqual(['Bash', 'Read'])
   })
 
   it('forwards cancellation INTO the sub-agent, not just between messages', async () => {
@@ -388,5 +406,39 @@ describe('the phase deadline follows the RUN config, not a frozen default', () =
       timeoutMs: 5000, runAgentImpl: quick as any,
     })
     expect(await fn({ phase: 'plan', node: {} as any, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })).toBe('ok')
+  })
+})
+
+describe('测试验证档的工具池(此前整条接线零覆盖)', () => {
+  // 三种改法 —— 删掉 verifyTools 接线、删掉 runAgentAdapter 的 verify 分支、把
+  // RUN_COMMAND_TOOL_NAMES 清空 —— 此前**各自都是全套测试全绿**,而验证者会静默退回
+  // 只读工具、跑不了任何命令,也就是这个环节的全部存在理由没了。
+  const tools = [
+    { name: 'Read' }, { name: 'Glob' }, { name: 'Grep' },
+    { name: 'Bash' }, { name: 'TaskOutput' }, { name: 'TaskStop' },
+    { name: 'Edit' }, { name: 'Write' }, { name: 'NotebookEdit' },
+  ]
+
+  it('验证档拿得到 Bash —— 没有它,这个环节做不了它唯一该做的事', () => {
+    expect(verifyToolPool(tools).map(t => t.name)).toContain('Bash')
+  })
+
+  it('拿不到编辑类工具', () => {
+    const names = verifyToolPool(tools).map(t => t.name)
+    for (const w of ['Edit', 'Write', 'NotebookEdit']) expect(`${w}:${names.includes(w)}`).toBe(`${w}:false`)
+  })
+
+  it('后台 shell 的读输出/停止也在 —— 名字必须是仓库的规范名', () => {
+    // 早先写的 'BashOutput' / 'KillShell' 在这里是死名,filter 匹配不上不报错,
+    // 只会静默少给两个工具:后台起的 shell 读不到输出、杀不掉。
+    const names = verifyToolPool(tools).map(t => t.name)
+    expect(names).toContain('TaskOutput')
+    expect(names).toContain('TaskStop')
+    expect(names).not.toContain('BashOutput')
+  })
+
+  it('只读那三个照旧在', () => {
+    const names = verifyToolPool(tools).map(t => t.name)
+    for (const r of ['Read', 'Glob', 'Grep']) expect(`${r}:${names.includes(r)}`).toBe(`${r}:true`)
   })
 })

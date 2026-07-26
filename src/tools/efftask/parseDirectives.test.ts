@@ -138,10 +138,12 @@ describe('the roster must not promise what will not run', () => {
     expect(cfg.notices.join(' ')).not.toContain('watcher')
   })
 
-  it('seats only the FIRST observer — node.score holds one record per dimension', async () => {
+  it('观察保留多个员工 —— 各自打分,取最低分收敛,其余理由挂 others', async () => {
+    // 这条曾经断言只留第一个。裁剪留着的话,关口会说一句关于系统能力的**假话**,
+    // 而且和 PHASE_SEATING/allowsMultipleSeats 直接矛盾。
     const cfg = await withRoles({ observer: ['w1', 'w2'] }, { knownRoles: ['w1', 'w2'] })
-    expect(cfg.phaseRoles.observer).toEqual([{ roleName: 'w1' }])
-    expect(cfg.notices.join(' ')).toContain('w2')
+    expect(cfg.phaseRoles.observer).toEqual([{ roleName: 'w1' }, { roleName: 'w2' }])
+    expect(cfg.notices.join(' ')).not.toContain('仅首个角色')
   })
 
   it('an unknown observer does NOT fall back to the main model — scoring is opt-in', async () => {

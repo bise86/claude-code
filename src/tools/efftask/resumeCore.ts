@@ -1,6 +1,6 @@
 import { parse as yamlParse } from 'yaml'
 import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES } from './types.js'
-import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
+import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
 import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
@@ -84,7 +84,7 @@ export function depCycleMembers(nodes: TaskNode[]): Set<string> {
  * with a raw TypeError, and the disk still holds the old reason so every later --resume
  * reproduces it exactly.
  */
-function scoreRecord(v: unknown): { role: string; score: number; rationale: string } | undefined {
+function scoreRecord(v: unknown): ScoreRecord | undefined {
   if (!v || typeof v !== 'object') return undefined
   const r = v as Record<string, unknown>
   return {
@@ -96,7 +96,16 @@ function scoreRecord(v: unknown): { role: string; score: number; rationale: stri
     // number" — and the first fix answered that by deleting the reviewer's actual comment.
     // String() neither throws nor loses it.
     rationale: typeof r.rationale === 'string' ? r.rationale : r.rationale === undefined || r.rationale === null ? '' : String(r.rationale),
-  }
+    ...(Array.isArray((v as { others?: unknown }).others)
+    // 多员工评分时,落选席位的分数与理由挂在这里。逐字段重建时漏掉它 = 一次 --resume
+    // 就丢,而 serializeNode 整对象落盘,恢复后的第一次 commit 会把盘上那份也抹掉 ——
+    // 永久丢失。取最低分是对的,丢掉其余理由是静默截断。
+    ? { others: ((v as { others: unknown[] }).others)
+        .map(o => (o && typeof o === 'object' ? o : {}) as Record<string, unknown>)
+        .filter(o => typeof o.role === 'string' && typeof o.score === 'number' && typeof o.rationale === 'string')
+        .map(o => ({ role: o.role as string, score: o.score as number, rationale: o.rationale as string })) }
+    : {}),
+}
 }
 
 /**

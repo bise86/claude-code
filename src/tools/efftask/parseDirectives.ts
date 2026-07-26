@@ -8,16 +8,16 @@ export type ModelJsonFn = (prompt: string) => Promise<string>
 
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
-{ "parallelism": number, "phaseRoles": { "plan"?: string[], "review"?: string[], "execute"?: string[], "accept"?: string[], "observer"?: string[] },
+{ "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
   "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number },
-  "roles": [{ "name": "角色名", "stage": "plan|review|execute|accept|observer", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }] }
+  "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }] }
 phaseRoles 的值是**员工名**数组(可派发的身份)。
 圆桌通过门槛有两个字段,按用户的说法二选一:
 - 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
 - 用户说**人数**(「至少 2 个人通过」「要 3 票」)→ caps.quorumSeats,就是那个人数。**不要**把人数写进 quorum:「至少 2 人」写成 quorum=2 的含义是 2%,等于 1 票就放行,和用户的意思正好相反。
 caps.maxSeatsPerPhase 是每个阶段最多几席。
 roles 是**任务角色**定义 —— 指令里凡是描述了「某个角色在哪个阶段、产出什么、起什么作用、由谁担当」的,抽到这里。
-角色名可以任意(架构师、安全、前端);stage 必须是那五个之一;staff 填员工名,没说由谁担当就省略。
+角色名可以任意(架构师、安全、前端);step 必须是那几个之一 —— 用户说的中文环节名对应关系:${PHASE_NAMES.map(x => `${PHASE_LABEL[x]}=${x}`).join('、')};staff 填员工名,没说由谁担当就省略。
 只抽指令里真的写了的,不要替用户补 output/purpose —— 缺项的角色会被明确地判为不生效。未提及的字段省略。指令:\n`
 
 function clampInt(v: unknown, min: number, max: number, fallback: number): number {
@@ -97,12 +97,9 @@ export async function parseDirectives(
       trimNotices.push(`${PHASE_LABEL[phase]}:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
       usable = usable.slice(0, 1)
     }
-    // Scoring runs ONE observer, like plan and execute — node.score holds a single record
-    // per dimension, so listing more would put names on the roster that never get called.
-    if (phase === 'observer' && usable.length > 1) {
-      trimNotices.push(`观察:仅首个角色 ${usable[0]} 生效,已忽略 ${usable.slice(1).join('、')}`)
-      usable = usable.slice(0, 1)
-    }
+    // observer 不再裁剪:它现在是多席位(各自打分,取最低分收敛,其余理由挂
+    // ScoreRecord.others)。留着这段会让关口说一句关于系统能力的**假话** ——
+    // 而且和 PHASE_SEATING/allowsMultipleSeats 直接矛盾。
 
     // "改用主模型" is only TRUE when the phase ends up with nobody. Saying it while another
     // role still holds the seat describes a fallback that never happens — the same class of

@@ -58,9 +58,30 @@ import { logError } from '../../utils/log.js'
 
 // Read-only tool pool for plan/review/accept/observer: they must be able to READ the repo
 // to judge anything, they just must not be able to WRITE it.
+import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
+import { TASK_OUTPUT_TOOL_NAME } from '../../tools/TaskOutputTool/constants.js'
+import { TASK_STOP_TOOL_NAME } from '../../tools/TaskStopTool/prompt.js'
+
 export const READ_ONLY_TOOL_NAMES = new Set(['Read', 'Glob', 'Grep'])
-/** 测试验证档在只读之上多这些 —— 它得能真的跑测试。 */
-export const RUN_COMMAND_TOOL_NAMES = new Set(['Bash', 'BashOutput', 'KillShell'])
+/**
+ * 测试验证档在只读之上多这些 —— 它得能真的跑测试。
+ *
+ * 名字必须是本仓库的**规范工具名**:早先写的 'BashOutput' / 'KillShell' 在这里是死名
+ * (它们只在 permissionRuleParser 里作为旧别名存在),后果是后台起的 shell 读不到输出、
+ * 杀不掉 —— 而 filter 匹配不上不会报错,只会静默少给两个工具。
+ */
+export const RUN_COMMAND_TOOL_NAMES = new Set([BASH_TOOL_NAME, TASK_OUTPUT_TOOL_NAME, TASK_STOP_TOOL_NAME])
+
+/**
+ * 测试验证档的工具池。
+ *
+ * 提成可导出的纯函数,是因为它此前**整条接线零覆盖**:把它删掉、把 filter 条件删掉、
+ * 把 RUN_COMMAND_TOOL_NAMES 清空 —— 三种改法各自都是全套测试全绿,而验证者会静默退回
+ * 只读工具、跑不了任何命令,也就是这个环节的全部存在理由没了。
+ */
+export function verifyToolPool<T extends { name: string }>(all: T[]): T[] {
+  return all.filter(t => READ_ONLY_TOOL_NAMES.has(t.name) || RUN_COMMAND_TOOL_NAMES.has(t.name))
+}
 
 const CANCELLED: StartupDecision = { parallelism: 0, approved: false }
 
@@ -174,9 +195,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     availableTools: context.options.tools, // execute phase only
     readOnlyTools, // plan / review / accept / integrate / observer
     // 测试验证要真的把测试跑起来,所以在只读之上加执行命令的能力。
-    verifyTools: context.options.tools.filter(
-      t => READ_ONLY_TOOL_NAMES.has(t.name) || RUN_COMMAND_TOOL_NAMES.has(t.name),
-    ),
+    verifyTools: verifyToolPool(context.options.tools),
     activeAgents,
     mainModelDefault,
     // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded

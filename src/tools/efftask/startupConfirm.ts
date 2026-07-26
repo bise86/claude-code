@@ -204,8 +204,17 @@ export function rosterLines(config: EffTaskConfig): string[] {
     // Scoring is OPT-IN: with no observer role nothing scores, and it does NOT fall back to
     // the main model the way the other phases do. Saying 主模型 here would promise a scorer
     // that never runs.
-    if (p === 'observer' && config.phaseRoles.observer.length === 0) {
-      return `${PHASE_LABEL[p]}: (未配置,不评分)`
+    // 三个环节在**没配角色**时不会回落到主模型,说「主模型」就是承诺一件不会发生的事。
+    // 这三条各自的真实行为不同,所以文案也不同 —— 统一说「未配置」同样是含糊其辞。
+    if ((config.phaseRoles[p] ?? []).length === 0) {
+      if (p === 'observer') return `${PHASE_LABEL[p]}: (未配置,不评分)`
+      // 测试验证是 opt-in:0 席 = 这一步整个不发生,一次调用都不会有。
+      if (p === 'verify') return `${PHASE_LABEL[p]}: (未配置,本次不做验证;验收只能读执行者的自述)`
+      // 集成提交 0 席时回落到验收席位 —— 说「主模型」会让用户以为是另一批人在跑。
+      if (p === 'integrate') {
+        const fallback = (config.phaseRoles.accept ?? []).length > 0 ? '由验收席位承担' : '由验收席位承担(即主模型)'
+        return `${PHASE_LABEL[p]}: (未配置,${fallback})`
+      }
     }
     // Show the bound model too: this gate exists to let the user see exactly who is on the
     // panel, and "coder" alone hides which model that role actually runs on.

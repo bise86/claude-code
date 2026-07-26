@@ -860,3 +860,31 @@ describe('角色定义读回要认新环节与新键名', () => {
     expect(degraded.join('\n')).toContain('不完整')
   })
 })
+
+describe('评分的其余席位理由要熬过 resume', () => {
+  it('others 从盘上读得回来', async () => {
+    // 逐字段重建时漏掉它 = 一次 --resume 就丢;而 serializeNode 整对象落盘,恢复后的
+    // 第一次 commit 会把盘上那份也抹掉 —— 永久丢失。取最低分是对的,丢掉其余理由是
+    // 静默截断。
+    const now = '2026-07-26T00:00:00Z'
+    const n = createNode({ id: 'n1', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now })
+    n.status = 'ACCEPTED'
+    n.score = {
+      plan: { role: 'low', score: 40, rationale: '差', others: [{ role: 'hi', score: 95, rationale: '好' }] },
+      exec: { role: 'low', score: 50, rationale: '一般' },
+    }
+    const { nodes } = validateLoadedNodes([n], { goal: 'g', phaseRoles: emptyPhaseRoles(), now })
+    expect(nodes[0].score?.plan?.others).toEqual([{ role: 'hi', score: 95, rationale: '好' }])
+    // 单席位那一维不该凭空多出这个字段
+    expect('others' in (nodes[0].score!.exec!)).toBe(false)
+  })
+
+  it('写坏的 others 条目被剔除,而不是让整份评分作废', async () => {
+    const now = '2026-07-26T00:00:00Z'
+    const n = createNode({ id: 'n1', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now })
+    n.status = 'ACCEPTED'
+    n.score = { plan: { role: 'a', score: 40, rationale: 'r', others: [{ role: 'ok', score: 9, rationale: 'y' }, { bad: 1 }] as never } }
+    const { nodes } = validateLoadedNodes([n], { goal: 'g', phaseRoles: emptyPhaseRoles(), now })
+    expect(nodes[0].score?.plan?.others).toEqual([{ role: 'ok', score: 9, rationale: 'y' }])
+  })
+})

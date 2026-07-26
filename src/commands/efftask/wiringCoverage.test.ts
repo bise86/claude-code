@@ -190,3 +190,11 @@ describe('收口关口的接线(spec §8)', () => {
     expect(SRC).toContain('props.handoffResult')
   })
 })
+
+describe('测试验证的工具池接线', () => {
+  it('verifyTools 真的传给了 runAgent 适配器', () => {
+    // 剪断它:验证者静默退回只读工具、跑不了任何命令,而这个环节的**全部存在理由**就是
+    // 「能真的把测试跑起来」。实测过:删掉这一行,全套测试一条都不红。
+    expect(SRC).toContain('verifyTools: verifyToolPool(context.options.tools)')
+  })
+})
