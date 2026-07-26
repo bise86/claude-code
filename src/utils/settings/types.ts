@@ -1075,9 +1075,13 @@ export const SettingsSchema = lazySchema(() =>
       }).optional(),
       roles: z.array(z.record(z.string(), z.unknown())).optional(),
       // /et 的角色定义(任务里的一个职能:在哪个阶段、产出什么、起什么作用、由哪些员工
-      // 担当)。逐条校验在 efftask/roleDefs.ts —— 这里只保证它能到达那里,一条写坏的
-      // 角色不该让整份 settings.json 解析失败。
-      efftaskRoles: z.array(z.record(z.string(), z.unknown())).optional(),
+      // 担当)。全部校验在 efftask/roleDefs.ts —— 这里只保证它能到达那里。
+      //
+      // z.unknown() 而不是 z.array(...):schema 失败时 parseSettingsFileUncached 返回
+      // settings: null —— **整份文件**作废,用户的 model/permissions/env/roles 全部失效。
+      // 实测把 efftaskRoles 写成对象、或写成字符串数组(两种最容易犯的写法)都会触发。
+      // 那个代价远大于「这个字段没生效」,而 parseRoleDefs 已经能对任意形状给出中文诊断。
+      efftaskRoles: z.unknown().optional(),
     })
     .passthrough(),
 )
