@@ -152,3 +152,41 @@ describe('角色定义的接线', () => {
     expect(SRC).toContain('cfg.notices.unshift(...baseRoleNotices)')
   })
 })
+
+describe('收口关口的接线(spec §8)', () => {
+  it('恢复路径在「没有可恢复的节点」之前就检查待收口', () => {
+    // 顺序是全部:一个跑完的 run 根节点已 ACCEPTED,reseat 一个节点也捞不回来,
+    // 所以那句 fatal 会先触发,用户永远到不了收口关口,集成分支永远没人处置。
+    const idxCheck = SRC.indexOf('recovered.pendingHandoff')
+    const idxFatal = SRC.indexOf('里没有可恢复的节点')
+    expect(idxCheck).toBeGreaterThan(0)
+    expect(idxFatal).toBeGreaterThan(0)
+    expect(idxCheck).toBeLessThan(idxFatal)
+  })
+
+  it('收口关口真的被渲染,而且不被 !config 吞掉', () => {
+    // 剪断它:待收口状态读出来了、phase 也切了,而屏幕上什么都没有。
+    expect(SRC).toContain("phase === 'handoff' && pendingHandoff")
+    expect(element('ConfirmHandoff')).toContain('handoff={pendingHandoff}')
+    // 收口不需要 config,而 `phase === 'parsing' || !config` 那条分支会拦住它。
+    expect(SRC.indexOf("phase === 'handoff'")).toBeLessThan(SRC.indexOf("phase === 'parsing' || !config"))
+  })
+
+  it('选择真的会去跑 git,而不是只切个界面', () => {
+    expect(SRC).toContain('runHandoffChoice(choice, h, gitRunner, getCwd())')
+  })
+
+  it('成功之后把待收口从 run.md 划掉,失败则留着', () => {
+    // 不划掉:下次 --resume 会为一条已经合并/推送/删掉的分支再弹一次四选一,
+    // 而「丢弃」会对着一条不存在的分支报错。
+    // 失败还划掉:用户就再也回不到这个关口了,而他刚被告知失败了什么。
+    expect(SRC).toContain('if (result.ok) {')
+    expect(SRC).toContain('pendingHandoff: undefined')
+  })
+
+  it('收口结果显示在 done 视图上', () => {
+    // 合并冲突之后安静地回到 done,用户会以为成功了 —— 而代码根本不在他的分支上。
+    expect(element('DoneView')).toContain('handoffResult={handoffResult}')
+    expect(SRC).toContain('props.handoffResult')
+  })
+})

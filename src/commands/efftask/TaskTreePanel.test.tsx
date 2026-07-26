@@ -264,7 +264,7 @@ describe('status colours must be real theme keys, not bare colour names', () => 
   it('no efftask component passes a bare colour name', async () => {
     const files = [
       'TaskTreePanel.tsx', 'NodeDetail.tsx', 'ConfirmStartup.tsx',
-      'ConfirmResume.tsx', 'ResumePicker.tsx', 'efftask.tsx',
+      'ConfirmResume.tsx', 'ResumePicker.tsx', 'efftask.tsx', 'ConfirmHandoff.tsx',
     ]
     const fs = await import('node:fs/promises')
     for (const f of files) {

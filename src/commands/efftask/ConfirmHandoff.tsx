@@ -48,7 +48,7 @@ export function ConfirmHandoff(props: {
       <Text bold>高效任务 {props.runId} · 收口</Text>
       {/* run 的结局要摆在最前面 —— 别邀请用户合并一棵没做完的树。 */}
       {h.outcome === 'blocked' ? (
-        <Text color="yellow">
+        <Text color="warning">
           注意:本次运行**没有正常跑完**（{h.reason || '被阻断或已取消'}）,下面的改动可能是半成品
         </Text>
       ) : null}
@@ -61,14 +61,14 @@ export function ConfirmHandoff(props: {
 
       {confirmingDiscard ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text bold color="red">确认丢弃?这一步不可逆</Text>
+          <Text bold color="error">确认丢弃?这一步不可逆</Text>
           {discardConfirmLines(h).map(l => <Text key={l}>{l}</Text>)}
           <Text dimColor>回车/y 确认丢弃 · 其它任意键返回</Text>
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
           {choices.map((c, i) => (
-            <Text key={c.key} color={i === idx ? 'cyan' : undefined}>
+            <Text key={c.key} color={i === idx ? 'success' : undefined}>
               {i === idx ? '▶ ' : '  '}{c.label} — {c.hint}
             </Text>
           ))}

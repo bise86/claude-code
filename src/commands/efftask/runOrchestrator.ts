@@ -21,7 +21,9 @@ export type Phase =
   | 'parsing' | 'picking' | 'recovering'
   // 'drafting'/'confirmRoot' are 启动关口第三关 (spec §2): the root plan + first-level tree is
   // drafted, then shown for confirmation/modification BEFORE autonomous execution begins.
-  | 'confirm' | 'drafting' | 'confirmRoot' | 'confirmResume' | 'running' | 'done' | 'fatal'
+  // 'handoff' 是收口关口(spec §8):run 早已跑完、终端也早还给用户了,
+  // `/et --resume` 进来发现 run.md 里还有 pendingHandoff,就先渲染它。
+  | 'confirm' | 'drafting' | 'confirmRoot' | 'confirmResume' | 'handoff' | 'running' | 'done' | 'fatal'
 
 /**
  * Drive one run to completion and report it.

@@ -14,7 +14,10 @@ import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
-import { loadRun, type FsLike } from '../../tools/efftask/persistence.js'
+import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
+import { ConfirmHandoff } from './ConfirmHandoff.js'
+import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
+import type { PendingHandoff } from '../../tools/efftask/types.js'
 import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResumeArgs.js'
 import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resumeCore.js'
 import { reseatTransientNodes } from '../../tools/efftask/reseat.js'
@@ -471,6 +474,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // 收口 (spec §8): where the run's work ended up. Collected when the run ends, while the
   // worktrees still exist, and shown in the two places the user actually looks.
   const [handoff, setHandoff] = React.useState<HandoffSummary | null>(null)
+  // 从 run.md 读回来的待收口状态(与上面那个 handoff 不同:这个是**恢复**路径上的)。
+  const [pendingHandoff, setPendingHandoff] = React.useState<PendingHandoff | null>(null)
+  // 收口动作的结果。必须显示出来:合并冲突/推送失败时,用户看到的不能是一个安静的 done。
+  const [handoffResult, setHandoffResult] = React.useState<HandoffResult | null>(null)
   const handoffRef = React.useRef<HandoffSummary | null>(null)
   // What the gate must SAY. Resolved before the gate opens; 'none' until then.
   const [isolation, setIsolation] = React.useState<'worktree' | 'none'>('none')
@@ -567,6 +574,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       props.active.runDir = runDir
 
       const { config: recovered, degraded } = await readRunManifest(props.fs, runDir)
+      // 收口关口要在**任何节点检查之前**判定,而且独立于 status —— 一个跑完的 run 根节点
+      // 已经 ACCEPTED,reseat 一个节点也捞不回来,于是下面那句「没有可恢复的节点」会直接
+      // 把用户挡在门外,而集成分支就永远没人处置了。这正是「跑完先还终端、回头再收口」
+      // 这条路唯一的入口。
+      if (recovered.pendingHandoff && recovered.pendingHandoff.commits > 0) {
+        if (cancelled) return
+        setPendingHandoff(recovered.pendingHandoff)
+        setConfig(recovered)
+        setPhase('handoff')
+        return
+      }
       const { nodes: raw, errors } = await loadRun(props.fs, runDir)
       const now = new Date().toISOString()
       const validated = validateLoadedNodes(raw, {
@@ -797,6 +815,35 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
   }, [runDir, runId, seed, props.fs, props.runAgent, props.signal, props.controller, recordOutcome, store, setAppState])
 
+  /**
+   * 执行收口选择,然后把待收口记录从 run.md 里划掉。
+   *
+   * 划掉这一步不能省:留着的话,下一次 `/et --resume` 会为一条**已经合并/推送/删掉**的
+   * 分支再弹一次四选一 —— 而「丢弃」那一项会对着一条不存在的分支报错。
+   */
+  const settleHandoff = React.useCallback(async (choice: HandoffChoice) => {
+    const h = pendingHandoff
+    if (!h || !runId) return
+    let result: HandoffResult
+    try {
+      result = await runHandoffChoice(choice, h, gitRunner, getCwd())
+    } catch (e) {
+      result = { ok: false, message: `收口失败: ${e instanceof Error ? e.message : String(e)}` }
+    }
+    // 只有真的成功了才划掉。失败(冲突、脏树、推不上去)必须让它留着,用户下次还能回来 ——
+    // 而且关口刚刚已经如实告诉他失败了什么。
+    if (result.ok) {
+      try {
+        const { config: cur } = await readRunManifest(props.fs, `${effRoot}/${runId}`)
+        const { nodes } = await loadRun(props.fs, `${effRoot}/${runId}`)
+        const cleared = { ...cur, pendingHandoff: undefined }
+        await writeRunManifest(props.fs, `${effRoot}/${runId}`, cleared, nodes)
+      } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
+    }
+    setHandoffResult(result)
+    setPhase('done')
+  }, [pendingHandoff, runId, effRoot, props.fs])
+
   // ---- 启动关口第三关: 起草根方案 + 首层任务树 (spec §2) ----
   React.useEffect(() => {
     if (phase !== 'drafting' || !approved) return
@@ -1022,6 +1069,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   if (phase === 'recovering') {
     return <MessageView title="高效任务 · 恢复" body={`正在读取并校验 run ${runId ?? ''}…`} tone="dim" onDismiss={bail} />
   }
+  if (phase === 'handoff' && pendingHandoff) {
+    return (
+      <ConfirmHandoff
+        handoff={pendingHandoff}
+        runId={runId ?? ''}
+        onDecision={choice => { void settleHandoff(choice) }}
+        onSkip={() => { void settleHandoff('keep') }}
+      />
+    )
+  }
   if (phase === 'parsing' || !config) {
     return <ParsingView onCancel={bail} />
   }
@@ -1089,7 +1146,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   if (phase === 'running') {
     return <RunningView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} pool={poolRead.current ?? undefined} onAbort={props.abort} />
   }
-  return <DoneView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} outcome={outcome} handoff={handoff} viewOnly={viewOnly} onExit={props.onExit} />
+  return <DoneView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} outcome={outcome} handoff={handoff} handoffResult={handoffResult} viewOnly={viewOnly} onExit={props.onExit} />
 }
 
 /** A one-line status/error screen that can always be dismissed. */
@@ -1143,6 +1200,13 @@ export function DoneView(props: {
   outcome: Outcome | null
   handoff: HandoffSummary | null
   /**
+   * 刚刚那次收口动作的结果。
+   *
+   * 必须显示:合并冲突、脏工作区、推送失败之后如果只是安静地回到 done,用户会以为
+   * 成功了 —— 而代码根本不在他的分支上。这是这个功能最不能出的错。
+   */
+  handoffResult?: HandoffResult | null
+  /**
    * 仅查看后退出 (spec §17.3): this view is doubling as a read-only browser for a run the user
    * chose NOT to continue. Nothing ran, so the summary must not say 被阻断 — that would report
    * a failure the user's own keystroke caused, about a run that is still perfectly resumable.
@@ -1171,8 +1235,14 @@ export function DoneView(props: {
           ? <Text dimColor>这个 run 原样留在盘上,想继续跑: /et --resume {props.runId}</Text>
           : null}
         {!props.viewOnly && props.outcome?.reason ? <Text dimColor>原因: {props.outcome.reason}</Text> : null}
+        {/* 收口结果排在最前:失败的话它是这一屏最重要的一行。用颜色区分,而不是让一条
+            「合并失败」和一堆灰色说明混在一起。 */}
+        {props.handoffResult
+          ? <Text color={props.handoffResult.ok ? 'success' : 'error'}>{props.handoffResult.message}</Text>
+          : null}
+        {props.handoffResult?.followUps?.map(l => <Text key={l} dimColor>{l}</Text>) ?? null}
         {props.handoff
-          ? handoffLines(props.handoff).map(l => <Text key={l} dimColor>{l}</Text>)
+          ? handoffLines(props.handoff, props.runId).map(l => <Text key={l} dimColor>{l}</Text>)
           : null}
         <Text dimColor>q / Esc 退出 · 回车看节点详情</Text>
       </Box>
