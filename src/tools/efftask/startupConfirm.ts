@@ -43,16 +43,6 @@ export function clip(s: string, max = 80): string {
 }
 
 /**
- * Toggle one role on a phase, returning a NEW roster.
- *
- * Pure so the gate's edit logic is testable without mounting anything — the gate itself is
- * keyboard plumbing around this.
- *
- * `observer` is deliberately allowed to be empty and everything else is too: an empty phase
- * means 主模型 (and, for observer, "no scoring at all"), which rosterLines already renders
- * correctly. Refusing to empty a phase would make the editor unable to undo its own additions.
- */
-/**
  * Phases that run a ROUNDTABLE — every bound role is dispatched, in parallel, and all must
  * pass. Everything else runs `firstRole`, i.e. index 0 and nothing else.
  *
@@ -63,6 +53,16 @@ export function clip(s: string, max = 80): string {
  */
 export const MULTI_ROLE_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['review', 'accept'])
 
+/**
+ * Toggle one role on a phase, returning a NEW roster.
+ *
+ * Pure so the gate's edit logic is testable without mounting anything — the gate itself is
+ * keyboard plumbing around this.
+ *
+ * `observer` is deliberately allowed to be empty and everything else is too: an empty phase
+ * means 主模型 (and, for observer, "no scoring at all"), which rosterLines already renders
+ * correctly. Refusing to empty a phase would make the editor unable to undo its own additions.
+ */
 export function toggleRole(
   roster: Record<PhaseName, RoleBinding[]>, phase: PhaseName, roleName: string, model?: string,
 ): Record<PhaseName, RoleBinding[]> {
@@ -416,28 +416,6 @@ export function relativeTime(iso: string, nowMs: number): string {
 }
 
 /**
- * Push a confirmed roster onto the nodes that will actually dispatch with it.
- *
- * WITHOUT this the resume gate's roster editor is decorative. Every dispatch site reads
- * `node.phaseRoles`, never `config.phaseRoles`: `firstRole()` for plan/execute/observer, the
- * roundtables for review/accept, and `createChildren`, which copies the parent's roster onto
- * every child it mints. `config.phaseRoles` reaches the tree in exactly one place —
- * `makeRootNode(cfg)` — and that runs only when the orchestrator gets NO seed. A resume always
- * passes a seed, so the edited roster was read by nothing at all.
- *
- * It was worse than inert. `writeRunManifest` persists `cfg.phaseRoles`, so run.md recorded the
- * edit while every node.md kept the old one, and the NEXT resume read that manifest back and
- * showed the user a roster no node was using. An acceptance reviewer reproduced the whole
- * chain: gate edited to `architect`/`qa`, dispatch went to the ghost role the edit was meant
- * to replace.
- *
- * ACCEPTED nodes are left alone, per §17.5's existing stance that a resume 「不修改已 ACCEPTED
- * 的节点」: their review and acceptance records were produced BY the old panel, and rewriting
- * the roster there would misattribute finished work. BLOCKED nodes are updated — they are
- * precisely what `--retry-blocked` reopens, and a retry should use the roster the user just
- * confirmed.
- */
-/**
  * 非 git 仓库/隔离不可用时,摆在用户面前的**选择** —— spec §8.
  *
  * 「若当前目录非 git 仓库 → 提示用户……并允许选择『改用共享工作目录串行执行』降级
@@ -467,6 +445,12 @@ export function isolationChoiceLines(reason: string, canInitGit: boolean): strin
   ]
 }
 
+/**
+ * Did the user actually change the roster at the gate?
+ *
+ * The gate for `applyRosterToNodes` below. Order counts as a change too: the single-seat
+ * phases dispatch `firstRole`, i.e. index 0 and nothing else, so reordering IS reassigning.
+ */
 export function rosterEquals(
   a: Record<PhaseName, RoleBinding[]>, b: Record<PhaseName, RoleBinding[]>,
 ): boolean {
@@ -477,6 +461,33 @@ export function rosterEquals(
   })
 }
 
+/**
+ * Push a confirmed roster onto the nodes that will actually dispatch with it.
+ *
+ * Called ONLY when `rosterEquals` says the user changed something — an unconditional write
+ * wiped the live roles off every node.md whenever run.md was unreadable (readRunManifest
+ * falls back to an empty roster, while the node files are the surviving truth), and flattened
+ * §4.2's per-node override on every resume even when nothing was edited.
+ *
+ * WITHOUT this the resume gate's roster editor is decorative. Every dispatch site reads
+ * `node.phaseRoles`, never `config.phaseRoles`: `firstRole()` for plan/execute/observer, the
+ * roundtables for review/accept, and `createChildren`, which copies the parent's roster onto
+ * every child it mints. `config.phaseRoles` reaches the tree in exactly one place —
+ * `makeRootNode(cfg)` — and that runs only when the orchestrator gets NO seed. A resume always
+ * passes a seed, so the edited roster was read by nothing at all.
+ *
+ * It was worse than inert. `writeRunManifest` persists `cfg.phaseRoles`, so run.md recorded the
+ * edit while every node.md kept the old one, and the NEXT resume read that manifest back and
+ * showed the user a roster no node was using. An acceptance reviewer reproduced the whole
+ * chain: gate edited to `architect`/`qa`, dispatch went to the ghost role the edit was meant
+ * to replace.
+ *
+ * ACCEPTED nodes are left alone, per §17.5's existing stance that a resume 「不修改已 ACCEPTED
+ * 的节点」: their review and acceptance records were produced BY the old panel, and rewriting
+ * the roster there would misattribute finished work. BLOCKED nodes are updated — they are
+ * precisely what `--retry-blocked` reopens, and a retry should use the roster the user just
+ * confirmed.
+ */
 export function applyRosterToNodes(
   nodes: TaskNode[],
   phaseRoles: Record<PhaseName, RoleBinding[]>,

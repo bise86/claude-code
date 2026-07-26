@@ -331,3 +331,26 @@ describe('spec §8:隔离不可用时,关口把它呈现成一个选择', () => 
     app.unmount()
   })
 })
+
+
+describe('启动关口:每一种改动都要通知调用方', () => {
+  // 验收评审实测:删掉 '←' / '-' 上的 props.onEdited?.(),两个关口都不红 —— 只测了右方向键
+  // 和名册切换。调**小**并行数之后被飞书抢跑,就不会有那句你的修改没有生效。
+  it('左方向键也要通知', async () => {
+    for (const key of [String.fromCharCode(27) + '[D', '-']) {
+      let edited = 0
+      const t = fakeTty()
+      const app = await render(
+        React.createElement(ConfirmStartup as never, {
+          config, availableRoles: ['architect'], onEdited: () => { edited++ }, onDecision: () => {},
+        } as never),
+        { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await new Promise(r => setTimeout(r, 20))
+      t.stdin.press(key)
+      await new Promise(r => setTimeout(r, 20))
+      expect(edited).toBeGreaterThan(0)
+      app.unmount()
+    }
+  })
+})

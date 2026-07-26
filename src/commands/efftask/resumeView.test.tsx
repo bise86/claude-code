@@ -325,7 +325,10 @@ describe('ConfirmResume (vendored renderer)', () => {
     // 飞书赢 → 终端这边的编辑被静默丢弃。ConfirmStartup 为此专门发一条 system 提示;
     // 恢复关口原本连 onEdited 都没接,那条提示在恢复路径上是死代码 —— 而这个关口刚刚才
     // 开始邀请用户编辑名册,等于把可被丢弃的东西从"并行数"扩大到"并行数 + 名册"。
-    for (const keys of [['r', ' '], [ESC + '[C']] as const) {
+    // 左方向键也算改动。第一版只走了右方向键和名册切换,验收评审实测:把 '←' 那条上的
+    // onEdited 删掉,两个关口都不红 —— 调**小**并行数之后被飞书抢跑,就没有那句
+    // '你的修改没有生效'。
+    for (const keys of [['r', ' '], [ESC + '[C'], [ESC + '[D'], ['-'], ['+']] as const) {
       let edited = 0
       const { stdin, stdout } = fakeTty()
       const app = await render(
