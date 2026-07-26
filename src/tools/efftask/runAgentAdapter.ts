@@ -61,6 +61,14 @@ export function makeRunAgentFn(deps: {
   // they just must not be able to WRITE it. (The one-shot config-extraction call is the
   // only no-tools caller, and it gets its own RunAgentFn.)
   readOnlyTools: Tools
+  /**
+   * 测试验证档:只读 + 能跑命令。
+   *
+   * 明确记下它挡不住什么:Bash 本身就能写(echo >、sed -i、git apply),所以这一档
+   * 相对 execute 减掉的是**便利**,不是能力。真正证明「它没改代码」的是流水线在这一场
+   * 前后比对 worktree 的 git status —— 工具清单只是第一道,不是那道。
+   */
+  verifyTools?: Tools
   activeAgents: AgentDefinition[]
   mainModelDefault: AgentDefinition
   /**
@@ -86,7 +94,11 @@ export function makeRunAgentFn(deps: {
     if (req.signal.aborted) return ''
     const picked = pickAgentDefinition(req.role, deps.activeAgents, deps.mainModelDefault)
     // Per-phase tool gating: only the execute phase gets the write-capable tool pool.
-    const tools: Tools = req.phase === 'execute' ? deps.availableTools : deps.readOnlyTools
+    // 三档:执行拿全部;测试验证拿只读 + 跑命令;其余只读。
+    const tools: Tools =
+      req.phase === 'execute' ? deps.availableTools
+      : req.phase === 'verify' ? (deps.verifyTools ?? deps.readOnlyTools)
+      : deps.readOnlyTools
     /**
      * Strip the role's OWN MCP servers outside the execute phase.
      *

@@ -59,6 +59,8 @@ import { logError } from '../../utils/log.js'
 // Read-only tool pool for plan/review/accept/observer: they must be able to READ the repo
 // to judge anything, they just must not be able to WRITE it.
 export const READ_ONLY_TOOL_NAMES = new Set(['Read', 'Glob', 'Grep'])
+/** 测试验证档在只读之上多这些 —— 它得能真的跑测试。 */
+export const RUN_COMMAND_TOOL_NAMES = new Set(['Bash', 'BashOutput', 'KillShell'])
 
 const CANCELLED: StartupDecision = { parallelism: 0, approved: false }
 
@@ -170,7 +172,11 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     toolUseContext: context,
     canUseTool,
     availableTools: context.options.tools, // execute phase only
-    readOnlyTools, // plan / review / accept / observer
+    readOnlyTools, // plan / review / accept / integrate / observer
+    // 测试验证要真的把测试跑起来,所以在只读之上加执行命令的能力。
+    verifyTools: context.options.tools.filter(
+      t => READ_ONLY_TOOL_NAMES.has(t.name) || RUN_COMMAND_TOOL_NAMES.has(t.name),
+    ),
     activeAgents,
     mainModelDefault,
     // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded

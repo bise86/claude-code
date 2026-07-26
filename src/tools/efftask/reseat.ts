@@ -22,7 +22,7 @@ import type { Caps, NodeStatus, TaskNode } from './types.js'
  * The real transition it is driven through is a load from disk (see reseat.test.ts).
  */
 const ACTIVE: ReadonlySet<NodeStatus> = new Set<NodeStatus>([
-  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'EXECUTED', 'ACCEPTANCE', 'REWORK',
+  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'EXECUTED', 'VERIFYING', 'ACCEPTANCE', 'REWORK',
   'INTEGRATION_ACCEPT', 'SCORING', 'MERGE',
 ])
 
@@ -36,6 +36,7 @@ const ACTIVE: ReadonlySet<NodeStatus> = new Set<NodeStatus>([
  */
 const PHASE_OF: Partial<Record<NodeStatus, string>> = {
   PLANNING: '方案制定', PLAN_REVIEW: '方案评审', EXECUTING: '执行', EXECUTED: '执行完成待验收',
+  VERIFYING: '测试验证',
   ACCEPTANCE: '验收', REWORK: '返工', INTEGRATION_ACCEPT: '集成验收', SCORING: '观察评分',
   MERGE: '合并回集成分支',
 }

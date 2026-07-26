@@ -121,8 +121,8 @@ export interface PipelineCtx {
  * ACCEPTANCE or INTEGRATION_ACCEPT, so the first-active stamp has already happened.
  */
 const ACTIVE_STATUSES = new Set([
-  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'ACCEPTANCE', 'REWORK', 'INTEGRATION_ACCEPT',
-  'SCORING', 'MERGE',
+  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'VERIFYING', 'ACCEPTANCE', 'REWORK',
+  'INTEGRATION_ACCEPT', 'SCORING', 'MERGE',
 ])
 
 async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineCtx): Promise<boolean> {
@@ -337,7 +337,7 @@ function depsSection(node: TaskNode, ctx: Pick<PipelineCtx, 'byId'>): string {
  * it once keeps the three from drifting, which they already had.
  */
 async function roundtableWithInfraRetry(args: {
-  phase: 'review' | 'accept'
+  phase: 'review' | 'accept' | 'verify'
   node: TaskNode
   roles: RoleBinding[]
   round: number
@@ -504,6 +504,25 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
 }
 // Blank fields must READ as blank. Interpolating an empty acceptance/execStatus renders
 // "验收点:\n执行状态:" — two empty slots a reviewer can wave through as satisfied.
+/**
+ * 测试验证的提示词。
+ *
+ * 和验收的关键差别:它要求**真的把命令跑起来并贴出原始输出**,而不是判断产出描述。
+ * 没有这一步,验收员只能给执行者的散文盖章 —— 这是本 fork 自己反复付过代价的那件事。
+ */
+function verifyPrompt(node: TaskNode, tag: string, brief = ''): string {
+  return (
+    brief +
+    `请**实际运行**验证这次改动,不要只读执行者的自述。\n` +
+    `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
+    `执行者的自述(仅供参考,不能作为通过依据):${quote(node.execStatus) || '(没有报告任何产出)'}\n` +
+    `要求:跑测试/构建/复现步骤,把**实际执行的命令与原始输出**写进 comments;` +
+    `跑不起来、或没有可跑的验证手段,如实说明并判不通过。\n` +
+    `**不要修改代码** —— 你的职责是验证,不是修复。发现问题填进 blocking 交回执行者。\n` +
+    `输出:{ "pass":boolean, "blocking":string[], "comments":"命令与原始输出" }。` +
+    answerRule(tag)
+  )
+}
 function acceptPrompt(node: TaskNode, tag: string, brief = ''): string {
   return (
     brief +
@@ -594,6 +613,24 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
  * 配了「集成提交」就用它;没配则回落到验收席位 —— 那是兼容老 run.md 和没配这个环节的
  * 用户,行为与拆环节之前逐字节相同。
  */
+/**
+ * 测试验证前后的工作区指纹。
+ *
+ * 没有隔离池(非 git 仓库、池初始化失败)或没有本节点的 worktree 时返回 undefined ——
+ * 此时无从比对,**不假装比对过**:静默放行和静默判失败都是撒谎,调用方看到 undefined
+ * 就知道这道闸门这次没生效。
+ */
+async function verifySnapshot(node: TaskNode, ctx: PipelineCtx): Promise<string | undefined> {
+  const wt = node.worktree?.path
+  if (!wt || !ctx.worktrees?.statusFingerprint) return undefined
+  try { return await ctx.worktrees.statusFingerprint(wt) } catch { return undefined }
+}
+
+/** 往 execStatus 追一条编排器注记(不是执行者写的,integratePrompt 会把它过滤掉)。 */
+function appendOrchestratorNote(cur: string, note: string): string {
+  return `${cur}${cur ? '\n' : ''}${ORCHESTRATOR_NOTE}${note})`
+}
+
 function integrateSeats(node: TaskNode): RoleBinding[] {
   const own = node.phaseRoles.integrate ?? []
   return own.length > 0 ? own : (node.phaseRoles.accept ?? [])
@@ -1401,6 +1438,59 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         await ctx.persist(node)
         safeUpdate(ctx)
         return
+      }
+    }
+
+    // 测试验证(spec §7.1)。**只在配了这个环节的角色时存在** —— 没配就整个不发生,
+    // 行为与引入它之前逐字节相同。
+    //
+    // 它和执行是不同的动机:执行者有动机说「做完了」;它和验收是不同的证据:验收判
+    // 「达没达成验收点」读的是产出描述,测试验证判「跑起来对不对」要真的执行命令。
+    // 没有这一步,验收员只能给执行者的散文盖章。
+    if ((node.phaseRoles.verify ?? []).length > 0) {
+      if (!(await commit(node, 'VERIFYING', ctx))) return
+      // 验证者**不该改代码**,而工具清单挡不住这件事:Bash 本身就能写(echo >、sed -i、
+      // git apply)。所以真正的探针是前后比对工作区 —— 断言它的工具集里没有 Edit/Write
+      // 与「它会不会改代码」毫无关系。
+      const before = await verifySnapshot(node, ctx)
+      const v = await roundtableWithInfraRetry({
+        phase: 'verify', node, roles: node.phaseRoles.verify, round: node.iteration.acceptance + 1,
+        system: 'verify',
+        buildPrompt: (tag, seat) => verifyPrompt(node, tag, seatBrief(ctx, seat, 'verify')),
+        ctx, cwd: node.worktree?.path,
+      })
+      node.acceptLog.push(v.rec)
+      const after = await verifySnapshot(node, ctx)
+      if (before !== undefined && after !== undefined && before !== after) {
+        // 它动了工作区。这一轮裁决作废:一个「跑完测试顺手把它改绿」的验证等于没有验证。
+        // 走返工而不是直接阻断 —— 执行者还有预算,而且现在工作区里多了一些没人评审过的
+        // 改动,必须让下一轮把它们纳入正常流程。
+        node.iteration.acceptance++
+        const why = '测试验证环节改动了工作区,该轮裁决作废(验证者只应验证,不应修复)'
+        if (node.iteration.acceptance >= caps.maxIterations) {
+          await blockWithReason(node, `${why};迭代已用尽(${caps.maxIterations})`, ctx, 'rework')
+          return
+        }
+        node.execStatus = appendOrchestratorNote(node.execStatus, why)
+        if (!(await commit(node, 'REWORK', ctx))) return
+        continue
+      }
+      if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
+      if (v.infraExhausted) {
+        await blockWithReason(node, `测试验证角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${v.rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(v.rec))
+        return
+      }
+      if (!v.rec.synthesized.pass) {
+        // 失败走已有的返工路径,和验收失败同一条,共用 iteration.acceptance —— 不新增
+        // 预算维度。但阻断文案要说清是**哪一关**没过,否则升级卡片和 --retry-blocked
+        // 会拿到一句「验收迭代超限」,而其实是测试没跑通。
+        node.iteration.acceptance++
+        if (node.iteration.acceptance >= caps.maxIterations) {
+          await blockWithReason(node, `测试验证迭代超限(${caps.maxIterations}): ${v.rec.synthesized.blockingSummary}`, ctx, 'rework')
+          return
+        }
+        if (!(await commit(node, 'REWORK', ctx))) return
+        continue
       }
     }
 

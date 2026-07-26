@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES } from './types.js'
+import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
@@ -611,16 +611,22 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
     const kept: RoleDef[] = []
     for (const d of rawDefs) {
       const o = (d && typeof d === 'object' ? d : {}) as Record<string, unknown>
+      // `step` 是新键名,`stage` 是旧的;中文别名也收 —— 手改 run.md 的人会照着文档写
+      // 中文。归一到内部 phase 名之后再校验,否则一份合法的手改配置会被判成「不完整」。
+      const rawStep = typeof o.step === 'string' && o.step.length > 0
+        ? o.step
+        : (typeof o.stage === 'string' ? o.stage : '')
+      const step = STEP_ALIASES[rawStep] ?? rawStep
       const ok = typeof o.name === 'string' && o.name.length > 0
-        && typeof o.stage === 'string' && (PHASE_NAMES as string[]).includes(o.stage)
+        && (PHASE_NAMES as string[]).includes(step)
         && typeof o.output === 'string' && o.output.length > 0
         && typeof o.purpose === 'string' && o.purpose.length > 0
       if (!ok) {
-        degraded.push(`run.md 里有一条角色定义不完整(需要 name/stage/output/purpose),已忽略`)
+        degraded.push(`run.md 里有一条角色定义不完整(需要 name/step/output/purpose),已忽略`)
         continue
       }
       kept.push({
-        name: o.name as string, stage: o.stage as PhaseName,
+        name: o.name as string, stage: step as PhaseName,
         output: o.output as string, purpose: o.purpose as string,
         staff: Array.isArray(o.staff) ? o.staff.filter((s): s is string => typeof s === 'string' && s.length > 0) : [],
       })

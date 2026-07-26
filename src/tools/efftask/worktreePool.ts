@@ -326,6 +326,18 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * told about, in worktrees they do not know exist. The work is preserved and invisible,
      * which for them is indistinguishable from lost.
      */
+    /**
+     * 一个工作区当前的改动指纹。
+     *
+     * 给测试验证环节用:那一场跑完之后再取一次,不同就说明验证者动了代码 —— 而工具
+     * 清单挡不住这件事(Bash 能 echo > file)。用 --porcelain 而不是 diff,是因为它同时
+     * 覆盖已跟踪与未跟踪文件:只看 diff 会漏掉「新建一个文件让测试通过」。
+     */
+    async statusFingerprint(cwd: string): Promise<string> {
+      const st = await git(['status', '--porcelain'], cwd)
+      return st.code === 0 ? st.stdout.trim() : `err:${st.code}`
+    },
+
     async handoff(nodes: TaskNode[]): Promise<{
       branch: string
       commits: number

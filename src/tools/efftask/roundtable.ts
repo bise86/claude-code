@@ -71,7 +71,8 @@ export function synthesizeVerdicts(
 }
 
 export async function runRoundtable(args: {
-  phase: 'review' | 'accept'
+  // 'verify' 有自己的工具档位(见 runAgentAdapter):它要能跑命令,而评审/验收只读。
+  phase: 'review' | 'accept' | 'verify'
   node: TaskNode
   roles: RoleBinding[]
   round: number

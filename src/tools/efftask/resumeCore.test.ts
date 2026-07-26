@@ -827,3 +827,36 @@ describe('LEGAL_STATUS 必须覆盖每一个状态,否则节点会被永久判�
     expect(repairs.join('\n')).toContain('非法状态')
   })
 })
+
+describe('角色定义读回要认新环节与新键名', () => {
+  const md = (body: string) => `---\ngoalPrompt: g\nroleDefs:\n${body}---\n\n`
+
+  it('新环节 verify / integrate 读得回来', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md(
+      '  - name: 测试官\n    step: verify\n    output: o\n    purpose: p\n' +
+      '  - name: 集成官\n    step: integrate\n    output: o\n    purpose: p\n') }), '/r')
+    expect(config.roleDefs?.map(d => d.stage)).toEqual(['verify', 'integrate'])
+    expect(degraded).toEqual([])
+  })
+
+  it('旧键名 stage 仍然读得回来 —— 老 run.md 不能一夜作废', async () => {
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': md(
+      '  - name: 架构师\n    stage: review\n    output: o\n    purpose: p\n') }), '/r')
+    expect(config.roleDefs?.[0].stage).toBe('review')
+  })
+
+  it('手改 run.md 写中文环节名 → 归一,而不是判成「不完整」', async () => {
+    // 用户照着文档写的就是中文。归一之前先校验的话,一份合法的手改配置会被判死。
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md(
+      '  - name: 测试官\n    step: 测试验证\n    output: o\n    purpose: p\n') }), '/r')
+    expect(config.roleDefs?.[0].stage).toBe('verify')
+    expect(degraded).toEqual([])
+  })
+
+  it('真正的非法环节名仍然被剔除', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md(
+      '  - name: 安全审计员\n    step: 安全审计\n    output: o\n    purpose: p\n') }), '/r')
+    expect(config.roleDefs).toBeUndefined()
+    expect(degraded.join('\n')).toContain('不完整')
+  })
+})

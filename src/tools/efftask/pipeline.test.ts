@@ -3054,3 +3054,98 @@ describe('集成提交是自己的环节,不再借用验收席位', () => {
     expect(prompt).toContain('逐条核对验收点')
   })
 })
+
+describe('测试验证环节(spec §7.1)', () => {
+  const ready = (verify: { roleName: string }[]) => {
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), verify }
+    return n
+  }
+  const agent = (verifyPasses: boolean, seen?: { phases: string[]; prompts: string[] }): RunAgentFn =>
+    async req => {
+      seen?.phases.push(req.phase)
+      if (req.phase === 'verify') seen?.prompts.push(req.prompt)
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'verify') {
+        return verifyPasses
+          ? vtag(req) + '\n{"pass":true,"blocking":[],"comments":"bun test 全绿"}\n```'
+          : vtag(req) + '\n{"pass":false,"blocking":["测试跑不起来"],"comments":""}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+
+  it('没配这个环节 → 整步不发生,行为与引入它之前一致', async () => {
+    const seen = { phases: [] as string[], prompts: [] as string[] }
+    const n = ready([])
+    await stepExecute(n, ctxFor([n], agent(true, seen), cfg))
+    expect(seen.phases).not.toContain('verify')
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  it('配了就真的跑,而且用自己的 phase 派发(工具档位靠它区分)', async () => {
+    const seen = { phases: [] as string[], prompts: [] as string[] }
+    const n = ready([{ roleName: 'v' }])
+    await stepExecute(n, ctxFor([n], agent(true, seen), { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(seen.phases).toContain('verify')
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  it('提示词要求实际运行,并明确禁止改代码', async () => {
+    const seen = { phases: [] as string[], prompts: [] as string[] }
+    const n = ready([{ roleName: 'v' }])
+    await stepExecute(n, ctxFor([n], agent(true, seen), { ...cfg, phaseRoles: n.phaseRoles }))
+    const p = seen.prompts[0]
+    expect(p).toContain('实际运行')
+    expect(p).toContain('不要修改代码')
+    // 执行者的自述明确标注为「不能作为通过依据」—— 没有这句,它就退化成第二个验收。
+    expect(p).toContain('不能作为通过依据')
+  })
+
+  it('验证不通过 → 返工,而且阻断文案说清是哪一关', async () => {
+    // 说成「验收迭代超限」会让升级卡片和 --retry-blocked 拿到错误诊断:其实是测试没跑通。
+    const n = ready([{ roleName: 'v' }])
+    await stepExecute(n, ctxFor([n], agent(false), { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, maxIterations: 1 } }))
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('测试验证')
+    expect(n.blockedReason).not.toContain('验收迭代超限')
+  })
+
+  it('验证者动了工作区 → 该轮裁决作废并返工', async () => {
+    // 工具清单挡不住这件事:Bash 本身就能写。真正的探针是前后比对工作区。
+    let calls = 0
+    const pool = {
+      statusFingerprint: async () => { calls++; return calls <= 1 ? 'clean' : ' M src/a.ts' },
+    }
+    const n = ready([{ roleName: 'v' }])
+    n.worktree = { branch: 'b', path: '/wt' }
+    const ctx = { ...ctxFor([n], agent(true), { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, maxIterations: 1 } }), worktrees: pool as never }
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('改动了工作区')
+  })
+
+  it('工作区没变 → 裁决照常算数', async () => {
+    // 完整到能走完合并 —— 只给 statusFingerprint 的话会在 mergeAndRelease 里炸,
+    // 那是测试双件不完整,不是被测行为出错。
+    const pool = {
+      statusFingerprint: async () => 'same',
+      commitAndMerge: async () => ({ ok: true }),
+      release: async () => ({ removed: true }),
+    }
+    const n = ready([{ roleName: 'v' }])
+    n.worktree = { branch: 'b', path: '/wt' }
+    const ctx = { ...ctxFor([n], agent(true), { ...cfg, phaseRoles: n.phaseRoles }), worktrees: pool as never }
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  it('没有隔离池时不假装比对过 —— 闸门这次就是没生效', async () => {
+    // 静默放行和静默判失败都是撒谎。undefined 让调用方知道这道闸门没生效。
+    const n = ready([{ roleName: 'v' }])
+    await stepExecute(n, ctxFor([n], agent(true), { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(n.status).toBe('ACCEPTED')
+  })
+})
