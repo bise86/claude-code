@@ -2914,3 +2914,51 @@ describe('方案阶段的多员工:顺序精化,只有一个产出', () => {
     expect(titles).toEqual(['最终一'])
   })
 })
+
+describe('达成结论的圆桌不该因为有席位没打通而被重试', () => {
+  // 实测过的失败:3 席 quorum=60、c 永久失败 → synthesized.pass 已经是 true,却因为
+  // 「所有 failing 都是 infra」继续重试,烧完 maxIterations 桌后以「未能取得任何裁决」
+  // 阻断 —— 而那句话是假的,a、b 都判决了且都通过。
+  const roster = { ...emptyPhaseRoles(), review: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
+  const cCallsFail = (): { agent: RunAgentFn; count: () => number } => {
+    let reviews = 0
+    return {
+      count: () => reviews,
+      agent: async req => {
+        if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        reviews++
+        if (req.role?.roleName === 'c') throw new Error('provider unreachable')
+        return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      },
+    }
+  }
+
+  it('quorum 达标 + 少数派纯 infra → 直接通过,不重试也不阻断', async () => {
+    const { agent, count } = cCallsFail()
+    const n = root()
+    n.phaseRoles = roster
+    await stepStart(n, ctxFor([n], agent, { ...cfg, phaseRoles: roster, caps: { ...DEFAULT_CAPS, quorum: 60 } }))
+    expect(n.status).toBe('READY')
+    expect(n.blockedReason).not.toContain('未能取得任何裁决')
+    // 三席一轮 = 3 次。重试三桌是 9 次。
+    expect(count()).toBe(3)
+  })
+
+  it('通过的那一轮裁决被保留下来,不会被后续重试覆盖掉', async () => {
+    const { agent } = cCallsFail()
+    const n = root()
+    n.phaseRoles = roster
+    await stepStart(n, ctxFor([n], agent, { ...cfg, phaseRoles: roster, caps: { ...DEFAULT_CAPS, quorum: 60 } }))
+    expect(n.reviewLog).toHaveLength(1)
+    expect(n.reviewLog[0].synthesized.pass).toBe(true)
+  })
+
+  it('全票档下同样的局面照旧重试并阻断 —— 默认行为不变', async () => {
+    const { agent, count } = cCallsFail()
+    const n = root()
+    n.phaseRoles = roster
+    await stepStart(n, ctxFor([n], agent, { ...cfg, phaseRoles: roster }))
+    expect(n.status).toBe('BLOCKED')
+    expect(count()).toBe(9)
+  })
+})

@@ -12,10 +12,12 @@ const PHASE_LABEL: Record<PhaseName, string> = {
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { "plan"?: string[], "review"?: string[], "execute"?: string[], "accept"?: string[], "observer"?: string[] },
-  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number },
+  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number },
   "roles": [{ "name": "角色名", "stage": "plan|review|execute|accept|observer", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }] }
 phaseRoles 的值是**员工名**数组(可派发的身份)。
-caps.quorum 是圆桌通过所需的赞成**百分比**(1-100,默认 100 全票);「过半通过」= 50,「三分之二」= 67。
+圆桌通过门槛有两个字段,按用户的说法二选一:
+- 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
+- 用户说**人数**(「至少 2 个人通过」「要 3 票」)→ caps.quorumSeats,就是那个人数。**不要**把人数写进 quorum:「至少 2 人」写成 quorum=2 的含义是 2%,等于 1 票就放行,和用户的意思正好相反。
 caps.maxSeatsPerPhase 是每个阶段最多几席。
 roles 是**任务角色**定义 —— 指令里凡是描述了「某个角色在哪个阶段、产出什么、起什么作用、由谁担当」的,抽到这里。
 角色名可以任意(架构师、安全、前端);stage 必须是那五个之一;staff 填员工名,没说由谁担当就省略。
@@ -51,11 +53,13 @@ export async function parseDirectives(
   // 没有抽取模型时也要把配置文件里的角色接上 —— 否则「在配置文件里配好角色」这条路
   // 只在抽取成功时才通,而抽取失败正是最常走到的退化路径。
   const applyDefs = (cfg: EffTaskConfig, defs: RoleDef[]): EffTaskConfig => {
-    if (defs.length === 0) return cfg
+    // **无条件**跑一遍,即使没有任何角色定义。此前这里是 `if (defs.length === 0) return cfg`,
+    // 于是「用户直接点名员工」这条最常见的路径完全绕开了席位上限:说了「每阶段最多 3 席」
+    // 却拿到 8 席,而 notices 是空的 —— 静默的不是截断,是**没有**截断。
     const applied = applyRoleDefsToPhases(cfg.phaseRoles, defs, cfg.caps.maxSeatsPerPhase)
     cfg.phaseRoles = applied.phaseRoles
     cfg.notices.push(...applied.notices)
-    cfg.roleDefs = defs
+    if (defs.length > 0) cfg.roleDefs = defs
     return cfg
   }
   if (!opts.modelJson) return applyDefs(base, opts.baseRoleDefs ?? [])
@@ -134,6 +138,7 @@ export async function parseDirectives(
   // run.md 再 --resume 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
   if (caps.maxSeatsPerPhase !== undefined) c.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
   if (caps.quorum !== undefined) c.quorum = clampInt(caps.quorum, 1, 100, 100)
+  if (caps.quorumSeats !== undefined) c.quorumSeats = clampInt(caps.quorumSeats, 1, 20, 1)
   base.caps = c
 
   // 提示词里定义的角色,合并到配置文件那一层之上。放在 phaseRoles 解析**之后**,因为

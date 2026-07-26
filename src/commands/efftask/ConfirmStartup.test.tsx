@@ -391,6 +391,6 @@ describe('ConfirmStartup 要显示多对多的代价', () => {
       { stdin: stdin as any, stdout: stdout as any, exitOnCtrlC: false, patchConsole: false },
     )
     await new Promise(r => setTimeout(r, 20))
-    expect(lastFrame()).toContain('60% 通过')
+    expect(lastFrame()).toContain('席位赞成')
   })
 })

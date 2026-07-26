@@ -75,7 +75,7 @@ export function ConfirmStartup(props: {
         if (key.rightArrow || input === 'l') { setRoleIdx((roleRef.current + 1) % available.length); return }
         if (input === ' ') {
           const name = available[roleRef.current]
-          setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name)))
+          setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name), props.config.caps.maxSeatsPerPhase))
           setEdited(true)
           props.onEdited?.()
           return

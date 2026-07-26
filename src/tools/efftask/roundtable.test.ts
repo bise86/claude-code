@@ -279,3 +279,41 @@ describe('法定人数一路接到圆桌上', () => {
     expect((await panel()).synthesized.pass).toBe(false)
   })
 })
+
+describe('quorumSeats:人数说法有自己的字段', () => {
+  const v = (role: string, pass: boolean, extra: Partial<Verdict> = {}): Verdict =>
+    ({ role, pass, blocking: pass ? [] : ['不行'], comments: '', ...extra })
+
+  it('「至少 2 席赞成」就是 2 席,不是 2%', () => {
+    // 把「至少 2 人」抽成 quorum=2 的含义是 2%,等于 1 票就放行 —— 用户想收紧,实得
+    // 几乎没有门槛,而且错在**放宽**方向。
+    expect(synthesizeVerdicts([v('a', true), v('b', false), v('c', false)], undefined, 2).pass).toBe(false)
+    expect(synthesizeVerdicts([v('a', true), v('b', true), v('c', false)], undefined, 2).pass).toBe(true)
+  })
+
+  it('与百分比并用时取更严的那个', () => {
+    const four = [v('a', true), v('b', true), v('c', true), v('d', false)]
+    // 比例够(75% ≥ 60)但席位不够(3 < 4)→ 不通过。
+    expect(synthesizeVerdicts(four, 60, 4).pass).toBe(false)
+    // 席位够(3 ≥ 3)但比例不够(75% < 80)→ 不通过。
+    expect(synthesizeVerdicts(four, 80, 3).pass).toBe(false)
+    expect(synthesizeVerdicts(four, 60, 3).pass).toBe(true)
+  })
+
+  it('比例判定用整数乘法 —— 三分之二不该被浮点判负', () => {
+    // (2*100)/3 = 66.666… ,和 66 比较时浮点没问题,但乘法形式让「刚好达到」在数学上
+    // 可判定,不依赖十进制舍入。
+    expect(synthesizeVerdicts([v('a', true), v('b', true), v('c', false)], 66).pass).toBe(true)
+    expect(synthesizeVerdicts([v('a', true), v('b', true), v('c', false)], 67).pass).toBe(false)
+  })
+
+  it('NaN 退回全票,而不是让一个全票赞成的面板也不通过', () => {
+    // Math.round(NaN) 是 NaN,两个比较分支对 NaN 都为假 → 永远过不去的圆桌。
+    expect(synthesizeVerdicts([v('a', true), v('b', true)], Number.NaN).pass).toBe(true)
+    expect(synthesizeVerdicts([v('a', true), v('b', false)], Number.NaN).pass).toBe(false)
+  })
+
+  it('quorumSeats 是 NaN 时不参与判定', () => {
+    expect(synthesizeVerdicts([v('a', true), v('b', true)], undefined, Number.NaN).pass).toBe(true)
+  })
+})

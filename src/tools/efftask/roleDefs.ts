@@ -338,7 +338,10 @@ export function applyRoleDefsToPhases(
       seats = seats.slice(0, 1)
     }
     // 席位上限。放在单席位裁剪之后,免得对 plan/execute/observer 报两遍同一件事。
-    const cap = Math.max(1, Math.round(maxSeats))
+    // NaN 会让 `seats.length > cap` 恒为假 —— 上限**静默失效**,12 席全部放行且没有
+    // 任何 notice。退回默认值而不是放行。
+    const rounded = Math.round(maxSeats)
+    const cap = Number.isFinite(rounded) ? Math.max(1, rounded) : DEFAULT_MAX_SEATS_PER_PHASE
     if (seats.length > cap) {
       notices.push(`${PHASE_LABEL[p]}:席位上限 ${cap},已忽略 ${seats.slice(cap).map(describeSeat).join('、')}(可调 caps.maxSeatsPerPhase)`)
       seats = seats.slice(0, cap)

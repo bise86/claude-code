@@ -40,6 +40,6 @@ describe('两个界面必须说同一件事', () => {
 
   it('不是全票时卡片也要说', () => {
     const c = cfg({ caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 1, quorum: 60 } })
-    expect(text(c)).toContain('60% 通过')
+    expect(text(c)).toContain('需 60% 席位赞成')
   })
 })

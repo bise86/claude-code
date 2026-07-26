@@ -25,19 +25,33 @@ export function synthesizeVerdicts(
    * 该走 isInfraOnlyFailure 的重试,不该被算成反对票。
    */
   quorum?: number,
+  /** 通过所需的赞成**席位数**。与 quorum 并用时取更严的那个。 */
+  quorumSeats?: number,
 ): { pass: boolean; blockingSummary: string } {
   const failing = verdicts.filter(v => !v.pass || v.blocking.length > 0)
   // 判决过的席位(排除 infra)。全都是 infra → 分母为 0 → 不通过,交给重试逻辑。
   const judged = verdicts.filter(v => !v.infra)
   const approving = judged.filter(v => v.pass && v.blocking.length === 0).length
-  const need = Math.min(100, Math.max(1, Math.round(quorum ?? 100)))
+  // NaN 要退回全票,不能让它穿过去:Math.round(NaN) 是 NaN,而下面两个分支对 NaN
+  // 都为假 —— 结果是**全票赞成的面板也不通过**,一个永远过不去的圆桌。
+  const rawNeed = Math.round(quorum ?? 100)
+  const need = Number.isFinite(rawNeed) ? Math.min(100, Math.max(1, rawNeed)) : 100
   // judged.length > 0 是**显式**的,而不是靠 0/0 = NaN 在下面的比较里恰好为假 —— 全是
   // infra 时必须不通过,好让 isInfraOnlyFailure 去重试。
-  const pass = verdicts.length > 0 && judged.length > 0
-    && (need >= 100
-      // 全票走原来那条路径,避免浮点比例在「刚好全票」上出现意外。
+  // 整数比较,不走浮点:2/3 在 (2*100)/3 >= 67 下是 66.666… < 67,而用户说「三分之二」
+  // 想的就是这个场景。乘法形式让「刚好达到」在数学上可判定。
+  // 只写了 quorumSeats(「至少 2 人通过」)时,比例这一维**不设限** —— 那句话的意思是
+  // 把门槛换成 2 席,不是「2 席**并且**全票」。两个都写才两个都要满足(取更严的)。
+  const seatsOnly = quorum === undefined && quorumSeats !== undefined
+  const byRatio = seatsOnly ? true
+    : need >= 100
+      // 全票走原来那条路径,与引入本旋钮之前逐字节相同(包括「有 infra 就不通过 → 重试」)。
       ? failing.length === 0
-      : (approving * 100) / judged.length >= need)
+      : approving * 100 >= need * judged.length
+  const rawSeats = Math.round(quorumSeats ?? 0)
+  const bySeats = quorumSeats === undefined || !Number.isFinite(rawSeats)
+    || approving >= Math.max(1, rawSeats)
+  const pass = verdicts.length > 0 && judged.length > 0 && byRatio && bySeats
   const blockingSummary = failing
     .flatMap(v =>
       // A verdict can fail (pass:false) with an EMPTY blocking list. Falling back to its
@@ -143,5 +157,5 @@ export async function runRoundtable(args: {
     return { role: roleName || 'main', ...tag, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true, ...(timedOut ? { timeout: true } : {}) }
   })
   // 阻断项**照样全部汇总**,即使已经达到法定人数 —— 少数派的意见不因为没挡住就消失。
-  return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts, args.quorum) }
+  return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts, args.quorum, args.quorumSeats) }
 }

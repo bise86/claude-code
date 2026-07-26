@@ -520,7 +520,10 @@ export function validateLoadedNodes(
 }
 
 const clampInt = (v: unknown, lo: number, hi: number, dflt: number): number => {
-  const n = typeof v === 'number' ? Math.trunc(v) : Number.NaN
+  // Math.round,与 parseDirectives 的同名函数一致。两路对小数取整不同(60.5 → 60 vs 61)
+  // 就意味着「手改 run.md」和「说给抽取模型听」会得到不同的值,而这两条路必须等价 ——
+  // 否则 resume 会静默改掉一个用户从没改过的门槛。
+  const n = typeof v === 'number' ? Math.round(v) : Number.NaN
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt
 }
 
@@ -587,6 +590,7 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   // 手改 run.md 是一条绕开 parseDirectives 全部校验的路,所以这里重做同样的夹取。
   if (caps.maxSeatsPerPhase !== undefined) rebuilt.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
   if (caps.quorum !== undefined) rebuilt.quorum = clampInt(caps.quorum, 1, 100, 100)
+  if (caps.quorumSeats !== undefined) rebuilt.quorumSeats = clampInt(caps.quorumSeats, 1, 20, 1)
   base.caps = rebuilt
 
   const pr = (fm.phaseRoles ?? {}) as Record<string, unknown>

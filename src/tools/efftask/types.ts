@@ -262,6 +262,14 @@ export interface Caps {
    * 分母**不含 infra 失败**:调用没打通不是一票反对,那种情形由 isInfraOnlyFailure 走重试。
    */
   quorum?: number
+  /**
+   * 通过所需的**赞成席位数**(绝对数),和 quorum 二选一或并用(并用时取更严的那个)。
+   *
+   * 为什么百分比不够:用户会说「至少 2 个人通过」。那句话抽成 quorum=2 会落在合法区间
+   * 里、夹取不报警,而 2% 的含义是「1 席赞成就放行」—— 用户想收紧,实得几乎没有门槛,
+   * 而且错在**放宽**方向。人数说法必须有自己的字段。
+   */
+  quorumSeats?: number
 }
 export const DEFAULT_CAPS: Caps = { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 600_000 }
 /** 一个阶段的席位上限默认值。 */

@@ -89,7 +89,7 @@ export function ConfirmResume(props: {
         if (key.rightArrow || k === 'l') { setRoleIdx((roleRef.current + 1) % available.length); return }
         if (input === ' ') {
           const name = available[roleRef.current]
-          setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name)))
+          setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name), props.config.caps.maxSeatsPerPhase))
           props.onEdited?.()
           return
         }

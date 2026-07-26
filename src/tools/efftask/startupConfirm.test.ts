@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine } from './startupConfirm.js'
+import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -712,7 +713,7 @@ describe('关口要说出多对多的代价', () => {
     const one = costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: 'a' }] } }))
     const three = costLine(mk({ phaseRoles: { ...emptyPhaseRoles(),
       review: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] } }))
-    const n = (s: string) => Number(s.match(/预估最多 (\d+) 次/)![1])
+    const n = (s: string) => Number(s.match(/预估上限 (\d+) 次/)![1])
     expect(n(three)).toBeGreaterThan(n(one))
   })
 
@@ -722,20 +723,85 @@ describe('关口要说出多对多的代价', () => {
     const line = costLine(mk({ parallelism: 5 }))
     expect(line).toContain('次模型调用')
     expect(line).toContain('并发上限仍是 5')
-    expect(line).not.toMatch(/预估最多 \d+ 个?并发/)
+    expect(line).not.toMatch(/预估上限 \d+ 个?并发/)
   })
 
   it('空名册也给得出一个数(每阶段至少主模型一次)', () => {
-    expect(costLine(mk())).toMatch(/预估最多 \d+ 次模型调用/)
+    expect(costLine(mk())).toMatch(/预估上限 \d+ 次模型调用/)
   })
 
   it('不是全票时安全阀行必须说出来', () => {
     // 这条直接改变「什么算通过」,藏起来就是关口在撒谎。
-    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, quorum: 60 } }))).toContain('60% 通过')
+    // 「圆桌 60% 通过」读法太多,文案必须点明是「席位赞成」。
+    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, quorum: 60 } }))).toContain('需 60% 席位赞成')
   })
 
   it('全票是默认,不啰嗦', () => {
-    expect(capsLine(mk())).not.toContain('通过')
-    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, quorum: 100 } }))).not.toContain('% 通过')
+    expect(capsLine(mk())).not.toContain('席位赞成')
+    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, quorum: 100 } }))).not.toContain('席位赞成')
+  })
+})
+
+describe('成本预估必须对得上真实调用数', () => {
+  const mk = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], ...over,
+  })
+  const n = (s: string) => Number(s.match(/每节点最多 (\d+) 次/)![1])
+
+  it('算上圆桌自己的 infra 重试层 —— 那是 maxIterations 的平方,不是一次方', () => {
+    // 漏掉它会低估约 2.5 倍:实测 1 评审席 + 2 验收席、迭代 3 时真实 23 次而旧公式
+    // 承诺 15 次。低估比高估糟 —— 用户按一个偏小的数批准。
+    // 精确值,不用比值:比值断言会被**另一个**阶段的平方项满足 —— 实测把方案阶段的
+    // 平方拆掉,验收阶段的平方仍让比值达标,测试照旧全绿。
+    // 默认 It=3,方案/评审/验收各 1 席,观察 0 席:
+    //   方案阶段 = 3 × (1 + 3×1) = 12;执行阶段 = 3 × (1 + 3×1 + 0) = 12;合计 24。
+    // 任一处平方被拆成一次方都会掉到 18。
+    expect(n(costLine(mk()))).toBe(24)
+    const it2 = n(costLine(mk({ caps: { ...DEFAULT_CAPS, maxIterations: 2 } })))
+    const it4 = n(costLine(mk({ caps: { ...DEFAULT_CAPS, maxIterations: 4 } })))
+    expect(it4 / it2).toBeGreaterThan(2.5)
+  })
+
+  it('算上方案席位 —— 顺序精化每一席都是一次串行调用', () => {
+    // 写死 1 的话,配 4 个方案员工在关口上是免费的,而那正是精化要用户知道的代价。
+    const one = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }] } })))
+    const four = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(),
+      plan: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }, { roleName: 'd' }] } })))
+    expect(four).toBeGreaterThan(one)
+  })
+
+  it('算上观察席 —— 每次验收通过都打一次分,返工可让验收通过多次', () => {
+    const without = n(costLine(mk()))
+    const with1 = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'o' }] } })))
+    expect(with1 - without).toBe(DEFAULT_CAPS.maxIterations)
+  })
+
+  it('措辞是上界,并说明实际通常远低于此', () => {
+    // maxNodes 默认 100 是硬上限而非预期值,一个只想翻译 README 的用户会看到一个
+    // 高出两个数量级的数。不说清口径,用户就学会永远忽略这一行。
+    const line = costLine(mk())
+    expect(line).toContain('预估上限')
+    expect(line).toContain('实际通常远低于此')
+  })
+})
+
+describe('两条夹取路径与 NaN', () => {
+  it('席位上限是 NaN 时退回默认值,不是静默放行', () => {
+    // NaN 会让 `seats.length > cap` 恒为假 —— 12 席全部放行且没有任何 notice。
+    const defs = [{ name: 'r', stage: 'review', output: 'o', purpose: 'p',
+      staff: Array.from({ length: 12 }, (_, i) => `s${i}`) }]
+    const { phaseRoles, notices } = applyRoleDefsToPhases(
+      emptyPhaseRoles() as never, defs as never, Number.NaN)
+    expect(phaseRoles.review).toHaveLength(5)
+    expect(notices.join('\n')).toContain('席位上限')
+  })
+
+  it('关口编辑器的上限是 NaN 时同样退回默认值', () => {
+    let roster: Record<PhaseName, RoleBinding[]> = emptyPhaseRoles()
+    for (const name of ['a', 'b', 'c', 'd', 'e', 'f', 'g']) {
+      roster = toggleRole(roster, 'review', name, undefined, Number.NaN)
+    }
+    expect(roster.review).toHaveLength(5)
   })
 })

@@ -364,12 +364,19 @@ async function roundtableWithInfraRetry(args: {
       phase: args.phase, node: args.node, roles: args.roles, round: args.round,
       system: args.system, prompt: (seat: RoleBinding | null) => args.buildPrompt(tag, seat),
       runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
-      quorum: args.ctx.config.caps.quorum,
+      quorum: args.ctx.config.caps.quorum, quorumSeats: args.ctx.config.caps.quorumSeats,
       onChunk: args.ctx.onChunk ? t => args.ctx.onChunk!(args.node.id, t) : undefined,
       slots: args.ctx.slots,
     })
     if (args.ctx.signal.aborted) return { rec, infraExhausted: false }
-    if (!isInfraOnlyFailure(rec)) return { rec, infraExhausted: false }
+    // 已经达成结论就收工 —— 哪怕有席位没打通。
+    //
+    // 这里此前只看 isInfraOnlyFailure,完全不看 pass。放宽 quorum 之后,「2 席赞成 +
+    // 1 席打不通」的 synthesized.pass 已经是 true,却因为「所有 failing 都是 infra」
+    // 继续重试,烧完 maxIterations 桌之后以 `未能取得任何裁决` 阻断 —— 而那句话是假的:
+    // a、b 都判决了且都通过。前几轮通过的裁决还会被丢掉(只返回最后一个 rec)。
+    // 实测:3 席 quorum=60、c 永久失败 → BLOCKED,9 次评审调用,reviewLog 只剩 1 条。
+    if (rec.synthesized.pass || !isInfraOnlyFailure(rec)) return { rec, infraExhausted: false }
   }
   return { rec, infraExhausted: true }
 }

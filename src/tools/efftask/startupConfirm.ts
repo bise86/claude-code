@@ -1,4 +1,4 @@
-import { PHASE_NAMES } from './types.js'
+import { DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
 
 export interface StartupDecision {
@@ -65,6 +65,13 @@ export const MULTI_ROLE_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['re
  */
 export function toggleRole(
   roster: Record<PhaseName, RoleBinding[]>, phase: PhaseName, roleName: string, model?: string,
+  /**
+   * 席位上限(caps.maxSeatsPerPhase)。省略 = 默认值。
+   *
+   * 关口是第三条能往名册里加人的路径,此前它完全不夹取 —— 用户在这里勾到 8 席,
+   * 上限是 3,没有任何提示。旋钮只在三条路径中的一条上转得动等于没有旋钮。
+   */
+  maxSeats: number = DEFAULT_MAX_SEATS_PER_PHASE,
 ): Record<PhaseName, RoleBinding[]> {
   const cur = roster[phase] ?? []
   // 只对**没有角色标签**的席位生效。带标签的席位来自角色定义(settings.json 或提示词),
@@ -86,6 +93,11 @@ export function toggleRole(
   // 单席位阶段已经被角色定义占满 → 这里无从下手。硬加一席只会让名册多一个永远不跑的
   // 名字(pipeline 取第 [0] 席),而那正是这个关口存在的意义所要防的。
   if (!MULTI_ROLE_PHASES.has(phase) && tagged.length > 0) return roster
+  // 加席时不能越过上限。拒绝而不是悄悄截断:用户按了键却什么都没发生,总好过名册上
+  // 多一个不会跑的名字 —— 而截断的那一席正是他刚刚亲手点的那个。
+  const rounded = Math.round(maxSeats)
+  const cap = Number.isFinite(rounded) ? Math.max(1, rounded) : DEFAULT_MAX_SEATS_PER_PHASE
+  if (!has && MULTI_ROLE_PHASES.has(phase) && cur.length >= cap) return roster
   next[phase] = has
     ? [...tagged, ...free.filter(r => r.roleName !== roleName)]
     // SINGLE-SEAT phases replace rather than append: the run would dispatch only the first
@@ -414,7 +426,12 @@ export function capsLine(config: EffTaskConfig): string {
     ? '评分不触发返工'
     : `评分低于 ${c.scoreThreshold} 触发一轮返工`
   // 全票是默认;不是全票就必须说出来,这条直接改变「什么算通过」。
-  const quorum = c.quorum === undefined || c.quorum >= 100 ? '' : ` · 圆桌 ${c.quorum}% 通过`
+  // 「圆桌 60% 通过」至少有三种读法(需 60% 席位赞成 / 圆桌有 60% 概率通过 / 60% 的
+  // 圆桌会通过)。文案里必须出现「席位」和「赞成」把语义锁死。
+  const parts: string[] = []
+  if (c.quorum !== undefined && c.quorum < 100) parts.push(`需 ${c.quorum}% 席位赞成`)
+  if (c.quorumSeats !== undefined) parts.push(`需至少 ${c.quorumSeats} 席赞成`)
+  const quorum = parts.length > 0 ? ` · 圆桌${parts.join('、')}` : ''
   return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}`
 }
 
@@ -431,12 +448,21 @@ export function capsLine(config: EffTaskConfig): string {
 export function costLine(config: EffTaskConfig): string {
   const c = config.caps
   const seats = (p: PhaseName) => config.phaseRoles[p].length
-  // 每个节点每轮:1 次方案 + 评审席位;执行轮:1 次执行 + 验收席位;打分一次。
-  const planRound = 1 + Math.max(1, seats('review'))
-  const execRound = 1 + Math.max(1, seats('accept'))
-  const perNode = c.maxIterations * (planRound + execRound) + seats('observer')
+  const It = Math.max(1, c.maxIterations)
+  // 方案阶段是**顺序精化**:每一席都是一次串行调用(runPlanRefinement)。写死 1 的话,
+  // 配 4 个方案员工在关口上是免费的 —— 而那正是精化要用户知道的代价。
+  const P = Math.max(1, seats('plan'))
+  const R = Math.max(1, seats('review'))
+  const A = Math.max(1, seats('accept'))
+  // 圆桌**自己**还有一层 infra 重试循环(roundtableWithInfraRetry 最多跑 maxIterations 桌),
+  // 所以是 It 的平方,不是一次方。漏掉它会低估约 2.5 倍 —— 实测 1 评审席 + 2 验收席、
+  // It=3 时真实 23 次而关口承诺 15 次。低估比高估糟:用户按一个偏小的数批准。
+  const planPhase = It * (P + It * R)
+  // 打分在**每一次验收通过后**都跑,而返工循环可以让验收通过多次。
+  const execPhase = It * (1 + It * A + seats('observer'))
+  const perNode = planPhase + execPhase
   const worst = perNode * c.maxNodes
-  return `预估最多 ${worst} 次模型调用(每节点最多 ${perNode} 次 × 节点上限 ${c.maxNodes});并发上限仍是 ${config.parallelism}`
+  return `预估上限 ${worst} 次模型调用(每节点最多 ${perNode} 次 × 节点上限 ${c.maxNodes};实际通常远低于此);并发上限仍是 ${config.parallelism}`
 }
 
 /**
