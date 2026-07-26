@@ -20,17 +20,57 @@ import { readFileSync } from 'node:fs'
 
 const SRC = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
 
+/**
+ * The text of ONE JSX element, start tag to its own `/>`.
+ *
+ * Not a regex over the whole file. A first version used
+ * `/<ConfirmResume[\s\S]*?availableRoles=…/` and it was a FALSE PASS: the lazy match walks
+ * straight past ConfirmResume's own `/>` and finds ConfirmStartup's `availableRoles` further
+ * down, so deleting the prop from ConfirmResume left the gate green. (A fixed-width window
+ * avoided that but broke the other way — measured 381 chars against a 400 budget, so one added
+ * comment line would have made a healthy wire fail.) Slicing the element is exact.
+ */
+function element(name: string): string {
+  const from = SRC.indexOf(`<${name}`)
+  if (from < 0) return ''
+  const to = SRC.indexOf('/>', from)
+  return to < 0 ? '' : SRC.slice(from, to + 2)
+}
+
 describe('efftask.tsx 的接线不能被静默剪断', () => {
   it('恢复关口拿到了恢复出来的任务树 (spec §17.3)', () => {
     // 剪断它:关口退回"只有计数",用户批准的是一个自己看不见形状的 run。
-    expect(SRC).toMatch(/<ConfirmResume[^>]*\bnodes=\{nodes\}/)
+    expect(element('ConfirmResume')).toContain('nodes={nodes}')
   })
 
   it('恢复关口拿到了可编辑的角色名册 (spec §17.3)', () => {
     // 剪断它:关口的 `r` 键进得去编辑器,但里面一个候选角色都没有 —— §17.3 的"名册可改"
     // 退回成一句空话,而它要解决的正是"盘上记的角色本会话已不存在、会被静默降级"。
-    expect(SRC).toMatch(/<ConfirmResume[\s\S]{0,400}?availableRoles=\{dispatchableRoles\(/)
-    expect(SRC).toMatch(/<ConfirmResume[\s\S]{0,400}?roleModel=\{/)
+    expect(element('ConfirmResume')).toContain('availableRoles={dispatchableRoles(')
+    expect(element('ConfirmResume')).toContain('roleModel={')
+  })
+
+  it('关口改出来的名册被写回了节点 (spec §17.3)', () => {
+    // 剪断它:编辑器可以按、可以看、可以确认,还会被写进 run.md —— 然后被整条执行管道
+    // 完全无视,因为派发只读 node.phaseRoles。而 run.md 会开始说谎:它记着一份没有任何
+    // 节点在用的名册,下一次 --resume 又把它读回来展示给用户。
+    expect(SRC).toMatch(/applyRosterToNodes\(nodes,\s*effectiveConfig\.phaseRoles\)/)
+  })
+
+  it('恢复关口的编辑会通知调用方 (飞书竞速的丢弃提示)', () => {
+    // 剪断它:飞书赢了竞速时终端的编辑被静默丢弃,而那条"你的修改没有生效"的提示
+    // 在恢复路径上变回死代码。
+    expect(element('ConfirmResume')).toContain('onEdited={')
+  })
+
+  it('切片函数确实只切到本元素为止', () => {
+    // 这条守的是上面几条断言的**匹配器本身**。ConfirmStartup 也有 availableRoles /
+    // roleModel / onEdited,所以一个越界的匹配器会让"剪断 ConfirmResume 的那三个 prop"
+    // 照样全绿 —— 第一版正是这样,验收之后才发现。
+    const el = element('ConfirmResume')
+    expect(el.startsWith('<ConfirmResume')).toBe(true)
+    expect(el.endsWith('/>')).toBe(true)
+    expect(el).not.toContain('<ConfirmStartup')
   })
 
   it('第三关起草拿到了隔离池 (spec §16)', () => {
@@ -45,11 +85,4 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     expect(SRC).toMatch(/<RunningView[^>]*\bpool=\{/)
   })
 
-  it('这些断言本身不是空的 —— 正则真的能匹配失败', () => {
-    // 一条元断言。上面四条全是"源码里存在某个模式",而写错的正则会永远为真地"通过"……
-    // 不,会永远为假。真正的风险是正则写得太松、剪断后仍然匹配。这里用一个绝不该存在的
-    // 模式反证匹配器确实在工作。
-    expect(SRC).not.toMatch(/<ConfirmResume[^>]*\bnodes=\{undefined\}/)
-    expect(SRC.length).toBeGreaterThan(1000) // 文件真的读进来了
-  })
 })

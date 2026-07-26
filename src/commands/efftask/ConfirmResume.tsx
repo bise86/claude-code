@@ -52,6 +52,16 @@ export function ConfirmResume(props: {
    */
   availableRoles?: string[]
   roleModel?: (roleName: string) => string | undefined
+  /**
+   * Fired the first time the user changes anything here.
+   *
+   * The Feishu surface races this gate and its card carries no roster and a gate-open
+   * parallelism snapshot, so a Feishu win silently discards whatever was edited in the
+   * terminal. The command uses this to SAY so. Without it that warning was dead code on the
+   * resume path — and this gate had just started inviting roster edits, which made the
+   * omission worse than it had been.
+   */
+  onEdited?: () => void
   onDecision: (d: StartupDecision) => void
 }): React.ReactElement {
   const [parallelism, setParallelism, parRef] = useLiveState(clampParallelism(props.config.parallelism))
@@ -80,14 +90,15 @@ export function ConfirmResume(props: {
         if (input === ' ') {
           const name = available[roleRef.current]
           setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name)))
+          props.onEdited?.()
           return
         }
       }
       if (key.return) decide({ approved: true })
       return
     }
-    if (key.leftArrow || input === '-') { setParallelism(clampParallelism(parRef.current - 1)); return }
-    if (key.rightArrow || input === '+' || input === '=') { setParallelism(clampParallelism(parRef.current + 1)); return }
+    if (key.leftArrow || input === '-') { setParallelism(clampParallelism(parRef.current - 1)); props.onEdited?.(); return }
+    if (key.rightArrow || input === '+' || input === '=') { setParallelism(clampParallelism(parRef.current + 1)); props.onEdited?.(); return }
     if (k === 'r') { setEditing(true); return }
     if (key.return || k === 'y') decide({ approved: true })
     else if (k === 'v') decide({ approved: false, viewOnly: true })

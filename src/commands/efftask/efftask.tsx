@@ -33,6 +33,7 @@ import {
   handoffLines,
   exitReportLine,
   applyStartupDecision,
+  applyRosterToNodes,
   dispatchableRoles,
   type HandoffSummary,
 } from '../../tools/efftask/startupConfirm.js'
@@ -858,7 +859,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // root plan would ask the user to confirm a decomposition the run is not going to
         // build, and `confirmedDraft` on a root that already has children would graft a
         // second copy of the first level.
-        if (isResumeGate) { startRun(effectiveConfig); return }
+        if (isResumeGate) {
+          // 名册可编辑 (spec §17.3) only means something if the edit reaches the NODES. Every
+          // dispatch site reads `node.phaseRoles`; `config.phaseRoles` enters the tree solely
+          // through `makeRootNode`, which a seeded (i.e. resumed) run never calls. Without
+          // this the gate's editor was decorative AND run.md recorded a roster no node used —
+          // see applyRosterToNodes.
+          applyRosterToNodes(nodes, effectiveConfig.phaseRoles)
+          startRun(effectiveConfig)
+          return
+        }
         setPhase('drafting')
       })
       .catch(e => {
@@ -910,6 +920,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // can actually dispatch, each rendered with the model it would run on.
         availableRoles={dispatchableRoles(props.knownRoles, props.unsupportedRoles)}
         roleModel={name => effectiveModel(props.agentModels.find(a => a.agentType === name), props.mainModel)}
+        // Same wire ConfirmStartup has, and it was missing here — so the 'Feishu won, your
+        // terminal edits were dropped' warning below was DEAD CODE on the resume path while
+        // this gate had just started inviting roster edits. The card carries no roster.
+        onEdited={() => { terminalEdited.current = true }}
         onDecision={d => terminalClaim.current?.('terminal', d)}
       />
   }

@@ -263,6 +263,103 @@ describe('ConfirmResume (vendored renderer)', () => {
     app.unmount()
   })
 
+  it('同一批到达的按键必须都读到最新游标 —— useLiveState 存在的唯一理由', async () => {
+    // 这条是照 useLiveState 文档里点名实测过的两个 bug 写的:「`↓` 和 `空格` 一起到达时把
+    // 角色绑到了 方案,而光标画在 评审」,以及「`→` + `回车` 确认了一个比屏幕低一档的
+    // 并行数」。ConfirmStartup 有这类回归用例,新关口一条都没抄过来 —— 验收评审用五个
+    // 变异证明:把 phaseRef/roleRef/parRef 换回闭包里的 state,962 个用例一条都不红。
+    const decisions: { parallelism: number; phaseRoles?: Record<string, { roleName: string }[]> }[] = []
+    const { stdin, stdout } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, {
+        config, summary, availableRoles: ['architect', 'security', 'qa'],
+        onDecision: (d: never) => decisions.push(d),
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press('r'); await tick()
+    // ↓ 和 空格 在同一次 read 里到达:游标要先移到 review,空格才生效。
+    stdin.press(ESC + '[B' + ' '); await tick()
+    stdin.press('\r'); await tick()
+    expect(decisions[0].phaseRoles?.review).toEqual([{ roleName: 'architect' }])
+    expect(decisions[0].phaseRoles?.plan).toEqual([]) // 没有绑到光标原来所在的阶段
+    app.unmount()
+  })
+
+  it('同一批到达的 →→ 和 空格,绑的是光标最后停的那个角色', async () => {
+    // 上一条走的是**阶段**游标(phaseRef),这一条走**角色**游标(roleRef)—— 两个 ref
+    // 是分开的,只测一个的话另一个换成陈旧闭包照样全绿(验收评审的变异矩阵抓到了)。
+    const decisions: { phaseRoles?: Record<string, { roleName: string }[]> }[] = []
+    const { stdin, stdout } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, {
+        config, summary, availableRoles: ['architect', 'security', 'qa'],
+        onDecision: (d: never) => decisions.push(d),
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press('r'); await tick()
+    stdin.press(ESC + '[C' + ESC + '[C' + ' '); await tick() // →→ 再空格,全在同一批
+    stdin.press('\r'); await tick()
+    expect(decisions[0].phaseRoles?.plan).toEqual([{ roleName: 'qa' }]) // 不是 architect
+    app.unmount()
+  })
+
+  it('同一批到达的 → 和 回车,确认的是屏幕上那个并行数', async () => {
+    const decisions: { parallelism: number }[] = []
+    const { stdin, stdout } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, onDecision: (d: never) => decisions.push(d) } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press(ESC + '[C' + ESC + '[C' + '\r'); await tick()
+    expect(decisions[0].parallelism).toBe(5) // 3 + 2,不是 3 或 4
+    app.unmount()
+  })
+
+  it('改动要通知调用方 —— 飞书赢了竞速时才有可能说出"你的修改被丢了"', async () => {
+    // 竞速对恢复关口是启用的,而飞书卡片既没有名册通道、并行数也是开关口那一刻的快照。
+    // 飞书赢 → 终端这边的编辑被静默丢弃。ConfirmStartup 为此专门发一条 system 提示;
+    // 恢复关口原本连 onEdited 都没接,那条提示在恢复路径上是死代码 —— 而这个关口刚刚才
+    // 开始邀请用户编辑名册,等于把可被丢弃的东西从"并行数"扩大到"并行数 + 名册"。
+    for (const keys of [['r', ' '], [ESC + '[C']] as const) {
+      let edited = 0
+      const { stdin, stdout } = fakeTty()
+      const app = await render(
+        React.createElement(ConfirmResume, {
+          config, summary, availableRoles: ['architect'],
+          onEdited: () => { edited++ }, onDecision: () => {},
+        } as never),
+        { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      for (const k of keys) { stdin.press(k); await tick() }
+      expect(edited).toBeGreaterThan(0)
+      app.unmount()
+    }
+  })
+
+  it('只是看看(没改任何东西)不算编辑', async () => {
+    // 否则每次恢复都会挂出一条"你的修改没有生效"的提示,而用户什么都没改。
+    let edited = 0
+    const { stdin, stdout } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, {
+        config, summary, availableRoles: ['architect'],
+        onEdited: () => { edited++ }, onDecision: () => {},
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    stdin.press('r'); await tick()      // 进编辑器
+    stdin.press(ESC); await tickEsc()   // 又退出来,什么都没改
+    expect(edited).toBe(0)
+    app.unmount()
+  })
+
   it('没有可用角色时不宣传三个按不动的键', async () => {
     const { stdin, stdout, lastFrame } = fakeTty()
     const app = await render(

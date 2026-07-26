@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
-import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
-import type { EffTaskConfig } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
+import { createNode, DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
+import type { EffTaskConfig, TaskNode } from './types.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -461,5 +461,49 @@ describe('spec §17.1:恢复选择器要显示最后更新时间', () => {
   it('时钟偏差不能渲染成负数', () => {
     // 另一台机器写的 run.md 可能比本机时钟略新。
     expect(relativeTime('2026-07-26T12:05:00.000Z', T)).toBe('刚刚')
+  })
+})
+
+describe('spec §17.3:关口改出来的名册必须落到节点上,否则编辑器是摆设', () => {
+  const node = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: '2026-07-26T00:00:00Z' }),
+    ...over,
+  })
+  const roster = { ...emptyPhaseRoles(), plan: [{ roleName: 'architect' }], review: [{ roleName: 'qa' }] }
+
+  it('未完成的节点换成新名册', () => {
+    // 派发只读 node.phaseRoles:firstRole 走它,圆桌走它,createChildren 还把父节点那份
+    // 抄给每一个新子节点。config.phaseRoles 进入树只有 makeRootNode 一条路,而带 seed 的
+    // (也就是恢复的)run 永远不走那条路 —— 所以改出来的名册此前被任何代码读到过。
+    const n = node({ status: 'READY', phaseRoles: { ...emptyPhaseRoles(), plan: [{ roleName: 'ghost-已不存在' }] } })
+    expect(applyRosterToNodes([n], roster).changed).toBe(1)
+    expect(n.phaseRoles.plan).toEqual([{ roleName: 'architect' }])
+    expect(n.phaseRoles.review).toEqual([{ roleName: 'qa' }])
+  })
+
+  it('已 ACCEPTED 的节点不动 —— 它的评审记录是旧班子做的', () => {
+    // §17.5 的既有立场:恢复「不修改已 ACCEPTED 的节点」。改掉它的名册等于把已完成的工作
+    // 归到一个从没参与过的角色名下。
+    const done = node({ id: 'root/01-a', status: 'ACCEPTED', phaseRoles: { ...emptyPhaseRoles(), plan: [{ roleName: 'old' }] } })
+    const live = node({ id: 'root/02-b', status: 'READY' })
+    expect(applyRosterToNodes([done, live], roster).changed).toBe(1)
+    expect(done.phaseRoles.plan).toEqual([{ roleName: 'old' }])
+    expect(live.phaseRoles.plan).toEqual([{ roleName: 'architect' }])
+  })
+
+  it('BLOCKED 的节点要换 —— --retry-blocked 重开的正是它们', () => {
+    const n = node({ status: 'BLOCKED', capBlocked: true })
+    applyRosterToNodes([n], roster)
+    expect(n.phaseRoles.plan).toEqual([{ roleName: 'architect' }])
+  })
+
+  it('每个节点拿到的是各自的副本,不是共享的同一个数组', () => {
+    // §4.2 允许每节点覆写名册;共享数组会让一次覆写改掉整棵树。
+    const a = node({ id: 'a', status: 'READY' })
+    const b = node({ id: 'b', status: 'READY' })
+    applyRosterToNodes([a, b], roster)
+    a.phaseRoles.plan.push({ roleName: 'extra' })
+    expect(b.phaseRoles.plan).toEqual([{ roleName: 'architect' }])
+    expect(a.phaseRoles.plan).not.toBe(roster.plan)
   })
 })

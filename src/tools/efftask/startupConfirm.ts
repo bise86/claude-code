@@ -1,5 +1,5 @@
 import { PHASE_NAMES } from './types.js'
-import type { EffTaskConfig, PhaseName, RoleBinding } from './types.js'
+import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
 
 export interface StartupDecision {
   parallelism: number
@@ -413,6 +413,45 @@ export function relativeTime(iso: string, nowMs: number): string {
   if (secs < 3600) return `${Math.floor(secs / 60)} 分钟前`
   if (secs < 86400) return `${Math.floor(secs / 3600)} 小时前`
   return `${Math.floor(secs / 86400)} 天前`
+}
+
+/**
+ * Push a confirmed roster onto the nodes that will actually dispatch with it.
+ *
+ * WITHOUT this the resume gate's roster editor is decorative. Every dispatch site reads
+ * `node.phaseRoles`, never `config.phaseRoles`: `firstRole()` for plan/execute/observer, the
+ * roundtables for review/accept, and `createChildren`, which copies the parent's roster onto
+ * every child it mints. `config.phaseRoles` reaches the tree in exactly one place —
+ * `makeRootNode(cfg)` — and that runs only when the orchestrator gets NO seed. A resume always
+ * passes a seed, so the edited roster was read by nothing at all.
+ *
+ * It was worse than inert. `writeRunManifest` persists `cfg.phaseRoles`, so run.md recorded the
+ * edit while every node.md kept the old one, and the NEXT resume read that manifest back and
+ * showed the user a roster no node was using. An acceptance reviewer reproduced the whole
+ * chain: gate edited to `architect`/`qa`, dispatch went to the ghost role the edit was meant
+ * to replace.
+ *
+ * ACCEPTED nodes are left alone, per §17.5's existing stance that a resume 「不修改已 ACCEPTED
+ * 的节点」: their review and acceptance records were produced BY the old panel, and rewriting
+ * the roster there would misattribute finished work. BLOCKED nodes are updated — they are
+ * precisely what `--retry-blocked` reopens, and a retry should use the roster the user just
+ * confirmed.
+ */
+export function applyRosterToNodes(
+  nodes: TaskNode[],
+  phaseRoles: Record<PhaseName, RoleBinding[]>,
+): { changed: number } {
+  let changed = 0
+  for (const n of nodes) {
+    if (n.status === 'ACCEPTED') continue
+    // Fresh copies per node: sharing one array would make a later per-node override (§4.2)
+    // silently edit every other node's roster.
+    n.phaseRoles = Object.fromEntries(
+      PHASE_NAMES.map(p => [p, phaseRoles[p].map(r => ({ ...r }))]),
+    ) as Record<PhaseName, RoleBinding[]>
+    changed++
+  }
+  return { changed }
 }
 
 export interface HandoffSummary {
