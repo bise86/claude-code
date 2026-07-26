@@ -392,7 +392,8 @@ describe('席位上限(caps.maxSeatsPerPhase)', () => {
     const { notices } = applyRoleDefsToPhases(empty() as never, many(7), 5)
     expect(notices.join('\n')).toContain('评审团(s5)')
     expect(notices.join('\n')).toContain('评审团(s6)')
-    expect(notices.join('\n')).toContain('caps.maxSeatsPerPhase')
+    // 关口不能指向一个用户找不到的地方:settings.json 里根本没有 caps 这个键。
+    expect(notices.join('\n')).toContain('在任务提示词里说明')
   })
 
   it('自定义上限生效', () => {

@@ -343,7 +343,7 @@ export function applyRoleDefsToPhases(
     const rounded = Math.round(maxSeats)
     const cap = Number.isFinite(rounded) ? Math.max(1, rounded) : DEFAULT_MAX_SEATS_PER_PHASE
     if (seats.length > cap) {
-      notices.push(`${PHASE_LABEL[p]}:席位上限 ${cap},已忽略 ${seats.slice(cap).map(describeSeat).join('、')}(可调 caps.maxSeatsPerPhase)`)
+      notices.push(`${PHASE_LABEL[p]}:席位上限 ${cap},已忽略 ${seats.slice(cap).map(describeSeat).join('、')}(如需更多,在任务提示词里说明「每阶段最多 N 席」)`)
       seats = seats.slice(0, cap)
     }
     out[p] = seats

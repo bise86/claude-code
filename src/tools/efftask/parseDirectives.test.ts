@@ -326,9 +326,11 @@ describe('提示词里可以定义角色,也可以改配置文件里的角色', 
 
 describe('caps 里两个新旋钮要有正常入口', () => {
   const json = (o: unknown) => async () => '```json\n' + JSON.stringify(o) + '\n```'
-  it('quorum 与 maxSeatsPerPhase 能从提示词抽出来并夹取', async () => {
-    // 只有 readRunManifest 读回而没人写进去的话,它们只能靠手改 run.md 再 --resume
-    // 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
+  it('抽取出来的 caps 能落到配置上并被夹取(modelJson 是桩,不验证抽取本身)', async () => {
+    // 名字要说实话:modelJson 是个忽略入参、直接吐固定 JSON 的桩,所以这条**验不了**
+    // 「那句中文能不能被抽出来」—— 决定那件事的是 EXTRACT_PROMPT 的文字,而它曾经
+    // 把「三分之二」教成 67(2/3 = 66.67 < 67,教科书场景直接不通过)。
+    // 这条只保证:JSON 到了 → 夹取 → 落到 caps 上。
     const cfg = await parseDirectives('过半通过就行,每阶段最多 3 席', {
       knownRoles: [], modelJson: json({ caps: { quorum: 50, maxSeatsPerPhase: 3 } }),
     })
