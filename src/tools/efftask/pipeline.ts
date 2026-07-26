@@ -588,6 +588,21 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
 // accept fan out into a roundtable. Extra plan/execute roles are deliberately ignored.
 // 'observer' is a real caller (scoreNode, and the two SCORING commits). The narrower literal
 // union was simply wrong, and with no typecheck in this repo nothing said so.
+/**
+ * 集成验收这一场坐谁。
+ *
+ * 配了「集成提交」就用它;没配则回落到验收席位 —— 那是兼容老 run.md 和没配这个环节的
+ * 用户,行为与拆环节之前逐字节相同。
+ */
+function integrateSeats(node: TaskNode): RoleBinding[] {
+  const own = node.phaseRoles.integrate ?? []
+  return own.length > 0 ? own : (node.phaseRoles.accept ?? [])
+}
+/** 简报要从席位真正所属的那个环节读,否则回落时会去找一份不存在的角色定义。 */
+function integrateBriefPhase(node: TaskNode): PhaseName {
+  return (node.phaseRoles.integrate ?? []).length > 0 ? 'integrate' : 'accept'
+}
+
 function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
   return node.phaseRoles[phase][0] ?? null
 }
@@ -1483,9 +1498,14 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     // Hold the integration worktree for the whole review: it is what the reviewers read, and
     // concurrent merges rewrite it underneath them.
     const runIntegrate = async () => roundtableWithInfraRetry({
-      phase: 'accept', node, roles: node.phaseRoles.accept,
+      // 集成提交(integrate)自己的席位。
+      //
+      // 回落到 accept 是**兼容**,不是默认:老 run.md 和没配这个环节的用户照旧由验收
+      // 角色承担,行为逐字节不变。但一旦用户配了「集成提交」,它就不再借用验收席位 ——
+      // 此前两者共用 phaseRoles.accept,规范告诉用户这是两个环节,系统却当成一个。
+      phase: 'accept', node, roles: integrateSeats(node),
       round: node.iteration.integration + 1, system: 'integrate',
-      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, 'accept')), // child evidence, NOT acceptPrompt
+      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, integrateBriefPhase(node))), // child evidence, NOT acceptPrompt
       ctx,
       // The INTEGRATION worktree, not the user's tree. This roundtable accepts every
       // decompose node — including root, i.e. the run's final verdict — and under isolation

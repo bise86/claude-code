@@ -2962,3 +2962,95 @@ describe('达成结论的圆桌不该因为有席位没打通而被重试', () =
     expect(count()).toBe(9)
   })
 })
+
+describe('集成提交是自己的环节,不再借用验收席位', () => {
+  // 此前 stepIntegrate 用 phaseRoles.accept:用户只配「验收」,他的验收角色被悄悄拿去
+  // 跑集成验收;用户配了「集成提交」,席位根本到不了这里。规范告诉用户这是两个环节,
+  // 系统却当成一个。
+  const parentWithChild = (roles: Partial<Record<string, { roleName: string; roleTag?: string }[]>>) => {
+    const parent = root()
+    parent.kind = 'decompose'
+    parent.status = 'WAITING_CHILDREN'
+    parent.childIds = ['c1']
+    parent.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    parent.phaseRoles = { ...emptyPhaseRoles(), ...roles } as typeof parent.phaseRoles
+    const child = createNode({ id: 'c1', title: 'c', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'
+    child.execStatus = '子任务做完了'
+    return { parent, child }
+  }
+  const seatsSeen = () => {
+    const seen: (string | undefined)[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'accept') seen.push(req.role?.roleName)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    return { seen, runAgent }
+  }
+
+  it('配了集成提交 → 用它的席位,不用验收的', async () => {
+    const { seen, runAgent } = seatsSeen()
+    const { parent, child } = parentWithChild({
+      accept: [{ roleName: '验收员' }], integrate: [{ roleName: '集成员' }],
+    })
+    await stepIntegrate(parent, ctxFor([parent, child], runAgent, { ...cfg, phaseRoles: parent.phaseRoles }))
+    expect(seen).toEqual(['集成员'])
+  })
+
+  it('没配集成提交 → 回落验收席位,老 run 行为不变', async () => {
+    const { seen, runAgent } = seatsSeen()
+    const { parent, child } = parentWithChild({ accept: [{ roleName: '验收员' }] })
+    await stepIntegrate(parent, ctxFor([parent, child], runAgent, { ...cfg, phaseRoles: parent.phaseRoles }))
+    expect(seen).toEqual(['验收员'])
+  })
+
+  it('叶子验收仍然用验收席位,不会被集成提交抢走', async () => {
+    // 两个环节各归各的:配了集成提交不该改变叶子节点的验收由谁跑。
+    const seen: (string | undefined)[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'accept') seen.push(req.role?.roleName)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'EXECUTED'
+    n.execStatus = '做完了'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: '验收员' }], integrate: [{ roleName: '集成员' }] }
+    await stepExecute(n, ctxFor([n], runAgent, { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(seen).toEqual(['验收员'])
+  })
+
+  it('集成提交席位拿到的是**集成提交**那个角色的简报', async () => {
+    let prompt = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'accept') prompt = req.prompt
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const defs: RoleDef[] = [
+      { name: '集成官', stage: 'integrate', output: '集成裁决', purpose: '核对子任务合起来是否达成父目标', staff: ['集成员'] },
+      { name: '验收官', stage: 'accept', output: '验收裁决', purpose: '不该出现在集成场上', staff: ['验收员'] },
+    ]
+    const { parent, child } = parentWithChild({
+      accept: [{ roleName: '验收员', roleTag: '验收官' }],
+      integrate: [{ roleName: '集成员', roleTag: '集成官' }],
+    })
+    await stepIntegrate(parent, ctxFor([parent, child], runAgent, { ...cfg, roleDefs: defs, phaseRoles: parent.phaseRoles }))
+    expect(prompt).toContain('核对子任务合起来是否达成父目标')
+    expect(prompt).not.toContain('不该出现在集成场上')
+  })
+
+  it('回落时简报从验收那个环节读 —— 否则回落会找一份不存在的定义', async () => {
+    let prompt = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'accept') prompt = req.prompt
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const defs: RoleDef[] = [
+      { name: '验收官', stage: 'accept', output: '验收裁决', purpose: '逐条核对验收点', staff: ['验收员'] },
+    ]
+    const { parent, child } = parentWithChild({ accept: [{ roleName: '验收员', roleTag: '验收官' }] })
+    await stepIntegrate(parent, ctxFor([parent, child], runAgent, { ...cfg, roleDefs: defs, phaseRoles: parent.phaseRoles }))
+    expect(prompt).toContain('逐条核对验收点')
+  })
+})
