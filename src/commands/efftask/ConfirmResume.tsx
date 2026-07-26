@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import type { EffTaskConfig } from '../../tools/efftask/types.js'
+import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
+import { TaskTreePanel } from './TaskTreePanel.js'
 import {
   clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections,
   type ResumeSummary, type StartupDecision,
@@ -25,6 +26,16 @@ export function ConfirmResume(props: {
   config: EffTaskConfig
   summary: ResumeSummary
   isolation?: 'worktree' | 'none'
+  /**
+   * 恢复出的任务树 (spec §17.3 的第一项)。
+   *
+   * The gate listed counts and a repair summary but never showed the tree itself, so a user
+   * was asked to approve spending real money on a run whose shape they could not see: which
+   * branches survived, which are blocked, how much is left. Rendered NON-interactively —
+   * TaskTreePanel's `useInput` is gated on `interactive`, so it cannot steal this gate's
+   * keyboard. Optional so the component still renders standalone.
+   */
+  nodes?: TaskNode[]
   onDecision: (d: StartupDecision) => void
 }): React.ReactElement {
   const [parallelism, setParallelism] = React.useState(clampParallelism(props.config.parallelism))
@@ -58,6 +69,13 @@ export function ConfirmResume(props: {
           ))}
         </Box>
       ))}
+      {/* 恢复出的任务树 (spec §17.3). Non-interactive: TaskTreePanel gates its useInput on
+          `interactive`, so this cannot take the keyboard away from the gate above. Height is
+          clamped because the gate has to stay readable on one screen — `v` opens the full
+          browsable tree for anyone who needs to go deeper. */}
+      {props.nodes && props.nodes.length > 0 ? (
+        <TaskTreePanel nodes={props.nodes} runId={props.summary.runId} maxRows={10} />
+      ) : null}
       <Text dimColor>回车/y 继续执行 · v 仅查看后退出 · Esc/n 取消</Text>
     </Box>
   )

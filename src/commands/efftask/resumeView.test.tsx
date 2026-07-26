@@ -13,7 +13,7 @@ import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { ResumePicker } from './ResumePicker.js'
 import { ConfirmResume } from './ConfirmResume.js'
-import { DEFAULT_CAPS, emptyPhaseRoles } from '../../tools/efftask/types.js'
+import { createNode, DEFAULT_CAPS, emptyPhaseRoles } from '../../tools/efftask/types.js'
 import type { EffTaskConfig } from '../../tools/efftask/types.js'
 import type { ResumeSummary } from '../../tools/efftask/startupConfirm.js'
 import type { RunSummary } from '../../tools/efftask/runRegistry.js'
@@ -36,6 +36,9 @@ function fakeTty() {
   const plain = (): string => frame.replace(/\[[0-9;>?]*[a-zA-Z]/g, ' ').replace(/\u001b/g, '')
   return { stdin, stdout, lastFrame: plain }
 }
+
+const mkNode = (o: { id: string; title: string }) =>
+  createNode({ ...o, parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: '2026-07-26T00:00:00Z' })
 
 const ESC = String.fromCharCode(27)
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, 10))
@@ -168,6 +171,54 @@ describe('ConfirmResume (vendored renderer)', () => {
       expect(decisions[decisions.length - 1]?.approved).toBe(approved)
       app.unmount()
     }
+  })
+
+  it('spec §17.3:恢复关口要显示恢复出来的任务树', async () => {
+    // 关口原本只有计数和修复摘要,树本身一眼都看不到 —— 用户被要求批准"花真金白银继续跑"
+    // 一个自己看不见形状的 run:哪些分支活下来了、哪些是阻断的、还剩多少。
+    const nodes = [
+      { ...mkNode({ id: 'root', title: '根任务' }), status: 'WAITING_CHILDREN', kind: 'decompose', childIds: ['root/01-a'] },
+      { ...mkNode({ id: 'root/01-a', title: '打通登录' }), parentId: 'root', depth: 1, status: 'BLOCKED' },
+    ] as never
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, nodes, onDecision: () => {} } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = lastFrame()
+    expect(f).toContain('打通登录')
+    // 断言的是**状态着色的字形**,不是 `[BLOCKED]` 那串字面量 —— 这个文件的 plain() 会把
+    // `[B` 当成光标转义序列吃掉(见文件顶部注释),所以字面量断言会以一个和实现无关的
+    // 理由失败。字形本身就是 §17.3 要的"状态着色"。
+    expect(f).toContain('✗')
+    expect(f).toContain('根任务')
+    app.unmount()
+  })
+
+  it('嵌进来的树不能把关口的键盘抢走', async () => {
+    // TaskTreePanel 的 useInput 是按 `interactive` 门控的。忘了这一点的话,↑↓ 会同时滚树
+    // 和调并行数,回车的含义也会有两个 —— 这个仓库为"两个 handler 抢同一个键"付过账。
+    const nodes = [{ ...mkNode({ id: 'root', title: '根任务' }), status: 'WAITING_CHILDREN' }] as never
+    const decisions: { approved: boolean }[] = []
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, nodes, onDecision: (d: never) => decisions.push(d) } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    // 断言树是**非交互**渲染的。只按一次回车再看 decisions 抓不到这个问题 —— 两个 handler
+    // 都会收到同一个键,关口照样会收到"继续执行",而树同时把节点详情打开了。所以直接查
+    // 交互模式独有的两样东西:面板自己的按键提示行,和选中行的 ❯ 标记。
+    const f = lastFrame()
+    expect(f).not.toContain('↑↓/jk 移动')
+    expect(f).not.toContain('❯')
+    // 关口自己的提示行仍在,说明少掉的确实是树那一份而不是整块没渲染。
+    expect(f).toContain('回车/y 继续执行')
+    stdin.press('\r')
+    await tick()
+    expect(decisions).toEqual([{ parallelism: 3, approved: true }])
+    app.unmount()
   })
 
   it('"v" is view-only: it declines, and says so DISTINCTLY from a cancellation', async () => {

@@ -901,7 +901,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return <ParsingView onCancel={bail} />
   }
   if (phase === 'confirmResume' && summary) {
-    return <ConfirmResume config={config} summary={summary} isolation={isolation} onDecision={d => terminalClaim.current?.('terminal', d)} />
+    return <ConfirmResume config={config} summary={summary} isolation={isolation} nodes={nodes} onDecision={d => terminalClaim.current?.('terminal', d)} />
   }
   if (phase === 'confirm') {
     return (
