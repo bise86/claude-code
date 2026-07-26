@@ -1,0 +1,80 @@
+import * as React from 'react'
+import { Box, Text, useInput } from '../../ink.js'
+import { useLiveState } from './useLiveState.js'
+import { choiceLabels, discardConfirmLines, type HandoffChoice } from '../../tools/efftask/handoffActions.js'
+import type { PendingHandoff } from '../../tools/efftask/types.js'
+
+/**
+ * 收口关口(spec §8):run 跑完之后,让用户决定集成分支怎么处置。
+ *
+ * 此前这里只有「打印三条要用户自己敲的命令」。现在是一个真的关口 —— 而且是**可恢复**的:
+ * 待收口状态写在 run.md 里,用户按 Esc 或直接关终端之后,`/et --resume` 会把它重新弹出来。
+ *
+ * 无限期等待,不设默认、不自动选(用户明确要求:飞书卡片 7 天,过期就是过期;终端这端
+ * 一直等,两边行为一致)。
+ */
+export function ConfirmHandoff(props: {
+  handoff: PendingHandoff
+  runId: string
+  onDecision: (choice: HandoffChoice) => void
+  /** 用户放弃选择(Esc)。退化成「保留」,不丢任何东西。 */
+  onSkip: () => void
+}): React.ReactNode {
+  const choices = choiceLabels(props.handoff)
+  const [idx, setIdx, idxRef] = useLiveState(0)
+  // 二次确认只给「丢弃」——四个动作里唯一不可逆的那个。
+  const [confirmingDiscard, setConfirming, confirmRef] = useLiveState(false)
+
+  useInput((input, key) => {
+    if (confirmRef.current) {
+      // 二次确认里,只有明确的 y/回车 才算数;其余任何键都退回选择列表。
+      if (key.return || input === 'y' || input === 'Y') { props.onDecision('discard'); return }
+      setConfirming(false)
+      return
+    }
+    if (key.escape) { props.onSkip(); return }
+    if (key.upArrow) { setIdx((idxRef.current + choices.length - 1) % choices.length); return }
+    if (key.downArrow) { setIdx((idxRef.current + 1) % choices.length); return }
+    if (key.return) {
+      const c = choices[idxRef.current].key
+      if (c === 'discard') { setConfirming(true); return }
+      props.onDecision(c)
+    }
+  })
+
+  const h = props.handoff
+  return (
+    <Box flexDirection="column" borderStyle="round" paddingX={1}>
+      <Text bold>高效任务 {props.runId} · 收口</Text>
+      {/* run 的结局要摆在最前面 —— 别邀请用户合并一棵没做完的树。 */}
+      {h.outcome === 'blocked' ? (
+        <Text color="yellow">
+          注意:本次运行**没有正常跑完**（{h.reason || '被阻断或已取消'}）,下面的改动可能是半成品
+        </Text>
+      ) : null}
+      <Text>
+        分支 {h.branch} 上有 {h.commits} 个提交,你的工作区未被改动
+      </Text>
+      {h.integrationPath ? <Text dimColor>集成工作区: {h.integrationPath}</Text> : null}
+      {h.salvage.map(s => <Text key={s} dimColor>中断时抢救出的提交: {s}</Text>)}
+      {h.kept.map(k => <Text key={k.path} dimColor>保留的工作区({k.why}): {k.path}</Text>)}
+
+      {confirmingDiscard ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text bold color="red">确认丢弃?这一步不可逆</Text>
+          {discardConfirmLines(h).map(l => <Text key={l}>{l}</Text>)}
+          <Text dimColor>回车/y 确认丢弃 · 其它任意键返回</Text>
+        </Box>
+      ) : (
+        <Box flexDirection="column" marginTop={1}>
+          {choices.map((c, i) => (
+            <Text key={c.key} color={i === idx ? 'cyan' : undefined}>
+              {i === idx ? '▶ ' : '  '}{c.label} — {c.hint}
+            </Text>
+          ))}
+          <Text dimColor>↑/↓ 选择 · 回车 确认 · Esc 稍后再说(等同「保留」)</Text>
+        </Box>
+      )}
+    </Box>
+  )
+}

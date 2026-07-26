@@ -637,17 +637,20 @@ export function exitReportLine(args: {
 }): string {
   const verb = args.resumed ? '续跑' : ''
   const path = args.withPath ? ` · .claude/efftask/${args.runId}/run.md` : ''
-  const where = args.handoff ? '\n' + handoffLines(args.handoff).join('\n') : ''
+  const where = args.handoff ? '\n' + handoffLines(args.handoff, args.runId).join('\n') : ''
   return `高效任务 ${args.runId} ${verb}${args.how}${path}${where}`
 }
 
-export function handoffLines(h: HandoffSummary): string[] {
+export function handoffLines(h: HandoffSummary, runId?: string): string[] {
   const out = [
     h.commits > 0
       ? `本次改动已合并到分支 ${h.branch}(${h.commits} 个提交),你的工作区未被改动`
       : `本次没有产生任何改动;分支 ${h.branch} 与起点相同`,
   ]
   if (h.commits > 0) {
+    // 现在收口是一个**关口**,不是一串要用户自己敲的命令 —— 但那几行命令仍然保留:
+    // 用户可能按 Esc 跳过关口,也可能想手工来。关口是新增的路,不是把旧路拆了。
+    if (runId) out.push(`稍后收口: /et --resume ${runId} 会重新弹出「合并/推送/保留/丢弃」`)
     out.push(`查看: git log ${h.branch}   合并: git merge ${h.branch}`)
     // 丢弃 gets its own line because it needs TWO commands. The branch is checked out in the
     // integration worktree, and git refuses to delete a checked-out branch — so the old
