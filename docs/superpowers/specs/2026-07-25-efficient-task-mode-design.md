@@ -34,7 +34,9 @@
 - **Run**:一次 `/et` 触发产生的整棵任务树 + 配置 + 集成分支,有唯一 `run-id`。
 - **Node(节点)**:树的一个单元,有状态机、`kind`、依赖、方案内容,持久化为一个目录含 `node.md`。
 - **Phase(阶段)**:节点生命周期里的一步——`方案制定(plan)` / `方案评审(review)` / `任务执行(execute)` / `任务验收(accept)` / `观察评分(observer)`。
-- **Role(角色)**:settings 里 `roles` 的一项(api/cli 两种 execMode),或"主模型"。每个阶段绑定一个或多个角色。
+- **Staff(员工)**:一个**可派发的身份** —— settings 里 `roles[]` 的一项(api/cli 两种 execMode)、`.claude/agents/*.md`、插件 agent、内置 agent,任何 agentType 都算。它自带模型、apiUrl、工具集。**旧称「角色模型」**,改名是因为它和下面的「角色」撞名。
+- **Role(角色)**:任务里的一个**职能** —— 「架构师」「安全」「前端」。角色必须说明:在哪个阶段用、产出什么、起什么作用、由哪些员工担当。见 §7.1。
+- **Seat(席位)**:(角色 × 员工) 的一个具体组合,也就是一次真实的 `runAgent` 调用。`node.phaseRoles[phase]` 存的就是席位列表。多对多:一个员工可担任多个角色,一个角色可由多个员工担任。
 - **Orchestrator(编排器)**:驱动一个 Run 的确定性 TS 引擎实例。
 
 ---
@@ -63,15 +65,19 @@
 - 模块:`src/tools/efftask/parseDirectives.ts`。输入:原始提示词字符串。输出:`EffTaskConfig`:
   ```ts
   type PhaseName = 'plan' | 'review' | 'execute' | 'accept' | 'observer'
-  type RoleBinding = { roleName: string /* settings role 名 或 'main' */; model?: string }
+  // 一个席位。roleName 永远是**员工**名;'' (MAIN_STAFF) = 主模型兼任。
+  // roleTag = 这一席在演哪个任务角色,见 §7.1。
+  type RoleBinding = { roleName: string; model?: string; roleTag?: string }
   interface EffTaskConfig {
     goalPrompt: string                       // 去掉指令后的核心需求
     parallelism: number                      // 默认 5
     phaseRoles: Record<PhaseName, RoleBinding[]>  // 空数组 = 用主模型
     caps: { maxDepth: number; maxNodes: number; maxIterations: number; nodeTimeoutMs: number; scoreThreshold?: number /* 默认 undefined=评分不触发返工 */ }
+    roleDefs?: RoleDef[]                     // 角色定义(§7.1),配置文件 + 提示词合并后的快照
   }
   ```
-- 解析策略:用一次**主模型**调用把自然语言指令(如"评审用 architect+security,执行用 coder,并行3,深度4")抽取成 `EffTaskConfig` 的**建议值**;解析出的角色名对照 settings `roles` 校验,不存在的角色名回退主模型并在确认表里标注。核心需求文本原样作为 `goalPrompt`。
+- 解析策略:用一次**主模型**调用把自然语言指令(如"评审用 architect+security,执行用 coder,并行3,深度4")抽取成 `EffTaskConfig` 的**建议值**;解析出的员工名对照 settings `roles` 校验,不存在的名字回退主模型并在确认表里标注。核心需求文本原样作为 `goalPrompt`。
+- 同一次调用还抽取**角色定义**(§7.1 的 `roles`),与配置文件里的 `efftaskRoles` 合并 —— 提示词可以覆盖配置文件里同名角色的产出/作用,员工取并集。配置文件里的角色在**抽取失败或没有抽取模型时同样生效**:抽取失败是最常走到的退化路径,「配置文件里配好角色」不该只在抽取成功时才通。
 - 解析只产生"建议",最终以 §2 用户确认为准。解析失败(模型没返回合法结构)→ 全部回退默认(并行 5、各阶段主模型)并照常进入确认。
 
 ## 4. 任务树与节点模型
@@ -209,6 +215,54 @@ Run 目录:`.claude/efftask/<run-id>/`(`run-id` = 扫描 `.claude/efftask/` 下�
 - **验收(ACCEPTANCE / INTEGRATION_ACCEPT)**:同上,对 `node.phaseRoles.accept` 并行独立验收执行结果;不通过 → `REWORK`(回 EXECUTING 按意见返工),`iteration.acceptance++`。
 - **观察评分(SCORING,可选)**:若 `node.phaseRoles.observer` 非空,验收通过后由观察角色对"方案质量""执行质量"打分(0-100)+ 理由,写入 `score`。**默认仅记录,不触发返工**;可在 caps 配 `scoreThreshold` 使低于阈值触发一次返工(默认关闭)。
 - 每一轮的角色意见与合成结果都追加进 `reviewLog`/`acceptLog` 并落盘到 `node.md` 的 `## 评审记录`/`## 验收记录`。
+
+### 7.1 角色定义(员工 / 角色 分离)
+
+模块:`src/tools/efftask/roleDefs.ts`(纯函数)、`roleDefsFromSettings.ts`(读配置)。
+
+一个角色**必须**说清四件事,缺任何一项该角色**不生效**并在关口 notices 里说明原因:
+
+| 字段 | 含义 | 必填 |
+|---|---|---|
+| `name` | 角色名,任意取(「架构师」「安全」「前端」) | 是 |
+| `stage` | 在哪个阶段用。**只能是** `plan`/`review`/`execute`/`accept`/`observer` | 是 |
+| `output` | 产出什么 | 是 |
+| `purpose` | 起什么作用 | 是 |
+| `staff` | 由哪些员工担当(员工名数组)。**省略 = 主模型兼任** | 否 |
+
+`stage` 不能自由取名,原因比「配置得进去、永远不执行」更硬:`resumeCore` 和 `startupConfirm` 都用 `Object.fromEntries(PHASE_NAMES.map(…))` 重建 `phaseRoles`,未知阶段键第一次 `--resume` 就被删掉;而 `makeRunAgentFn` 按 `phase === 'execute'` 决定给不给写工具,自由阶段名永远只拿到只读工具集。
+
+**两条录入路径**,提示词覆盖配置文件(同名角色:产出/作用后写的赢,员工取**并集**):
+
+1. **配置文件** —— `settings.json` 顶层 `efftaskRoles`(角色侧),以及 `roles[].efftaskRoles`(员工侧,声明「我能担任哪些角色」)。两侧都受同样的校验,员工侧不是绕过校验的后门。
+2. **任务提示词** —— 凡是描述了「某角色在哪个阶段、产出什么、起什么作用、由谁担当」的,由 `parseDirectives` 抽出来。
+
+```jsonc
+// .claude/settings.json
+{
+  "roles": [
+    { "name": "opus-架构", "whenToUse": "架构评审", "execMode": "api",
+      "apiUrl": "https://…", "apiToken": "sk-…", "model": "claude-opus-4-8",
+      "efftaskRoles": ["架构师"] }          // 员工侧:我能当架构师
+  ],
+  "efftaskRoles": [                          // 角色侧
+    { "name": "架构师", "stage": "review",
+      "output": "通过/阻断裁决与具体阻断项", "purpose": "把关可维护性与回滚路径",
+      "staff": ["opus-架构", "ds-架构"] },   // 一个角色多个员工 → 两席,同一场圆桌
+    { "name": "验收官", "stage": "accept",
+      "output": "验收裁决", "purpose": "逐条核对验收点" }  // 无 staff → 主模型兼任
+  ]
+}
+```
+
+**展平成席位,不做两层圆桌。** `synthesizeVerdicts` 是全体 AND,而 AND 满足结合律,所以 `AND_over_roles(AND_over_staff(v)) ≡ AND_over_all_pairs(v)`。展平之后零新增聚合、零嵌套、infra 重试语义不变、并发溢出回到今天的水平(嵌套会让 `slotPool` 的防自旋兜底按 `1+角色数` 相乘)。去重键是 **(角色名, 员工名)** 而不是员工名 —— 同一员工在两个角色里拿到两份不同的职责简报,应当分别作答。
+
+**两条不变式:**
+
+- `phaseRoles[].roleName` **永远是员工名**,绝不是角色名。找不到的名字在全链路都静默回落主模型(`pickAgentDefinition → mainModelDefault`、`effectiveModel → mainModel`),所以写角色名会让关口渲染出「架构师(claude-opus-4)」——看起来绑好了,实际是主模型披了个名字。「主模型兼任」在磁盘上表达为 `roleName: ""`(`MAIN_STAFF`)。
+- 席位的角色归属存在 `RoleBinding.roleTag`,不靠数组下标反推 —— 同一员工可兼两角,按 (阶段, 员工名) 反查是二义的。`roleDefs` 和 `roleTag` 都必须被 `readRunManifest`/`roleArray` **读回**:`writeRunManifest` 整文件重写 run.md,只写不读的字段第一次 `--resume` 就清零,而且清得毫无声响 —— 席位数量、员工名、模型全对,只有职责简报没了。
+
+角色的 `output`/`purpose` 经 `roleBriefFor` → `seatBrief` 拼进该席位的提示词,这是它到达模型的**唯一**通道。没有 `roleTag` 的席位(关口上手勾的员工、老 run.md)拿到空串,提示词退回原样。
 
 ## 8. 并行隔离与合并回收(git worktree)
 
