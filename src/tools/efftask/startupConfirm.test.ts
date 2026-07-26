@@ -850,3 +850,41 @@ describe('新环节的成本必须计入,而默认配置的数字不能动', () 
     expect(both).toBe(24 + 9 + 9)
   })
 })
+
+describe('关口不能对没配角色的环节撒谎', () => {
+  const mk = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], mainModel: 'm', ...over,
+  })
+  const row = (c: EffTaskConfig, label: string) => rosterLines(c).find(l => l.startsWith(label))!
+
+  it('测试验证 0 席 → 说这一步不发生,不说「主模型」', () => {
+    // 它是 opt-in:0 席 = 一次调用都不会有。说「主模型」就是承诺一件不会发生的事。
+    const line = row(mk(), '测试验证')
+    expect(line).not.toContain('主模型')
+    expect(line).toContain('不做验证')
+  })
+
+  it('集成提交 0 席 → 说它回落到验收席位,不说「主模型」', () => {
+    // 0 席时用的是验收的人。说「主模型」会让用户以为是另一批人在跑。
+    const line = row(mk({ phaseRoles: { ...emptyPhaseRoles(), accept: [{ roleName: 'qa' }] } }), '集成提交')
+    expect(line).not.toMatch(/主模型\(/)
+    expect(line).toContain('验收席位')
+  })
+
+  it('观察 0 席仍然说不评分', () => {
+    expect(row(mk(), '观察')).toContain('不评分')
+  })
+
+  it('配了席位就照常显示那些人', () => {
+    const line = row(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'tester', model: 'm2' }] } }), '测试验证')
+    expect(line).toContain('tester')
+    expect(line).not.toContain('不做验证')
+  })
+
+  it('其余环节 0 席照旧回落主模型 —— 那三条特判不能扩大化', () => {
+    for (const label of ['分析', '质疑讨论', '执行', '验收']) {
+      expect(`${label}:${row(mk(), label).includes('主模型')}`).toBe(`${label}:true`)
+    }
+  })
+})

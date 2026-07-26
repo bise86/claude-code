@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'bun:test'
 import { parseDirectives } from './parseDirectives.js'
 import type { RoleDef } from './roleDefs.js'
+import { PHASE_NAMES } from './types.js'
 import { DEFAULT_CAPS } from './types.js'
 
 describe('parseDirectives', () => {
@@ -362,5 +363,31 @@ describe('caps 里两个新旋钮要有正常入口', () => {
     const cfg = await parseDirectives('x', { knownRoles: [], modelJson: json({ parallelism: 2 }) })
     expect(cfg.caps.quorum).toBeUndefined()
     expect(cfg.caps.maxSeatsPerPhase).toBeUndefined()
+  })
+})
+
+describe('抽取提示词必须覆盖全部环节', () => {
+  // 它此前停在五个:用户在 /et 指令里写「测试验证由 X 跑」,抽取模型被明确告知只能从
+  // 那五个里选 —— 而文档同时承诺「任务提示词里也可以定义或覆盖任务角色」。
+  const promptText = async (): Promise<string> => {
+    let seen = ''
+    await parseDirectives('随便', { knownRoles: [], modelJson: async p => { seen = p; return '' } })
+    return seen
+  }
+
+  it('七个内部环节名都在', async () => {
+    const t = await promptText()
+    for (const p of PHASE_NAMES) expect(`${p}:${t.includes(p)}`).toBe(`${p}:true`)
+  })
+
+  it('中文环节名的对应关系也给了模型', async () => {
+    const t = await promptText()
+    for (const label of ['测试验证', '集成提交', '质疑讨论']) {
+      expect(`${label}:${t.includes(label)}`).toBe(`${label}:true`)
+    }
+  })
+
+  it('不再宣称「那五个之一」', async () => {
+    expect(await promptText()).not.toContain('那五个之一')
   })
 })

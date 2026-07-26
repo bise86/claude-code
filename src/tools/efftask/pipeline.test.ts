@@ -3363,3 +3363,83 @@ describe('评分调用失败不该买下一整轮执行(回归)', () => {
     expect(n.iteration.scoring).toBe(1)
   })
 })
+
+describe('测试验证的返工路径(此前三条分支零覆盖)', () => {
+  // 之前两条 verify 测试都把 maxIterations 设成 1,于是每次直奔 BLOCKED,continue 那条
+  // 真正的「返工」路一步没走 —— 删掉 continue、删掉 acceptLog.push、把注记写成 no-op,
+  // 全都是整套测试全绿。
+  const n = () => {
+    const x = root()
+    x.kind = 'executable'
+    x.status = 'READY'
+    x.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    x.phaseRoles = { ...emptyPhaseRoles(), verify: [{ roleName: 'tester' }] }
+    return x
+  }
+  const twoRounds = { ...DEFAULT_CAPS, maxIterations: 2 }
+
+  it('验证失败 → 返工 → 再执行 → 通过,整条路走完', async () => {
+    let verifyRound = 0
+    const calls: string[] = []
+    const agent: RunAgentFn = async req => {
+      calls.push(req.phase)
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      if (req.phase === 'verify') {
+        verifyRound++
+        return verifyRound === 1
+          ? vtag(req) + '\n{"pass":false,"blocking":["测试红了"],"comments":"$ bun test"}\n```'
+          : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"$ bun test → 全绿"}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = n()
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles, caps: twoRounds }))
+    expect(node.status).toBe('ACCEPTED')
+    expect(calls.filter(c => c === 'execute')).toHaveLength(2)
+    expect(calls.filter(c => c === 'verify')).toHaveLength(2)
+  })
+
+  it('验证裁决进 acceptLog —— 否则用户在 node.md 里看不到验证结果', async () => {
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'verify') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"$ bun test → 1271 pass"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = n()
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles, caps: twoRounds }))
+    expect(JSON.stringify(node.acceptLog)).toContain('1271 pass')
+  })
+
+  it('验证者动了工作区 → 返工,并且注记写进 execStatus', async () => {
+    let fp = 0
+    const pool = {
+      statusFingerprint: async () => { fp++; return fp === 2 ? ' M a.ts' : 'clean' },
+      commitAndMerge: async () => ({ ok: true }), release: async () => ({ removed: true }),
+      refreshFromIntegration: async () => ({ ok: true }),
+    }
+    let execRounds = 0
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') { execRounds++; return '```json\n{"execStatus":"做完了"}\n```' }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = n()
+    node.worktree = { branch: 'b', path: '/wt' }
+    await stepExecute(node, { ...ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles, caps: twoRounds }), worktrees: pool as never })
+    expect(node.status).toBe('ACCEPTED')
+    // 断言的是**返工真的发生了**(两轮执行),不是终态的 execStatus —— 第二轮执行会用
+    // 新报告覆盖它,注记本来就是写给下一轮提示词看的(见上面那组 feedback 测试)。
+    expect(execRounds).toBe(2)
+  })
+
+  it('验证席位持续调用失败 → 说清是「未能取得任何裁决」,不是测试没过', async () => {
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'verify') throw new Error('provider unreachable')
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = n()
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles, caps: twoRounds }))
+    expect(node.status).toBe('BLOCKED')
+    expect(node.blockedReason).toContain('未能取得任何裁决')
+  })
+})

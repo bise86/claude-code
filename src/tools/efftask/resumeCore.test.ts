@@ -197,6 +197,7 @@ import { readRunManifest } from './resumeCore.js'
 import { writeRunManifest } from './persistence.js'
 import { roleBriefFor, type RoleDef } from './roleDefs.js'
 import { createNode, DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, NODE_STATUSES } from './types.js'
+import type { TaskNode } from './types.js'
 import type { EffTaskConfig } from './types.js'
 import type { FsLike } from './persistence.js'
 
@@ -886,5 +887,34 @@ describe('评分的其余席位理由要熬过 resume', () => {
     n.score = { plan: { role: 'a', score: 40, rationale: 'r', others: [{ role: 'ok', score: 9, rationale: 'y' }, { bad: 1 }] as never } }
     const { nodes } = validateLoadedNodes([n], { goal: 'g', phaseRoles: emptyPhaseRoles(), now })
     expect(nodes[0].score?.plan?.others).toEqual([{ role: 'ok', score: 9, rationale: 'y' }])
+  })
+})
+
+describe('每个状态都要能真的从盘上恢复(不是同义反复)', () => {
+  // 上一版那条测试遍历 NODE_STATUSES 断言 LEGAL_STATUS.has(...) —— 两边同源,所以它
+  // 杀不掉自己注释里描述的那个缺陷。实证:从 NODE_STATUSES 里删掉 'MERGE',全套测试
+  // 全绿,而一个在 MERGE 期间被杀的节点从此永久判死。改成对**每个 NodeStatus 造一个
+  // 落盘节点**跑 validateLoadedNodes,断言没有「非法状态」修复。
+  // **写死**这份清单,不遍历 NODE_STATUSES —— 遍历它自己是同义反复:从 NODE_STATUSES
+  // 里删掉一项,这条测试只是少测一项,照样全绿(实测删 'MERGE' 全绿),而一个在该状态
+  // 期间被杀的节点从此永久判死。写死才能抓住「类型加了新状态、数组忘了同步」。
+  const EVERY_STATUS: TaskNode['status'][] = [
+    'CREATED', 'PLANNING', 'PLAN_REVIEW', 'READY', 'EXECUTING', 'EXECUTED', 'ACCEPTANCE',
+    'REWORK', 'WAITING_CHILDREN', 'INTEGRATION_ACCEPT', 'VERIFYING', 'SCORING', 'MERGE',
+    'ACCEPTED', 'BLOCKED',
+  ]
+
+  it('写死的这份清单和 NODE_STATUSES 一样长 —— 加了新状态两边都要动', () => {
+    expect(EVERY_STATUS.length).toBe(NODE_STATUSES.length)
+  })
+
+  it.each(EVERY_STATUS)('%s 落盘后能被恢复,不被判成非法状态', st => {
+    const now = '2026-07-26T00:00:00Z'
+    const n = createNode({ id: 'n1', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now })
+    n.status = st
+    n.interrupted = true
+    const { nodes, repairs } = validateLoadedNodes([n], { goal: 'g', phaseRoles: emptyPhaseRoles(), now })
+    expect(`${st}:${repairs.join('|').includes('非法状态')}`).toBe(`${st}:false`)
+    expect(`${st}:${nodes[0].status}`).toBe(`${st}:${st}`)
   })
 })

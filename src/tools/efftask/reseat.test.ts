@@ -657,3 +657,29 @@ describe('被杀在评审阶段的节点,不能跳过评审直接去执行', () 
     expect(n.status).toBe('READY')
   })
 })
+
+describe('三张状态表必须覆盖同一批「进行中」状态', () => {
+  // 这个仓库已经为两个 ACTIVE 列表漂移付过一次代价(38% 的阶段耗时无处可归)。新增状态时
+  // 漏掉任一张都不会有东西报错:漏 reseat.ACTIVE → 崩溃后节点不再入座;漏 PHASE_OF →
+  // 恢复摘要说不出它停在哪(退化成「某个阶段」)。
+  const RUNNING: TaskNode['status'][] = [
+    'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'VERIFYING', 'ACCEPTANCE', 'REWORK',
+    'INTEGRATION_ACCEPT', 'SCORING', 'MERGE',
+  ]
+
+  it.each(RUNNING)('%s 崩溃后会被重新入座', st => {
+    const n = mk({ id: 'n1', kind: 'executable', status: st })
+    const r = reseatTransientNodes([n], NOW, DEFAULT_CAPS, {})
+    expect(`${st}:${r.reseated.length}`).toBe(`${st}:1`)
+  })
+
+  it.each(RUNNING)('%s 的恢复注记说得出它停在哪 —— 不能漏给用户内部枚举名', st => {
+    // execStatus 必须非空:注记只在已有内容后面追加(reseat.ts:313)。空着的话下面两条
+    // 断言对任何状态都成立 —— 那是一条什么也没验的测试,我第一版就是这么写的。
+    const n = mk({ id: 'n1', kind: 'executable', status: st, execStatus: '干了一半' })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS, {})
+    expect(`${st}:${n.execStatus.includes('上次运行在')}`).toBe(`${st}:true`)
+    expect(`${st}:${n.execStatus.includes('某个阶段')}`).toBe(`${st}:false`)
+    expect(`${st}:${n.execStatus.includes(st)}`).toBe(`${st}:false`)
+  })
+})
