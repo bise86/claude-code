@@ -1,3 +1,7 @@
+// 纯类型导入,编译期擦除 —— roleDefs.ts 对本文件是值依赖(PHASE_NAMES/MAIN_STAFF),
+// 所以这条反向依赖必须是 `import type`,否则就成了真实的运行期循环。
+import type { RoleDef } from './roleDefs.js'
+
 export type PhaseName = 'plan' | 'review' | 'execute' | 'accept' | 'observer'
 export const PHASE_NAMES: PhaseName[] = ['plan', 'review', 'execute', 'accept', 'observer']
 
@@ -25,7 +29,32 @@ export type NodeStatus =
   | 'WAITING_CHILDREN' | 'INTEGRATION_ACCEPT'
   | 'SCORING' | 'MERGE' | 'ACCEPTED' | 'BLOCKED'
 
-export interface RoleBinding { roleName: string; model?: string }
+export interface RoleBinding {
+  /**
+   * 员工名 —— 一个可派发的 agentType,**永远不是角色名**。
+   *
+   * 找不到的名字在全链路都静默回落主模型(pickAgentDefinition → mainModelDefault、
+   * effectiveModel → mainModel),所以往这里写角色名会让关口渲染出「架构师(claude-opus-4)」
+   * ——看起来是绑好的员工,实际是主模型披了个名字。
+   *
+   * `MAIN_STAFF`(空串)是「主模型兼任」:它没有对应的 agentType,于是上面那两条回落链
+   * 正好把这一席交给主模型 —— 这是想要的行为,不是漏网。
+   */
+  roleName: string
+  model?: string
+  /**
+   * 这一席在演哪个任务角色(roleDefs 里的 name)。
+   *
+   * 席位归属存在这里而不是靠数组下标反推,是因为同一个员工可以同时担任两个角色 —— 名册
+   * 里会出现两个 roleName 相同的席位,按 (阶段, 员工名) 反查是二义的。
+   */
+  roleTag?: string
+}
+/** 「主模型兼任」的员工名。见 RoleBinding.roleName。 */
+export const MAIN_STAFF = ''
+export function isMainSeat(r: RoleBinding | null | undefined): boolean {
+  return !r || r.roleName === MAIN_STAFF
+}
 export interface NodePlan { solution: string; keyPoints: string; risks: string; acceptance: string }
 /**
  * `infra: true` marks a verdict the reviewer never actually rendered — the call itself
@@ -253,6 +282,14 @@ export interface EffTaskConfig {
    * with the config means every manifest write re-emits the history.
    */
   resumes?: ResumeRecord[]
+  /**
+   * 角色定义(§员工/角色)。配置文件 + 提示词合并后的结果,该 run 的快照。
+   *
+   * 必须被 `readRunManifest` 读回:`writeRunManifest` 整文件重写 run.md,一个只写不读的
+   * 字段会在第一次 --resume 时清零 —— 于是恢复后的评审席位还在,而它们的职责简报没了,
+   * 名册看起来一模一样,模型收到的东西却变了。`resumes` 已经踩过这个坑。
+   */
+  roleDefs?: RoleDef[]
 }
 
 export interface ResumeRecord {

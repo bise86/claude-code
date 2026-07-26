@@ -194,7 +194,10 @@ describe('validateLoadedNodes guarantees the invariant run() asserts', () => {
 })
 
 import { readRunManifest } from './resumeCore.js'
-import { DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
+import { writeRunManifest } from './persistence.js'
+import { roleBriefFor, type RoleDef } from './roleDefs.js'
+import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles } from './types.js'
+import type { EffTaskConfig } from './types.js'
 import type { FsLike } from './persistence.js'
 
 const fsWith = (files: Record<string, string>): FsLike => ({
@@ -668,5 +671,70 @@ describe('revised 的归一化(补救拆分只做一次的那把锁)', () => {
   it('真正的 true 保留,未设置的保持未设置', () => {
     expect(validateLoadedNodes([base3({ revised: true })], opts3).nodes[0].revised).toBe(true)
     expect(validateLoadedNodes([base3()], opts3).nodes[0].revised).toBeUndefined()
+  })
+})
+
+describe('角色定义必须能从 run.md 原样回来', () => {
+  // 这一组防的是这个仓库反复在修的那类失败:字段写进磁盘、没人读回来。
+  // writeRunManifest 整文件重写 run.md,所以「只写不读」不是慢性退化,是第一次 --resume
+  // 立刻清零 —— 而且清得毫无声响:席位数量、员工名、模型全对,只有职责简报没了。
+  const write = async (cfg: Partial<EffTaskConfig>) => {
+    const files: Record<string, string> = {}
+    const fs: FsLike = {
+      ...fsWith(files),
+      readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error(`ENOENT ${p}`); return v },
+      writeFile: async (p: string, c: string) => { files[p] = c },
+    }
+    await writeRunManifest(fs, '/r', {
+      goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(),
+      caps: { ...DEFAULT_CAPS }, notices: [], ...cfg,
+    } as EffTaskConfig, [])
+    return { fs, text: files['/r/run.md'] }
+  }
+
+  const arch: RoleDef = { name: '架构师', stage: 'review', output: '裁决与阻断项', purpose: '把关可维护性', staff: ['opus-架构'] }
+
+  it('写进去 → 读回来,一字不差', async () => {
+    const { fs } = await write({ roleDefs: [arch] })
+    const { config } = await readRunManifest(fs, '/r')
+    expect(config.roleDefs).toEqual([arch])
+  })
+
+  it('主模型兼任(空 staff)也原样回来,不会变成 undefined', async () => {
+    const solo: RoleDef = { ...arch, staff: [] }
+    const { fs } = await write({ roleDefs: [solo] })
+    const { config } = await readRunManifest(fs, '/r')
+    expect(config.roleDefs).toEqual([solo])
+  })
+
+  it('席位的 roleTag 熬过一次 resume —— 否则简报静默消失', async () => {
+    // roleTag 是席位与角色定义的唯一关联。roleArray 曾经只保留 roleName/model,
+    // 那样恢复出来的名册和原来长得完全一样,只是每一席都不再知道自己演谁。
+    const { fs } = await write({
+      roleDefs: [arch],
+      phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: 'opus-架构', model: 'm', roleTag: '架构师' }] },
+    })
+    const { config } = await readRunManifest(fs, '/r')
+    expect(config.phaseRoles.review[0].roleTag).toBe('架构师')
+    expect(roleBriefFor(config.roleDefs ?? [], config.phaseRoles.review[0], 'review')).toContain('把关可维护性')
+  })
+
+  it('手改 run.md 塞进不完整的角色 → 剔除并说明,不能绕开校验', async () => {
+    const md = [
+      '---', 'goalPrompt: g', 'roleDefs:',
+      '  - name: 架构师', '    stage: review', '    output: o', '    purpose: p',
+      '  - name: 半成品', '    stage: review', '    output: o',
+      '  - name: 自由阶段', '    stage: 安全审计', '    output: o', '    purpose: p',
+      '---', '',
+    ].join('\n')
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md }), '/r')
+    expect(config.roleDefs?.map(d => d.name)).toEqual(['架构师'])
+    expect(degraded.filter(d => d.includes('角色定义不完整'))).toHaveLength(2)
+  })
+
+  it('没有角色定义的老 run.md 照常恢复', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': '---\ngoalPrompt: g\n---\n\n' }), '/r')
+    expect(config.roleDefs).toBeUndefined()
+    expect(degraded.filter(d => d.includes('角色'))).toEqual([])
   })
 })

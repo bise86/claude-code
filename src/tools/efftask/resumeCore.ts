@@ -2,6 +2,7 @@ import { parse as yamlParse } from 'yaml'
 import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_PARALLELISM, PHASE_NAMES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
 import type { FsLike } from './persistence.js'
+import type { RoleDef } from './roleDefs.js'
 import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
 
 // Exported because they ARE the post-condition: whatever this module hands back, every reader
@@ -23,7 +24,13 @@ const roleArray = (v: unknown): RoleBinding[] =>
     ? v
         .filter((r): r is { roleName: string; model?: unknown } =>
           !!r && typeof r === 'object' && typeof (r as { roleName?: unknown }).roleName === 'string')
-        .map(r => ({ roleName: r.roleName, ...(typeof r.model === 'string' ? { model: r.model } : {}) }))
+        // roleTag 必须保留:它是席位与角色定义的唯一关联(同一员工可兼两角,按员工名反查
+        // 是二义的)。丢掉它 → 恢复后席位数量、名字、模型全对,只有职责简报静默消失。
+        .map(r => ({
+          roleName: r.roleName,
+          ...(typeof r.model === 'string' ? { model: r.model } : {}),
+          ...(typeof (r as { roleTag?: unknown }).roleTag === 'string' ? { roleTag: (r as { roleTag: string }).roleTag } : {}),
+        }))
     : []
 
 /**
@@ -583,6 +590,31 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   base.phaseRoles = Object.fromEntries(
     PHASE_NAMES.map(p => [p, roleArray(pr[p])]),
   ) as Record<PhaseName, RoleBinding[]>
+
+  // 角色定义读回。**必须**读回:writeRunManifest 整文件重写 run.md,只写不读的字段第一次
+  // --resume 就清零 —— 席位还在,职责简报没了,名册长得一模一样而模型收到的东西变了。
+  // 校验在这里重做一遍,因为手改 run.md 是一条绕开 parseRoleDefs 全部校验的路。
+  const rawDefs = fm.roleDefs
+  if (Array.isArray(rawDefs)) {
+    const kept: RoleDef[] = []
+    for (const d of rawDefs) {
+      const o = (d && typeof d === 'object' ? d : {}) as Record<string, unknown>
+      const ok = typeof o.name === 'string' && o.name.length > 0
+        && typeof o.stage === 'string' && (PHASE_NAMES as string[]).includes(o.stage)
+        && typeof o.output === 'string' && o.output.length > 0
+        && typeof o.purpose === 'string' && o.purpose.length > 0
+      if (!ok) {
+        degraded.push(`run.md 里有一条角色定义不完整(需要 name/stage/output/purpose),已忽略`)
+        continue
+      }
+      kept.push({
+        name: o.name as string, stage: o.stage as PhaseName,
+        output: o.output as string, purpose: o.purpose as string,
+        staff: Array.isArray(o.staff) ? o.staff.filter((s): s is string => typeof s === 'string' && s.length > 0) : [],
+      })
+    }
+    if (kept.length > 0) base.roleDefs = kept
+  }
 
   base.notices = Array.isArray(fm.notices) ? fm.notices.filter((n): n is string => typeof n === 'string') : []
   if (typeof fm.mainModel === 'string') base.mainModel = fm.mainModel
