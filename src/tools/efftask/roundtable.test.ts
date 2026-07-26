@@ -1,6 +1,7 @@
 // src/tools/efftask/roundtable.test.ts
 import { describe, expect, it } from 'bun:test'
-import { createNode, emptyPhaseRoles } from './types.js'
+import { createNode, emptyPhaseRoles, MAIN_STAFF } from './types.js'
+import type { RoleBinding } from './types.js'
 import { synthesizeVerdicts, runRoundtable, RunAgentFn } from './roundtable.js'
 import { MAX_SUMMARY_CHARS } from './parseOutput.js'
 
@@ -126,5 +127,60 @@ describe('每个席位可以拿到自己的提示词 —— 角色职责说明�
       runAgent, signal: new AbortController().signal,
     })
     expect(got).toBeNull()
+  })
+})
+
+describe('裁决的署名与角色归属', () => {
+  const run = (roles: RoleBinding[], reply?: (r: unknown) => Promise<string>) =>
+    runRoundtable({
+      phase: 'review', node: node(), roles, round: 1, system: 's', prompt: () => 'p',
+      runAgent: (reply ?? (async () => '```verdict\n{"pass":false,"blocking":["缺回滚方案"],"comments":""}\n```')) as never,
+      signal: new AbortController().signal, answerTag: 'verdict',
+    })
+
+  it('主模型兼任的席位署角色名,不是一对空方括号', async () => {
+    // `role ? role.roleName : 'main'` 在这个席位上产出空串 —— 席位是个 truthy 对象,
+    // 而它的 roleName 是 MAIN_STAFF。blockingSummary 于是成了 `[] 缺回滚方案`,而它
+    // 会被原样送进返工提示词,模型收到的字面就是那对空方括号。
+    const rec = await run([{ roleName: MAIN_STAFF, roleTag: '架构师' }])
+    expect(rec.verdicts[0].role).toBe('架构师')
+    expect(rec.synthesized.blockingSummary).toBe('[架构师] 缺回滚方案')
+    expect(rec.synthesized.blockingSummary).not.toContain('[]')
+  })
+
+  it('有员工时仍然署员工名', async () => {
+    const rec = await run([{ roleName: 'opus-架构', roleTag: '架构师' }])
+    expect(rec.verdicts[0].role).toBe('opus-架构')
+  })
+
+  it('既无员工也无角色 → main', async () => {
+    const rec = await run([{ roleName: MAIN_STAFF }])
+    expect(rec.verdicts[0].role).toBe('main')
+    expect(rec.synthesized.blockingSummary).toBe('[main] 缺回滚方案')
+  })
+
+  it('角色归属落在裁决上,不是只留在内存的名册里', async () => {
+    // node.md 存的是 verdicts[]。归属只存在 roster[i] 的话,一次 --resume 之后
+    // 「这几条裁决属于同一个角色的几个员工」就无从恢复 —— 而按角色分组正是
+    // 「一个角色多员工要收敛成一个结论」的前提。
+    const rec = await run([
+      { roleName: 'ds-安全', roleTag: '架构师' },
+      { roleName: 'ds-安全', roleTag: '安全' },
+    ])
+    expect(rec.verdicts.map(v => v.roleTag)).toEqual(['架构师', '安全'])
+    // 两条裁决的 role 完全相同,所以 roleTag 是唯一能把它们分开的东西。
+    expect(rec.verdicts[0].role).toBe(rec.verdicts[1].role)
+  })
+
+  it('调用失败的席位同样带上角色归属和一个非空署名', async () => {
+    const rec = await run([{ roleName: MAIN_STAFF, roleTag: '架构师' }], async () => { throw new Error('boom') })
+    expect(rec.verdicts[0].role).toBe('架构师')
+    expect(rec.verdicts[0].roleTag).toBe('架构师')
+    expect(rec.verdicts[0].infra).toBe(true)
+  })
+
+  it('没有角色标签的席位不会凭空多出一个 roleTag 字段', async () => {
+    const rec = await run([{ roleName: 'opus-架构' }])
+    expect('roleTag' in rec.verdicts[0]).toBe(false)
   })
 })

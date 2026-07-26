@@ -64,6 +64,14 @@ export interface NodePlan { solution: string; keyPoints: string; risks: string; 
 export interface Verdict {
   role: string; pass: boolean; blocking: string[]; comments: string; infra?: boolean
   /**
+   * 这一席在演哪个任务角色(见 RoleBinding.roleTag)。
+   *
+   * 必须落在裁决上而不是只存在于 runRoundtable 内存里的 roster[i]:node.md 存的是
+   * verdicts[],一次 --resume 之后「这几条裁决属于同一个角色的几个员工」就无从恢复,
+   * 而按角色分组正是「一个角色多员工要收敛成一个结论」的前提。
+   */
+  roleTag?: string
+  /**
    * The reviewer's call hit caps.nodeTimeoutMs rather than failing to connect.
    *
    * Both are `infra` (nobody judged the work, so retrying the review is right), but they

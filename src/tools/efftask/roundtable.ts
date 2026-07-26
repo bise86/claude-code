@@ -99,15 +99,25 @@ export async function runRoundtable(args: {
   )
   const verdicts: Verdict[] = settled.map((res, i) => {
     const role = roster[i]
-    const roleName = role ? role.roleName : 'main'
-    if (res.status === 'fulfilled') return parseVerdict(res.value, roleName, args.answerTag)
+    // 署名的取值顺序:员工名 → 角色名 → 'main'。
+    //
+    // `role ? role.roleName : 'main'` 曾经在「主模型兼任」的席位上产出**空串** —— 那个
+    // 席位是一个 truthy 对象,而它的 roleName 是 MAIN_STAFF(空串)。于是 blockingSummary
+    // 变成 `[] 缺回滚方案`,而 blockingSummary 会被原样送进返工提示词交给执行者,模型
+    // 收到的字面就是那对空方括号。
+    const roleName = (role?.roleName || role?.roleTag) ?? 'main'
+    // roleTag 必须落到裁决上,不能只留在内存里的 roster[i]:node.md 存的是 verdicts[],
+    // 一次 --resume 之后「这几条裁决属于同一个角色的几个员工」就无从恢复,而按角色分组
+    // 正是「一个角色多员工要收敛成一个结论」的前提。
+    const tag = role?.roleTag ? { roleTag: role.roleTag } : {}
+    if (res.status === 'fulfilled') return { ...parseVerdict(res.value, roleName || 'main', args.answerTag), ...tag }
     const reason = res.reason instanceof Error ? res.reason.message : String(res.reason)
     // infra: the reviewer never judged anything, the CALL failed. Flagged so the caller
     // retries the review instead of reading it as a rejection and redoing real work.
     // A DEADLINE is still infra (nobody judged anything), but it is a different fact from
     // an unreachable provider and needs different advice on the escalation card.
     const timedOut = res.reason instanceof PhaseTimeoutError
-    return { role: roleName, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true, ...(timedOut ? { timeout: true } : {}) }
+    return { role: roleName || 'main', ...tag, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true, ...(timedOut ? { timeout: true } : {}) }
   })
   return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts) }
 }
