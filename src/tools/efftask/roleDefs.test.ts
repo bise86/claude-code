@@ -279,7 +279,7 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
   const role = (name: string, stage: string, staff: string[]): RoleDef =>
     ({ name, stage, output: 'o', purpose: 'p', staff }) as RoleDef
 
-  it.each(['execute', 'observer'])('%s:一个角色两个员工 → 一席,并点名被忽略的是谁', stage => {
+  it.each(['execute'])('%s:一个角色两个员工 → 一席,并点名被忽略的是谁', stage => {
     const { phaseRoles, notices } = applyRoleDefsToPhases(
       empty() as never, [role('主设计', stage, ['opus-架构', 'ds-安全'])],
     )
@@ -290,7 +290,7 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
     expect(joined).toContain('已忽略 主设计(ds-安全)')
   })
 
-  it.each(['execute', 'observer'])('%s:同阶段两个角色 → 一席,点名被忽略的那个角色', stage => {
+  it.each(['execute'])('%s:同阶段两个角色 → 一席,点名被忽略的那个角色', stage => {
     const { phaseRoles, notices } = applyRoleDefsToPhases(
       empty() as never, [role('前端实现', stage, ['gpt-前端']), role('后端实现', stage, ['opus-架构'])],
     )
@@ -298,7 +298,7 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
     expect(notices.join('\n')).toContain('已忽略 后端实现(opus-架构)')
   })
 
-  it.each(['review', 'accept'])('%s 是圆桌阶段,多席位不能被误伤', stage => {
+  it.each(['review', 'accept', 'verify', 'integrate', 'observer'])('%s 是圆桌阶段,多席位不能被误伤', stage => {
     const { phaseRoles, notices } = applyRoleDefsToPhases(
       empty() as never, [role('架构师', stage, ['opus-架构', 'ds-安全'])],
     )
@@ -323,7 +323,7 @@ describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
 
   it('主模型兼任的席位被忽略时也称呼得出来', () => {
     const { notices } = applyRoleDefsToPhases(
-      empty() as never, [role('甲', 'observer', ['opus-架构']), role('乙', 'observer', [])],
+      empty() as never, [role('甲', 'execute', ['opus-架构']), role('乙', 'execute', [])],
     )
     expect(notices.join('\n')).toContain('已忽略 乙(主模型)')
   })

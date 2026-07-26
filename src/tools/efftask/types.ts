@@ -156,7 +156,17 @@ export interface Verdict {
   remedy?: { title: string; deps: string[] }[]
 }
 export interface RoundtableRecord { round: number; verdicts: Verdict[]; synthesized: { pass: boolean; blockingSummary: string } }
-export interface ScoreRecord { role: string; score: number; rationale: string }
+export interface ScoreRecord {
+  role: string; score: number; rationale: string
+  /**
+   * 多员工评分时,**其余席位**的记录。主记录取最低分。
+   *
+   * 取最低分是对的(显示宽容的那个数会掩盖阈值要抓的情况),但只留最低分就把其余人的
+   * 理由丢了 —— 那是静默截断。它们挂在这里:阈值判定、显示、持久化的既有消费者读主
+   * 记录不受影响,而没有一条理由消失。
+   */
+  others?: { role: string; score: number; rationale: string }[]
+}
 
 export interface TaskNode {
   id: string

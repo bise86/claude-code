@@ -364,9 +364,11 @@ describe('名册可编辑 (spec §2 第一关)', () => {
     // firstRole() dispatches index 0 and nothing else. An editor that appends re-opens that
     // hole by hand: measured 观察: w1、w2 on the roster with only w1 ever dispatched, and no
     // notice anywhere.
+    // observer 现在是圆桌:多员工各自打分,取最低分收敛,其余理由挂在 others 上。
+    // 真正的单席位只剩 execute —— 那是物理约束(pathFor 不含员工维度)。
     let r = toggleRole(empty() as never, 'observer', 'w1')
     r = toggleRole(r, 'observer', 'w2')
-    expect(r.observer.map(x => x.roleName)).toEqual(['w2'])
+    expect(r.observer.map(x => x.roleName)).toEqual(['w1', 'w2'])
     // plan 不在此列:它走顺序精化(第一位起草,后面每一位在前一稿上修订),多员工是
     // 支持的形态。这条断言曾经写的是 ['a2'] —— 那是关口和流水线漂移出来的 bug:
     // 用户连点两个方案员工,第二个把第一个顶掉且毫无提示。
@@ -394,7 +396,7 @@ describe('名册可编辑 (spec §2 第一关)', () => {
     expect(row('分析')).not.toContain('(单选)')     // 顺序精化,可多员工
     expect(row('质疑讨论')).not.toContain('(单选)') // 圆桌
     expect(row('执行')).toContain('(单选)')         // 物理约束,只能一个
-    expect(row('观察')).toContain('(单选)')         // node.score 每维一条记录
+    expect(row('观察')).not.toContain('(单选)')     // 圆桌:取最低分收敛
   })
 
   it('toggleRole 记住模型,否则只读名册会掉回裸名字', () => {

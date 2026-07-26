@@ -44,7 +44,11 @@ const PHASE_SET = new Set<string>(PHASE_NAMES)
  * - single:只跑一个 agent,多出来的席位永远不会被派发(execute / observer)
  */
 export const PHASE_SEATING: Record<PhaseName, 'roundtable' | 'sequential' | 'single'> = {
-  plan: 'sequential', review: 'roundtable', execute: 'single', accept: 'roundtable', observer: 'single',
+  plan: 'sequential', review: 'roundtable', execute: 'single',
+  verify: 'roundtable', accept: 'roundtable', integrate: 'roundtable',
+  // 观察也是多席位:各自独立打分,取最低分收敛成一个结论,其余理由挂在 ScoreRecord.others
+  // 上 —— 「一个角色多个员工必须只有一个产出」在这里就是这样满足的。
+  observer: 'roundtable',
 }
 
 /** 这个阶段允许多个席位吗?圆桌与顺序精化都允许,只有 single 不允许。 */
@@ -66,7 +70,7 @@ const SINGLE_SEAT_REASON: Partial<Record<PhaseName, string>> = {
   // plan 不在这里:它支持**顺序精化**(第一位起草,后面每一位在前一稿上修订),
   // 全程只有一份稿子,所以「只有一个产出」成立。见 pipeline.runPlanRefinement。
   execute: '执行阶段只跑一个 agent(两个带写工具的执行器会落在同一个 worktree 上)',
-  observer: '观察阶段只跑一个 agent(node.score 每个维度只有一条记录)',
+
 }
 
 /** 名册/提醒里怎么称呼一席。 */

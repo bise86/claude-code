@@ -1,5 +1,5 @@
 // src/tools/efftask/pipeline.ts
-import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, TaskNode } from './types.js'
+import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
 import { createNode } from './types.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
@@ -7,7 +7,7 @@ import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
-import type { SlotPool } from './slotPool.js'
+import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, type BlockCategory } from './escalation.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 
@@ -999,30 +999,47 @@ function scorePrompt(node: TaskNode, tag: string, brief = ''): string {
  * Returns true when the node should go back for rework.
  */
 async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
-  const role = firstRole(node, 'observer')
-  if (!role) return false // opt-in: no observer, no scoring, no fallback to the main model
+  const seats = node.phaseRoles.observer ?? []
+  if (seats.length === 0) return false // opt-in: no observer, no scoring, no fallback to the main model
   const tag = answerTag(ANSWER_TAGS.score)
-  const res = await runPhase(ctx, {
-    phase: 'observer', node, role, system: 'observer', prompt: scorePrompt(node, tag, seatBrief(ctx, role, 'observer')), signal: ctx.signal,
-    cwd: node.worktree?.path,
-  })
-  if (!res.ok) {
-    // A failed scoring call must NOT fail the node: acceptance already passed, and scoring is
-    // advisory. Record why the number is missing instead of discarding hours of accepted work.
-    node.score = {
-      plan: { role: role.roleName, score: 0, rationale: `评分调用失败: ${res.reason}` },
-      exec: { role: role.roleName, score: 0, rationale: `评分调用失败: ${res.reason}` },
+  // 每个席位独立打分,并行 —— 和圆桌同构。取最低分收敛成一个结论(显示宽容的那个数会
+  // 掩盖阈值要抓的情况),其余理由挂在 others 上而不是丢掉。
+  const results = await mapWithinPool(
+    seats,
+    seat => runPhase(ctx, {
+      phase: 'observer', node, role: seat, system: 'observer',
+      prompt: scorePrompt(node, tag, seatBrief(ctx, seat, 'observer')), signal: ctx.signal,
+      cwd: node.worktree?.path,
+    }),
+    ctx.slots,
+  )
+  type Pair = { role: string; plan: { score: number; rationale: string }; exec: { score: number; rationale: string } }
+  const pairs: Pair[] = results.map((r, i) => {
+    const who = seats[i].roleName || 'main'
+    if (r.status !== 'fulfilled' || !r.value.ok) {
+      // 评分调用失败**不能**让节点失败:验收已经通过,评分是咨询性的。记下为什么没有
+      // 这个数,而不是丢掉已经完成的工作。
+      const why = `评分调用失败: ${r.status === 'fulfilled' ? r.value.reason : String(r.reason)}`
+      return { role: who, plan: { score: 0, rationale: why }, exec: { score: 0, rationale: why } }
     }
-    return false
+    const parsed = parseScoreOutput(r.value.text, tag)
+    return { role: who, plan: parsed.plan, exec: parsed.exec }
+  })
+  const pick = (dim: 'plan' | 'exec'): ScoreRecord => {
+    const sorted = [...pairs].sort((x, y) => x[dim].score - y[dim].score)
+    const low = sorted[0]
+    const rest = sorted.slice(1)
+    return {
+      role: low.role, score: low[dim].score, rationale: low[dim].rationale,
+      ...(rest.length > 0
+        ? { others: rest.map(o => ({ role: o.role, score: o[dim].score, rationale: o[dim].rationale })) }
+        : {}),
+    }
   }
-  const parsed = parseScoreOutput(res.text, tag)
-  node.score = {
-    plan: { role: role.roleName, score: parsed.plan.score, rationale: parsed.plan.rationale },
-    exec: { role: role.roleName, score: parsed.exec.score, rationale: parsed.exec.rationale },
-  }
+  node.score = { plan: pick('plan'), exec: pick('exec') }
   const threshold = ctx.config.caps.scoreThreshold
   if (threshold === undefined) return false // 默认仅记录
-  const worst = Math.min(parsed.plan.score, parsed.exec.score)
+  const worst = Math.min(node.score.plan!.score, node.score.exec!.score)
   if (worst >= threshold) return false
   // Exactly one rework, then the score is recorded and the node proceeds regardless.
   if (node.iteration.scoring >= 1) return false

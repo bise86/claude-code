@@ -3149,3 +3149,79 @@ describe('测试验证环节(spec §7.1)', () => {
     expect(n.status).toBe('ACCEPTED')
   })
 })
+
+describe('观察多员工:取最低分,其余理由不丢', () => {
+  const scored = (byRole: Record<string, { plan: number; exec: number }>): RunAgentFn =>
+    async req => {
+      if (req.phase === 'observer') {
+        const who = req.role?.roleName ?? 'main'
+        const v = byRole[who]
+        const tag = req.prompt.match(/```(score[a-z0-9]+)/)?.[1] ?? 'score'
+        return '```' + tag + '\n' + JSON.stringify({
+          plan: { score: v.plan, rationale: `${who} 说方案 ${v.plan}` },
+          exec: { score: v.exec, rationale: `${who} 说执行 ${v.exec}` },
+        }) + '\n```'
+      }
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+  const nodeWith = (observer: { roleName: string }[]) => {
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), observer }
+    return n
+  }
+
+  it('三个员工各自打分 → 主记录是最低的那个', async () => {
+    const n = nodeWith([{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }])
+    await stepExecute(n, ctxFor([n], scored({
+      a: { plan: 90, exec: 80 }, b: { plan: 60, exec: 95 }, c: { plan: 75, exec: 70 },
+    }), { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(n.score?.plan?.score).toBe(60)
+    expect(n.score?.plan?.role).toBe('b')
+    expect(n.score?.exec?.score).toBe(70)
+    expect(n.score?.exec?.role).toBe('c')
+  })
+
+  it('其余席位的理由挂在 others 上,一条都不丢', async () => {
+    // 取最低分是对的(显示宽容的那个数会掩盖阈值要抓的情况),但只留最低分就把其余人的
+    // 理由丢了 —— 那是静默截断。
+    const n = nodeWith([{ roleName: 'a' }, { roleName: 'b' }])
+    await stepExecute(n, ctxFor([n], scored({ a: { plan: 90, exec: 80 }, b: { plan: 60, exec: 95 } }),
+      { ...cfg, phaseRoles: n.phaseRoles }))
+    const all = [n.score!.plan!, ...(n.score!.plan!.others ?? [])]
+    expect(all.map(x => x.role).sort()).toEqual(['a', 'b'])
+    expect(all.map(x => x.rationale).join('\n')).toContain('a 说方案 90')
+    expect(all.map(x => x.rationale).join('\n')).toContain('b 说方案 60')
+  })
+
+  it('单员工时不凭空多出 others 字段 —— 老 node.md 形状不变', async () => {
+    const n = nodeWith([{ roleName: 'a' }])
+    await stepExecute(n, ctxFor([n], scored({ a: { plan: 88, exec: 71 } }), { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(n.score?.plan?.score).toBe(88)
+    expect('others' in n.score!.plan!).toBe(false)
+  })
+
+  it('一个席位调用失败不拖垮评分,而且失败原因被记下来', async () => {
+    // 验收已经通过,评分是咨询性的 —— 不能因为一次调用失败丢掉已完成的工作。
+    const n = nodeWith([{ roleName: 'a' }, { roleName: 'boom' }])
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'observer' && req.role?.roleName === 'boom') throw new Error('provider down')
+      return scored({ a: { plan: 90, exec: 90 }, boom: { plan: 0, exec: 0 } })(req)
+    }
+    await stepExecute(n, ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(n.status).toBe('ACCEPTED')
+    const all = [n.score!.plan!, ...(n.score!.plan!.others ?? [])]
+    expect(all.map(x => x.rationale).join('\n')).toContain('评分调用失败')
+  })
+
+  it('阈值按最低分判定 —— 宽容的那个数不该掩盖它', async () => {
+    const n = nodeWith([{ roleName: 'a' }, { roleName: 'b' }])
+    await stepExecute(n, ctxFor([n], scored({ a: { plan: 95, exec: 95 }, b: { plan: 40, exec: 95 } }),
+      { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, scoreThreshold: 60 } }))
+    // 40 < 60 触发一轮返工
+    expect(n.iteration.scoring).toBe(1)
+  })
+})
