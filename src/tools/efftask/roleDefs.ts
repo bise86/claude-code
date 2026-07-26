@@ -5,7 +5,7 @@
 // 员工 = settings.json 的 `roles[]` / `.claude/agents/*.md` / 内置 agent —— 任何可派发的
 // agentType,带自己的模型、apiUrl、工具集。角色 = 「架构师」「安全」,在某个阶段做某件事,
 // 由零个或多个员工担当。多对多:一个员工可以出现在多个角色里,一个角色可以有多个员工。
-import { PHASE_NAMES, PHASE_LABEL } from './types.js'
+import { PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
 import { DEFAULT_MAX_SEATS_PER_PHASE, MAIN_STAFF } from './types.js'
 import type { PhaseName, RoleBinding } from './types.js'
 
@@ -78,6 +78,21 @@ function describeSeat(s: RoleBinding): string {
 /** 复合键分隔符。用 NUL 是因为角色名和员工名都可能含空格/冒号,而 NUL 不可能出现在里面。 */
 const KEY_SEP = '\u0000'
 
+/**
+ * 猜用户想写的那个环节名。
+ *
+ * 只做前缀/包含匹配,不做编辑距离 —— 一个猜错的建议比没有建议更糟,而中文环节名之间
+ * 的字面距离很近(「验收」vs「集成提交」)。宁可不猜。
+ */
+function guessStep(raw: string): string | undefined {
+  if (!raw) return undefined
+  for (const p of PHASE_NAMES) {
+    const label = PHASE_LABEL[p]
+    if (label.includes(raw) || raw.includes(label) || p.startsWith(raw.toLowerCase())) return label
+  }
+  return undefined
+}
+
 function str(v: unknown): string {
   return typeof v === 'string' ? v.trim() : ''
 }
@@ -117,7 +132,10 @@ export function parseRoleDefs(
       notices.push(`${opts.source}:${label} 没有 name,该角色不生效`)
       return
     }
-    const stage = str(o.stage)
+    // `step` 是新键名,`stage` 是旧的 —— 读时都收,**写时只写内部 phase 名**。
+    // 两边都当 canonical 会让 run.md 里出现两种写法,而读回那侧只认一种。
+    const rawStep = str(o.step) || str(o.stage)
+    const stage = STEP_ALIASES[rawStep] ?? rawStep
     const output = str(o.output)
     const purpose = str(o.purpose)
     // 阶段必须固定为五个之一,而且原因比「配置得进去、永远不执行」更严重:自由阶段名会被
@@ -125,11 +143,18 @@ export function parseRoleDefs(
     // 重建 phaseRoles,未知键第一次 --resume 就没了;而 makeRunAgentFn 按 phase === 'execute'
     // 决定给不给写工具,自由阶段名永远只拿到只读工具集。
     if (!stage) {
-      notices.push(`${opts.source}:角色「${name}」没有写 stage(在什么阶段使用),该角色不生效`)
+      notices.push(`${opts.source}:角色「${name}」没有写 step(在哪个环节使用),该角色不生效`)
       return
     }
     if (!PHASE_SET.has(stage)) {
-      notices.push(`${opts.source}:角色「${name}」的 stage「${stage}」不是 ${PHASE_NAMES.join('/')} 之一,该角色不生效`)
+      // 列**中文**合法值:文档和关口给用户看的就是中文,列内部 phase 名等于让他自己
+      // 做一次中英对照。再猜一个最接近的 —— 把「够不够让他改对」提到「不用想」。
+      const legal = PHASE_NAMES.map(x => PHASE_LABEL[x]).join('/')
+      const guess = guessStep(rawStep)
+      notices.push(
+        `${opts.source}:角色「${name}」的环节「${rawStep}」不是 ${legal} 之一,该角色不生效` +
+        (guess ? `。是不是想写「${guess}」?` : ''),
+      )
       return
     }
     const missing: string[] = []

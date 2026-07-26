@@ -35,7 +35,7 @@ describe('parseRoleDefs:「必须描述清楚」是强制的', () => {
   it('缺 stage → 不生效', () => {
     const { defs, notices } = P([{ name: '架构师', output: 'o', purpose: 'p' }])
     expect(defs).toEqual([])
-    expect(notices.join('\n')).toContain('没有写 stage')
+    expect(notices.join('\n')).toContain('没有写 step')
   })
 
   it('自由阶段名 → 不生效,而不是配置得进去永远不跑', () => {
@@ -414,5 +414,58 @@ describe('席位上限(caps.maxSeatsPerPhase)', () => {
     expect(phaseRoles.execute).toHaveLength(1)
     expect(notices.filter(n => n.includes('已忽略'))).toHaveLength(1)
     expect(notices.join('\n')).not.toContain('席位上限')
+  })
+})
+
+describe('环节名可以写中文,写错了要能自己改对', () => {
+  const K = new Set(['opus-架构'])
+  const P2 = (raw: unknown) => parseRoleDefs(raw, { knownStaff: K, source: '配置文件' })
+  const def = (o: object) => ({ name: '架构师', output: 'o', purpose: 'p', staff: ['opus-架构'], ...o })
+
+  it('中文环节名归一到内部 phase 名 —— 落盘只有一种写法', () => {
+    // 两边都当 canonical 会让 run.md 里出现两种写法,而读回那侧(resumeCore)只认一种。
+    expect(P2([def({ step: '质疑讨论' })]).defs[0].stage).toBe('review')
+    expect(P2([def({ step: '测试验证' })]).defs[0].stage).toBe('verify')
+    expect(P2([def({ step: '集成提交' })]).defs[0].stage).toBe('integrate')
+    expect(P2([def({ step: '分析' })]).defs[0].stage).toBe('plan')
+  })
+
+  it('内部 phase 名照旧收下', () => {
+    expect(P2([def({ step: 'review' })]).defs[0].stage).toBe('review')
+  })
+
+  it('旧键名 stage 仍然读得进来 —— 老 run.md 和已发布的文档不能一夜作废', () => {
+    expect(P2([def({ stage: 'review' })]).defs[0].stage).toBe('review')
+    expect(P2([def({ stage: '评审' })]).defs[0].stage).toBe('review')
+  })
+
+  it('step 优先于 stage', () => {
+    expect(P2([def({ step: '验收', stage: 'review' })]).defs[0].stage).toBe('accept')
+  })
+
+  it('写错时列**中文**合法值 —— 列内部名等于让用户自己做中英对照', () => {
+    const n = P2([def({ step: '测试' })]).notices.join('\n')
+    expect(n).toContain('分析/质疑讨论/执行/测试验证/验收/集成提交/观察')
+    expect(n).not.toContain('plan/review/execute')
+  })
+
+  it('并且猜一个最接近的', () => {
+    expect(P2([def({ step: '测试' })]).notices.join('\n')).toContain('是不是想写「测试验证」')
+    expect(P2([def({ step: '集成' })]).notices.join('\n')).toContain('是不是想写「集成提交」')
+  })
+
+  it('猜不出来就不猜 —— 一个猜错的建议比没有建议更糟', () => {
+    const n = P2([def({ step: '安全审计' })]).notices.join('\n')
+    expect(n).toContain('不生效')
+    expect(n).not.toContain('是不是想写')
+  })
+
+  it('错误信息不超过关口的截断长度,否则结论会被截掉', () => {
+    // notices 在关口上走 clip(n, 100)。超了会把句尾的「该角色不生效」截没,
+    // 只剩一串合法值 —— 结论没了。
+    for (const bad of ['测试', '安全审计', 'reviews']) {
+      const line = P2([def({ step: bad })]).notices[0]
+      expect(`${bad}:${[...line].length <= 100}`).toBe(`${bad}:true`)
+    }
   })
 })
