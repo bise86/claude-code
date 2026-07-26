@@ -594,3 +594,35 @@ describe('spec §17.2:归位注记要说清中断在哪个阶段', () => {
     expect(n.execStatus).toContain('上次运行在某个阶段中断')
   })
 })
+
+describe('spec §10.1:归位要把 startedAt 清掉,否则耗时把宕机时间算进去', () => {
+  it('被杀在执行中的节点,归位后耗时重新计时', () => {
+    // startedAt 随 node.md 落盘,而归位原本只改 status。于是恢复之后 elapsed 算的是
+    // `now - startedAt`,把**终端关着的那段时间**整个算成节点耗时。实测:两天前被杀的 run,
+    // 一个灰色 ○「排队中」的节点旁边写着 172800s,真实值是崩溃前几十秒;而且面板把非终态
+    // 节点当作在跑,数字还一秒一跳。
+    //
+    // 这在树只在运行时出现的年代影响有限;恢复关口开始渲染任务树之后,它变成了用户决定
+    // "要不要继续花钱"时看到的第一个数字。也正是 elapsed 自己注释里记着修过一次的同一个
+    // 缺陷(「一个从没跑过的节点在树建好一小时后显示 3600s」)。
+    const n = mk({ id: 'root', kind: 'executable', status: 'EXECUTING', startedAt: '2026-07-24T00:00:00.000Z' })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('READY')
+    expect(n.startedAt).toBeUndefined()
+  })
+
+  it('同一棵树里已完成的节点不受影响 —— 它们的耗时是真的', () => {
+    // 反向守卫:不能靠"把整棵树的 startedAt 全清掉"来满足上一条。ACCEPTED 的节点没有被
+    // 归位,它那段耗时是真跑出来的,清掉等于把已经完成的工作说成没跑过。
+    //
+    // 两个节点必须放在**同一个数组**里:第一版只放了一个 ACCEPTED 节点,而它压根进不了
+    // 归位循环(开头就 continue),所以"全清"那个变异根本执行不到那一行,用例照样绿 ——
+    // 是变异跑出来的。得有一个真被归位的节点把循环带起来。
+    const done = mk({ id: 'root/01-a', status: 'ACCEPTED', startedAt: '2026-07-24T00:00:00.000Z' })
+    const killed = mk({ id: 'root/02-b', kind: 'executable', status: 'EXECUTING', startedAt: '2026-07-24T00:00:00.000Z' })
+    const r = reseatTransientNodes([done, killed], NOW, DEFAULT_CAPS)
+    expect(r.reseated).toEqual(['root/02-b']) // 循环确实跑起来了
+    expect(killed.startedAt).toBeUndefined()
+    expect(done.startedAt).toBe('2026-07-24T00:00:00.000Z')
+  })
+})

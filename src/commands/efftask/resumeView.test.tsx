@@ -178,7 +178,8 @@ describe('ConfirmResume (vendored renderer)', () => {
     // 一个自己看不见形状的 run:哪些分支活下来了、哪些是阻断的、还剩多少。
     const nodes = [
       { ...mkNode({ id: 'root', title: '根任务' }), status: 'WAITING_CHILDREN', kind: 'decompose', childIds: ['root/01-a'] },
-      { ...mkNode({ id: 'root/01-a', title: '打通登录' }), parentId: 'root', depth: 1, status: 'BLOCKED' },
+      // 标题刻意和 config.goalPrompt('打通登录接口')不同 —— 否则断言会被顶部的目标行满足。
+      { ...mkNode({ id: 'root/01-a', title: '登录子任务' }), parentId: 'root', depth: 1, status: 'BLOCKED' },
     ] as never
     const { stdin, stdout, lastFrame } = fakeTty()
     const app = await render(
@@ -187,12 +188,49 @@ describe('ConfirmResume (vendored renderer)', () => {
     )
     await tick()
     const f = lastFrame()
-    expect(f).toContain('打通登录')
-    // 断言的是**状态着色的字形**,不是 `[BLOCKED]` 那串字面量 —— 这个文件的 plain() 会把
-    // `[B` 当成光标转义序列吃掉(见文件顶部注释),所以字面量断言会以一个和实现无关的
-    // 理由失败。字形本身就是 §17.3 要的"状态着色"。
-    expect(f).toContain('✗')
-    expect(f).toContain('根任务')
+    // 三条断言,每一条都必须只能由**树里那一行**满足。第一版三条里有两条是空的:
+    //   · toContain('打通登录') 由顶部的「目标: 打通登录接口」满足,和树无关 —— 实测把
+    //     阻断分支整个过滤掉,用例照样绿,而"哪些是阻断的"正是它自称要保护的东西;
+    //   · toContain('✗') 由表头那个静态的 `✗{counts.failed}` 满足,不是行内状态字形 ——
+    //     实测把 GLYPH[ui] 换成 '@',用例照样绿。
+    // 所以改成用树里独有的标题、以及"字形 + 标题同处一行"来钉。
+    expect(f).toContain('登录子任务')                 // 只出现在树里,不在目标行里
+    expect(f).toMatch(/✗\s*登录子任务/)              // 状态字形必须贴在那一行上
+    expect(f).toMatch(/▾\s*○\s*根任务/)              // 折叠标记 + 排队字形 + 根标题
+    app.unmount()
+  })
+
+  it('树放不下时要说出来 —— 关口上没有任何键能滚动它', async () => {
+    // 非交互渲染意味着**没有任何键能滚**。21 个节点时画面只显示前 10 行,边框直接闭合,
+    // 看起来像一整棵完整的树,而表头还数着一个用户根本看不到的 ✗。唯一的线索是面板那个
+    // `1/21` —— 那是交互模式下的光标位置,而这里没有光标。同一个仓库里 block() 和实时
+    // 输出面板都为这类情况写了"省略了 N 行"。
+    const many = Array.from({ length: 21 }, (_, i) => ({
+      ...mkNode({ id: `root/${i}`, title: `子任务${i}` }),
+      status: i === 20 ? 'BLOCKED' : 'READY',
+    })) as never
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, nodes: many, onDecision: () => {} } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = lastFrame()
+    expect(f).toContain('共 21 个节点')
+    expect(f).toContain('按 v 查看完整任务树')
+    app.unmount()
+  })
+
+  it('放得下时不显示那句提示', async () => {
+    const few = [{ ...mkNode({ id: 'root', title: '根任务' }), status: 'WAITING_CHILDREN' }] as never
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, nodes: few, onDecision: () => {} } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(lastFrame()).not.toContain('按 v 查看完整任务树')
+    expect(lastFrame()).toContain('根任务') // 正向锚点:树确实渲染了
     app.unmount()
   })
 

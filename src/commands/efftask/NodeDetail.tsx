@@ -125,11 +125,23 @@ export function NodeDetail(props: {
       {/* 依赖 (spec §10.2). Missing deps are REPORTED, not hidden: a dangling id is why the
           node is blocked, and silently shrinking the list would hide the cause. */}
       <Section
-        maxLines={perSection}
+        // Its own allowance, like the live log below, rather than the shared per-section
+        // slice. `perSection` is budget/6 — four lines at the default — and that divisor was
+        // set when there were six sections; 依赖 is now the eleventh. Four lines answers "you
+        // have deps" but not "which ones am I waiting on", which is the entire question that
+        // brings someone to this pane. Lines here are one short row per dependency, so a
+        // larger allowance costs little. Over-long lists still fold through block(), which
+        // says how many it hid.
+        maxLines={Math.max(6, Math.floor(budget / 3))}
         title="依赖"
         body={n.deps
           .map(id => {
-            const d = props.resolveNode?.(id)
+            // No resolver at all is NOT "the node is missing" — it is "the caller did not
+            // wire one". Reporting the first as the second is precisely the class of lie this
+            // repo keeps paying for, so an unwired pane degrades to bare ids and only a
+            // resolver that ANSWERS undefined reports a missing node.
+            if (!props.resolveNode) return id
+            const d = props.resolveNode(id)
             return d ? `${d.title}(${d.status})` : `${id}(节点缺失)`
           })
           .join('\n')}

@@ -243,6 +243,28 @@ export function reseatTransientNodes(
 
     n.status = target
     n.interrupted = false
+    /**
+     * 耗时重新计时 (spec §10.1: 「自进入**活动态**起的累计耗时」).
+     *
+     * `startedAt` round-trips through node.md, and nothing here used to clear it — so after a
+     * resume `elapsed` computed `now - startedAt` across the entire time the terminal was
+     * CLOSED. Measured on a run killed two days earlier: a grey ○ 排队中 node rendered
+     * `172800s` beside it, against a true runtime of a few tens of seconds, and because the
+     * panel treats any non-terminal node as live the number ticked upward once a second while
+     * nothing was running at all.
+     *
+     * That mattered little while the tree only appeared during a live run; it became the first
+     * number on screen when the resume gate started rendering the recovered tree, i.e. exactly
+     * where a user decides whether to spend more money. It is also the SAME defect `elapsed`'s
+     * own comment records having fixed once before ("a node that never ran … rendered 3600s an
+     * hour after the tree was built").
+     *
+     * Cleared rather than adjusted: this node is going back to a resting state and will be
+     * re-stamped by commit() on its next ACTIVE phase, which is what the field means.
+     * `resumeCore` already tells the user this in so many words when it drops a malformed one
+     * — 「耗时将从恢复后的首个活动阶段重新计时」.
+     */
+    n.startedAt = undefined
     // Reopen the chain above too, or this seat is unreachable.
     reopenAncestors(n)
     // …and anything that was only waiting on this node. Same reason: the block was never

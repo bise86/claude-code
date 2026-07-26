@@ -495,16 +495,29 @@ describe('实时输出面板不能只交代一半的截断', () => {
       node: mk({ id: 'root/02-b', title: '写接口', status: 'READY', deps: ['root/01-a', 'root/09-gone'] }),
       resolveNode: (id: string) => (id === dep.id ? dep : undefined),
     })
-    expect(f).toContain('依赖') // 小节标题本身 —— 少了它,下面的内容就没有归属
+    // 标题**恰好**是「依赖」:toContain('依赖') 是超集匹配,改成「依赖项目清单」照样绿
+    // (验收评审实测)。后面跟空白 = 这一行到此为止。
+    expect(f).toMatch(/依赖\s/)
     expect(f).toContain('建表')
     expect(f).toContain('ACCEPTED')
     // 缺失的依赖要报出来,不能悄悄缩短列表 —— 那恰恰是这个节点推不动的原因。
     expect(f).toContain('节点缺失')
   })
 
+  it('没接解析器时退化成裸 id,不能说成"节点缺失"', async () => {
+    // 「调用方忘了接线」和「依赖真的没了」是两件事。默认值原本选反了:没有 resolveNode 时
+    // 每一条**健康**依赖都被渲染成「节点缺失」—— 恰好是这个仓库反复在修的那一类谎,而且
+    // 会把人送去查一个并不存在的故障。
+    const f = await mountDetail({ node: mk({ id: 'n', deps: ['root/01-a'] }) })
+    expect(f).toContain('root/01-a')
+    expect(f).not.toContain('节点缺失')
+  })
+
   it('没有依赖时不渲染空的「依赖」小节', async () => {
-    const f = await mountDetail({ node: mk({ id: 'n', deps: [] }) })
+    const f = await mountDetail({ node: mk({ id: 'n', title: '独立任务', deps: [] }) })
     expect(f).not.toContain('依赖')
+    // 正向锚点:否则一个空帧(渲染整个挂了)也能满足上面那条否定断言。
+    expect(f).toContain('独立任务')
   })
 
   it('面板真的把整棵树交给了详情 —— 否则依赖只能显示成 id', async () => {

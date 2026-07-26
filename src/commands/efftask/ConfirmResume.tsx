@@ -7,6 +7,10 @@ import {
   type ResumeSummary, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
+/** Rows of tree the gate draws. Small on purpose — the gate must stay readable on one
+ * screen, and `v` opens the full browsable tree for anyone who needs more. */
+const TREE_ROWS = 10
+
 /**
  * §17.3 恢复确认关口. Same shape as ConfirmStartup, plus the recovery summary — rendered
  * from `resumeSummarySections`, the SAME function the Feishu card uses, so the two surfaces
@@ -74,7 +78,19 @@ export function ConfirmResume(props: {
           clamped because the gate has to stay readable on one screen — `v` opens the full
           browsable tree for anyone who needs to go deeper. */}
       {props.nodes && props.nodes.length > 0 ? (
-        <TaskTreePanel nodes={props.nodes} runId={props.summary.runId} maxRows={10} />
+        <Box flexDirection="column">
+          <TaskTreePanel nodes={props.nodes} runId={props.summary.runId} maxRows={TREE_ROWS} />
+          {/* Say the truncation out loud. The panel is NON-interactive here, so nothing can
+              scroll it: with 21 nodes the frame showed the first 10 and closed its border as
+              though that were the whole tree, while the header counted a ✗ the user could not
+              see. The only hint was the panel's `1/21`, which is a cursor position — and there
+              is no cursor in this mode. Same rule the log pane and block() already follow. */}
+          {props.nodes.length > TREE_ROWS ? (
+            <Text dimColor>
+              {'  '}(树太长,上面只显示了前 {TREE_ROWS} 行,共 {props.nodes.length} 个节点;按 v 查看完整任务树)
+            </Text>
+          ) : null}
+        </Box>
       ) : null}
       <Text dimColor>回车/y 继续执行 · v 仅查看后退出 · Esc/n 取消</Text>
     </Box>

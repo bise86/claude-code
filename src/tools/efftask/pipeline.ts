@@ -359,11 +359,25 @@ export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feed
     // so a planner optimising for parallelism produced precisely the shape the spec warns
     // about: independent siblings editing one file, each in its own worktree, the later merge
     // conflicting. Isolation is what makes this both possible and invisible until merge time.
-    (isolated
-      ? `注意:每个子任务在**各自独立的 git worktree** 里并行执行,最后逐个合并回集成分支。` +
-        `因此**可能改到同一批文件的子任务,必须用 deps 串起来**(让它们先后执行),` +
-        `不要为了并行把它们并列 —— 并列的代价是合并冲突,需要人工介入。` +
-        `真正互不相干的子任务才并列。\n`
+    // Suppressed at the depth cap — the line above just said "no more children", so advice
+    // about how to wire siblings contradicts it — and at parallelism 1, where the global pool
+    // admits one node at a time and `acquire` branches from the integration branch's CURRENT
+    // tip, so the second node already contains the first one's merge. That is the same test
+    // used to suppress this for un-isolated runs: do not describe a hazard this run cannot have.
+    (isolated && node.depth + 1 <= caps.maxDepth && ctx.config.parallelism > 1
+      ? `注意:子任务在**各自独立的 git worktree** 里并行执行,最后逐个合并回集成分支。` +
+        `所以**几乎必然会改到同一个文件的子任务,优先用 deps 串起来**,让它们先后执行。\n` +
+        // The counter-pressure, and it is load-bearing rather than decoration. `deps` is a hard
+        // scheduling gate, and 依赖阻断 propagates to every downstream dependant — so
+        // over-chaining converts "one node failed" into "the whole chain failed", on top of
+        // costing wall-clock. spec §16 says 鼓励, and in the same breath 「不追求全自动无冲突」
+        // with an auto-resolve → escalate path behind it. An earlier wording here said 必须 and
+        // gave three clauses all pushing the same way; asked "could these touch the same file?"
+        // a planner answers yes for almost any two tasks in one repo, so that reads as
+        // "serialise everything" — destroying the parallelism this whole mode exists for.
+        `但 deps 是硬调度门:串起来的任务只能依次执行,而且上游一旦阻断,下游会跟着阻断。` +
+        `所以只在**确实会碰同一个文件**时串,拿不准就并列 —— 合并冲突有自动解决和人工升级兜底,` +
+        `不必为了躲冲突牺牲并行。\n`
       : '') +
     `请输出一个 json 代码块:{ "kind":"decompose"|"executable", "solution", "keyPoints", "risks", "acceptance", "children":[{"title","deps":["兄弟标题"]}] }。` +
     `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。` +
@@ -925,6 +939,31 @@ async function growTree(
  * straight into the shared tree.
  */
 async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = false): Promise<boolean> {
+  /**
+   * "Nothing to merge" and "the pool that owned my commits is gone" are NOT the same answer.
+   *
+   * The single `!ctx.worktrees || !node.worktree` short-circuit reported success for both.
+   * The second case is reachable, and it is the bad one: `validateLoadedNodes` deliberately
+   * KEEPS `node.worktree` for a node blocked on a merge conflict — that path is where the
+   * human's fix lives, and the resume summary promises 「恢复后将重跑验收并重试合并」. If the
+   * pool then fails to init on that resume (very reachable: the escalation card sends the user
+   * to look at the conflict, they `git checkout` the integration branch in their main tree,
+   * and the next `git worktree add` refuses with "already checked out"), the run degrades to
+   * `isolation: 'none'` — and this function answered "merged fine" for a node holding real
+   * commits on a branch nothing will ever merge. It then reached ACCEPTED. Measured by an
+   * acceptance reviewer end to end.
+   *
+   * That is exactly what §17.2 promises never to do: 宁可重做,不可谎报.
+   */
+  if (!ctx.worktrees && node.worktree) {
+    await blockWithReason(
+      node,
+      `该节点在隔离工作区(${node.worktree.branch})里有未合并的提交,但本次运行没有可用的隔离池,` +
+      `无法把它合入集成分支。请先解决 ${node.worktree.path} 处的占用(常见原因:集成分支已在主检出里被 checkout),再 /et --resume 继续。`,
+      ctx,
+    )
+    return false
+  }
   if (!ctx.worktrees || !node.worktree) return true
   const res = await ctx.worktrees.commitAndMerge(node)
   if (!res.ok) {

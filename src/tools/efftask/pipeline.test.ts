@@ -940,7 +940,21 @@ describe('隔离下,验收与评分必须读到被验收的工作', () => {
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as RunAgentFn
-    const ctx = ctxFor([n], agent)
+    // A pool is REQUIRED now, and the fixture was wrong without it: it pinned a worktree onto
+    // the node while leaving ctx.worktrees undefined — a node holding commits with no pool
+    // able to merge them. mergeAndRelease used to answer "merged fine" for that and let the
+    // node reach ACCEPTED, which is the very state an acceptance reviewer reproduced on the
+    // resume path (conflict node keeps its worktree, pool init then fails) and the reason the
+    // short-circuit now distinguishes the two cases.
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: {
+        acquire: async () => ({ path: n.worktree!.path, branch: n.worktree!.branch, gitRoot: '/repo' }),
+        commitAndMerge: async () => ({ ok: true, merged: true }),
+        release: async () => ({ removed: true }),
+        withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      } as never,
+    }
     await stepStart(n, ctx)
     await stepExecute(n, ctx)
     expect(n.status).toBe('ACCEPTED')
@@ -2330,6 +2344,42 @@ function ctx2Child(parent: TaskNode): TaskNode {
   return k
 }
 
+describe('隔离池没了但节点手里还攥着提交时,不许报"已验收"', () => {
+  it('有 worktree、没有池 → 阻断,而不是当作"没什么要合的"', async () => {
+    // 可达路径,而且正是升级卡片把用户引过去的那条:validateLoadedNodes **故意**为
+    // mergeConflict 的节点保留 worktree(人的修复就在那个目录里),恢复摘要还承诺
+    // 「恢复后将重跑验收并重试合并」。若这次 resume 的 pool.init() 失败(用户在主检出里
+    // checkout 了集成分支 → `git worktree add` 报 already checked out),run 退化成
+    // isolation='none',而 mergeAndRelease 的
+    // `if (!ctx.worktrees || !node.worktree) return true` 会对一个**手里攥着真实提交**的
+    // 节点回答"合好了",节点随后 ACCEPTED。提交永远留在节点分支上,而 run 报告完成。
+    // §17.2 的原话是:宁可重做,不可谎报。
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    n.worktree = { branch: 'worktree-efftask-001-abc', path: '/wt/abc' }
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = ctxFor([n], agent) // 注意:没有 worktrees
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('未合并的提交')
+    expect(n.blockedReason).toContain('worktree-efftask-001-abc')
+  })
+
+  it('本来就没有隔离(节点也没有 worktree)时照常通过', async () => {
+    // 反向守卫:上面那条不能靠"只要没池就阻断"来满足 —— 共享工作目录的 run 是合法的,
+    // 它的节点根本没有 worktree,没有任何东西需要合并。
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    await stepExecute(n, ctxFor([n], agent))
+    expect(n.status).toBe('ACCEPTED')
+  })
+})
+
 describe('spec §16:方案阶段必须被告知"可能冲突的子任务要用依赖边串起来"', () => {
   // §16 把 worktree 合并冲突列为**最大风险**,并且只给了一条缓解:
   // 「鼓励 plan 阶段以依赖边串联可能冲突的节点」。这条指示此前到不了 planner —— schema 那行
@@ -2337,12 +2387,44 @@ describe('spec §16:方案阶段必须被告知"可能冲突的子任务要用�
   // 的那个形状:互不依赖的兄弟改同一个文件,各自一个 worktree,后合并的那个冲突。
   const fakePool = { integrationPath: '/wt/integration' } as never
 
-  it('隔离运行时,提示词里要讲清 worktree 并行与冲突代价', () => {
+  it('隔离运行时要给出可执行的串联指示 —— 不是提到几个词就算', () => {
     const n = root()
     const p = planPrompt(n, { config: cfg, byId: byIdMap([n]), worktrees: fakePool }, 'plantag')
-    expect(p).toContain('worktree')
-    expect(p).toContain('deps')
-    expect(p).toContain('合并冲突')
+    // 断言的是**指示本身**。第一版只查 'worktree'/'deps'/'合并冲突' 三个词,而 'deps' 由
+    // 改动前就存在的 schema 行(`"children":[{"title","deps":[...]}]`)满足 —— 那条断言在
+    // 这个 commit 之前就是绿的,证明不了任何事。验收评审据此把整段指示换成字面量
+    // 「注意:worktree 合并冲突。」(保留被断言的词、删光所有可执行内容),230 个用例全绿。
+    expect(p).toContain('优先用 deps 串起来')
+    expect(p).toContain('各自独立的 git worktree')
+  })
+
+  it('同一段话必须同时讲清串联的代价,否则等于叫 planner 全部串行化', () => {
+    // §16 原话是「**鼓励**」,同一段还写着「不追求全自动无冲突」并给了
+    // 「冲突→自动解决→失败升级人工」的通路。而 deps 是硬调度门,依赖阻断还会传播给所有
+    // 下游 —— 串成链之后一个节点挂掉会连坐整条链。只讲收益不讲代价,而「可能改到同一批
+    // 文件」对同一仓库里任意两个子任务几乎恒真,planner 的理性反应就是全部串行,
+    // 而并行正是这个模式存在的理由。
+    const n = root()
+    const p = planPrompt(n, { config: cfg, byId: byIdMap([n]), worktrees: fakePool }, 'plantag')
+    expect(p).toContain('硬调度门')
+    expect(p).toContain('下游会跟着阻断')
+    expect(p).toContain('拿不准就并列')
+    expect(p).not.toContain('必须用 deps') // 模态不能强过 spec 的「鼓励」
+  })
+
+  it('已到深度上限时不发 —— 上一行刚说了不得再拆分', () => {
+    const n = root(); n.depth = DEFAULT_CAPS.maxDepth
+    const p = planPrompt(n, { config: cfg, byId: byIdMap([n]), worktrees: fakePool }, 'plantag')
+    expect(p).toContain('不得再拆分')
+    expect(p).not.toContain('各自独立的 git worktree')
+  })
+
+  it('parallelism 为 1 时不发 —— 这个风险本次运行不可能有', () => {
+    // 全局池一次只放一个节点在飞,而 acquire 基于集成分支**当前**状态开分支,所以第二个
+    // 节点看得见第一个已合并的结果。和"没有隔离时不发"用的是同一条标准。
+    const n = root()
+    const p = planPrompt(n, { config: { ...cfg, parallelism: 1 }, byId: byIdMap([n]), worktrees: fakePool }, 'plantag')
+    expect(p).not.toContain('各自独立的 git worktree')
   })
 
   it('没有隔离时不讲 —— 那样是在描述一个这次运行不可能有的风险', () => {
