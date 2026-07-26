@@ -465,9 +465,17 @@ export function costLine(config: EffTaskConfig): string {
   // 所以是 It 的平方,不是一次方。漏掉它会低估约 2.5 倍 —— 实测 1 评审席 + 2 验收席、
   // It=3 时真实 23 次而关口承诺 15 次。低估比高估糟:用户按一个偏小的数批准。
   const planPhase = It * (P + It * R)
+  // 测试验证是 **opt-in**:没配这个环节的角色,这一步整个不发生。所以用 seats() 原值
+  // 而不是 Math.max(1, …) —— 照抄 accept 的写法会让默认配置的关口数字凭空涨一截,
+  // 而实际一次调用都不会有。关口高估同样是撒谎,只是方向相反(用户会去调一个根本不
+  // 需要调的旋钮)。
+  const V = seats('verify')
   // 打分在**每一次验收通过后**都跑,而返工循环可以让验收通过多次。
-  const execPhase = It * (1 + It * A + seats('observer'))
-  const perNode = planPhase + execPhase
+  const execPhase = It * (1 + (V > 0 ? It * V : 0) + It * A + seats('observer'))
+  // 集成提交:拆分型节点在子任务全部完成后的那一场,同样有自己的 infra 重试层。
+  // 没配就回落到验收席位,不额外计数。
+  const integratePhase = It * It * seats('integrate')
+  const perNode = planPhase + execPhase + integratePhase
   const worst = perNode * c.maxNodes
   return `预估上限 ${worst} 次模型调用(每节点最多 ${perNode} 次 × 节点上限 ${c.maxNodes};实际通常远低于此);并发上限仍是 ${config.parallelism}`
 }

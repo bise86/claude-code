@@ -814,3 +814,37 @@ describe('两条夹取路径与 NaN', () => {
     expect(roster.review).toHaveLength(5)
   })
 })
+
+describe('新环节的成本必须计入,而默认配置的数字不能动', () => {
+  const mk = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], ...over,
+  })
+  const n = (s: string) => Number(s.match(/每节点最多 (\d+) 次/)![1])
+
+  it('默认配置仍然是 24 —— 两个新环节都是 opt-in', () => {
+    // 照抄 accept 的 Math.max(1, seats) 写法会让这个数凭空涨一截,而实际一次调用都不会
+    // 发生。关口高估同样是撒谎,只是方向相反:用户会去调一个根本不需要调的旋钮。
+    expect(n(costLine(mk()))).toBe(24)
+  })
+
+  it('配了测试验证 → 数字涨,而且带 infra 重试层(平方项)', () => {
+    const one = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }] } })))
+    const two = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }, { roleName: 'w' }] } })))
+    expect(one).toBeGreaterThan(24)
+    // It=3:一席 +9,两席 +18。一次方的话是 +3/+6。
+    expect(one - 24).toBe(9)
+    expect(two - one).toBe(9)
+  })
+
+  it('配了集成提交 → 数字涨', () => {
+    const withInt = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), integrate: [{ roleName: 'i' }] } })))
+    expect(withInt - 24).toBe(9)
+  })
+
+  it('两个都配 → 两份都算上', () => {
+    const both = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(),
+      verify: [{ roleName: 'v' }], integrate: [{ roleName: 'i' }] } })))
+    expect(both).toBe(24 + 9 + 9)
+  })
+})
