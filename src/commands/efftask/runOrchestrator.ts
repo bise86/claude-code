@@ -123,6 +123,9 @@ export async function runOrchestrator(
    * cannot double-dispose after the happy path already did it.
    */
   let ran = false
+  // run 的结局,收口关口要带上它 —— 别邀请用户合并一棵没做完的树。reclaim 可能在
+  // orch.run() 返回前(异常路径)就跑,所以默认按「被阻断」算,拿到真结果再覆盖。
+  let pendingOutcome: Outcome = { status: 'blocked', reason: '未知' }
   const reclaim = async (nodes: TaskNode[]): Promise<void> => {
     if (ran || !args.worktrees) return
     ran = true
@@ -131,7 +134,21 @@ export async function runOrchestrator(
       // worktrees that genuinely still hold something. Reporting before reclaiming would list
       // directories that are about to disappear.
       await args.worktrees.dispose(nodes)
-      onHandoff?.(await args.worktrees.handoff(nodes))
+      const h = await args.worktrees.handoff(nodes)
+      onHandoff?.(h)
+      // 挂到 config 上 → 下一次 queueManifest 把它写进 run.md。**独立于 status**:
+      // status 先写下 completed 而集成分支还没处置,用户直接关终端就再也没人管那条分支
+      // 了(reseat 只捞活动态节点,根节点已 ACCEPTED)。
+      //
+      // commits === 0 时不留 —— 没有任何改动就没什么可收口的,留下它只会让下次 --resume
+      // 弹一个四选一去处置一条空分支。
+      if (h.commits > 0) {
+        args.config.pendingHandoff = {
+          branch: h.branch, commits: h.commits, integrationPath: h.integrationPath,
+          kept: h.kept, salvage: h.salvage,
+          outcome: pendingOutcome.status, ...(pendingOutcome.reason ? { reason: pendingOutcome.reason } : {}),
+        }
+      }
     } catch (e) {
       logError(e instanceof Error ? e : new Error(String(e)))
     }
@@ -170,6 +187,7 @@ export async function runOrchestrator(
     liveNodes = orch.nodes()
     const result = await orch.run() // { status, reason }
     liveNodes = orch.nodes()
+    pendingOutcome = result
     await reclaim(orch.nodes())
     setNodes([...orch.nodes()])
     setOutcome(result)
@@ -179,6 +197,7 @@ export async function runOrchestrator(
     // run() is not supposed to reject (the orchestrator catches per-step), but if it ever
     // does, the UI must NOT wedge on 'running' with no way out.
     const failed: Outcome = { status: 'blocked', reason: e instanceof Error ? e.message : String(e) }
+    pendingOutcome = failed
     setOutcome(failed)
     // …and the /tasks row must not sit at 运行中 forever for a run that is over. This path
     // is the one that leaves a task with no other way to reach a terminal status.
@@ -186,6 +205,10 @@ export async function runOrchestrator(
   } finally {
     // The reclaim the happy path may not have reached. A no-op when it did.
     await reclaim(liveNodes)
+    // 待收口状态必须落盘,而异常路径上 happy path 的那次 queueManifest 根本没跑到 ——
+    // 于是 pendingHandoff 被设进 config、一次也没写出去,集成分支再没人处置。
+    // 幂等:happy path 已经写过时这只是再写一遍同样的内容。
+    if (args.config.pendingHandoff) await queueManifest(liveNodes, pendingOutcome)
     setPhase('done') // the done view is ALWAYS reached
   }
 }

@@ -313,6 +313,9 @@ export async function writeRunManifest(
     ...(cfg.resumeGuidance ? { resumeGuidance: cfg.resumeGuidance } : {}),
     ...(cfg.resumes && cfg.resumes.length > 0 ? { resumes: cfg.resumes } : {}),
     ...(cfg.roleDefs && cfg.roleDefs.length > 0 ? { roleDefs: cfg.roleDefs } : {}),
+    // 独立于 status 落盘 —— 见 EffTaskConfig.pendingHandoff:status 先写下 completed 而
+    // 集成分支还没处置,用户直接关终端就再也没人管那条分支了。
+    ...(cfg.pendingHandoff ? { pendingHandoff: cfg.pendingHandoff } : {}),
     ...(result ? { status: result.status, reason: result.reason ?? '' } : {}),
   })}---\n\n`
   await fs.mkdir(runDir)

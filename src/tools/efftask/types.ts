@@ -325,6 +325,29 @@ export interface EffTaskConfig {
    * 名册看起来一模一样,模型收到的东西却变了。`resumes` 已经踩过这个坑。
    */
   roleDefs?: RoleDef[]
+  /**
+   * 跑完了、但用户还没决定怎么处置集成分支(§8 收口)。
+   *
+   * 为什么必须是**持久**状态而不是内存里的一个关口:run.md 的 `status` 只在最后一次写入
+   * 时带上,所以盘上会先出现 `status: completed`,而集成分支还没人处置。用户此时**直接
+   * 关终端**(不是按 Esc)→ 关口消失 → `--resume` 的 reseat 只捞活动态节点,根节点已经
+   * ACCEPTED → **什么都不会重开**,那条分支永远留在那没人管。
+   *
+   * 所以恢复路径必须**独立于 status 和节点状态**检查这个字段。
+   */
+  pendingHandoff?: PendingHandoff
+}
+
+/** 待收口的集成分支快照(§8)。字段与 worktreePool.handoff() 的返回一致。 */
+export interface PendingHandoff {
+  branch: string
+  commits: number
+  integrationPath?: string
+  kept: { path: string; why: string }[]
+  salvage: string[]
+  /** run 是正常跑完还是被阻断/取消 —— 别邀请用户合并一棵没做完的树。 */
+  outcome: 'completed' | 'blocked'
+  reason?: string
 }
 
 export interface ResumeRecord {

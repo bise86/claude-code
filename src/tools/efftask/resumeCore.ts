@@ -623,6 +623,31 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
     if (kept.length > 0) base.roleDefs = kept
   }
 
+  // 待收口状态读回。只写不读的话,「跑完先还终端、回头再收口」整条路都不存在。
+  const ph = fm.pendingHandoff
+  if (ph && typeof ph === 'object') {
+    const o = ph as Record<string, unknown>
+    const commits = typeof o.commits === 'number' && Number.isFinite(o.commits) ? Math.max(0, Math.trunc(o.commits)) : 0
+    if (typeof o.branch === 'string' && o.branch.length > 0) {
+      base.pendingHandoff = {
+        branch: o.branch,
+        commits,
+        ...(typeof o.integrationPath === 'string' ? { integrationPath: o.integrationPath } : {}),
+        kept: Array.isArray(o.kept)
+          ? o.kept.filter((k): k is { path: string; why: string } =>
+              !!k && typeof k === 'object'
+              && typeof (k as { path?: unknown }).path === 'string'
+              && typeof (k as { why?: unknown }).why === 'string')
+          : [],
+        salvage: Array.isArray(o.salvage) ? o.salvage.filter((x): x is string => typeof x === 'string') : [],
+        outcome: o.outcome === 'blocked' ? 'blocked' : 'completed',
+        ...(typeof o.reason === 'string' && o.reason.length > 0 ? { reason: o.reason } : {}),
+      }
+    } else {
+      degraded.push('run.md 里的待收口记录缺少分支名,已忽略:集成分支需要你自己处置')
+    }
+  }
+
   base.notices = Array.isArray(fm.notices) ? fm.notices.filter((n): n is string => typeof n === 'string') : []
   if (typeof fm.mainModel === 'string') base.mainModel = fm.mainModel
   if (typeof fm.resumeGuidance === 'string') base.resumeGuidance = fm.resumeGuidance

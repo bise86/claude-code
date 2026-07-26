@@ -762,3 +762,36 @@ describe('新 caps 旋钮的读回与再校验', () => {
     expect(config.caps.maxSeatsPerPhase).toBeUndefined()
   })
 })
+
+describe('待收口状态必须能从 run.md 读回', () => {
+  const md = (extra: string) => `---\ngoalPrompt: g\npendingHandoff:\n${extra}---\n\n`
+
+  it('读回分支、提交数、路径、结局', async () => {
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': md(
+      '  branch: efftask/001/integration\n  commits: 3\n  integrationPath: /repo/.wt/int\n' +
+      '  kept: []\n  salvage: [efftask/001/salvage]\n  outcome: completed\n') }), '/r')
+    expect(config.pendingHandoff).toEqual({
+      branch: 'efftask/001/integration', commits: 3, integrationPath: '/repo/.wt/int',
+      kept: [], salvage: ['efftask/001/salvage'], outcome: 'completed',
+    })
+  })
+
+  it('被阻断的 run 的结局照样读回 —— 别邀请用户合并一棵没做完的树', async () => {
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': md(
+      '  branch: b\n  commits: 1\n  outcome: blocked\n  reason: 连续返工超限\n') }), '/r')
+    expect(config.pendingHandoff?.outcome).toBe('blocked')
+    expect(config.pendingHandoff?.reason).toBe('连续返工超限')
+  })
+
+  it('缺分支名 → 忽略并说明,不留一条没法执行的收口记录', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md('  commits: 3\n') }), '/r')
+    expect(config.pendingHandoff).toBeUndefined()
+    expect(degraded.join('\n')).toContain('缺少分支名')
+  })
+
+  it('没有待收口的老 run.md 照常恢复', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': '---\ngoalPrompt: g\n---\n\n' }), '/r')
+    expect(config.pendingHandoff).toBeUndefined()
+    expect(degraded.filter(d => d.includes('收口'))).toEqual([])
+  })
+})

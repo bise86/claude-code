@@ -508,3 +508,86 @@ describe('并行占用的 reader 真的被交出去了', () => {
     expect(u.inUse).toBe(0)          // settled after the run
   })
 })
+
+describe('跑完之后的待收口状态要落盘(§8 收口)', () => {
+  // 为什么必须持久:run.md 的 status 只在最后一次写入时带上,所以盘上会先出现
+  // status: completed 而集成分支还没处置。用户此时**直接关终端**(不是按 Esc)→
+  // --resume 的 reseat 只捞活动态节点、根节点已 ACCEPTED → 什么都不会重开,
+  // 那条分支永远留在那没人管。
+  const poolWith = (commits: number) => ({
+    init: async () => {},
+    acquire: async () => undefined,
+    release: async () => {},
+    dispose: async () => {},
+    integrationBranchName: 'efftask/001/integration',
+    handoff: async () => ({
+      branch: 'efftask/001/integration', commits,
+      kept: [], salvage: [], integrationPath: '/repo/.wt/int',
+    }),
+  })
+
+  const drive = async (commits: number) => {
+    const fs = memFs()
+    const ac = new AbortController()
+    ac.abort() // 最短路径到终态;收口那一跳的接缝是一样的
+    const config = cfg()
+    await runOrchestrator(
+      // biome-ignore lint/suspicious/noExplicitAny: partial worktree pool double
+      { config, runDir: '/run', fs, runAgent: (async () => '') as RunAgentFn, signal: ac.signal, worktrees: poolWith(commits) as any },
+      () => {}, () => {}, () => {},
+    )
+    return { config, manifest: fs.files.get('/run/run.md') ?? '' }
+  }
+
+  it('有提交时写进 run.md,并带上 run 的结局', async () => {
+    const { config, manifest } = await drive(3)
+    expect(config.pendingHandoff?.branch).toBe('efftask/001/integration')
+    expect(config.pendingHandoff?.commits).toBe(3)
+    expect(config.pendingHandoff?.outcome).toBe('blocked') // 这次是被中断的
+    expect(manifest).toContain('pendingHandoff')
+    expect(manifest).toContain('efftask/001/integration')
+  })
+
+  it('零提交时不留待收口 —— 别为一条空分支弹四选一', async () => {
+    const { config, manifest } = await drive(0)
+    expect(config.pendingHandoff).toBeUndefined()
+    expect(manifest).not.toContain('pendingHandoff')
+  })
+})
+
+describe('异常路径上待收口状态同样要落盘', () => {
+  it('happy path 的那次 manifest 写入没跑到时,finally 里补写', async () => {
+    // reclaim 在 try 里、queueManifest 在它后面。两者之间任何一步抛出,就会跳到 catch,
+    // 于是 pendingHandoff 被设进 config、一次也没写出去 —— 集成分支再没人处置,而这
+    // 恰恰是「跑完先还终端、回头再收口」整条路赖以存在的那条记录。
+    const fs = memFs()
+    const ac = new AbortController()
+    ac.abort()
+    const config = cfg()
+    let calls = 0
+    await runOrchestrator(
+      {
+        config, runDir: '/run', fs, runAgent: (async () => '') as RunAgentFn, signal: ac.signal,
+        // biome-ignore lint/suspicious/noExplicitAny: partial worktree pool double
+        worktrees: {
+          init: async () => {}, acquire: async () => undefined, release: async () => {},
+          dispose: async () => {}, integrationBranchName: 'b',
+          // 先让排队中的 manifest 写入排干。否则更早那次 queueManifest 会在 pendingHandoff
+          // 被设上之后才真正执行(它是惰性读 config 的),顺手把字段带出去 —— 于是这条
+          // 测试会因为一个**竞态**而通过,而不是因为 finally 里那次补写。
+          handoff: async () => {
+            await new Promise(r => setTimeout(r, 10))
+            return { branch: 'b', commits: 2, kept: [], salvage: [], integrationPath: '/p' }
+          },
+        } as any,
+      },
+      // 精确打在 reclaim **之后**、queueManifest **之前**的那一步。按调用序号数是错的:
+      // setNodes 还会被 orch 的 onUpdate 调用(而那里的抛出被吞掉),实测调了 3 次。
+      // 按「pendingHandoff 已经被设上」判定,才是那一步。
+      () => { calls++; if (config.pendingHandoff) throw new Error('store 炸了') },
+      () => {}, () => {},
+    )
+    expect(config.pendingHandoff?.branch).toBe('b')
+    expect(fs.files.get('/run/run.md') ?? '').toContain('pendingHandoff')
+  })
+})
