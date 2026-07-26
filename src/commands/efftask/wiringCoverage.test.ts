@@ -141,6 +141,14 @@ describe('角色定义的接线', () => {
   })
 
   it('baseRoleDefs 在 effect 依赖里 —— 否则它变了也不会重新解析', () => {
-    expect(SRC).toContain('baseRoleDefs, extractJson, agentModels, mainModel]')
+    expect(SRC).toContain('baseRoleDefs, baseRoleNotices, extractJson, agentModels, mainModel]')
+  })
+
+  it('配置文件那条录入口的诊断被接住并并进 notices', () => {
+    // 剪断它:员工名打错一个字 → 关口显示「架构师←主模型」,看起来像「我配的就是主模型
+    // 兼任」,而解释这件事的那句话被丢了。同样的错写在提示词里则会正常显示 —— 两条录入口
+    // 不对称,而这一条是静默的那一条。
+    expect(element('EffTaskRunner')).toContain('baseRoleNotices={collectedRoles.notices}')
+    expect(SRC).toContain('cfg.notices.unshift(...baseRoleNotices)')
   })
 })

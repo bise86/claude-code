@@ -191,6 +191,17 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // them, so they must be reported at the gate rather than silently downgraded to the main
   // model while the roster still shows the role's name.
   const unsupportedRoles = activeAgents.filter(a => 'execMode' in a && (a as { execMode?: string }).execMode === 'cli').map(a => a.agentType)
+  // settings.json 里配好的角色定义。读在这里而不是 parseDirectives 里面,是因为那个文件
+  // 是纯函数、不碰全局状态,整套解析/合并/展平才能不搭环境地测。
+  //
+  // `.notices` 和 `.defs` 一起接住:此前只取 `.defs`,于是配置文件那条录入口的**全部**
+  // 诊断信息无人接收 —— 员工名打错一个字,关口显示「架构师←主模型」,看起来像「我配的
+  // 就是主模型兼任」,而解释这件事的那句话被丢了。同样的错写在提示词里则会正常显示,
+  // 两条录入口不对称。连整份 settings.json 读不出来(EACCES)都是静默的。
+  const collectedRoles = collectRoleDefs({
+    knownStaff: new Set(knownRoles),
+    unsupportedStaff: new Set(unsupportedRoles),
+  })
   // Set when the view is torn down rather than exited, so the report can tell the two apart.
   let tornDown = false
   // The handoff, in call()'s OWN scope. onExit runs here, and it used to read `handoffRef` —
@@ -208,12 +219,8 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       unsupportedRoles={unsupportedRoles}
       // settings.json 里配好的角色定义。读在这里而不是 parseDirectives 里面,是因为那个
       // 文件是纯函数、不碰全局状态,整套解析/合并/展平才能不搭环境地测。
-      baseRoleDefs={
-        collectRoleDefs({
-          knownStaff: new Set(knownRoles),
-          unsupportedStaff: new Set(unsupportedRoles),
-        }).defs
-      }
+      baseRoleDefs={collectedRoles.defs}
+      baseRoleNotices={collectedRoles.notices}
       // The roster must say which model each seat runs on, and that answer lives in the
       // agent definitions + the session model — neither of which parseDirectives can see.
       agentModels={activeAgents}
@@ -411,6 +418,8 @@ type RunnerProps = {
   knownRoles: string[]
   /** settings.json 里配好的角色定义;提示词里的同名角色会覆盖它。 */
   baseRoleDefs?: RoleDef[]
+  /** 读配置文件时产生的诊断 —— 必须并进 cfg.notices,否则关口对配置文件里的错误一言不发。 */
+  baseRoleNotices?: string[]
   unsupportedRoles: string[]
   agentModels: AgentModelInfo[]
   mainModel: string
@@ -619,7 +628,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: run once per phase entry
   }, [phase, runId])
 
-  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs } = props
+  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs, baseRoleNotices } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
   // call(), which would freeze the terminal with no UI while spending tokens.
   React.useEffect(() => {
@@ -659,6 +668,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // ALSO recorded in run.md. Replacing the notices.push with component state alone meant
         // the manifest stopped saying the run was un-isolated, while the resume path still did.
         if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
+        // 配置文件那条录入口的诊断。放在**最前**:它讲的是用户写在盘上的东西哪里不对,
+        // 比运行期的降级更该先看到。也一并落进 run.md —— notices 是持久的。
+        if (baseRoleNotices && baseRoleNotices.length > 0) cfg.notices.unshift(...baseRoleNotices)
         setConfig(annotateRoleModels(cfg, agentModels, mainModel))
         setPhase('confirm')
       })
@@ -666,7 +678,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return () => {
       cancelled = true
     }
-  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, extractJson, agentModels, mainModel])
+  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, baseRoleNotices, extractJson, agentModels, mainModel])
 
   /**
    * Hand the confirmed run to the orchestrator. ONE definition, because two gates now reach
