@@ -3214,7 +3214,7 @@ describe('观察多员工:取最低分,其余理由不丢', () => {
     await stepExecute(n, ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles }))
     expect(n.status).toBe('ACCEPTED')
     const all = [n.score!.plan!, ...(n.score!.plan!.others ?? [])]
-    expect(all.map(x => x.rationale).join('\n')).toContain('评分调用失败')
+    expect(all.map(x => x.rationale).join('\n')).toContain('provider down')
   })
 
   it('阈值按最低分判定 —— 宽容的那个数不该掩盖它', async () => {
@@ -3327,7 +3327,9 @@ describe('评分调用失败不该买下一整轮执行(回归)', () => {
     expect(n.iteration.scoring).toBe(0)
     expect(execCalls).toBe(1)
     // 原因仍然记下来 —— 不返工不等于装作没发生。
-    expect(JSON.stringify(n.score)).toContain('评分调用失败')
+    // 断言**真实原因**,不只是硬编码前缀:只查前缀的话,把 res.reason 换成常量字符串
+    // 也不会红 —— 而那条原因正是用户唯一能据以判断「为什么没有这个数」的东西。
+    expect(JSON.stringify(n.score)).toContain('provider 502')
   })
 
   it('一席失败一席给高分 → 主记录是那个高分,不是 0', async () => {
@@ -3346,7 +3348,7 @@ describe('评分调用失败不该买下一整轮执行(回归)', () => {
     expect(n.score?.plan?.role).toBe('good')
     expect(n.iteration.scoring).toBe(0)
     // 失败那席仍在 others 里,原因不丢。
-    expect(JSON.stringify(n.score?.plan?.others)).toContain('评分调用失败')
+    expect(JSON.stringify(n.score?.plan?.others)).toContain('provider 502')
   })
 
   it('真的低分仍然触发返工 —— 别把闸门一起关了', async () => {
@@ -3459,5 +3461,37 @@ describe('验证裁决在记录里能和验收区分开', () => {
     n.phaseRoles = { ...emptyPhaseRoles(), verify: [{ roleName: 'tester' }] }
     await stepExecute(n, ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles }))
     expect(n.acceptLog.map(r => r.step)).toEqual(['verify', undefined])
+  })
+})
+
+describe('工作区闸门:两个守卫各自守的是什么', () => {
+  const ready = () => {
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }] }
+    return n
+  }
+  const agent: RunAgentFn = async req => {
+    if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+    return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+  }
+
+  // 注:「有池但节点没有 worktree」这种情形在 stepExecute 里**不可达** —— acquire 要么
+  // 给出工作区、要么直接阻断(pipeline.ts:1326-1332)。所以 verifySnapshot 里的 !wt 守卫
+  // 是纵深防御,不是活路径;不为它写一条假装可达的测试。
+  it('第二次取指纹失败时不判作弊 —— 量不到不等于变了', async () => {
+    // 这才是那两个 undefined 守卫存在的唯一理由:非对称的取不到。
+    let calls = 0
+    const pool = {
+      statusFingerprint: async () => { calls++; if (calls === 2) throw new Error('git 挂了'); return 'clean' },
+      commitAndMerge: async () => ({ ok: true }), release: async () => ({ removed: true }),
+    }
+    const n = ready()
+    n.worktree = { branch: 'b', path: '/wt' }
+    await stepExecute(n, { ...ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles }), worktrees: pool as never })
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.execStatus).not.toContain('改动了工作区')
   })
 })

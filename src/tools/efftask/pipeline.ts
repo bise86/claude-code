@@ -621,6 +621,9 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
  * 就知道这道闸门这次没生效。
  */
 async function verifySnapshot(node: TaskNode, ctx: PipelineCtx): Promise<string | undefined> {
+  // !wt 是纵深防御:走到这里时 acquire 要么已经给了工作区、要么已经阻断了节点,
+  // 所以它在 stepExecute 里不可达。留着是因为它一旦可达,后果是拿**用户主仓库**的
+  // git status 当指纹 —— 他手头任何无关改动都会被算到验证者头上。
   const wt = node.worktree?.path
   if (!wt || !ctx.worktrees?.statusFingerprint) return undefined
   try { return await ctx.worktrees.statusFingerprint(wt) } catch { return undefined }

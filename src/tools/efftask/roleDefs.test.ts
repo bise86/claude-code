@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 import {
-  applyRoleDefsToPhases, applyStaffDeclarations, mergeRoleDefs, parseRoleDefs, roleBriefFor,
+  allowsMultipleSeats, applyRoleDefsToPhases, applyStaffDeclarations, mergeRoleDefs,
+  MULTI_SEAT_PHASES, parseRoleDefs, PHASE_SEATING, roleBriefFor,
   seatsFor,
   type RoleDef,
 } from './roleDefs.js'
-import { MAIN_STAFF } from './types.js'
+import { MAIN_STAFF, PHASE_NAMES } from './types.js'
 import type { RoleBinding } from './types.js'
 
 const KNOWN = new Set(['opus-架构', 'ds-安全', 'gpt-前端'])
@@ -467,5 +468,30 @@ describe('环节名可以写中文,写错了要能自己改对', () => {
       const line = P2([def({ step: bad })]).notices[0]
       expect(`${bad}:${[...line].length <= 100}`).toBe(`${bad}:true`)
     }
+  })
+})
+
+describe('席位规则那份唯一真相要被直接钉住', () => {
+  // 上面那条参数化的「%s 是圆桌阶段,多席位不能被误伤」**杀不掉** PHASE_SEATING 的变异:
+  // 裁剪到一席需要 allowsMultipleSeats(p) 为假**且** SINGLE_SEAT_REASON[p] 有值,而后者
+  // 只剩 execute。于是 verify/integrate 的 toHaveLength(2) 是被「没有裁剪理由」满足的,
+  // 和 PHASE_SEATING 的取值毫无关系 —— 实测把它们双双改成 'single',整套测试全绿。
+  // 而关口的 (单选) 标记与 toggleRole 的替换语义都走 allowsMultipleSeats。
+  it('每个环节的容纳方式是明确写死的', () => {
+    expect(PHASE_SEATING).toEqual({
+      plan: 'sequential', review: 'roundtable', execute: 'single',
+      verify: 'roundtable', accept: 'roundtable', integrate: 'roundtable',
+      observer: 'roundtable',
+    })
+  })
+
+  it('只有执行不允许多席位', () => {
+    for (const p of PHASE_NAMES) {
+      expect(`${p}:${allowsMultipleSeats(p)}`).toBe(`${p}:${p !== 'execute'}`)
+    }
+  })
+
+  it('圆桌集合就是那五个 —— 顺序精化不算圆桌', () => {
+    expect([...MULTI_SEAT_PHASES].sort()).toEqual(['accept', 'integrate', 'observer', 'review', 'verify'])
   })
 })
