@@ -73,6 +73,13 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     expect(el).not.toContain('<ConfirmStartup')
   })
 
+  it('启动关口拿到了隔离不可用的原因和 git init 入口 (spec §8)', () => {
+    // 剪断它:降级回到"自动发生 + 一行埋在解析提醒里",§8 的「允许选择」又变成
+    // 接受或取消两条路。
+    expect(element('ConfirmStartup')).toContain('isolationReason={')
+    expect(element('ConfirmStartup')).toContain('onInitGit={')
+  })
+
   it('第三关起草拿到了隔离池 (spec §16)', () => {
     // 剪断它:关口上给用户看的那棵树是在**没有**冲突约束的情况下拆出来的,而 run 随后按
     // 有约束的规则跑 —— 用户批准的拆分和实际执行的规则不是一回事。

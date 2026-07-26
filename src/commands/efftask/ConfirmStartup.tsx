@@ -4,7 +4,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, clampParallelism, goalLine, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -29,6 +29,20 @@ export function ConfirmStartup(props: {
    * than let the view flip to the next phase as if nothing was lost.
    */
   onEdited?: () => void
+  /**
+   * 隔离不可用的原因 (spec §8). Present means the run WILL share the working tree.
+   *
+   * Rendered as its own block rather than folded into `notices`: that list is headed
+   * 「以下请求不会生效」 and is about the prompt's directives, while this is a change to how
+   * the whole run executes. Burying one inside the other is how a degradation the user never
+   * chose looks like a parsing footnote.
+   */
+  isolationReason?: string
+  /**
+   * 「或初始化 git」 (spec §8). Absent → the gate offers only the degrade-or-cancel choice and
+   * says so, rather than advertising a key that does nothing.
+   */
+  onInitGit?: () => void
   onDecision: (d: StartupDecision) => void
 }): React.ReactElement {
   // 用户原话:"默认5个,需求提示词可指定,可跟用户确认修改" —— the fourth clause. Both
@@ -75,6 +89,10 @@ export function ConfirmStartup(props: {
     if (key.leftArrow || input === '-') { setParallelism(clampParallelism(parRef.current - 1)); props.onEdited?.(); return }
     if (key.rightArrow || input === '+' || input === '=') { setParallelism(clampParallelism(parRef.current + 1)); props.onEdited?.(); return }
     if (input.toLowerCase() === 'r') { setEditing(true); return }
+    // 「或初始化 git」 (spec §8). Only live when the caller supplied a handler AND isolation is
+    // actually unavailable — an advertised key that does nothing is the failure this repo has
+    // paid for repeatedly.
+    if (input.toLowerCase() === 'g' && props.onInitGit && props.isolationReason) { props.onInitGit(); return }
     if (key.return || input.toLowerCase() === 'y') confirm()
     else if (key.escape || input.toLowerCase() === 'n') props.onDecision({ parallelism: parRef.current, approved: false })
   })
@@ -103,6 +121,18 @@ export function ConfirmStartup(props: {
           {edited && <Text dimColor>  (以上是解析提示词时的提醒;名册已被你手动修改,以上面的名册为准)</Text>}
         </Box>
       )}
+      {/* 隔离不可用 (spec §8) gets its OWN block. It used to be one line inside the
+          「你的请求中有以下部分不会生效」 list — a heading about the PROMPT's directives —
+          so a change to how the entire run executes read as a parsing footnote, and the spec's
+          「允许选择」 amounted to accept-or-cancel. */}
+      {props.isolationReason && !editing && (
+        <Box flexDirection="column">
+          <Text color="warning">隔离并行不可用,本次将降级执行:</Text>
+          {isolationChoiceLines(props.isolationReason, props.onInitGit !== undefined).map(l => (
+            <Text key={l} color="warning">  · {l}</Text>
+          ))}
+        </Box>
+      )}
       <Text>{capsLine(props.config)}</Text>
       {editing ? (
         <Text dimColor>
@@ -113,7 +143,11 @@ export function ConfirmStartup(props: {
             : '回车 确认并开始 · Esc 退出编辑(没有可用角色,无法编辑)'}
         </Text>
       ) : (
-        <Text dimColor>回车/y 开始 · r 编辑角色名册 · ←/→ 调整并行数 · Esc/n 取消</Text>
+        <Text dimColor>
+          回车/y 开始 · r 编辑角色名册 · ←/→ 调整并行数
+          {props.isolationReason && props.onInitGit ? ' · g 初始化 git 并重试隔离' : ''}
+          {' · Esc/n 取消'}
+        </Text>
       )}
     </Box>
   )

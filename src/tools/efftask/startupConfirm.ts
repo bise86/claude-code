@@ -437,6 +437,29 @@ export function relativeTime(iso: string, nowMs: number): string {
  * precisely what `--retry-blocked` reopens, and a retry should use the roster the user just
  * confirmed.
  */
+/**
+ * 非 git 仓库/隔离不可用时,摆在用户面前的**选择** —— spec §8.
+ *
+ * 「若当前目录非 git 仓库 → 提示用户……并允许选择『改用共享工作目录串行执行』降级
+ * (或初始化 git)」。实现只做了自动降级:一行文字被塞进 `notices`,和解析提示词产生的
+ * 那些提醒混在同一个「以下请求不会生效」标题下面 —— 那个标题讲的是"你的请求没生效",
+ * 而这里发生的是"整个 run 的执行方式变了"。用户能做的只有接受或取消。
+ *
+ * 返回的是描述这次降级**意味着什么**的几行,而不是一句结论:共享工作目录下执行阶段会被
+ * 串行化(orchestrator 的 serialiseExecute),所以慢,但不会有两个 executor 同时改同一份
+ * 代码;而 §16 那条最大风险(worktree 合并冲突)在这种模式下根本不存在。
+ */
+export function isolationChoiceLines(reason: string, canInitGit: boolean): string[] {
+  return [
+    `隔离不可用:${reason}`,
+    '继续的话,执行阶段会共享你当前的工作目录,并被强制串行(一次只有一个节点在改代码)。',
+    '方案/评审阶段仍然并行;不会出现两个执行 agent 同时改同一份文件。',
+    canInitGit
+      ? '想要隔离并行执行,可以按 g 在当前目录初始化 git 仓库后重试。'
+      : '想要隔离并行执行,请在一个 git 仓库里运行 /et。',
+  ]
+}
+
 export function applyRosterToNodes(
   nodes: TaskNode[],
   phaseRoles: Record<PhaseName, RoleBinding[]>,

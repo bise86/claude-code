@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -505,5 +505,31 @@ describe('spec §17.3:关口改出来的名册必须落到节点上,否则编辑
     a.phaseRoles.plan.push({ roleName: 'extra' })
     expect(b.phaseRoles.plan).toEqual([{ roleName: 'architect' }])
     expect(a.phaseRoles.plan).not.toBe(roster.plan)
+  })
+})
+
+describe('spec §8:非 git 仓库要给用户一个选择,而不是自动降级', () => {
+  // §8:「若当前目录非 git 仓库 → 提示用户……并允许**选择**『改用共享工作目录串行执行』
+  // 降级(**或初始化 git**)」。实现只做了自动降级 —— 一行字塞进 notices,和解析提示词
+  // 产生的提醒混在「以下请求不会生效」这个标题下面。那个标题讲的是"你的请求没生效",
+  // 而这里发生的是"整个 run 的执行方式变了"。
+  it('说清降级之后到底会怎么跑,而不是只说"不可用"', () => {
+    const lines = isolationChoiceLines('当前目录不是 git 仓库', true)
+    const text = lines.join('\n')
+    expect(text).toContain('当前目录不是 git 仓库')
+    expect(text).toContain('共享')
+    expect(text).toContain('串行')     // 这是真的:orchestrator 的 serialiseExecute
+    expect(text).toContain('方案/评审') // 而这些阶段仍然并行 —— 别把降级说得比实际严重
+  })
+
+  it('能初始化 git 时才提 g 键', () => {
+    expect(isolationChoiceLines('r', true).join('\n')).toContain('按 g')
+  })
+
+  it('不能初始化时不宣传那个键,改说怎么办', () => {
+    // 宣传一个按不动的键,正是这个仓库反复在修的那类问题。
+    const text = isolationChoiceLines('r', false).join('\n')
+    expect(text).not.toContain('按 g')
+    expect(text).toContain('git 仓库里运行')
   })
 })

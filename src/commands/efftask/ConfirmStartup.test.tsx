@@ -275,3 +275,59 @@ describe('编辑器的提示行不能列出死键', () => {
     app.unmount()
   })
 })
+
+describe('spec §8:隔离不可用时,关口把它呈现成一个选择', () => {
+  const mountIso = async (props: Record<string, unknown>) => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmStartup as never, { config, onDecision: () => {}, ...props } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    return { ...t, app }
+  }
+
+  it('单独成块,不再混在"你的请求不会生效"里', async () => {
+    // 那个标题讲的是提示词里的指令没生效;而这里变的是整个 run 的执行方式。把后者塞进前者,
+    // 就是让一次用户从没选择过的降级读起来像一条解析脚注。
+    const { lastFrame, app } = await mountIso({ isolation: 'none', isolationReason: '当前目录不是 git 仓库' })
+    const f = lastFrame()
+    expect(f).toContain('隔离并行不可用')
+    expect(f).toContain('当前目录不是 git 仓库')
+    expect(f).toContain('串行')
+    app.unmount()
+  })
+
+  it('隔离正常时整块都不出现', async () => {
+    const { lastFrame, app } = await mountIso({ isolation: 'worktree' })
+    expect(lastFrame()).not.toContain('隔离并行不可用')
+    app.unmount()
+  })
+
+  it('给了 onInitGit 才提 g 键,按下去才真的触发', async () => {
+    let fired = 0
+    const { stdin, lastFrame, app } = await mountIso({
+      isolation: 'none', isolationReason: '当前目录不是 git 仓库', onInitGit: () => { fired++ },
+    })
+    expect(lastFrame()).toContain('g 初始化 git')
+    stdin.press('g'); await new Promise(r => setTimeout(r, 20))
+    expect(fired).toBe(1)
+    app.unmount()
+  })
+
+  it('没给 onInitGit 就不宣传 g,按下去也不能有副作用', async () => {
+    const { stdin, lastFrame, app } = await mountIso({ isolation: 'none', isolationReason: 'r' })
+    expect(lastFrame()).not.toContain('g 初始化 git')
+    stdin.press('g'); await new Promise(r => setTimeout(r, 20))
+    expect(lastFrame()).toContain('隔离并行不可用') // 还在关口上,没被当成别的键吞掉
+    app.unmount()
+  })
+
+  it('隔离正常时 g 不是活键 —— 免得误触在一个好好的仓库里跑 git init', async () => {
+    let fired = 0
+    const { stdin, app } = await mountIso({ isolation: 'worktree', onInitGit: () => { fired++ } })
+    stdin.press('g'); await new Promise(r => setTimeout(r, 20))
+    expect(fired).toBe(0)
+    app.unmount()
+  })
+})

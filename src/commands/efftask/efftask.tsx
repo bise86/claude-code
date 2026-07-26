@@ -428,6 +428,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // 仅查看后退出 (spec §17.3): the done view is reused as a read-only browser, and must not
   // claim the run was blocked when the user simply chose not to continue it.
   const [viewOnly, setViewOnly] = React.useState(false)
+  // 隔离不可用的原因 (spec §8). null = isolation is available.
+  const [isolationReason, setIsolationReason] = React.useState<string | null>(null)
   const [outcome, setOutcome] = React.useState<Outcome | null>(null)
   const [runs, setRuns] = React.useState<RunSummary[] | null>(null)
   const [seed, setSeed] = React.useState<TaskNode[] | null>(null)
@@ -626,7 +628,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         if (cancelled) return
         poolRef.current = iso.pool
         setIsolation(iso.pool ? 'worktree' : 'none')
-        if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
+        // spec §8's 「允许选择」: carried as its own state so the gate can present it as a
+        // decision, instead of a line buried in the prompt-parsing notices.
+        setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
         setConfig(annotateRoleModels(cfg, agentModels, mainModel))
         setPhase('confirm')
       })
@@ -641,6 +645,26 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * it: the resume gate goes straight here, while a fresh run passes through the root-plan
    * gate first and arrives carrying its confirmed root as the seed.
    */
+  /**
+   * spec §8 的「或初始化 git」。
+   *
+   * 在用户当前目录里跑 `git init`,然后重建隔离池。这是一次真实的、会改用户目录的副作用,
+   * 所以它只能由关口上那个明确标注的按键触发 —— 绝不自动发生。失败时把原因换成 git 的
+   * 报错留在关口上,让用户看得见为什么没成功,而不是静默回到原样。
+   */
+  const initGitAndRetry = React.useCallback(async (): Promise<void> => {
+    const cwd = getCwd()
+    const init = await gitRunner(['init'], cwd)
+    if (init.code !== 0) {
+      setIsolationReason(`git init 失败: ${(init.stderr || init.stdout).trim() || '未知错误'}`)
+      return
+    }
+    const iso = await makeWorktreePool(runId!, cwd)
+    poolRef.current = iso.pool
+    setIsolation(iso.pool ? 'worktree' : 'none')
+    setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
+  }, [runId])
+
   const startRun = React.useCallback((cfg: EffTaskConfig, rootSeed?: TaskNode[]): void => {
     setPhase('running')
     // Built at gate time, before the first step: init() creates the integration branch and
@@ -939,6 +963,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // runs BEFORE this gate, so a role added here would otherwise show as a bare name.
         roleModel={name => effectiveModel(props.agentModels.find(a => a.agentType === name), props.mainModel)}
         onEdited={() => { terminalEdited.current = true }}
+        // spec §8:非 git 仓库时「允许选择『改用共享工作目录串行执行』降级(**或初始化 git**)」。
+        // 降级本身一直是自动发生的;这两个 prop 才让它成为一个"选择"。
+        isolationReason={isolationReason ?? undefined}
+        onInitGit={() => { void initGitAndRetry() }}
         onDecision={d => terminalClaim.current?.('terminal', d)}
       />
     )
