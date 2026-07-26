@@ -37,6 +37,12 @@ function element(name: string): string {
   return to < 0 ? '' : SRC.slice(from, to + 2)
 }
 
+/** 出现次数。同一行字在这个文件里往往有两处(新建/恢复、初次/重试),只查存在会被
+ * 另一处满足,剪断任意一处都不红 —— 实测过。 */
+function occurrences(needle: string): number {
+  return SRC.split(needle).length - 1
+}
+
 describe('efftask.tsx 的接线不能被静默剪断', () => {
   it('恢复关口拿到了恢复出来的任务树 (spec §17.3)', () => {
     // 剪断它:关口退回"只有计数",用户批准的是一个自己看不见形状的 run。
@@ -54,7 +60,7 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     // 剪断它:编辑器可以按、可以看、可以确认,还会被写进 run.md —— 然后被整条执行管道
     // 完全无视,因为派发只读 node.phaseRoles。而 run.md 会开始说谎:它记着一份没有任何
     // 节点在用的名册,下一次 --resume 又把它读回来展示给用户。
-    expect(SRC).toMatch(/applyRosterToNodes\(nodes,\s*effectiveConfig\.phaseRoles\)/)
+    expect(SRC).toMatch(/applyRosterToNodes\(seed \?\? nodes,\s*effectiveConfig\.phaseRoles\)/)
   })
 
   it('恢复关口的编辑会通知调用方 (飞书竞速的丢弃提示)', () => {
@@ -71,6 +77,31 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     expect(el.startsWith('<ConfirmResume')).toBe(true)
     expect(el.endsWith('/>')).toBe(true)
     expect(el).not.toContain('<ConfirmStartup')
+  })
+
+  it('名册只在真被改过时才写回节点', () => {
+    // 剪断这个条件:run.md 损坏时 readRunManifest 回退成 emptyPhaseRoles(),无条件写回就会
+    // 把每个 node.md 里还活着、还会被派发的角色全部清成主模型 —— 而 node.md 才是那时候
+    // 幸存的真相。同时它还会抹掉 §4.2 的 per-node 名册覆写,哪怕用户什么都没改、直接回车。
+    expect(SRC).toContain('if (!rosterEquals(effectiveConfig.phaseRoles, config.phaseRoles)) {')
+  })
+
+  it('git init 只在"根本不是 git 仓库"时才提供 (spec §8)', () => {
+    // 剪断它:任何一种池初始化失败都会亮出 g 键,而除 notARepo 外的每一种失败都发生在
+    // "目录确实是仓库"之后 —— 在子目录里 git init 会造出一个**遮蔽父仓库**的嵌套仓库,
+    // 一次按键、无确认、无撤销,代码里也没有任何地方会清理它。真机验证过。
+    // COUNTED, not merely present: the same line appears twice (the initial pool build and
+    // initGitAndRetry's re-build), so `toContain` was satisfied by the other one and cutting
+    // either left the gate green — measured. Same trap as three identically-worded filters in
+    // one file earlier this session.
+    expect(occurrences('setCanInitGit(iso.pool ? false : iso.notARepo === true)')).toBe(2)
+    expect(SRC).toContain('onInitGit={canInitGit ?')
+  })
+
+  it('未隔离这件事也要写进 run.md(新建和恢复两条路径都要)', () => {
+    // 剪断它:新建 run 的 run.md 不再记录"本次未隔离",而恢复路径还在记 —— 同一件事在
+    // 两条路径上的持久化记录不一致。同样必须计数:两条路径的这行字是逐字相同的。
+    expect(occurrences('notices.push(`隔离不可用,执行阶段将共享工作目录并串行')).toBe(2)
   })
 
   it('启动关口拿到了隔离不可用的原因和 git init 入口 (spec §8)', () => {

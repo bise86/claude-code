@@ -454,10 +454,27 @@ export function isolationChoiceLines(reason: string, canInitGit: boolean): strin
     `隔离不可用:${reason}`,
     '继续的话,执行阶段会共享你当前的工作目录,并被强制串行(一次只有一个节点在改代码)。',
     '方案/评审阶段仍然并行;不会出现两个执行 agent 同时改同一份文件。',
+    // The `g` offer appears ONLY when the directory is not a repo at all. Every other pool
+    // failure happens after that check passed — no commits yet, a branch-name clash, a
+    // worktree already checked out — so the directory IS a repo, and `git init` there would
+    // create a NESTED one that shadows it (measured: `git init` in /repo/sub makes
+    // `rev-parse --show-toplevel` answer /repo/sub, and nothing here ever cleans that up).
+    // In those cases the reason above is the actionable thing, so point at it instead of
+    // telling someone already inside a repo to find one.
     canInitGit
-      ? '想要隔离并行执行,可以按 g 在当前目录初始化 git 仓库后重试。'
-      : '想要隔离并行执行,请在一个 git 仓库里运行 /et。',
+      ? '想要隔离并行执行,可以按 g 在当前目录初始化 git 仓库(会建一个空提交)后重试。'
+      : '想要隔离并行执行,需要先解决上面这条原因;也可以取消,处理好之后重新运行 /et。',
   ]
+}
+
+export function rosterEquals(
+  a: Record<PhaseName, RoleBinding[]>, b: Record<PhaseName, RoleBinding[]>,
+): boolean {
+  return PHASE_NAMES.every(p => {
+    const x = a[p] ?? []
+    const y = b[p] ?? []
+    return x.length === y.length && x.every((r, i) => r.roleName === y[i].roleName && r.model === y[i].model)
+  })
 }
 
 export function applyRosterToNodes(

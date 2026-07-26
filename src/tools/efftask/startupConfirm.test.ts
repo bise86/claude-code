@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles } from './startupConfirm.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
 
@@ -523,13 +523,53 @@ describe('spec §8:非 git 仓库要给用户一个选择,而不是自动降级'
   })
 
   it('能初始化 git 时才提 g 键', () => {
-    expect(isolationChoiceLines('r', true).join('\n')).toContain('按 g')
+    const t = isolationChoiceLines('r', true).join('\n')
+    expect(t).toContain('按 g')
+    // 并且说清 g 会做什么:它会建一个空提交,而那是隔离能跑起来的前提 —— 实测全新仓库
+    // `git rev-parse HEAD` 直接 fatal,worktreePool.init 第一行就挂。
+    expect(t).toContain('空提交')
   })
 
   it('不能初始化时不宣传那个键,改说怎么办', () => {
     // 宣传一个按不动的键,正是这个仓库反复在修的那类问题。
     const text = isolationChoiceLines('r', false).join('\n')
     expect(text).not.toContain('按 g')
-    expect(text).toContain('git 仓库里运行')
+    // 而且不能叫一个**已经在仓库里**的人去"找个 git 仓库":除 notARepo 之外的每一种失败,
+    // 目录本来就是仓库(没有提交 / 分支名冲突 / worktree 被别处占用),真正可操作的是
+    // 上面那条原因本身。
+    expect(text).not.toContain('git 仓库里运行')
+    expect(text).toContain('先解决上面这条原因')
+  })
+})
+
+describe('名册只在用户真改了的时候才写回节点', () => {
+  const R = (over: Partial<Record<string, { roleName: string }[]>> = {}) =>
+    ({ ...emptyPhaseRoles(), ...over }) as never
+
+  it('一模一样就认作没改', () => {
+    expect(rosterEquals(R({ plan: [{ roleName: 'a' }] }), R({ plan: [{ roleName: 'a' }] }))).toBe(true)
+    expect(rosterEquals(emptyPhaseRoles(), emptyPhaseRoles())).toBe(true)
+  })
+
+  it('增删、换名、换模型都算改了', () => {
+    expect(rosterEquals(R({ plan: [{ roleName: 'a' }] }), R())).toBe(false)
+    expect(rosterEquals(R({ plan: [{ roleName: 'a' }] }), R({ plan: [{ roleName: 'b' }] }))).toBe(false)
+    expect(rosterEquals(
+      R({ plan: [{ roleName: 'a' }] }),
+      R({ plan: [{ roleName: 'a', model: 'opus' } as never] }),
+    )).toBe(false)
+    // 顺序也算 —— 单席位阶段取的是 index 0,换顺序就是换人。
+    expect(rosterEquals(
+      R({ review: [{ roleName: 'a' }, { roleName: 'b' }] }),
+      R({ review: [{ roleName: 'b' }, { roleName: 'a' }] }),
+    )).toBe(false)
+  })
+
+  it('run.md 损坏时,不能拿空名册去抹掉 node.md 里还活着的角色', () => {
+    // readRunManifest 读不出 run.md 时回退成 emptyPhaseRoles() 并标 degraded。无条件写回
+    // 就会把每个 node.md 里真实、可派发的角色全部清成主模型 —— 而 node.md 才是幸存的真相,
+    // readRunManifest 自己的注释就写着 every node.md is still on disk。
+    // 用户没改任何东西 ⇒ 两份名册相等 ⇒ 调用点不会调 applyRosterToNodes。
+    expect(rosterEquals(emptyPhaseRoles(), emptyPhaseRoles())).toBe(true)
   })
 })

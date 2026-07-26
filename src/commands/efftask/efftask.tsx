@@ -34,6 +34,7 @@ import {
   exitReportLine,
   applyStartupDecision,
   applyRosterToNodes,
+  rosterEquals,
   dispatchableRoles,
   type HandoffSummary,
 } from '../../tools/efftask/startupConfirm.js'
@@ -351,9 +352,15 @@ const gitRunner: GitRunner = (args, cwd) =>
  */
 async function makeWorktreePool(
   runId: string, cwd: string,
-): Promise<{ pool?: WorktreePool; reason?: string }> {
+): Promise<{ pool?: WorktreePool; reason?: string; notARepo?: boolean }> {
   const top = await gitRunner(['rev-parse', '--show-toplevel'], cwd)
-  if (top.code !== 0) return { reason: '当前目录不是 git 仓库' }
+  // notARepo is reported SEPARATELY from the reason string because it is the only condition
+  // under which offering `git init` is correct. Every other failure below happens AFTER this
+  // check succeeded — i.e. the directory already IS a repo (no commits yet, a branch-name
+  // conflict, a worktree already checked out elsewhere) — and running `git init` there creates
+  // a NESTED repository that shadows the real one. Measured: `git init` inside /repo/sub makes
+  // `rev-parse --show-toplevel` answer /repo/sub, and nothing in this codebase ever cleans it up.
+  if (top.code !== 0) return { reason: '当前目录不是 git 仓库', notARepo: true }
   const gitRoot = top.stdout.trim()
   const pool = createWorktreePool({ runId, gitRoot, git: gitRunner, worktreeRoot: `${gitRoot}/.efftask-worktrees` })
   const init = await pool.init()
@@ -430,6 +437,11 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [viewOnly, setViewOnly] = React.useState(false)
   // 隔离不可用的原因 (spec §8). null = isolation is available.
   const [isolationReason, setIsolationReason] = React.useState<string | null>(null)
+  // Whether offering `git init` is CORRECT — i.e. the directory is not a repo at all. Every
+  // other pool failure happens after that check passed, so init would create a nested repo.
+  const [canInitGit, setCanInitGit] = React.useState(false)
+  const [, setInitingGit] = React.useState(false)
+  const initingGit = React.useRef(false)
   const [outcome, setOutcome] = React.useState<Outcome | null>(null)
   const [runs, setRuns] = React.useState<RunSummary[] | null>(null)
   const [seed, setSeed] = React.useState<TaskNode[] | null>(null)
@@ -631,6 +643,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // spec §8's 「允许选择」: carried as its own state so the gate can present it as a
         // decision, instead of a line buried in the prompt-parsing notices.
         setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
+        setCanInitGit(iso.pool ? false : iso.notARepo === true)
+        // ALSO recorded in run.md. Replacing the notices.push with component state alone meant
+        // the manifest stopped saying the run was un-isolated, while the resume path still did.
+        if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
         setConfig(annotateRoleModels(cfg, agentModels, mainModel))
         setPhase('confirm')
       })
@@ -653,16 +669,51 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 报错留在关口上,让用户看得见为什么没成功,而不是静默回到原样。
    */
   const initGitAndRetry = React.useCallback(async (): Promise<void> => {
-    const cwd = getCwd()
-    const init = await gitRunner(['init'], cwd)
-    if (init.code !== 0) {
-      setIsolationReason(`git init 失败: ${(init.stderr || init.stdout).trim() || '未知错误'}`)
-      return
+    // In-flight guard. Two presses used to launch two concurrent `git init` + pool builds and
+    // let the later one overwrite poolRef; worse, pressing `g` and then Enter started the run
+    // while poolRef.current was still undefined — un-isolated — and only afterwards flipped
+    // the (already closed) gate to 'worktree'.
+    if (initingGit.current) return
+    initingGit.current = true
+    setInitingGit(true)
+    try {
+      const cwd = getCwd()
+      const init = await gitRunner(['init'], cwd)
+      if (init.code !== 0) {
+        setIsolationReason(`git init 失败: ${(init.stderr || init.stdout).trim() || '未知错误'}`)
+        return
+      }
+      /**
+       * A FIRST COMMIT, because without one `git init` cannot deliver what the key promises.
+       *
+       * `worktreePool.init()` begins with `rev-parse HEAD`, which on a fresh repo fails
+       * (`fatal: ambiguous argument 'HEAD'`) — measured against real git. So the key labelled
+       * 「初始化 git 并重试隔离」 used to leave a `.git` behind and STILL report isolation
+       * unavailable, with the same key still on screen to press again. An advertised action
+       * that provably cannot succeed is the exact failure this repo keeps paying for.
+       *
+       * `--allow-empty` so nothing of the user's is staged or captured by surprise, and the
+       * message says who made it. Only ever reached on a repo this keypress just created.
+       */
+      const head = await gitRunner(['rev-parse', '--verify', '--quiet', 'HEAD'], cwd)
+      if (head.code !== 0) {
+        const seedCommit = await gitRunner(['commit', '--allow-empty', '-m', 'chore: 初始化仓库(/et 隔离执行需要至少一个提交)'], cwd)
+        if (seedCommit.code !== 0) {
+          setIsolationReason(
+            `已初始化 git 仓库,但建立首个提交失败,隔离仍不可用: ${(seedCommit.stderr || seedCommit.stdout).trim() || '未知错误'}`,
+          )
+          return
+        }
+      }
+      const iso = await makeWorktreePool(runId!, cwd)
+      poolRef.current = iso.pool
+      setIsolation(iso.pool ? 'worktree' : 'none')
+      setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
+      setCanInitGit(iso.pool ? false : iso.notARepo === true)
+    } finally {
+      initingGit.current = false
+      setInitingGit(false)
     }
-    const iso = await makeWorktreePool(runId!, cwd)
-    poolRef.current = iso.pool
-    setIsolation(iso.pool ? 'worktree' : 'none')
-    setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
   }, [runId])
 
   const startRun = React.useCallback((cfg: EffTaskConfig, rootSeed?: TaskNode[]): void => {
@@ -889,7 +940,23 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           // through `makeRootNode`, which a seeded (i.e. resumed) run never calls. Without
           // this the gate's editor was decorative AND run.md recorded a roster no node used —
           // see applyRosterToNodes.
-          applyRosterToNodes(nodes, effectiveConfig.phaseRoles)
+          // ONLY when the user actually changed it. An unconditional overwrite broke two
+          // things at once:
+          //   - a DEGRADED run.md yields `emptyPhaseRoles()` (readRunManifest's documented
+          //     fallback), so pushing it onto the tree wiped the live, dispatchable roles that
+          //     every node.md still carried — and node.md is the surviving truth there, as
+          //     readRunManifest's own comment says ("every node.md is still on disk");
+          //   - §4.2 allows a per-node roster override, and re-stamping the run-level roster on
+          //     every resume flattened it, even when the user touched nothing and just pressed
+          //     Enter. applyRosterToNodes' own comment explains why it copies per node to
+          //     protect that override — while the call site erased it.
+          if (!rosterEquals(effectiveConfig.phaseRoles, config.phaseRoles)) {
+            // `seed` is what the orchestrator actually receives (startRun passes it through),
+            // so this does not depend on `nodes` and `seed` being the same object identities —
+            // a plain `setNodes(reseated.nodes.map(n => ({...n})))` tidy-up would otherwise
+            // have silently un-done the whole fix, with every test still green.
+            applyRosterToNodes(seed ?? nodes, effectiveConfig.phaseRoles)
+          }
           startRun(effectiveConfig)
           return
         }
@@ -966,7 +1033,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // spec §8:非 git 仓库时「允许选择『改用共享工作目录串行执行』降级(**或初始化 git**)」。
         // 降级本身一直是自动发生的;这两个 prop 才让它成为一个"选择"。
         isolationReason={isolationReason ?? undefined}
-        onInitGit={() => { void initGitAndRetry() }}
+        onInitGit={canInitGit ? () => { void initGitAndRetry() } : undefined}
         onDecision={d => terminalClaim.current?.('terminal', d)}
       />
     )
