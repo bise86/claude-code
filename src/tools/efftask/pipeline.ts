@@ -1013,22 +1013,28 @@ async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
     }),
     ctx.slots,
   )
-  type Pair = { role: string; plan: { score: number; rationale: string }; exec: { score: number; rationale: string } }
+  type Pair = { role: string; ok: boolean; plan: { score: number; rationale: string }; exec: { score: number; rationale: string } }
   const pairs: Pair[] = results.map((r, i) => {
     const who = seats[i].roleName || 'main'
     if (r.status !== 'fulfilled' || !r.value.ok) {
       // 评分调用失败**不能**让节点失败:验收已经通过,评分是咨询性的。记下为什么没有
       // 这个数,而不是丢掉已经完成的工作。
       const why = `评分调用失败: ${r.status === 'fulfilled' ? r.value.reason : String(r.reason)}`
-      return { role: who, plan: { score: 0, rationale: why }, exec: { score: 0, rationale: why } }
+      return { role: who, ok: false, plan: { score: 0, rationale: why }, exec: { score: 0, rationale: why } }
     }
     const parsed = parseScoreOutput(r.value.text, tag)
-    return { role: who, plan: parsed.plan, exec: parsed.exec }
+    return { role: who, ok: true, plan: parsed.plan, exec: parsed.exec }
   })
+  // 真正判决过的席位。调用失败被折成 score 0,如果让它参与排序,它必然成为最低分 ——
+  // 于是一次网络抖动就把节点的展示分变成 0,并(配了阈值时)买下一整轮带写工具的执行。
+  // 旧代码在调用失败时直接 return false,这条回归是本轮改成多席位时引入的。
+  const judged = pairs.filter(x => x.ok)
   const pick = (dim: 'plan' | 'exec'): ScoreRecord => {
-    const sorted = [...pairs].sort((x, y) => x[dim].score - y[dim].score)
+    // 主记录只在判决过的席位里选;失败的席位仍然记进 others,原因不丢。
+    const ranked = (judged.length > 0 ? judged : pairs)
+    const sorted = [...ranked].sort((x, y) => x[dim].score - y[dim].score)
     const low = sorted[0]
-    const rest = sorted.slice(1)
+    const rest = [...sorted.slice(1), ...(judged.length > 0 ? pairs.filter(x => !x.ok) : [])]
     return {
       role: low.role, score: low[dim].score, rationale: low[dim].rationale,
       ...(rest.length > 0
@@ -1039,6 +1045,9 @@ async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
   node.score = { plan: pick('plan'), exec: pick('exec') }
   const threshold = ctx.config.caps.scoreThreshold
   if (threshold === undefined) return false // 默认仅记录
+  // 没有任何席位真正判决过 → 不返工。验收已经通过,评分是咨询性的:不能因为一次调用
+  // 失败丢掉已完成的工作,更不能让它买下一整轮执行。
+  if (judged.length === 0) return false
   const worst = Math.min(node.score.plan!.score, node.score.exec!.score)
   if (worst >= threshold) return false
   // Exactly one rework, then the score is recorded and the node proceeds regardless.
@@ -1489,6 +1498,9 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
           return
         }
         node.execStatus = appendOrchestratorNote(node.execStatus, why)
+        // 同样要进 feedback:execStatus 里的注记只在 feedback 非空时才被渲染进提示词,
+        // 只写 execStatus 等于写给没人看的地方。
+        feedback = why
         if (!(await commit(node, 'REWORK', ctx))) return
         continue
       }
@@ -1501,6 +1513,13 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         // 失败走已有的返工路径,和验收失败同一条,共用 iteration.acceptance —— 不新增
         // 预算维度。但阻断文案要说清是**哪一关**没过,否则升级卡片和 --retry-blocked
         // 会拿到一句「验收迭代超限」,而其实是测试没跑通。
+        //
+        // **把原因交给执行者。** 不设 feedback 的后果实测过:第 1 轮和第 2 轮的执行提示词
+        // 逐字节相同(只有随机 answer tag 不同),三轮空转后阻断 —— verifyPrompt 花整段
+        // 要来的「实际执行的命令与原始输出」一次也到不了能修它的人。更糟的是 feedback 是
+        // 循环外变量:不覆盖它,执行者会拿到**两轮之前、另一道关口**的意见,还被告知那是
+        // 「上一轮」的。
+        feedback = v.rec.synthesized.blockingSummary
         node.iteration.acceptance++
         if (node.iteration.acceptance >= caps.maxIterations) {
           await blockWithReason(node, `测试验证迭代超限(${caps.maxIterations}): ${v.rec.synthesized.blockingSummary}`, ctx, 'rework')

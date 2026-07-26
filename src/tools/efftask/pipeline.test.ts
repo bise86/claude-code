@@ -3225,3 +3225,141 @@ describe('观察多员工:取最低分,其余理由不丢', () => {
     expect(n.iteration.scoring).toBe(1)
   })
 })
+
+describe('测试验证判不通过时,原因必须到达能修它的人', () => {
+  // 实测过的失败:不设 feedback 时,第 1 轮和第 2 轮的执行提示词逐字节相同(只有随机
+  // answer tag 不同),三轮空转后阻断 —— verifyPrompt 花整段要来的「实际执行的命令与
+  // 原始输出」一次也到不了执行者。
+  const n = () => {
+    const x = root()
+    x.kind = 'executable'
+    x.status = 'READY'
+    x.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    x.phaseRoles = { ...emptyPhaseRoles(), verify: [{ roleName: 'tester' }] }
+    return x
+  }
+  const BLOCK = 'auth.test.ts:42 期望 200 实际 500'
+
+  it('第二轮执行提示词里带着测试验证的阻断项', async () => {
+    const prompts: string[] = []
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') { prompts.push(req.prompt); return '```json\n{"execStatus":"改了"}\n```' }
+      if (req.phase === 'verify') return vtag(req) + `\n{"pass":false,"blocking":["${BLOCK}"],"comments":"$ bun test"}\n\`\`\``
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = n()
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }))
+    expect(prompts.length).toBeGreaterThan(1)
+    expect(prompts[1]).toContain(BLOCK)
+    expect(prompts[1]).toContain('请针对性返工')
+    // 而且两轮提示词确实不同 —— 否则上面的断言可能被一段共享文本满足。
+    expect(prompts[0]).not.toBe(prompts[1])
+  })
+
+  it('不会把**验收**上一轮的意见冒充成测试验证的', async () => {
+    // feedback 是循环外变量。verify 失败不覆盖它,执行者会拿到两轮之前、另一道关口的
+    // 意见,并被明确告知那是「上一轮」的。
+    const prompts: string[] = []
+    let verifyRounds = 0
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') { prompts.push(req.prompt); return '```json\n{"execStatus":"改了"}\n```' }
+      if (req.phase === 'verify') {
+        verifyRounds++
+        return verifyRounds === 1
+          ? vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+          : vtag(req) + `\n{"pass":false,"blocking":["${BLOCK}"],"comments":""}\n\`\`\``
+      }
+      // 第一轮验收失败
+      return vtag(req) + '\n{"pass":false,"blocking":["验收点 3 没达成"],"comments":""}\n```'
+    }
+    const node = n()
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }))
+    const last = prompts[prompts.length - 1]
+    expect(last).toContain(BLOCK)
+    expect(last).not.toContain('验收点 3 没达成')
+  })
+
+  it('验证者改了工作区时,那条注记也要进提示词', async () => {
+    // 只写 execStatus 等于写给没人看的地方:它只在 feedback 非空时才被渲染进提示词。
+    const prompts: string[] = []
+    let calls = 0
+    const pool = {
+      statusFingerprint: async () => { calls++; return calls <= 1 ? 'clean' : ' M a.ts' },
+      commitAndMerge: async () => ({ ok: true }), release: async () => ({ removed: true }),
+      // 第二轮执行前会从集成分支同步 —— 双件不完整会在这里炸,那是双件的问题。
+      refreshFromIntegration: async () => ({ ok: true }),
+    }
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') { prompts.push(req.prompt); return '```json\n{"execStatus":"改了"}\n```' }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = n()
+    node.worktree = { branch: 'b', path: '/wt' }
+    await stepExecute(node, { ...ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }), worktrees: pool as never })
+    expect(prompts.length).toBeGreaterThan(1)
+    expect(prompts[1]).toContain('改动了工作区')
+  })
+})
+
+describe('评分调用失败不该买下一整轮执行(回归)', () => {
+  // 旧代码在调用失败时直接 return false。改成多席位之后,失败席位被折成 score 0,
+  // 参与排序时必然成为最低分 → 低于阈值 → 返工。一次网络抖动买下一整轮带写工具的执行
+  // 加一整轮验收圆桌。
+  const nodeWith = (observer: { roleName: string }[]) => {
+    const x = root()
+    x.kind = 'executable'
+    x.status = 'READY'
+    x.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    x.phaseRoles = { ...emptyPhaseRoles(), observer }
+    return x
+  }
+  const withThreshold = (n: TaskNode) => ({ ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, scoreThreshold: 60 } })
+
+  it('唯一的观察席位调用失败 → 不返工', async () => {
+    let execCalls = 0
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'observer') throw new Error('provider 502')
+      if (req.phase === 'execute') { execCalls++; return '```json\n{"execStatus":"做完了"}\n```' }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = nodeWith([{ roleName: 'o1' }])
+    await stepExecute(n, ctxFor([n], agent, withThreshold(n)))
+    expect(n.iteration.scoring).toBe(0)
+    expect(execCalls).toBe(1)
+    // 原因仍然记下来 —— 不返工不等于装作没发生。
+    expect(JSON.stringify(n.score)).toContain('评分调用失败')
+  })
+
+  it('一席失败一席给高分 → 主记录是那个高分,不是 0', async () => {
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'observer') {
+        if (req.role?.roleName === 'bad') throw new Error('provider 502')
+        const tag = req.prompt.match(/```(score[a-z0-9]+)/)?.[1] ?? 'score'
+        return '```' + tag + '\n{"plan":{"score":95,"rationale":"好"},"exec":{"score":92,"rationale":"好"}}\n```'
+      }
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = nodeWith([{ roleName: 'good' }, { roleName: 'bad' }])
+    await stepExecute(n, ctxFor([n], agent, withThreshold(n)))
+    expect(n.score?.plan?.score).toBe(95)
+    expect(n.score?.plan?.role).toBe('good')
+    expect(n.iteration.scoring).toBe(0)
+    // 失败那席仍在 others 里,原因不丢。
+    expect(JSON.stringify(n.score?.plan?.others)).toContain('评分调用失败')
+  })
+
+  it('真的低分仍然触发返工 —— 别把闸门一起关了', async () => {
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'observer') {
+        const tag = req.prompt.match(/```(score[a-z0-9]+)/)?.[1] ?? 'score'
+        return '```' + tag + '\n{"plan":{"score":30,"rationale":"差"},"exec":{"score":90,"rationale":"好"}}\n```'
+      }
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = nodeWith([{ roleName: 'o1' }])
+    await stepExecute(n, ctxFor([n], agent, withThreshold(n)))
+    expect(n.iteration.scoring).toBe(1)
+  })
+})
