@@ -626,3 +626,34 @@ describe('spec §10.1:归位要把 startedAt 清掉,否则耗时把宕机时间�
     expect(done.startedAt).toBe('2026-07-24T00:00:00.000Z')
   })
 })
+
+describe('被杀在评审阶段的节点,不能跳过评审直接去执行', () => {
+  // stepStart 在评审圆桌**之前**就把 kind 从 plan 输出里写好了。所以进程恰好死在这两步
+  // 之间时,盘上留下的是 `kind: 'executable'` + 空的 reviewLog —— 而结构规则会把它座到
+  // READY,advanceableKind 随即回答 'execute',一个**没有任何评审员看过**的方案就交给了
+  // 带写工具的执行器。实测:status READY,advanceableKind 'execute',reviewLog 0 轮。
+  //
+  // 这和 reviewExhausted 挡的是同一个洞的两扇门:那条守 --retry-blocked(capBlocked),
+  // 而被杀的节点带的是 interrupted,两边都不匹配。
+  for (const killedIn of ['PLANNING', 'PLAN_REVIEW'] as const) {
+    it(`${killedIn} 期间被杀 → 回到 CREATED 重新走方案和评审`, () => {
+      const n = mk({ id: 'root', kind: 'executable', status: killedIn, reviewLog: [] })
+      reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+      expect(n.status).toBe('CREATED')
+    })
+  }
+
+  it('已经通过评审、被杀在执行中的节点仍然回 READY —— 它的方案是批过的', () => {
+    // 反向守卫:不能靠"所有 executable 都回 CREATED"来满足上面两条。那会让每次中断都
+    // 重跑一遍方案和评审,把 §17.5"恢复不重置预算"的克制变成每次续跑都重新烧钱。
+    const n = mk({ id: 'root', kind: 'executable', status: 'EXECUTING', execStatus: '改了一半' })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('READY')
+  })
+
+  it('被杀在验收中的节点也回 READY,不回 CREATED', () => {
+    const n = mk({ id: 'root', kind: 'executable', status: 'ACCEPTANCE', execStatus: '做完了' })
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('READY')
+  })
+})

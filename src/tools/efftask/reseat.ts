@@ -194,6 +194,21 @@ export function reseatTransientNodes(
       awaitingHumanMerge ? 'READY'
       : n.childIds.length > 0 ? 'WAITING_CHILDREN'
       : reviewExhausted ? 'CREATED'
+      /**
+       * A plan that was never APPROVED must re-enter planning, whatever `kind` says.
+       *
+       * `stepStart` writes `node.kind` from the plan output BEFORE the review roundtable runs.
+       * So a process killed between those two points leaves `kind: 'executable'` on disk with
+       * an EMPTY reviewLog — and the structural rule below then seats it at READY, where
+       * `advanceableKind` answers 'execute' and a write-capable executor runs a plan no
+       * reviewer ever saw. Measured: status READY, advanceableKind 'execute', reviewLog 0.
+       *
+       * This is the same hole `reviewExhausted` closes one line up, through the other door:
+       * that one guards `--retry-blocked` (capBlocked), and a node killed mid-review carries
+       * `interrupted` instead, so it matched neither. Being INTERRUPTED is not evidence about
+       * the plan; only a passing review is, and these two statuses mean it has not happened.
+       */
+      : wasStatus === 'PLANNING' || wasStatus === 'PLAN_REVIEW' ? 'CREATED'
       : n.kind === 'executable' ? 'READY'
       : 'CREATED'
 
