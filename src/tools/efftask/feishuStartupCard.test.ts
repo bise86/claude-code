@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { buildStartupCard } from './feishuStartupCard.js'
+import { buildStartupCard, buildHandoffCard } from './feishuStartupCard.js'
 import { costLine } from './startupConfirm.js'
 
 describe('启动卡不能邀请一件它自己会丢掉的事', () => {
@@ -41,5 +41,50 @@ describe('两个界面必须说同一件事', () => {
   it('不是全票时卡片也要说', () => {
     const c = cfg({ caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 1, quorum: 60 } })
     expect(text(c)).toContain('需 60% 席位赞成')
+  })
+})
+
+describe('收口卡片:不可逆动作不上卡', () => {
+  const H = {
+    branch: 'efftask/001/integration', commits: 3,
+    integrationPath: '/repo/.wt/int', kept: [], salvage: [], outcome: 'completed' as const,
+  }
+  const card = (h = H) => buildHandoffCard(h, '001', 'req-1') as {
+    elements: { text?: { content: string }; actions?: { text: { content: string } }[] }[]
+  }
+  const buttons = (h = H) => card(h).elements.flatMap(e => e.actions ?? []).map(a => a.text.content)
+  const text = (h = H) => card(h).elements.map(e => e.text?.content ?? '').join('\n')
+
+  it('三个按钮,没有「丢弃」', () => {
+    // 丢弃不可逆,而这条通道没有过期机制、点击失效卡完全静默、updateCard 吞掉所有错误。
+    // 不可逆动作配上一条「点了没反应也不知道」的通道,是最坏的组合。
+    expect(buttons()).toEqual(['合并回当前分支', '推送分支', '保留分支'])
+    expect(buttons().join('')).not.toContain('丢弃')
+  })
+
+  it('但要说清这个选项存在、去哪儿做 —— 不是假装它不存在', () => {
+    expect(text()).toContain('丢弃')
+    expect(text()).toContain('终端')
+  })
+
+  it('「推送」不叫「建 PR」,和终端一致', () => {
+    expect(buttons().join('')).not.toContain('PR')
+  })
+
+  it('每个按钮带上自己的 choice,否则三个按钮点下去是同一件事', () => {
+    const acts = card().elements.flatMap(e => e.actions ?? []) as unknown as
+      { behaviors: { value: { choice?: string } }[] }[]
+    expect(acts.map(a => a.behaviors[0].value.choice)).toEqual(['merge', 'push', 'keep'])
+  })
+
+  it('run 没跑完时卡片顶部就说清楚', () => {
+    const t = text({ ...H, outcome: 'blocked', reason: '连续返工超限' })
+    expect(t).toContain('没有正常跑完')
+    expect(t).toContain('连续返工超限')
+  })
+
+  it('分支与提交数如实显示', () => {
+    expect(text()).toContain('efftask/001/integration')
+    expect(text()).toContain('3 个提交')
   })
 })

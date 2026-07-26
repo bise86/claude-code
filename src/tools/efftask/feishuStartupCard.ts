@@ -10,7 +10,7 @@
 // FeishuPermissionCallbacks.resolve(...), so we just claim our own requestId.
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
-import type { EffTaskConfig } from './types.js'
+import type { EffTaskConfig, PendingHandoff } from './types.js'
 import { capsLine, costLine, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
@@ -62,6 +62,45 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
         actions: [
           button(resume ? '继续执行' : '开始', 'primary', { requestId, behavior: 'allow' }),
           button('取消', 'danger', { requestId, behavior: 'deny' }),
+        ],
+      },
+    ],
+  }
+}
+
+/**
+ * 收口卡片(spec §8)。三个按钮,**没有「丢弃」**。
+ *
+ * 丢弃是四个动作里唯一不可逆的一个,而这条通道是最不适合承载它的:卡片没有过期机制、
+ * 点击一张失效卡完全静默、updateCard 吞掉所有错误。不可逆动作配上一条「点了没反应也
+ * 不知道」的通道,是最坏的组合。所以卡片**显示**这个选项存在,但要求去终端确认 ——
+ * 假装它不存在同样是撒谎。
+ *
+ * 无限期有效、不设默认、不自动选:飞书卡 7 天,过期就是过期;终端那端一直等。两边一致。
+ */
+export function buildHandoffCard(h: PendingHandoff, runId: string, requestId: string): object {
+  const lines: string[] = []
+  // run 的结局摆在最前 —— 别邀请用户合并一棵没做完的树。
+  if (h.outcome === 'blocked') {
+    lines.push('⚠ **本次运行没有正常跑完**(' + (h.reason || '被阻断或已取消') + '),下面的改动可能是半成品', '')
+  }
+  lines.push('**高效任务 ' + runId + ' · 收口**')
+  lines.push('分支 ' + h.branch + ' 上有 ' + h.commits + ' 个提交,你的工作区未被改动')
+  if (h.integrationPath) lines.push('集成工作区: ' + h.integrationPath)
+  if (h.salvage.length > 0) lines.push('中断时抢救出的提交: ' + h.salvage.join('、'))
+  if (h.kept.length > 0) lines.push('保留的工作区: ' + h.kept.length + ' 个')
+  lines.push('', '**丢弃**这一项不在卡片上 —— 它不可逆,请在终端确认。')
+  return {
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: '高效任务模式 · 收口' } },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } },
+      {
+        tag: 'action',
+        actions: [
+          button('合并回当前分支', 'primary', { requestId, behavior: 'allow', choice: 'merge' }),
+          button('推送分支', 'default', { requestId, behavior: 'allow', choice: 'push' }),
+          button('保留分支', 'default', { requestId, behavior: 'allow', choice: 'keep' }),
         ],
       },
     ],
