@@ -287,3 +287,67 @@ describe('applyRoleDefsToPhases:配置了角色 → 真的会被派发', () => {
     expect(notices).toEqual([])
   })
 })
+
+describe('单席位阶段:名册上不能出现永远不跑的名字', () => {
+  // pipeline 用 firstRole() 取第 [0] 席,plan/execute/observer 多出来的席位一次都不会被
+  // 派发。按名字直接指定那条路径(parseDirectives)一直有这道裁剪 + 提醒;角色定义这条
+  // 新入口曾经完全没有,于是关口列出两个执行者、只跑一个、零提示。
+  const empty = (): Record<string, RoleBinding[]> =>
+    ({ plan: [], review: [], execute: [], accept: [], observer: [] })
+  const role = (name: string, stage: string, staff: string[]): RoleDef =>
+    ({ name, stage, output: 'o', purpose: 'p', staff }) as RoleDef
+
+  it.each(['plan', 'execute', 'observer'])('%s:一个角色两个员工 → 一席,并点名被忽略的是谁', stage => {
+    const { phaseRoles, notices } = applyRoleDefsToPhases(
+      empty() as never, [role('主设计', stage, ['opus-架构', 'ds-安全'])],
+    )
+    expect(phaseRoles[stage as 'plan']).toHaveLength(1)
+    expect(phaseRoles[stage as 'plan'][0].roleName).toBe('opus-架构')
+    const joined = notices.join('\n')
+    expect(joined).toContain('仅 主设计(opus-架构) 生效')
+    expect(joined).toContain('已忽略 主设计(ds-安全)')
+  })
+
+  it.each(['plan', 'execute', 'observer'])('%s:同阶段两个角色 → 一席,点名被忽略的那个角色', stage => {
+    const { phaseRoles, notices } = applyRoleDefsToPhases(
+      empty() as never, [role('前端实现', stage, ['gpt-前端']), role('后端实现', stage, ['opus-架构'])],
+    )
+    expect(phaseRoles[stage as 'plan']).toHaveLength(1)
+    expect(notices.join('\n')).toContain('已忽略 后端实现(opus-架构)')
+  })
+
+  it.each(['review', 'accept'])('%s 是圆桌阶段,多席位不能被误伤', stage => {
+    const { phaseRoles, notices } = applyRoleDefsToPhases(
+      empty() as never, [role('架构师', stage, ['opus-架构', 'ds-安全'])],
+    )
+    expect(phaseRoles[stage as 'review']).toHaveLength(2)
+    expect(notices.join('\n')).not.toContain('仅')
+  })
+
+  it('单席位阶段:角色席位赢过按名字直接指定的员工', () => {
+    // 评审实测的那个「复现 C」:角色席位被追加在后面 → 第 [0] 席是按名字点的那个 →
+    // 角色整体死掉,而真正跑的那一席连职责简报都没有。这个组合完全普通,不需要多员工。
+    const base = { ...empty(), plan: [{ roleName: 'gpt-前端' }] }
+    const { phaseRoles, notices } = applyRoleDefsToPhases(base as never, [role('主设计', 'plan', ['opus-架构'])])
+    expect(phaseRoles.plan).toEqual([{ roleName: 'opus-架构', roleTag: '主设计' }])
+    expect(notices.join('\n')).toContain('已忽略 gpt-前端')
+  })
+
+  it('圆桌阶段不重排 —— 按名字指定的员工仍在前面', () => {
+    const base = { ...empty(), review: [{ roleName: 'gpt-前端' }] }
+    const { phaseRoles } = applyRoleDefsToPhases(base as never, [role('架构师', 'review', ['opus-架构'])])
+    expect(phaseRoles.review.map(s => s.roleName)).toEqual(['gpt-前端', 'opus-架构'])
+  })
+
+  it('主模型兼任的席位被忽略时也称呼得出来', () => {
+    const { notices } = applyRoleDefsToPhases(
+      empty() as never, [role('甲', 'plan', ['opus-架构']), role('乙', 'plan', [])],
+    )
+    expect(notices.join('\n')).toContain('已忽略 乙(主模型)')
+  })
+
+  it('正好一席时不说废话', () => {
+    const { notices } = applyRoleDefsToPhases(empty() as never, [role('主设计', 'plan', ['opus-架构'])])
+    expect(notices).toEqual([])
+  })
+})

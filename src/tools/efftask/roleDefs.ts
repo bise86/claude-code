@@ -33,8 +33,26 @@ const PHASE_LABEL: Record<PhaseName, string> = {
   plan: '方案', review: '评审', execute: '执行', accept: '验收', observer: '观察',
 }
 
-/** 只有 review / accept 会开圆桌;其余阶段只跑一个 agent。 */
-export const MULTI_SEAT_PHASES: PhaseName[] = ['review', 'accept']
+/** 只有 review / accept 会开圆桌;其余阶段只跑一个 agent(见 pipeline.firstRole)。 */
+export const MULTI_SEAT_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['review', 'accept'])
+
+/**
+ * 单席位阶段为什么只能有一席 —— 每条都是物理约束,不是策略。
+ *
+ * 这些阶段 pipeline 用 `firstRole()` 取第 [0] 席,多出来的席位一次都不会被派发。把它们
+ * 留在名册上,关口就会列出永远不跑的名字 —— 而关口存在的唯一意义就是别撒谎。
+ */
+const SINGLE_SEAT_REASON: Partial<Record<PhaseName, string>> = {
+  plan: '方案阶段只跑一个 agent',
+  execute: '执行阶段只跑一个 agent(两个带写工具的执行器会落在同一个 worktree 上)',
+  observer: '观察阶段只跑一个 agent(node.score 每个维度只有一条记录)',
+}
+
+/** 名册/提醒里怎么称呼一席。 */
+function describeSeat(s: RoleBinding): string {
+  const who = s.roleName || '主模型'
+  return s.roleTag ? `${s.roleTag}(${who})` : who
+}
 
 /** 复合键分隔符。用 NUL 是因为角色名和员工名都可能含空格/冒号,而 NUL 不可能出现在里面。 */
 const KEY_SEP = '\u0000'
@@ -257,6 +275,14 @@ export function mergeSeats(
   existing: RoleBinding[],
   fromDefs: RoleBinding[],
   phaseLabel: string,
+  /**
+   * 单席位阶段:把角色席位排在前面。
+   *
+   * 这些阶段只有第 [0] 席会被派发,而角色席位是追加在后面的 —— 于是「配置文件里配了一个
+   * 带职责的角色 + 提示词里按名字点了一个员工」这种再普通不过的组合,会让角色整体死掉,
+   * 真正跑的那一席连简报都没有。带职责说明的那一席信息更全,它该赢。
+   */
+  roleSeatsFirst = false,
 ): { seats: RoleBinding[]; notices: string[] } {
   const notices: string[] = []
   const tagged = new Set(fromDefs.map(s => s.roleName))
@@ -274,7 +300,7 @@ export function mergeSeats(
     seen.add(k)
     return true
   })
-  return { seats: [...kept, ...added], notices }
+  return { seats: roleSeatsFirst ? [...added, ...kept] : [...kept, ...added], notices }
 }
 
 /**
@@ -290,9 +316,17 @@ export function applyRoleDefsToPhases(
   const notices: string[] = []
   const out = {} as Record<PhaseName, RoleBinding[]>
   for (const p of PHASE_NAMES) {
-    const merged = mergeSeats(phaseRoles[p] ?? [], seatsFor(defs, p), PHASE_LABEL[p])
-    out[p] = merged.seats
+    const merged = mergeSeats(phaseRoles[p] ?? [], seatsFor(defs, p), PHASE_LABEL[p], !MULTI_SEAT_PHASES.has(p))
     notices.push(...merged.notices)
+    let seats = merged.seats
+    const reason = SINGLE_SEAT_REASON[p]
+    // 裁剪放在合并**之后**:先合并再截断。反过来的话,按名字直接指定的员工会把角色
+    // 席位挤掉,用户看到的是自己配的角色凭空消失,而且一声不响。
+    if (reason && seats.length > 1) {
+      notices.push(`${PHASE_LABEL[p]}:${reason},仅 ${describeSeat(seats[0])} 生效,已忽略 ${seats.slice(1).map(describeSeat).join('、')}`)
+      seats = seats.slice(0, 1)
+    }
+    out[p] = seats
   }
   return { phaseRoles: out, notices }
 }
