@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import {
   applyRoleDefsToPhases, applyStaffDeclarations, mergeRoleDefs, parseRoleDefs, roleBriefFor,
-  seatsFor, seatSummaryLines,
+  seatsFor,
   type RoleDef,
 } from './roleDefs.js'
 import { MAIN_STAFF } from './types.js'
@@ -218,24 +218,6 @@ describe('mergeRoleDefs / applyStaffDeclarations:双向配置', () => {
   })
 })
 
-describe('seatSummaryLines:一人多席要在关口说清楚', () => {
-  it('同一员工占多席时点名', () => {
-    const lines = seatSummaryLines([
-      { name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['ds-安全'] },
-      { name: '安全', stage: 'review', output: 'o', purpose: 'p', staff: ['ds-安全'] },
-    ])
-    expect(lines.join('\n')).toContain('ds-安全 占 2 席')
-    expect(lines.join('\n')).toContain('架构师')
-    expect(lines.join('\n')).toContain('安全')
-  })
-
-  it('各就各位时不说废话', () => {
-    expect(seatSummaryLines([
-      { name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['a'] },
-      { name: '安全', stage: 'review', output: 'o', purpose: 'p', staff: ['b'] },
-    ])).toEqual([])
-  })
-})
 
 describe('applyRoleDefsToPhases:配置了角色 → 真的会被派发', () => {
   const defs: RoleDef[] = [

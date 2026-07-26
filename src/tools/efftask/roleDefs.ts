@@ -249,20 +249,6 @@ export function roleBriefFor(defs: RoleDef[], seat: RoleBinding | null, phase: P
   ].join('\n')
 }
 
-/** 关口上把「谁占了几席、分别演什么角色」说清楚。 */
-export function seatSummaryLines(defs: RoleDef[]): string[] {
-  const byStaff = new Map<string, string[]>()
-  for (const d of defs) {
-    for (const s of d.staff.length > 0 ? d.staff : ['主模型']) {
-      const list = byStaff.get(s) ?? []
-      if (!list.includes(d.name)) list.push(d.name)
-      byStaff.set(s, list)
-    }
-  }
-  return [...byStaff.entries()]
-    .filter(([, roles]) => roles.length > 1)
-    .map(([staff, roles]) => `${staff} 占 ${roles.length} 席:${roles.join('、')}`)
-}
 
 /**
  * 把角色展平出来的席位并进「按名字直接指定的员工」那份名册。

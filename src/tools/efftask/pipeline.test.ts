@@ -2691,7 +2691,10 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
     expect(acceptPrompt).toContain('主模型兼任')
   })
 
-  it('没有角色定义时提示词一字不多 —— 老 run 的行为不变', async () => {
+  it('席位没有角色标签时,有没有 roleDefs 都得到同一份提示词', async () => {
+    // 名字曾经是「老 run 的行为不变」,而它验的其实只是「roleDefs 存在但席位无 roleTag
+    // ≡ 完全没有 roleDefs」—— 基础提示词文案被改动会原样溜过去。改名说实话;
+    // 「不多一个字」由下面那条黄金断言单独守。
     const grab = (roleDefs?: RoleDef[]) => {
       let p = ''
       const runAgent: RunAgentFn = async req => {
@@ -2711,7 +2714,75 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
     const noTag = norm(await grab(defs))
     expect(withoutDefs).toBe(noTag)
     expect(withoutDefs).not.toContain('你的角色')
-    // 归一化本身别把断言变空:提示词确实带着一个标签。
+    // 归一化本身别把断言变空:提示词确实带着一个标签,而且没把整份提示词吃掉。
     expect(withoutDefs).toContain('TAG')
+    expect(withoutDefs.length).toBeGreaterThan(40)
+    // 无标签席位拿到的就是**原样**的评审提示词 —— 这条才是「一字不多」。
+    expect(withoutDefs.startsWith('请评审以下方案是否可执行、完整、无重大风险。')).toBe(true)
+  })
+})
+
+describe('简报到达剩下那几个调用点', () => {
+  // 评审实测:8 个 seatBrief 调用点里只有 3 个被覆盖。下面补上其中最要紧的两个 ——
+  // 集成验收(整个 run 的最终裁决,唯一走 integratePrompt 的路径)和执行阶段。
+  const defs: RoleDef[] = [
+    { name: '总验收', stage: 'accept', output: '整体验收裁决', purpose: '核对父目标是否达成', staff: ['opus-验收'] },
+    { name: '写手', stage: 'execute', output: '代码改动', purpose: '按方案落地不夹带', staff: ['opus-写手'] },
+  ]
+
+  it('集成验收(integratePrompt)拿到简报', async () => {
+    let seen = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'accept') seen = req.prompt
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const parent = root()
+    parent.kind = 'decompose'
+    parent.status = 'WAITING_CHILDREN'
+    parent.childIds = ['c1']
+    parent.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    parent.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: 'opus-验收', roleTag: '总验收' }] }
+    const child = createNode({ id: 'c1', title: 'c', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'
+    child.execStatus = '子任务做完了'
+    await stepIntegrate(parent, ctxFor([parent, child], runAgent, { ...cfg, roleDefs: defs, phaseRoles: parent.phaseRoles }))
+    expect(seen).toContain('核对父目标是否达成')
+    expect(seen).toContain('整体验收裁决')
+    // 确认真的走的是集成验收那条路,不是普通验收 —— 否则这条断言换个路径也能过。
+    expect(seen).toContain('子任务结果')
+  })
+
+  it('执行阶段(executePrompt)拿到简报', async () => {
+    let seen = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') seen = req.prompt
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), execute: [{ roleName: 'opus-写手', roleTag: '写手' }] }
+    await stepExecute(n, ctxFor([n], runAgent, { ...cfg, roleDefs: defs, phaseRoles: n.phaseRoles }))
+    expect(seen).toContain('按方案落地不夹带')
+    expect(seen).toContain('代码改动')
+  })
+
+  it('简报和后面的正文之间留了空行,不会黏成一句', async () => {
+    // 去掉 seatBrief 尾部的 \n\n,简报最后一行会和「请评审…」黏在一起。
+    let seen = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'review') seen = req.prompt
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    const rdefs: RoleDef[] = [{ name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['a'] }]
+    n.phaseRoles = { ...emptyPhaseRoles(), review: [{ roleName: 'a', roleTag: '架构师' }] }
+    await stepStart(n, ctxFor([n], runAgent, { ...cfg, roleDefs: rdefs, phaseRoles: n.phaseRoles }))
+    expect(seen).toContain('作答;裁决格式仍按下面的要求。\n\n请评审')
   })
 })

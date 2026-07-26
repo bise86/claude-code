@@ -68,3 +68,32 @@ describe('parseRoles', () => {
     expect(out).toHaveLength(4)
   })
 })
+
+describe('员工侧的 efftaskRoles 声明', () => {
+  const api = (over: object = {}) => ({
+    name: 'ds-安全', whenToUse: 'w', execMode: 'api',
+    apiUrl: 'https://x', apiToken: 'sk-x', model: 'm', ...over,
+  })
+
+  it('带 efftaskRoles 的员工能被收下,字段原样保留', () => {
+    // RoleSchema 是 .strict()。少了这个字段声明,后果不是「这个字段没生效」,而是
+    // **整条员工被跳过 = 这个员工不存在** —— 用户看到的是自己配好的模型凭空消失。
+    // 此前这条路径零覆盖:roleDefsFromSettings 的测试全部走注入的 read 接缝,
+    // 完全绕开 zod,所以删掉那行声明整套测试依然全绿。
+    const out = parseRoles([api({ efftaskRoles: ['架构师', '安全'] })], 'userSettings')
+    expect(out).toHaveLength(1)
+    expect(out[0].role.efftaskRoles).toEqual(['架构师', '安全'])
+  })
+
+  it('不写 efftaskRoles 的员工照常被收下', () => {
+    expect(parseRoles([api()], 'userSettings')).toHaveLength(1)
+  })
+
+  it('efftaskRoles 写成字符串(漏了方括号)→ 整条员工被拒,这是 .strict() 的既定行为', () => {
+    expect(parseRoles([api({ efftaskRoles: '安全' })], 'userSettings')).toHaveLength(0)
+  })
+
+  it('真正未声明的键仍然被拒 —— 这条声明没有把 schema 变松', () => {
+    expect(parseRoles([api({ 完全没听说过的键: 1 })], 'userSettings')).toHaveLength(0)
+  })
+})

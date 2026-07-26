@@ -248,6 +248,17 @@ describe('提示词里可以定义角色,也可以改配置文件里的角色', 
     expect(cfg.parallelism).toBe(3)
   })
 
+  it('抽取模型答了但没吐出 json 块 → 配置文件里的角色仍然生效', async () => {
+    // 第三条退化路径(另两条是抛异常、根本没有抽取模型)。此前无人守:把 `if (!obj)`
+    // 改回 `return base`,整个 efftask 目录全绿。
+    const cfg = await parseDirectives('随便做点什么', {
+      knownRoles: known,
+      baseRoleDefs: [arch({ staff: ['opus-架构'] })],
+      modelJson: async () => '模型只说了句人话,没有代码块',
+    })
+    expect(cfg.phaseRoles.review).toEqual([{ roleName: 'opus-架构', roleTag: '架构师' }])
+  })
+
   it('抽取模型挂了 → 配置文件里的角色仍然生效', async () => {
     // 这条最要紧:抽取失败是最常走到的退化路径,而「在配置文件里配好角色」不该只在
     // 抽取成功时才通。

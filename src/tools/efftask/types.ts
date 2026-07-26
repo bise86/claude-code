@@ -52,9 +52,6 @@ export interface RoleBinding {
 }
 /** 「主模型兼任」的员工名。见 RoleBinding.roleName。 */
 export const MAIN_STAFF = ''
-export function isMainSeat(r: RoleBinding | null | undefined): boolean {
-  return !r || r.roleName === MAIN_STAFF
-}
 export interface NodePlan { solution: string; keyPoints: string; risks: string; acceptance: string }
 /**
  * `infra: true` marks a verdict the reviewer never actually rendered — the call itself

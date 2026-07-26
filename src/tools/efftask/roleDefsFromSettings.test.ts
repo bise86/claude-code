@@ -52,6 +52,9 @@ describe('collectRoleDefs:配置文件里能配角色', () => {
     })
     expect(defs.map(d => d.name)).toEqual(['架构师'])
     expect(notices.join('\n')).toContain('半成品')
+    // 来源标签也要钉住:三份 settings 都可能出问题,只说「角色定义有误」用户不知道
+    // 该去改哪个文件。
+    expect(notices.join('\n')).toContain('用户配置')
   })
 })
 
