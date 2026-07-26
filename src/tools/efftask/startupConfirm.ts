@@ -67,15 +67,27 @@ export function toggleRole(
   roster: Record<PhaseName, RoleBinding[]>, phase: PhaseName, roleName: string, model?: string,
 ): Record<PhaseName, RoleBinding[]> {
   const cur = roster[phase] ?? []
-  const has = cur.some(r => r.roleName === roleName)
+  // 只对**没有角色标签**的席位生效。带标签的席位来自角色定义(settings.json 或提示词),
+  // 它携带 stage/output/purpose,而这个编辑器是一个按员工名打勾的列表 —— 它没有地方
+  // 放这些信息,也就无法把一个被勾掉的角色席位再放回来。
+  //
+  // 实测过按 roleName 匹配的后果:同一个员工兼两个角色时,一次按键把**两席**一起删掉;
+  // 再按一次只回来一席,而且没有 roleTag —— 职责简报永久丢失,名册也不再显示角色名,
+  // 用户还以为自己撤销了。
+  const tagged = cur.filter(r => r.roleTag)
+  const free = cur.filter(r => !r.roleTag)
+  const has = free.some(r => r.roleName === roleName)
   // Copy every phase's ARRAY, not just the outer record: TaskNode.createNode copies these per
   // node, and a shared array instance would let one edit reach the whole tree.
   const next = Object.fromEntries(
     PHASE_NAMES.map(p => [p, [...(roster[p] ?? [])]]),
   ) as Record<PhaseName, RoleBinding[]>
   const binding: RoleBinding = model ? { roleName, model } : { roleName }
+  // 单席位阶段已经被角色定义占满 → 这里无从下手。硬加一席只会让名册多一个永远不跑的
+  // 名字(pipeline 取第 [0] 席),而那正是这个关口存在的意义所要防的。
+  if (!MULTI_ROLE_PHASES.has(phase) && tagged.length > 0) return roster
   next[phase] = has
-    ? cur.filter(r => r.roleName !== roleName)
+    ? [...tagged, ...free.filter(r => r.roleName !== roleName)]
     // SINGLE-SEAT phases replace rather than append: the run would dispatch only the first
     // one, so a second name on the roster is a seat that never gets called.
     : MULTI_ROLE_PHASES.has(phase) ? [...cur, binding] : [binding]
@@ -99,14 +111,23 @@ export function rosterEditorLines(
   window = ROSTER_WINDOW,
 ): string[] {
   return PHASE_NAMES.map((p, i) => {
-    const bound = new Set((roster[p] ?? []).map(r => r.roleName))
+    const seatsHere = roster[p] ?? []
+    // 打勾只反映**没有角色标签**的席位 —— 带标签的那些在这个编辑器里改不了(见 toggleRole),
+    // 给它们打勾会让用户以为按一下就能取消。
+    const bound = new Set(seatsHere.filter(r => !r.roleTag).map(r => r.roleName))
+    // 角色定义排上的席位,单独列出来。此前它们对这一行完全不可见:主模型兼任的席位
+    // roleName 是空串,`bound` 成了 Set{''},于是 size !== 0 让「(主模型)」也不显示 ——
+    // 只读名册说「验收: 验收官←主模型」,同一个关口的编辑器行却说什么都没选。
+    const locked = seatsHere.filter(r => r.roleTag)
+      .map(r => `${clip(r.roleTag!, 12)}←${clip(r.roleName || '主模型', 14)}`)
     const label = PHASE_LABEL[p]
-    const empty = bound.size === 0 ? (p === 'observer' ? ' (不评分)' : ' (主模型)') : ''
+    const empty = seatsHere.length === 0 ? (p === 'observer' ? ' (不评分)' : ' (主模型)') : ''
+    const lockedPrefix = locked.length > 0 ? `〔角色定义:${locked.join('、')}〕` : ''
     const seats = MULTI_ROLE_PHASES.has(p) ? '' : '(单选)'
     if (available.length === 0) {
       // Say WHY rather than render an empty row: with no roles available there is nothing to
       // edit, and a blank line reads as a broken editor.
-      return `${i === phaseIdx ? '▶' : ' '} ${label}${empty}: (没有可用角色,本阶段用主模型)`
+      return `${i === phaseIdx ? '▶' : ' '} ${label}${empty}: ${lockedPrefix || '(没有可用角色,本阶段用主模型)'}`
     }
     // Keep the cursor inside the window, and keep bound roles visible on rows the cursor is
     // not on — otherwise a user cannot see what they already selected.
@@ -125,7 +146,7 @@ export function rosterEditorLines(
     const hiddenAfter = available.length - (from + shown.length)
     // Count what is off-screen. A window that silently shows a slice looks like the whole list.
     const more = [hiddenBefore > 0 ? `←${hiddenBefore}` : '', hiddenAfter > 0 ? `→${hiddenAfter}` : ''].filter(Boolean).join(' ')
-    return `${i === phaseIdx ? '▶' : ' '} ${label}${seats}${empty}: ${cells.join(' ')}${more ? ' ' + more : ''}`
+    return `${i === phaseIdx ? '▶' : ' '} ${label}${seats}${empty}: ${lockedPrefix}${cells.join(' ')}${more ? ' ' + more : ''}`
   })
 }
 

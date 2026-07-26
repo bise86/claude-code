@@ -631,3 +631,71 @@ describe('rosterEquals 必须把角色归属算进去', () => {
     expect(rosterEquals(a, b)).toBe(true)
   })
 })
+
+describe('关口编辑器与角色席位', () => {
+  const R = (over: Partial<Record<PhaseName, RoleBinding[]>>) => ({ ...emptyPhaseRoles(), ...over })
+
+  it('勾掉一个员工不会连带删掉它的角色席位', () => {
+    // 实测过按 roleName 匹配的后果:同一个员工兼两角时,一次按键把**两席**一起删掉;
+    // 再按一次只回来一席,而且没有 roleTag —— 职责简报永久丢失,用户还以为自己撤销了。
+    const before = R({ review: [
+      { roleName: 'ds-安全', roleTag: '架构师' },
+      { roleName: 'ds-安全', roleTag: '安全' },
+      { roleName: 'ds-安全' },
+    ] })
+    const after = toggleRole(before, 'review', 'ds-安全')
+    expect(after.review).toEqual([
+      { roleName: 'ds-安全', roleTag: '架构师' },
+      { roleName: 'ds-安全', roleTag: '安全' },
+    ])
+  })
+
+  it('角色席位不参与打勾判定 —— 否则用户以为按一下就能取消', () => {
+    const roster = R({ review: [{ roleName: 'opus-架构', roleTag: '架构师' }] })
+    // 没有自由席位 → 这次按键是「加一席」,不是「取消」。
+    const after = toggleRole(roster, 'review', 'opus-架构')
+    expect(after.review).toHaveLength(2)
+    expect(after.review.filter(r => r.roleTag)).toHaveLength(1)
+  })
+
+  it('单席位阶段已被角色定义占满 → 编辑器改不动,名册原样返回', () => {
+    // 硬加一席只会让名册多一个永远不跑的名字(pipeline 取第 [0] 席)。
+    const roster = R({ plan: [{ roleName: 'opus-架构', roleTag: '主设计' }] })
+    expect(toggleRole(roster, 'plan', 'ds-安全')).toBe(roster)
+  })
+
+  it('没有角色席位时单席位阶段照旧是替换', () => {
+    const roster = R({ plan: [{ roleName: 'opus-架构' }] })
+    expect(toggleRole(roster, 'plan', 'ds-安全').plan).toEqual([{ roleName: 'ds-安全' }])
+  })
+
+  it('编辑器行把角色定义排的席位显示出来', () => {
+    // 此前它们对这一行完全不可见:主模型兼任的席位 roleName 是空串,bound 成了 Set{''},
+    // size !== 0 让「(主模型)」也不显示 —— 只读名册说「验收: 验收官←主模型」,同一个
+    // 关口的编辑器行却说什么都没选。
+    const line = rosterEditorLines(
+      R({ accept: [{ roleName: '', roleTag: '验收官' }] }), ['opus-架构', 'ds-安全'], 0, 0,
+    ).find(l => l.includes('验收'))!
+    expect(line).toContain('验收官')
+    expect(line).toContain('主模型')
+  })
+
+  it('角色席位不打勾,自由席位才打勾', () => {
+    const lines = rosterEditorLines(
+      R({ review: [{ roleName: 'opus-架构', roleTag: '架构师' }, { roleName: 'ds-安全' }] }),
+      ['opus-架构', 'ds-安全'], 1, 0,
+    )
+    const line = lines.find(l => l.includes('评审'))!
+    expect(line).toContain('[ ]opus-架构')
+    expect(line).toContain('[x]ds-安全')
+    expect(line).toContain('架构师')
+  })
+
+  it('有角色席位时不说「(主模型)」', () => {
+    const line = rosterEditorLines(
+      R({ plan: [{ roleName: '', roleTag: '主设计' }] }), ['opus-架构'], 3, 0,
+    ).find(l => l.includes('方案'))!
+    expect(line).not.toContain('(主模型):')
+    expect(line).toContain('主设计')
+  })
+})
