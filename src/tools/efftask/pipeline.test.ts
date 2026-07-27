@@ -4237,3 +4237,96 @@ describe('复验点出来的四处「行为对、但没人守」', () => {
     expect(alt.solution).toContain('5000')
   })
 })
+
+/**
+ * 评审收敛 (spec 2026-07-27 §10) —— 接线部分。
+ *
+ * 纯函数在 reviewConvergence.test.ts 里全测过了;这里钉的是**它们真的被接上了**:
+ * 累积反馈进了方案提示词、重复提示进了评审提示词、触顶话术进了 blockedReason 和卡片。
+ * 这个项目已经两次出现「函数写对了、单测全绿、生产里那根线是断的」。
+ */
+describe('评审收敛真的接上了', () => {
+  const node = (): TaskNode => createNode({
+    id: 'root', title: 't', parentId: null, deps: [], depth: 0,
+    phaseRoles: emptyPhaseRoles(), now: NOW, goal: 'g',
+  })
+
+  /** 本地的 onBlocked 捕获夹具 —— 文件里别处那两个都在各自的 describe 闭包里。 */
+  function withBlocks(nodes: TaskNode[], runAgent: RunAgentFn) {
+    const c = ctxFor(nodes, runAgent)
+    const fired: { category?: string; reason: string; remedy?: string }[] = []
+    c.onBlocked = info => { fired.push({ category: info.category, reason: info.reason, remedy: info.remedy }) }
+    return { ctx: c, fired }
+  }
+
+  /** 每轮都提同一条阻断意见 —— 用户实际撞到的形状。 */
+  const alwaysSame = (req: { phase: string; prompt: string }) =>
+    req.phase === 'plan'
+      ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      : vtag(req) + '\n{"pass":false,"blocking":["评分等级与分数的映射规则未定义"],"comments":""}\n```'
+
+  it('方案提示词带上**所有轮次**的意见,并点名哪几条是老账', async () => {
+    // 此前是 feedback = 最后一轮的拼接串,每轮覆盖 —— 作者从来没同时看到过三轮意见。
+    const n = node()
+    const prompts: string[] = []
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'plan') prompts.push(req.prompt)
+      return alwaysSame(req)
+    })
+    await stepStart(n, ctx)
+    const last = prompts[prompts.length - 1]!
+    expect(last).toContain('连续')
+    expect(last).toContain('轮未解决')
+    expect(last).toContain('评分等级与分数的映射规则未定义')
+    expect(last).toContain('逐条')
+  })
+
+  it('评审提示词带上历史 —— 评审员此前完全看不到自己在重复', async () => {
+    const n = node()
+    const prompts: string[] = []
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'review') prompts.push(req.prompt)
+      return alwaysSame(req)
+    })
+    await stepStart(n, ctx)
+    // 第一轮没有历史可讲;第二轮起必须有。
+    expect(prompts.length).toBeGreaterThan(1)
+    expect(prompts[0]).not.toContain('前几轮已经提出过')
+    expect(prompts[prompts.length - 1]).toContain('前几轮已经提出过')
+    expect(prompts[prompts.length - 1]).toContain('本轮是第 3 轮')
+    expect(prompts[prompts.length - 1]).toContain('第 1、2 轮')
+    // 而且不能推着评审员放行 —— 相似度判定会误判。
+    expect(prompts[prompts.length - 1]).not.toContain('请判通过')
+  })
+
+  it('触顶的阻断理由点名老账,处理方式按事实分叉', async () => {
+    const n = node()
+    const { ctx, fired } = withBlocks([n], async req => alwaysSame(req))
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('评审迭代超限')
+    expect(n.blockedReason).toContain('轮未解决')
+    // 静态那句是「若方案本身没问题,可提高…」;按事实分叉之后要说的是「先确认」。
+    expect(n.blockedReason).toContain('先确认')
+    // 卡片走的是同一句,不是静态表。
+    expect(fired[0]!.remedy).toContain('先确认')
+  })
+
+  it('每轮意见都不一样时,不谎称有老账', async () => {
+    const n = node()
+    let i = 0
+    const { ctx } = withBlocks([n], async req => {
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      i++
+      // 三条必须是**真的**不一样的文字。第一版写的是「第1个/第2个/第3个完全不同的问题」——
+      // 只差一个字,相似度极高,三条被合并成一条老账,于是这条测试测的是夹具而不是实现。
+      // (这正是 similarItem 那段注释里记着的已知误判。)
+      const complaints = ['缺少回滚方案', '没有并发上限的说明', '验收标准里没写超时怎么算']
+      return vtag(req) + '\n{"pass":false,"blocking":["' + complaints[(i - 1) % 3] + '"],"comments":""}\n' + '```'
+    })
+    await stepStart(n, ctx)
+    expect(n.blockedReason).toContain('评审迭代超限')
+    expect(n.blockedReason).not.toContain('轮未解决')
+    expect(n.blockedReason).toContain('扩大范围')
+  })
+})

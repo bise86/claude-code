@@ -60,6 +60,8 @@ export interface BlockEscalation {
    * Defaults from the category when the caller does not say.
    */
   stopped?: boolean
+  /** 按事实定的 处理方式;省略则用静态表。见 blockReasonWithRemedy。 */
+  remedy?: string
 }
 
 const TITLE: Record<BlockCategory, string> = {
@@ -160,7 +162,7 @@ export function blockEscalationLines(e: BlockEscalation, runId?: string): string
           ? '状态: 该节点没有停,已转为等待这些补救子任务;它们全部验收通过后,该节点会重新做一次集成验收。'
           : '状态: 这次加子节点的请求被拒绝了,但该节点本身没有停,会带着这条拒绝记录继续执行和验收。',
       `记录: ${recordPath(e.node, runId)}`,
-      `处理方式: ${REMEDY[e.category]}`,
+      `处理方式: ${e.remedy ?? REMEDY[e.category]}`,
     ]
   }
   return [
@@ -179,7 +181,7 @@ export function blockEscalationLines(e: BlockEscalation, runId?: string): string
     // /et really would have two orchestrators writing the same node.md files.
     '注意: 本次运行可能还有其它分支在跑。请等它结束后再执行下面的命令 —— 运行期间另开一个 /et 会有两个进程写同一批 node.md。',
     `记录: ${recordPath(e.node, runId)}`,
-    `处理方式: ${REMEDY[e.category]}`,
+    `处理方式: ${e.remedy ?? REMEDY[e.category]}`,
     // The ONLY command that actually reopens this node. A bare `--resume` reproduces the
     // block having made zero model calls — measured behaviour of reseatTransientNodes.
     // Run-scoped, and says so: the flag reopens EVERY valve-stopped node in the run, not just
@@ -222,9 +224,17 @@ export function buildBlockCard(e: BlockEscalation, runId?: string): object {
  * The merge-conflict path already does exactly this (its detail string carries the 处理方式
  * and the resume command); the valve path recorded a bare reason.
  */
-export function blockReasonWithRemedy(reason: string, category: BlockCategory, runId?: string): string {
+/**
+ * @param remedy 覆盖静态的那一句。
+ *
+ * 静态表只能给一句放之四海皆准的话,而有些类别需要**按事实分叉**:方案评审触顶时,
+ * 「同一条意见连提三轮」和「每轮意见都不一样」的正确动作是相反的 —— 前者再加轮次大概率
+ * 还是同样的结论,后者恰恰就该加轮次。给一句通用的话,总有一半的人被指反方向。
+ * 其余类别不传这个参数,行为逐字节不变。
+ */
+export function blockReasonWithRemedy(reason: string, category: BlockCategory, runId?: string, remedy?: string): string {
   const id = runId ?? '<运行 ID>'
-  return `${reason} · ${REMEDY[category]} · 重试: /et --resume ${id} --retry-blocked`
+  return `${reason} · ${remedy ?? REMEDY[category]} · 重试: /et --resume ${id} --retry-blocked`
 }
 
 /** Default cards per run before the limiter starts suppressing. */

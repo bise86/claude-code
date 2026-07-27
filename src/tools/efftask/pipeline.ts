@@ -3,6 +3,7 @@ import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreReco
 import { roleBriefFor } from './roleDefs.js'
 import { ALT_SOLUTION_CHARS, createNode, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
+import { exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
@@ -249,11 +250,11 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: 
 
 // Records WHY the node died in its own field. It must NOT touch node.execStatus, which may
 // hold real completed-work evidence that acceptance/audit still needs.
-async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx, category?: BlockCategory): Promise<void> {
+async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx, category?: BlockCategory, remedy?: string): Promise<void> {
   // The 处理方式 and the retry command travel WITH the reason, exactly as the merge-conflict
   // path does. The escalation limiter drops cards past its cap while telling the user to read
   // run.md — so run.md has to actually contain what the card would have said.
-  node.blockedReason = category !== undefined ? blockReasonWithRemedy(reason, category, ctx.runId) : reason
+  node.blockedReason = category !== undefined ? blockReasonWithRemedy(reason, category, ctx.runId, remedy) : reason
   // Assigned in BOTH directions, like `interrupted`: a node that previously tripped a valve
   // and is now blocked for a structural reason must not keep a flag that offers a retry.
   node.capBlocked = category !== undefined
@@ -273,7 +274,7 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx,
   if (category !== undefined && !ctx.signal.aborted) {
     // The RAW reason: buildBlockCard renders its own 处理方式 line, and passing the already-
     // decorated text would print the remedy twice on one card.
-    try { ctx.onBlocked?.({ node, reason, category, stopped: true }) } catch { /* a notification failure must not change the verdict */ }
+    try { ctx.onBlocked?.({ node, reason, category, stopped: true, remedy }) } catch { /* a notification failure must not change the verdict */ }
   }
 }
 
@@ -504,8 +505,21 @@ function graftTargets(node: TaskNode, ctx: PipelineCtx): string {
 // otherwise the goal drifts every time the plan is re-emitted during review iterations.
 function ctxGoal(node: TaskNode): string { return node.goal }
 
-function reviewPrompt(node: TaskNode, tag: string, brief = ''): string {
-  return brief + `请评审以下方案是否可执行、完整、无重大风险。方案:\n${quote(JSON.stringify(node.plan))}\n输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` + answerRule(tag)
+/**
+ * 评审提示词。
+ *
+ * `round` 和历史是**后加的**,而它们的缺席正是评审循环不收敛的一半原因:此前这里只吃
+ * `node.plan` —— 没有 reviewLog、没有轮次号、没有上一版方案,而 `node.reviewLog` 就挂在
+ * 同一个对象上,一行没用。方案作者那边反而是有历史的(planPrompt 带「上一版方案」+
+ * feedback),所以是**单边失明**:作者知道自己在改什么,评审员不知道自己在重复什么。
+ */
+function reviewPrompt(node: TaskNode, tag: string, brief = '', round = 1): string {
+  const notice = reviewRepeatNotice(feedbackItems(node.reviewLog), round)
+  return brief +
+    `请评审以下方案是否可执行、完整、无重大风险。方案:\n${quote(JSON.stringify(node.plan))}\n` +
+    (notice ? notice + '\n' : '') +
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` +
+    answerRule(tag)
 }
 function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', syncNote = '', brief = ''): string {
   return (
@@ -981,7 +995,9 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     } else {
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
-      system: 'review', buildPrompt: (tag, seat) => reviewPrompt(node, tag, seatBrief(ctx, seat, 'review')), ctx,
+      system: 'review',
+      buildPrompt: (tag, seat) => reviewPrompt(node, tag, seatBrief(ctx, seat, 'review'), node.iteration.planReview + 1),
+      ctx,
     })
     node.reviewLog.push(rec)
     // runRoundtable resolves even when the run was cancelled mid-flight (it collects
@@ -995,9 +1011,17 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     }
     if (!rec.synthesized.pass) {
       node.iteration.planReview++
-      feedback = rec.synthesized.blockingSummary
+      // **累积**反馈,不是只带最后一轮。
+      //
+      // 此前是 `feedback = rec.synthesized.blockingSummary`,每轮覆盖 —— 方案作者从来
+      // 没同时看到过三轮意见,它每次都在打地鼠:第 1 轮的意见在第 2 轮被改跑偏,第 3 轮
+      // 又提回来,三轮烧完,说的其实是同一件事。
+      const items = feedbackItems(node.reviewLog)
+      feedback = planFeedbackPrompt(items) || rec.synthesized.blockingSummary
       if (node.iteration.planReview >= caps.maxIterations) {
-        await blockWithReason(node, `评审迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx, 'cap-iteration')
+        // 触顶时点名**哪几条是连着几轮没解决的**,并按这个事实给下一步 —— 静态的一句
+        // 「可提高 caps.maxIterations」在「同一条连提三轮」的情况下是误导。
+        await blockWithReason(node, exhaustionReason(items, caps.maxIterations), ctx, 'cap-iteration', exhaustionRemedy(items))
         return
       }
       continue
