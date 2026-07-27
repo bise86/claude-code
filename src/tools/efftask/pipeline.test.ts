@@ -3665,3 +3665,128 @@ describe('圆桌起草必须走并发池', () => {
     expect(peak).toBeLessThanOrEqual(2)
   })
 })
+
+describe('环节跳过:七个都能跳,且跳过 ≠ 通过', () => {
+  const mk = (skip: string[], pr: Partial<Record<string, { roleName: string }[]>> = {}) => {
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), ...pr } as typeof n.phaseRoles
+    return { n, ctx: (agent: RunAgentFn, extra = {}) => ctxFor([n], agent, {
+      ...cfg, phaseRoles: n.phaseRoles, skipSteps: skip as never, ...extra }) }
+  }
+  const ok = (req: { phase: string; prompt: string }) =>
+    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    : req.phase === 'execute' ? '```json\n{"execStatus":"做完了"}\n```'
+    : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+
+  it('跳过分析:不调 plan,节点仍能被推进(kind 必须被设)', async () => {
+    const seen: string[] = []
+    const { n, ctx } = mk(['plan'])
+    await stepStart(n, ctx(async req => { seen.push(req.phase); return ok(req) }))
+    expect(seen).not.toContain('plan')
+    // kind 不设的话 advanceableKind 恒返回 null,节点永久卡死。
+    expect(n.kind).toBe('executable')
+    expect(n.status).toBe('READY')
+    expect(n.execStatus).toContain('分析环节已跳过')
+  })
+
+  it('跳过分析时,已挂上的子节点不会被孤儿化', async () => {
+    const { n, ctx } = mk(['plan'])
+    n.childIds = ['root/01']
+    await stepStart(n, ctx(async req => ok(req)))
+    expect(n.kind).toBe('decompose')
+    expect(n.status).toBe('WAITING_CHILDREN')
+  })
+
+  it('跳过质疑讨论:不调 review,而且**不写 reviewLog**', async () => {
+    // 写一条 PASS 记录 = 谎报有人评审过,而 node.md 是用户事后追责的依据。
+    const seen: string[] = []
+    const { n, ctx } = mk(['review'], { review: [{ roleName: 'r' }] })
+    await stepStart(n, ctx(async req => { seen.push(req.phase); return ok(req) }))
+    expect(seen).not.toContain('review')
+    expect(n.reviewLog).toEqual([])
+    expect(n.status).toBe('READY')
+  })
+
+  it('跳过执行:不调 execute,不申请工作区,并且留痕带编排器前缀', async () => {
+    const seen: string[] = []
+    let acquired = 0
+    const { n, ctx } = mk(['execute'])
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    const pool = {
+      acquire: async () => { acquired++; return { branch: 'b', path: '/wt' } },
+      release: async () => ({ removed: true }), commitAndMerge: async () => ({ ok: true }),
+    }
+    await stepExecute(n, { ...ctx(async req => { seen.push(req.phase); return ok(req) }), worktrees: pool as never })
+    expect(seen).not.toContain('execute')
+    // 早退必须在 acquire 之前,否则每个跳过的节点仍会真的建一个 worktree 再删。
+    expect(acquired).toBe(0)
+    expect(n.execStatus).toContain('执行环节已跳过')
+    expect(n.execStatus.startsWith('(注:')).toBe(true)
+  })
+
+  it('跳过验收:不调 accept,不写 acceptLog,节点仍到 ACCEPTED', async () => {
+    const seen: string[] = []
+    const { n, ctx } = mk(['accept'], { accept: [{ roleName: 'qa' }] })
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    await stepExecute(n, ctx(async req => { seen.push(req.phase); return ok(req) }))
+    expect(seen).not.toContain('accept')
+    expect(n.acceptLog).toEqual([])
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  it('跳过测试验证 / 观察:与不配席位等价', async () => {
+    const seen: string[] = []
+    const { n, ctx } = mk(['verify', 'observer'], { verify: [{ roleName: 'v' }], observer: [{ roleName: 'o' }] })
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    await stepExecute(n, ctx(async req => { seen.push(req.phase); return ok(req) }))
+    expect(seen).not.toContain('verify')
+    expect(seen).not.toContain('observer')
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  it('跳过集成验收:拆分型节点直接 ACCEPTED,不调 accept', async () => {
+    const seen: string[] = []
+    const parent = root()
+    parent.kind = 'decompose'; parent.status = 'WAITING_CHILDREN'; parent.childIds = ['c1']
+    parent.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    const child = createNode({ id: 'c1', title: 'c', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = 'done'
+    await stepIntegrate(parent, ctxFor([parent, child], async req => { seen.push(req.phase); return ok(req) },
+      { ...cfg, skipSteps: ['integrate'] as never }))
+    expect(seen).not.toContain('accept')
+    expect(parent.acceptLog).toEqual([])
+    expect(parent.status).toBe('ACCEPTED')
+  })
+
+  it('跳过集成验收但本节点自己有未解决的冲突 → 仍然阻断', async () => {
+    // 这个守卫挡的是「靠子任务结果拿到 ACCEPTED,而自己的改动还冲突着」——绕过它就是谎报完成。
+    const parent = root()
+    parent.kind = 'decompose'; parent.status = 'WAITING_CHILDREN'; parent.childIds = ['c1']
+    parent.mergeConflict = true
+    const child = createNode({ id: 'c1', title: 'c', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'
+    await stepIntegrate(parent, ctxFor([parent, child], async req => ok(req), { ...cfg, skipSteps: ['integrate'] as never }))
+    expect(parent.status).toBe('BLOCKED')
+    expect(parent.blockedReason).toContain('合并冲突')
+  })
+
+  it('七个全跳:一次模型调用都没有', async () => {
+    const seen: string[] = []
+    const { n, ctx } = mk(['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer'])
+    await stepStart(n, ctx(async req => { seen.push(req.phase); return ok(req) }))
+    await stepExecute(n, ctx(async req => { seen.push(req.phase); return ok(req) }))
+    expect(seen).toEqual([])
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  it('什么都不跳时行为完全不变', async () => {
+    const seen: string[] = []
+    const { n, ctx } = mk([])
+    await stepStart(n, ctx(async req => { seen.push(req.phase); return ok(req) }))
+    expect(seen).toContain('plan')
+    expect(seen).toContain('review')
+  })
+})

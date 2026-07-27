@@ -324,6 +324,10 @@ export async function writeRunManifest(
     ...(cfg.resumeGuidance ? { resumeGuidance: cfg.resumeGuidance } : {}),
     ...(cfg.resumes && cfg.resumes.length > 0 ? { resumes: cfg.resumes } : {}),
     ...(cfg.roleDefs && cfg.roleDefs.length > 0 ? { roleDefs: cfg.roleDefs } : {}),
+    // writeRunManifest 是**显式白名单** —— 不加进来就永远写不出去,而 readRunManifest
+    // 读的是一个不存在的键:恢复之后所有跳过失效,评审/验收席位复活(0 席 = 主模型顶上),
+    // 用户毫不知情地为一次恢复付了说好不付的钱。
+    ...(cfg.skipSteps && cfg.skipSteps.length > 0 ? { skipSteps: cfg.skipSteps } : {}),
     // 独立于 status 落盘 —— 见 EffTaskConfig.pendingHandoff:status 先写下 completed 而
     // 集成分支还没处置,用户直接关终端就再也没人管那条分支了。
     ...(cfg.pendingHandoff ? { pendingHandoff: cfg.pendingHandoff } : {}),

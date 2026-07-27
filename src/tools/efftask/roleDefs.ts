@@ -91,7 +91,7 @@ const KEY_SEP = '\u0000'
  * 只做前缀/包含匹配,不做编辑距离 —— 一个猜错的建议比没有建议更糟,而中文环节名之间
  * 的字面距离很近(「验收」vs「集成提交」)。宁可不猜。
  */
-function guessStep(raw: string): string | undefined {
+export function guessStep(raw: string): string | undefined {
   if (!raw) return undefined
   for (const p of PHASE_NAMES) {
     const label = PHASE_LABEL[p]

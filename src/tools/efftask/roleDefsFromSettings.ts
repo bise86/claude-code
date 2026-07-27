@@ -5,7 +5,8 @@
 // 和 roleDefs.ts 分开,是因为那个文件是纯函数、不碰任何全局状态,整套解析/合并/展平逻辑
 // 都能不搭环境地测。这里只做「去哪儿拿原始数据」。
 import { getSettingsForSource } from '../../utils/settings/settings.js'
-import { applyStaffDeclarations, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
+import { applyStaffDeclarations, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
+import { PHASE_LABEL, PHASE_NAMES, STEP_ALIASES, type PhaseName } from './types.js'
 
 /** 和 collectRoleAgents 用同一组来源、同一个优先级顺序。 */
 const SOURCES = ['userSettings', 'projectSettings', 'localSettings'] as const
@@ -83,4 +84,47 @@ export function collectRoleDefs(opts: {
   }
 
   return { defs, notices }
+}
+
+/**
+ * settings.json 里配的「要跳过的环节」。
+ *
+ * 和 collectRoleDefs 同一批来源、同一个优先级顺序 —— 它们是同一层的两个方向:
+ * efftaskRoles 说「这个环节谁来干」,efftaskSkipSteps 说「这个环节干不干」。
+ *
+ * 归一到内部 phase 名;不认识的项给 notice 并猜一个最接近的,和角色定义里 step 写错时
+ * 同一套待遇。
+ */
+export function collectSkipSteps(opts?: {
+  read?: (source: (typeof SOURCES)[number]) => { efftaskSkipSteps?: unknown } | undefined
+}): { steps: PhaseName[]; notices: string[] } {
+  const read = opts?.read ?? ((s: (typeof SOURCES)[number]) =>
+    getSettingsForSource(s) as { efftaskSkipSteps?: unknown } | undefined)
+  const notices: string[] = []
+  const steps: PhaseName[] = []
+  for (const src of SOURCES) {
+    let raw: unknown
+    try { raw = read(src)?.efftaskSkipSteps } catch { continue }
+    if (raw === undefined || raw === null) continue
+    if (!Array.isArray(raw)) {
+      notices.push(`${SOURCE_LABEL[src]}:efftaskSkipSteps 不是数组,已忽略(相关环节会照常运行)`)
+      continue
+    }
+    for (const item of raw) {
+      const t = typeof item === 'string' ? item.trim() : ''
+      if (!t) continue
+      const v = STEP_ALIASES[t] ?? t
+      if ((PHASE_NAMES as string[]).includes(v)) {
+        if (!steps.includes(v as PhaseName)) steps.push(v as PhaseName)
+      } else {
+        const legal = PHASE_NAMES.map(x => PHASE_LABEL[x]).join('/')
+        const guess = guessStep(t)
+        notices.push(
+          `${SOURCE_LABEL[src]}:要跳过的环节「${t}」不是 ${legal} 之一,该环节会照常运行`
+          + (guess ? `。是不是想写「${guess}」?` : ''),
+        )
+      }
+    }
+  }
+  return { steps, notices }
 }

@@ -643,6 +643,18 @@ function integrateBriefPhase(node: TaskNode): PhaseName {
   return (node.phaseRoles.integrate ?? []).length > 0 ? 'integrate' : 'accept'
 }
 
+/**
+ * 这个环节被整个跳过了吗?
+ *
+ * **跳过 ≠ 清空席位。** 0 席在 plan/review/execute/accept 上的语义是「主模型顶上跑一次」,
+ * 在 integrate 上是「回落到 accept 席位」—— 只有 verify/observer 真的不发生。所以跳过必须
+ * 是显式早退,而席位**保持原样**(清空还会让关口说「未配置」而不是「已跳过」,并误触发
+ * integrateSeats 的回落)。
+ */
+function isSkipped(ctx: PipelineCtx, phase: PhaseName): boolean {
+  return (ctx.config.skipSteps ?? []).includes(phase)
+}
+
 function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
   return node.phaseRoles[phase][0] ?? null
 }
@@ -908,6 +920,21 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // pre-existing; the draft merely gives it one more thing to lose.
       node.confirmedDraft = undefined
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
+    } else if (isSkipped(ctx, 'plan')) {
+      // 跳过分析 = 本次不出方案、不主动拆子任务。
+      //
+      // node.kind 是 plan 的产出,不设它的话 advanceableKind 对 'unknown' 恒返回 null ——
+      // 节点永久不可推进,调度器每一轮都跳过它(实测)。
+      //
+      // childIds 守卫必须复制正常路径那一条:plan 在飞时别的节点可能已经把子节点挂上来了,
+      // 直接判成 executable 会让那棵子树被孤儿化。
+      // 只设 executable 即可:评审之后的路由(:977)会在 childIds 非空时把它改判成
+      // decompose + WAITING_CHILDREN。在这里再判一次是冗余 —— 实测把它写死成
+      // 'executable',带子节点的用例照样通过,因为下游兜住了。
+      node.kind = 'executable'
+      noteOnNode(node, '分析环节已跳过:本节点不出方案,也不主动拆子任务')
+      lastChildren = []
+      if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     } else {
       if (!(await commit(node, 'PLANNING', ctx))) return
       const res = await runPlanPhase(node, ctx, feedback)
@@ -918,6 +945,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       lastChildren = parsed.children
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     }
+    if (!isSkipped(ctx, 'review')) {
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
       system: 'review', buildPrompt: (tag, seat) => reviewPrompt(node, tag, seatBrief(ctx, seat, 'review')), ctx,
@@ -942,6 +970,9 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       continue
     }
 
+    }
+    // 跳过评审时**不写 reviewLog** —— 一条 PASS 记录 = 谎报有人评审过,而 node.md 是
+    // 用户事后追责的依据。跳过 ≠ 通过。评审之后的路由(深度上限/建子节点)原样跑。
     // Re-check before committing READY. Read-only phases run CONCURRENTLY, so another node's
     // growTree can have grafted children onto THIS one while its plan call was in flight.
     // Overwriting that WAITING_CHILDREN with READY orphaned the new subtree: nothing waited
@@ -1111,7 +1142,8 @@ function scorePrompt(node: TaskNode, tag: string, brief = ''): string {
  */
 async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
   const seats = node.phaseRoles.observer ?? []
-  if (seats.length === 0) return false // opt-in: no observer, no scoring, no fallback to the main model
+  // 跳过与「没配席位」在这两个环节上等价 —— 它们本来就是 opt-in。
+  if (seats.length === 0 || isSkipped(ctx, 'observer')) return false // opt-in: no observer, no scoring, no fallback to the main model
   const tag = answerTag(ANSWER_TAGS.score)
   // 每个席位独立打分,并行 —— 和圆桌同构。取最低分收敛成一个结论(显示宽容的那个数会
   // 掩盖阈值要抓的情况),其余理由挂在 others 上而不是丢掉。
@@ -1348,6 +1380,13 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           // node that had used its normal rounds became un-resumable the moment it hit a
           // conflict — measured "恢复时该阶段预算已耗尽(3/3)" on a node whose card had just
           // told the user to resume it. The rework budget must mean rework.
+          if (isSkipped(ctx, 'accept')) {
+            // 跳过验收的第三个调用点(自动解冲突后的复验)。
+            noteOnNode(node, '自动解决冲突后的复验已跳过')
+            if (!(await mergeAndRelease(node, ctx))) return
+            await commit(node, 'ACCEPTED', ctx)
+            return
+          }
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
             phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
             system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
@@ -1434,7 +1473,18 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   // with write tools in the user's real checkout — concurrently with others once the execute
   // mutex is lifted. Refusing is the only safe answer; the run degrades node by node, and
   // says so, instead of silently writing where it promised not to.
-  if (ctx.worktrees && !node.worktree) {
+  if (isSkipped(ctx, 'execute')) {
+    // 早退必须在 acquire **之前**:放后面的话,每个被跳过的节点仍会真的 git worktree add
+    // 一个分支再 release。放前面 node.worktree 为 undefined,mergeAndRelease 直接短路。
+    //
+    // 必须往 execStatus 写一行,否则 acceptPrompt / integratePrompt 会渲染成空槽;而且
+    // 这一行**必须带编排器前缀** —— 否则 integratePrompt 的 realWork 过滤器会把它当成
+    // 「本节点自己的执行产出(已合入集成分支)」交给集成验收员。
+    //
+    // 不早退而只是「不调模型」的话,空产出闸门会让节点空转 maxIterations 圈再阻断,
+    // 一次模型调用都没有,而阻断信息还在指责执行者没干活。
+    noteOnNode(node, '执行环节已跳过:本节点没有产生任何代码改动')
+  } else if (ctx.worktrees && !node.worktree) {
     const lease = await ctx.worktrees.acquire(node)
     if ('error' in lease) {
       await blockWithReason(node, `无法为该节点准备隔离工作区,拒绝在共享工作区执行: ${lease.error}`, ctx)
@@ -1450,6 +1500,14 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   // survives — so it is judged before it merges, exactly as an auto-resolution is.
   if (node.mergeConflict && node.worktree) {
     node.mergeConflict = false
+    if (isSkipped(ctx, 'accept')) {
+      // 跳过验收的第二个调用点。人手改过的冲突解决代码因此**零评审直接合入** ——
+      // 这是用户选择跳过验收的代价,关口文案里写明了。
+      noteOnNode(node, '人工解决冲突后的验收已跳过')
+      if (!(await mergeAndRelease(node, ctx))) return
+      await commit(node, 'ACCEPTED', ctx)
+      return
+    }
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       // acceptLog.length + 1, like the other conflict path. iteration.acceptance is never
@@ -1514,6 +1572,10 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
             : '注意:本轮未能与集成分支同步(同步过程出错),你仍在较旧的基线上,可能看不到其他任务已合入的改动。\n'
     }
     if (!(await commit(node, 'EXECUTING', ctx))) return
+    if (!isSkipped(ctx, 'execute')) {
+    // 跳过执行时整块不跑 —— **不能**只是「不调模型」:空产出闸门会让节点空转
+    // maxIterations 圈再阻断,一次模型调用都没有,而阻断信息还在指责执行者没干活。
+    // execStatus 里已经有跳过的注记(带编排器前缀),验收/集成验收因此不会渲染成空槽。
     // node.execStatus still holds the PREVIOUS round's result here (it's overwritten below),
     // which is exactly what executePrompt renders on rework.
     const execTag = answerTag(ANSWER_TAGS.exec)
@@ -1578,13 +1640,15 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       }
     }
 
+    }
+
     // 测试验证(spec §7.1)。**只在配了这个环节的角色时存在** —— 没配就整个不发生,
     // 行为与引入它之前逐字节相同。
     //
     // 它和执行是不同的动机:执行者有动机说「做完了」;它和验收是不同的证据:验收判
     // 「达没达成验收点」读的是产出描述,测试验证判「跑起来对不对」要真的执行命令。
     // 没有这一步,验收员只能给执行者的散文盖章。
-    if ((node.phaseRoles.verify ?? []).length > 0) {
+    if ((node.phaseRoles.verify ?? []).length > 0 && !isSkipped(ctx, 'verify')) {
       if (!(await commit(node, 'VERIFYING', ctx))) return
       // 验证者**不该改代码**,而工具清单挡不住这件事:Bash 本身就能写(echo >、sed -i、
       // git apply)。所以真正的探针是前后比对工作区 —— 断言它的工具集里没有 Edit/Write
@@ -1645,6 +1709,21 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // roundtableWithInfraRetry) — redoing the executor's real work over a flaky connection
     // would be wrong, and charging those retries to the rework budget would consume every
     // attempt the executor was owed.
+    if (isSkipped(ctx, 'accept')) {
+      // **三个调用点全部跳过**(主循环 + 人工解冲突后 + 自动解冲突后)。只跳主循环的话,
+      // 验收会在「最该有人看」的冲突解决场景悄悄复活 —— 那是更坏的惊喜。
+      //
+      // 不写 acceptLog:跳过 ≠ 通过。
+      if (firstRole(node, 'observer') && !isSkipped(ctx, 'observer') && !(await commit(node, 'SCORING', ctx))) return
+      if (await scoreNode(node, ctx)) {
+        if (!(await commit(node, 'REWORK', ctx))) return
+        continue
+      }
+      if (ctx.worktrees && node.worktree && !(await commit(node, 'MERGE', ctx))) return
+      if (!(await mergeAndRelease(node, ctx))) return
+      await commit(node, 'ACCEPTED', ctx)
+      return
+    }
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
@@ -1734,6 +1813,19 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     if (!(await commit(node, 'INTEGRATION_ACCEPT', ctx))) return
     // Hold the integration worktree for the whole review: it is what the reviewers read, and
     // concurrent merges rewrite it underneath them.
+    if (isSkipped(ctx, 'integrate')) {
+      // 跳过集成验收。连带后果(关口要说):补救子任务的唯一入口没了,而且 scoreNode 也
+      // 一起没了 —— 所有拆分型节点包括根再也不会被评分,整个 run 的最终分消失。
+      //
+      // mergeConflict 不用在这里再挡一次 —— stepIntegrate 前面已有一道守卫会先触发
+      // (实测阻断信息来自那一道)。在这里重复一份是死代码,而死代码会让人以为
+      // 保护来自这里,下次改前面那道时就没人知道它是唯一的那道。
+      noteOnNode(node, '集成验收已跳过:子任务各自通过即视为本节点达成')
+      if (ctx.worktrees && node.worktree && !(await commit(node, 'MERGE', ctx))) return
+      if (!(await mergeAndRelease(node, ctx))) return
+      await commit(node, 'ACCEPTED', ctx)
+      return
+    }
     const runIntegrate = async () => roundtableWithInfraRetry({
       // 集成提交(integrate)自己的席位。
       //

@@ -1082,6 +1082,10 @@ export const SettingsSchema = lazySchema(() =>
       // 实测把 efftaskRoles 写成对象、或写成字符串数组(两种最容易犯的写法)都会触发。
       // 那个代价远大于「这个字段没生效」,而 parseRoleDefs 已经能对任意形状给出中文诊断。
       efftaskRoles: z.unknown().optional(),
+      // /et 要整个跳过的环节。z.unknown 的理由同上:写成 z.array(z.string()) 的话,
+      // 用户把它写成一个字符串会让**整份 settings.json 作废**(schema 失败 → settings: null)。
+      // 形状判定交给 efftask 侧,它已经能对任意形状给出中文诊断。
+      efftaskSkipSteps: z.unknown().optional(),
     })
     .passthrough(),
 )

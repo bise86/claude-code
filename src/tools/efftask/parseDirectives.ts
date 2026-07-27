@@ -2,13 +2,14 @@
 import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES, PHASE_LABEL } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
-import { applyRoleDefsToPhases, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
+import { applyRoleDefsToPhases, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
 
 export type ModelJsonFn = (prompt: string) => Promise<string>
 
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
+  "skipSteps": ["要整个跳过的环节名"],
   "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化" },
   "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }] }
 phaseRoles 的值是**员工名**数组(可派发的身份)。
@@ -16,6 +17,7 @@ phaseRoles 的值是**员工名**数组(可派发的身份)。
 - 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
 - 用户说**人数**(「至少 2 个人通过」「要 3 票」)→ caps.quorumSeats,就是那个人数。**不要**把人数写进 quorum:「至少 2 人」写成 quorum=2 的含义是 2%,等于 1 票就放行,和用户的意思正好相反。
 caps.maxSeatsPerPhase 是每个阶段最多几席。
+skipSteps:用户说「跳过X」「不做X」「X就不用了」时,把那个环节名放进来。没说就省略。
 caps.planConverge:分析环节多员工时怎么收敛 ——「各自出稿再融合」=圆桌,「一稿传下去改」=精化(默认)。
 roles 是**任务角色**定义 —— 指令里凡是描述了「某个角色在哪个阶段、产出什么、起什么作用、由谁担当」的,抽到这里。
 角色名可以任意(架构师、安全、前端);step 必须是那几个之一 —— 用户说的中文环节名对应关系:${PHASE_NAMES.map(x => `${PHASE_LABEL[x]}=${x}`).join('、')};staff 填员工名,没说由谁担当就省略。
@@ -118,6 +120,24 @@ export async function parseDirectives(
     base.notices.push(...trimNotices)
 
     base.phaseRoles[phase] = usable.map(name => ({ roleName: name }))
+  }
+
+  // 跳过的环节。归一到内部 phase 名,不认识的给 notice + 猜一个最接近的 —— 和角色定义
+  // 里 step 写错时同一套待遇。
+  if (Array.isArray(obj.skipSteps)) {
+    const kept: PhaseName[] = []
+    for (const raw of obj.skipSteps) {
+      const t = typeof raw === 'string' ? raw.trim() : ''
+      if (!t) continue
+      const v = STEP_ALIASES[t] ?? t
+      if ((PHASE_NAMES as string[]).includes(v)) { if (!kept.includes(v as PhaseName)) kept.push(v as PhaseName) }
+      else {
+        const legal = PHASE_NAMES.map(x => PHASE_LABEL[x]).join('/')
+        const guess = guessStep(t)
+        base.notices.push(`要跳过的环节「${t}」不是 ${legal} 之一,该环节会照常运行` + (guess ? `。是不是想写「${guess}」?` : ''))
+      }
+    }
+    if (kept.length > 0) base.skipSteps = kept
   }
 
   const caps = (obj.caps ?? {}) as Record<string, unknown>

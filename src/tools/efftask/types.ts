@@ -442,6 +442,16 @@ export interface EffTaskConfig {
    * 所以恢复路径必须**独立于 status 和节点状态**检查这个字段。
    */
   pendingHandoff?: PendingHandoff
+  /**
+   * 被整个跳过的环节。
+   *
+   * **跳过 ≠ 不配角色。** 0 席在七个环节里有五个的语义是「主模型顶上跑一次」
+   * (plan/review/execute/accept 各跑一次主模型,integrate 回落到 accept 席位),只有
+   * verify 和 observer 是真的不发生。所以跳过**绝不能**实现成「清空席位」—— 那是把用户
+   * 配的三席评审团换成主模型独审,比不跳过更糟,而关口会显示「验收: 主模型(…)」,
+   * 看起来像正常配置。跳过只能是各 step 里的显式早退分支。
+   */
+  skipSteps?: PhaseName[]
 }
 
 /** 待收口的集成分支快照(§8)。字段与 worktreePool.handoff() 的返回一致。 */

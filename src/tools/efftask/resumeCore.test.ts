@@ -918,3 +918,40 @@ describe('每个状态都要能真的从盘上恢复(不是同义反复)', () =>
     expect(`${st}:${nodes[0].status}`).toBe(`${st}:${st}`)
   })
 })
+
+describe('跳过的环节必须能从 run.md 读回', () => {
+  const md = (body: string) => `---\ngoalPrompt: g\n${body}---\n\n`
+
+  it('读回并归一', async () => {
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': md('skipSteps:\n  - review\n  - 观察\n') }), '/r')
+    expect(config.skipSteps).toEqual(['review', 'observer'])
+  })
+
+  it('手改 run.md 写了非法环节名 → 丢弃并说明它会照常运行', async () => {
+    // 只加读回不加校验的话,一个拼错的名字会静默变成「没跳过」—— 用户以为跳了,系统照跑。
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md('skipSteps:\n  - 安全审计\n') }), '/r')
+    expect(config.skipSteps).toBeUndefined()
+    expect(degraded.join('')).toContain('会照常运行')
+  })
+
+  it('老 run.md 没有这个键 → undefined,不报噪音', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': '---\ngoalPrompt: g\n---\n\n' }), '/r')
+    expect(config.skipSteps).toBeUndefined()
+    expect(degraded.filter(d => d.includes('跳过'))).toEqual([])
+  })
+
+  it('写进去 → 读回来(writeRunManifest 是白名单,漏了它恢复后跳过全失效)', async () => {
+    const files: Record<string, string> = {}
+    const fs2: FsLike = {
+      ...fsWith(files),
+      readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error('ENOENT'); return v },
+      writeFile: async (p: string, c: string) => { files[p] = c },
+    }
+    await writeRunManifest(fs2, '/r', {
+      goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
+      notices: [], skipSteps: ['review', 'accept'],
+    } as EffTaskConfig, [])
+    const { config } = await readRunManifest(fs2, '/r')
+    expect(config.skipSteps).toEqual(['review', 'accept'])
+  })
+})

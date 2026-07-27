@@ -684,6 +684,19 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
     }
   }
 
+  // 跳过的环节。手改 run.md 是一条绕开 parseDirectives 全部校验的路,所以归一和白名单
+  // 都要在这里重做一遍;不认识的项丢弃并记进 degraded,而不是让一个拼错的环节名静默
+  // 变成「没跳过」。
+  if (Array.isArray(fm.skipSteps)) {
+    const kept: PhaseName[] = []
+    for (const raw of fm.skipSteps) {
+      const v = typeof raw === 'string' ? (STEP_ALIASES[raw] ?? raw) : ''
+      if ((PHASE_NAMES as string[]).includes(v)) { if (!kept.includes(v as PhaseName)) kept.push(v as PhaseName) }
+      else degraded.push(`run.md 里的跳过环节「${String(raw)}」不是合法环节名,已忽略(该环节会照常运行)`)
+    }
+    if (kept.length > 0) base.skipSteps = kept
+  }
+
   base.notices = Array.isArray(fm.notices) ? fm.notices.filter((n): n is string => typeof n === 'string') : []
   if (typeof fm.mainModel === 'string') base.mainModel = fm.mainModel
   if (typeof fm.resumeGuidance === 'string') base.resumeGuidance = fm.resumeGuidance

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { collectRoleDefs } from './roleDefsFromSettings.js'
+import { collectRoleDefs, collectSkipSteps } from './roleDefsFromSettings.js'
 
 const KNOWN = new Set(['opus-架构', 'ds-安全', 'gpt-前端'])
 const arch = { name: '架构师', stage: 'review', output: '裁决与阻断项', purpose: '把关可维护性' }
@@ -121,5 +121,40 @@ describe('collectRoleDefs:员工侧也能声明自己担任哪些角色', () => 
     )
     expect(viaStaff.defs[0].staff).toEqual(['opus-架构'])
     expect(viaStaff.notices.join('\n')).toContain('CLI 模式')
+  })
+})
+
+describe('collectSkipSteps:配置文件里指定跳过的环节', () => {
+  const C = (bySource: Record<string, unknown>) =>
+    collectSkipSteps({ read: s => bySource[s] as { efftaskSkipSteps?: unknown } | undefined })
+
+  it('中文环节名归一到内部名', () => {
+    expect(C({ userSettings: { efftaskSkipSteps: ['质疑讨论', '观察'] } }).steps).toEqual(['review', 'observer'])
+  })
+
+  it('英文内部名也收', () => {
+    expect(C({ userSettings: { efftaskSkipSteps: ['review', 'verify'] } }).steps).toEqual(['review', 'verify'])
+  })
+
+  it('跨来源合并且去重', () => {
+    const r = C({ userSettings: { efftaskSkipSteps: ['质疑讨论'] }, projectSettings: { efftaskSkipSteps: ['质疑讨论', '验收'] } })
+    expect(r.steps).toEqual(['review', 'accept'])
+  })
+
+  it('写错的环节名 → 说清它会照常运行,并猜一个', () => {
+    // 静默忽略最糟:用户以为跳过了,系统照跑,他为此付了钱还不知道。
+    const n = C({ userSettings: { efftaskSkipSteps: ['测试'] } }).notices.join('\n')
+    expect(n).toContain('该环节会照常运行')
+    expect(n).toContain('是不是想写「测试验证」')
+  })
+
+  it('不是数组 → 说明,而不是让整份配置作废', () => {
+    const r = C({ userSettings: { efftaskSkipSteps: '质疑讨论' } })
+    expect(r.steps).toEqual([])
+    expect(r.notices.join('')).toContain('不是数组')
+  })
+
+  it('没配 → 空,不报噪音', () => {
+    expect(C({})).toEqual({ steps: [], notices: [] })
   })
 })
