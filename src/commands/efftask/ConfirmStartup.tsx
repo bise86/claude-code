@@ -64,7 +64,12 @@ export function ConfirmStartup(props: {
   const available = props.availableRoles ?? []
 
   const confirm = (): void =>
-    props.onDecision({ parallelism: parRef.current, approved: true, phaseRoles: rosterRef.current })
+    props.onDecision({
+      parallelism: parRef.current, approved: true, phaseRoles: rosterRef.current,
+      // 必须带上:编辑器承诺「勾选任一员工即恢复」,不带就是纯 no-op —— 用户勾完人,
+      // 界面上的「已跳过」标记消失了,run 照样跳过,那一席永远不会被派发。
+      skipSteps: skipRef.current,
+    })
 
   useInput((input, key) => {
     if (editingRef.current) {

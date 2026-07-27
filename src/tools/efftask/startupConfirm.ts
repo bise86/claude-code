@@ -14,6 +14,17 @@ export interface StartupDecision {
    */
   phaseRoles?: Record<PhaseName, RoleBinding[]>
   /**
+   * 名册编辑器里改过的「要跳过的环节」(spec §7.5)。
+   *
+   * 和 phaseRoles 同样是 OPTIONAL / 同样是「缺省 = 不变」:飞书卡上没有这个开关。
+   *
+   * 缺了这个字段的后果实测过:编辑器那一行写着「(已跳过,勾选任一员工即恢复)」,用户
+   * 勾了人,那一行的「已跳过」标记当场消失 —— 而决策 payload 里根本没有这个字段,run
+   * 照样整个跳过该环节,名册里坐着一个永远不会被派发的员工。同一个关口的两屏还互相
+   * 矛盾:编辑器说恢复了,退出编辑器后的只读名册说已跳过。
+   */
+  skipSteps?: PhaseName[]
+  /**
    * 仅查看后退出 (spec §17.3) — a THIRD answer at the resume gate, not a synonym for cancel.
    *
    * It was implemented as a synonym: `v` sent the byte-identical
@@ -188,6 +199,8 @@ export function applyStartupDecision(config: EffTaskConfig, decision: StartupDec
     // Absent means UNCHANGED, which is what a Feishu approval sends: that card has no channel
     // for a five-phase role table, so it must keep exactly the roster it displayed.
     phaseRoles: decision.phaseRoles ?? config.phaseRoles,
+    // 同样的「缺省 = 不变」语义:飞书那条路没有这个开关,不能把它当成「清空跳过」。
+    skipSteps: decision.skipSteps ?? config.skipSteps,
   }
 }
 

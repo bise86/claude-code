@@ -945,7 +945,11 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       lastChildren = parsed.children
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     }
-    if (!isSkipped(ctx, 'review')) {
+    if (isSkipped(ctx, 'review')) {
+      // 名册上还挂着评审员,记录却一片空白 —— 不写一行的话,这在 node.md 上读起来像
+      // 「跑了但记录丢了」。写「已跳过」是为了让这两件事在事后追责时分得开。
+      noteOnNode(node, '质疑讨论环节已跳过:本节点的方案没有经过任何评审')
+    } else {
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
       system: 'review', buildPrompt: (tag, seat) => reviewPrompt(node, tag, seatBrief(ctx, seat, 'review')), ctx,
@@ -1722,7 +1726,9 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // **三个调用点全部跳过**(主循环 + 人工解冲突后 + 自动解冲突后)。只跳主循环的话,
       // 验收会在「最该有人看」的冲突解决场景悄悄复活 —— 那是更坏的惊喜。
       //
-      // 不写 acceptLog:跳过 ≠ 通过。
+      // 不写 acceptLog:跳过 ≠ 通过。但要在 execStatus 上留一行,否则 node.md 是
+      // 「名册挂着 qa、验收记录空白、状态 ACCEPTED」—— 读起来像记录丢了,不像没跑过。
+      noteOnNode(node, '验收环节已跳过:本节点的产出未经任何人核对就合进集成分支')
       if (firstRole(node, 'observer') && !isSkipped(ctx, 'observer') && !(await commit(node, 'SCORING', ctx))) return
       if (await scoreNode(node, ctx)) {
         if (!(await commit(node, 'REWORK', ctx))) return

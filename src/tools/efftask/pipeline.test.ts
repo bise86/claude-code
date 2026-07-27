@@ -4,6 +4,7 @@ import { parseDirectives } from './parseDirectives.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap } from './stateMachine.js'
+import { serializeNode } from './persistence.js'
 import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, planPrompt, commitForTest } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
@@ -3871,5 +3872,46 @@ describe('跳过验收 × 合并冲突:三个调用点都不能谎报完成', ()
     await stepExecute(n, ctx)
     expect(escalations.length).toBeGreaterThan(0)
     expect(`本次尝试过自动解决: ${escalations[0].attempted}`).toBe('本次尝试过自动解决: true')
+  })
+})
+
+describe('跳过的环节要在 node.md 上留痕(不是留 PASS,是留「已跳过」)', () => {
+  // 「不写假 PASS」只做到了一半:名册上挂着评审员/验收员、记录一片空白、状态 ACCEPTED。
+  // 用户事后追责读到的是「跑了但记录丢了」,而不是「没跑」—— 正是这行注记要消除的歧义。
+  const mk2 = (skip: string[], pr: Record<string, { roleName: string }[]>) => {
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), ...pr } as typeof n.phaseRoles
+    return { n, ctx: (agent: RunAgentFn) => ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles, skipSteps: skip as never }) }
+  }
+  const ok2 = (req: { phase: string; prompt: string }) =>
+    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    : req.phase === 'execute' ? '```json\n{"execStatus":"做完了"}\n```'
+    : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+
+  it('跳过质疑讨论:reviewLog 仍是空的,但 execStatus 说清了没人评审', async () => {
+    const { n, ctx } = mk2(['review'], { review: [{ roleName: '架构师' }] })
+    await stepStart(n, ctx(async req => ok2(req)))
+    expect(n.reviewLog).toEqual([])                        // 不写假 PASS
+    expect(n.execStatus).toContain('质疑讨论环节已跳过')     // 但也不是一片空白
+    expect(n.execStatus).toContain('(注:')                  // 带编排器前缀,和执行者自述分得开
+  })
+
+  it('跳过验收:acceptLog 仍是空的,但 execStatus 说清了没人核对', async () => {
+    const { n, ctx } = mk2(['accept'], { accept: [{ roleName: 'qa' }] })
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    await stepExecute(n, ctx(async req => ok2(req)))
+    expect(n.acceptLog).toEqual([])
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.execStatus).toContain('验收环节已跳过')
+  })
+
+  it('这行注记真的会出现在 node.md 里 —— 内存里有、盘上没有等于没有', async () => {
+    const { n, ctx } = mk2(['review', 'accept'], { review: [{ roleName: '架构师' }], accept: [{ roleName: 'qa' }] })
+    await stepStart(n, ctx(async req => ok2(req)))
+    const md = serializeNode(n)
+    expect(md).toContain('质疑讨论环节已跳过')
+    // 名册上人还在,记录是空的 —— 这两件事同时出现时,必须有那行字解释。
+    expect(md).toContain('架构师')
   })
 })

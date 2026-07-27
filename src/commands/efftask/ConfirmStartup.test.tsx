@@ -14,6 +14,7 @@ import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { ConfirmStartup } from './ConfirmStartup.js'
+import { applyStartupDecision } from '../../tools/efftask/startupConfirm.js'
 import { DEFAULT_CAPS, emptyPhaseRoles } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 
@@ -411,5 +412,72 @@ describe('ConfirmStartup 要拦住跑不完的组合', () => {
     expect(f).toContain('跑不完')
     // 跳过是**生效了**的,不该出现在「你的请求中有以下部分不会生效」下面。
     expect(f).not.toContain('不会生效')
+  })
+})
+
+describe('两个块同时在场时不能串台', () => {
+  it('notices 块和跳过块各说各的', async () => {
+    // 上一条的 fixture 是 notices: [],于是 not.toContain('不会生效') 恒真 —— 把整个
+    // notices 块删掉都测不出来。这里给一条真的 notice,让两个块都真的画出来。
+    const { stdin, stdout, lastFrame } = fakeTty()
+    await render(
+      React.createElement(ConfirmStartup, {
+        config: {
+          ...config,
+          notices: ['验收:未找到员工「ghost」,改由主模型兼任'],
+          skipSteps: ['execute', 'plan'] as never,
+        },
+        onDecision: () => {},
+      }),
+      // biome-ignore lint/suspicious/noExplicitAny: fake TTY streams for a headless render
+      { stdin: stdin as any, stdout: stdout as any, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    const f = lastFrame()
+    expect(f).toContain('不会生效')       // notices 块真的在
+    expect(f).toContain('ghost')
+    expect(f).toContain('跑不完')          // 冲突块真的在
+    expect(f).toContain('连带后果')        // 连带后果块真的在
+    // 三个标题各自独立出现,内容不能挂错标题。
+    // 「不主动拆子任务」是跑得完的连带后果,不能出现在「跑不完」标题和「连带后果」标题之间。
+    expect(f.indexOf('任务树基本只有根节点')).toBeGreaterThan(f.indexOf('连带后果'))
+  })
+})
+
+describe('给被跳过的环节勾人,必须真的取消跳过', () => {
+  it('勾完人之后决策里不再含那个环节', async () => {
+    // 编辑器那一行写着「(已跳过,勾选任一员工即恢复)」。此前这句话是纯 no-op:
+    // setSkip 只改渲染,而 StartupDecision 里根本没有 skipSteps 字段,run 照样跳过,
+    // 名册里坐着一个永远不会被派发的员工 —— 正是那行代码注释说要防的东西。
+    const decisions: { skipSteps?: string[]; phaseRoles?: Record<string, unknown> }[] = []
+    const { stdin, stdout } = fakeTty()
+    await render(
+      React.createElement(ConfirmStartup, {
+        config: { ...config, phaseRoles: emptyPhaseRoles() as never, skipSteps: ['review'] as never },
+        availableRoles: ['alice'],
+        onDecision: (d: never) => decisions.push(d),
+      }),
+      // biome-ignore lint/suspicious/noExplicitAny: fake TTY streams for a headless render
+      { stdin: stdin as any, stdout: stdout as any, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    stdin.press('r')                                  // 进编辑器
+    await new Promise(r => setTimeout(r, 10))
+    stdin.press('j')                                  // 移到质疑讨论那一行
+    await new Promise(r => setTimeout(r, 10))
+    stdin.press(' ')                                  // 勾上 alice
+    await new Promise(r => setTimeout(r, 10))
+    stdin.press('\r')                                 // 确认
+    await new Promise(r => setTimeout(r, 20))
+
+    expect(decisions.length).toBe(1)
+    // **不能写 `?? []`**:缺省语义是「不变」——字段缺席时 run 照样跳过。写了默认值的话,
+    // 把 skipSteps 整个从 payload 里删掉这条也是绿的(实测过)。所以先断它在场,再断值。
+    expect(`决策里带 skipSteps: ${decisions[0].skipSteps !== undefined}`).toBe('决策里带 skipSteps: true')
+    expect(decisions[0].skipSteps).toEqual([])
+    // 再过一遍真正生效的那一层:applyStartupDecision 才是决定 run 用哪份 config 的地方。
+    const applied = applyStartupDecision({ ...config, skipSteps: ['review'] } as never, decisions[0] as never)
+    expect(applied.skipSteps).toEqual([])
+    expect(decisions[0].phaseRoles?.review).toEqual([{ roleName: 'alice' }])
   })
 })
