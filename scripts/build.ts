@@ -2,14 +2,18 @@
 /**
  * 打包 / 编译入口。
  *
- * **单文件编译目前是坏的,原因不在本仓库。** bun 1.3.14 的打包器会打散 zod v4 的循环
- * re-export —— 实测编出来的二进制 `--version` 正常,`--help` 直接
- * `ReferenceError: _uppercase2 is not defined`。把 zod 标成 external 打包就好了,但
- * `--compile` 不会把 external 模块嵌进单文件,于是二进制在没有 node_modules 的目录里
- * 报 `Cannot find module zod/v4`。1.3.14 已是当时最新版,没有升级可绕;换 zod 大版本
- * 的爆炸半径覆盖全仓库。所以发布走「打包产物 + 外部 zod」,不是单文件。
+ * **单文件编译是可用的**(四平台都产出可执行文件)。这一段记的是它曾经为什么不可用,
+ * 以及现在靠什么撑着 —— 拆掉那根撑杆就会原样复发。
  *
- * 复现:bun run scripts/build.ts --compile && ./dist/claude-haha --help
+ * bun 1.3.14 的打包器会打散 zod v4 的循环 re-export:实测编出来的二进制 `--version`
+ * 正常,`--help` 直接 `ReferenceError: _uppercase2 is not defined`。把 zod 标成
+ * external 能绕开,但 `--compile` 不会把 external 模块嵌进单文件,于是二进制在没有
+ * node_modules 的目录里报 `Cannot find module zod/v4`——等于没解决。
+ *
+ * 现在的解法是**预先把 zod 压平成一个文件**(scripts/vendor-zod.ts → vendor/zod-v4.js,
+ * 已提交进仓库),主构建用下面的 zodAlias 插件指向那一份,绕开出问题的那条 codegen 路径。
+ *
+ * 复现原问题:删掉 zodAlias,然后 bun run scripts/build.ts --compile && ./dist/claude-haha --help
  *
  * 两种产物:
  *   bun run scripts/build.ts            → dist/cli.js(需要目标机器有 bun/node)
@@ -24,6 +28,7 @@
  * **完全一致** —— 那些模块今天也是缺的。
  */
 import { rm, mkdir } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 
 /** 可选的第三方模块:装了就用,没装走降级。 */
 const OPTIONAL_PACKAGES = [
@@ -124,7 +129,12 @@ const zodAlias = {
     // 再指向那一份,就绕开了出问题的那条 codegen 路径。
     //
     // vendor/zod-v4.js 由 scripts/vendor-zod.ts 生成,已提交进仓库。
-    const flat = new URL('../vendor/zod-v4.js', import.meta.url).pathname
+    //
+    // **必须 fileURLToPath,不能用 .pathname。** 在 Windows 上 file URL 的 pathname 是
+    // `/D:/a/claude-code/vendor/zod-v4.js` —— 盘符前面多一个斜杠,bun 拿去读就是
+    // `EINVAL reading file`,四平台里只有 windows-x64 那一条挂掉。POSIX 上两者恰好
+    // 相同,所以本机怎么跑都发现不了。
+    const flat = fileURLToPath(new URL('../vendor/zod-v4.js', import.meta.url))
     build.onResolve({ filter: /^zod(\/v4)?$/ }, () => ({ path: flat }))
   },
 }
