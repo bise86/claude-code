@@ -73,10 +73,16 @@ export function ConfirmResume(props: {
   const [editing, setEditing, editingRef] = useLiveState(false)
   const [phaseIdx, setPhaseIdx, phaseRef] = useLiveState(0)
   const [roleIdx, setRoleIdx, roleRef] = useLiveState(0)
+  // 续跑关口此前完全没有这个状态,于是编辑器里被跳过的环节既不标记、也撤不掉:
+  // 只读名册说「验收:(已跳过 —— 没人核对验收点…)」,按 r 进去那一行却写着
+  // 「验收(主模型):[ ]alice」—— 同一个关口的两屏自相矛盾,而且后一屏承诺了
+  // 一件不会发生的事(该环节一次调用都没有)。勾完人确认,席位进了 run.md,
+  // skipSteps 原样保留,那一席永远不会被派发 —— 「配得进去、永远不生效」。
+  const [skip, setSkip, skipRef] = useLiveState<PhaseName[]>(props.config.skipSteps ?? [])
   const available = props.availableRoles ?? []
 
   const decide = (d: Partial<StartupDecision> & { approved: boolean }): void =>
-    props.onDecision({ parallelism: parRef.current, phaseRoles: rosterRef.current, ...d })
+    props.onDecision({ parallelism: parRef.current, phaseRoles: rosterRef.current, skipSteps: skipRef.current, ...d })
 
   useInput((input, key) => {
     const k = input.toLowerCase()
@@ -91,6 +97,9 @@ export function ConfirmResume(props: {
         if (key.rightArrow || k === 'l') { setRoleIdx((roleRef.current + 1) % available.length); return }
         if (input === ' ') {
           const name = available[roleRef.current]
+          // 给一个被跳过的环节勾人 = 取消它的跳过,和启动关口同一条规则。
+          const ph = PHASE_NAMES[phaseRef.current]
+          if (skipRef.current.includes(ph)) setSkip(skipRef.current.filter(x => x !== ph))
           setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name), props.config.caps.maxSeatsPerPhase))
           props.onEdited?.()
           return
@@ -109,7 +118,7 @@ export function ConfirmResume(props: {
   const sections = resumeSummarySections(props.summary)
   // What the roster lines describe must be the EDITED roster, not what came off disk —
   // otherwise the gate shows one panel and resumes with another.
-  const shown: EffTaskConfig = { ...props.config, phaseRoles: roster }
+  const shown: EffTaskConfig = { ...props.config, phaseRoles: roster, skipSteps: skip }
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 恢复确认</Text>
@@ -117,7 +126,7 @@ export function ConfirmResume(props: {
       <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: props.isolation })}</Text>
       <Text bold>角色名册{editing ? '(编辑中)' : ''}:</Text>
       {editing
-        ? rosterEditorLines(roster, available, phaseIdx, roleIdx).map((line, i) => (
+        ? rosterEditorLines(roster, available, phaseIdx, roleIdx, undefined, skipRef.current).map((line, i) => (
           <Text key={`ed-${i}`}>{'  '}{line}</Text>
         ))
         : rosterLines(shown).map(line => <Text key={line}>  {line}</Text>)}

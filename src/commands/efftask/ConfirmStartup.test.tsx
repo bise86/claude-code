@@ -14,7 +14,7 @@ import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { ConfirmStartup } from './ConfirmStartup.js'
-import { applyStartupDecision } from '../../tools/efftask/startupConfirm.js'
+import { applyStartupDecision, costLine } from '../../tools/efftask/startupConfirm.js'
 import { DEFAULT_CAPS, emptyPhaseRoles } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 
@@ -50,7 +50,10 @@ function fakeTty() {
   // The renderer positions text with cursor-move escapes rather than spaces, so raw frames
   // read as "把[1CREADME". Strip control sequences before asserting on content.
   const plain = (): string => frame.replace(/\[[0-9;>?]*[a-zA-Z]/g, ' ')
-  return { stdin, stdout, lastFrame: plain }
+  // 帧缓冲是**累加**的:所有 write 拼在一起。断言「屏幕上没有 X」之前必须先清空,
+  // 否则编辑前那一帧里的 X 会一直满足 includes,而你以为自己在看最新一帧。
+  const reset = (): void => { frame = '' }
+  return { stdin, stdout, lastFrame: plain, reset }
 }
 
 describe('ConfirmStartup (vendored renderer)', () => {
@@ -95,7 +98,7 @@ describe('启动关口的角色名册真的能改 (spec §2 第一关)', () => {
     phaseRoles: { plan: [], review: [], execute: [], accept: [], observer: [] },
   })
   const mount2 = async (over: Record<string, unknown> = {}) => {
-    const { stdin, stdout, lastFrame } = fakeTty()
+    const { stdin, stdout, lastFrame, reset } = fakeTty()
     const decisions: { parallelism: number; approved: boolean; phaseRoles?: Record<string, { roleName: string }[]> }[] = []
     const app = await render(
       React.createElement(ConfirmStartup as never, {
@@ -105,7 +108,7 @@ describe('启动关口的角色名册真的能改 (spec §2 第一关)', () => {
       { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
     )
     await new Promise(r => setTimeout(r, 20))
-    return { stdin, lastFrame, decisions, app }
+    return { stdin, lastFrame, decisions, app, reset }
   }
   const press = async (m: { stdin: { press: (s: string) => void } }, s: string) => {
     m.stdin.press(s); await new Promise(r => setTimeout(r, 20))
@@ -454,7 +457,7 @@ describe('给被跳过的环节勾人,必须真的取消跳过', () => {
     await render(
       React.createElement(ConfirmStartup, {
         config: { ...config, phaseRoles: emptyPhaseRoles() as never, skipSteps: ['review'] as never },
-        availableRoles: ['alice'],
+        availableRoles: ['alice', 'bob'],
         onDecision: (d: never) => decisions.push(d),
       }),
       // biome-ignore lint/suspicious/noExplicitAny: fake TTY streams for a headless render
@@ -480,4 +483,64 @@ describe('给被跳过的环节勾人,必须真的取消跳过', () => {
     expect(applied.skipSteps).toEqual([])
     expect(decisions[0].phaseRoles?.review).toEqual([{ roleName: 'alice' }])
   })
+})
+
+describe('关口显示的必须是**编辑后**的状态,不是传进来的那份', () => {
+  // 这是最危险的那一种失真:用户读着「本次不会产生任何提交」按下 y,而送出去的决策里
+  // skipSteps 是空的 —— 代码照改照合进集成分支。他批准的是另一件事。
+  //
+  // 断言用**正向**形式:「编辑后的那个数在屏幕上出现过」。渲染器是局部重绘,清空帧缓冲
+  // 之后只会写变化的那几行,成本行不在其中 —— 所以「屏幕上没有旧值」这种负向断言在这个
+  // 接缝上根本测不了(实测清帧后整帧只剩名册和快捷键两行)。而正向断言是可靠的:
+  // 组件若用的是 props.config,新值一次都不会被渲染出来。
+  const mountSkip = async (over: Record<string, unknown>) => {
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const decisions: { skipSteps?: string[]; phaseRoles?: Record<string, unknown> }[] = []
+    const app = await render(
+      React.createElement(ConfirmStartup as never, {
+        config: { ...config, phaseRoles: emptyPhaseRoles(), ...over },
+        availableRoles: ['alice', 'bob'],
+        onDecision: (d: never) => decisions.push(d),
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    return { stdin, lastFrame, decisions, app }
+  }
+  const press = async (m: { stdin: { press: (s: string) => void } }, k: string) => {
+    m.stdin.press(k); await new Promise(r => setTimeout(r, 30))
+  }
+  const DOWN = String.fromCharCode(27) + '[B'
+  const ESC = String.fromCharCode(27)
+  const costNum = (cfg: unknown) => costLine(cfg as never).match(/预估上限\s*(\d+)/)?.[1]
+  // 渲染器用光标移动指令定位,数字在帧里会被拆开(「33 00」这种)。比数之前先把空白
+  // 全挤掉,否则这条断言测的是渲染器的排版,而不是组件用了哪一份 config。
+  const squash = (f: string) => f.replace(/\s+/g, '')
+
+  it('给被跳过的「执行」勾人之后,屏幕上要出现取消跳过后的成本', async () => {
+    const m = await mountSkip({ skipSteps: ['execute'] })
+    const skippedCost = costNum({ ...config, phaseRoles: emptyPhaseRoles(), skipSteps: ['execute'] })
+    await press(m, 'r')
+    for (let i2 = 0; i2 < 2; i2++) await press(m, DOWN)   // plan → review → execute
+    await press(m, ' ')                                    // 勾 alice = 取消跳过
+    await press(m, ESC)
+    await new Promise(r => setTimeout(r, 250))
+    await press(m, '\r')
+    const d = m.decisions[0]
+    expect(d.skipSteps).toEqual([])
+    // 取消跳过之后该显示的那个数 —— 用真实函数按真实决策算出来,不硬编码。
+    const unskippedCost = costNum({ ...config, phaseRoles: d.phaseRoles, skipSteps: d.skipSteps })
+    expect(`跳过前后成本一样(说明这个用例没测到东西): ${skippedCost === unskippedCost}`)
+      .toBe('跳过前后成本一样(说明这个用例没测到东西): false')
+    expect(`屏幕上出现过取消跳过后的成本 ${unskippedCost}: ${squash(m.lastFrame()).includes(String(unskippedCost))}`)
+      .toBe(`屏幕上出现过取消跳过后的成本 ${unskippedCost}: true`)
+    m.app.unmount()
+  })
+
+  it('没动过的时候照常显示后果 —— 排除「这几句永远不显示」', async () => {
+    const m = await mountSkip({ skipSteps: ['execute'] })
+    expect(m.lastFrame()).toContain('本次不会产生任何提交')
+    m.app.unmount()
+  })
+
 })

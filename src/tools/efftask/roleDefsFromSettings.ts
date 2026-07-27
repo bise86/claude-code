@@ -128,3 +128,23 @@ export function collectSkipSteps(opts?: {
   }
   return { steps, notices }
 }
+
+/**
+ * 两条录入口的跳过环节怎么合。
+ *
+ * **并集,不是覆盖。** 配置文件说「一直跳质疑讨论」、提示词说「这次也跳验收」,两句都
+ * 该生效。角色定义那边是覆盖语义(提示词点名了就换人),因为「谁来干」是单选;跳过是
+ * 「干不干」的开关,叠加才符合两句话都说过的直觉。
+ *
+ * 抽成函数而不是在组件里内联,是因为组件那一层的测试驱动不了抽取模型:内联的话这条
+ * 语义就只能靠「读源码」来验,而读源码的闸门在这个项目里已经放过一次死代码了。
+ *
+ * 想在某一次 run 里**取消**配置文件里的跳过,走关口的名册编辑器(给那个环节勾一个员工),
+ * 提示词做不到 —— 并集没有减法。
+ */
+export function mergeSkipSteps(fromSettings: PhaseName[], fromPrompt: PhaseName[] | undefined): PhaseName[] | undefined {
+  const all = [...new Set([...fromSettings, ...(fromPrompt ?? [])])]
+  // 一个都没有时返回 undefined 而不是 []:下游用 `?? []` 判缺省,空数组会让
+  // 「没说过跳过」和「说了但一个都不合法」在 run.md 上长得不一样。
+  return all.length > 0 ? all : undefined
+}

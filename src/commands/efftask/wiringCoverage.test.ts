@@ -231,3 +231,21 @@ describe('环节跳过的接线', () => {
     expect(GATE_SRC).toContain('if (skipRef.current.includes(ph)) setSkip(skipRef.current.filter(x => x !== ph))')
   })
 })
+
+describe('组件里不许出现只存在于 call() 作用域的绑定', () => {
+  it('EffTaskRunner 内部的 effRoot 一律是 props.effRoot', () => {
+    // `const effRoot` 声明在 call() 里(:134),组件里没有这个绑定。裸写它有两种死法:
+    //  - 写在依赖数组里 → 依赖数组每次 render 都求值 → 第一次渲染就抛 ReferenceError,
+    //    /et 输入任何内容都只得到一屏堆栈,一次模型调用都没有;
+    //  - 写在 try/catch 里 → **静默失败**:收口明明成功了,pendingHandoff 却永远划不掉,
+    //    下次 --resume 会为一条已经合并/推送/删掉的分支再弹一次四选一。
+    // 两种都发生过,而且第二种在全量测试下完全无声。这条闸门查的是词法作用域本身,
+    // 比逐个补行为测试更贴近真正的失败原因。
+    const body = SRC.slice(SRC.indexOf('function EffTaskRunner(props: RunnerProps)'))
+    const bare = body.split('\n')
+      .map((l, i) => ({ n: i, l }))
+      .filter(({ l }) => /(?<!props\.)(?<!\.)\beffRoot\b/.test(l) && !l.trimStart().startsWith('//'))
+    expect(`组件里裸写 effRoot 的行: ${bare.map(b => b.l.trim()).join(' | ') || '无'}`)
+      .toBe('组件里裸写 effRoot 的行: 无')
+  })
+})

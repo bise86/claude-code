@@ -421,8 +421,16 @@ export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feed
     // The depth budget lives IN THE PROMPT so the model self-limits, instead of us
     // silently discarding the children it asked for once it hits the cap.
     `当前深度 ${node.depth}/上限 ${caps.maxDepth};已达上限时必须返回 kind=executable,不得再拆分。\n` +
+    // `alternatives` 必须剥掉。它存的是圆桌落选稿的 `{staff: 真名, solution: 正文}`,
+    // 而这一段在返工时喂给**每一位**起草者(以及融合者 —— 而融合者本人就是作者之一)。
+    // 不剥的话,第二轮起两条写进 README 的承诺当场作废:
+    //   - 「拿到的是匿名化的稿 A / 稿 B / 稿 C,看不到谁写的」→ 带着真名回来了
+    //   - 「每一位独立起草,互相看不到」→ 第二轮每人都逐字读到了别人第一轮的稿
+    // 而且这是个**具名**的锚,比顺序精化那种匿名锚更糟 —— 圆桌存在的全部理由就是去掉锚。
+    // 融合那一处早就剥了(见 fusePrompt 的 `alternatives: undefined`),这一处漏了。
+    // 顺带:不剥的话每轮还要多背 ALT_SOLUTION_CHARS(1500)× N 的提示词。
     (feedback
-      ? `上一版方案(就是它需要被修订):\n${quote(JSON.stringify(node.plan))}\n上一轮评审阻断意见,请针对性修订:\n${quote(feedback)}\n`
+      ? `上一版方案(就是它需要被修订):\n${quote(JSON.stringify({ ...node.plan, alternatives: undefined }))}\n上一轮评审阻断意见,请针对性修订:\n${quote(feedback)}\n`
       : '') +
     // spec §16 names worktree merge conflict as the run's BIGGEST risk, and names exactly one
     // mitigation for it: 「鼓励 plan 阶段以依赖边串联可能冲突的节点」. That instruction reached
@@ -1151,6 +1159,12 @@ function scorePrompt(node: TaskNode, tag: string, brief = ''): string {
 async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
   const seats = node.phaseRoles.observer ?? []
   // 跳过与「没配席位」在这两个环节上等价 —— 它们本来就是 opt-in。
+  // 但**配了席位再跳**要留痕:名册上挂着 watcher、评分一片空白、没有任何解释,和跳过
+  // 质疑讨论时是同一种歧义。没配席位就不写 —— 那本来就不算「跳过了」。
+  if (seats.length > 0 && isSkipped(ctx, 'observer')) {
+    noteOnNode(node, '观察环节已跳过:本节点没有评分,低分返工不会发生')
+    return false
+  }
   if (seats.length === 0 || isSkipped(ctx, 'observer')) return false // opt-in: no observer, no scoring, no fallback to the main model
   const tag = answerTag(ANSWER_TAGS.score)
   // 每个席位独立打分,并行 —— 和圆桌同构。取最低分收敛成一个结论(显示宽容的那个数会
@@ -1622,7 +1636,13 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       if (!(await commit(node, 'REWORK', ctx))) return
       continue
     }
-    node.execStatus = reported
+    // 执行者的自述覆盖**上一轮的自述**,但不能连编排器注记一起冲掉。那些注记记的是
+    // 「这个环节整个没跑过」这类事实(跳过分析/质疑讨论都写在 stepStart 里),被这一行
+    // 覆盖之后 node.md 上就只剩「名册挂着评审员、评审记录一片空白、没有任何解释」——
+    // 正是注记要消除的那种歧义。实测:跳过质疑讨论的 executable 节点走完 stepExecute
+    // 后,node.md 里搜不到「质疑讨论环节已跳过」。
+    const keptNotes = node.execStatus.split('\n').filter(l => l.startsWith(ORCHESTRATOR_NOTE))
+    node.execStatus = [reported, ...keptNotes].join('\n')
 
     // 动态生长(spec §4):honoured AFTER the empty-report gate, so a reply that grafts nodes
     // but evidences no work still counts as an empty round rather than buying a free pass.
@@ -1665,6 +1685,11 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // 它和执行是不同的动机:执行者有动机说「做完了」;它和验收是不同的证据:验收判
     // 「达没达成验收点」读的是产出描述,测试验证判「跑起来对不对」要真的执行命令。
     // 没有这一步,验收员只能给执行者的散文盖章。
+    // 配了席位却被跳过时要留痕 —— 名册上挂着 tester、验证记录空白、没有解释,
+    // 和跳过质疑讨论时是同一种歧义。没配席位就不写:那本来就是 opt-in,不算「跳过了」。
+    if ((node.phaseRoles.verify ?? []).length > 0 && isSkipped(ctx, 'verify')) {
+      noteOnNode(node, '测试验证环节已跳过:没有实跑过任何测试')
+    }
     if ((node.phaseRoles.verify ?? []).length > 0 && !isSkipped(ctx, 'verify')) {
       if (!(await commit(node, 'VERIFYING', ctx))) return
       // 验证者**不该改代码**,而工具清单挡不住这件事:Bash 本身就能写(echo >、sed -i、

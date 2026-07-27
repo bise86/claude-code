@@ -7,7 +7,7 @@ import type { LocalJSXCommandCall } from '../../types/command.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from '../../Tool.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
-import { collectRoleDefs, collectSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
+import { collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
 import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
@@ -726,7 +726,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 验收」,两句都该生效。角色定义那边是覆盖语义(提示词点名了就换人),因为那是
         // 「谁来干」的单选;跳过是「干不干」的开关,叠加才符合两句话都说过的直觉。
         if (baseSkipSteps && baseSkipSteps.length > 0) {
-          cfg.skipSteps = [...new Set([...baseSkipSteps, ...(cfg.skipSteps ?? [])])]
+          cfg.skipSteps = mergeSkipSteps(baseSkipSteps, cfg.skipSteps)
         }
         setConfig(annotateRoleModels(cfg, agentModels, mainModel))
         setPhase('confirm')
@@ -872,11 +872,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // 只有真的成功了才划掉。失败(冲突、脏树、推不上去)必须让它留着,用户下次还能回来 ——
     // 而且关口刚刚已经如实告诉他失败了什么。
     if (result.ok) {
+      // props.effRoot,不是裸 effRoot —— 那个绑定只存在于 call() 的作用域。这三行躲在
+      // try/catch 后面,所以裸写它是**静默失败**:收口明明成功了,pendingHandoff 却永远
+      // 划不掉,下次 --resume 会为一条已经合并/推送/删掉的分支再弹一次四选一,而「丢弃」
+      // 那一项会对着一条不存在的分支报错。
       try {
-        const { config: cur } = await readRunManifest(props.fs, `${effRoot}/${runId}`)
-        const { nodes } = await loadRun(props.fs, `${effRoot}/${runId}`)
+        const runDir = `${props.effRoot}/${runId}`
+        const { config: cur } = await readRunManifest(props.fs, runDir)
+        const { nodes } = await loadRun(props.fs, runDir)
         const cleared = { ...cur, pendingHandoff: undefined }
-        await writeRunManifest(props.fs, `${effRoot}/${runId}`, cleared, nodes)
+        await writeRunManifest(props.fs, runDir, cleared, nodes)
       } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
     }
     setHandoffResult(result)

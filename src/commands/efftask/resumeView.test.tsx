@@ -439,7 +439,8 @@ describe('ConfirmResume (vendored renderer)', () => {
     expect(f).toContain('回车/y 继续执行')
     stdin.press('\r')
     await tick()
-    expect(decisions).toEqual([{ parallelism: 3, approved: true, phaseRoles: emptyPhaseRoles() }])
+    // skipSteps 现在也随决策一起送 —— 续跑关口的编辑器也能取消跳过了。
+    expect(decisions).toEqual([{ parallelism: 3, approved: true, phaseRoles: emptyPhaseRoles(), skipSteps: [] }])
     app.unmount()
   })
 
@@ -456,7 +457,7 @@ describe('ConfirmResume (vendored renderer)', () => {
     await tick()
     stdin.press('v')
     await tick()
-    expect(decisions).toEqual([{ parallelism: 3, approved: false, viewOnly: true, phaseRoles: emptyPhaseRoles() }])
+    expect(decisions).toEqual([{ parallelism: 3, approved: false, viewOnly: true, phaseRoles: emptyPhaseRoles(), skipSteps: [] }])
     app.unmount()
   })
 

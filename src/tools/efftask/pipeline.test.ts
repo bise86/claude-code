@@ -3855,6 +3855,27 @@ describe('跳过验收 × 合并冲突:三个调用点都不能谎报完成', ()
     return { n }
   }
 
+  it('冲突 + 跳过验收:自动解冲突之后**不能**把验收复活', async () => {
+    // 第三个调用点此前无人守:短路掉它,全量 1427 条一条不红。现有三条冲突用例断的
+    // status/childIds/attempted 在「验收复活并判通过」时**取值完全相同** —— 语义空操作
+    // 把缺陷盖住了。用户明确说了不要验收,自动解完冲突却会悄悄开一场验收圆桌并写一条
+    // acceptLog。这里直接断调用序列和日志长度。
+    const seen: string[] = []
+    const n = root()
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: 'qa' }] } as typeof n.phaseRoles
+    const ctx = {
+      ...ctxFor([n], async (req: { phase: string; prompt: string }) => { seen.push(req.phase); return growAgent(req) },
+        { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['accept'] as never }),
+      worktrees: pool() as never,
+    }
+    await stepExecute(n, ctx)
+    expect(`accept 被调用: ${seen.includes('accept')} / acceptLog: ${n.acceptLog.length}`)
+      .toBe('accept 被调用: false / acceptLog: 0')
+    expect(n.execStatus).toContain('自动解决冲突后的复验已跳过')
+  })
+
   it('冲突 + 跳过验收:长出来的子任务不会被静默丢弃', async () => {
     const { n } = await run(['accept'])
     // 拍死 ACCEPTED 的话:父进终态、子停在 CREATED,调度器再也不会看它一眼。
@@ -4045,5 +4066,111 @@ describe('圆桌只剩一份稿,和注记不许重复', () => {
     }, { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['plan'] as never }))
     const hits = n.execStatus.split('分析环节已跳过').length - 1
     expect(`「分析环节已跳过」出现次数: ${hits}`).toBe('「分析环节已跳过」出现次数: 1')
+  })
+})
+
+describe('跳过的注记必须挺过整条链路,而不是只活到 stepStart', () => {
+  // 复验实测:注记写在 stepStart,而 stepExecute 拿到执行者报告后是**赋值**不是追加,
+  // 于是 executable 节点走完 stepExecute,node.md 里就搜不到「质疑讨论环节已跳过」了 ——
+  // 用户看到的仍然是「名册挂着架构师、评审记录空白、没有任何解释」。
+  // 上一版测试之所以全绿,是因为它只跑到 stepStart 就 serializeNode。
+  const full = async (skip: string[], pr: Record<string, { roleName: string }[]>) => {
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), ...pr } as typeof n.phaseRoles
+    const ctx = ctxFor([n], async (req: { phase: string; prompt: string }) =>
+      req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      : req.phase === 'execute' ? '```json\n{"execStatus":"我改了 src/a.ts"}\n```'
+      : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```',
+      { ...cfg, phaseRoles: n.phaseRoles, skipSteps: skip as never })
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    return n
+  }
+
+  it('跳过质疑讨论:执行者的自述覆盖不掉那行注记', async () => {
+    const n = await full(['review'], { review: [{ roleName: '架构师' }] })
+    expect(n.execStatus).toContain('我改了 src/a.ts')          // 执行者说的还在
+    expect(n.execStatus).toContain('质疑讨论环节已跳过')        // 编排器说的也还在
+    expect(serializeNode(n)).toContain('质疑讨论环节已跳过')    // 盘上也还在
+  })
+
+  it('跳过分析同理', async () => {
+    const n = await full(['plan'], {})
+    expect(n.execStatus).toContain('分析环节已跳过')
+    expect(serializeNode(n)).toContain('分析环节已跳过')
+  })
+
+  it('配了席位再跳测试验证 / 观察,node.md 上也要有交代', async () => {
+    // 这两个环节是 opt-in:没配席位不算跳过,不写;配了再跳就是真砍掉了调用,要写。
+    const n = await full(['verify', 'observer'], {
+      verify: [{ roleName: 'tester' }], observer: [{ roleName: 'watcher' }],
+    })
+    const md = serializeNode(n)
+    expect(md).toContain('测试验证环节已跳过')
+    expect(md).toContain('观察环节已跳过')
+  })
+
+  it('没配席位时不写 —— opt-in 的环节本来就不算「跳过了」', async () => {
+    const n = await full(['verify', 'observer'], {})
+    expect(n.execStatus).not.toContain('测试验证环节已跳过')
+    expect(n.execStatus).not.toContain('观察环节已跳过')
+  })
+
+  it('执行者的自述仍然会覆盖上一轮的自述 —— 去重不能变成只追加', async () => {
+    // 保留注记不等于「execStatus 只进不出」。上一轮的执行自述必须被这一轮替换掉,
+    // 否则返工几轮之后 node.md 上是几份互相矛盾的自述叠在一起。
+    const n = root()
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: 'qa' }] } as typeof n.phaseRoles
+    let round = 0
+    await stepExecute(n, ctxFor([n], async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'execute') { round++; return `\`\`\`json\n{"execStatus":"第 ${round} 轮的自述"}\n\`\`\`` }
+      return vtag(req) + `\n{"pass":${round >= 2},"blocking":${round >= 2 ? '[]' : '["再改"]'},"comments":"c"}\n` + '```'
+    }, { ...cfg, phaseRoles: n.phaseRoles }))
+    expect(n.execStatus).toContain('第 2 轮的自述')
+    expect(n.execStatus).not.toContain('第 1 轮的自述')
+  })
+})
+
+describe('圆桌的匿名与独立必须挺过返工轮', () => {
+  it('第二轮的提示词里不能带回第一轮落选稿的作者名和正文', async () => {
+    // planPrompt 把 node.plan 整个 JSON 塞进「上一版方案」,而 node.plan.alternatives
+    // 存的是 {staff: 真名, solution: 正文}。于是从第二轮起:
+    //   - 「拿到的是匿名化的稿 A/B/C,看不到谁写的」→ 带着真名回来了
+    //   - 「每一位独立起草,互相看不到」→ 每人都逐字读到了别人第一轮的稿
+    // 而且这是个**具名**的锚 —— 圆桌存在的全部理由就是去掉锚。现有的匿名测试只跑第一轮,
+    // 结构上看不见这个泄漏。
+    //
+    // 稿子正文里**不能**嵌作者名,否则断言测的是 fixture 不是行为:第二轮的融合提示词
+    // 本来就该带着第二轮的稿,正文里有名字就会误判成泄漏。
+    const prompts: string[] = []
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: [{ roleName: '甲员工' }, { roleName: '乙员工' }] } as typeof n.phaseRoles
+    let planCall = 0
+    let reviewed = 0
+    await stepStart(n, ctxFor([n], async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') {
+        prompts.push(req.prompt)
+        planCall++
+        // 第一轮:两份稿 R1A / R1B,再融合成 FUSED1。第二轮换一批标记。
+        const mark = planCall === 1 ? 'R1A' : planCall === 2 ? 'R1B' : planCall === 3 ? 'FUSED1' : 'R2-' + planCall
+        return '\`\`\`json\n{"kind":"executable","solution":"方案正文-' + mark + '","keyPoints":"k","risks":"r","acceptance":"a"}\n\`\`\`'
+      }
+      reviewed++
+      return vtag(req) + `\n{"pass":${reviewed >= 2},"blocking":${reviewed >= 2 ? '[]' : '["验收点写得不够具体"]'},"comments":"c"}\n` + '\`\`\`'
+    }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
+
+    const round2 = prompts.slice(3)   // 第一轮 = 2 份稿 + 1 次融合
+    expect(round2.length).toBeGreaterThan(0)
+    for (const q of round2) {
+      expect(`第二轮提示词里出现作者真名: ${q.includes('甲员工') || q.includes('乙员工')}`)
+        .toBe('第二轮提示词里出现作者真名: false')
+      // 第一轮的**落选稿**正文不能回来。融合稿(FUSED1)作为「上一版方案」出现是应该的。
+      expect(`第二轮提示词里出现第一轮落选稿正文: ${q.includes('R1A') || q.includes('R1B')}`)
+        .toBe('第二轮提示词里出现第一轮落选稿正文: false')
+    }
+    // 落选稿本身没有被删掉 —— 只是不再喂回提示词。
+    expect(n.plan.alternatives?.length).toBeGreaterThan(0)
   })
 })

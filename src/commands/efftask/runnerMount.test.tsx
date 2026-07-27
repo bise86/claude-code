@@ -48,6 +48,9 @@ mock.module('../../utils/cwd.js', () => ({ ...realCwd, getCwd: () => TMP }))
 const { render } = await import('../../ink.js')
 const { call } = await import('./efftask.js')
 const { AppStateProvider } = await import('../../state/AppState.js')
+const { applyStartupDecision } = await import('../../tools/efftask/startupConfirm.js')
+const { DEFAULT_CAPS, emptyPhaseRoles } = await import('../../tools/efftask/types.js')
+const baseConfig = { goalPrompt: 'g', parallelism: 3, notices: [], caps: { ...DEFAULT_CAPS }, phaseRoles: emptyPhaseRoles() }
 
 function fakeTty() {
   let pending: string | null = null
@@ -156,3 +159,16 @@ describe('跳过分析:run 必须真的启动', () => {
 })
 
 afterAll(() => { rmSync(TMP, { recursive: true, force: true }) })
+
+describe('飞书批准不能被当成「清空跳过」', () => {
+  it('payload 里没有 skipSteps 时,config 里的跳过原样保留', async () => {
+    // applyStartupDecision 的 `?? config.skipSteps` 语义是「缺省 = 不变」。写成 `?? []`
+    // 的话,从飞书批准会静默取消用户在 settings.json 里配的全部跳过 —— 而卡片上根本
+    // 没有这个开关,他也无从知道自己按了什么。
+    const applied = applyStartupDecision(
+      { ...baseConfig, skipSteps: ['review'] } as never,
+      { parallelism: 3, approved: true } as never,   // 飞书卡的 payload 形状
+    )
+    expect(applied.skipSteps).toEqual(['review'])
+  })
+})

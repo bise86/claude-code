@@ -111,7 +111,17 @@ export function ConfirmStartup(props: {
 
   // What the roster lines describe must be the EDITED roster, not the incoming config —
   // otherwise the gate shows one panel and starts another.
-  const shown: EffTaskConfig = { ...props.config, phaseRoles: roster }
+  //
+  // **skipSteps 必须一起带上,而且下面每一个块都要用 shown。** 只带 phaseRoles 时,
+  // 用户在编辑器里给「执行」勾了个人(那一行明写着「勾选任一员工即恢复」),退出编辑,
+  // 屏幕上仍然写着「执行:(已跳过 —— 没有人改代码,本次不会产生任何提交)」和一条
+  // 「跳过了执行但没跳验收」的红字,而**送出去的决策里 skipSteps 是空的**:他按 y 时
+  // 相信不会有任何提交,实际代码照改照合。这是这个关口存在要防的失真本身,而且落在
+  // 更糟的那个方向。
+  //
+  // 同样的道理,成本行也必须用 shown:在编辑器里加三个验收席位后,屏幕上的
+  // 「预估上限」纹丝不动(实测 2400,真值 4200)—— spec §7.2 点名说低估比高估糟。
+  const shown: EffTaskConfig = { ...props.config, phaseRoles: roster, skipSteps: skip }
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 启动确认</Text>
@@ -126,24 +136,24 @@ export function ConfirmStartup(props: {
       {/* 自己的块。塞进 notices 是错的 —— 那个块的标题是「你的请求中有以下部分**不会
           生效**」,而跳过是**生效了**的。把降质动作塞进那个标题下面,和把隔离降级塞
           进去是同一个错。 */}
-      {skipConflictLines(props.config).length > 0 && (
+      {skipConflictLines(shown).length > 0 && (
         <Box flexDirection="column">
           <Text color="error">以下配置组合会让任务跑不完:</Text>
-          {skipConflictLines(props.config).map(l => <Text key={l} color="error">  · {l}</Text>)}
+          {skipConflictLines(shown).map(l => <Text key={l} color="error">  · {l}</Text>)}
         </Box>
       )}
       {/* 跑得完、但有连带后果的,单独一块。混进上面那个标题下,就是「标题说 A、内容说 B」
           —— 正是这个关口存在要防的那种失真,只是换了个块。 */}
-      {skipConsequenceLines(props.config).length > 0 && (
+      {skipConsequenceLines(shown).length > 0 && (
         <Box flexDirection="column">
           <Text color="warning">跳过带来的连带后果:</Text>
-          {skipConsequenceLines(props.config).map(l => <Text key={l} color="warning">  · {l}</Text>)}
+          {skipConsequenceLines(shown).map(l => <Text key={l} color="warning">  · {l}</Text>)}
         </Box>
       )}
-      {noticeLines(props.config).length > 0 && (
+      {noticeLines(shown).length > 0 && (
         <Box flexDirection="column">
           <Text color="warning">你的请求中有以下部分不会生效:</Text>
-          {noticeLines(props.config).map(l => <Text key={l} color="warning">  · {l}</Text>)}
+          {noticeLines(shown).map(l => <Text key={l} color="warning">  · {l}</Text>)}
           {/* The notices came from parsing the PROMPT. Once the roster is hand-edited they can
               contradict the table right above them — "方案仍由 architect 承担" beside a
               方案: 主模型 row. Say which one is current instead of leaving two claims. */}
@@ -162,8 +172,8 @@ export function ConfirmStartup(props: {
           ))}
         </Box>
       )}
-      <Text>{capsLine(props.config)}</Text>
-      <Text dimColor>{costLine(props.config)}</Text>
+      <Text>{capsLine(shown)}</Text>
+      <Text dimColor>{costLine(shown)}</Text>
       {editing ? (
         <Text dimColor>
           {available.length > 0

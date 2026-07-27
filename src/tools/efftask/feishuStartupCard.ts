@@ -45,11 +45,11 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
     // The roster says who WILL run; this says whose request was dropped and why. Without it
     // the card would answer the user's "确认有多少角色、各自承担什么" with a half-truth.
     // 竞速器的前提是两端说同一件事:终端拦住的组合,卡片也必须拦。
-    (skipConsequenceLines(config).length > 0
-      ? `\n\n**跳过带来的连带后果**:\n${skipConsequenceLines(config).map(l => `- ${l}`).join('\n')}`
-      : '') +
     (skipConflictLines(config).length > 0
       ? `\n\n**以下配置组合会让任务跑不完**:\n${skipConflictLines(config).map(l => `- ${l}`).join('\n')}`
+      : '') +
+    (skipConsequenceLines(config).length > 0
+      ? `\n\n**跳过带来的连带后果**:\n${skipConsequenceLines(config).map(l => `- ${l}`).join('\n')}`
       : '') +
     (noticeLines(config).length > 0
       ? `\n\n**以下请求不会生效**:\n${noticeLines(config).map(l => `- ${l}`).join('\n')}`

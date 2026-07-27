@@ -162,6 +162,14 @@ export function rosterEditorLines(
     if (available.length === 0) {
       // Say WHY rather than render an empty row: with no roles available there is nothing to
       // edit, and a blank line reads as a broken editor.
+      //
+      // 被跳过的环节在这里**不能说「本阶段用主模型」** —— 那是承诺一件不会发生的事
+      // (该环节一次调用都没有),而同一个关口的只读名册说的是「已跳过」,两屏自相矛盾。
+      // 而且取消跳过的唯一途径是勾一个具名员工,没有可用角色时根本做不到,所以这里
+      // 要顺带说清「这一步撤不掉」,别让用户在编辑器里白找。
+      if ((skipped ?? []).includes(p)) {
+        return `${i === phaseIdx ? '▶' : ' '} ${label}: (已跳过;本会话没有可派发的员工,无法在这里取消 —— 去掉 settings.json 的 efftaskSkipSteps 或改提示词)`
+      }
       return `${i === phaseIdx ? '▶' : ' '} ${label}${empty}: ${lockedPrefix || '(没有可用角色,本阶段用主模型)'}`
     }
     // Keep the cursor inside the window, and keep bound roles visible on rows the cursor is
@@ -270,7 +278,7 @@ export function skipConsequenceLines(config: EffTaskConfig): string[] {
     out.push('跳过分析 = 本次不主动拆子任务,任务树基本只有根节点(执行者仍可动态加),深度与节点数上限因此失去意义。')
   }
   if (skip.has('integrate')) {
-    out.push('跳过集成验收 = 所有拆分型节点(含根节点)不再评分,这次 run 不会有最终分。')
+    out.push('跳过集成验收 = 所有**拆分型**节点(含根节点,如果它被拆了)不再评分;执行型节点照常评分。')
   }
   return out
 }

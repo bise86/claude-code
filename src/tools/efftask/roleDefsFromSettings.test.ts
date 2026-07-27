@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { collectRoleDefs, collectSkipSteps } from './roleDefsFromSettings.js'
+import { collectRoleDefs, collectSkipSteps, mergeSkipSteps } from './roleDefsFromSettings.js'
 
 const KNOWN = new Set(['opus-架构', 'ds-安全', 'gpt-前端'])
 const arch = { name: '架构师', stage: 'review', output: '裁决与阻断项', purpose: '把关可维护性' }
@@ -156,5 +156,28 @@ describe('collectSkipSteps:配置文件里指定跳过的环节', () => {
 
   it('没配 → 空,不报噪音', () => {
     expect(C({})).toEqual({ steps: [], notices: [] })
+  })
+})
+
+describe('mergeSkipSteps:两条录入口取并集', () => {
+  // README 和 roles-setup 的头条语义,此前零测试 —— 把并集改成覆盖,全量一条不红。
+  it('配置文件说的和提示词说的都生效', () => {
+    expect(mergeSkipSteps(['review'], ['accept'])).toEqual(['review', 'accept'])
+  })
+  it('**不是覆盖** —— 提示词说了不代表配置文件那条作废', () => {
+    const out = mergeSkipSteps(['review'], ['accept'])!
+    expect(`配置文件那条还在: ${out.includes('review')}`).toBe('配置文件那条还在: true')
+  })
+  it('重合的只算一次', () => {
+    expect(mergeSkipSteps(['review', 'accept'], ['accept'])).toEqual(['review', 'accept'])
+  })
+  it('提示词没说时,配置文件那条照样生效', () => {
+    expect(mergeSkipSteps(['review'], undefined)).toEqual(['review'])
+  })
+  it('两边都空 → undefined,不是空数组', () => {
+    // 下游用 `?? []` 判缺省;空数组会让「没说过跳过」和「说了但一个都不合法」在
+    // run.md 上长得不一样,而它们该是同一件事。
+    expect(mergeSkipSteps([], undefined)).toBeUndefined()
+    expect(mergeSkipSteps([], [])).toBeUndefined()
   })
 })
