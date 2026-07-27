@@ -1382,10 +1382,19 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           // told the user to resume it. The rework budget must mean rework.
           if (isSkipped(ctx, 'accept')) {
             // 跳过验收的第三个调用点(自动解冲突后的复验)。
+            //
+            // **必须和通过分支走同一个出口** `return mergeAndRelease(node, ctx, true)`,
+            // 不能自己拍板 ACCEPTED。这里是 mergeAndRelease 内部,函数签名是 Promise<boolean>:
+            //  - 裸 `return` 返回 undefined,调用方的 `if (!(await mergeAndRelease(...)))`
+            //    会把成功当失败;
+            //  - 更糟的是自己 commit ACCEPTED —— 执行者在这一轮给自己挂了补救子任务时,
+            //    调用方本该把它置成 WAITING_CHILDREN。实测:冲突 + 跳过验收 → 父节点
+            //    ACCEPTED(终态),子节点停在 CREATED 永远不被调度,run 报告完成而那个
+            //    子任务一次都没跑。
+            // triedThisRun=true 也不能漏:漏了的话重入时 attempted 停在 false,升级卡会说
+            // 「自动解决机会已在此前用完,本次未再尝试」,而本次实实在在跑了一次解冲突。
             noteOnNode(node, '自动解决冲突后的复验已跳过')
-            if (!(await mergeAndRelease(node, ctx))) return
-            await commit(node, 'ACCEPTED', ctx)
-            return
+            return mergeAndRelease(node, ctx, true)
           }
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
             phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,

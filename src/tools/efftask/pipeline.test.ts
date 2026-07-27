@@ -3790,3 +3790,86 @@ describe('环节跳过:七个都能跳,且跳过 ≠ 通过', () => {
     expect(seen).toContain('review')
   })
 })
+
+describe('跳过验收 × 合并冲突:三个调用点都不能谎报完成', () => {
+  // 多角色验收实测出来的:自动解冲突之后的那个跳过分支自己拍板 ACCEPTED,而它身处
+  // mergeAndRelease 内部(Promise<boolean>)。后果是执行者在这一轮给自己挂的补救子任务
+  // 被静默丢弃 —— 父节点进终态,子节点停在 CREATED 永远不被调度,run 报告完成。
+  const pool = (over: Record<string, unknown> = {}) => ({
+    acquire: async (n: TaskNode) => ({ path: `/wt/${n.id}`, branch: `b/${n.id}`, gitRoot: '/repo' }),
+    // 第一次合并冲突,解完之后放行 —— 这是「自动解冲突」那条路的触发条件。
+    commitAndMerge: (() => { let first = true; return async () => (first ? (first = false, { ok: false, kind: 'conflict', message: 'CONFLICT' }) : { ok: true, merged: true }) })(),
+    release: async () => ({ removed: true }),
+    dispose: async () => ({ kept: [] }),
+    init: async () => ({ ok: true }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
+    integrationPath: '/wt/integration',
+    conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/a.ts'] }),
+    refreshFromIntegration: async () => ({ ok: true, updated: false }),
+    mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
+    integrationBranchName: 'efftask/001/integration',
+    ...over,
+  })
+
+  /** 执行者报告产出,并给自己挂一个补救子任务(动态生长)。 */
+  const etagX = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+  let grew = false
+  const growAgent = (req: { phase: string; prompt: string }) => {
+    if (req.phase === 'execute') {
+      const extra = grew ? '' : ',"newChildren":[{"title":"补做的子任务","deps":[]}]'
+      grew = true
+      return `${etagX(req)}\n{"execStatus":"做完了"${extra}}\n` + '```'
+    }
+    return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+  }
+
+  const run = async (skip: string[]) => {
+    const n = root()
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: 'qa' }] } as typeof n.phaseRoles
+    grew = false
+    const nodes = [n]
+    const ctx = {
+      ...ctxFor(nodes, async req => growAgent(req), { ...cfg, phaseRoles: n.phaseRoles, skipSteps: skip as never }),
+      worktrees: pool() as never,
+    }
+    await stepExecute(n, ctx)
+    return { n }
+  }
+
+  it('冲突 + 跳过验收:长出来的子任务不会被静默丢弃', async () => {
+    const { n } = await run(['accept'])
+    // 拍死 ACCEPTED 的话:父进终态、子停在 CREATED,调度器再也不会看它一眼。
+    expect(`父节点=${n.status} 子节点数=${n.childIds.length}`).toBe(`父节点=WAITING_CHILDREN 子节点数=${n.childIds.length}`)
+    expect(n.childIds.length).toBeGreaterThan(0)
+  })
+
+  it('同一场景不跳过验收时状态一致 —— 跳过只该省掉裁决,不该改变形态', async () => {
+    const { n } = await run([])
+    expect(n.status).toBe('WAITING_CHILDREN')
+  })
+
+  it('升级卡不能说反话:本次真的试过自动解冲突', async () => {
+    // triedThisRun 漏传 → 重入时 attempted 停在 false → 卡片说「自动解决机会已在此前用完,
+    // 本次未再尝试」,而本次实实在在跑了一次解冲突 + 一次带写工具的 execute 调用。
+    //
+    // 这里断的是**升级回调收到的值**,不是源码字面量。上一版断的是源码里有
+    // `return mergeAndRelease(node, ctx, true)` —— 而通过分支里恰好有一模一样的一行,
+    // 于是漏传 triedThisRun 的变异被那一行满足,测试全绿。
+    const escalations: { attempted: boolean }[] = []
+    const n = root()
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    const ctx = {
+      ...ctxFor([n], async req => growAgent(req), { ...cfg, skipSteps: ['accept'] as never }),
+      // 两次都冲突:第一次触发自动解决,解完重入时再冲突一次 → 走到升级。
+      worktrees: pool({ commitAndMerge: async () => ({ ok: false, kind: 'conflict', message: 'C' }) }) as never,
+      onEscalate: (e: { attempted: boolean }) => { escalations.push(e) },
+    }
+    await stepExecute(n, ctx)
+    expect(escalations.length).toBeGreaterThan(0)
+    expect(`本次尝试过自动解决: ${escalations[0].attempted}`).toBe('本次尝试过自动解决: true')
+  })
+})

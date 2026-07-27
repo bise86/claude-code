@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { skipConflictLines } from './startupConfirm'
-import { PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName } from './types'
+import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
+import { DEFAULT_CAPS, emptyPhaseRoles, PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName } from './types'
 
 /**
  * 文档必须说真话。
@@ -28,14 +28,19 @@ function norm(s: string): string {
   return s.replace(/,/g, '，').replace(/:/g, '：').replace(/;/g, '；').replace(/\(/g, '（').replace(/\)/g, '）')
 }
 
-const cfg = (skip: PhaseName[]): EffTaskConfig => ({ skipSteps: skip }) as unknown as EffTaskConfig
+const cfg = (skip: PhaseName[]): EffTaskConfig => ({
+  goalPrompt: 'g', parallelism: 5, notices: [], skipSteps: skip,
+  caps: { ...DEFAULT_CAPS },
+  phaseRoles: emptyPhaseRoles(),
+}) as unknown as EffTaskConfig
 
 describe('文档说的和代码干的是同一件事', () => {
   it('每个环节被跳过的后果,两份文档都逐条写出来了', () => {
     // 关口把后果说给用户听,文档也必须说 —— 用户是先读文档再决定跳不跳的。
     for (const p of PHASE_NAMES) {
-      // 关口对这个环节的原话(rosterLines 里那句 `${PHASE_LABEL[p]}: ${SKIP_CONSEQUENCE[p]}`)。
-      // SKIP_CONSEQUENCE 没导出,从关口的实际输出里取,顺带证明它真的被接上了。
+      // **真的调 rosterLines**,拿它渲染给用户的那一行。上一版是拿正则从源码里刮
+      // SKIP_CONSEQUENCE 的字面量,于是把 rosterLines 里的跳过分支整行删掉 —— 关口对被
+      // 跳过的环节什么都不说了 —— 这道闸门照样全绿。读源码的闸门证明不了接线。
       const line = norm(rosterLineFor(p))
       const core = line.replace(/^[^（]*（已跳过 —— /, '').replace(/）$/, '')
       expect(core.length).toBeGreaterThan(8)
@@ -48,17 +53,22 @@ describe('文档说的和代码干的是同一件事', () => {
   it('关口能弹出来的每一条冲突提示,文档里都有对应说法', () => {
     // 手写的映射:代码里的提示 → 文档里必须出现的那句话的核心。
     // 加了新的冲突规则却没登记在这里,下面那条穷举断言会红。
+    // 片段太短会被**反话**满足:实测把第一条整句换成「这个组合完全没问题…验收根本
+    // 跑不到也不影响结果,无需处理」,四个文件的断言全绿,因为反话里保留了那几个碎片。
+    // 所以登记的是**判别句**——一句话里最不可能在改写后还留下的那部分。
     const REQUIRED: [RegExp, string][] = [
-      [/连报 3 轮空产出后阻断/, '3 轮空产出后阻断'],
-      [/评审席位.*空方案/, '空方案'],
+      [/验收席位仍会照常开会/, '验收席位仍会照常开会去核对这个空产出'],
+      [/评审席位.*空方案/, '评审席位去评一份空方案'],
       [/不会有任何代码改动/, '不会有任何代码改动'],
       [/任务树基本只有根节点/, '任务树基本只有根节点'],
+      [/不再评分/, '不再评分'],
     ]
-    // 穷举 2^7 种跳过组合,收集关口所有可能说出口的话。
+    // 穷举 2^7 种跳过组合,收集关口所有可能说出口的话(两个块都算)。
     const produced = new Set<string>()
     for (let mask = 0; mask < 1 << PHASE_NAMES.length; mask++) {
       const skip = PHASE_NAMES.filter((_, i) => mask & (1 << i))
       for (const l of skipConflictLines(cfg(skip))) produced.add(norm(l))
+      for (const l of skipConsequenceLines(cfg(skip))) produced.add(norm(l))
     }
     expect(produced.size).toBeGreaterThan(0)
     for (const msg of produced) {
@@ -109,12 +119,12 @@ describe('文档说的和代码干的是同一件事', () => {
   })
 })
 
-/** 关口名册里这一环节被跳过时的那一行。 */
+/** 关口名册里这一环节被跳过时的那一行 —— 真调 rosterLines 取。 */
 function rosterLineFor(p: PhaseName): string {
-  // 直接调 rosterLines 需要一份完整 config;这里只要跳过分支那一句,
-  // 用关口自己的格式重建会变成自说自话,所以从源码里取 SKIP_CONSEQUENCE 的字面量。
-  const src = readFileSync(new URL('src/tools/efftask/startupConfirm.ts', ROOT), 'utf8')
-  const m = src.match(new RegExp(`^\\s*${p}: '([^']+)',`, 'm'))
-  if (!m) throw new Error(`SKIP_CONSEQUENCE 里没有 ${p} —— 环节加了却没写后果`)
-  return `${PHASE_LABEL[p]}: ${m[1]}`
+  const line = rosterLines(cfg([p])).find(l => l.startsWith(`${PHASE_LABEL[p]}: `))
+  if (!line) throw new Error(`关口名册里没有 ${PHASE_LABEL[p]} 这一行`)
+  if (!line.includes('已跳过')) {
+    throw new Error(`关口对被跳过的 ${PHASE_LABEL[p]} 说的是「${line}」—— 跳过分支没接上`)
+  }
+  return line
 }

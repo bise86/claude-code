@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, skipConflictLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, skipConflictLines, skipConsequenceLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -917,9 +917,15 @@ describe('关口:跳过要说出后果,组合要拦住', () => {
     expect(row(mk(), '验收')).toContain('主模型')
   })
 
-  it('跳过执行不跳验收 → 拦住,并说清验收根本跑不到', () => {
-    const t = skipConflictLines(mk({ skipSteps: ['execute'] as never })).join('\n')
-    expect(t).toContain('验收根本跑不到')
+  it('跳过执行不跳验收 → 拦住,并说清验收会去核对一个空产出', () => {
+    // 断**整句**,不断片段。断片段时把这句话改成意思完全相反的
+    // 「这个组合完全没问题…验收根本跑不到也不影响结果,无需处理」照样绿 —— 实测过。
+    // 这条警告的全部价值就在它的祈使部分,而祈使部分正是被片段断言漏掉的那半句。
+    const lines = skipConflictLines(mk({ skipSteps: ['execute'] as never }))
+    expect(lines).toContain("跳过了执行但没跳验收:本次不会有任何代码改动,验收席位仍会照常开会,去核对一个空产出。判通过 = 给一个什么都没做的节点盖章并合进集成分支;判不通过 = 烧完验收迭代后阻断。要么一并跳过验收,要么别跳执行。")
+    // 上一版这里写的是「验收根本跑不到」—— 一句假话:跳过执行是在空产出闸门**之前**
+    // 整块早退的,闸门不触发,验收照跑。实测一次调用就把空节点判成了 ACCEPTED。
+    expect(lines.join('\n')).not.toContain('验收根本跑不到')
   })
 
   it('跳过分析不跳质疑讨论 → 拦住', () => {
@@ -931,9 +937,31 @@ describe('关口:跳过要说出后果,组合要拦住', () => {
     expect(skipConflictLines(mk({ skipSteps: all as never })).join('\n')).toContain('不会有任何模型调用')
   })
 
+  it('**没全跳时绝不能说全跳** —— 只有正向断言时阈值可以从 7 改成 1 而无人发现', () => {
+    // 实测:把 `skip.size >= PHASE_NAMES.length` 改成 `>= 1`,141 条全绿。用户只跳一个
+    // 验收,关口就红字弹「七个环节全部跳过:本次不会有任何模型调用」—— 一句彻头彻尾的
+    // 假话,还是在**要求他批准**的界面上。1..6 这段中间地带原先一条断言都没有。
+    const all = ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer']
+    for (let n = 0; n < all.length; n++) {
+      const t = skipConflictLines(mk({ skipSteps: all.slice(0, n) as never })).join('\n')
+      expect(`跳 ${n} 个时误报全跳: ${t.includes('全部跳过')}`).toBe(`跳 ${n} 个时误报全跳: false`)
+    }
+  })
+
+  it('连带后果和「跑不完」是两个块 —— 标题必须配得上内容', () => {
+    // 「跳过分析 = 不主动拆子任务」是**跑得完**的连带后果,挂在「会让任务跑不完」标题
+    // 下面就是标题说 A 内容说 B —— 和把隔离降级塞进「不会生效」块是同一个错。
+    const conflict = skipConflictLines(mk({ skipSteps: ['plan', 'review'] as never })).join('\n')
+    const conseq = skipConsequenceLines(mk({ skipSteps: ['plan', 'review'] as never })).join('\n')
+    expect(conflict).not.toContain('任务树基本只有根节点')
+    expect(conseq).toContain('任务树基本只有根节点')
+    // 跳过集成验收会连带关掉所有拆分型节点的评分,这条以前一个字都没说。
+    expect(skipConsequenceLines(mk({ skipSteps: ['integrate'] as never })).join('\n')).toContain('不再评分')
+    expect(skipConsequenceLines(mk({ skipSteps: [] as never }))).toEqual([])
+  })
+
   it('两个都跳时不再报那条组合警告', () => {
-    const t = skipConflictLines(mk({ skipSteps: ['execute', 'accept'] as never })).join('\n')
-    expect(t).not.toContain('验收根本跑不到')
+    expect(skipConflictLines(mk({ skipSteps: ['execute', 'accept'] as never }))).not.toContain("跳过了执行但没跳验收:本次不会有任何代码改动,验收席位仍会照常开会,去核对一个空产出。判通过 = 给一个什么都没做的节点盖章并合进集成分支;判不通过 = 烧完验收迭代后阻断。要么一并跳过验收,要么别跳执行。")
   })
 
   it('什么都不跳 → 没有警告', () => {

@@ -216,16 +216,23 @@ const SKIP_CONSEQUENCE: Record<PhaseName, string> = {
 }
 
 /**
- * 会让任务跑不完的**配置组合**。
+ * 跳过带来的**连带后果**:要么让任务跑不完,要么让某个环节评一个它评不了的东西。
  *
  * 单独一个块,不塞进 notices —— 那个块的标题是「你的请求中有以下部分**不会生效**」,
  * 而跳过是**生效了**的。把一个降质动作塞进那个标题下面,和把隔离降级塞进去是同一个错。
+ *
+ * 这里的每一句话都必须**实测**过。上一版第一条写的是「节点会在执行环节连报 3 轮空产出
+ * 后阻断,验收根本跑不到。请一并跳过验收」——三句全错:跳过执行是在空产出闸门**之前**
+ * 整块早退的,闸门根本不触发,验收照跑(实测一次调用就把一个什么都没做的节点判成
+ * ACCEPTED)。而最后那句建议尤其糟:它让用户去掉唯一还在跑的那道检查。
  */
 export function skipConflictLines(config: EffTaskConfig): string[] {
   const skip = new Set(config.skipSteps ?? [])
   const out: string[] = []
   if (skip.has('execute') && !skip.has('accept')) {
-    out.push('跳过了执行但没跳验收:节点会在执行环节连报 3 轮空产出后阻断,验收根本跑不到。请一并跳过验收。')
+    out.push('跳过了执行但没跳验收:本次不会有任何代码改动,验收席位仍会照常开会,去核对一个空产出。'
+      + '判通过 = 给一个什么都没做的节点盖章并合进集成分支;判不通过 = 烧完验收迭代后阻断。'
+      + '要么一并跳过验收,要么别跳执行。')
   }
   if (skip.has('plan') && !skip.has('review')) {
     out.push('跳过了分析但没跳质疑讨论:评审席位会去评一份空方案,大概率判不通过并烧完迭代。建议一并跳过质疑讨论。')
@@ -233,8 +240,24 @@ export function skipConflictLines(config: EffTaskConfig): string[] {
   if (skip.size >= PHASE_NAMES.length) {
     out.push('七个环节全部跳过:本次不会有任何模型调用,也不会有任何代码改动。确认要空跑吗?')
   }
+  return out
+}
+
+/**
+ * 跳过之后**照常发生、但和你原本预期不同**的事。
+ *
+ * 和上面那个函数分开,因为它们的标题不一样:上面是「会跑不完」,这里是「跑得完,但
+ * 有个连带后果你得知道」。把后者塞进前者的标题下,就是 spec §7.5 批评 notices 块
+ * 「标题说 A、内容说 B」的同一个错,只是换了个块。
+ */
+export function skipConsequenceLines(config: EffTaskConfig): string[] {
+  const skip = new Set(config.skipSteps ?? [])
+  const out: string[] = []
   if (skip.has('plan')) {
     out.push('跳过分析 = 本次不主动拆子任务,任务树基本只有根节点(执行者仍可动态加),深度与节点数上限因此失去意义。')
+  }
+  if (skip.has('integrate')) {
+    out.push('跳过集成验收 = 所有拆分型节点(含根节点)不再评分,这次 run 不会有最终分。')
   }
   return out
 }

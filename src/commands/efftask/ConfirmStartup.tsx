@@ -4,7 +4,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, costLine, skipConflictLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, costLine, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -125,6 +125,14 @@ export function ConfirmStartup(props: {
         <Box flexDirection="column">
           <Text color="error">以下配置组合会让任务跑不完:</Text>
           {skipConflictLines(props.config).map(l => <Text key={l} color="error">  · {l}</Text>)}
+        </Box>
+      )}
+      {/* 跑得完、但有连带后果的,单独一块。混进上面那个标题下,就是「标题说 A、内容说 B」
+          —— 正是这个关口存在要防的那种失真,只是换了个块。 */}
+      {skipConsequenceLines(props.config).length > 0 && (
+        <Box flexDirection="column">
+          <Text color="warning">跳过带来的连带后果:</Text>
+          {skipConsequenceLines(props.config).map(l => <Text key={l} color="warning">  · {l}</Text>)}
         </Box>
       )}
       {noticeLines(props.config).length > 0 && (

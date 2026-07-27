@@ -101,6 +101,6 @@ describe('组合警告两端都要有', () => {
     const card = buildStartupCard(cfg as never, 'req-1') as { elements: { text?: { content: string } }[] }
     const text = card.elements.map(e => e.text?.content ?? '').join('\n')
     expect(text).toContain('跑不完')
-    expect(text).toContain('验收根本跑不到')
+    expect(text).toContain("跳过了执行但没跳验收:本次不会有任何代码改动,验收席位仍会照常开会,去核对一个空产出。判通过 = 给一个什么都没做的节点盖章并合进集成分支;判不通过 = 烧完验收迭代后阻断。要么一并跳过验收,要么别跳执行。")
   })
 })
