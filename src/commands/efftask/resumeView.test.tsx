@@ -638,3 +638,45 @@ describe('spec §17.1:选择器上要看得见最后更新时间', () => {
     app.unmount()
   })
 })
+
+describe('续跑关口的编辑器也要认识「被跳过」', () => {
+  // 此前这个关口完全没有跳过这回事:只读那屏说「验收:(已跳过 —— 没人核对验收点…)」,
+  // 按 r 进去那一行却写着「验收(主模型):[ ]alice」—— 同一个关口两屏自相矛盾,而且
+  // 后一屏承诺了一件不会发生的事。勾完人确认,席位写进 run.md,skipSteps 原样保留,
+  // 那一席永远不会被派发 —— 「配得进去、永远不生效」。
+  const mountSkipped = async () => {
+    const decisions: { skipSteps?: string[]; phaseRoles?: Record<string, { roleName: string }[]> }[] = []
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, {
+        config: { ...config, skipSteps: ['review'] },
+        summary, availableRoles: ['architect'],
+        onDecision: (d: never) => decisions.push(d),
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    return { stdin, lastFrame, decisions, app }
+  }
+
+  it('编辑器里那一行标出「已跳过」', async () => {
+    const m = await mountSkipped()
+    m.stdin.press('r'); await tick()
+    // 断**编辑器独有**的那句。帧缓冲是累加的,而只读名册在按 r 之前就印过
+    // 「已跳过」了 —— 断那三个字等于在断上一屏,实测这条变异因此存活。
+    expect(m.lastFrame()).toContain('勾选任一员工即恢复')
+    m.app.unmount()
+  })
+
+  it('给它勾个人 = 取消跳过,而且决策里带得出去', async () => {
+    const m = await mountSkipped()
+    m.stdin.press('r'); await tick()
+    m.stdin.press(ESC + '[B' + ' '); await tick()   // 移到质疑讨论并勾上 architect
+    m.stdin.press('\r'); await tick()
+    // 不能写 `?? []`:缺省语义是「不变」,字段缺席时 run 照样跳过。
+    expect(`决策里带 skipSteps: ${m.decisions[0].skipSteps !== undefined}`).toBe('决策里带 skipSteps: true')
+    expect(m.decisions[0].skipSteps).toEqual([])
+    expect(m.decisions[0].phaseRoles?.review).toEqual([{ roleName: 'architect' }])
+    m.app.unmount()
+  })
+})
