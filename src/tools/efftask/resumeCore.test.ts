@@ -932,6 +932,9 @@ describe('跳过的环节必须能从 run.md 读回', () => {
     const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md('skipSteps:\n  - 安全审计\n') }), '/r')
     expect(config.skipSteps).toBeUndefined()
     expect(degraded.join('')).toContain('会照常运行')
+    // 反话也含这四个字:「…但它会照常运行,所以你不用管」。措辞失守时行为断言还在
+    // (skipSteps 被丢弃),但关口说给用户的那句话会变成一句「别管」。
+    expect(degraded.join('')).not.toContain('不用管')
   })
 
   it('老 run.md 没有这个键 → undefined,不报噪音', async () => {

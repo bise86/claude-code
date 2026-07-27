@@ -3553,9 +3553,17 @@ describe('分析环节:圆桌(各自出稿 → 融合成一份)', () => {
     await stepStart(n, ctxFor([n], runAgent, roundtableCfg()))
     expect(fusePrompt).toContain('稿 A')
     expect(fusePrompt).toContain('稿 C')
-    // 署名会让最后一席偏袒自己那份。
-    expect(fusePrompt).not.toContain('员工「c」')
-    expect(fusePrompt).toContain('不是选一份')
+    // 署名会让最后一席偏袒自己那份。断的是**真实的员工名**在提示词里一个都不出现,
+    // 而不是某个硬编码的渲染格式 —— 后者只要换个模板就永远为真。
+    // 断的是**署名**不存在,不是员工名这个字符串不出现 —— 后者在稿子正文里本来就有
+    // (fixture 的稿文就是「a 的稿」)。真正要防的是稿子被挂上作者。
+    const headings = fusePrompt.split('\n').filter(l => l.startsWith('### '))
+    expect(headings).toEqual(['### 稿 A', '### 稿 B', '### 稿 C'])
+    // 断**正向语义**,而且这句话不能被它的反话满足。上一版断的是 '不是选一份',而
+    // 「不是选一份的老规矩已作废:直接挑你觉得最好的那一稿原样交出来」也含这五个字 ——
+    // 融合当场退化成选优,alternatives 变成噪音,216 条测试全绿。
+    expect(fusePrompt).toContain('是取各稿之长合成一份')
+    expect(fusePrompt).not.toContain('原样交出')
   })
 
   it('单席位时不走圆桌,也不多花那次融合调用', async () => {
@@ -3691,11 +3699,18 @@ describe('环节跳过:七个都能跳,且跳过 ≠ 通过', () => {
   })
 
   it('跳过分析时,已挂上的子节点不会被孤儿化', async () => {
+    // 这条原先只断 kind/status,而那两样完全由**跳过之前就存在**的下游路由产生,
+    // 已被 'a node that gained children while planning does NOT get committed to READY'
+    // 守着 —— 实测把跳过分支的 kind 写死成 'executable',这条照样绿。
+    // 补上跳过路径**特有**的两件事,三者合起来才排除「其实偷偷跑了 plan」。
+    const seen: string[] = []
     const { n, ctx } = mk(['plan'])
     n.childIds = ['root/01']
-    await stepStart(n, ctx(async req => ok(req)))
+    await stepStart(n, ctx(async req => { seen.push(req.phase); return ok(req) }))
     expect(n.kind).toBe('decompose')
     expect(n.status).toBe('WAITING_CHILDREN')
+    expect(seen).not.toContain('plan')
+    expect(n.execStatus).toContain('分析环节已跳过')
   })
 
   it('跳过质疑讨论:不调 review,而且**不写 reviewLog**', async () => {

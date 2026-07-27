@@ -96,7 +96,7 @@ export function phaseTimeBody(n: TaskNode): string {
     // actual rework effort is charged to that next EXECUTING round. A row reading 返工 45s
     // directly beneath 迭代次数 · 验收返工 2 reads as "reworking took 45 seconds", and the
     // two mislead each other.
-    REWORK: '返工前同步集成分支', INTEGRATION_ACCEPT: '集成提交', SCORING: '观察', MERGE: '合并',
+    REWORK: '返工前同步集成分支', INTEGRATION_ACCEPT: '集成验收', SCORING: '观察', MERGE: '合并',
   }
   return Object.entries(n.phaseMs ?? {})
     .filter(([, ms]) => Number.isFinite(ms) && ms >= 1000)

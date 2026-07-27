@@ -10,6 +10,7 @@ import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { TaskTreePanel, visibleRows, viewport, elapsed } from './TaskTreePanel.js'
 import { NodeDetail, phaseTimeBody } from './NodeDetail.js'
+import { PHASE_LABEL, PHASE_NAMES } from '../../tools/efftask/types.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
 
 const NOW = new Date().toISOString()
@@ -772,5 +773,22 @@ describe('各阶段耗时不能把内部枚举名漏给用户', () => {
       expect(`${st}:${body.includes(st)}`).toBe(`${st}:false`)
     }
     expect(body).toContain('测试验证')
+  })
+})
+
+describe('运行中的界面不能还叫旧名', () => {
+  it('阶段耗时行用的是 PHASE_LABEL 里的名字', () => {
+    // 「集成提交」改名成「集成验收」的**全部理由**就是前者听起来像在做合并,而它不做
+    // 合并(README 特意声明过)。关口、错误信息、升级卡、两份文档都改了,只有用户
+    // 真正盯着跑的这块屏幕没改 —— 他会以为有两个环节,或者以为这一步在提交代码。
+    const body = phaseTimeBody({
+      phaseMs: { PLANNING: 3000, PLAN_REVIEW: 3000, EXECUTING: 3000, VERIFYING: 3000,
+        ACCEPTANCE: 3000, INTEGRATION_ACCEPT: 3000, SCORING: 3000 },
+    } as never)
+    // 七个环节的名字都必须来自同一个源;任何一个漂了,这里就红。
+    for (const p of PHASE_NAMES) {
+      expect(`${p} 的标签: ${body.includes(PHASE_LABEL[p])}`).toBe(`${p} 的标签: true`)
+    }
+    expect(body).not.toContain('集成提交')
   })
 })
