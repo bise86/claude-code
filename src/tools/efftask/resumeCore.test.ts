@@ -996,3 +996,25 @@ describe('落选稿从盘上读回来时要逐条校验', () => {
     expect(out.repairs.join(' ')).not.toContain('备选方案')
   })
 })
+
+describe('--resume 之后收敛方式不能变', () => {
+  // 这个夹取删掉后全量一条不红,而后果是同一个 run 前后两种形态:第一段用圆桌,
+  // 恢复之后静默退回精化,用户毫不知情。
+  const manifest = (planConverge: string) => [
+    '---', 'goalPrompt: 干活', 'parallelism: 3',
+    'caps:', '  maxDepth: 5', '  maxNodes: 100', '  maxIterations: 3',
+    '  nodeTimeoutMs: 600000', `  planConverge: ${planConverge}`,
+    'phaseRoles:', '  plan: []',
+    '---', '', '# tree',
+  ].join('\n')
+
+  it('run.md 里写的圆桌,读回来还是圆桌', async () => {
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': manifest('圆桌') }), '/r')
+    expect(config.caps.planConverge).toBe('圆桌')
+  })
+
+  it('run.md 被手改成不认识的值 → 回落默认,不原样带进 run', async () => {
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': manifest('roundtable') }), '/r')
+    expect(config.caps.planConverge).toBeUndefined()
+  })
+})
