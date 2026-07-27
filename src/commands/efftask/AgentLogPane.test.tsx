@@ -163,12 +163,19 @@ describe('AgentLogPane 的折叠', () => {
 
   it('空格折的是**选中**那条,不是第 0 条', async () => {
     // 只在 selected=0 的时候按空格,写死成 0 的实现照样绿 —— 探针是空的。
+    // 第 0 条**已收口**、第 1 条还在跑 —— 两者的默认折叠状态必须不同,否则「读第 0 条
+    // 的当前值」和「读选中那条的当前值」算出来一样,探针是空的。
     const { t, app, last } = await mount({
-      streams: [stream({ events: lines('甲') }), stream({ events: lines('乙') }), stream({ events: lines('丙') })],
+      streams: [
+        stream({ closed: true, endedAt: Date.now(), events: lines('甲') }),
+        stream({ closed: false, events: lines('乙') }),
+        stream({ closed: false, events: lines('丙') }),
+      ],
     })
-    t.stdin.press(TAB); await tick()   // 选中第 1 条
+    expect(last().folded).toEqual([0])   // 默认:收口的折起来
+    t.stdin.press(TAB); await tick()     // 选中第 1 条(还在跑,默认展开)
     t.stdin.press(' '); await tick()
-    expect(last().folded).toEqual([1])
+    expect(last().folded).toEqual([0, 1])
     app.unmount()
   })
 })
