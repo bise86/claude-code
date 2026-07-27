@@ -4009,3 +4009,41 @@ describe('两个特性叠加时不能互相踩', () => {
     expect(n.status).toBe('READY')
   })
 })
+
+describe('圆桌只剩一份稿,和注记不许重复', () => {
+  it('3 席挂 2 席:直接用剩下那份,并说清没做过融合', async () => {
+    // 现有的「一席起草失败」用例是 3 席挂 1 席(剩 2 份,照常融合),从没构造过剩 1 份的
+    // 局面。不说的话,用户以为拿到的是三方融合结论,实际是某一个人的独稿。
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: ['a', 'b', 'c'].map(roleName => ({ roleName })) } as typeof n.phaseRoles
+    let fused = 0
+    await stepStart(n, ctxFor([n], async req => {
+      if (req.phase === 'plan') {
+        if (req.prompt.includes('请合成')) { fused++; return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"a"}\n```' }
+        if (req.role?.roleName !== 'c') throw new Error(`${req.role?.roleName} 挂了`)
+        return '```json\n{"kind":"executable","solution":"c 的独稿","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
+    expect(fused).toBe(0)                              // 一份稿没什么可融,也别白花那次调用
+    expect(n.plan.solution).toBe('c 的独稿')
+    expect(n.plan.alternatives).toBeUndefined()        // 没有落选稿
+    expect(n.execStatus).toContain('只有 1 份稿可用')   // 但这件事要说出来
+  })
+
+  it('同一句注记不会因为返工被叠成好几遍', async () => {
+    // 跳过分支在每轮返工里都会重新走一遍;不去重的话三轮之后同一句话叠三遍,
+    // 读的人会以为发生了三件事。
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), review: [{ roleName: 'r' }] } as typeof n.phaseRoles
+    let round = 0
+    await stepStart(n, ctxFor([n], async req => {
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      round++
+      // 前两轮打回,第三轮放行 —— 让跳过分支被走到三次。
+      return vtag(req) + `\n{"pass":${round >= 3},"blocking":${round >= 3 ? '[]' : '["再改"]'},"comments":"c"}\n` + '```'
+    }, { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['plan'] as never }))
+    const hits = n.execStatus.split('分析环节已跳过').length - 1
+    expect(`「分析环节已跳过」出现次数: ${hits}`).toBe('「分析环节已跳过」出现次数: 1')
+  })
+})

@@ -530,7 +530,15 @@ export function capsLine(config: EffTaskConfig): string {
   if (c.quorum !== undefined && c.quorum < 100) parts.push(`需 ${c.quorum}% 席位赞成`)
   if (c.quorumSeats !== undefined) parts.push(`需至少 ${c.quorumSeats} 席赞成`)
   const quorum = parts.length > 0 ? ` · 圆桌${parts.join('、')}` : ''
-  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}`
+  // 分析的收敛方式同时改变**形态**和**成本**,却在关口上一个字都没有:圆桌和精化两种
+  // 配置下这一行此前逐字相同,只有成本数字差一点,而没有任何一句话解释那点差额是什么。
+  // 判据和 quorum 一样 —— 改变行为的开关必须说出来,藏起来正是这个关口存在要防的失败。
+  // 只在真的会生效时说(≥2 席才有第二稿可融),否则就成了另一种不实承诺。
+  const planSeats = (config.phaseRoles?.plan ?? []).length
+  const converge = c.planConverge === '圆桌' && planSeats > 1
+    ? ` · 分析用圆桌(${planSeats} 人各自起草,末席融合,多 1 次调用)`
+    : ''
+  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}${converge}`
 }
 
 /**

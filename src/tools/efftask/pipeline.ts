@@ -751,7 +751,11 @@ async function runPlanRoundtable(
 
 /** 往 execStatus 追一条编排器注记(带前缀,否则 integratePrompt 会当成执行产出)。 */
 function noteOnNode(node: TaskNode, note: string): void {
-  node.execStatus = `${node.execStatus}${node.execStatus ? '\n' : ''}${ORCHESTRATOR_NOTE}${note})`
+  const line = `${ORCHESTRATOR_NOTE}${note})`
+  // 同一句注记不重复写。跳过分支在每轮返工里都会重新走一遍,实测三轮之后 execStatus
+  // 里是同一句话叠了三遍(86 字符)—— 读的人会以为发生了三件事。
+  if (node.execStatus.includes(line)) return
+  node.execStatus = `${node.execStatus}${node.execStatus ? '\n' : ''}${line}`
 }
 
 /**

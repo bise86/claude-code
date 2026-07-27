@@ -1014,3 +1014,33 @@ describe('编辑器要标出被跳过的环节', () => {
     expect(lines.join('\n')).not.toContain('已跳过')
   })
 })
+
+describe('分析的收敛方式必须在关口上看得见', () => {
+  const mk = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], ...over,
+  })
+  // 圆桌和精化此前在关口上**逐字相同**,只有成本数字差一点,而没有任何一句话解释那点
+  // 差额是什么。用户说了「分析用圆桌」,关口上找不到任何证据说明它生效了。
+  const withPlan = (n: number, planConverge?: '圆桌' | '精化') => mk({
+    caps: { ...DEFAULT_CAPS, ...(planConverge ? { planConverge } : {}) } as never,
+    phaseRoles: { ...emptyPhaseRoles(), plan: Array.from({ length: n }, (_, i) => ({ roleName: `p${i}` })) } as never,
+  })
+
+  it('圆桌 + 多席 → 说清是谁在融合、多花一次调用', () => {
+    const line = capsLine(withPlan(3, '圆桌'))
+    expect(line).toContain('分析用圆桌')
+    expect(line).toContain('3 人')
+    expect(line).toContain('多 1 次调用')
+  })
+
+  it('精化(默认)不说 —— 默认值说出来就是噪音', () => {
+    expect(capsLine(withPlan(3, '精化'))).not.toContain('圆桌(')
+    expect(capsLine(withPlan(3))).not.toContain('圆桌(')
+  })
+
+  it('**只有一席时不说** —— 那时圆桌和精化完全等价,说了就是又一句不实承诺', () => {
+    expect(capsLine(withPlan(1, '圆桌'))).not.toContain('分析用圆桌')
+    expect(capsLine(withPlan(0, '圆桌'))).not.toContain('分析用圆桌')
+  })
+})
