@@ -958,3 +958,41 @@ describe('跳过的环节必须能从 run.md 读回', () => {
     expect(config.skipSteps).toEqual(['review', 'accept'])
   })
 })
+
+describe('落选稿从盘上读回来时要逐条校验', () => {
+  // alternatives 是 validateLoadedNodes 唯一不就地补字段的 plan 字段,所以坏数据能
+  // 原样穿过去,而 serializeNode 会把它渲染进 body:一条 {staff:1} 就是 [object Object]。
+  // node.md 是手改得动的文本,崩溃残留也长这样。
+  const withPlan = (alternatives: unknown) =>
+    mk({ plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', alternatives } as never })
+
+  it('不是数组 → 整个丢掉并记进 repairs', () => {
+    const out = validateLoadedNodes([withPlan('boom')], OPTS)
+    expect((out.nodes[0].plan as { alternatives?: unknown }).alternatives).toBeUndefined()
+    expect(out.repairs.join(' ')).toContain('备选方案')
+  })
+
+  it('数组里的坏条目被剔除,好的留下', () => {
+    const out = validateLoadedNodes([withPlan([
+      { staff: 'a', solution: '好的' },
+      { staff: 1, solution: '坏的' },
+      null,
+      { staff: 'b' },
+    ])], OPTS)
+    const alts = (out.nodes[0].plan as { alternatives?: { staff: string }[] }).alternatives
+    expect(alts).toEqual([{ staff: 'a', solution: '好的' }])
+    expect(out.repairs.join(' ')).toContain('3 条格式非法')
+  })
+
+  it('全是坏的 → 字段整个消失,而不是留一个空数组', () => {
+    const out = validateLoadedNodes([withPlan([{ staff: 1 }])], OPTS)
+    expect('alternatives' in (out.nodes[0].plan as object)).toBe(false)
+  })
+
+  it('合法的原样留着,不报噪音', () => {
+    const good = [{ staff: 'a', solution: 'A' }, { staff: 'b', solution: 'B' }]
+    const out = validateLoadedNodes([withPlan(good)], OPTS)
+    expect((out.nodes[0].plan as { alternatives?: unknown }).alternatives).toEqual(good)
+    expect(out.repairs.join(' ')).not.toContain('备选方案')
+  })
+})

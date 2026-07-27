@@ -438,3 +438,42 @@ describe('验收记录要说清哪一轮是哪一关', () => {
     expect(serializeNode(n)).toContain('- round 1: PASS')
   })
 })
+
+describe('落选稿要真的落到人读得到的那一半', () => {
+  // 「不静默截断」此前只做到了机器可读那一半:frontmatter 里有,body 里没有 ——
+  // 人打开 node.md 什么都看不到。这一段整个删掉,全量 1385 条一条不红。
+  const withAlts = (alts: { staff: string; solution: string }[]) => {
+    const n = createNode({ id: 'root', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    n.plan = { solution: '融合稿', keyPoints: 'k', risks: 'r', acceptance: 'a', alternatives: alts }
+    return n
+  }
+
+  it('body 里有「备选方案」段,每份一个小标题', () => {
+    const md = serializeNode(withAlts([
+      { staff: 'opus-架构', solution: 'A 方案正文' },
+      { staff: 'ds-安全', solution: 'B 方案正文' },
+    ]))
+    expect(md).toContain('## 备选方案')
+    expect(md).toContain('### opus-架构')
+    expect(md).toContain('### ds-安全')
+    expect(md).toContain('A 方案正文')
+    expect(md).toContain('B 方案正文')
+  })
+
+  it('没有落选稿时不画空段 —— 空标题会让人以为落选稿丢了', () => {
+    const n = createNode({ id: 'root', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    expect(serializeNode(n)).not.toContain('备选方案')
+  })
+
+  it('超长的落选稿在 body 里被截断,并指向 frontmatter', () => {
+    // body 给人读,frontmatter 给机器读。body 无上限的话,一份 5000 字的落选稿会把
+    // node.md 顶到人翻不动;直接砍掉又是静默截断 —— 砍完必须说清全文去哪儿找。
+    const md = serializeNode(withAlts([{ staff: 'a', solution: 'X'.repeat(5000) }]))
+    const body = md.slice(md.indexOf('## 备选方案'))
+    expect(body).toContain('完整内容见 frontmatter')
+    expect(body.length).toBeLessThan(2000)
+    // 而全文确实还在 frontmatter 里 —— 说了去哪儿找,那儿就得真有。
+    expect(md.slice(0, md.indexOf('## 备选方案'))).toContain('X'.repeat(2000))
+  })
+})

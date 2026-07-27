@@ -3930,3 +3930,82 @@ describe('跳过的环节要在 node.md 上留痕(不是留 PASS,是留「已跳
     expect(md).toContain('架构师')
   })
 })
+
+describe('跳过验收的另外两个调用点(冲突场景)', () => {
+  // 只跳主循环的话,验收会在「最该有人看」的冲突解决场景悄悄复活 —— 那是更坏的惊喜:
+  // 用户明确说了不要验收,系统却在人手改过冲突之后突然拉起一场验收圆桌,烧掉 It² 次调用。
+  // 反过来若这两个分支写错,人手改的冲突代码就零评审直接合入。两个方向此前都无人守。
+  const poolB = (over: Record<string, unknown> = {}) => ({
+    acquire: async (n: TaskNode) => ({ path: `/wt/${n.id}`, branch: `b/${n.id}`, gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: true, merged: true }),
+    release: async () => ({ removed: true }),
+    dispose: async () => ({ kept: [] }),
+    init: async () => ({ ok: true }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
+    integrationPath: '/wt/integration',
+    conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+    refreshFromIntegration: async () => ({ ok: true, updated: false }),
+    mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
+    integrationBranchName: 'efftask/001/integration',
+    ...over,
+  })
+
+  it('人工解决冲突后:跳过验收 = 不开会、不写 acceptLog,并说清没人看过', async () => {
+    const seen: string[] = []
+    const n = root()
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: 'qa' }] } as typeof n.phaseRoles
+    // 人手改完冲突后重入的形态:mergeConflict 还挂着,工作区还在。
+    n.mergeConflict = true
+    n.worktree = { path: '/wt/root', branch: 'b/root', gitRoot: '/repo' } as never
+    const ctx = {
+      ...ctxFor([n], async req => { seen.push(req.phase); return req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```' },
+        { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['accept'] as never }),
+      worktrees: poolB() as never,
+    }
+    await stepExecute(n, ctx)
+    expect(seen).not.toContain('accept')
+    expect(n.acceptLog).toEqual([])
+    expect(n.execStatus).toContain('已跳过')
+  })
+})
+
+describe('两个特性叠加时不能互相踩', () => {
+  const seatsOf = (names: string[]) => names.map(roleName => ({ roleName }))
+
+  it('跳过分析 + 圆桌:一次 plan 调用都不能有(否则并发烧 N+1 次再把结果丢掉)', async () => {
+    const seen: string[] = []
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: seatsOf(['a', 'b', 'c']) } as typeof n.phaseRoles
+    await stepStart(n, ctxFor([n], async req => {
+      seen.push(req.phase)
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        : '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }, { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['plan'] as never,
+        caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
+    expect(seen.filter(p => p === 'plan')).toEqual([])
+    expect(n.kind).toBe('executable')
+    expect(n.plan.alternatives).toBeUndefined()   // 没起草就不该有落选稿
+  })
+
+  it('跳过质疑讨论 + 3 席评审:三个员工一次都不派发', async () => {
+    // 漏掉就是 It²×3 次白花的调用,而名册上他们还坐着。
+    const seen: string[] = []
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), review: seatsOf(['r1', 'r2', 'r3']) } as typeof n.phaseRoles
+    await stepStart(n, ctxFor([n], async req => {
+      seen.push(req.phase)
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        : '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }, { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['review'] as never }))
+    expect(seen.filter(p => p === 'review')).toEqual([])
+    expect(n.reviewLog).toEqual([])
+    expect(n.status).toBe('READY')
+  })
+})
