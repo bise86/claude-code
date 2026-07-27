@@ -7,7 +7,7 @@ import type { LocalJSXCommandCall } from '../../types/command.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from '../../Tool.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
-import { collectRoleDefs } from '../../tools/efftask/roleDefsFromSettings.js'
+import { collectRoleDefs, collectSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
 import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
@@ -25,7 +25,7 @@ import { acquireRunLock, listRuns, releaseRunLock, reserveRun, type RunSummary }
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
-import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
+import type { EffTaskConfig, PhaseName, TaskNode } from '../../tools/efftask/types.js'
 import { applyRootDraft, buildRootPlanNoticeCard, draftRootPlan, makeRootNode, type RootDraft } from '../../tools/efftask/rootPlan.js'
 import { ConfirmRootPlan, type RootPlanDecision } from './ConfirmRootPlan.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
@@ -230,6 +230,11 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     knownStaff: new Set(knownRoles),
     unsupportedStaff: new Set(unsupportedRoles),
   })
+  // 同一层的另一半:efftaskRoles 说「这个环节谁来干」,efftaskSkipSteps 说「这个环节干不干」。
+  // 这个调用点缺了整整一版 —— 函数写好了、六条测试全绿、README 和 roles-setup 都把它写成
+  // 两条录入口之一,而它在生产上一次都没被读过。测试全绿是因为它们直接调函数,没有任何
+  // 东西检查函数**被接上了**。
+  const collectedSkip = collectSkipSteps()
   // Set when the view is torn down rather than exited, so the report can tell the two apart.
   let tornDown = false
   // The handoff, in call()'s OWN scope. onExit runs here, and it used to read `handoffRef` —
@@ -248,7 +253,8 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       // settings.json 里配好的角色定义。读在这里而不是 parseDirectives 里面,是因为那个
       // 文件是纯函数、不碰全局状态,整套解析/合并/展平才能不搭环境地测。
       baseRoleDefs={collectedRoles.defs}
-      baseRoleNotices={collectedRoles.notices}
+      baseRoleNotices={[...collectedRoles.notices, ...collectedSkip.notices]}
+      baseSkipSteps={collectedSkip.steps}
       // The roster must say which model each seat runs on, and that answer lives in the
       // agent definitions + the session model — neither of which parseDirectives can see.
       agentModels={activeAgents}
@@ -448,6 +454,8 @@ type RunnerProps = {
   baseRoleDefs?: RoleDef[]
   /** 读配置文件时产生的诊断 —— 必须并进 cfg.notices,否则关口对配置文件里的错误一言不发。 */
   baseRoleNotices?: string[]
+  /** settings.json 的 efftaskSkipSteps 指定要跳过的环节;和提示词里说的**取并集**。 */
+  baseSkipSteps?: PhaseName[]
   unsupportedRoles: string[]
   agentModels: AgentModelInfo[]
   mainModel: string
@@ -671,7 +679,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: run once per phase entry
   }, [phase, runId])
 
-  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs, baseRoleNotices } = props
+  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs, baseRoleNotices, baseSkipSteps } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
   // call(), which would freeze the terminal with no UI while spending tokens.
   React.useEffect(() => {
@@ -714,6 +722,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 配置文件那条录入口的诊断。放在**最前**:它讲的是用户写在盘上的东西哪里不对,
         // 比运行期的降级更该先看到。也一并落进 run.md —— notices 是持久的。
         if (baseRoleNotices && baseRoleNotices.length > 0) cfg.notices.unshift(...baseRoleNotices)
+        // 两条录入口取**并集**,不是覆盖:配置文件说「一直跳质疑讨论」,提示词说「这次也跳
+        // 验收」,两句都该生效。角色定义那边是覆盖语义(提示词点名了就换人),因为那是
+        // 「谁来干」的单选;跳过是「干不干」的开关,叠加才符合两句话都说过的直觉。
+        if (baseSkipSteps && baseSkipSteps.length > 0) {
+          cfg.skipSteps = [...new Set([...baseSkipSteps, ...(cfg.skipSteps ?? [])])]
+        }
         setConfig(annotateRoleModels(cfg, agentModels, mainModel))
         setPhase('confirm')
       })
@@ -721,7 +735,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return () => {
       cancelled = true
     }
-  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, baseRoleNotices, extractJson, agentModels, mainModel])
+  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, baseRoleNotices, baseSkipSteps, extractJson, agentModels, mainModel])
 
   /**
    * Hand the confirmed run to the orchestrator. ONE definition, because two gates now reach
@@ -867,7 +881,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     }
     setHandoffResult(result)
     setPhase('done')
-  }, [pendingHandoff, runId, effRoot, props.fs])
+    // props.effRoot,不是裸 effRoot:那个绑定只存在于 call() 的作用域,组件里没有。
+  // 依赖数组**每次 render 都求值**,所以裸写它 = EffTaskRunner 第一次渲染就抛
+  // ReferenceError,/et 输入任何内容都只得到一屏红色堆栈,一次模型调用都没有。
+  }, [pendingHandoff, runId, props.effRoot, props.fs])
 
   // ---- 启动关口第三关: 起草根方案 + 首层任务树 (spec §2) ----
   React.useEffect(() => {
@@ -875,7 +892,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // 跳过分析时整个关掉第三关。不关的话:白付一次 plan 调用,而且 stepStart 的守卫
     // 会把用户在这一关批准的首层任务树**整个丢掉**(实测:关口显示 5 个子任务,
     // 用户回车,运行建出 0 个)。这次 run 声明了不要方案,就别再问他确认方案。
-    if ((config?.skipSteps ?? []).includes('plan')) { setPhase('running'); return }
+    // **必须走 startRun**。setPhase('running') 只是把界面翻到运行视图 —— runOrchestrator
+    // 在整个文件里只有 startRun 这一个调用点,绕开它的结果是:界面停在
+    // 「run 004 ✓0 ◐0 ○0 ✗0」永远不动,没有节点、没有报错、也不退出。
+    if ((config?.skipSteps ?? []).includes('plan')) { startRun(approved); return }
     let cancelled = false
     void (async () => {
       const now = new Date().toISOString()
@@ -923,7 +943,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     })
     return () => { cancelled = true }
     // biome-ignore lint/correctness/useExhaustiveDependencies: re-runs per drafting entry
-  }, [phase, approved, redrafts])
+  }, [phase, approved, redrafts, startRun])
 
   /**
    * Settle-once. The other two gates go through raceConfirm, whose claim() is single-shot;

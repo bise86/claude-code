@@ -391,3 +391,77 @@ describe('抽取提示词必须覆盖全部环节', () => {
     expect(await promptText()).not.toContain('那五个之一')
   })
 })
+
+/**
+ * 提示词那条录入口的解析。
+ *
+ * 这一整块之前是**零覆盖**的,代价是:`STEP_ALIASES` 没写进这个文件的 import,于是抽取
+ * 模型只要返回任何非空 `skipSteps` 就抛 `ReferenceError`。efftask.tsx 的 `.catch` 把它
+ * 兜住,回落到「不带抽取模型」那条路 —— 那条路直接返回一份纯默认 config。用户说的
+ * 并行数、门槛、席位、角色定义**全部消失**,notices 是空的,关口一个字都不解释。
+ * 全量 1384 条测试当时是全绿的。
+ */
+describe('parseDirectives:跳过环节(唯一的提示词入口)', () => {
+  const P = (skipSteps: unknown, extra: Record<string, unknown> = {}) =>
+    parseDirectives('干活', { knownRoles: [], modelJson: async () => JSON.stringify({ skipSteps, ...extra }) })
+
+  it('中文环节名归一成内部名', async () => {
+    expect((await P(['质疑讨论', '验收'])).skipSteps).toEqual(['review', 'accept'])
+  })
+  it('英文名直接收下,大小写敏感', async () => {
+    expect((await P(['review', 'observer'])).skipSteps).toEqual(['review', 'observer'])
+  })
+  it('旧名「集成提交」仍然认', async () => {
+    expect((await P(['集成提交'])).skipSteps).toEqual(['integrate'])
+  })
+  it('七个环节每一个都跳得掉 —— 没有哪个是特殊的', async () => {
+    for (const p of PHASE_NAMES) expect((await P([p])).skipSteps).toEqual([p])
+  })
+  it('去重,且空串/非字符串被忽略', async () => {
+    expect((await P(['验收', 'accept', '', '  ', 42, null])).skipSteps).toEqual(['accept'])
+  })
+  it('环节名写错 → 不跳,给 notice 并猜一个最接近的', async () => {
+    const cfg = await P(['测试'])
+    expect(cfg.skipSteps).toBeUndefined()
+    expect(cfg.notices.join('\n')).toContain('是不是想写「测试验证」')
+  })
+  it('没说跳过时 skipSteps 不出现,也不报噪音', async () => {
+    const cfg = await parseDirectives('干活', { knownRoles: [], modelJson: async () => '{"parallelism":3}' })
+    expect(cfg.skipSteps).toBeUndefined()
+    expect(cfg.notices).toEqual([])
+  })
+  it('**跳过解析不能拖垮整份配置** —— 同一份 JSON 里的其它指令必须都活着', async () => {
+    // 这正是 STEP_ALIASES 那个 ReferenceError 的实际杀伤方式:它不是「跳过没生效」,
+    // 而是**整条提示词的所有指令一起消失**。
+    const cfg = await parseDirectives('干活', {
+      knownRoles: ['arch'],
+      modelJson: async () => JSON.stringify({
+        skipSteps: ['质疑讨论'], parallelism: 8,
+        phaseRoles: { plan: ['arch'] }, caps: { maxIterations: 5, planConverge: '圆桌' },
+      }),
+    })
+    expect(cfg.skipSteps).toEqual(['review'])
+    expect(cfg.parallelism).toBe(8)
+    expect(cfg.phaseRoles.plan).toEqual([{ roleName: 'arch' }])
+    expect(cfg.caps.maxIterations).toBe(5)
+    expect(cfg.caps.planConverge).toBe('圆桌')
+  })
+})
+
+/** 分析环节的收敛方式 —— 删掉这个夹取,整个方案融合特性在生产上不可达,而它的十条测试一条不红。 */
+describe('parseDirectives:planConverge', () => {
+  const C = (planConverge: unknown) =>
+    parseDirectives('干活', { knownRoles: [], modelJson: async () => JSON.stringify({ caps: { planConverge } }) })
+
+  it('圆桌 / 精化 都收下', async () => {
+    expect((await C('圆桌')).caps.planConverge).toBe('圆桌')
+    expect((await C('精化')).caps.planConverge).toBe('精化')
+  })
+  it('不认识的值回落 undefined(= 默认精化),并且**说出来**', async () => {
+    // 静默回落最糟:用户说了「分析用 roundtable」,系统跑精化,关口和 notices 都不吭声,
+    // 没有任何界面能让他发现。
+    const cfg = await C('roundtable')
+    expect(cfg.caps.planConverge).toBeUndefined()
+    expect(cfg.notices.join('\n')).toContain('planConverge')
+  })
+})

@@ -1,5 +1,5 @@
 // src/tools/efftask/parseDirectives.ts
-import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES, PHASE_LABEL } from './types.js'
+import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 import { applyRoleDefsToPhases, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
@@ -154,8 +154,13 @@ export async function parseDirectives(
   if (caps.maxSeatsPerPhase !== undefined) c.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
   if (caps.quorum !== undefined) c.quorum = clampInt(caps.quorum, 1, 100, 100)
   if (caps.quorumSeats !== undefined) c.quorumSeats = clampInt(caps.quorumSeats, 1, 20, 1)
-  // 只收这两个值,别的写法(roundtable/refine/乱写)一律回落默认的精化。
+  // 只收这两个值,别的写法(roundtable/refine/乱写)一律回落默认的精化 —— 但**必须说出来**。
+  // 静默回落是这里最坏的形态:用户说了「分析用 roundtable」,系统跑精化,关口在两种模式下
+  // 逐字相同,notices 是空的,没有任何界面能让他发现自己要的模式没生效。
   if (caps.planConverge === '圆桌' || caps.planConverge === '精化') c.planConverge = caps.planConverge
+  else if (caps.planConverge !== undefined) {
+    base.notices.push(`分析环节的收敛方式(planConverge)「${String(caps.planConverge)}」不是 圆桌/精化 之一,本次按默认的顺序精化跑`)
+  }
   base.caps = c
 
   // 提示词里定义的角色,合并到配置文件那一层之上。放在 phaseRoles 解析**之后**,因为

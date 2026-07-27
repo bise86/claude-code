@@ -143,14 +143,21 @@ describe('角色定义的接线', () => {
   })
 
   it('baseRoleDefs 在 effect 依赖里 —— 否则它变了也不会重新解析', () => {
-    expect(SRC).toContain('baseRoleDefs, baseRoleNotices, extractJson, agentModels, mainModel]')
+    // 钉整串依赖的字面量会让「往数组里再加一项」变成一次假红。改成逐项断言:
+    // 每个进解析的 prop 都必须在依赖里,加新 prop 时这条会诚实地要求你也加进去。
+    const deps = SRC.match(/\}, \[args, knownRoles[^\]]*\]\)/)?.[0] ?? ''
+    for (const d of ['baseRoleDefs', 'baseRoleNotices', 'baseSkipSteps', 'extractJson', 'agentModels', 'mainModel']) {
+      expect(`${d} 在依赖里: ${deps.includes(d)}`).toBe(`${d} 在依赖里: true`)
+    }
   })
 
   it('配置文件那条录入口的诊断被接住并并进 notices', () => {
     // 剪断它:员工名打错一个字 → 关口显示「架构师←主模型」,看起来像「我配的就是主模型
     // 兼任」,而解释这件事的那句话被丢了。同样的错写在提示词里则会正常显示 —— 两条录入口
     // 不对称,而这一条是静默的那一条。
-    expect(element('EffTaskRunner')).toContain('baseRoleNotices={collectedRoles.notices}')
+    // 两条录入口的诊断都要接住:角色定义的,和跳过环节的。
+    const el = element('EffTaskRunner')
+    expect(el).toContain('baseRoleNotices={[...collectedRoles.notices, ...collectedSkip.notices]}')
     expect(SRC).toContain('cfg.notices.unshift(...baseRoleNotices)')
   })
 })
@@ -205,7 +212,13 @@ describe('环节跳过的接线', () => {
   it('跳过分析时整个关掉第三关', () => {
     // 剪断它:白付一次 plan 调用,而且 stepStart 的守卫会把用户在这一关批准的首层任务树
     // 整个丢掉 —— 关口显示 5 个子任务,用户回车,运行建出 0 个。
-    expect(SRC).toContain("if ((config?.skipSteps ?? []).includes('plan')) { setPhase('running'); return }")
+    //
+    // 这条断言原先钉的是 `setPhase('running')`,而那正是 bug 本身:runOrchestrator 在整个
+    // 文件里只有 startRun 一个调用点,setPhase 只翻界面不启动编排器,run 永远停在
+    // 「✓0 ◐0 ○0 ✗0」。把 bug 钉进闸门之后,改对反而变红。所以这里断的是**必须经过
+    // startRun**,并显式挡住只翻界面的写法。
+    const line = SRC.split('\n').find(l => l.includes("skipSteps ?? []).includes('plan')")) ?? ''
+    expect(`跳过分析这一行: ${line.trim()}`).toBe("跳过分析这一行: if ((config?.skipSteps ?? []).includes('plan')) { startRun(approved); return }")
   })
 
   it('关口编辑器拿得到被跳过的环节', () => {
