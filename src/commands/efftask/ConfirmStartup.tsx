@@ -4,7 +4,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, costLine, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, costLine, skipConflictLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -55,6 +55,7 @@ export function ConfirmStartup(props: {
     // ——实测整个关口渲染成一屏红色堆栈。
     Object.fromEntries(PHASE_NAMES.map(p => [p, [...(props.config.phaseRoles[p] ?? [])]])) as Record<PhaseName, RoleBinding[]>,
   )
+  const [skip, setSkip, skipRef] = useLiveState<PhaseName[]>(props.config.skipSteps ?? [])
   const [editing, setEditing, editingRef] = useLiveState(false)
   const [phaseIdx, setPhaseIdx, phaseRef] = useLiveState(0)
   const [roleIdx, setRoleIdx, roleRef] = useLiveState(0)
@@ -77,6 +78,10 @@ export function ConfirmStartup(props: {
         if (key.rightArrow || input === 'l') { setRoleIdx((roleRef.current + 1) % available.length); return }
         if (input === ' ') {
           const name = available[roleRef.current]
+          // 给一个被跳过的环节勾人 = 取消它的跳过。最符合直觉:我给它派人了,当然要跑。
+          // 不这么做的话,那一行的复选框就是「配得进去、永远不生效」。
+          const ph = PHASE_NAMES[phaseRef.current]
+          if (skipRef.current.includes(ph)) setSkip(skipRef.current.filter(x => x !== ph))
           setRoster(toggleRole(rosterRef.current, PHASE_NAMES[phaseRef.current], name, props.roleModel?.(name), props.config.caps.maxSeatsPerPhase))
           setEdited(true)
           props.onEdited?.()
@@ -109,10 +114,19 @@ export function ConfirmStartup(props: {
       <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: props.isolation })}</Text>
       <Text bold>角色名册{editing ? '(编辑中)' : ''}:</Text>
       {editing
-        ? rosterEditorLines(roster, available, phaseIdx, roleIdx).map((line, i) => (
+        ? rosterEditorLines(roster, available, phaseIdx, roleIdx, undefined, skipRef.current).map((line, i) => (
           <Text key={`ed-${i}`}>{'  '}{line}</Text>
         ))
         : rosterLines(shown).map(line => <Text key={line}>  {line}</Text>)}
+      {/* 自己的块。塞进 notices 是错的 —— 那个块的标题是「你的请求中有以下部分**不会
+          生效**」,而跳过是**生效了**的。把降质动作塞进那个标题下面,和把隔离降级塞
+          进去是同一个错。 */}
+      {skipConflictLines(props.config).length > 0 && (
+        <Box flexDirection="column">
+          <Text color="error">以下配置组合会让任务跑不完:</Text>
+          {skipConflictLines(props.config).map(l => <Text key={l} color="error">  · {l}</Text>)}
+        </Box>
+      )}
       {noticeLines(props.config).length > 0 && (
         <Box flexDirection="column">
           <Text color="warning">你的请求中有以下部分不会生效:</Text>

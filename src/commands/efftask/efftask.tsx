@@ -872,6 +872,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // ---- 启动关口第三关: 起草根方案 + 首层任务树 (spec §2) ----
   React.useEffect(() => {
     if (phase !== 'drafting' || !approved) return
+    // 跳过分析时整个关掉第三关。不关的话:白付一次 plan 调用,而且 stepStart 的守卫
+    // 会把用户在这一关批准的首层任务树**整个丢掉**(实测:关口显示 5 个子任务,
+    // 用户回车,运行建出 0 个)。这次 run 声明了不要方案,就别再问他确认方案。
+    if ((config?.skipSteps ?? []).includes('plan')) { setPhase('running'); return }
     let cancelled = false
     void (async () => {
       const now = new Date().toISOString()

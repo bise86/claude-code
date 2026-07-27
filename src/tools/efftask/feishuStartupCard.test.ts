@@ -88,3 +88,19 @@ describe('收口卡片:不可逆动作不上卡', () => {
     expect(text()).toContain('3 个提交')
   })
 })
+
+describe('组合警告两端都要有', () => {
+  it('飞书卡带上和终端同一批组合警告', () => {
+    // 竞速器的前提是两端说同一件事:终端拦住的组合,从飞书批准的人也必须看到。
+    const cfg = {
+      goalPrompt: 'g', parallelism: 5, notices: [], mainModel: 'm',
+      caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 1 },
+      phaseRoles: { plan: [], review: [], execute: [], verify: [], accept: [], integrate: [], observer: [] },
+      skipSteps: ['execute'],
+    }
+    const card = buildStartupCard(cfg as never, 'req-1') as { elements: { text?: { content: string } }[] }
+    const text = card.elements.map(e => e.text?.content ?? '').join('\n')
+    expect(text).toContain('跑不完')
+    expect(text).toContain('验收根本跑不到')
+  })
+})

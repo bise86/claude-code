@@ -198,3 +198,20 @@ describe('测试验证的工具池接线', () => {
     expect(SRC).toContain('verifyTools: verifyToolPool(context.options.tools)')
   })
 })
+
+describe('环节跳过的接线', () => {
+  it('跳过分析时整个关掉第三关', () => {
+    // 剪断它:白付一次 plan 调用,而且 stepStart 的守卫会把用户在这一关批准的首层任务树
+    // 整个丢掉 —— 关口显示 5 个子任务,用户回车,运行建出 0 个。
+    expect(SRC).toContain("if ((config?.skipSteps ?? []).includes('plan')) { setPhase('running'); return }")
+  })
+
+  it('关口编辑器拿得到被跳过的环节', () => {
+    // 拿不到的话,被跳过那一行照常显示复选框,用户勾了人什么都不会发生。
+    expect(SRC).toContain('rosterEditorLines(roster, available, phaseIdx, roleIdx, undefined, skipRef.current)')
+  })
+
+  it('给被跳过的环节勾人 = 取消跳过', () => {
+    expect(SRC).toContain('if (skipRef.current.includes(ph)) setSkip(skipRef.current.filter(x => x !== ph))')
+  })
+})

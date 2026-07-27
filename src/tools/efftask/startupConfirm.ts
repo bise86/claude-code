@@ -128,6 +128,8 @@ export const ROSTER_WINDOW = 6
 export function rosterEditorLines(
   roster: Record<PhaseName, RoleBinding[]>, available: string[], phaseIdx: number, roleIdx: number,
   window = ROSTER_WINDOW,
+  /** 被跳过的环节 —— 编辑器要标出来,否则勾了人什么都不会发生。 */
+  skipped?: PhaseName[],
 ): string[] {
   return PHASE_NAMES.map((p, i) => {
     const seatsHere = roster[p] ?? []
@@ -141,6 +143,9 @@ export function rosterEditorLines(
       .map(r => `${clip(r.roleTag!, 12)}←${clip(r.roleName || '主模型', 14)}`)
     const label = PHASE_LABEL[p]
     const empty = seatsHere.length === 0 ? (p === 'observer' ? ' (不评分)' : ' (主模型)') : ''
+    // 被跳过的环节照常显示复选框会是又一处「配得进去、永远不生效」:用户勾了人,
+    // 什么都不会发生。标出来,并说明勾选即恢复(命令侧据此把它移出 skipSteps)。
+    const skipMark = (skipped ?? []).includes(p) ? '(已跳过,勾选任一员工即恢复)' : ''
     const lockedPrefix = locked.length > 0 ? `〔角色定义:${locked.join('、')}〕` : ''
     const seats = MULTI_ROLE_PHASES.has(p) ? '' : '(单选)'
     if (available.length === 0) {
@@ -165,7 +170,7 @@ export function rosterEditorLines(
     const hiddenAfter = available.length - (from + shown.length)
     // Count what is off-screen. A window that silently shows a slice looks like the whole list.
     const more = [hiddenBefore > 0 ? `←${hiddenBefore}` : '', hiddenAfter > 0 ? `→${hiddenAfter}` : ''].filter(Boolean).join(' ')
-    return `${i === phaseIdx ? '▶' : ' '} ${label}${seats}${empty}: ${lockedPrefix}${cells.join(' ')}${more ? ' ' + more : ''}`
+    return `${i === phaseIdx ? '▶' : ' '} ${label}${seats}${empty}${skipMark}: ${lockedPrefix}${cells.join(' ')}${more ? ' ' + more : ''}`
   })
 }
 
@@ -199,11 +204,49 @@ export function dispatchableRoles(known: string[], unsupported: string[]): strin
   return known.filter(r => !bad.has(r))
 }
 
+/** 每个环节被跳过之后**实际会发生什么**。写后果,不写「已跳过」。 */
+const SKIP_CONSEQUENCE: Record<PhaseName, string> = {
+  plan: '(已跳过 —— 不出方案、不主动拆子任务,节点直接照目标开工)',
+  review: '(已跳过 —— 方案没人质疑就进执行,漏项和隐藏依赖不会在这里被拦下)',
+  execute: '(已跳过 —— 没有人改代码,本次不会产生任何提交)',
+  verify: '(已跳过 —— 不实跑测试,验收只能读执行者的自述)',
+  accept: '(已跳过 —— 没人核对验收点,产出未经判断就合进集成分支)',
+  integrate: '(已跳过 —— 子任务各自通过就算父任务达成,当初拆漏了不会再有人发现)',
+  observer: '(已跳过 —— 不打分,低分触发的那一轮返工不会发生)',
+}
+
+/**
+ * 会让任务跑不完的**配置组合**。
+ *
+ * 单独一个块,不塞进 notices —— 那个块的标题是「你的请求中有以下部分**不会生效**」,
+ * 而跳过是**生效了**的。把一个降质动作塞进那个标题下面,和把隔离降级塞进去是同一个错。
+ */
+export function skipConflictLines(config: EffTaskConfig): string[] {
+  const skip = new Set(config.skipSteps ?? [])
+  const out: string[] = []
+  if (skip.has('execute') && !skip.has('accept')) {
+    out.push('跳过了执行但没跳验收:节点会在执行环节连报 3 轮空产出后阻断,验收根本跑不到。请一并跳过验收。')
+  }
+  if (skip.has('plan') && !skip.has('review')) {
+    out.push('跳过了分析但没跳质疑讨论:评审席位会去评一份空方案,大概率判不通过并烧完迭代。建议一并跳过质疑讨论。')
+  }
+  if (skip.size >= PHASE_NAMES.length) {
+    out.push('七个环节全部跳过:本次不会有任何模型调用,也不会有任何代码改动。确认要空跑吗?')
+  }
+  if (skip.has('plan')) {
+    out.push('跳过分析 = 本次不主动拆子任务,任务树基本只有根节点(执行者仍可动态加),深度与节点数上限因此失去意义。')
+  }
+  return out
+}
+
 export function rosterLines(config: EffTaskConfig): string[] {
   return PHASE_NAMES.map(p => {
     // Scoring is OPT-IN: with no observer role nothing scores, and it does NOT fall back to
     // the main model the way the other phases do. Saying 主模型 here would promise a scorer
     // that never runs.
+    // 跳过要写出**后果**,不只是「已跳过」。这是降低质量保证的动作,而关口存在的意义
+    // 就是让用户在批准前知道自己批准了什么。
+    if ((config.skipSteps ?? []).includes(p)) return `${PHASE_LABEL[p]}: ${SKIP_CONSEQUENCE[p]}`
     // 三个环节在**没配角色**时不会回落到主模型,说「主模型」就是承诺一件不会发生的事。
     // 这三条各自的真实行为不同,所以文案也不同 —— 统一说「未配置」同样是含糊其辞。
     if ((config.phaseRoles[p] ?? []).length === 0) {
@@ -438,7 +481,10 @@ export function parallelismLine(
  */
 export function capsLine(config: EffTaskConfig): string {
   const c = config.caps
-  const score = c.scoreThreshold === undefined
+  // 跳过观察时,评分整个不发生 —— 再说「评分低于 N 触发返工」就是承诺一件不会发生的事。
+  const scoringOff = (config.skipSteps ?? []).includes('observer')
+  const score = scoringOff ? '观察已跳过,不评分'
+    : c.scoreThreshold === undefined
     ? '评分不触发返工'
     : `评分低于 ${c.scoreThreshold} 触发一轮返工`
   // 全票是默认;不是全票就必须说出来,这条直接改变「什么算通过」。
@@ -464,12 +510,18 @@ export function capsLine(config: EffTaskConfig): string {
 export function costLine(config: EffTaskConfig): string {
   const c = config.caps
   const seats = (p: PhaseName) => (config.phaseRoles[p] ?? []).length
+  // 被跳过的环节一次调用都没有。Math.max(1, seats) 的语义是「没配角色也跑一次主模型」,
+  // 跳过时必须绕过它 —— 不绕的话关口高估,用户会去调一个根本不需要调的旋钮。
+  const skip = new Set(config.skipSteps ?? [])
+  const on = (ph: PhaseName, n: number) => (skip.has(ph) ? 0 : n)
   const It = Math.max(1, c.maxIterations)
   // 方案阶段是**顺序精化**:每一席都是一次串行调用(runPlanRefinement)。写死 1 的话,
   // 配 4 个方案员工在关口上是免费的 —— 而那正是精化要用户知道的代价。
-  const P = Math.max(1, seats('plan'))
-  const R = Math.max(1, seats('review'))
-  const A = Math.max(1, seats('accept'))
+  // 圆桌模式多一次融合调用(只在 ≥2 席时)。
+  const planSeats = Math.max(1, seats('plan'))
+  const P = on('plan', c.planConverge === '圆桌' && seats('plan') > 1 ? planSeats + 1 : planSeats)
+  const R = on('review', Math.max(1, seats('review')))
+  const A = on('accept', Math.max(1, seats('accept')))
   // 圆桌**自己**还有一层 infra 重试循环(roundtableWithInfraRetry 最多跑 maxIterations 桌),
   // 所以是 It 的平方,不是一次方。漏掉它会低估约 2.5 倍 —— 实测 1 评审席 + 2 验收席、
   // It=3 时真实 23 次而关口承诺 15 次。低估比高估糟:用户按一个偏小的数批准。
@@ -478,12 +530,12 @@ export function costLine(config: EffTaskConfig): string {
   // 而不是 Math.max(1, …) —— 照抄 accept 的写法会让默认配置的关口数字凭空涨一截,
   // 而实际一次调用都不会有。关口高估同样是撒谎,只是方向相反(用户会去调一个根本不
   // 需要调的旋钮)。
-  const V = seats('verify')
+  const V = on('verify', seats('verify'))
   // 打分在**每一次验收通过后**都跑,而返工循环可以让验收通过多次。
-  const execPhase = It * (1 + (V > 0 ? It * V : 0) + It * A + seats('observer'))
+  const execPhase = It * (on('execute', 1) + (V > 0 ? It * V : 0) + It * A + on('observer', seats('observer')))
   // 集成提交:拆分型节点在子任务全部完成后的那一场,同样有自己的 infra 重试层。
   // 没配就回落到验收席位,不额外计数。
-  const integratePhase = It * It * seats('integrate')
+  const integratePhase = on('integrate', It * It * seats('integrate'))
   const perNode = planPhase + execPhase + integratePhase
   const worst = perNode * c.maxNodes
   return `预估上限 ${worst} 次模型调用(每节点最多 ${perNode} 次 × 节点上限 ${c.maxNodes};实际通常远低于此);并发上限仍是 ${config.parallelism}`

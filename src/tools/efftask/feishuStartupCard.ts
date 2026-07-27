@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig, PendingHandoff } from './types.js'
-import { capsLine, costLine, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { capsLine, costLine, skipConflictLines, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -44,6 +44,10 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
     `**角色名册**:\n${rosterLines(config).map(l => `- ${l}`).join('\n')}` +
     // The roster says who WILL run; this says whose request was dropped and why. Without it
     // the card would answer the user's "确认有多少角色、各自承担什么" with a half-truth.
+    // 竞速器的前提是两端说同一件事:终端拦住的组合,卡片也必须拦。
+    (skipConflictLines(config).length > 0
+      ? `\n\n**以下配置组合会让任务跑不完**:\n${skipConflictLines(config).map(l => `- ${l}`).join('\n')}`
+      : '') +
     (noticeLines(config).length > 0
       ? `\n\n**以下请求不会生效**:\n${noticeLines(config).map(l => `- ${l}`).join('\n')}`
       : '') +

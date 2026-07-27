@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, skipConflictLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -886,5 +886,103 @@ describe('关口不能对没配角色的环节撒谎', () => {
     for (const label of ['分析', '质疑讨论', '执行', '验收']) {
       expect(`${label}:${row(mk(), label).includes('主模型')}`).toBe(`${label}:true`)
     }
+  })
+})
+
+describe('关口:跳过要说出后果,组合要拦住', () => {
+  const mk = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], mainModel: 'm', ...over,
+  })
+  const row = (c: EffTaskConfig, label: string) => rosterLines(c).find(l => l.startsWith(label))!
+
+  it('每个被跳过的环节都写出后果,不是只写「已跳过」', () => {
+    for (const [ph, label, must] of [
+      ['plan', '分析', '不主动拆子任务'], ['review', '质疑讨论', '不会在这里被拦下'],
+      ['execute', '执行', '不会产生任何提交'], ['verify', '测试验证', '读执行者的自述'],
+      ['accept', '验收', '未经判断就合进集成分支'], ['integrate', '集成验收', '拆漏了'],
+      ['observer', '观察', '不打分'],
+    ] as const) {
+      const line = row(mk({ skipSteps: [ph] as never }), label)
+      expect(`${ph}:${line.includes('已跳过')}`).toBe(`${ph}:true`)
+      expect(`${ph}:${line.includes(must)}`).toBe(`${ph}:true`)
+    }
+  })
+
+  it('跳过的环节不再显示「主模型」—— 那是承诺一件不会发生的事', () => {
+    expect(row(mk({ skipSteps: ['accept'] as never }), '验收')).not.toContain('主模型(')
+  })
+
+  it('没跳过时名册照旧', () => {
+    expect(row(mk(), '验收')).toContain('主模型')
+  })
+
+  it('跳过执行不跳验收 → 拦住,并说清验收根本跑不到', () => {
+    const t = skipConflictLines(mk({ skipSteps: ['execute'] as never })).join('\n')
+    expect(t).toContain('验收根本跑不到')
+  })
+
+  it('跳过分析不跳质疑讨论 → 拦住', () => {
+    expect(skipConflictLines(mk({ skipSteps: ['plan'] as never })).join('\n')).toContain('评一份空方案')
+  })
+
+  it('七个全跳 → 说清是空跑', () => {
+    const all = ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer']
+    expect(skipConflictLines(mk({ skipSteps: all as never })).join('\n')).toContain('不会有任何模型调用')
+  })
+
+  it('两个都跳时不再报那条组合警告', () => {
+    const t = skipConflictLines(mk({ skipSteps: ['execute', 'accept'] as never })).join('\n')
+    expect(t).not.toContain('验收根本跑不到')
+  })
+
+  it('什么都不跳 → 没有警告', () => {
+    expect(skipConflictLines(mk())).toEqual([])
+  })
+
+  it('跳过观察时,安全阀行不再承诺一个不会发生的返工', () => {
+    const line = capsLine(mk({ skipSteps: ['observer'] as never, caps: { ...DEFAULT_CAPS, scoreThreshold: 60 } }))
+    expect(line).not.toContain('触发一轮返工')
+    expect(line).toContain('观察已跳过')
+  })
+
+  it('成本:被跳过的环节归零', () => {
+    const n = (c: EffTaskConfig) => Number(costLine(c).match(/每节点最多 (\d+) 次/)![1])
+    expect(n(mk())).toBe(24)
+    expect(n(mk({ skipSteps: ['review'] as never }))).toBeLessThan(24)
+    expect(n(mk({ skipSteps: ['execute'] as never }))).toBeLessThan(24)
+    // 七个全跳 = 一次调用都没有。
+    const all = ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer']
+    expect(n(mk({ skipSteps: all as never }))).toBe(0)
+  })
+
+  it('成本:圆桌模式在 ≥2 席时多一次融合,单席位不变', () => {
+    const n = (c: EffTaskConfig) => Number(costLine(c).match(/每节点最多 (\d+) 次/)![1])
+    const three = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
+    const refine = n(mk({ phaseRoles: three }))
+    const table = n(mk({ phaseRoles: three, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' } }))
+    expect(table - refine).toBe(DEFAULT_CAPS.maxIterations)
+    // 单席位两种模式相同 —— 没有第二份稿可融合。
+    expect(n(mk({ caps: { ...DEFAULT_CAPS, planConverge: '圆桌' } }))).toBe(24)
+  })
+})
+
+describe('编辑器要标出被跳过的环节', () => {
+  it('被跳过的那一行说明勾选即恢复', () => {
+    // 不标的话那一行的复选框就是「配得进去、永远不生效」:用户勾了人,什么都不会发生。
+    const lines = rosterEditorLines(emptyPhaseRoles() as never, ['a'], 0, 0, undefined, ['review'])
+    const row = lines.find(l => l.includes('质疑讨论'))!
+    expect(row).toContain('已跳过')
+    expect(row).toContain('勾选任一员工即恢复')
+  })
+
+  it('没跳过的行不加这个标记', () => {
+    const lines = rosterEditorLines(emptyPhaseRoles() as never, ['a'], 0, 0, undefined, ['review'])
+    expect(lines.find(l => l.includes('分析'))!).not.toContain('已跳过')
+  })
+
+  it('不传 skipped 时行为不变', () => {
+    const lines = rosterEditorLines(emptyPhaseRoles() as never, ['a'], 0, 0)
+    expect(lines.join('\n')).not.toContain('已跳过')
   })
 })

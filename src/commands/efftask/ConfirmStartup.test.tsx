@@ -394,3 +394,22 @@ describe('ConfirmStartup 要显示多对多的代价', () => {
     expect(lastFrame()).toContain('席位赞成')
   })
 })
+
+describe('ConfirmStartup 要拦住跑不完的组合', () => {
+  it('组合警告画在终端上,而且不混进「不会生效」那一块', async () => {
+    const { stdin, stdout, lastFrame } = fakeTty()
+    await render(
+      React.createElement(ConfirmStartup, {
+        config: { ...config, skipSteps: ['execute'] as never },
+        onDecision: () => {},
+      }),
+      // biome-ignore lint/suspicious/noExplicitAny: fake TTY streams for a headless render
+      { stdin: stdin as any, stdout: stdout as any, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    const f = lastFrame()
+    expect(f).toContain('跑不完')
+    // 跳过是**生效了**的,不该出现在「你的请求中有以下部分不会生效」下面。
+    expect(f).not.toContain('不会生效')
+  })
+})
