@@ -122,7 +122,7 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
 
   it('运行中的面板拿到了输出缓冲和并行占用 (spec §10.1 / §10.2)', () => {
     // 这两条是 efftask.tsx 历史上真的被剪断过的线,注释里点名的"上两个特性"。
-    expect(SRC).toMatch(/<RunningView[^>]*\bchunks=\{chunks\.current\}/)
+    expect(SRC).toMatch(/<RunningView[^>]*\bstreams=\{streams\.current\}/)
     expect(SRC).toMatch(/<RunningView[^>]*\bpool=\{/)
   })
 
@@ -139,7 +139,10 @@ describe('角色定义的接线', () => {
   it('读进来的角色定义传给了 parseDirectives —— 两条调用路径都要传', () => {
     // parseDirectives 在这里被调两次:正常一次、抽取失败兜底一次。只在正常那次传,
     // 抽取失败(最常走到的退化路径)就会静默丢掉全部配置文件角色。
-    expect(occurrences('baseRoleDefs, modelJson: extractJson')).toBe(1)
+    // 锚点不再钉 `modelJson: extractJson` 的字面量:抽取那一次现在还要把自己的实时窗口
+    // 递进去(那一屏是用户敲完 /et 看到的第一屏,背后跑着一次真实模型调用)。钉住的是
+    // 「正常那条路径确实带了 baseRoleDefs 且确实传了 modelJson」。
+    expect(occurrences('baseRoleDefs, modelJson:')).toBe(1)
     expect(occurrences('unsupportedRoles, baseRoleDefs }')).toBe(1)
   })
 
@@ -292,5 +295,87 @@ describe('工具档位:非执行环节要拿得到 MCP,但拿不到写工具', (
     expect(SRC).toContain('verifyTools: verifyToolPool(context.options.tools)')
     // 执行档必须还是全量 —— 少给了执行者就改不了代码。
     expect(SRC).toContain('availableTools: context.options.tools, // execute phase only')
+  })
+})
+
+/**
+ * 实时窗口的每一跳 (spec 2026-07-27)。
+ *
+ * 这个特性的数据流有**五跳**:efftask.tsx → runOrchestrator → orchestrator → PipelineCtx →
+ * 调用点。orchestrator.ts 自己的注释记着,前两个走这条路的回调(onEscalate、onBlocked)
+ * 各自在 PipelineCtx 和 runOrchestrator 上都声明了、却漏在中间那一跳,于是在**每一次真实
+ * 运行里都是死的**,而它们的单元测试全绿地跨过了那道断口。这个仓库没有 typecheck,漏一跳
+ * 不会报错,只会全空。
+ */
+describe('子 agent 实时窗口:五跳都要接上', () => {
+  const ORCH = readFileSync(new URL('../../tools/efftask/orchestrator.ts', import.meta.url), 'utf8')
+  const RUNNER = readFileSync(new URL('./runOrchestrator.ts', import.meta.url), 'utf8')
+  const PIPE = readFileSync(new URL('../../tools/efftask/pipeline.ts', import.meta.url), 'utf8')
+  const ADAPTER = readFileSync(new URL('../../tools/efftask/runAgentAdapter.ts', import.meta.url), 'utf8')
+
+  it('efftask.tsx 建了 store 并把 openStream 交给编排器', () => {
+    expect(SRC).toContain('createStreamStore()')
+    expect(SRC).toContain('openStream: meta => streams.current.open(meta)')
+  })
+
+  it('runOrchestrator 那一跳 —— 上两个特性就是漏在这一层的邻居', () => {
+    expect(`runOrchestrator 声明了: ${RUNNER.includes("openStream?: PipelineCtx['openStream']")}`)
+      .toBe('runOrchestrator 声明了: true')
+    expect(`runOrchestrator 透传了: ${RUNNER.includes('openStream: args.openStream')}`)
+      .toBe('runOrchestrator 透传了: true')
+  })
+
+  it('orchestrator 那一跳', () => {
+    expect(`orchestrator 声明了: ${ORCH.includes("openStream?: PipelineCtx['openStream']")}`)
+      .toBe('orchestrator 声明了: true')
+    expect(`orchestrator 透传了: ${ORCH.includes('openStream: this.deps.openStream')}`)
+      .toBe('orchestrator 透传了: true')
+  })
+
+  it('runPhase 的每一个调用点都自报环节名和署名', () => {
+    // 分析圆桌 N 席、方案融合席、方案精化 N 席、观察评分 N 席全都走 runPhase,不走圆桌。
+    // 少给一个署名,这些席位就退回「几个人的话并成一坨、看不出谁说的」——正是要治的病。
+    const calls = PIPE.split('runPhase(ctx,').length - 1
+    expect(`runPhase 调用点: ${calls}`).toBe('runPhase 调用点: 6')
+    // 每一处都得带 phaseLabel;数量对不上说明有人加了调用点却没给窗口。
+    const labeled = PIPE.split('phaseLabel:').length - 1
+    expect(`带 phaseLabel 的位置: ${labeled >= 7}`).toBe('带 phaseLabel 的位置: true')
+    for (const one of ['解决合并冲突', '方案融合', '方案精化']) {
+      expect(`${one} 有自己的表头: ${PIPE.includes(`'${one}'`)}`).toBe(`${one} 有自己的表头: true`)
+    }
+  })
+
+  it('集成验收不套用「验收」的表头', () => {
+    // 它走的是 phase:'accept'(只有 system 是 'integrate')。按 phase 取名会把整个 run 的
+    // 最终裁决标成「验收」,和 node.md 里分开记的两份记录对不上。
+    expect(`集成验收显式给了表头: ${PIPE.includes('phaseLabel: PHASE_LABEL.integrate')}`)
+      .toBe('集成验收显式给了表头: true')
+  })
+
+  it('收口在 adapter 的 finally —— 唯一一个所有模型调用必经的点', () => {
+    // 放在圆桌里的话,走 runPhase 的六处加根方案全都不会收口:表头永远停在「运行中」,
+    // 而且这些流永远不进可淘汰集合,内存上限对它们直接失效。
+    const fin = ADAPTER.slice(ADAPTER.lastIndexOf('} finally {'))
+    expect(`finally 里收口: ${fin.includes('req.stream?.end(')}`).toBe('finally 里收口: true')
+    // 已中断的早退路径绕过 finally,它得自己收。
+    expect(`早退路径也收口: ${ADAPTER.includes("req.stream?.end('已中断')")}`).toBe('早退路径也收口: true')
+  })
+
+  it('树外那两次模型调用也有窗口 —— 「每一次模型调用」不能少算它们', () => {
+    // 「正在解析需求…」是用户敲完 /et 看到的第一屏;「正在起草根方案…」是整个运行里最长的
+    // 单次调用之一。两者背后都是真实模型调用,此前都是纯黑屏。
+    expect(SRC).toContain("phaseLabel: '需求解析'")
+    expect(SRC).toContain("phaseLabel: '根方案'")
+    expect(SRC).toContain('<ParsingView onCancel={bail} log={preStreams()} />')
+    expect(SRC).toContain('log={preStreams()}')
+  })
+
+  it('resume 回来的节点被标成历史 —— 空窗口 ≠ 什么都没干', () => {
+    expect(SRC).toContain('streams.current.markHistorical(')
+  })
+
+  it('工具摘要接到了工具自己的 userFacingName', () => {
+    expect(SRC).toContain('briefResolver:')
+    expect(SRC).toContain('userFacingName')
   })
 })

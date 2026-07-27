@@ -85,7 +85,7 @@ describe('runAgentAdapter helpers', () => {
     // Esc, rather than the generator cancelling itself between yields.
     const text = await fn({
       phase: 'plan', node: {} as any, role: null, system: 's', prompt: 'p',
-      signal: ac.signal, onChunk: () => ac.abort(),
+      signal: ac.signal, stream: { push: () => ac.abort(), end: () => {} },
     })
     expect(text).toBe('first') // 'second' is never consumed
   })
@@ -186,15 +186,75 @@ describe('runAgentAdapter helpers', () => {
     await expect(makeRunAgentFn(baseDeps(fakeRun))(req({ phase: 'plan' }))).rejects.toThrow('provider exploded')
   })
 
-  it('onChunk receives each message individually, not the cumulative buffer', async () => {
-    const chunks: string[] = []
+  it('每条消息逐条推给窗口,不是把累积缓冲重发一遍', async () => {
+    const evs: string[] = []
     async function* fakeRun(): AsyncGenerator<any> {
       yield { type: 'assistant', message: { content: [{ type: 'text', text: 'AAA' }] } }
       yield { type: 'assistant', message: { content: [{ type: 'text', text: 'BBB' }] } }
     }
-    const text = await makeRunAgentFn(baseDeps(fakeRun))(req({ phase: 'plan', onChunk: (t: string) => chunks.push(t) }))
-    expect(chunks).toEqual(['AAA', 'BBB'])
+    const text = await makeRunAgentFn(baseDeps(fakeRun))(
+      req({ phase: 'plan', stream: { push: (e: any) => evs.push(e.text), end: () => {} } }),
+    )
+    expect(evs).toEqual(['AAA', 'BBB'])
     expect(text).toBe('AAABBB')
+  })
+
+  it('工具调用与工具返回值也进窗口 —— 此前这两类一个字都看不到', async () => {
+    // 改动之前:只有 type === 'assistant' 触发回调,而且只取 text 块。于是模型「调了什么
+    // 工具」「工具返回了什么」全部丢失,一个纯工具轮次在界面上完全空白。
+    const kinds: string[] = []
+    const briefs: string[] = []
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'thinking', thinking: '先看看' }] } }
+      yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.ts' } }] } }
+      yield { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: '读到了' }] } }
+    }
+    await makeRunAgentFn(baseDeps(fakeRun))(
+      req({ phase: 'plan', stream: { push: (e: any) => { kinds.push(e.kind); briefs.push(e.brief ?? e.text) }, end: () => {} } }),
+    )
+    expect(kinds).toEqual(['thinking', 'tool', 'result'])
+    expect(briefs[1]).toBe('Read(a.ts)')
+    expect(briefs[2]).toBe('读到了')
+  })
+
+  it('调用结束时收口窗口 —— 这是唯一一个所有模型调用必经的点', async () => {
+    // 放在圆桌里收口的话,走 runPhase 的六处(分析圆桌/方案融合/方案精化/观察评分/
+    // 冲突解决/执行)加根方案全都不会收口:表头永远停在「运行中」,而且这些流永远不进
+    // 可淘汰集合,内存上限对它们直接失效。
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'A' }] } }
+    }
+    let ended = 0
+    await makeRunAgentFn(baseDeps(fakeRun))(
+      req({ phase: 'plan', stream: { push: () => {}, end: () => { ended++ } } }),
+    )
+    expect(ended).toBe(1)
+  })
+
+  it('provider 抛出时也收口', async () => {
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'A' }] } }
+      throw new Error('provider exploded')
+    }
+    let ended = 0
+    await expect(
+      makeRunAgentFn(baseDeps(fakeRun))(req({ phase: 'plan', stream: { push: () => {}, end: () => { ended++ } } })),
+    ).rejects.toThrow('provider exploded')
+    expect(ended).toBe(1)
+  })
+
+  it('已中断的早退路径也收口 —— 它绕过 finally', async () => {
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'A' }] } }
+    }
+    const ac = new AbortController()
+    ac.abort()
+    let endedWith: string | undefined | null = null
+    const text = await makeRunAgentFn(baseDeps(fakeRun))(
+      req({ phase: 'plan', signal: ac.signal, stream: { push: () => {}, end: (e?: string) => { endedWith = e } } }),
+    )
+    expect(text).toBe('')
+    expect(endedWith).toBe('已中断')
   })
 
   it('pickAgentDefinition resolves a duplicated agentType to the first match', () => {
@@ -204,13 +264,35 @@ describe('runAgentAdapter helpers', () => {
     expect(pickAgentDefinition({ roleName: 'dup' }, [first, second], main)).toBe(first)
   })
 
-  it('a throwing onChunk does not take the call down', async () => {
+  it('窗口崩了不能带走这次调用', async () => {
+    // 代价不是「窗口空了」:异常从 for await 逃出 → consume() reject → collectText 永不
+    // 执行 → 模型已经答完的内容全丢 → 席位判 infra → 重试三桌 → 节点阻断,而理由写的是
+    // 「角色调用失败」,指向完全错误的方向。
     async function* fakeRun(): AsyncGenerator<any> {
       yield { type: 'assistant', message: { content: [{ type: 'text', text: 'A' }] } }
       yield { type: 'assistant', message: { content: [{ type: 'text', text: 'B' }] } }
     }
     const text = await makeRunAgentFn(baseDeps(fakeRun))(
-      req({ phase: 'plan', onChunk: () => { throw new Error('渲染崩溃') } }),
+      req({ phase: 'plan', stream: { push: () => { throw new Error('渲染崩溃') }, end: () => {} } }),
+    )
+    expect(text).toBe('AB')
+  })
+
+  it('事件提取本身抛了也不能带走这次调用', async () => {
+    // try/catch 必须包住 eventsFromMessage,不能只包 push —— 只包 push 的话,一个畸形
+    // 消息在提取阶段抛出来就直接逃出循环了。
+    //
+    // 用 **user** 类型是刻意的:collectText 先判 `m.type !== 'assistant'` 就 continue,
+    // 根本不碰 `.message`,所以这条消息只在**事件提取**那一侧炸。用 assistant 的话
+    // collectText 会先炸,这条测试就变成在测别的东西了(第一版就是这么写错的)。
+    const hostile = { type: 'user', get message(): never { throw new Error('畸形消息') } }
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'A' }] } }
+      yield hostile
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'B' }] } }
+    }
+    const text = await makeRunAgentFn(baseDeps(fakeRun))(
+      req({ phase: 'plan', stream: { push: () => {}, end: () => {} } }),
     )
     expect(text).toBe('AB')
   })

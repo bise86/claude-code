@@ -43,7 +43,7 @@ export interface OrchestratorDeps {
    * declared on PipelineCtx and on runOrchestrator but missed HERE and in ctx() below, and
    * were therefore dead in every real run while their unit tests passed over the cut wire.
    */
-  onChunk?: PipelineCtx['onChunk']
+  openStream?: PipelineCtx['openStream']
   runAgent: RunAgentFn
   persist: (n: TaskNode) => Promise<void>
   now: () => string
@@ -143,7 +143,7 @@ export class EffTaskOrchestrator {
       onEscalate: this.deps.onEscalate,
       onBlocked: this.deps.onBlocked,
       runId: this.deps.runId,
-      onChunk: this.deps.onChunk,
+      openStream: this.deps.openStream,
       slots: this.slots,
       byId: this.byId,
       runAgent: this.deps.runAgent,

@@ -2,6 +2,8 @@ import * as React from 'react'
 import { Box, Text } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus } from '../../tools/efftask/stateMachine.js'
+import type { StreamState } from '../../tools/efftask/agentStream.js'
+import { AgentLogPane } from './AgentLogPane.js'
 
 const COLOR = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' } as const
 
@@ -109,10 +111,16 @@ export function NodeDetail(props: {
   node: TaskNode
   elapsed: string
   maxLines?: number
-  /** 子 agent 实时输出 (spec §10.2), oldest first. Empty when nothing has streamed yet. */
-  output?: string[]
-  /** How many lines the ring buffer dropped. Shown, so the pane cannot imply it holds all of it. */
-  outputDropped?: number
+  /** 子 agent 实时输出:每次模型调用一条流,带署名。 */
+  streams?: readonly StreamState[]
+  /** 这个节点一共有多少输出没能留下来(环形缓冲 + 被收起的窗口)。 */
+  droppedEvents?: number
+  /** 这个节点是 --resume 带进来的:没有流 ≠ 什么都没干。 */
+  historical?: boolean
+  /** 日志窗是否接管键盘(详情视图打开时是,只读等待屏不是)。 */
+  logActive?: boolean
+  /** 可用列宽。 */
+  columns?: number
   /**
    * Resolves a dependency id to its node, so 依赖 renders as titles and statuses.
    *
@@ -128,15 +136,14 @@ export function NodeDetail(props: {
   // a 40-line terminal, and this view does not scroll, so the title and goal were the first
   // things pushed off screen. Share one budget across the sections instead.
   const budget = Math.max(6, props.maxLines ?? 24)
-  const perSection = Math.max(2, Math.floor(budget / 6))
+  const hasLog = (props.streams?.length ?? 0) > 0 || props.historical === true
+  // 日志窗打开时其余小节收缩到 2 行。不收的话十几个小节各占 4 行,加上一个至少 8 行的
+  // 窗口,标题和目标会被挤出屏幕 —— 这个文件上一次就是为这件事重写过预算分配。
+  const perSection = hasLog ? 2 : Math.max(2, Math.floor(budget / 6))
   const ui = uiStatus(n.status)
-  // The live log gets its OWN budget, not a per-section slice: spec §10.2 wants it to read
-  // like a sub-agent terminal, and at perSection*2 the pane rendered a fixed 8 lines, leaving
-  // 96% of a 200-line buffer permanently unreachable.
-  const outputRows = Math.max(6, Math.floor(budget / 2))
-  const allOutput = props.output ?? []
-  const visibleOutput = allOutput.slice(-outputRows)
-  const hiddenOutput = (props.outputDropped ?? 0) + (allOutput.length - visibleOutput.length)
+  // 日志窗自己一份预算,不吃小节的份额:它要读起来像一个子 agent 的终端,而按小节切
+  // 出来的四五行做不到这件事。
+  const logHeight = Math.max(8, Math.floor(budget / 2))
   const rounds = (log: TaskNode['reviewLog']) =>
     log.map(r => `第 ${r.round} 轮 ${r.synthesized.pass ? '通过' : '未通过'}${r.synthesized.blockingSummary ? ': ' + r.synthesized.blockingSummary : ''}`).join('\n')
   return (
@@ -192,24 +199,21 @@ export function NodeDetail(props: {
       <Section maxLines={perSection} title="评审记录" body={rounds(n.reviewLog)} />
       <Section maxLines={perSection} title="验收记录" body={rounds(n.acceptLog)} />
       {n.worktree ? <Section maxLines={perSection} title="隔离工作区" body={`${n.worktree.branch}\n${n.worktree.path}`} /> : null}
-      {/* 子 agent 实时终端 (spec §10.2). The TAIL, because this is a live stream and the newest
-          line is the one being waited on — the opposite of the plan sections above, which are
-          documents. Kept after the run ends too ("完成后保留最终输出"). */}
-      {props.output && props.output.length > 0 ? (
+      {/* 子 agent 实时终端:每次模型调用一条可折叠的流,带滚动条。最新的在下面 ——
+          这是活的流,不是上面那些文档。运行结束后保留最终输出。 */}
+      {hasLog ? (
         <Box flexDirection="column">
           <Text bold color={ui === 'running' ? 'warning' : undefined}>
             子 agent 输出{ui === 'running' ? '(进行中)' : ''}
           </Text>
-          {/* BOTH numbers. The buffer drops the oldest lines and the pane then renders only
-              its last few — reporting just the first left a user told "300 hidden" while 492
-              were. That is the same "starts in the middle but looks complete" lie block()
-              above had to fix. */}
-          {hiddenOutput > 0 ? (
-            <Text dimColor>  … 更早的 {hiddenOutput} 行未显示{(props.outputDropped ?? 0) > 0 ? `(其中 ${props.outputDropped} 行已滚出缓冲,无法找回)` : ''}</Text>
-          ) : null}
-          {visibleOutput.map((l, i) => (
-            <Text key={`out-${i}`} dimColor>  {Array.from(l).slice(0, 100).join('')}</Text>
-          ))}
+          <AgentLogPane
+            streams={props.streams ?? []}
+            droppedEvents={props.droppedEvents}
+            historical={props.historical}
+            height={logHeight}
+            width={Math.max(30, props.columns ?? 100)}
+            isActive={props.logActive === true}
+          />
         </Box>
       ) : null}
       <Text dimColor>回车 / Esc / q 返回任务树</Text>

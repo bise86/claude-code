@@ -1,7 +1,8 @@
 // src/tools/efftask/pipeline.ts
 import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
-import { ALT_SOLUTION_CHARS, createNode } from './types.js'
+import { ALT_SOLUTION_CHARS, createNode, PHASE_LABEL } from './types.js'
+import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
@@ -83,7 +84,7 @@ export interface PipelineCtx {
    * detail view had no output to show. A declared-and-implemented-and-tested parameter with
    * no caller is exactly the dead wire this project keeps finding.
    */
-  onChunk?: (nodeId: string, text: string) => void
+  openStream?: (meta: StreamMeta) => StreamHandle
   /**
    * 全局并发池 (spec §6): "评审/验收的多角色调用…受同一全局池约束,避免总并发爆炸".
    *
@@ -224,13 +225,18 @@ type PhaseResult = { ok: true; text: string } | { ok: false; reason: string; tex
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
 // which records it into node.blockedReason and BLOCKs the node.
-async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0]): Promise<PhaseResult> {
+/**
+ * 单次(非圆桌)模型调用。
+ *
+ * `meta` 不是可选的装饰:分析圆桌(N 席并行)、方案融合席、分析精化(N 席)、观察评分
+ * (N 席并行)全都走这里,而不是走 runRoundtable。少给一个署名,这些席位就会退回
+ * chunkBuffer 时代那种「几个人的话并成一坨、看不出谁说的」——正是本次要治的病。
+ */
+async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: Omit<StreamMeta, 'nodeId'>): Promise<PhaseResult> {
   try {
-    // Tagged with the node so the detail view can show the right stream. A caller-supplied
-    // onChunk wins, so this never silently replaces a more specific one.
     const text = await ctx.runAgent({
       ...req,
-      onChunk: req.onChunk ?? (ctx.onChunk ? t => ctx.onChunk!(req.node.id, t) : undefined),
+      stream: req.stream ?? ctx.openStream?.({ nodeId: req.node.id, ...meta }),
     })
     if (ctx.signal.aborted) return { ok: false, reason: '已中断', text }
     return { ok: true, text }
@@ -343,6 +349,14 @@ async function roundtableWithInfraRetry(args: {
   round: number
   system: string
   /**
+   * 窗口表头上的环节名。省略则按 phase 取 PHASE_LABEL。
+   *
+   * 集成验收必须显式给:它走的是 `phase: 'accept'`(只有 system 是 'integrate'),按 phase
+   * 取名会把整个 run 的最终裁决标成「验收」—— 和 node.md 里分开记的两份记录、以及关口对
+   * 用户讲的「这是两个不同环节」全都对不上。
+   */
+  phaseLabel?: string
+  /**
    * Per-SEAT prompt builder. The seat argument is what lets a task role carry its own brief
    * into the model call — see runRoundtable.prompt for why a single shared string made role
    * definitions unreachable.
@@ -365,7 +379,10 @@ async function roundtableWithInfraRetry(args: {
       system: args.system, prompt: (seat: RoleBinding | null) => args.buildPrompt(tag, seat),
       runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
       quorum: args.ctx.config.caps.quorum, quorumSeats: args.ctx.config.caps.quorumSeats,
-      onChunk: args.ctx.onChunk ? t => args.ctx.onChunk!(args.node.id, t) : undefined,
+      openStream: args.ctx.openStream,
+      // 集成验收走的是 phase:'accept'(只有 system 不同),表头照 phase 写会把整个 run 的
+      // 最终裁决标成「验收」,和 node.md 的验收记录、和关口对用户讲的两个不同环节全对不上。
+      phaseLabel: args.phaseLabel ?? PHASE_LABEL[args.phase],
       slots: args.ctx.slots,
     })
     if (args.ctx.signal.aborted) return { rec, infraExhausted: false }
@@ -716,7 +733,7 @@ async function runPlanRoundtable(
       phase: 'plan', node, role: seat, system: 'plan',
       prompt: planPrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, 'plan')),
       signal: ctx.signal,
-    }),
+    }, { phaseLabel: PHASE_LABEL.plan, round: node.iteration.planReview + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model }),
     ctx.slots,
   )
   const drafts: { staff: string; parsed: ReturnType<typeof parsePlanOutput> }[] = []
@@ -742,7 +759,7 @@ async function runPlanRoundtable(
     phase: 'plan', node, role: fuseSeat, system: 'plan',
     prompt: fusePrompt(node, ctx, fuseTag, feedback, seatBrief(ctx, fuseSeat, 'plan'), drafts.map(d => d.parsed)),
     signal: ctx.signal,
-  })
+  }, { phaseLabel: '方案融合', round: node.iteration.planReview + 1, label: (fuseSeat?.roleName || fuseSeat?.roleTag) || '主模型', model: fuseSeat?.model })
   if (!fused.ok) {
     // 融合那一次失败 → 回落到第一份成功的草稿。比整体阻断诚实:手上确实有可用的稿子。
     noteOnNode(node, `方案融合调用失败,采用第一份草稿(${drafts[0].staff}): ${fused.reason}`)
@@ -811,7 +828,7 @@ async function runPlanRefinement(
       phase: 'plan', node, role: seat, system: 'plan',
       prompt: planPrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, 'plan') + priorDraft),
       signal: ctx.signal,
-    })
+    }, { phaseLabel: i === 0 ? PHASE_LABEL.plan : '方案精化', round: node.iteration.planReview + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model })
     if (!res.ok) {
       // 第一位就失败 → 手上没有任何稿子,照旧阻断。后面的人失败 → 已经有一份**解析通过**
       // 的稿子,拿它继续走评审,比把前面的工作全丢掉更诚实 —— 评审那关照样会挡。
@@ -1175,7 +1192,7 @@ async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
       phase: 'observer', node, role: seat, system: 'observer',
       prompt: scorePrompt(node, tag, seatBrief(ctx, seat, 'observer')), signal: ctx.signal,
       cwd: node.worktree?.path,
-    }),
+    }, { phaseLabel: PHASE_LABEL.observer, round: node.iteration.scoring + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model }),
     ctx.slots,
   )
   type Pair = { role: string; ok: boolean; plan: { score: number; rationale: string }; exec: { score: number; rationale: string } }
@@ -1375,6 +1392,12 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
             `冲突文件:\n${local.files.map(f => '- ' + quote(f)).join('\n')}\n` +
             `解决后输出:{ "execStatus":"如何解决的" }。` + answerRule(tag),
           cwd: node.worktree.path, signal: ctx.signal,
+        }, {
+          // 不是「执行」:它和主执行流是两件事,共用一个表头会让人以为执行跑了两遍。
+          phaseLabel: '解决合并冲突',
+          round: node.iteration.mergeResolve + 1,
+          label: (firstRole(node, 'execute')?.roleName || firstRole(node, 'execute')?.roleTag) || '主模型',
+          model: firstRole(node, 'execute')?.model,
         })
         // Set only once the executor has actually been asked. Setting it on entry made the
         // card claim an attempt on the branch that recurses without ever calling the model.
@@ -1611,7 +1634,10 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // which is exactly what executePrompt renders on rework.
     const execTag = answerTag(ANSWER_TAGS.exec)
     const execSeat = firstRole(node, 'execute')
-    const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatBrief(ctx, execSeat, 'execute')), cwd: node.worktree?.path, signal: ctx.signal })
+    const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatBrief(ctx, execSeat, 'execute')), cwd: node.worktree?.path, signal: ctx.signal },
+      // round 用的是 stepExecute 的局部轮次:返工每一轮都是一次独立的执行,合成一条流
+      // 会让「第三轮才修好」读起来像「一直在改同一件事」。
+      { phaseLabel: PHASE_LABEL.execute, round, label: (execSeat?.roleName || execSeat?.roleTag) || '主模型', model: execSeat?.model })
     if (!res.ok) {
       // Keep whatever the executor managed to report before the interruption. It ran with
       // write tools, so discarding this can leave the repo changed with no record of it.
@@ -1878,6 +1904,8 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       // 此前两者共用 phaseRoles.accept,规范告诉用户这是两个环节,系统却当成一个。
       phase: 'accept', node, roles: integrateSeats(node),
       round: node.iteration.integration + 1, system: 'integrate',
+      // 见 phaseLabel 的注释:不显式给的话,整个 run 的最终裁决会被标成「验收」。
+      phaseLabel: PHASE_LABEL.integrate,
       buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, integrateBriefPhase(node))), // child evidence, NOT acceptPrompt
       ctx,
       // The INTEGRATION worktree, not the user's tree. This roundtable accepts every

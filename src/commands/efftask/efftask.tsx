@@ -52,7 +52,8 @@ import { hasPermissionsToUseTool } from '../../utils/permissions/permissions.js'
 import { useAppStateStore, useSetAppState } from '../../state/AppState.js'
 import { getCwd } from '../../utils/cwd.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
-import { createChunkStore, type ChunkStore } from '../../tools/efftask/chunkBuffer.js'
+import { createStreamStore, PRE_TREE_NODE, type StreamHandle, type StreamState, type StreamStore } from '../../tools/efftask/agentStream.js'
+import { AgentLogPane } from './AgentLogPane.js'
 import { logError } from '../../utils/log.js'
 
 
@@ -232,6 +233,13 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded
     // axis left. The extraction seam below gets it too.
     timeoutMs: () => capsRef.nodeTimeoutMs,
+    // 工具摘要用工具自己的 userFacingName —— 主 REPL 每一行工具调用就是这么渲染的。
+    // 接上它,以后新增的工具自动有好摘要,不用回来改那张静态表。
+    briefResolver: (name, input) => {
+      const t = context.options.tools.find(x => x.name === name) as
+        | { userFacingName?: (i: unknown) => string } | undefined
+      try { return t?.userFacingName?.(input) } catch { return undefined }
+    },
   })
   // Separate NO-TOOLS seam for the one-shot config extraction: it only rewrites text into
   // JSON, so it needs neither read nor write tools. This is the ONLY place that passes [].
@@ -291,7 +299,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       // agent definitions + the session model — neither of which parseDirectives can see.
       agentModels={activeAgents}
       mainModel={context.options.mainLoopModel}
-      extractJson={prompt => extractAgent({ phase: 'plan', node: stubNode(), role: null, system: '', prompt, signal })}
+      extractJson={(prompt, stream) => extractAgent({ phase: 'plan', node: stubNode(), role: null, system: '', prompt, signal, stream })}
       resumeArgs={resumeArgs}
       effRoot={effRoot}
       active={active}
@@ -493,7 +501,11 @@ type RunnerProps = {
   unsupportedRoles: string[]
   agentModels: AgentModelInfo[]
   mainModel: string
-  extractJson: (prompt: string) => Promise<string>
+  /**
+   * 需求解析那一次模型调用。第二个参数是它的实时窗口 —— 这一屏是用户敲完 /et
+   * 看到的第一屏,此前背后跑着一次真实调用而界面上一个字都没有。
+   */
+  extractJson: (prompt: string, stream?: StreamHandle) => Promise<string>
   resumeArgs: ResumeArgs
   effRoot: string
   /** Mutated once the run is identified, so call()'s onExit closure can release the right lock. */
@@ -564,7 +576,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // reset on re-render, and nothing renders from it.
   const cardLimit = React.useRef(createEscalationLimiter())
   // 子 agent 实时输出 (spec §10.2). One bounded ring buffer per node for the whole run.
-  const chunks = React.useRef(createChunkStore())
+  const streams = React.useRef(createStreamStore())
+  /**
+   * 树还没建起来时的两次真实模型调用也要有窗口。
+   *
+   * 「正在解析需求…」和「正在起草根方案…」各自背后是一次完整的模型调用,而它们此前
+   * **完全没接输出** —— 用户敲完 /et 看到的第一屏、以及整个运行里最长的单次调用之一,
+   * 都是纯黑屏。目标写的是「每一次模型调用都有窗口」,这两次也算数。
+   */
+  const preStreams = (): StreamState[] => streams.current.streams(PRE_TREE_NODE)
   /** 并行占用 reader, handed over once by runOrchestrator. */
   const poolRead = React.useRef<(() => { inUse: number; limit: number }) | null>(null)
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
@@ -706,6 +726,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         loadErrors: errors.map(e => `${e.path}: ${e.message}`),
         inheritedGuidance: inherited,
       })
+      // 这些节点是从盘上恢复的,事件流不落盘 —— 所以它们的窗口是空的。**空 ≠ 什么
+      // 都没干**:一个上次跑了四十分钟的已完成节点,不标记的话会渲染成「暂无输出」,
+      // 正是这个仓库反复在修的那类谎。
+      streams.current.markHistorical(reseated.nodes.map(n => n.id))
       setNodes(reseated.nodes)
       setPhase('confirmResume')
     })().catch(e => { if (!cancelled) { setFatal(`恢复失败: ${msg(e)}`); setPhase('fatal') } })
@@ -719,7 +743,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   React.useEffect(() => {
     if (isResume) return // resume recovers its config from run.md; no model call, no roster overwrite
     let cancelled = false
-    void parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, modelJson: extractJson })
+    const preStream = streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '需求解析', label: '主模型' })
+    void parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, modelJson: p => extractJson(p, preStream) })
       // belt & braces: parseDirectives already swallows extraction failures, but a rejection
       // here would otherwise strand the UI on 'parsing' forever. Keep unsupportedRoles here
       // too: dropping it would let a cli-mode role back onto the roster unannounced.
@@ -848,9 +873,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         taskEntry: runId && runDir
           ? { runId, runDir, setAppState, abortController: props.controller }
           : undefined,
-        // 子 agent 实时输出 (spec §10.2). The buffer is bounded, so a long run cannot grow it
-        // without limit; the detail view reads it directly at render time.
-        onChunk: (nodeId, text) => chunks.current.push(nodeId, text),
+        // 子 agent 实时输出:每次模型调用一条流。缓冲三层有界,长跑不会无限涨;详情
+        // 视图在 render 期直接读它。
+        openStream: meta => streams.current.open(meta),
         // 并行占用 (spec §10.1). One call, storing a live reader for the status bar.
         onPool: read => { poolRead.current = read },
         // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
@@ -944,7 +969,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       rootRef.current = root
       const feedback = redraftFeedback.current ?? undefined
       redraftFeedback.current = null
-      const res = await draftRootPlan({ root, config: approved, runAgent: props.runAgent, signal: props.signal, feedback, worktrees: poolRef.current })
+      const res = await draftRootPlan({
+        root, config: approved, runAgent: props.runAgent, signal: props.signal, feedback,
+        worktrees: poolRef.current,
+        // 第三关的窗口。整个运行里最长的单次调用之一,此前是纯黑屏。
+        stream: streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '根方案', label: '主模型', round: redrafts + 1 }),
+      })
       if (cancelled) return
       if (res.ok) {
         // Keep the node in step with what the gate shows: a later re-draft must revise THIS
@@ -1168,7 +1198,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'parsing' || !config) {
-    return <ParsingView onCancel={bail} />
+    return <ParsingView onCancel={bail} log={preStreams()} />
   }
   if (phase === 'confirmResume' && summary) {
     return <ConfirmResume
@@ -1217,6 +1247,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         body={redrafts > 0 ? '正在按你的意见重拟根方案与首层任务树…' : '正在起草根方案与首层任务树…'}
         tone="dim"
         onDismiss={bail}
+        log={preStreams()}
       />
     )
   }
@@ -1235,14 +1266,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'running') {
-    return <RunningView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} pool={poolRead.current ?? undefined} onAbort={props.abort} />
+    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} />
   }
-  return <DoneView nodes={nodes} runId={runId ?? ''} chunks={chunks.current} outcome={outcome} handoff={handoff} handoffResult={handoffResult} viewOnly={viewOnly} onExit={props.onExit} />
+  return <DoneView nodes={nodes} runId={runId ?? ''} streams={streams.current} outcome={outcome} handoff={handoff} handoffResult={handoffResult} viewOnly={viewOnly} onExit={props.onExit} />
 }
 
 /** A one-line status/error screen that can always be dismissed. */
 function MessageView(props: {
   title: string; body: string; tone: 'error' | 'dim'; onDismiss: () => void
+  /** 等待期间这一屏背后跑着的模型调用。只读:回车/q/Esc 归这一屏自己。 */
+  log?: readonly StreamState[]
 }): React.ReactElement {
   useInput((input, key) => {
     if (key.return || key.escape || input.toLowerCase() === 'q') props.onDismiss()
@@ -1251,19 +1284,26 @@ function MessageView(props: {
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>{props.title}</Text>
       <Text color={props.tone === 'error' ? 'error' : undefined} dimColor={props.tone === 'dim'}>{props.body}</Text>
+      {props.log && props.log.length > 0 ? (
+        <AgentLogPane streams={props.log} height={10} width={100} isActive={false} />
+      ) : null}
       <Text dimColor>回车 / q / Esc 退出</Text>
     </Box>
   )
 }
 
 // 'parsing' phase: the extraction model call is in flight. Esc/q must work here too.
-function ParsingView(props: { onCancel: () => void }): React.ReactElement {
+function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[] }): React.ReactElement {
   useInput((input, key) => {
     if (key.escape || input.toLowerCase() === 'q') props.onCancel()
   })
   return (
     <Box flexDirection="column">
       <Text dimColor>正在解析需求…</Text>
+      {/* 这一屏是用户敲完 /et 看到的**第一屏**,背后是一次真实的模型调用。 */}
+      {props.log && props.log.length > 0 ? (
+        <AgentLogPane streams={props.log} height={8} width={100} isActive={false} />
+      ) : null}
       <Text dimColor>Esc/q 取消</Text>
     </Box>
   )
@@ -1275,19 +1315,19 @@ function ParsingView(props: { onCancel: () => void }): React.ReactElement {
 // EXPORTED for testing. The three §10.2 hops that live in this file — creating the store,
 // pushing into it, and handing it to each panel — are exactly the shape of wire this repo has
 // cut twice, and nothing else here is importable by a test.
-export function RunningView(props: { nodes: TaskNode[]; runId: string; chunks?: ChunkStore; pool?: () => { inUse: number; limit: number }; onAbort: () => void }): React.ReactElement {
+export function RunningView(props: { nodes: TaskNode[]; runId: string; streams?: StreamStore; pool?: () => { inUse: number; limit: number }; onAbort: () => void }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
   // different things at once (abort the run vs leave the detail view). The panel owns the
   // keyboard and calls back for exit.
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive chunks={props.chunks} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
 export function DoneView(props: {
   nodes: TaskNode[]
   runId: string
-  chunks?: ChunkStore
+  streams?: StreamStore
   outcome: Outcome | null
   handoff: HandoffSummary | null
   /**
@@ -1315,7 +1355,7 @@ export function DoneView(props: {
         runId={props.runId}
         interactive
         // "完成后保留最终输出" — the buffer outlives the run, so the done view keeps it.
-        chunks={props.chunks}
+        streams={props.streams}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">

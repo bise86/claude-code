@@ -47,7 +47,7 @@ export async function runOrchestrator(
     /** 触阀升级 (spec §9/§11): a node stopped by a safety valve or a rework limit. */
     onBlocked?: PipelineCtx['onBlocked']
     /** 子 agent 实时输出 (spec §10.2): streamed per node, for the detail view. */
-    onChunk?: PipelineCtx['onChunk']
+    openStream?: PipelineCtx['openStream']
     /** 并行占用 (spec §10.1): called ONCE with a live reader for the status bar. */
     onPool?: (read: () => { inUse: number; limit: number }) => void
     /**
@@ -172,7 +172,7 @@ export async function runOrchestrator(
         runId: args.taskEntry?.runId,
         onEscalate: args.onEscalate,
         onBlocked: args.onBlocked,
-        onChunk: args.onChunk,
+        openStream: args.openStream,
         onUpdate: nodes => {
           setNodes([...nodes])
           touch(nodes)

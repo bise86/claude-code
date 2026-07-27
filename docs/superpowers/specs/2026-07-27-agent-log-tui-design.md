@@ -554,7 +554,21 @@ onReviewExhausted?: (info: { node: TaskNode; items: FeedbackItem[]; max: number 
 - `accept`:`node.kind` 按当前方案定,走正常路由继续。**必须留痕** —— `noteOnNode(node, '用户越过方案评审(第 N 轮)。当时未解决的阻断意见: …')`,并且 `notifyValve` 发一张说明这件事的卡片。这不是可选项:整个 `/et` 的价值就在于那几道关卡是真的,越过了就必须写在 `node.md` 上让事后追责看得见。
 - `stop`:原样 `blockWithReason(..., 'cap-iteration')`。
 
-TUI 侧新增 `ConfirmReviewExhausted`(形状抄 `ConfirmRootPlan`):运行中的树上方浮出一屏,三选一 + 自由文本输入。其他节点**继续跑**,不阻塞。
+TUI 侧新增 `ConfirmReviewExhausted`(形状抄 `ConfirmRootPlan`):运行中的树上方浮出一屏,三选一 + 自由文本输入。
+
+#### 关口评审查出的七个坑(全部必须处理,否则这一节是净负值)
+
+1. **等待期间必须交出并发槽。** `orchestrator.ts:186-193` 的 `step()` 一进来就 `slots.take()`,`finally` 才 release —— 人不按键,那个槽就一直占着,`:256` 的 `budget = parallelism - running()` 永久少 1。**parallelism=1 时整个运行冻死**;关口节点是唯一在飞的时,`:270` 的 `Promise.race` 永远不返回,新可推进节点也永远派发不出去。所以 `PipelineCtx` 要加一个 `parked<T>(fn)`:等待期间把槽还回去,拿到决定再取回来。**做不到这条就把「其他节点继续跑」这句从方案里删掉**,老实写「运行暂停等你」。
+2. **必须建在 `raceConfirm` 之上并传 `ctx.signal`。** 按 v2 原来的签名,handler 不收 signal:用户按 Esc 走 `TaskTreePanel.tsx:157` 的 `onExitKey` → `abort()`,而**没有任何东西去 settle 那个 promise** —— 节点永远挂在 await 上,`orchestrator.ts:250` 的 `settleAll` 一直等它,进程不退出。`startupConfirm.ts:419-422` 的 `raceConfirm` 已经在 abort 时 `claim('cancelled')`,直接用。
+3. **abort 要走「已中断」,不是 `cap-iteration`。** `pipeline.ts:253` 的 `capBlocked = category !== undefined`;打成 cap-iteration 就变成「必须 `--retry-blocked` 才能复活」。而 Esc 是中断,应照 `:971` 那条 `已中断` 走,拿 `interrupted:true`,普通 `--resume` 就能接上。
+4. **多个节点会同时触顶,UI 必须排队。** `orchestrator.ts:259-260` 一批最多派 parallelism 个 step,同一批建出来的兄弟节点 caps 相同、节奏相近,同时走到 `pipeline.ts:982` 是常态。而 UI 侧现有的决策全是**单槽 ref**(`efftask.tsx:558-559` 的 `redraftFeedback`、`:995-1003` 的 `rootDecided` latch)—— 照抄的话第二个关口一开就把第一个的 resolve 冲掉,第一个节点永久挂起。要 `Map<nodeId, resolve>` FIFO,一次渲染一屏,标注「还有 N 个等你决定」,并给一个「对其余全部适用」的批量出口。**不能合并**:各节点的 blockingSummary 不同,合并就是替用户瞎决定。
+5. **`more` 不许动 `iteration.planReview`。** 它是 `:979-985` 这个循环**唯一**的界,而且随 commit 落盘、`reseat.ts:250-251` 的 `spent >= caps.maxIterations` 读的就是它 —— 减过的值会改变以后 `--resume` 的判断。用户连点 20 次 = 20 轮真评审,没有任何东西拦。改法:新增**单调**的 `iteration.planReviewGranted`,条件改成 `planReview >= maxIterations + granted`,granted 自己有硬上限(3);到顶后关口只剩 accept/stop。新字段**必须同时补进 `persistence.ts:178-186` 的归一化** —— 否则老 `node.md` 读出 `undefined`,`undefined + 1 = NaN` 永远不满足 `>=`,那正是 `persistence.ts:172-176` 记着的「把有界重试变成无界」。
+6. **`accept` 是「落下去」,不是「插一段」。** 评审通过后的路由(`:996` childIds、`:1002` READY、`:1006-1018` 深度上限、`:1020` createChildren)都在 `if (!rec.synthesized.pass)` 和它外层 `else` 之后。所以 accept 的唯一正确形态是**从 `:982` 那个 if 里直接落下去**,不 return、不 continue。陷阱是 `:986` 那个 `continue` 现在是无条件的 —— 必须改成只在 `more`/未触顶时执行,否则 accept 会重进循环再发一次 plan 调用,把用户刚采纳的那版方案扔掉。留痕用 `noteOnNode` 写在落下去之前,四条路由各自紧跟一次 commit,注记会一起落盘。
+7. **关口打开的瞬间要落盘一行。** 盘上状态是 `PLAN_REVIEW`(`:958` 在圆桌之前就 commit 了),而 `:980` 的 `planReview++` 只在内存里 —— 磁盘上的计数是 `max-1`。用户此时关掉终端,`reseat.ts:24-26` 会把 `PLAN_REVIEW` 归位到 `CREATED`,`spent = max-1 < max` 不触发「预算已耗尽」→ **关掉终端等于白拿一次 `more`,而 `node.md` 上没有一行说这里曾经拦过人**。修法:关口打开即 `noteOnNode('已达评审上限,正在等待人工决定')` + 一次 `commit(node,'PLAN_REVIEW')`,顺手把滞后的计数写实。
+
+另外:关口浮出时任务树必须切 `interactive={false}`(照 `ConfirmResume.tsx:41`)—— `efftask.tsx:1279-1281` 明确写了 running 期只能有一个 `useInput` 主人,否则 Esc 同时意味着「停这个节点」和「杀整个运行」。
+
+**这个关口真正买到的是什么,要说准。** `--retry-blocked` 已经能干 more/accept 的活(`reseat.ts:143, 209-236`),关口买到的是**不丢内存态和 worktree、不用重跑整个运行**。按这个理由做,不要按「多给一个按钮」做。
 
 飞书侧:若 `store.getState().feishuClient` 存在,发一张**告知**卡片说「终端里有一个待确认的关口」。**不做飞书端回执** —— `escalation.ts:197` 的 `buildBlockCard` 现在没有回执通道,补一条完整的双端竞速是另一件事的体量。这是明确的取舍,不假装做了。
 

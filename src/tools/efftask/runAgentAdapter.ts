@@ -6,6 +6,7 @@ import type { Message } from '../../types/message.js'
 import type { ModelAlias } from '../../utils/model/aliases.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { runWithCwdOverride } from '../../utils/cwd.js'
+import { eventsFromMessage, type BriefResolver } from './agentEvents.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { RoleBinding } from './types.js'
 
@@ -84,6 +85,12 @@ export function makeRunAgentFn(deps: {
    * another — config saying one thing and behaviour doing another.
    */
   timeoutMs?: number | (() => number)
+  /**
+   * 工具摘要解析器。适配层手上有 `availableTools`,每个 Tool 自带 `userFacingName(input)`,
+   * 主 REPL 就是用它渲染每一行工具调用的。接上它,新工具进来自动有好摘要;缺席则落到
+   * agentEvents 里那张静态表。
+   */
+  briefResolver?: BriefResolver
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
@@ -91,7 +98,9 @@ export function makeRunAgentFn(deps: {
     // Already cancelled → don't start a sub-agent at all. Without this an abort racing the
     // next phase call still launches a real, tool-bearing agent (write-capable in the
     // execute phase). runRoundtable guards the same way for the same reason.
-    if (req.signal.aborted) return ''
+    // 这条早退路径**绕过下面的 finally**,所以它得自己收口:调用点已经把窗口开出来了,
+    // 不收的话它会永远停在「运行中」,而且永远不进可淘汰集合。
+    if (req.signal.aborted) { req.stream?.end('已中断'); return '' }
     const picked = pickAgentDefinition(req.role, deps.activeAgents, deps.mainModelDefault)
     // Per-phase tool gating: only the execute phase gets the write-capable tool pool.
     // 三档:执行拿全部;测试验证拿只读 + 跑命令;其余只读。
@@ -141,6 +150,23 @@ export function makeRunAgentFn(deps: {
       : undefined
 
     const collected: Message[] = []
+    /**
+     * 每条消息拆成事件推给窗口。
+     *
+     * **try/catch 必须包住 `eventsFromMessage` 本身,不能只包 push。** 裹错层的代价不是
+     * 「窗口空了」:异常会从 `for await` 逃出 → `consume()` reject → 下面的
+     * `collectText(collected)` **永不执行**,模型已经答完的内容全丢 → 席位被判 infra →
+     * roundtableWithInfraRetry 重试三桌(十几次真实模型调用)→ 节点 BLOCKED,而理由写的是
+     * 「角色调用失败」,指向完全错误的方向。一个只负责画字符串的函数不该有这种权力。
+     */
+    const emit = (message: Message): void => {
+      if (!req.stream) return
+      try {
+        for (const e of eventsFromMessage(message, deps.briefResolver)) req.stream.push(e)
+      } catch {
+        /* ignore */
+      }
+    }
     const invoke = (): AsyncGenerator<Message, void> =>
       run({
         agentDefinition,
@@ -168,10 +194,9 @@ export function makeRunAgentFn(deps: {
     const consume = async (): Promise<void> => {
       for await (const message of invoke()) {
         collected.push(message)
-        if (req.onChunk && message.type === 'assistant') {
-          // A crashing renderer must not take the run down (same rule as pipeline/orchestrator).
-          try { req.onChunk(collectText([message])) } catch { /* ignore */ }
-        }
+        // 每一条消息都要看,不只是 assistant —— 工具返回值走的是 user 消息,而它此前整条
+        // 被跳过,所以「工具返回了什么、报没报错」在界面上一个字都没有。
+        emit(message)
         if (req.signal.aborted || timedOut) break
       }
     }
@@ -201,6 +226,16 @@ export function makeRunAgentFn(deps: {
       if (poll) clearInterval(poll)
       if (timer) clearTimeout(timer)
       req.signal.removeEventListener('abort', relay)
+      /**
+       * 窗口的收口点。**只能在这里**,不能放在圆桌里。
+       *
+       * 这是唯一一个所有模型调用必经的地方:正常返回、抛出、超时、中断四条路径全覆盖。
+       * 放在 runRoundtable 里的话,走 runPhase 的六处(分析圆桌、方案融合、方案精化、
+       * 观察评分、冲突自动解决、执行)加根方案全都不会收口 —— 表头会永远停在「运行中」,
+       * 一个两小时前就跑完的分析环节还在转圈;更要命的是这些流永远不进可淘汰集合,
+       * 内存上限对超过三分之一的流直接失效。
+       */
+      req.stream?.end(timedOut ? `阶段调用超时(${limitMs ?? 0} ms)` : undefined)
     }
     // Report the deadline rather than returning a truncated answer that the phase would
     // parse as a real (empty) reply.

@@ -1,5 +1,6 @@
 // src/tools/efftask/roundtable.ts
 import type { PhaseName, RoleBinding, RoundtableRecord, TaskNode, Verdict } from './types.js'
+import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { capText, MAX_SUMMARY_CHARS, parseVerdict } from './parseOutput.js'
@@ -12,7 +13,16 @@ export type RunAgentFn = (req: {
   prompt: string
   cwd?: string
   signal: AbortSignal
-  onChunk?: (t: string) => void
+  /**
+   * 这次调用的实时窗口 (spec 2026-07-27)。
+   *
+   * 由**调用点**开出来(它才知道这是哪个环节、第几轮、哪位员工),由 `makeRunAgentFn` 的
+   * finally 收口(那是唯一一个所有调用必经的点)。一次调用一个句柄,所以不存在 key 碰撞
+   * —— 此前按 `nodeId#phase#round#seat` 拼 key 的设计有四处真实碰撞:infra 重试三桌共用
+   * 同一个 round、执行返工的轮次 runPhase 看不见、冲突自动解决与主执行同键、集成验收与
+   * 叶子验收同键。
+   */
+  stream?: StreamHandle
 }) => Promise<string>
 
 export function synthesizeVerdicts(
@@ -106,8 +116,15 @@ export async function runRoundtable(args: {
    * executor's own prose. A reviewer that cannot see the change is not a reviewer.
    */
   cwd?: string
-  /** 子 agent 实时输出 (spec §10.2). Every reviewer in the roundtable streams into it. */
-  onChunk?: (t: string) => void
+  /**
+   * 每个席位开一个自己的窗口 (spec 2026-07-27 §5/§6)。
+   *
+   * 此前是**一个** onChunk 被全部席位共用,于是 N 个评审员的话逐句交错地并进同一个桶,
+   * 而且没有任何署名 —— 读不出哪句是谁说的。这正是取代 chunkBuffer 的全部理由。
+   */
+  openStream?: (meta: StreamMeta) => StreamHandle
+  /** 窗口表头上的环节名。省略时用 phase。集成验收走的是 phase:'accept',必须由调用点纠正。 */
+  phaseLabel?: string
   /**
    * 全局并发池 (spec §6). Reviewers beyond the first take a slot from it.
    *
@@ -132,7 +149,20 @@ export async function runRoundtable(args: {
     role =>
       // cwd goes to EVERY reviewer: the work under review lives in the node's worktree, and a
       // reviewer reading the main tree can only rubber-stamp the executor's own prose.
-      args.runAgent({ phase: args.phase, node: args.node, role, system: args.system, prompt: args.prompt(role), signal: args.signal, cwd: args.cwd, onChunk: args.onChunk }),
+      args.runAgent({
+        phase: args.phase, node: args.node, role, system: args.system,
+        prompt: args.prompt(role), signal: args.signal, cwd: args.cwd,
+        stream: args.openStream?.({
+          nodeId: args.node.id,
+          phaseLabel: args.phaseLabel ?? args.phase,
+          round: args.round,
+          // 署名的取值顺序与 verdict 那边逐字一致(见下面 :roleName 的注释):`||` 不是 `??`
+          // —— MAIN_STAFF(「主模型兼任」的员工名)是**空串**,而空串是一个 truthy 对象上的
+          // falsy 字段。用 `??` 会渲染出 `▾ 质疑讨论 ·  (opus)`,而「没有署名」正是要治的病。
+          label: (role?.roleName || role?.roleTag) || '主模型',
+          model: role?.model,
+        }),
+      }),
     args.slots,
   )
   const verdicts: Verdict[] = settled.map((res, i) => {

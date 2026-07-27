@@ -11,6 +11,7 @@
 // surface after the gate — the exact "gate describes something other than the run" failure
 // the confirmation gates exist to prevent.
 import { ANSWER_TAGS, answerTag, parsePlanOutput } from './parseOutput.js'
+import type { StreamHandle } from './agentStream.js'
 import { planPrompt, type PlanPromptCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import { createNode } from './types.js'
@@ -83,6 +84,13 @@ export async function draftRootPlan(args: {
    * without the constraint the run then enforces.
    */
   worktrees?: PlanPromptCtx['worktrees']
+  /**
+   * 第三关的实时窗口。
+   *
+   * 这是整个运行里最长的单次调用之一(要读代码、拆任务),而它此前**完全没接输出** ——
+   * 用户面对的是一屏纯文字的「正在起草根方案…」,不知道模型是在读文件还是卡死了。
+   */
+  stream?: StreamHandle
 }): Promise<DraftResult> {
   const { root, config, runAgent, signal } = args
   const tag = answerTag(ANSWER_TAGS.plan)
@@ -98,6 +106,7 @@ export async function draftRootPlan(args: {
       system: 'plan',
       prompt: planPrompt(root, ctx, tag, args.feedback ?? ''),
       signal,
+      stream: args.stream,
     })
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) }

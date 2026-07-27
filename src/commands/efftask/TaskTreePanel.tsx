@@ -3,7 +3,10 @@ import { Box, Text, useInput } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus, type UiStatus } from '../../tools/efftask/stateMachine.js'
 import { NodeDetail } from './NodeDetail.js'
-import type { ChunkStore } from '../../tools/efftask/chunkBuffer.js'
+import type { StreamStore } from '../../tools/efftask/agentStream.js'
+import { useStreamTick } from './AgentLogPane.js'
+import { budgetRows, lastActivity } from './logView.js'
+import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 
 const COLOR: Record<UiStatus, string> = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' }
 const GLYPH: Record<UiStatus, string> = { done: '●', running: '◐', queued: '○', failed: '✗' }
@@ -109,14 +112,12 @@ export function TaskTreePanel(props: {
   maxRows?: number
   onExitKey?: () => void
   /**
-   * 子 agent 实时输出 (spec §10.2). Read on demand by the detail view.
+   * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
-   * A live store rather than React state on purpose: the stream fires once per assistant
-   * message for EVERY node in flight, and mirroring that into state would repaint the whole
-   * tree on each one. The panel already re-renders once a second while anything is running,
-   * which is the refresh rate a scrolling log needs.
+   * 活存储而不是 React state:事件流对每个在飞的节点每条消息都要触发一次,镜像进 state
+   * 会让整棵树在每条消息上重绘。重绘由 useStreamTick 合批驱动(静默期零重绘)。
    */
-  chunks?: ChunkStore
+  streams?: StreamStore
   /** 并行占用 (spec §10.1). Read at render time; see `chunks` for why it is not state. */
   pool?: () => { inUse: number; limit: number }
 }): React.ReactElement {
@@ -131,6 +132,11 @@ export function TaskTreePanel(props: {
     const timer = setInterval(() => setNowMs(Date.now()), 1000)
     return () => clearInterval(timer)
   }, [live])
+
+  // 订阅事件流,合批重绘。放在这里而不是放在窗口自己身上:窗口拿到的 streams 是这个组件
+  // 在 render 期读出来的,窗口自己重绘并不会让这里重新去读。
+  useStreamTick(props.streams, live)
+  const { columns } = useTerminalSize()
 
   const [collapsed, setCollapsed] = React.useState<ReadonlySet<string>>(() => new Set())
   const [cursor, setCursor] = React.useState(0)
@@ -189,11 +195,13 @@ export function TaskTreePanel(props: {
       <NodeDetail
         node={detail}
         elapsed={elapsed(detail, nowMs)}
-        // 子 agent 实时输出 (spec §10.2). Read at RENDER time from the live store, not copied
-        // into React state: the stream fires per assistant message across every node in
-        // flight, and mirroring it into state would re-render the whole tree on each one.
-        output={props.chunks?.lines(detail.id)}
-        outputDropped={props.chunks?.dropped(detail.id)}
+        // 在 RENDER 期从活存储读,不复制进 React state:事件流对每个在飞的节点每条消息
+        // 都要触发一次,镜像进 state 会让整棵树在每条消息上重绘。
+        streams={props.streams?.streams(detail.id)}
+        droppedEvents={props.streams?.droppedEvents(detail.id)}
+        historical={props.streams?.isHistorical(detail.id)}
+        logActive={props.interactive === true}
+        columns={columns}
         // 依赖 (spec §10.2) needs the whole tree to turn ids into titles and statuses; the
         // detail pane only ever holds one node.
         resolveNode={id => props.nodes.find(x => x.id === id)}
@@ -201,7 +209,27 @@ export function TaskTreePanel(props: {
     )
   }
 
-  const view = viewport(rows, idx, height)
+  /**
+   * 行预算按行结算:运行中且有活动的行下面会多挂一条「此刻在调什么工具」。
+   *
+   * 不能先按「全树运行中节点数」减一个常数。反例:height=20、全部节点在跑 → 预算 14,
+   * 而那 14 行**全是运行中的** → 实打印 28 行;反方向,切片里一个运行中的都没有时照样
+   * 白扣,树永久少显示好几个节点。
+   */
+  const activity = new Map<string, string>()
+  if (props.streams) {
+    for (const r of rows) {
+      if (uiStatus(r.node.status) !== 'running') continue
+      const list = props.streams.streams(r.node.id)
+      const open = [...list].reverse().find(x => !x.closed) ?? list[list.length - 1]
+      if (!open) continue
+      const act = lastActivity(open)
+      if (act) activity.set(r.node.id, `${open.meta.phaseLabel}·${open.meta.label} ${act}`)
+    }
+  }
+  const cost = rows.map(r => (activity.has(r.node.id) ? 2 : 1))
+  const firstPass = viewport(rows, idx, height)
+  const view = viewport(rows, idx, budgetRows(cost, firstPass.from, height))
   const counts: Record<UiStatus, number> = { done: 0, running: 0, queued: 0, failed: 0 }
   for (const n of props.nodes) counts[uiStatus(n.status)]++
 
@@ -222,15 +250,24 @@ export function TaskTreePanel(props: {
         const selected = props.interactive === true && i === idx
         const fold = hasKids ? (collapsed.has(n.id) ? '▸' : '▾') : ' '
         const hidden = hasKids && collapsed.has(n.id) ? ` (+${countSubtree(props.nodes, n)})` : ''
+        const act = activity.get(n.id)
         return (
-          <Text key={n.id} color={COLOR[ui]} inverse={selected}>
-            {selected ? '❯' : ' '}
-            {'  '.repeat(depth)}
-            {fold} {GLYPH[ui]} {n.title}{' '}
-            <Text dimColor>
-              [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{scoreTag(n)}{hidden}
+          <Box key={n.id} flexDirection="column">
+            <Text color={COLOR[ui]} inverse={selected}>
+              {selected ? '❯' : ' '}
+              {'  '.repeat(depth)}
+              {fold} {GLYPH[ui]} {n.title}{' '}
+              <Text dimColor>
+                [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{scoreTag(n)}{hidden}
+              </Text>
             </Text>
-          </Text>
+            {/* 「此刻在调什么工具」—— 不用进详情视图就答得上来。1s 采样,不承诺逐条。 */}
+            {act ? (
+              <Text dimColor wrap="truncate-end">
+                {'   '}{'  '.repeat(depth)}⎿ {act}
+              </Text>
+            ) : null}
+          </Box>
         )
       })}
       {props.interactive === true ? (

@@ -454,11 +454,11 @@ describe('子 agent 实时输出 (spec §10.2) 真的被接上', () => {
     // over the cut. `onChunk` had it worse: RunAgentFn has accepted one since P1 and the
     // adapter implements and tests it, but NOTHING in production ever passed one — so spec
     // §10.2's live output pane had nothing to show.
-    const seen: { nodeId: string; text: string }[] = []
+    const seen: { nodeId: string; phaseLabel: string; label: string; text: string }[] = []
     const ac = new AbortController()
     const runAgent: RunAgentFn = async req => {
-      // A real adapter streams assistant messages through onChunk before resolving.
-      req.onChunk?.(`${req.phase} 在干活`)
+      // 真实适配层在 resolve 之前会把每条消息拆成事件推进窗口。
+      req.stream?.push({ kind: 'text', text: `${req.phase} 在干活` })
       if (req.phase === 'plan') {
         return '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
           '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
@@ -472,19 +472,56 @@ describe('子 agent 实时输出 (spec §10.2) 真的被接上', () => {
     await runOrchestrator(
       {
         config: cfg(), runDir: '/r', fs: memFs(), runAgent, signal: ac.signal,
-        onChunk: (nodeId, text) => seen.push({ nodeId, text }),
+        openStream: meta => ({
+          push: (e: { kind: string; text?: string }) =>
+            seen.push({ nodeId: meta.nodeId, phaseLabel: meta.phaseLabel, label: meta.label, text: e.text ?? '' }),
+          end: () => {},
+        }),
       },
       () => {}, () => {}, () => {},
     )
     expect(seen.length).toBeGreaterThan(0)
-    // Tagged with the node, or the detail view cannot tell whose stream it is showing.
+    // 挂在正确的节点上,否则详情视图分不清这是谁的流。
     expect(seen.every(s => s.nodeId === 'root')).toBe(true)
-    // BOTH kinds of phase: runPhase (plan/execute) and runRoundtable (review/accept) are two
-    // separate call paths and each had to be wired.
+    // 两条调用路径都要接:runPhase(分析/执行)和 runRoundtable(评审/验收)是两套代码,
+    // 各接各的。
     const texts = seen.map(s => s.text)
     expect(texts).toContain('plan 在干活')
     expect(texts).toContain('execute 在干活')
     expect(texts.some(t => t.startsWith('review') || t.startsWith('accept'))).toBe(true)
+    // 而且每条流带得出**中文环节名和署名** —— 表头全靠它,拿 phase 原样顶上去的话,
+    // 集成验收会被标成「验收」。
+    expect(seen.some(s => s.phaseLabel === '分析')).toBe(true)
+    expect(seen.some(s => s.phaseLabel === '执行')).toBe(true)
+    expect(seen.every(s => s.label.length > 0)).toBe(true)
+  })
+
+  it('每一次模型调用开一条**自己**的流,不是全节点共用一条', async () => {
+    // 这是取代 chunkBuffer 的全部理由:此前 N 个席位共用一个 onChunk,几个人的话逐句
+    // 交错地并进同一个桶,而且没有署名。
+    const opened: { phaseLabel: string; round?: number }[] = []
+    const ac = new AbortController()
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        return '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
+          '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      }
+      if (req.phase === 'execute') {
+        return '```' + (req.prompt.match(/```(exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
+      }
+      return '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+        '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    }
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/r', fs: memFs(), runAgent, signal: ac.signal,
+        openStream: meta => { opened.push({ phaseLabel: meta.phaseLabel, round: meta.round }); return { push: () => {}, end: () => {} } },
+      },
+      () => {}, () => {}, () => {},
+    )
+    // 分析、质疑讨论、执行、验收 —— 一个环节一条(或多条),不是一条包打天下。
+    expect(opened.length).toBeGreaterThanOrEqual(4)
+    expect(new Set(opened.map(o => o.phaseLabel)).size).toBeGreaterThanOrEqual(4)
   })
 })
 
