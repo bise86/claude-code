@@ -24,8 +24,15 @@
  */
 import type { AgentEvent } from './agentEvents.js'
 
-/** 树还没建起来时的调用(需求解析、根方案)挂在这个伪节点下。 */
-export const PRE_TREE_NODE = '__pre__'
+/**
+ * 树还没建起来时的调用(需求解析、根方案)挂在哪个节点下。
+ *
+ * **就是根节点的 id,不是一个伪节点。** 用 '__pre__' 的话,这两条流在树出来之后
+ * 永远打不开:TaskTreePanel 只渲染 props.nodes,伪节点不在其中 —— 窗口的寿命只到
+ * 第三关为止,而「整个运行里最长的单次调用之一」的记录恰恰是事后最想回看的。
+ * 根节点 id 是确定的(rootPlan.makeRootNode 写死 'root'),所以这里可以先用。
+ */
+export const PRE_TREE_NODE = 'root'
 
 /**
  * 单流保留的事件数。

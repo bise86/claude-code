@@ -6,8 +6,11 @@ import {
   MAX_STREAMS_PER_NODE,
   MAX_TOTAL_EVENTS,
   TOMBSTONE_KEEP,
+  PRE_TREE_NODE,
   type StreamMeta,
 } from './agentStream.js'
+import { makeRootNode } from './rootPlan.js'
+import { DEFAULT_CAPS, emptyPhaseRoles } from './types.js'
 
 const meta = (over: Partial<StreamMeta> = {}): StreamMeta => ({
   nodeId: 'root/01-a',
@@ -353,5 +356,17 @@ describe('验收实测出来的两条', () => {
     const intact = rows.filter(r => r.tombstone !== true).length
     expect(`完整的流: ${intact}`).toBe(`完整的流: ${MAX_STREAMS_PER_NODE}`)
     expect(rows.filter(r => r.tombstone === true)).toHaveLength(10)
+  })
+})
+
+describe('树外那两条流要能在树出来之后打开', () => {
+  it('PRE_TREE_NODE 就是根节点 id —— 伪节点在树里永远打不开', () => {
+    // TaskTreePanel 只渲染 props.nodes,一个 '__pre__' 伪节点不在其中:需求解析和根方案
+    // 的窗口寿命只到第三关为止,而「整个运行里最长的单次调用之一」的记录恰恰是事后
+    // 最想回看的。根节点 id 由 rootPlan.makeRootNode 写死。
+    expect(PRE_TREE_NODE).toBe(makeRootNode(
+      { goalPrompt: 'g', parallelism: 1, phaseRoles: emptyPhaseRoles(), caps: DEFAULT_CAPS } as never,
+      '2026-07-27T00:00:00Z',
+    ).id)
   })
 })
