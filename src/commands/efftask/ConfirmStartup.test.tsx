@@ -544,3 +544,33 @@ describe('关口显示的必须是**编辑后**的状态,不是传进来的那�
   })
 
 })
+
+describe('关口要说清 MCP 的边界', () => {
+  const mountMcp = async (mcpToolNames: string[]) => {
+    const { stdin, stdout, lastFrame } = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmStartup as never, {
+        config: { ...config, phaseRoles: emptyPhaseRoles() }, mcpToolNames, onDecision: () => {},
+      } as never),
+      { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    return { lastFrame, app }
+  }
+
+  it('有 MCP 时:说清所有环节可用,而且说清挡不住会写的 MCP', async () => {
+    // 两句都必须有。只说「能用」是在卖能力而藏起风险;只说风险又解释不了为什么放开。
+    const m = await mountMcp(['mcp__docs__search', 'mcp__db__query'])
+    const f = m.lastFrame()
+    expect(f).toContain('所有环节')
+    expect(f).toContain('mcp__docs__search')
+    expect(f).toContain('挡不住')
+    m.app.unmount()
+  })
+
+  it('没有 MCP 时一个字都不说 —— 说一件不存在的事同样是噪音', async () => {
+    const m = await mountMcp([])
+    expect(m.lastFrame()).not.toContain('MCP 工具:')
+    m.app.unmount()
+  })
+})

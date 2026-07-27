@@ -4,13 +4,15 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, costLine, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, costLine, mcpNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
 export function ConfirmStartup(props: {
   config: EffTaskConfig
   isolation?: 'worktree' | 'none'
+  /** 本次会话可用的 MCP 工具名。关口要说清它们在哪些环节可用、以及挡不住什么。 */
+  mcpToolNames?: string[]
   /**
    * Role names this session can actually dispatch — spec §2 第一关's "名册可编辑".
    *
@@ -148,6 +150,12 @@ export function ConfirmStartup(props: {
         <Box flexDirection="column">
           <Text color="warning">跳过带来的连带后果:</Text>
           {skipConsequenceLines(shown).map(l => <Text key={l} color="warning">  · {l}</Text>)}
+        </Box>
+      )}
+      {mcpNoticeLines(props.mcpToolNames ?? []).length > 0 && (
+        <Box flexDirection="column">
+          <Text color="warning">MCP 工具:</Text>
+          {mcpNoticeLines(props.mcpToolNames ?? []).map(l => <Text key={l} color="warning">  · {l}</Text>)}
         </Box>
       )}
       {noticeLines(shown).length > 0 && (

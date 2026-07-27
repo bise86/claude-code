@@ -73,7 +73,7 @@ const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise(r 
 /** 去掉 ANSI,否则渲染出来的中文之间夹着控制序列,任何 includes 都是碰运气。 */
 const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
 
-async function mount(args: string, settings: Record<string, unknown>) {
+async function mount(args: string, settings: Record<string, unknown>, tools: { name: string }[] = []) {
   FAKE_SETTINGS = settings
   const tty = fakeTty()
   const done: string[] = []
@@ -84,7 +84,7 @@ async function mount(args: string, settings: Record<string, unknown>) {
         isNonInteractiveSession: false,
         mainLoopModel: 'main',
         // 抽取模型:这一层只回默认,让「配置文件那条录入口」单独可见。
-        tools: [],
+        tools,
       },
       abortController: new AbortController(),
     } as never,
@@ -170,5 +170,28 @@ describe('飞书批准不能被当成「清空跳过」', () => {
       { parallelism: 3, approved: true } as never,   // 飞书卡的 payload 形状
     )
     expect(applied.skipSteps).toEqual(['review'])
+  })
+})
+
+describe('MCP 工具要一路走到关口上', () => {
+  it('会话里有 mcp__* 时,关口说清它们在所有环节可用、以及挡不住什么', async () => {
+    // 这条钉的是**接线**:mcpNoticeLines 写对了、单测全绿,但如果 efftask.tsx 不把
+    // context.options.tools 里的 mcp__* 传给关口,用户什么都看不到 —— 而这正是
+    // collectSkipSteps 死掉整整一版的同一个形状。
+    const { tty, app } = await mount('把 README 翻译成英文', {}, [
+      { name: 'Read' }, { name: 'mcp__docs__search' },
+    ])
+    await tick(10)
+    const f = strip(tty.frames())
+    expect(`关口列出了 MCP: ${f.includes('mcp__docs__search')}`).toBe('关口列出了 MCP: true')
+    expect(`关口说了挡不住: ${f.includes('挡不住')}`).toBe('关口说了挡不住: true')
+    app.unmount()
+  })
+
+  it('会话里没有 MCP 时,关口不提这件事', async () => {
+    const { tty, app } = await mount('把 README 翻译成英文', {}, [{ name: 'Read' }])
+    await tick(10)
+    expect(`误报 MCP: ${strip(tty.frames()).includes('MCP工具:')}`).toBe('误报 MCP: false')
+    app.unmount()
   })
 })

@@ -17,6 +17,7 @@
  */
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import { nonExecuteToolPool, verifyToolPool } from './efftask.js'
 
 const SRC = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
 /** 关口组件自己的源码 —— 编辑器接线在这里,不在 efftask.tsx。 */
@@ -247,5 +248,49 @@ describe('组件里不许出现只存在于 call() 作用域的绑定', () => {
       .filter(({ l }) => /(?<!props\.)(?<!\.)\beffRoot\b/.test(l) && !l.trimStart().startsWith('//'))
     expect(`组件里裸写 effRoot 的行: ${bare.map(b => b.l.trim()).join(' | ') || '无'}`)
       .toBe('组件里裸写 effRoot 的行: 无')
+  })
+})
+
+describe('工具档位:非执行环节要拿得到 MCP,但拿不到写工具', () => {
+  // 旧实现是白名单 `{Read, Glob, Grep}`,于是**所有 mcp__* 连带被滤掉** —— 用户配了
+  // 查文档/查数据库的 MCP,以为评审员能用,实际只有执行者能用;起草者也只能靠三个
+  // 工具摸黑,复杂仓库里经常直接回「访问不了文件系统,请你贴代码」。
+  const pool = [
+    { name: 'Read' }, { name: 'Glob' }, { name: 'Grep' },
+    { name: 'Edit' }, { name: 'Write' }, { name: 'NotebookEdit' }, { name: 'Bash' },
+    { name: 'mcp__docs__search' }, { name: 'mcp__db__query' }, { name: 'TodoWrite' },
+  ]
+
+  it('非执行档:MCP 留下,四个写工具全部拿掉', () => {
+    const names = nonExecuteToolPool(pool).map(t => t.name)
+    expect(names).toContain('mcp__docs__search')
+    expect(names).toContain('mcp__db__query')
+    expect(names).toContain('Read')
+    for (const w of ['Edit', 'Write', 'NotebookEdit', 'Bash']) {
+      expect(`${w} 漏进非执行档: ${names.includes(w)}`).toBe(`${w} 漏进非执行档: false`)
+    }
+  })
+
+  it('测试验证档 = 非执行档 + 跑命令的能力', () => {
+    const names = verifyToolPool(pool).map(t => t.name)
+    expect(names).toContain('Bash')                 // 它得真的把测试跑起来
+    expect(names).toContain('mcp__db__query')       // MCP 同样留着
+    for (const w of ['Edit', 'Write', 'NotebookEdit']) {
+      expect(`${w} 漏进测试验证档: ${names.includes(w)}`).toBe(`${w} 漏进测试验证档: false`)
+    }
+  })
+
+  it('非执行档不是白名单 —— 没见过的工具默认留下', () => {
+    // 这条区分「减去写工具」和「只放行三件套」两种实现:后者会把任何新工具静默丢掉,
+    // 而 MCP 工具的名字是用户装什么就叫什么,枚举不完。
+    const names = nonExecuteToolPool([{ name: '某个以后才有的只读工具' }]).map(t => t.name)
+    expect(names).toEqual(['某个以后才有的只读工具'])
+  })
+
+  it('生产接线用的就是这个函数', () => {
+    expect(SRC).toContain('const readOnlyTools: Tools = nonExecuteToolPool(context.options.tools)')
+    expect(SRC).toContain('verifyTools: verifyToolPool(context.options.tools)')
+    // 执行档必须还是全量 —— 少给了执行者就改不了代码。
+    expect(SRC).toContain('availableTools: context.options.tools, // execute phase only')
   })
 })

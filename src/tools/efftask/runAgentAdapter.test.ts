@@ -301,7 +301,7 @@ describe('the deadline must not turn a provider error into a crash report', () =
   })
 })
 
-describe('a reviewer must not get its own MCP tools back after the read-only gate', () => {
+describe('各环节的子 agent 都拿得到自己的 MCP(2026-07 起的新约定)', () => {
   const mcpAgent = {
     agentType: 'sec',
     mcpServers: [{ name: 'writer', command: 'x' }],
@@ -331,21 +331,51 @@ describe('a reviewer must not get its own MCP tools back after the read-only gat
     })
   }
 
-  it('strips mcpServers for every non-execute phase', async () => {
-    // Otherwise runAgent merges agentMcpTools back AFTER the per-phase filter, so a
-    // review/accept role reaches its own (possibly write-capable) MCP tools and can fix the
-    // work itself before passing it — the executor/reviewer separation bypassed.
+  it('非执行环节也保留 mcpServers —— 评审员查得了文档和数据库', async () => {
+    // 旧约定是非执行环节一律剥掉 mcpServers,于是评审员/验收员连**只读** MCP 都没有,
+    // 只能凭 Read/Glob/Grep 猜,而关口对此一个字都没说。用户要求各环节都能用 MCP。
+    //
+    // 换来的代价必须记清楚:runAgent 在工具分档**之后**才合并 agentMcpTools,所以一个
+    // 声明了写能力 MCP 的角色挂在评审席位上时,能自己改完再判通过。剩下的防线是
+    // 「内建写工具仍然只有执行环节有」+ canUseTool 询问 + 测试验证的工作区指纹比对。
     for (const phase of ['plan', 'review', 'accept', 'observer'] as const) {
       seenDefs.sec = 'unset'
       await fnFor()({
         phase, node: {} as any, role: { roleName: 'sec' }, system: 's', prompt: 'p',
         signal: new AbortController().signal,
       })
-      expect(`${phase}:${seenDefs.sec}`).toBe(`${phase}:undefined`)
+      expect(`${phase}:${Array.isArray(seenDefs.sec)}`).toBe(`${phase}:true`)
     }
   })
 
-  it('leaves the execute phase untouched — that role is SUPPOSED to change the repo', async () => {
+  it('但内建的写工具仍然只有执行环节拿得到', async () => {
+    // 这条是放开 MCP 之后**唯一**还在结构上拦着「评审员自己改」的东西,必须钉死。
+    const seenTools: Record<string, string[]> = {}
+    async function* fake(args: { agentDefinition: { agentType: string }; availableTools: { name: string }[] }): AsyncGenerator<any> {
+      seenTools[args.agentDefinition.agentType] = args.availableTools.map(t => t.name)
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }
+    }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as any,
+      canUseTool: (async () => ({ behavior: 'allow' })) as any,
+      availableTools: [{ name: 'Write' }, { name: 'Read' }, { name: 'mcp__db__query' }] as any,
+      readOnlyTools: [{ name: 'Read' }, { name: 'mcp__db__query' }] as any,
+      activeAgents: [mcpAgent],
+      mainModelDefault: { agentType: 'main' } as any,
+      runAgentImpl: fake as any,
+    })
+    for (const phase of ['plan', 'review', 'accept', 'observer'] as const) {
+      seenTools.sec = []
+      await fn({ phase, node: {} as any, role: { roleName: 'sec' }, system: 's', prompt: 'p', signal: new AbortController().signal })
+      expect(`${phase} 拿到写工具: ${seenTools.sec.includes('Write')}`).toBe(`${phase} 拿到写工具: false`)
+      expect(`${phase} 拿到 MCP: ${seenTools.sec.includes('mcp__db__query')}`).toBe(`${phase} 拿到 MCP: true`)
+    }
+    seenTools.sec = []
+    await fn({ phase: 'execute', node: {} as any, role: { roleName: 'sec' }, system: 's', prompt: 'p', signal: new AbortController().signal })
+    expect(seenTools.sec).toContain('Write')
+  })
+
+  it('执行环节照旧', async () => {
     seenDefs.sec = 'unset'
     await fnFor()({
       phase: 'execute', node: {} as any, role: { roleName: 'sec' }, system: 's', prompt: 'p',

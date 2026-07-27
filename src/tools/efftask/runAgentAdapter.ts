@@ -100,30 +100,28 @@ export function makeRunAgentFn(deps: {
       : req.phase === 'verify' ? (deps.verifyTools ?? deps.readOnlyTools)
       : deps.readOnlyTools
     /**
-     * Strip the role's OWN MCP servers outside the execute phase.
+     * 角色自带的 mcpServers **不再被剥掉**(此前非执行环节一律 `mcpServers: undefined`)。
      *
-     * The tool gating above is applied by runAgent via resolveAgentTools — and then runAgent
-     * merges `agentMcpTools` back in AFTERWARDS (runAgent.ts, `uniqBy([...resolvedTools,
-     * ...agentMcpTools])`). So a custom agent that declares `mcpServers` and is bound as a
-     * review/accept role gets its own, possibly write-capable, MCP tools back: that
-     * "reviewer" can fix the problem itself and then pass the work — exactly what separating
-     * executor from reviewer exists to prevent.
+     * 改动理由是用户的明确要求:各环节的子 agent 都要能用工具和 MCP。此前评审员/验收员
+     * 连**只读**的 MCP 都拿不到 —— 查不了文档、查不了数据库,只能凭 Read/Glob/Grep 猜,
+     * 而关口对此一个字都没说。
      *
-     * Done HERE, caller-side, rather than by changing runAgent: `initializeAgentMcpServers`
-     * early-returns `tools: []` when `mcpServers` is empty, so the hole closes completely
-     * while every other AgentTool caller keeps its current contract. It also avoids spawning
-     * arbitrary MCP server processes for a read-only reviewer.
+     * 被放弃的那条保护要写清楚:runAgent 在工具分档**之后**才把 `agentMcpTools` 合并
+     * 回来(runAgent.ts 的 `uniqBy([...resolvedTools, ...agentMcpTools])`),所以一个声明了
+     * 写能力 MCP 的角色被挂在评审席位上时,**能自己把问题改了再判通过** —— 执行者与
+     * 评审者分离在这种配置下失效。
      *
-     * Honest cost: this also denies reviewers any READ-ONLY MCP tools. And the practical
-     * severity today is moderated by canUseTool still prompting — fully silent self-approval
-     * needs bypassPermissions or an already-allowlisted MCP tool.
+     * 剩下的防线有三道,都不依赖这次剥离:
+     *  1. 内建写工具(Edit/Write/NotebookEdit/Bash)仍然只有执行环节拿得到
+     *     —— 见 WRITE_CAPABLE_TOOL_NAMES;
+     *  2. canUseTool 仍然会对 MCP 调用询问,除非用户自己 allowlist 或开了 bypassPermissions;
+     *  3. 测试验证环节有工作区前后比对(git status --porcelain 指纹),动了就判该轮作废。
      *
-     * `disallowedTools` was the obvious alternative and does NOT work: it is consumed only
-     * inside resolveAgentTools, which runs BEFORE the MCP merge, and filterToolsForAgent
-     * returns true unconditionally for any `mcp__*` name.
+     * 关口会把「MCP 在所有环节可用、且挡不住会写的 MCP」说给用户听,让他自己决定给
+     * 评审席位配什么角色。`disallowedTools` 不是替代方案:它只在 resolveAgentTools 内部
+     * 生效,而那一步跑在 MCP 合并**之前**,filterToolsForAgent 对任何 `mcp__*` 都无条件返回 true。
      */
-    const agentDefinition: AgentDefinition =
-      req.phase === 'execute' ? picked : { ...picked, mcpServers: undefined }
+    const agentDefinition: AgentDefinition = picked
     const promptMessages: Message[] = [
       createUserMessage({ content: [{ type: 'text', text: `${req.system}\n\n${req.prompt}` }] }),
     ]

@@ -59,10 +59,40 @@ import { logError } from '../../utils/log.js'
 // Read-only tool pool for plan/review/accept/observer: they must be able to READ the repo
 // to judge anything, they just must not be able to WRITE it.
 import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
+import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
+import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
+import { NOTEBOOK_EDIT_TOOL_NAME } from '../../tools/NotebookEditTool/constants.js'
 import { TASK_OUTPUT_TOOL_NAME } from '../../tools/TaskOutputTool/constants.js'
 import { TASK_STOP_TOOL_NAME } from '../../tools/TaskStopTool/prompt.js'
 
 export const READ_ONLY_TOOL_NAMES = new Set(['Read', 'Glob', 'Grep'])
+
+/**
+ * 会改盘的工具。非执行环节从会话工具池里**减掉这些**,而不是只放行三件套。
+ *
+ * 从白名单换成黑名单是有原因的:白名单是 `{Read, Glob, Grep}` 三个写死的名字,于是
+ * **所有 `mcp__*` 工具连带被滤掉** —— 用户配了查文档/查数据库的 MCP server,以为
+ * 评审员能用,实际只有执行者能用,而且关口上看不出任何迹象。起草者同样只能靠这三个
+ * 工具摸黑,复杂仓库里它经常直接说「访问不了文件系统,请你贴代码」。
+ *
+ * Bash 在这一档里也要减掉:它能写(`echo >`、`sed -i`、`git apply`),测试验证档
+ * 单独把它加回去,那一档另有工作区前后比对做闸门。
+ *
+ * 诚实的边界:**挡不住会写的 MCP 工具** —— 没有可靠办法从名字判断 `mcp__x__y` 是否
+ * 只读。放开 MCP 就接受了这一点,所以关口要说出来,让用户自己决定给评审席位配什么。
+ */
+export const WRITE_CAPABLE_TOOL_NAMES = new Set([
+  FILE_EDIT_TOOL_NAME, FILE_WRITE_TOOL_NAME, NOTEBOOK_EDIT_TOOL_NAME, BASH_TOOL_NAME,
+])
+
+/**
+ * 非执行环节的工具池:会话里的一切,减去会改盘的。
+ *
+ * 提成可导出的纯函数,和 verifyToolPool 同一个理由 —— 接线要能被单独钉住。
+ */
+export function nonExecuteToolPool<T extends { name: string }>(all: T[]): T[] {
+  return all.filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name))
+}
 /**
  * 测试验证档在只读之上多这些 —— 它得能真的跑测试。
  *
@@ -80,7 +110,7 @@ export const RUN_COMMAND_TOOL_NAMES = new Set([BASH_TOOL_NAME, TASK_OUTPUT_TOOL_
  * 只读工具、跑不了任何命令,也就是这个环节的全部存在理由没了。
  */
 export function verifyToolPool<T extends { name: string }>(all: T[]): T[] {
-  return all.filter(t => READ_ONLY_TOOL_NAMES.has(t.name) || RUN_COMMAND_TOOL_NAMES.has(t.name))
+  return all.filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name) || RUN_COMMAND_TOOL_NAMES.has(t.name))
 }
 
 const CANCELLED: StartupDecision = { parallelism: 0, approved: false }
@@ -187,8 +217,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // fork path uses at processSlashCommand.tsx:728.
   const canUseTool = context.canUseTool ?? hasPermissionsToUseTool
   const mainModelDefault = pickMainAgentDefinition(allAgents)
-  // REAL read-only pool (NOT []): a reviewer that cannot read the repo can only guess.
-  const readOnlyTools: Tools = context.options.tools.filter(t => READ_ONLY_TOOL_NAMES.has(t.name))
+  // 非执行环节的池子:会话里的一切,减去会改盘的(含 MCP —— 见 WRITE_CAPABLE_TOOL_NAMES)。
+  // 此前是写死的 {Read, Glob, Grep} 白名单,连带把所有 mcp__* 滤掉了。
+  const readOnlyTools: Tools = nonExecuteToolPool(context.options.tools)
   const runAgent: RunAgentFn = makeRunAgentFn({
     toolUseContext: context,
     canUseTool,
@@ -255,6 +286,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       baseRoleDefs={collectedRoles.defs}
       baseRoleNotices={[...collectedRoles.notices, ...collectedSkip.notices]}
       baseSkipSteps={collectedSkip.steps}
+      mcpToolNames={context.options.tools.filter(t => t.name.startsWith('mcp__')).map(t => t.name)}
       // The roster must say which model each seat runs on, and that answer lives in the
       // agent definitions + the session model — neither of which parseDirectives can see.
       agentModels={activeAgents}
@@ -456,6 +488,8 @@ type RunnerProps = {
   baseRoleNotices?: string[]
   /** settings.json 的 efftaskSkipSteps 指定要跳过的环节;和提示词里说的**取并集**。 */
   baseSkipSteps?: PhaseName[]
+  /** 本次会话可用的 MCP 工具名。关口要说清它们在哪些环节可用、以及挡不住什么。 */
+  mcpToolNames?: string[]
   unsupportedRoles: string[]
   agentModels: AgentModelInfo[]
   mainModel: string
@@ -1158,6 +1192,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       <ConfirmStartup
         config={config}
         isolation={isolation}
+        // 会话级 MCP 工具。放开之后所有环节都能用,而「挡不住会写的 MCP」这件事
+        // 必须在用户按 y 之前说出来 —— 这是他要自己决定的取舍。
+        mcpToolNames={props.mcpToolNames}
         // spec §2 第一关 "名册可编辑". Only roles this session can actually dispatch — the
         // roster must not offer a seat the run would then silently downgrade to the main model.
         availableRoles={dispatchableRoles(props.knownRoles, props.unsupportedRoles)}

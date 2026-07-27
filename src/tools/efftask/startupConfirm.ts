@@ -271,6 +271,28 @@ export function skipConflictLines(config: EffTaskConfig): string[] {
  * 有个连带后果你得知道」。把后者塞进前者的标题下,就是 spec §7.5 批评 notices 块
  * 「标题说 A、内容说 B」的同一个错,只是换了个块。
  */
+/**
+ * MCP 在这次 run 里的边界。
+ *
+ * 必须说,因为它同时是**能力**和**风险**,而两者用户都看不见:
+ *  - 能力:2026-07 起所有环节都拿得到 MCP(此前只有执行环节有,而关口一个字没提,
+ *    用户配了查文档的 server 却以为评审员在用它);
+ *  - 风险:内建写工具挡得住,**会写的 MCP 挡不住** —— 没有可靠办法从 `mcp__x__y`
+ *    这个名字判断它是否只读。所以评审席位上的角色如果带着写能力 MCP,它能自己把
+ *    问题改了再判通过。这是用户要自己决定的事,不是可以替他咽下去的事。
+ *
+ * 没有 MCP 工具时返回空 —— 说一件不存在的事同样是噪音。
+ */
+export function mcpNoticeLines(mcpToolNames: string[]): string[] {
+  if (mcpToolNames.length === 0) return []
+  const shown = mcpToolNames.slice(0, 3).map(n => clip(n, 28)).join('、')
+  const more = mcpToolNames.length > 3 ? ` 等 ${mcpToolNames.length} 个` : ''
+  return [
+    `本次所有环节(不只是执行)都能用 MCP:${shown}${more}`,
+    '内建写工具(Edit/Write/NotebookEdit/Bash)仍然只有执行环节有;但**会写的 MCP 挡不住** —— 给评审/验收席位配带写能力 MCP 的角色时,它可以自己改完再判通过。',
+  ]
+}
+
 export function skipConsequenceLines(config: EffTaskConfig): string[] {
   const skip = new Set(config.skipSteps ?? [])
   const out: string[] = []
