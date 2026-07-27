@@ -4174,3 +4174,66 @@ describe('圆桌的匿名与独立必须挺过返工轮', () => {
     expect(n.plan.alternatives?.length).toBeGreaterThan(0)
   })
 })
+
+describe('复验点出来的四处「行为对、但没人守」', () => {
+  const okAll = (req: { phase: string; prompt: string }) =>
+    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    : req.phase === 'execute' ? '```json\n{"execStatus":"做完了"}\n```'
+    : req.phase === 'observer' ? '```score\n{"score":88,"rationale":"还行"}\n```'
+    : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+
+  it('配了观察席位又跳过观察时,不能提交 SCORING 状态', async () => {
+    // 那个 `&& !isSkipped(ctx,'observer')` 从来没被求值过:每个跑到这里的测试都因为
+    // firstRole 为 null 先短路了(包括「七个全跳」—— 它跳了观察但没配观察席位)。
+    // 删掉它,节点会为一个用户关掉的环节提交并持久化 SCORING 状态。
+    const seen: string[] = []
+    const committed: string[] = []
+    const n = root()
+    n.kind = 'executable'; n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] } as typeof n.phaseRoles
+    const ctx = ctxFor([n], async req => { seen.push(req.phase); return okAll(req) },
+      { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['accept', 'observer'] as never })
+    const orig = ctx.onUpdate
+    await stepExecute(n, { ...ctx, onUpdate: () => { committed.push(n.status); orig?.() } })
+    expect(seen).not.toContain('observer')
+    expect(`提交过 SCORING: ${committed.includes('SCORING')}`).toBe('提交过 SCORING: false')
+    expect(n.score).toEqual({})
+  })
+
+  it('圆桌是**并发独立**起草,不是串行接力', async () => {
+    // 把 runPlanRoundtable 改写成「把上一位的稿喂给下一位」(圆桌退化成精化)是全绿的:
+    // 席位顺序测试对串行同样成立,并发测试断的是 peak <= 2,串行的 peak 是 1 也满足。
+    // 独立性是圆桌区别于精化的**唯一**理由,必须直接断:没有任何一位在起草时看得到别人的稿。
+    const drafts: string[] = []
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: ['a', 'b', 'c'].map(roleName => ({ roleName })) } as typeof n.phaseRoles
+    await stepStart(n, ctxFor([n], async (req: { phase: string; prompt: string; role?: { roleName: string } }) => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.prompt.includes('请合成')) return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      // 起草者的提示词里不能出现任何别人的稿子标记。
+      drafts.push(req.prompt)
+      return `\`\`\`json\n{"kind":"executable","solution":"稿-${req.role?.roleName}-MARK","keyPoints":"k","risks":"r","acceptance":"a"}\n\`\`\``
+    }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
+    expect(drafts).toHaveLength(3)
+    for (const d of drafts) {
+      expect(`起草提示词里看得到别人的稿: ${/稿-[abc]-MARK/.test(d)}`).toBe('起草提示词里看得到别人的稿: false')
+    }
+  })
+
+  it('超长的落选稿在存进 alternatives 时就被截断,并标注原文字数', async () => {
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }] } as typeof n.phaseRoles
+    const long = 'X'.repeat(5000)
+    await stepStart(n, ctxFor([n], async (req: { phase: string; prompt: string; role?: { roleName: string } }) => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.prompt.includes('请合成')) return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      return `\`\`\`json\n{"kind":"executable","solution":"${long}","keyPoints":"k","risks":"r","acceptance":"a"}\n\`\`\``
+    }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
+    const alt = n.plan.alternatives![0]
+    expect(alt.solution.length).toBeLessThan(long.length)
+    // 截断了却不说 = 静默截断,而落选稿存在的意义就是「事后查得到」。
+    expect(alt.solution).toContain('已截断')
+    expect(alt.solution).toContain('5000')
+  })
+})
