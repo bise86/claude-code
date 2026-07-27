@@ -19,6 +19,8 @@ import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 
 const SRC = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
+/** 关口组件自己的源码 —— 编辑器接线在这里,不在 efftask.tsx。 */
+const GATE_SRC = readFileSync(new URL('./ConfirmStartup.tsx', import.meta.url), 'utf8')
 
 /**
  * The text of ONE JSX element, start tag to its own `/>`.
@@ -208,10 +210,11 @@ describe('环节跳过的接线', () => {
 
   it('关口编辑器拿得到被跳过的环节', () => {
     // 拿不到的话,被跳过那一行照常显示复选框,用户勾了人什么都不会发生。
-    expect(SRC).toContain('rosterEditorLines(roster, available, phaseIdx, roleIdx, undefined, skipRef.current)')
+    // 注意读的是 ConfirmStartup.tsx —— 本文件顶部的 SRC 是 efftask.tsx。
+    expect(GATE_SRC).toContain('rosterEditorLines(roster, available, phaseIdx, roleIdx, undefined, skipRef.current)')
   })
 
   it('给被跳过的环节勾人 = 取消跳过', () => {
-    expect(SRC).toContain('if (skipRef.current.includes(ph)) setSkip(skipRef.current.filter(x => x !== ph))')
+    expect(GATE_SRC).toContain('if (skipRef.current.includes(ph)) setSkip(skipRef.current.filter(x => x !== ph))')
   })
 })
