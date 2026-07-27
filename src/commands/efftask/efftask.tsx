@@ -53,7 +53,7 @@ import { useAppStateStore, useSetAppState } from '../../state/AppState.js'
 import { getCwd } from '../../utils/cwd.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { createStreamStore, PRE_TREE_NODE, type StreamHandle, type StreamState, type StreamStore } from '../../tools/efftask/agentStream.js'
-import { AgentLogPane } from './AgentLogPane.js'
+import { AgentLogPane, useStreamTick } from './AgentLogPane.js'
 import { logError } from '../../utils/log.js'
 
 
@@ -585,6 +585,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 都是纯黑屏。目标写的是「每一次模型调用都有窗口」,这两次也算数。
    */
   const preStreams = (): StreamState[] => streams.current.streams(PRE_TREE_NODE)
+  /**
+   * 这两屏的重绘。**必须在这里**,不能只挂在 TaskTreePanel 上。
+   *
+   * store 是 useRef —— 没有订阅就没有重绘。而「正在解析需求…」和「正在起草根方案…」
+   * 这两屏根本没有任务树,TaskTreePanel 那个 tick 一次都不会跑:窗口会渲染一次空白,
+   * 然后到调用结束都不动。那就等于把窗口挂上去当摆设,而这正是「声明了却没接上」的
+   * 老毛病(orchestrator.ts 的注释里记着它已经发生过两次)。
+   */
+  useStreamTick(streams.current, phase === 'parsing' || phase === 'drafting')
   /** 并行占用 reader, handed over once by runOrchestrator. */
   const poolRead = React.useRef<(() => { inUse: number; limit: number }) | null>(null)
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)

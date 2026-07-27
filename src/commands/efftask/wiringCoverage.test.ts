@@ -379,3 +379,14 @@ describe('子 agent 实时窗口:五跳都要接上', () => {
     expect(SRC).toContain('userFacingName')
   })
 })
+
+describe('等待屏的窗口要真的会动', () => {
+  it('parsing / drafting 两屏自己订阅事件流', () => {
+    // store 是 useRef —— 没有订阅就没有重绘。而这两屏根本没有任务树,TaskTreePanel 里
+    // 那个 useStreamTick 一次都不会跑:窗口渲染一次空白,然后到调用结束都不动。
+    // 「挂上去了但它是死的」正是这个文件存在的理由。
+    expect(SRC).toContain('useStreamTick(streams.current')
+    expect(SRC).toMatch(/useStreamTick\(streams\.current,[^)]*'parsing'/)
+    expect(SRC).toMatch(/useStreamTick\(streams\.current,[^)]*'drafting'/)
+  })
+})
