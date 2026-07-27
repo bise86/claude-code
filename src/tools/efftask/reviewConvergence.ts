@@ -20,6 +20,7 @@
  * 全纯函数。数据从已经落盘的 `node.reviewLog` 里读,不新增任何状态。
  */
 import type { RoundtableRecord } from './types.js'
+import { capText, MAX_SUMMARY_CHARS } from './parseOutput.js'
 
 export interface FeedbackItem {
   /** 意见原文(取自结构化的 verdict.blocking,不是拼接后的字符串)。 */
@@ -149,7 +150,42 @@ export function stuckItems(items: readonly FeedbackItem[], minRounds = 2): Feedb
   return items.filter(it => it.rounds.length >= Math.max(2, minRounds))
 }
 
-const bullet = (it: FeedbackItem, i: number): string => `  ${i + 1}. [${it.role}] ${it.text}`
+/**
+ * 一次最多列多少条,以及整段的字符预算。
+ *
+ * 这两个上限不是保险丝,是**必需**的。单条阻断意见的上限是 2000 字(parseOutput 的
+ * MAX_BLOCKING_CHARS),每席最多 20 条,5 席 × 3 轮 = 300 条 —— 不设上限的话,这一段能把
+ * 方案提示词顶到 600 KB。原来的 `blockingSummary` 走的是 synthesizeVerdicts 里的
+ * capText(…, MAX_SUMMARY_CHARS),换成累积反馈时如果不接上同一个预算,就是**绕过**了它。
+ *
+ * 裁剪时**老账优先**:那几条才是作者一直没回应的东西,新增的下一轮还会再提。
+ * 丢了多少要说出来 —— 这个仓库反复在修的就是「残缺的视图看起来完完整整」。
+ */
+export const MAX_FEEDBACK_ITEMS = 20
+
+/**
+ * 单条意见在这一段里的字符预算。
+ *
+ * 光有条数上限不够:单条阻断意见本身可以有 2000 字(MAX_BLOCKING_CHARS),20 条就是
+ * 40000 字,整段的 capText 会在第二条就把后面全砍掉 —— 连「另有 N 条未列出」那句话
+ * 一起砍掉。于是用户看到的是一份**看起来完整**的两条清单。每条各自先缩,20 条才装得进
+ * 一段预算里,而且是**均匀**地缩,不是砍掉后 18 条。
+ *
+ * 原文一个字都没丢:它在 node.md 的评审记录里,提示语也是这么写的。
+ */
+export const MAX_ITEM_CHARS = 160
+
+const bullet = (it: FeedbackItem, i: number): string =>
+  `  ${i + 1}. [${it.role}] ${capText(it.text, MAX_ITEM_CHARS)}`
+
+/** 按「老账优先」裁到 MAX_FEEDBACK_ITEMS,返回被裁掉的条数。 */
+function trim(stuck: FeedbackItem[], fresh: FeedbackItem[]): { stuck: FeedbackItem[]; fresh: FeedbackItem[]; dropped: number } {
+  const total = stuck.length + fresh.length
+  if (total <= MAX_FEEDBACK_ITEMS) return { stuck, fresh, dropped: 0 }
+  const keepStuck = stuck.slice(0, MAX_FEEDBACK_ITEMS)
+  const keepFresh = fresh.slice(0, Math.max(0, MAX_FEEDBACK_ITEMS - keepStuck.length))
+  return { stuck: keepStuck, fresh: keepFresh, dropped: total - keepStuck.length - keepFresh.length }
+}
 
 /**
  * 给**方案作者**的累积反馈。
@@ -160,20 +196,24 @@ const bullet = (it: FeedbackItem, i: number): string => `  ${i + 1}. [${it.role}
 export function planFeedbackPrompt(items: readonly FeedbackItem[]): string {
   if (items.length === 0) return ''
   const rounds = Math.max(...items.flatMap(i => i.rounds), 0)
-  const stuck = stuckItems(items)
-  const fresh = items.filter(it => !stuck.includes(it))
-  const parts: string[] = [`前 ${rounds} 轮评审共提出 ${items.length} 条阻断意见,按轮次汇总如下。`]
-  if (stuck.length > 0) {
+  const allStuck = stuckItems(items)
+  const cut = trim(allStuck, items.filter(it => !allStuck.includes(it)))
+  const parts: string[] = [
+    `前 ${rounds} 轮评审共提出 ${items.length} 条阻断意见,按轮次汇总如下` +
+      (cut.dropped > 0 ? `(只列其中 ${MAX_FEEDBACK_ITEMS} 条,另有 ${cut.dropped} 条未列出,全文见 node.md 的评审记录)` : '') +
+      '。',
+  ]
+  if (cut.stuck.length > 0) {
     parts.push(
-      `【连续 ${Math.max(...stuck.map(s => s.rounds.length))} 轮未解决】` +
+      `【连续 ${Math.max(...cut.stuck.map(s => s.rounds.length))} 轮未解决】` +
         '必须逐条明确回应:要么在方案里解决,要么写明为什么不适用。',
-      ...stuck.map(bullet),
+      ...cut.stuck.map(bullet),
     )
   }
-  if (fresh.length > 0) {
-    parts.push('【本轮新增】', ...fresh.map(bullet))
+  if (cut.fresh.length > 0) {
+    parts.push('【本轮新增】', ...cut.fresh.map(bullet))
   }
-  return parts.join('\n')
+  return capText(parts.join('\n'), MAX_SUMMARY_CHARS)
 }
 
 /**
@@ -187,12 +227,18 @@ export function reviewRepeatNotice(items: readonly FeedbackItem[], round: number
   if (round <= 1 || items.length === 0) return ''
   const seen = items.filter(it => it.rounds.length > 0)
   if (seen.length === 0) return ''
-  return [
-    `本轮是第 ${round} 轮评审。前几轮已经提出过下面这些意见(按出现轮次标注):`,
-    ...seen.map((it, i) => `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮) ${it.text}`),
+  // 同一个预算,理由同 planFeedbackPrompt:这一段进的是**每一个评审席位**的提示词,
+  // 5 席就是 5 份。
+  const shown = seen.slice(0, MAX_FEEDBACK_ITEMS)
+  const dropped = seen.length - shown.length
+  return capText([
+    `本轮是第 ${round} 轮评审。前几轮已经提出过下面这些意见` +
+      (dropped > 0 ? `(只列 ${MAX_FEEDBACK_ITEMS} 条,另有 ${dropped} 条未列出)` : '') +
+      '(按出现轮次标注):',
+    ...shown.map((it, i) => `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮) ${capText(it.text, MAX_ITEM_CHARS)}`),
     '对其中每一条:若新方案已经回应了它,请指出是方案的哪一句回应的;若仍未回应,请指出',
     '方案缺了什么。不要仅因为措辞眼熟就放行,也不要把同一条换个说法再提一遍。',
-  ].join('\n')
+  ].join('\n'), MAX_SUMMARY_CHARS)
 }
 
 /**
@@ -203,17 +249,21 @@ export function reviewRepeatNotice(items: readonly FeedbackItem[], round: number
 export function exhaustionReason(items: readonly FeedbackItem[], max: number): string {
   const head = `评审迭代超限(${max})`
   if (items.length === 0) return head
-  const stuck = stuckItems(items)
-  const fresh = items.filter(it => !stuck.includes(it))
+  const allStuck = stuckItems(items)
+  const cut = trim(allStuck, items.filter(it => !allStuck.includes(it)))
   const seg: string[] = []
-  if (stuck.length > 0) {
-    seg.push(`连续 ${Math.max(...stuck.map(s => s.rounds.length))} 轮未解决 ${stuck.length} 条 —— ` +
-      stuck.map(it => `[${it.role}] ${it.text}`).join('; '))
+  if (cut.dropped > 0) seg.push(`共 ${items.length} 条,以下只列 ${MAX_FEEDBACK_ITEMS} 条`)
+  if (cut.stuck.length > 0) {
+    seg.push(`连续 ${Math.max(...cut.stuck.map(s => s.rounds.length))} 轮未解决 ${allStuck.length} 条 —— ` +
+      cut.stuck.map(it => `[${it.role}] ${capText(it.text, MAX_ITEM_CHARS)}`).join('; '))
   }
-  if (fresh.length > 0) {
-    seg.push(`本轮新增 ${fresh.length} 条 —— ` + fresh.map(it => `[${it.role}] ${it.text}`).join('; '))
+  if (cut.fresh.length > 0) {
+    seg.push(`本轮新增 ${items.length - allStuck.length} 条 —— ` +
+      cut.fresh.map(it => `[${it.role}] ${capText(it.text, MAX_ITEM_CHARS)}`).join('; '))
   }
-  return `${head}: ${seg.join(';')}`
+  // 这句会原样进 node.blockedReason,而 blockedReason 又会被卡片和树引用 —— 它是
+  // node.md 体积的第二大来源,预算和 blockingSummary 用同一个。
+  return capText(`${head}: ${seg.join(';')}`, MAX_SUMMARY_CHARS)
 }
 
 /**

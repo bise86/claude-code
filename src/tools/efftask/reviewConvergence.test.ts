@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import type { RoundtableRecord, Verdict } from './types.js'
+import { MAX_SUMMARY_CHARS } from './parseOutput.js'
 import {
   exhaustionReason,
   exhaustionRemedy,
@@ -9,6 +10,8 @@ import {
   reviewRepeatNotice,
   similarItem,
   stuckItems,
+  MAX_FEEDBACK_ITEMS,
+  type FeedbackItem,
 } from './reviewConvergence.js'
 
 const v = (role: string, blocking: string[], over: Partial<Verdict> = {}): Verdict =>
@@ -261,5 +264,73 @@ describe('触顶时的话要说准', () => {
     expect(exhaustionRemedy(stuckCase)).toContain('先确认')
     // 有老账的分支也**不能**把「提高 maxIterations」这条路堵死:万一是误判呢。
     expect(exhaustionRemedy(stuckCase)).toContain('caps.maxIterations')
+  })
+})
+
+describe('提示词有预算 —— 累积反馈不能绕过原来的上限', () => {
+  // 单条阻断意见上限 2000 字、每席最多 20 条,5 席 × 3 轮 = 300 条。不设上限的话这一段
+  // 能把方案提示词顶到 600 KB。原来的 blockingSummary 走的是 capText(…, MAX_SUMMARY_CHARS);
+  // 换成累积反馈时如果不接上同一个预算,就是**绕过**了它。
+  const huge = (): FeedbackItem[] =>
+    [...Array(300)].map((_, i) => ({ text: `第${i}条意见`.padEnd(2000, '啊'), role: 'main', rounds: i < 40 ? [1, 2] : [3] }))
+
+  it('planFeedbackPrompt 有字符预算,并说清丢了多少', () => {
+    const p = planFeedbackPrompt(huge())
+    // capText 截断时会补一句「…(已截断,原文 N 字)」,所以上限要留出它的长度。
+    expect(Array.from(p).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
+    expect(p).toContain('300 条')
+  })
+
+  it('条数也有上限,而且**老账优先**保留', () => {
+    const p = planFeedbackPrompt(huge())
+    const listed = (p.match(/^ {2}\d+\. /gm) ?? []).length
+    expect(listed).toBeLessThanOrEqual(MAX_FEEDBACK_ITEMS)
+    // 保下来的必须是连续多轮的那些 —— 新增的下一轮还会再提,老账才是作者一直没回应的。
+    expect(p).toContain('轮未解决')
+    // 「你看到的不是全部」这句话必须**在最前面**。放在列表末尾的话,它会被整段的
+    // 字符预算连同后面的条目一起截掉 —— 于是用户看到一份看起来完整的短清单。
+    expect(p).toContain('未列出')
+    expect(p.indexOf('未列出')).toBeLessThan(p.indexOf('1. ['))
+  })
+
+  it('reviewRepeatNotice 同样有预算 —— 它进的是每一个席位的提示词,5 席就是 5 份', () => {
+    const n = reviewRepeatNotice(huge(), 3)
+    expect(Array.from(n).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
+    expect(n).toContain('未列出')
+  })
+
+  it('exhaustionReason 同样有预算 —— 它原样进 node.blockedReason', () => {
+    const r = exhaustionReason(huge(), 3)
+    expect(Array.from(r).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
+  })
+
+  it('没超预算时不加任何「未列出」的噪音', () => {
+    const few: FeedbackItem[] = [{ text: '就一条', role: 'main', rounds: [1] }]
+    expect(planFeedbackPrompt(few)).not.toContain('未列出')
+    expect(exhaustionReason(few, 3)).not.toContain('未列出')
+  })
+})
+
+describe('预算是怎么花的', () => {
+  const bigItems = (n: number, chars: number): FeedbackItem[] =>
+    [...Array(n)].map((_, i) => ({ text: `第${i}条`.padEnd(chars, '啊'), role: 'main', rounds: [1, 2] }))
+
+  it('单条先缩,20 条才都看得见 —— 否则第二条就把整段预算吃光', () => {
+    // 单条阻断意见上限是 2000 字。只做整段截断的话,20 条里只有前两条露面,而用户看到的
+    // 是一份**看起来完整**的两条清单。
+    const p = planFeedbackPrompt(bigItems(20, 2000))
+    const listed = (p.match(/^ {2}\d+\. /gm) ?? []).length
+    expect(`列出的条数: ${listed >= 10}`).toBe('列出的条数: true')
+  })
+
+  it('整段仍有硬预算 —— role 之类的字段没有单独的上限', () => {
+    // 条数上限 + 单条上限算出来是够的,但那是在「其余字段都很短」的前提下。role 是模型/
+    // 配置来的,没人截过它。整段那道 capText 是兜住这类情况的最后一道。
+    const nasty: FeedbackItem[] = [...Array(20)].map((_, i) => ({
+      text: `第${i}条`, role: 'x'.repeat(5000), rounds: [1, 2],
+    }))
+    expect(Array.from(planFeedbackPrompt(nasty)).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
+    expect(Array.from(exhaustionReason(nasty, 3)).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
+    expect(Array.from(reviewRepeatNotice(nasty, 3)).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
   })
 })
