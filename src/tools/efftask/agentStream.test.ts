@@ -1,0 +1,299 @@
+import { describe, expect, it } from 'bun:test'
+import type { AgentEvent } from './agentEvents.js'
+import {
+  createStreamStore,
+  MAX_EVENTS_PER_STREAM,
+  MAX_STREAMS_PER_NODE,
+  MAX_TOTAL_EVENTS,
+  TOMBSTONE_KEEP,
+  type StreamMeta,
+} from './agentStream.js'
+
+const meta = (over: Partial<StreamMeta> = {}): StreamMeta => ({
+  nodeId: 'root/01-a',
+  phaseLabel: '执行',
+  label: '甲员工',
+  ...over,
+})
+
+const text = (t: string): AgentEvent => ({ kind: 'text', text: t })
+const tool = (n: string): AgentEvent => ({ kind: 'tool', useId: n, name: n, brief: n })
+
+/** 可注入的假时钟 —— 这个仓库的测试不许摸真实时钟。 */
+function clock(start = 1000): { now: () => number; tick: (ms: number) => void } {
+  let t = start
+  return { now: () => t, tick: ms => { t += ms } }
+}
+
+describe('一次调用一条流', () => {
+  it('按开启顺序保存,不同节点互不相干', () => {
+    const s = createStreamStore()
+    const a = s.open(meta({ phaseLabel: '分析' }))
+    const b = s.open(meta({ nodeId: 'root/02-b' }))
+    const c = s.open(meta({ phaseLabel: '执行' }))
+    a.push(text('甲说的'))
+    b.push(text('别人的'))
+    c.push(text('丙说的'))
+    expect(s.streams('root/01-a').map(x => x.meta.phaseLabel)).toEqual(['分析', '执行'])
+    expect(s.streams('root/02-b')).toHaveLength(1)
+    expect(s.nodes().sort()).toEqual(['root/01-a', 'root/02-b'])
+  })
+
+  it('圆桌的每个席位各自成流,署名分得开 —— 这是取代 chunkBuffer 的全部理由', () => {
+    // chunkBuffer 把 N 个评审员并进一个桶,三段话逐句交错且没有署名,读不出哪句是谁说的。
+    const s = createStreamStore()
+    const jia = s.open(meta({ phaseLabel: '质疑讨论', label: '甲员工', round: 1 }))
+    const yi = s.open(meta({ phaseLabel: '质疑讨论', label: '乙员工', round: 1 }))
+    jia.push(text('我反对'))
+    yi.push(text('我赞成'))
+    jia.push(text('理由是'))
+    const rows = s.streams('root/01-a')
+    expect(rows.map(r => r.meta.label)).toEqual(['甲员工', '乙员工'])
+    expect(rows[0]!.events.map(e => (e.kind === 'text' ? e.text : ''))).toEqual(['我反对', '理由是'])
+    expect(rows[1]!.events.map(e => (e.kind === 'text' ? e.text : ''))).toEqual(['我赞成'])
+  })
+
+  it('同一个节点、同一环节、同一轮开两次也是两条流 —— infra 重试就是这样', () => {
+    // 设计稿第一版用 nodeId#phase#round#seat 做 key,而 roundtableWithInfraRetry 的三次
+    // attempt 共用同一个 round:第二次会往一条已经收口的流里继续写。句柄从结构上排除这件事。
+    const s = createStreamStore()
+    const first = s.open(meta({ phaseLabel: '质疑讨论', round: 1 }))
+    first.push(text('第一桌'))
+    first.end('角色调用失败')
+    const second = s.open(meta({ phaseLabel: '质疑讨论', round: 1 }))
+    second.push(text('第二桌'))
+    expect(s.streams('root/01-a')).toHaveLength(2)
+    expect(s.streams('root/01-a')[0]!.closed).toBe(true)
+    expect(s.streams('root/01-a')[1]!.closed).toBe(false)
+  })
+
+  it('没有流的节点读作空数组,不是 undefined', () => {
+    const s = createStreamStore()
+    expect(s.streams('nope')).toEqual([])
+    expect(s.droppedEvents('nope')).toBe(0)
+  })
+
+  it('统计工具调用次数', () => {
+    const s = createStreamStore()
+    const h = s.open(meta())
+    h.push(tool('Read'))
+    h.push(text('说点什么'))
+    h.push(tool('Bash'))
+    expect(s.streams('root/01-a')[0]!.toolCount).toBe(2)
+  })
+
+  it('events 每次都换引用 —— 否则 memo 过的窗口永远停在第一帧', () => {
+    // chunkBuffer 每次 push 都造新数组。原地 push 的话数组引用永不变,任何
+    // React.memo / useMemo([streams]) 都看不见变化。
+    const s = createStreamStore()
+    const h = s.open(meta())
+    h.push(text('一'))
+    const before = s.streams('root/01-a')[0]!.events
+    h.push(text('二'))
+    const after = s.streams('root/01-a')[0]!.events
+    expect(before).not.toBe(after)
+    expect(before).toHaveLength(1)
+  })
+})
+
+describe('收口', () => {
+  it('记录耗时,用注入的时钟', () => {
+    const c = clock()
+    const s = createStreamStore({ now: c.now })
+    const h = s.open(meta())
+    c.tick(4200)
+    h.end()
+    const st = s.streams('root/01-a')[0]!
+    expect(st.startedAt).toBe(1000)
+    expect(st.endedAt).toBe(5200)
+  })
+
+  it('收口之后到达的事件被丢弃并计数,不会让「已完成」的窗口继续长', () => {
+    // runAgentAdapter 的超时是 Promise.race,poll 赢了之后并不停下 consume():生成器要等
+    // 下一次 yield 才看得到 abort,provider 缓冲里的消息会在 end() 之后继续到达。
+    const s = createStreamStore()
+    const h = s.open(meta())
+    h.push(text('正常的一行'))
+    h.end()
+    h.push(text('超时之后才吐出来的'))
+    const st = s.streams('root/01-a')[0]!
+    expect(st.events).toHaveLength(1)
+    expect(st.dropped).toBe(1)
+    expect(s.droppedEvents('root/01-a')).toBe(1)
+  })
+
+  it('一条事件都没产出过的席位也要看得见 —— 失败恰恰是最需要看见的', () => {
+    // provider 401、或者已中断早退,席位一条事件都没有。若 end() 是 no-op,3 席面板只画
+    // 出 2 个窗口,第三席连它失败了都看不见。
+    const s = createStreamStore()
+    const h = s.open(meta({ label: '丙员工' }))
+    h.end('角色调用失败: 401')
+    const st = s.streams('root/01-a')[0]!
+    expect(st.closed).toBe(true)
+    expect(st.error).toBe('角色调用失败: 401')
+    expect(st.events).toEqual([])
+  })
+
+  it('end 幂等', () => {
+    const c = clock()
+    const s = createStreamStore({ now: c.now })
+    const h = s.open(meta())
+    h.end()
+    c.tick(9999)
+    h.end('后来的错')
+    const st = s.streams('root/01-a')[0]!
+    expect(st.endedAt).toBe(1000)
+    expect(st.error).toBeUndefined()
+  })
+})
+
+describe('有界 —— 一场没人看的长跑不能把内存吃光', () => {
+  it('单流是环形缓冲,并记录丢了多少', () => {
+    const s = createStreamStore()
+    const h = s.open(meta())
+    for (let i = 1; i <= MAX_EVENTS_PER_STREAM + 7; i++) h.push(text(`行 ${i}`))
+    const st = s.streams('root/01-a')[0]!
+    expect(st.events).toHaveLength(MAX_EVENTS_PER_STREAM)
+    expect(st.dropped).toBe(7)
+    expect((st.events[0] as { text: string }).text).toBe('行 8')
+    expect(s.droppedEvents('root/01-a')).toBe(7)
+  })
+
+  it('单节点流数超限 → 最旧的已收口流压成墓碑,不是删除', () => {
+    // 淘汰规则「最旧的先走」正好淘汰第 1 轮评审 —— 而那恰好是评审收敛那一半让用户回去
+    // 对照的东西。墓碑保住表头和结论。
+    const s = createStreamStore()
+    for (let i = 0; i < MAX_STREAMS_PER_NODE + 3; i++) {
+      const h = s.open(meta({ phaseLabel: `第${i}场` }))
+      for (let k = 0; k < 10; k++) h.push(text(`${i}-${k}`))
+      h.end()
+    }
+    const rows = s.streams('root/01-a')
+    // 一条都没少 —— 表头还在
+    expect(rows).toHaveLength(MAX_STREAMS_PER_NODE + 3)
+    expect(rows[0]!.meta.phaseLabel).toBe('第0场')
+    expect(rows[0]!.tombstone).toBe(true)
+    expect(rows[0]!.events).toHaveLength(TOMBSTONE_KEEP)
+    // 留的必须是**最后**几条,不是最前几条:折叠态显示的是「最新: …」,而一条流最后
+    // 说的话通常就是它的结论。留开头等于把结论换成开场白。
+    expect(rows[0]!.events.map(e => (e.kind === 'text' ? e.text : ''))).toEqual(['0-7', '0-8', '0-9'])
+    expect(rows[rows.length - 1]!.tombstone).toBeUndefined()
+    expect(s.droppedEvents('root/01-a')).toBeGreaterThan(0)
+  })
+
+  it('还活着的流永远不会被压掉 —— 它正在被人看', () => {
+    const s = createStreamStore()
+    const live: { push: (e: AgentEvent) => void }[] = []
+    for (let i = 0; i < MAX_STREAMS_PER_NODE + 5; i++) {
+      const h = s.open(meta({ phaseLabel: `第${i}场` }))
+      for (let k = 0; k < 10; k++) h.push(text(`${i}-${k}`))
+      live.push(h) // 一个都不收口
+    }
+    expect(s.streams('root/01-a').every(r => r.tombstone === undefined)).toBe(true)
+  })
+
+  it('全局上限盖住总量,与节点数无关', () => {
+    // caps.maxNodes 的真实上限是 5000,而 cap-nodes 卡片会主动引导用户调高它。只靠
+    // 每流/每节点两层上限,总量随节点数线性涨,GB 级是算得出来的。
+    const s = createStreamStore()
+    for (let n = 0; n < 400; n++) {
+      const h = s.open(meta({ nodeId: `node-${n}` }))
+      for (let k = 0; k < MAX_EVENTS_PER_STREAM; k++) h.push(text(`${n}-${k}`))
+      h.end()
+    }
+    expect(s.totalEvents()).toBeLessThanOrEqual(MAX_TOTAL_EVENTS)
+    // 而且不是靠删光:最早那些节点还留着表头
+    expect(s.streams('node-0')).toHaveLength(1)
+    expect(s.streams('node-0')[0]!.tombstone).toBe(true)
+    expect(s.droppedEvents('node-0')).toBeGreaterThan(0)
+  })
+
+  it('全局上限在 push 时就生效,不能只等到收口才算账', () => {
+    // 只在 end() 里做全局淘汰是不够的:一个**还在跑**的执行席位可以一直 push,而它永远
+    // 不会收口。先用已收口的流把额度填满,再让一条活流继续写 —— 只有 push 时的那道
+    // 检查能把总量按回去。
+    const s = createStreamStore()
+    const perStream = MAX_EVENTS_PER_STREAM
+    const closedCount = Math.ceil(MAX_TOTAL_EVENTS / perStream)
+    for (let n = 0; n < closedCount; n++) {
+      const h = s.open(meta({ nodeId: `filler-${n}` }))
+      for (let k = 0; k < perStream; k++) h.push(text(`${n}-${k}`))
+      h.end() // 收口时刚好不超,所以这里不会触发淘汰
+    }
+    const beforeLive = s.totalEvents()
+    const live = s.open(meta({ nodeId: 'still-running' }))
+    live.push(text('活流的第一行'))
+    live.push(text('活流的第二行'))
+    expect(`收口后未超限: ${beforeLive <= MAX_TOTAL_EVENTS}`).toBe('收口后未超限: true')
+    expect(s.totalEvents()).toBeLessThanOrEqual(MAX_TOTAL_EVENTS)
+    expect(s.streams('still-running')[0]!.events).toHaveLength(2)
+  })
+
+  it('全局淘汰不碰活流', () => {
+    const s = createStreamStore()
+    const alive = s.open(meta({ nodeId: 'watched' }))
+    for (let k = 0; k < MAX_EVENTS_PER_STREAM; k++) alive.push(text(`看着的 ${k}`))
+    for (let n = 0; n < 400; n++) {
+      const h = s.open(meta({ nodeId: `node-${n}` }))
+      for (let k = 0; k < MAX_EVENTS_PER_STREAM; k++) h.push(text(`${n}-${k}`))
+      h.end()
+    }
+    const st = s.streams('watched')[0]!
+    expect(st.tombstone).toBeUndefined()
+    expect(st.events).toHaveLength(MAX_EVENTS_PER_STREAM)
+  })
+
+  it('三层上限的关系要说得出口,不是随手填的数', () => {
+    // 单流 × 单节点 = 单节点理论峰值;它必须**大于**全局上限,否则全局那一层就是摆设
+    // (一个节点自己都撑不满,那层永远不会触发)。同时全局上限要能装下若干个满节点。
+    expect(MAX_EVENTS_PER_STREAM * MAX_STREAMS_PER_NODE).toBeLessThan(MAX_TOTAL_EVENTS)
+    expect(MAX_TOTAL_EVENTS / (MAX_EVENTS_PER_STREAM * MAX_STREAMS_PER_NODE)).toBeGreaterThanOrEqual(2)
+    // 一屏多一点,不是一整份 transcript
+    expect(MAX_EVENTS_PER_STREAM).toBeGreaterThan(50)
+    expect(MAX_EVENTS_PER_STREAM).toBeLessThanOrEqual(500)
+  })
+})
+
+describe('订阅', () => {
+  it('push / end / open 都会通知', () => {
+    const s = createStreamStore()
+    let n = 0
+    const off = s.subscribe(() => { n++ })
+    const h = s.open(meta())
+    h.push(text('x'))
+    h.end()
+    expect(n).toBe(3)
+    off()
+    s.open(meta()).push(text('y'))
+    expect(n).toBe(3)
+  })
+
+  it('一个崩掉的订阅者不能带走这条流', () => {
+    const s = createStreamStore()
+    let ok = 0
+    s.subscribe(() => { throw new Error('渲染崩了') })
+    s.subscribe(() => { ok++ })
+    const h = s.open(meta())
+    expect(() => h.push(text('x'))).not.toThrow()
+    expect(ok).toBeGreaterThan(0)
+  })
+})
+
+describe('resume:没有流 ≠ 什么都没干', () => {
+  it('标记过的历史节点认得出来', () => {
+    // store 每次挂载都是新的,--resume 拿到的是磁盘上的节点树 + 空 store。不区分的话,
+    // 一个上次跑了 40 分钟的已完成节点会渲染成「这个节点什么都没干」。
+    const s = createStreamStore()
+    s.markHistorical(['root/01-a', 'root/02-b'])
+    expect(s.isHistorical('root/01-a')).toBe(true)
+    expect(s.isHistorical('root/03-c')).toBe(false)
+  })
+
+  it('历史节点后来被 reseat 重开、产生新流时,两件事都成立', () => {
+    const s = createStreamStore()
+    s.markHistorical(['root/01-a'])
+    s.open(meta()).push(text('这一轮新跑的'))
+    expect(s.isHistorical('root/01-a')).toBe(true)
+    expect(s.streams('root/01-a')).toHaveLength(1)
+  })
+})
