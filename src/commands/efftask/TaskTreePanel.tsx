@@ -104,6 +104,32 @@ export function viewport<T>(rows: T[], cursor: number, height: number): { slice:
   return { slice: rows.slice(from, from + height), from }
 }
 
+/**
+ * 按**终端行数**而不是**树行数**开窗 —— 运行中的行下面会多挂一条活动行。
+ *
+ * 第一版是两趟 `viewport`:先用 height 定一个 from、按它算预算、再用变小的 height 调一次
+ * viewport。**那两趟的 from 不是同一个** —— 第二趟会拿新 height 重新居中光标,于是「按哪些
+ * 行算的预算」和「实际画的哪些行」错开。实测 height=20、光标在 30、34 行起全在跑:
+ * firstFrom=20 算出预算 17,而真正画的是 from=22,占 22 个终端行 —— 超 2 行;20 万次随机
+ * 扫描里最坏一例超 7 行。溢出的那几行顶掉的正是底部的计数与按键提示。
+ *
+ * 现在迭代到不动点,并且**最后一步一定是「按最终的 from 重算行数」**,所以
+ * `Σcost(slice) <= height` 是构造上成立的,不靠收敛运气。收敛不了就以不溢出为准。
+ */
+export function budgetedViewport<T>(
+  rows: T[], cost: readonly number[], cursor: number, height: number,
+): { slice: T[]; from: number } {
+  let from = viewport(rows, cursor, height).from
+  let n = budgetRows(cost, from, height)
+  for (let i = 0; i < 4; i++) {
+    const next = viewport(rows, cursor, n).from
+    if (next === from) break
+    from = next
+    n = budgetRows(cost, from, height)
+  }
+  return { slice: rows.slice(from, from + n), from }
+}
+
 export function TaskTreePanel(props: {
   nodes: TaskNode[]
   runId: string
@@ -228,8 +254,7 @@ export function TaskTreePanel(props: {
     }
   }
   const cost = rows.map(r => (activity.has(r.node.id) ? 2 : 1))
-  const firstPass = viewport(rows, idx, height)
-  const view = viewport(rows, idx, budgetRows(cost, firstPass.from, height))
+  const view = budgetedViewport(rows, cost, idx, height)
   const counts: Record<UiStatus, number> = { done: 0, running: 0, queued: 0, failed: 0 }
   for (const n of props.nodes) counts[uiStatus(n.status)]++
 

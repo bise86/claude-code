@@ -8,7 +8,7 @@ import { describe, expect, it } from 'bun:test'
 import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
-import { TaskTreePanel, visibleRows, viewport, elapsed } from './TaskTreePanel.js'
+import { TaskTreePanel, visibleRows, viewport, elapsed, budgetedViewport } from './TaskTreePanel.js'
 import { NodeDetail, phaseTimeBody } from './NodeDetail.js'
 import { PHASE_LABEL, PHASE_NAMES } from '../../tools/efftask/types.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
@@ -820,5 +820,43 @@ describe('运行中的界面不能还叫旧名', () => {
       expect(`${p} 的标签: ${body.includes(PHASE_LABEL[p])}`).toBe(`${p} 的标签: true`)
     }
     expect(body).not.toContain('集成提交')
+  })
+})
+
+describe('budgetedViewport —— 画出去的终端行数不能超预算', () => {
+  const rows = (n: number) => [...Array(n)].map((_, i) => i)
+
+  it('全是单行时就是普通 viewport', () => {
+    const v = budgetedViewport(rows(40), rows(40).map(() => 1), 10, 20)
+    expect(v.slice).toHaveLength(20)
+  })
+
+  it('随机扫描:Σcost(实际画的那些行) 恒不超 height', () => {
+    // 第一版是两趟 viewport,而两趟的 from 不是同一个 —— 「按哪些行算的预算」和「实际画
+    // 的哪些行」错开。20 万次随机扫描里最坏一例超 7 行,顶掉的正是底部的计数和按键提示。
+    // 这条测试是那次实测的固化:不看实现怎么写,只看这条不变量。
+    let worst = 0
+    let worstCase = ''
+    // 确定性伪随机 —— 这个仓库的测试不许摸真实时钟,也不该跑一次绿一次红。
+    let seed = 12345
+    const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n }
+    for (let t = 0; t < 4000; t++) {
+      const total = 1 + rnd(60)
+      const height = 3 + rnd(30)
+      const cursor = rnd(total)
+      const runFrom = rnd(total)
+      const cost = [...Array(total)].map((_, i) => (i >= runFrom ? 2 : 1))
+      const v = budgetedViewport(rows(total), cost, cursor, height)
+      const used = cost.slice(v.from, v.from + v.slice.length).reduce((a, b) => a + b, 0)
+      if (used - height > worst) {
+        worst = used - height
+        worstCase = `total=${total} height=${height} cursor=${cursor} runFrom=${runFrom} from=${v.from} used=${used}`
+      }
+    }
+    expect(`最坏超出 ${worst} 行 ${worstCase}`).toBe('最坏超出 0 行 ')
+  })
+
+  it('至少画一行 —— 预算再紧也不能把树整个变空', () => {
+    expect(budgetedViewport(rows(5), [2, 2, 2, 2, 2], 0, 1).slice.length).toBeGreaterThanOrEqual(1)
   })
 })
