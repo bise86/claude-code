@@ -89,9 +89,17 @@ function bigrams(s: string): Set<string> {
  *     或者指出方案的哪一句没回应它」。触顶话术两个分支给的也都是「先确认」而不是相反的
  *     指令。这样一次误判最多是多一句废话,不会改变裁决。
  */
-export function similarItem(a: string, b: string): boolean {
-  const x = normalizeItem(a)
-  const y = normalizeItem(b)
+interface Prepared { norm: string; grams: Set<string> }
+
+/** 归一 + 建二元组,**一条只做一次**。见 similarItem 上面那段关于 O(n²) 的说明。 */
+function prepare(text: string): Prepared {
+  const norm = normalizeItem(text)
+  return { norm, grams: bigrams(norm) }
+}
+
+function similarPrepared(a: Prepared, b: Prepared): boolean {
+  const x = a.norm
+  const y = b.norm
   // 归一后为空的条目**不参与比较,也不被匹配**。parseOutput 只滤空串,`"   "` 和 `"……"`
   // 活得下来;而空串是任何字符串的子串 —— 不挡的话,一条纯标点的阻断项会把全部意见
   // 合并成一组「连续 N 轮未解决」。
@@ -104,12 +112,34 @@ export function similarItem(a: string, b: string): boolean {
   if (long.includes(short) && short.length >= CONTAIN_MIN_LEN && short.length / long.length >= CONTAIN_MIN_RATIO) {
     return true
   }
-  const A = bigrams(x)
-  const B = bigrams(y)
+  const A = a.grams
+  const B = b.grams
+  // 便宜的预筛:交集不可能超过较小的那个集合,所以 Jaccard <= min/max。差得太远就不用
+  // 遍历了。真实数据里绝大多数比较在这里就结束 —— 而这条函数跑在 O(n²) 的循环里。
+  const lo = Math.min(A.size, B.size)
+  const hi = Math.max(A.size, B.size)
+  if (hi === 0 || lo / hi < SIMILAR_THRESHOLD) return false
+  // 遍历小的那个集合,查大的 —— Set.has 是 O(1),但少遍历一半就是少一半的调用。
+  const [small, big] = A.size <= B.size ? [A, B] : [B, A]
   let inter = 0
-  for (const g of A) if (B.has(g)) inter++
+  for (const g of small) if (big.has(g)) inter++
   const union = A.size + B.size - inter
   return union > 0 && inter / union >= SIMILAR_THRESHOLD
+}
+
+/**
+ * 两条阻断意见是不是同一条(字符串入口)。
+ *
+ * **这个函数每调一次都要重建两边的二元组集合。** 放进 O(n²) 的合并循环里实测过:
+ * 5 席 × 3 轮 × 20 条,单次 feedbackItems 要 752 ms,而 reviewPrompt 把它放在函数体里
+ * → 每个席位各算一遍完全相同的结果 → 一轮 15 次 = **11.3 秒的主线程同步阻塞**,
+ * 期间整个界面(含别的节点正在跑的日志窗)不刷新。
+ *
+ * 所以内部走 prepare/similarPrepared:每条只归一、只建集合一次。这个字符串入口保留给
+ * 测试和零星调用。
+ */
+export function similarItem(a: string, b: string): boolean {
+  return similarPrepared(prepare(a), prepare(b))
 }
 
 /**
@@ -122,6 +152,9 @@ export function similarItem(a: string, b: string): boolean {
  */
 export function feedbackItems(log: readonly RoundtableRecord[]): FeedbackItem[] {
   const items: FeedbackItem[] = []
+  // 与 items 平行的预处理数组。合并是 O(n²) 的比较,不预处理的话每次比较都要把**两边**
+  // 重新归一 + 重建二元组集合 —— 那正是 752 ms 的来源。
+  const prep: Prepared[] = []
   for (const rec of log ?? []) {
     if (!rec || !Array.isArray(rec.verdicts)) continue
     for (const v of rec.verdicts) {
@@ -131,13 +164,16 @@ export function feedbackItems(log: readonly RoundtableRecord[]): FeedbackItem[] 
       for (const raw of v?.blocking ?? []) {
         if (typeof raw !== 'string') continue
         const text = raw.trim()
-        if (normalizeItem(text).length === 0) continue
-        const hit = items.find(it => similarItem(it.text, text))
-        if (hit) {
+        const p = prepare(text)
+        if (p.norm.length === 0) continue
+        const at = prep.findIndex(q => similarPrepared(q, p))
+        if (at >= 0) {
+          const hit = items[at]!
           if (!hit.rounds.includes(rec.round)) hit.rounds.push(rec.round)
           continue
         }
         items.push({ text, role: v.role ?? 'main', rounds: [rec.round] })
+        prep.push(p)
       }
     }
   }

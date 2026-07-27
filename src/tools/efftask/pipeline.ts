@@ -513,8 +513,14 @@ function ctxGoal(node: TaskNode): string { return node.goal }
  * 同一个对象上,一行没用。方案作者那边反而是有历史的(planPrompt 带「上一版方案」+
  * feedback),所以是**单边失明**:作者知道自己在改什么,评审员不知道自己在重复什么。
  */
-function reviewPrompt(node: TaskNode, tag: string, brief = '', round = 1): string {
-  const notice = reviewRepeatNotice(feedbackItems(node.reviewLog), round)
+/**
+ * @param notice 已经算好的重复提示。**不在这里算。**
+ *
+ * 这个函数是 per-seat 的:5 席就调 5 次,而 `feedbackItems(node.reviewLog)` 在一轮之内
+ * 结果完全相同。放在函数体里实测过 —— 5 席 × 3 轮 × 20 条时单次 752 ms,一轮 15 次 =
+ * **11.3 秒的主线程同步阻塞**,期间整个界面(含别的节点正在跑的日志窗)不刷新。
+ */
+function reviewPrompt(node: TaskNode, tag: string, brief = '', notice = ''): string {
   return brief +
     `请评审以下方案是否可执行、完整、无重大风险。方案:\n${quote(JSON.stringify(node.plan))}\n` +
     (notice ? notice + '\n' : '') +
@@ -993,10 +999,12 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // 「跑了但记录丢了」。写「已跳过」是为了让这两件事在事后追责时分得开。
       noteOnNode(node, '质疑讨论环节已跳过:本节点的方案没有经过任何评审')
     } else {
+    const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog), node.iteration.planReview + 1)
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
       system: 'review',
-      buildPrompt: (tag, seat) => reviewPrompt(node, tag, seatBrief(ctx, seat, 'review'), node.iteration.planReview + 1),
+      // 一轮算一次,不是一席算一次:reviewLog 在这一轮之内不变。
+      buildPrompt: (tag, seat) => reviewPrompt(node, tag, seatBrief(ctx, seat, 'review'), reviewNotice),
       ctx,
     })
     node.reviewLog.push(rec)

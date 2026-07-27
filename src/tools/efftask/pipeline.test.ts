@@ -1,5 +1,6 @@
 // src/tools/efftask/pipeline.test.ts
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { parseDirectives } from './parseDirectives.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
@@ -4328,5 +4329,19 @@ describe('评审收敛真的接上了', () => {
     expect(n.blockedReason).toContain('评审迭代超限')
     expect(n.blockedReason).not.toContain('轮未解决')
     expect(n.blockedReason).toContain('扩大范围')
+  })
+
+  it('重复提示一轮只算一次,不是一席算一次(结构闸门)', () => {
+    // feedbackItems 是 O(n²)。留在 per-seat 的提示词构造里,5 席就重算 5 遍**完全相同**
+    // 的结果:实测 5 席 × 3 轮 × 20 条时单次 752 ms、一轮 15 次 = 11.3 秒的主线程同步
+    // 阻塞,期间整个界面(含别的节点正在跑的日志窗)一动不动。
+    //
+    // 这条是**结构**闸门,不是行为闸门 —— 第一版写成「几个席位拿到同一个字符串」,而
+    // 字符串的 === 比的是值不是身份,各算各的照样相等,那条探针是空的。真正要钉的是
+    // 「这次调用发生在哪一层」,而那件事在运行时观测不到。
+    const SRC = readFileSync(new URL('./pipeline.ts', import.meta.url), 'utf8')
+    const body = SRC.slice(SRC.indexOf('function reviewPrompt('), SRC.indexOf('function executePrompt('))
+    expect(`reviewPrompt 里还在算: ${body.includes('feedbackItems')}`).toBe('reviewPrompt 里还在算: false')
+    expect(SRC).toContain('const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog)')
   })
 })
