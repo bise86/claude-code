@@ -54,6 +54,7 @@ import { getCwd } from '../../utils/cwd.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { createStreamStore, PRE_TREE_NODE, type StreamHandle, type StreamState, type StreamStore } from '../../tools/efftask/agentStream.js'
 import { AgentLogPane, useStreamTick } from './AgentLogPane.js'
+import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { logError } from '../../utils/log.js'
 
 
@@ -594,6 +595,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 老毛病(orchestrator.ts 的注释里记着它已经发生过两次)。
    */
   useStreamTick(streams.current, phase === 'parsing' || phase === 'drafting')
+  // 真实列宽。写死 100 的话,80 列终端上表头右半段(运行中/工具数/耗时)会被整段切掉 ——
+  // justify() 放不下时退化成 left + ' ' + right,而 truncate-end 是从右边吃的,先没的
+  // 正好是状态。80 列是极常见的默认,而 ParsingView 是敲完 /et 看到的第一屏。
+  const { columns: termColumns } = useTerminalSize()
   /** 并行占用 reader, handed over once by runOrchestrator. */
   const poolRead = React.useRef<(() => { inUse: number; limit: number }) | null>(null)
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
@@ -1207,7 +1212,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'parsing' || !config) {
-    return <ParsingView onCancel={bail} log={preStreams()} />
+    return <ParsingView onCancel={bail} log={preStreams()} columns={termColumns} />
   }
   if (phase === 'confirmResume' && summary) {
     return <ConfirmResume
@@ -1257,6 +1262,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         tone="dim"
         onDismiss={bail}
         log={preStreams()}
+        columns={termColumns}
       />
     )
   }
@@ -1285,6 +1291,7 @@ function MessageView(props: {
   title: string; body: string; tone: 'error' | 'dim'; onDismiss: () => void
   /** 等待期间这一屏背后跑着的模型调用。只读:回车/q/Esc 归这一屏自己。 */
   log?: readonly StreamState[]
+  columns?: number
 }): React.ReactElement {
   useInput((input, key) => {
     if (key.return || key.escape || input.toLowerCase() === 'q') props.onDismiss()
@@ -1294,7 +1301,7 @@ function MessageView(props: {
       <Text bold>{props.title}</Text>
       <Text color={props.tone === 'error' ? 'error' : undefined} dimColor={props.tone === 'dim'}>{props.body}</Text>
       {props.log && props.log.length > 0 ? (
-        <AgentLogPane streams={props.log} height={10} width={100} isActive={false} />
+        <AgentLogPane streams={props.log} height={10} width={props.columns ?? 100} isActive={false} />
       ) : null}
       <Text dimColor>回车 / q / Esc 退出</Text>
     </Box>
@@ -1302,7 +1309,7 @@ function MessageView(props: {
 }
 
 // 'parsing' phase: the extraction model call is in flight. Esc/q must work here too.
-function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[] }): React.ReactElement {
+function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[]; columns?: number }): React.ReactElement {
   useInput((input, key) => {
     if (key.escape || input.toLowerCase() === 'q') props.onCancel()
   })
@@ -1311,7 +1318,7 @@ function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[]
       <Text dimColor>正在解析需求…</Text>
       {/* 这一屏是用户敲完 /et 看到的**第一屏**,背后是一次真实的模型调用。 */}
       {props.log && props.log.length > 0 ? (
-        <AgentLogPane streams={props.log} height={8} width={100} isActive={false} />
+        <AgentLogPane streams={props.log} height={8} width={props.columns ?? 100} isActive={false} />
       ) : null}
       <Text dimColor>Esc/q 取消</Text>
     </Box>

@@ -237,10 +237,15 @@ describe('runAgentAdapter helpers', () => {
       throw new Error('provider exploded')
     }
     let ended = 0
+    let reason: string | undefined
     await expect(
-      makeRunAgentFn(baseDeps(fakeRun))(req({ phase: 'plan', stream: { push: () => {}, end: () => { ended++ } } })),
+      makeRunAgentFn(baseDeps(fakeRun))(req({ phase: 'plan', stream: { push: () => {}, end: (e?: string) => { ended++; reason = e } } })),
     ).rejects.toThrow('provider exploded')
     expect(ended).toBe(1)
+    // **收口时要带上理由。** 只断言 end() 被调用是不够的:第一版给抛出那一支传的是
+    // undefined,于是 provider 抛 ECONNRESET 之后窗口表头是绿色的「● 已完成」——
+    // 而中断那条路径反而是对的,同一块屏上两种失败长得不一样。
+    expect(reason).toContain('provider exploded')
   })
 
   it('已中断的早退路径也收口 —— 它绕过 finally', async () => {

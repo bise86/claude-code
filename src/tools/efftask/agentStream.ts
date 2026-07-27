@@ -174,8 +174,18 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
   /** 单节点流数超限 → 压掉该节点最旧的一条已收口的流。 */
   const enforcePerNode = (nodeId: string): void => {
     const list = byNode.get(nodeId)
-    if (!list || list.length <= MAX_STREAMS_PER_NODE) return
-    let over = list.length - MAX_STREAMS_PER_NODE
+    if (!list) return
+    /**
+     * 只数**还完整**的流。
+     *
+     * 用 `list.length`(含墓碑)算超量,等于每 open 一条就按全额超量重新收一次费:
+     * 实测 41 条 → 压 1 条,42 → 3,45 → 15,50 → **49** —— T(k)=(k-40)(k-39)/2。
+     * 上限承诺的是「留 40 条完整的」,实际到 50 条时第 1 轮到第 49 轮全成了墓碑,而
+     * 评审收敛那一半正指望用户回去对照第 1 轮说了什么。
+     */
+    const intact = list.filter(s => s.tombstone !== true).length
+    if (intact <= MAX_STREAMS_PER_NODE) return
+    let over = intact - MAX_STREAMS_PER_NODE
     for (const s of list) {
       if (over <= 0) break
       if (!s.closed || s.tombstone) continue
@@ -216,10 +226,30 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
           // 会永远停在第一帧。
           const next = [...state.events, e]
           if (next.length > MAX_EVENTS_PER_STREAM) {
-            const cut = next.length - MAX_EVENTS_PER_STREAM
-            state.dropped += cut
-            addDropped(state.meta.nodeId, cut)
-            state.events = next.slice(cut)
+            /**
+             * 满了先丢**思考**,丢不够再从头丢。
+             *
+             * 一视同仁的先进先出会让这个功能的核心失效:thinking 每块最多产 60 条
+             * (MAX_LINES_PER_BLOCK),而单流只有 100 条。实测「1 个工具 + 1 个返回 +
+             * 120 条思考」之后,缓冲里**一条工具事件都不剩**,表头还写着「1 工具」——
+             * 而屏幕上占满全部位置的思考默认还是折叠成一行计数的。用户要看的
+             * 「在调用什么工具」就这样被「在思考啥」挤没了。
+             *
+             * 思考不是不重要,它只是**可以少留一点**:折叠态本来只显示段数,展开也只是
+             * 回看几段。工具调用是这条流干了什么的唯一证据。
+             */
+            let quota = next.length - MAX_EVENTS_PER_STREAM
+            const kept: AgentEvent[] = []
+            for (const ev of next) {
+              if (quota > 0 && ev.kind === 'thinking') { quota--; continue }
+              kept.push(ev)
+            }
+            const overflow = kept.length - MAX_EVENTS_PER_STREAM
+            const finalKept = overflow > 0 ? kept.slice(overflow) : kept
+            const removed = next.length - finalKept.length
+            state.dropped += removed
+            addDropped(state.meta.nodeId, removed)
+            state.events = finalKept
             // total 不变:丢几条补几条
           } else {
             state.events = next

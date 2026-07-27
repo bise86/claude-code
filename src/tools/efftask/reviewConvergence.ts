@@ -77,6 +77,10 @@ function bigrams(s: string): Set<string> {
  * **诚实的边界:字符 n-gram 分不开下面这两种情况。** 实测(归一 + 二元组 Jaccard):
  *
  *   「评分等级与分数的映射规则未定义」 vs 「评分等级到分数的映射规则没有定义」  → 0.53
+ *
+ * **注意这里用的是简写版。** 用户真实那条带着 `(A/B/C/D)`,把它和上面右边那句比是
+ * **判不重复的** —— 也就是说这份文档的招牌例子本身就接不住。调阈值的人别照着这张表推,
+ * 它说明的是「该判的分数更低」这个方向,不是「0.5 刚好够用」。
  *   「…返回**超时**时的重试策略与退避算法」 vs 「…返回**错误**时的重试策略与退避算法」 → 0.79
  *
  * 前者是同一条换了说法(**应该**判重复),后者是两条不同的意见(**不应该**判重复),
@@ -181,7 +185,14 @@ export function feedbackItems(log: readonly RoundtableRecord[]): FeedbackItem[] 
   return items
 }
 
-/** 连续出现过 minRounds 轮以上的意见 —— 「方案一直没回应」的那些。 */
+/**
+ * 在**不止一轮**里出现过的意见 —— 「方案一直没回应」的那些。
+ *
+ * 名字里没有「连续」,输出里也不该有。第一版把它叫「连续 N 轮未解决」,而这里数的是
+ * **出现次数**:rounds=[1,3](第 2 轮没提)会被报成「连续 2 轮」。给方案作者的提示词里
+ * 说假话,和这个仓库反复在修的那一类是同一件事。真要说「连续」就得算最长连续段,
+ * 而那个数对作者没有额外价值 —— 他要知道的是「这条你被提了几次、分别在第几轮」。
+ */
 export function stuckItems(items: readonly FeedbackItem[], minRounds = 2): FeedbackItem[] {
   return items.filter(it => it.rounds.length >= Math.max(2, minRounds))
 }
@@ -212,7 +223,7 @@ export const MAX_FEEDBACK_ITEMS = 20
 export const MAX_ITEM_CHARS = 160
 
 const bullet = (it: FeedbackItem, i: number): string =>
-  `  ${i + 1}. [${it.role}] ${capText(it.text, MAX_ITEM_CHARS)}`
+  `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮) ${capText(it.text, MAX_ITEM_CHARS)}`
 
 /** 按「老账优先」裁到 MAX_FEEDBACK_ITEMS,返回被裁掉的条数。 */
 function trim(stuck: FeedbackItem[], fresh: FeedbackItem[]): { stuck: FeedbackItem[]; fresh: FeedbackItem[]; dropped: number } {
@@ -241,13 +252,15 @@ export function planFeedbackPrompt(items: readonly FeedbackItem[]): string {
   ]
   if (cut.stuck.length > 0) {
     parts.push(
-      `【连续 ${Math.max(...cut.stuck.map(s => s.rounds.length))} 轮未解决】` +
+      `【被提过不止一轮,至今没有被回应】` +
         '必须逐条明确回应:要么在方案里解决,要么写明为什么不适用。',
       ...cut.stuck.map(bullet),
     )
   }
   if (cut.fresh.length > 0) {
-    parts.push('【本轮新增】', ...cut.fresh.map(bullet))
+    // 不是「本轮新增」:fresh 的判据是「只出现过一轮」,那一轮可能是第 1 轮。第 4 轮
+    // 构造提示词时,三条分别只在第 1/2/3 轮出现过的意见会被全部标成「本轮新增」。
+    parts.push('【只被提过一轮】', ...cut.fresh.map(bullet))
   }
   return capText(parts.join('\n'), MAX_SUMMARY_CHARS)
 }
@@ -290,11 +303,11 @@ export function exhaustionReason(items: readonly FeedbackItem[], max: number): s
   const seg: string[] = []
   if (cut.dropped > 0) seg.push(`共 ${items.length} 条,以下只列 ${MAX_FEEDBACK_ITEMS} 条`)
   if (cut.stuck.length > 0) {
-    seg.push(`连续 ${Math.max(...cut.stuck.map(s => s.rounds.length))} 轮未解决 ${allStuck.length} 条 —— ` +
-      cut.stuck.map(it => `[${it.role}] ${capText(it.text, MAX_ITEM_CHARS)}`).join('; '))
+    seg.push(`被提过不止一轮、至今未解决 ${allStuck.length} 条 —— ` +
+      cut.stuck.map(it => `[${it.role}] (第 ${it.rounds.join('、')} 轮) ${capText(it.text, MAX_ITEM_CHARS)}`).join('; '))
   }
   if (cut.fresh.length > 0) {
-    seg.push(`本轮新增 ${items.length - allStuck.length} 条 —— ` +
+    seg.push(`只被提过一轮 ${items.length - allStuck.length} 条 —— ` +
       cut.fresh.map(it => `[${it.role}] ${capText(it.text, MAX_ITEM_CHARS)}`).join('; '))
   }
   // 这句会原样进 node.blockedReason,而 blockedReason 又会被卡片和树引用 —— 它是
@@ -314,7 +327,7 @@ export function exhaustionRemedy(items: readonly FeedbackItem[]): string {
     return '每一轮的意见都不一样,说明评审在持续扩大范围。可以提高 run.md 里的 caps.maxIterations 让它多谈几轮,' +
       '或者收紧验收点、缩小这一节点的范围后重试。'
   }
-  return `有 ${stuck.length} 条意见连续多轮出现。先确认方案是不是真的回应了它们:` +
+  return `有 ${stuck.length} 条意见被提过不止一轮。先确认方案是不是真的回应了它们:` +
     '若确已回应而评审没看见,提高 run.md 里的 caps.maxIterations 让评审继续;' +
     '若确实没回应,单纯加轮次大概率还是同样的结论 —— 先把这几条写进需求或补充说明,再用 ' +
     '`/et --resume <运行ID> --retry-blocked <补充说明>` 重试。'

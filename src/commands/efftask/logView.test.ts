@@ -391,3 +391,38 @@ describe('budgetRows —— 任务树的行预算按行结算', () => {
     expect(budgetRows([1, 1], 0, 0)).toBe(0)
   })
 })
+
+describe('思考:默认折成段数,但要给得出来', () => {
+  const s = () => stream({ events: [think('第一段想法'), think('第二段想法'), tool('Bash', 'Bash(x)')] })
+
+  it('默认只给段数,并说清怎么展开', () => {
+    const ls = render({ streams: [s()], width: 60 })
+    const body = plain(ls.filter(l => !l.isHeader)).join('\n')
+    expect(body).toContain('思考 2 段')
+    expect(body).toContain('t 展开')
+    expect(body).not.toContain('第一段想法')
+  })
+
+  it('展开之后思考原文真的到得了屏幕', () => {
+    // 此前 agentEvents 老老实实按行抽了思考、eventLine 还给它备了 dim 样式,而渲染层
+    // 把它整体换成一个计数 —— 抽出来的原文**永远到不了屏幕**。用户的原话是「看到模型
+    // 在思考啥」,这是直接对着需求做的相反决定。
+    const ls = render({ streams: [s()], width: 60, expandedThinking: new Set([0]) })
+    const body = plain(ls.filter(l => !l.isHeader)).join('\n')
+    expect(body).toContain('第一段想法')
+    expect(body).toContain('第二段想法')
+    expect(body).toContain('Bash(x)')
+  })
+
+  it('只展开被点名的那一条流', () => {
+    const ls = render({ streams: [s(), s()], width: 60, expandedThinking: new Set([1]) })
+    const body = plain(ls).join('\n')
+    expect((body.match(/第一段想法/g) ?? []).length).toBe(1)
+  })
+
+  it('t 是一个按键动作', () => {
+    expect(logPaneAction('t', key())).toEqual({ t: 'toggleThinking' })
+    // 幂等:连击只走一次,不该来回翻
+    expect(logPaneAction('ttt', key())).toEqual({ t: 'toggleThinking' })
+  })
+})

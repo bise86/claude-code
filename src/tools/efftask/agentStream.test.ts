@@ -297,3 +297,61 @@ describe('resume:没有流 ≠ 什么都没干', () => {
     expect(s.streams('root/01-a')).toHaveLength(1)
   })
 })
+
+describe('思考不许把工具调用挤出缓冲', () => {
+  const think = (t: string): AgentEvent => ({ kind: 'thinking', text: t })
+
+  it('缓冲满了先丢思考,工具与返回值留下', () => {
+    // 一视同仁的先进先出会让这个功能的核心失效:thinking 每块最多产 60 条,而单流只有
+    // 100 条。实测「1 工具 + 1 返回 + 120 条思考」之后缓冲里一条工具事件都不剩,而表头
+    // 还写着「1 工具」—— 用户要看的「在调用什么工具」被「在思考啥」挤没了。
+    const s = createStreamStore()
+    const h = s.open(meta())
+    h.push(tool('Read'))
+    h.push({ kind: 'result', useId: 'Read', brief: '读到了', isError: false })
+    for (let i = 0; i < MAX_EVENTS_PER_STREAM + 20; i++) h.push(think(`想法 ${i}`))
+    const st = s.streams('root/01-a')[0]!
+    const kinds = st.events.map(e => e.kind)
+    expect(`还有工具事件: ${kinds.includes('tool')}`).toBe('还有工具事件: true')
+    expect(`还有返回值: ${kinds.includes('result')}`).toBe('还有返回值: true')
+    expect(st.events).toHaveLength(MAX_EVENTS_PER_STREAM)
+    expect(st.dropped).toBeGreaterThan(0)
+  })
+
+  it('思考丢光了还超,才从头丢别的', () => {
+    const s = createStreamStore()
+    const h = s.open(meta())
+    for (let i = 0; i < MAX_EVENTS_PER_STREAM + 5; i++) h.push(tool(`T${i}`))
+    const st = s.streams('root/01-a')[0]!
+    expect(st.events).toHaveLength(MAX_EVENTS_PER_STREAM)
+    // 丢的是最老的那几个
+    expect((st.events[0] as { name: string }).name).toBe('T5')
+  })
+})
+
+describe('验收实测出来的两条', () => {
+  it('抛出去的调用要标成失败,不是绿色的「已完成」', () => {
+    // 实测:provider 抛 ECONNRESET / 529 之后表头是 `● 已完成`,而中断那条路径反而是对的
+    // —— 同一块屏上两种失败长得不一样。而这块屏正是用户打开去查「这一席为什么失败」的。
+    const s = createStreamStore()
+    const h = s.open(meta())
+    h.end('provider exploded')
+    expect(s.streams('root/01-a')[0]!.error).toBe('provider exploded')
+  })
+
+  it('每节点淘汰不是二次方的 —— 50 条流要留 40 条完整的', () => {
+    // 用 list.length(含墓碑)算超量,等于每 open 一条就按全额超量重新收一次费:
+    // 实测 41 条 → 压 1,42 → 3,45 → 15,50 → **49**。上限承诺的是「留 40 条完整」,
+    // 而实际到 50 条时第 1 轮到第 49 轮全成了墓碑。
+    const s = createStreamStore()
+    for (let i = 0; i < MAX_STREAMS_PER_NODE + 10; i++) {
+      const h = s.open(meta({ phaseLabel: `第${i}场` }))
+      for (let k = 0; k < 5; k++) h.push(text(`${i}-${k}`))
+      h.end()
+    }
+    const rows = s.streams('root/01-a')
+    const intact = rows.filter(r => r.tombstone !== true).length
+    expect(`完整的流: ${intact}`).toBe(`完整的流: ${MAX_STREAMS_PER_NODE}`)
+    expect(rows.filter(r => r.tombstone === true)).toHaveLength(10)
+  })
+})

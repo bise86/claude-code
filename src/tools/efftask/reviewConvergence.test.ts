@@ -173,10 +173,12 @@ describe('planFeedbackPrompt —— 方案作者要同时看到所有轮次', ()
 
   it('老账和新账分开列', () => {
     const p = planFeedbackPrompt(items)
-    expect(p).toContain('连续 3 轮未解决')
+    expect(p).toContain('被提过不止一轮')
     expect(p).toContain('映射规则未定义')
-    expect(p).toContain('本轮新增')
+    expect(p).toContain('只被提过一轮')
     expect(p).toContain('验收标准自相矛盾')
+    // 分组标题要经得起核对:每条都带出现轮次,读的人能自己数。
+    expect(p).toContain('(第 1、2、3 轮)')
   })
 
   it('要求逐条回应 —— 只列出来不说要干什么,作者还是会挑软的捏', () => {
@@ -185,8 +187,8 @@ describe('planFeedbackPrompt —— 方案作者要同时看到所有轮次', ()
 
   it('没有老账时不编一个「连续未解决」出来', () => {
     const p = planFeedbackPrompt(feedbackItems([round(1, [v('main', ['第一次提'])])]))
-    expect(p).not.toContain('连续')
-    expect(p).toContain('本轮新增')
+    expect(p).not.toContain('不止一轮')
+    expect(p).toContain('只被提过一轮')
   })
 
   it('没有意见时是空串,不是一段空模板', () => {
@@ -237,15 +239,15 @@ describe('触顶时的话要说准', () => {
   it('reason 点名哪几条是一直没解决的', () => {
     const r = exhaustionReason(stuckCase, 3)
     expect(r).toContain('评审迭代超限(3)')
-    expect(r).toContain('连续 3 轮未解决')
+    expect(r).toContain('被提过不止一轮')
     expect(r).toContain('映射规则未定义')
-    expect(r).toContain('本轮新增')
+    expect(r).toContain('只被提过一轮')
   })
 
   it('每轮都换意见时不谎称有老账', () => {
     const r = exhaustionReason(movingCase, 3)
-    expect(r).not.toContain('未解决')
-    expect(r).toContain('新增 3 条')
+    expect(r).not.toContain('不止一轮')
+    expect(r).toContain('只被提过一轮 3 条')
   })
 
   it('没有任何意见时只报超限,不拼一个空冒号', () => {
@@ -253,7 +255,7 @@ describe('触顶时的话要说准', () => {
   })
 
   it('remedy 按事实分叉', () => {
-    expect(exhaustionRemedy(stuckCase)).toContain('连续多轮出现')
+    expect(exhaustionRemedy(stuckCase)).toContain('被提过不止一轮')
     expect(exhaustionRemedy(stuckCase)).toContain('--retry-blocked')
     expect(exhaustionRemedy(movingCase)).toContain('扩大范围')
     expect(exhaustionRemedy(movingCase)).toContain('caps.maxIterations')
@@ -286,7 +288,7 @@ describe('提示词有预算 —— 累积反馈不能绕过原来的上限', ()
     const listed = (p.match(/^ {2}\d+\. /gm) ?? []).length
     expect(listed).toBeLessThanOrEqual(MAX_FEEDBACK_ITEMS)
     // 保下来的必须是连续多轮的那些 —— 新增的下一轮还会再提,老账才是作者一直没回应的。
-    expect(p).toContain('轮未解决')
+    expect(p).toContain('不止一轮')
     // 「你看到的不是全部」这句话必须**在最前面**。放在列表末尾的话,它会被整段的
     // 字符预算连同后面的条目一起截掉 —— 于是用户看到一份看起来完整的短清单。
     expect(p).toContain('未列出')

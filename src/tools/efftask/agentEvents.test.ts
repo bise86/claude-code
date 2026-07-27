@@ -141,8 +141,12 @@ describe('sanitizeLine', () => {
     expect(sanitizeLine('一行内容\r')).toBe('一行内容')
   })
 
-  it('保留 TAB', () => {
-    expect(sanitizeLine('a\tb')).toBe('a\tb')
+  it('TAB 换成空格 —— 量出来的宽度必须等于画出来的宽度', () => {
+    // 留着 TAB 的话 stringWidth('\t') 是 0,而渲染层按 8 列展开:实测一行 4 个 TAB
+    // 量出 26 列、实际画 45 列,折行按错误的宽度切块,后面的块接在看不见的位置上。
+    // 而这不是理论 —— 每一条 Read 的返回值首行都是 `%6d\t…`。
+    expect(sanitizeLine('a\tb')).toBe('a  b')
+    expect(sanitizeLine('\t\t缩进')).toBe('    缩进')
   })
 
   it('按码点截断 —— 一条没有换行的百万字消息不能常驻整场运行', () => {

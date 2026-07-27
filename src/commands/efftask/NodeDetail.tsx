@@ -136,7 +136,16 @@ export function NodeDetail(props: {
   // a 40-line terminal, and this view does not scroll, so the title and goal were the first
   // things pushed off screen. Share one budget across the sections instead.
   const budget = Math.max(6, props.maxLines ?? 24)
-  const hasLog = (props.streams?.length ?? 0) > 0 || props.historical === true
+  const hasLog = (props.streams?.length ?? 0) > 0
+  /**
+   * resume 回来、又没有任何新流的节点:只给**一行**说明,不给一个 12 行的空窗口。
+   *
+   * `historical` 是个只进不出的标记,`--resume` 之后每个节点都带着它。跟着 hasLog 一起
+   * 判的话,perSection 恒为 2 —— 目标、完整方案、执行状态、**阻断原因**、评审记录全被压到
+   * 2 行,而让出来的位置是一个只写着「输出属于上一次运行」的大窗口。用户 resume 一个
+   * BLOCKED 的运行,进详情视图正是为了读阻断原因和方案,结果反而比不 resume 时看得少。
+   */
+  const historyOnly = !hasLog && props.historical === true
   // 日志窗打开时其余小节收缩到 2 行。不收的话十几个小节各占 4 行,加上一个至少 8 行的
   // 窗口,标题和目标会被挤出屏幕 —— 这个文件上一次就是为这件事重写过预算分配。
   const perSection = hasLog ? 2 : Math.max(2, Math.floor(budget / 6))
@@ -201,6 +210,9 @@ export function NodeDetail(props: {
       {n.worktree ? <Section maxLines={perSection} title="隔离工作区" body={`${n.worktree.branch}\n${n.worktree.path}`} /> : null}
       {/* 子 agent 实时终端:每次模型调用一条可折叠的流,带滚动条。最新的在下面 ——
           这是活的流,不是上面那些文档。运行结束后保留最终输出。 */}
+      {historyOnly ? (
+        <Text dimColor>子 agent 输出:属于上一次运行,事件流只在内存里、不落盘,看不到历史。</Text>
+      ) : null}
       {hasLog ? (
         <Box flexDirection="column">
           <Text bold color={ui === 'running' ? 'warning' : undefined}>

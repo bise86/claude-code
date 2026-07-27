@@ -149,6 +149,15 @@ export function makeRunAgentFn(deps: {
       ? setTimeout(() => { timedOut = true; inner.abort() }, limitMs)
       : undefined
 
+    /**
+     * 这次调用是不是抛出去了。
+     *
+     * 没有它的话,`end()` 只在超时那一支传了理由,**抛出那一支传的是 undefined** ——
+     * 于是 provider 抛 ECONNRESET / 529 之后,窗口表头是绿色的「● 已完成」。而这块屏
+     * 正是用户打开去查「这一席为什么失败、节点为什么阻断」的地方。中断那一支反而是对的,
+     * 所以同一个屏幕上两种失败长得不一样。
+     */
+    let failure: string | undefined
     const collected: Message[] = []
     /**
      * 每条消息拆成事件推给窗口。
@@ -211,7 +220,11 @@ export function makeRunAgentFn(deps: {
     try {
       // Race the consumption against the deadline: a generator that never yields would
       // otherwise never observe the abort, which is exactly the hang this bounds.
-      const work = req.cwd ? runWithCwdOverride(req.cwd, consume) : consume()
+      const work = (req.cwd ? runWithCwdOverride(req.cwd, consume) : consume())
+        .catch((e: unknown) => {
+          failure = e instanceof Error ? e.message : String(e)
+          throw e
+        })
       if (timer) {
         await Promise.race([
           work,
@@ -235,7 +248,7 @@ export function makeRunAgentFn(deps: {
        * 一个两小时前就跑完的分析环节还在转圈;更要命的是这些流永远不进可淘汰集合,
        * 内存上限对超过三分之一的流直接失效。
        */
-      req.stream?.end(timedOut ? `阶段调用超时(${limitMs ?? 0} ms)` : undefined)
+      req.stream?.end(timedOut ? `阶段调用超时(${limitMs ?? 0} ms)` : failure)
     }
     // Report the deadline rather than returning a truncated answer that the phase would
     // parse as a real (empty) reply.

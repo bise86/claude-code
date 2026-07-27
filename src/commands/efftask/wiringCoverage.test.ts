@@ -366,8 +366,12 @@ describe('子 agent 实时窗口:五跳都要接上', () => {
     // 单次调用之一。两者背后都是真实模型调用,此前都是纯黑屏。
     expect(SRC).toContain("phaseLabel: '需求解析'")
     expect(SRC).toContain("phaseLabel: '根方案'")
-    expect(SRC).toContain('<ParsingView onCancel={bail} log={preStreams()} />')
+    expect(SRC).toContain('<ParsingView onCancel={bail} log={preStreams()}')
     expect(SRC).toContain('log={preStreams()}')
+    // 宽度要用真实列宽,不是写死的 100:80 列终端上表头右半段(运行中/工具数/耗时)
+    // 会被整段切掉,而 justify 放不下时退化成 left + ' ' + right、truncate-end 从右边吃。
+    expect(SRC).not.toContain('width={100}')
+    expect(SRC).toContain('columns={termColumns}')
   })
 
   it('resume 回来的节点被标成历史 —— 空窗口 ≠ 什么都没干', () => {
@@ -388,5 +392,17 @@ describe('等待屏的窗口要真的会动', () => {
     expect(SRC).toContain('useStreamTick(streams.current')
     expect(SRC).toMatch(/useStreamTick\(streams\.current,[^)]*'parsing'/)
     expect(SRC).toMatch(/useStreamTick\(streams\.current,[^)]*'drafting'/)
+  })
+})
+
+describe('席位署名的取值必须短路(六个调用点)', () => {
+  it('pipeline 里没有一处用 ?? 兜「主模型」', () => {
+    // MAIN_STAFF 是空串,而空串是 truthy 对象上的 falsy 字段。`??` 只挡 null/undefined,
+    // 于是表头渲染成 `▾ 分析 ·  (opus)` —— 「没有署名」正是这次要治的病。
+    // 六个 runPhase 调用点各写了一遍,逐个测太笨;这条闸门盯的是「有没有人写错成 ??」。
+    const PIPE = readFileSync(new URL('../../tools/efftask/pipeline.ts', import.meta.url), 'utf8')
+    expect(`用了 ?? 的地方: ${PIPE.includes("?? '主模型'")}`).toBe('用了 ?? 的地方: false')
+    // 而且六处都真的给了署名
+    expect((PIPE.match(/\|\| '主模型'/g) ?? []).length).toBeGreaterThanOrEqual(6)
   })
 })

@@ -4276,8 +4276,7 @@ describe('评审收敛真的接上了', () => {
     })
     await stepStart(n, ctx)
     const last = prompts[prompts.length - 1]!
-    expect(last).toContain('连续')
-    expect(last).toContain('轮未解决')
+    expect(last).toContain('被提过不止一轮')
     expect(last).toContain('评分等级与分数的映射规则未定义')
     expect(last).toContain('逐条')
   })
@@ -4306,7 +4305,7 @@ describe('评审收敛真的接上了', () => {
     await stepStart(n, ctx)
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain('评审迭代超限')
-    expect(n.blockedReason).toContain('轮未解决')
+    expect(n.blockedReason).toContain('被提过不止一轮')
     // 静态那句是「若方案本身没问题,可提高…」;按事实分叉之后要说的是「先确认」。
     expect(n.blockedReason).toContain('先确认')
     // 卡片走的是同一句,不是静态表。
@@ -4327,7 +4326,7 @@ describe('评审收敛真的接上了', () => {
     })
     await stepStart(n, ctx)
     expect(n.blockedReason).toContain('评审迭代超限')
-    expect(n.blockedReason).not.toContain('轮未解决')
+    expect(n.blockedReason).not.toContain('被提过不止一轮')
     expect(n.blockedReason).toContain('扩大范围')
   })
 

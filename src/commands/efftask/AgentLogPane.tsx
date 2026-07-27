@@ -21,7 +21,11 @@ import { useLiveState } from './useLiveState.js'
  * 推进一次整屏重置**(它没法局部更新已经滚出去的行),而表头带着秒数,帧根本不相同。
  * 实测记录是 1s tick 在 29 行终端 + 4000 行历史下,10 分钟 507 次整屏重置。
  *
- * 改成订阅 + 合批:静默期**零重绘**(比今天的 1s 轮询还省),有事件时 ≤250ms 上屏。
+ * 改成订阅 + 合批:**这个窗口自己**在静默期零重绘,有事件时 ≤250ms 上屏。
+ *
+ * 说清边界:任务树那个 1s tick(TaskTreePanel)**没有动** —— 只要还有节点在跑它就照跑,
+ * 因为树上的耗时是按秒变的。所以「整屏静默期零重绘」并不成立,成立的是「日志窗没有在
+ * 那之上再加一个轮询」。上面那段实测数据讲的是为什么不该再加一个。
  */
 export const LOG_COALESCE_MS = 250
 
@@ -65,7 +69,7 @@ export interface AgentLogPaneProps {
   isActive?: boolean
   emptyHint?: string
   /** 仅供测试观测内部状态 —— 滚动位置在这个仓库的 TTY 夹具里根本看不见。 */
-  onState?: (s: { from: number; total: number; follow: boolean; selected: number; folded: number[] }) => void
+  onState?: (s: { from: number; total: number; follow: boolean; selected: number; folded: number[]; thinking: number[] }) => void
 }
 
 /**
@@ -94,6 +98,8 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
    * 几千行全铺开。
    */
   const [, setOverride, overrideRef] = useLiveState<ReadonlyMap<number, boolean>>(new Map())
+  /** 展开了思考原文的流。默认空 —— 思考会淹掉工具调用,但用户点名要看得到。 */
+  const [, setThinking, thinkingRef] = useLiveState<ReadonlySet<number>>(new Set())
 
   const folded = React.useMemo(() => {
     const s = new Set<number>()
@@ -113,6 +119,7 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
     nowMs: Date.now(),
     width: contentWidth,
     historical: props.historical,
+    expandedThinking: thinkingRef.current,
   })
 
   const total = lines.length
@@ -155,6 +162,15 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
           }
           return
         }
+        case 'toggleThinking': {
+          const i = selectedRef.current
+          if (i < 0 || i >= props.streams.length) return
+          const set = new Set(thinkingRef.current)
+          if (set.has(i)) set.delete(i)
+          else set.add(i)
+          setThinking(set)
+          return
+        }
         case 'toggleFold': {
           const i = selectedRef.current
           if (i < 0 || i >= props.streams.length) return
@@ -176,6 +192,7 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
       follow: followRef.current,
       selected: selectedRef.current,
       folded: [...folded].sort((a, b) => a - b),
+      thinking: [...thinkingRef.current].sort((a, b) => a - b),
     })
   })
 
@@ -211,7 +228,7 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
           <Text color="warning">{`↓ 下面还有 ${behind} 行(G 跟随最新)`}</Text>
         ) : null}
         {props.isActive === true ? (
-          <Text dimColor>↑↓/jk 滚动 · PgUp/PgDn 翻页 · g/G 顶部/底部 · Tab 切换环节 · 空格 折叠</Text>
+          <Text dimColor>↑↓/jk 滚动 · PgUp/PgDn 翻页 · g/G 顶部/底部 · Tab 切换环节 · 空格 折叠 · t 思考</Text>
         ) : null}
       </Box>
     </OffscreenFreeze>

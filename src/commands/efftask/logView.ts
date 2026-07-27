@@ -118,11 +118,16 @@ export function lastActivity(s: StreamState): string {
  * 实测思考流会把工具调用整个淹掉,而用户第一位要看的是工具。这是定论,所以**不给切换键**
  * —— 一个已经想清楚的问题不该再造一个旋钮和一条测试。
  */
-function foldThinking(events: readonly AgentEvent[]): AgentEvent[] {
+function foldThinking(events: readonly AgentEvent[], expanded: boolean): AgentEvent[] {
+  // 展开时原样返回:抽出来的思考原文此前**永远到不了屏幕** —— agentEvents 老老实实按行
+  // 抽了、eventLine 还给它准备了 dim 样式,渲染层却在这里把它整体换成一个计数。
+  // 而用户的原话是「看到模型…在思考啥」。默认仍然折叠(思考会淹掉工具调用,这条实测
+  // 成立),但必须给得出来。
+  if (expanded) return [...events]
   const out: AgentEvent[] = []
   let run = 0
   const flush = (): void => {
-    if (run > 0) out.push({ kind: 'thinking', text: `${TEARDROP_ASTERISK} 思考 ${run} 段` })
+    if (run > 0) out.push({ kind: 'thinking', text: `${TEARDROP_ASTERISK} 思考 ${run} 段(t 展开)` })
     run = 0
   }
   for (const e of events) {
@@ -161,6 +166,8 @@ export interface RenderArgs {
   width: number
   /** 这个节点的输出属于上一次运行。 */
   historical?: boolean
+  /** 哪几条流要展开思考原文(下标)。默认全部折叠成段数。 */
+  expandedThinking?: ReadonlySet<number>
 }
 
 export function renderStreamLines(args: RenderArgs): LogLine[] {
@@ -205,7 +212,7 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
     if (s.tombstone === true) {
       out.push({ text: `${GUTTER}… 这一场的窗口已收起,只留最后几条`, dim: true, streamIndex: i })
     }
-    for (const e of foldThinking(s.events)) {
+    for (const e of foldThinking(s.events, args.expandedThinking?.has(i) === true)) {
       const { prefix, body, color, dim } = eventLine(e)
       const avail = Math.max(4, w - stringWidth(prefix))
       // 续行对齐到内容列,并保住左边那根 gutter —— 真实终端就是这么折的。
@@ -261,6 +268,7 @@ export type PaneAction =
   | { t: 'bottom' }
   | { t: 'nextStream' }
   | { t: 'toggleFold' }
+  | { t: 'toggleThinking' }
 
 /**
  * 按键 → 动作。
@@ -295,6 +303,8 @@ export function logPaneAction(input: string, key: Key): PaneAction | null {
   if (c === 'G' || (c === 'g' && key.shift)) return { t: 'bottom' }
   if (c === 'g') return { t: 'top' }
   // j/k 是**非幂等**的,按住多久就滚多远;g/G 幂等,重复多少次都一样。
+  // 't' 展开/折叠选中流的思考原文。幂等,所以连击只走一次。
+  if (c === 't') return { t: 'toggleThinking' }
   if (c === 'j') return { t: 'line', d: input.length }
   if (c === 'k') return { t: 'line', d: -input.length }
   return null

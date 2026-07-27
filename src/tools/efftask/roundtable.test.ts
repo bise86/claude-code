@@ -317,3 +317,31 @@ describe('quorumSeats:人数说法有自己的字段', () => {
     expect(synthesizeVerdicts([v('a', true), v('b', true)], undefined, Number.NaN).pass).toBe(true)
   })
 })
+
+describe('席位署名不能是空串', () => {
+  it('「主模型兼任」的席位 —— MAIN_STAFF 是空串,取值必须短路', () => {
+    // 这个坑上线过一次:`role ? role.roleName : 'main'` 在主模型兼任的席位上产出**空串**,
+    // 于是 blockingSummary 变成 `[] 缺回滚方案`,那对空方括号被原样送进返工提示词。
+    // 现在窗口表头也吃同一个值 —— 用 `??` 的话会渲染成 `▾ 质疑讨论 ·  (opus)`,而
+    // 「没有署名」正是这次改动要治的病。变异测试证明此前两处都没有测试守。
+    const labels: string[] = []
+    const runAgent = async (r: { stream?: unknown }) => {
+      void r
+      return '```verdict\n{"pass":true,"blocking":[],"comments":""}\n```'
+    }
+    return runRoundtable({
+      phase: 'review',
+      node: { id: 'n', title: 't' } as never,
+      roles: [{ roleName: '', roleTag: '', model: 'opus' }] as never,
+      round: 1,
+      system: 'review',
+      prompt: () => 'p',
+      runAgent: runAgent as never,
+      signal: new AbortController().signal,
+      answerTag: 'verdict',
+      openStream: meta => { labels.push(meta.label); return { push: () => {}, end: () => {} } },
+    }).then(() => {
+      expect(labels).toEqual(['主模型'])
+    })
+  })
+})

@@ -48,7 +48,9 @@ export type AgentEvent =
 export type BriefResolver = (name: string, input: unknown) => string | undefined
 
 /**
- * 控制字节。保留 TAB(U+0009) 与换行(U+000A),其余一律剥掉 —— 含回车(U+000D)。
+ * 控制字节。保留换行(U+000A),其余一律剥掉 —— 含回车(U+000D)。
+ *
+ * TAB 在上面已经被换成空格,所以这里不必也不该再放行它(见 sanitizeLine)。
  *
  * chunkBuffer 里那条留了回车;这里补上,因为 CRLF 文本拆行之后每行尾部会挂一个回车,把
  * 光标打回行首,后面一行就覆盖上去了。
@@ -72,7 +74,17 @@ const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F]/g
 export function sanitizeLine(raw: string): string {
   if (typeof raw !== 'string' || raw.length === 0) return ''
   const coarse = raw.length > MAX_EVENT_CHARS * 4 ? raw.slice(0, MAX_EVENT_CHARS * 4) : raw
-  const stripped = coarse.replace(CONTROL, '')
+  /**
+   * TAB 换成两个空格。
+   *
+   * 留着 TAB 会让「量出来的宽度」和「画出来的宽度」对不上:`stringWidth('\t')` 是 **0**,
+   * 而渲染层按 **8 列**展开(ink 的 expandTabs)。实测一行 4 个 TAB —— 量出 26 列、实际
+   * 画 45 列。而这不是理论:每一条 Read 的返回值首行都是 `%6d\t…`,Bash 的 TSV 输出成倍
+   * 放大。折行按错误的宽度切块,后面的块接在看不见的位置上。
+   *
+   * 两个空格而不是八个:窗口里要的是可读的缩进,不是还原原始排版。
+   */
+  const stripped = coarse.replace(/\t/g, '  ').replace(CONTROL, '')
   const cps = Array.from(stripped)
   const clipped = cps.length > MAX_EVENT_CHARS ? cps.slice(0, MAX_EVENT_CHARS).join('') + '…' : stripped
   return clipped.trim().length === 0 ? '' : clipped
