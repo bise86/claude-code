@@ -1,4 +1,4 @@
-import { z } from 'zod'
+import { z } from 'zod/v4'
 import { logError } from '../../../utils/log.js'
 import { parseEffortValue, type EffortValue } from '../../../utils/effort.js'
 import type { RoleClientConfig } from './roleTypes.js'

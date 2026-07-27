@@ -1,4 +1,4 @@
-import { z } from 'zod'
+import { z } from 'zod/v4'
 import type { FeishuConfig } from './types.js'
 
 export const FeishuConfigSchema = z.object({

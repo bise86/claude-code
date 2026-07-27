@@ -11,7 +11,8 @@
     "start": "bun run ./bin/claude-haha",
     "build": "bun run scripts/build.ts",
     "build:compile": "bun run scripts/build.ts --compile",
-    "test": "bun test"
+    "test": "bun test",
+    "vendor:zod": "bun run scripts/vendor-zod.ts"
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.44",

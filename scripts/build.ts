@@ -28,8 +28,6 @@ import { rm, mkdir } from 'node:fs/promises'
 /** 可选的第三方模块:装了就用,没装走降级。 */
 const OPTIONAL_PACKAGES = [
   'sharp', 'fflate', 'turndown',
-  // zod 不是可选的 —— 它是被迫外置的。见文件顶部那段。
-  'zod',
   '@anthropic-ai/bedrock-sdk', '@anthropic-ai/foundry-sdk',
   '@anthropic-ai/mcpb', '@anthropic-ai/vertex-sdk',
   '@aws-sdk/client-bedrock', '@aws-sdk/client-sts', '@azure/identity',
@@ -62,7 +60,37 @@ const MISSING_UPSTREAM_MODULES = [
   './tools/VerifyPlanExecutionTool/VerifyPlanExecutionTool.js',
 ]
 
-const compile = process.argv.includes('--compile')
+/**
+ * `MACRO` 平时由 `preload.ts` 挂到 globalThis 上(bunfig.toml 的 preload)。
+ *
+ * 打包/编译产物**不会**跑 preload —— 实测编出来的二进制一跑 `--version` 就
+ * `ReferenceError: MACRO is not defined`。所以这里把它做成编译期常量静态替换掉。
+ *
+ * 取值与 preload.ts 保持一致,并允许 CI 用同名环境变量注入真实版本号/构建时间。
+ */
+const MACRO_DEFINE = {
+  VERSION: process.env.CLAUDE_CODE_LOCAL_VERSION ?? '999.0.0-local',
+  PACKAGE_URL: process.env.CLAUDE_CODE_LOCAL_PACKAGE_URL ?? 'claude-code-local',
+  NATIVE_PACKAGE_URL: process.env.CLAUDE_CODE_LOCAL_PACKAGE_URL ?? 'claude-code-local',
+  BUILD_TIME: process.env.CLAUDE_CODE_LOCAL_BUILD_TIME ?? new Date().toISOString(),
+  FEEDBACK_CHANNEL: 'local',
+  VERSION_CHANGELOG: '',
+  ISSUES_EXPLAINER: '',
+}
+
+const argv = process.argv.slice(2)
+const compile = argv.includes('--compile')
+/** 读 `--flag value` 形式的参数。 */
+const argOf = (flag: string): string | undefined => {
+  const i = argv.indexOf(flag)
+  return i >= 0 ? argv[i + 1] : undefined
+}
+/**
+ * 交叉编译目标(bun-linux-x64 / bun-darwin-arm64 / bun-windows-x64 …)。
+ * 省略 = 当前平台。CI 用它在一次 matrix 里出四个平台的二进制。
+ */
+const target = argOf('--target')
+const outfile = argOf('--outfile')
 const outdir = 'dist'
 await rm(outdir, { recursive: true, force: true })
 await mkdir(outdir, { recursive: true })
@@ -74,6 +102,33 @@ await mkdir(outdir, { recursive: true })
  * 于是调用方拿到 undefined 再在别处炸,堆栈指向一个和原因无关的地方。让它保持解析失败,
  * 源码里那些 try/catch 才会按设计接住。
  */
+/**
+ * 把裸 `zod` 收敛到 `zod/v4`。
+ *
+ * 本仓库源码全部用 `zod/v4`(131 处),但依赖树里有包 import 裸 `zod`。两条路径在 bun
+ * 眼里是两个模块图,于是 zod 内部被**打包两份**,第二份的 __export 绑定指向从未定义的
+ * 符号 —— 实测产物一跑就 `ReferenceError: _uppercase2 is not defined`。
+ *
+ * 两个入口最终都落到 v4 classic,所以收敛是安全的:根入口是
+ * `export * from ./v4/classic/external.js` + 具名 z + default,`zod/v4` 是
+ * `export * from ./classic/index.js` + default,具名 z 由那个 star 提供。
+ */
+const zodAlias = {
+  name: 'zod-single-copy',
+  setup(build: { onResolve: (o: { filter: RegExp }, cb: (a: { path: string }) => unknown) => void }) {
+    // 指向**预先压平**的那一份,而不是 node_modules 里的原始入口。
+    //
+    // 原因:bun 1.3.14 给 zod 的 export * 链生成的懒导出表引用了不存在的符号
+    // (实测产物一跑就 ReferenceError: _uppercase2 is not defined),而且不是重复打包 ——
+    // 产物里只有一份 checks.js。单独打包 zod 却没事,所以先把它压平成一个文件,主构建
+    // 再指向那一份,就绕开了出问题的那条 codegen 路径。
+    //
+    // vendor/zod-v4.js 由 scripts/vendor-zod.ts 生成,已提交进仓库。
+    const flat = new URL('../vendor/zod-v4.js', import.meta.url).pathname
+    build.onResolve({ filter: /^zod(\/v4)?$/ }, () => ({ path: flat }))
+  },
+}
+
 const externalRelative = {
   name: 'external-missing-upstream',
   setup(build: { onResolve: (o: { filter: RegExp }, cb: (a: { path: string }) => unknown) => void }) {
@@ -93,13 +148,19 @@ const result = await Bun.build({
   // 在用户报 bug 时值钱得多。
   minify: false,
   external: OPTIONAL_PACKAGES,
+  // 整体替换 `MACRO`,而不是逐个 `MACRO.VERSION` —— 源码里有 `MACRO.X` 也有对整个
+  // 对象的引用,只替字段会漏掉后者。
+  define: { MACRO: JSON.stringify(MACRO_DEFINE) },
   // biome-ignore lint/suspicious/noExplicitAny: Bun 插件类型在此版本里不够精确
-  plugins: [externalRelative as any],
-  ...(compile ? { compile: { outfile: `${outdir}/claude-haha` } } : {}),
+  // biome-ignore lint/suspicious/noExplicitAny: Bun 插件类型在此版本里不够精确
+  plugins: [zodAlias as any, externalRelative as any],
+  ...(compile
+    ? { compile: { outfile: outfile ?? `${outdir}/claude-haha`, ...(target ? { target } : {}) } }
+    : {}),
 })
 
 if (!result.success) {
   for (const log of result.logs) console.error(log)
   process.exit(1)
 }
-console.log(compile ? `已编译: ${outdir}/claude-haha` : `已打包: ${outdir}/cli.js`)
+console.log(compile ? `已编译: ${outfile ?? `${outdir}/claude-haha`}${target ? ` (${target})` : ''}` : `已打包: ${outdir}/cli.js`)
