@@ -5,7 +5,7 @@ import {
   seatsFor,
   type RoleDef,
 } from './roleDefs.js'
-import { MAIN_STAFF, PHASE_NAMES } from './types.js'
+import { MAIN_STAFF, PHASE_LABEL, PHASE_NAMES } from './types.js'
 import type { RoleBinding } from './types.js'
 
 const KNOWN = new Set(['opus-架构', 'ds-安全', 'gpt-前端'])
@@ -427,7 +427,7 @@ describe('环节名可以写中文,写错了要能自己改对', () => {
     // 两边都当 canonical 会让 run.md 里出现两种写法,而读回那侧(resumeCore)只认一种。
     expect(P2([def({ step: '质疑讨论' })]).defs[0].stage).toBe('review')
     expect(P2([def({ step: '测试验证' })]).defs[0].stage).toBe('verify')
-    expect(P2([def({ step: '集成提交' })]).defs[0].stage).toBe('integrate')
+    expect(P2([def({ step: '集成验收' })]).defs[0].stage).toBe('integrate')
     expect(P2([def({ step: '分析' })]).defs[0].stage).toBe('plan')
   })
 
@@ -446,13 +446,13 @@ describe('环节名可以写中文,写错了要能自己改对', () => {
 
   it('写错时列**中文**合法值 —— 列内部名等于让用户自己做中英对照', () => {
     const n = P2([def({ step: '测试' })]).notices.join('\n')
-    expect(n).toContain('分析/质疑讨论/执行/测试验证/验收/集成提交/观察')
+    expect(n).toContain('分析/质疑讨论/执行/测试验证/验收/集成验收/观察')
     expect(n).not.toContain('plan/review/execute')
   })
 
   it('并且猜一个最接近的', () => {
     expect(P2([def({ step: '测试' })]).notices.join('\n')).toContain('是不是想写「测试验证」')
-    expect(P2([def({ step: '集成' })]).notices.join('\n')).toContain('是不是想写「集成提交」')
+    expect(P2([def({ step: '集成' })]).notices.join('\n')).toContain('是不是想写「集成验收」')
   })
 
   it('猜不出来就不猜 —— 一个猜错的建议比没有建议更糟', () => {
@@ -493,5 +493,30 @@ describe('席位规则那份唯一真相要被直接钉住', () => {
 
   it('圆桌集合就是那五个 —— 顺序精化不算圆桌', () => {
     expect([...MULTI_SEAT_PHASES].sort()).toEqual(['accept', 'integrate', 'observer', 'review', 'verify'])
+  })
+})
+
+describe('环节改名之后,旧名不能一夜作废', () => {
+  const K = new Set(['a'])
+  const P = (step: string) => parseRoleDefs(
+    [{ name: 'r', step, output: 'o', purpose: 'p', staff: ['a'] }], { knownStaff: K, source: 'doc' })
+
+  it('「集成提交」是旧名,仍然收下并归一到 integrate', () => {
+    // 改名的理由是它不做任何合并 —— 合并早在每个执行型子节点自己通过验收时就发生了,
+    // 这一关判的是「子任务的结果合起来达没达成父目标」。但已经按旧名写过配置的人
+    // 不该因为一次改名就全部失效。
+    expect(P('集成提交').defs[0].stage).toBe('integrate')
+    expect(P('集成提交').notices).toEqual([])
+  })
+
+  it('新名是「集成验收」', () => {
+    expect(P('集成验收').defs[0].stage).toBe('integrate')
+    expect(PHASE_LABEL.integrate).toBe('集成验收')
+  })
+
+  it('关口和错误信息用的是新名', () => {
+    // 旧名只是入口别名,不该再出现在给用户看的文案里 —— 否则用户会以为有两个环节。
+    expect(P('不存在的环节').notices.join()).toContain('集成验收')
+    expect(P('不存在的环节').notices.join()).not.toContain('集成提交')
   })
 })

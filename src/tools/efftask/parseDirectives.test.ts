@@ -382,7 +382,7 @@ describe('抽取提示词必须覆盖全部环节', () => {
 
   it('中文环节名的对应关系也给了模型', async () => {
     const t = await promptText()
-    for (const label of ['测试验证', '集成提交', '质疑讨论']) {
+    for (const label of ['测试验证', '集成验收', '质疑讨论']) {
       expect(`${label}:${t.includes(label)}`).toBe(`${label}:true`)
     }
   })

@@ -1,7 +1,7 @@
 // src/tools/efftask/pipeline.ts
 import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
-import { createNode } from './types.js'
+import { ALT_SOLUTION_CHARS, createNode } from './types.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
@@ -659,6 +659,114 @@ function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
  * 一份稿子在走,所以「只有一个产出」是结构保证的,不是靠事后挑。代价是 N 次串行调用
  * —— 这正是关口的 costLine 要把调用数显示出来的原因。
  */
+/**
+ * 分析环节的产出 —— 按 caps.planConverge 走两条路之一。
+ *
+ * 单席位时两条路**行为完全相同**(都是一次调用),不额外花钱、也不加融合那一次。
+ */
+async function runPlanPhase(
+  node: TaskNode, ctx: PipelineCtx, feedback: string,
+): Promise<{ ok: true; parsed: ReturnType<typeof parsePlanOutput> } | { ok: false; reason: string; timeout?: boolean }> {
+  const seats = node.phaseRoles.plan ?? []
+  if (ctx.config.caps.planConverge === '圆桌' && seats.length > 1) return runPlanRoundtable(node, ctx, feedback)
+  return runPlanRefinement(node, ctx, feedback)
+}
+
+/**
+ * 圆桌:N 席**并行**各自从零起草 → 最后一席融合成一份。
+ *
+ * 为什么融合由**最后一席**做:runPlanRefinement 今天的不变式就是「本环节的最终产出来自
+ * 最后一席」。让融合也用最后一席,两种模式的不变式逐字节相同,costLine 的 P 项含义不变,
+ * 而且它天然不是第一稿的作者。融合因此是精化的**严格推广** —— 最后一席看到的是全部 N 份,
+ * 而不只是前一份。(第一席还不稳定:toggleRole 删席位时会重排,applyRosterToNodes 恢复时
+ * 整份覆盖,同一节点两次运行的「第一席」可能不是同一个人。)
+ *
+ * 并发**必须**走 ctx.slots:runPlanRefinement 是串行的,所以 plan 阶段每节点只占一个在飞
+ * 调用;不套池子就会复现 roundtable.ts 记录过的那个已修缺陷(parallelism 2 + 3 席面板
+ * 实测峰值 6 个并发调用),而且是在 parallelism 个节点同时开的情况下。
+ */
+async function runPlanRoundtable(
+  node: TaskNode, ctx: PipelineCtx, feedback: string,
+): Promise<{ ok: true; parsed: ReturnType<typeof parsePlanOutput> } | { ok: false; reason: string; timeout?: boolean }> {
+  const seats = node.phaseRoles.plan
+  const tag = answerTag(ANSWER_TAGS.plan)
+  const settled = await mapWithinPool(
+    seats,
+    seat => runPhase(ctx, {
+      phase: 'plan', node, role: seat, system: 'plan',
+      prompt: planPrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, 'plan')),
+      signal: ctx.signal,
+    }),
+    ctx.slots,
+  )
+  const drafts: { staff: string; parsed: ReturnType<typeof parsePlanOutput> }[] = []
+  const failures: string[] = []
+  settled.forEach((r, i) => {
+    const who = seats[i].roleName || '主模型'
+    if (r.status !== 'fulfilled' || !r.value.ok) {
+      failures.push(`${who}: ${r.status === 'fulfilled' ? r.value.reason : String(r.reason)}`)
+      return
+    }
+    drafts.push({ staff: who, parsed: parsePlanOutput(r.value.text, tag) })
+  })
+  // 一份都没成 → 照旧阻断,和精化第一位失败时一致。
+  if (drafts.length === 0) return { ok: false, reason: `全部方案席位调用失败: ${failures.join('; ')}` }
+  // 只剩一份 → 没什么可融合的,直接用它(还省下融合那一次调用)。
+  if (drafts.length === 1) {
+    if (failures.length > 0) noteOnNode(node, `方案圆桌只有 1 份稿可用,未做融合: ${failures.join('; ')}`)
+    return { ok: true, parsed: drafts[0].parsed }
+  }
+  const fuseSeat = seats[seats.length - 1]
+  const fuseTag = answerTag(ANSWER_TAGS.plan)
+  const fused = await runPhase(ctx, {
+    phase: 'plan', node, role: fuseSeat, system: 'plan',
+    prompt: fusePrompt(node, ctx, fuseTag, feedback, seatBrief(ctx, fuseSeat, 'plan'), drafts.map(d => d.parsed)),
+    signal: ctx.signal,
+  })
+  if (!fused.ok) {
+    // 融合那一次失败 → 回落到第一份成功的草稿。比整体阻断诚实:手上确实有可用的稿子。
+    noteOnNode(node, `方案融合调用失败,采用第一份草稿(${drafts[0].staff}): ${fused.reason}`)
+    return { ok: true, parsed: drafts[0].parsed }
+  }
+  const parsed = parsePlanOutput(fused.text, fuseTag)
+  // 落选稿挂到融合结果上。**不静默截断**:三份稿只产出一份,另外两份不能凭空消失。
+  parsed.plan.alternatives = drafts.map(d => ({
+    staff: d.staff, solution: capText(d.parsed.plan.solution, ALT_SOLUTION_CHARS),
+  }))
+  if (failures.length > 0) noteOnNode(node, `方案圆桌有席位调用失败,已用其余稿融合: ${failures.join('; ')}`)
+  return { ok: true, parsed }
+}
+
+/** 往 execStatus 追一条编排器注记(带前缀,否则 integratePrompt 会当成执行产出)。 */
+function noteOnNode(node: TaskNode, note: string): void {
+  node.execStatus = `${node.execStatus}${node.execStatus ? '\n' : ''}${ORCHESTRATOR_NOTE}${note})`
+}
+
+/**
+ * 融合提示词。
+ *
+ * 稿子**匿名**(稿 A/B/C,不写员工名):融合由最后一席做,而它自己也交了一份稿 —— 署名会
+ * 让它偏袒自己那份。真名记在 node.plan.alternatives 里,供事后追责。
+ */
+function fusePrompt(
+  node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback: string, brief: string,
+  drafts: ReturnType<typeof parsePlanOutput>[],
+): string {
+  const letters = drafts.map((d, i) => 
+    `### 稿 ${String.fromCharCode(65 + i)}\n${quote(JSON.stringify({ ...d.plan, alternatives: undefined }))}\n子任务拆分:${quote(JSON.stringify(d.children))}`,
+  ).join('\n\n')
+  return (
+    brief +
+    `下面是 ${drafts.length} 份**各自独立**起草的方案。请合成**一份**最优方案。\n\n` +
+    letters +
+    `\n\n要求:\n` +
+    `- **不是选一份**,是取各稿之长合成一份;某一稿的哪个点更好,就吸收哪个点。\n` +
+    `- 在 keyPoints 里写清楚你吸收了哪几稿的哪些点、放弃了什么以及为什么。\n` +
+    `- 子任务拆分同样要合成一份 —— 不是几份的并集,而是去重、补漏之后的那一份。\n` +
+    planPrompt(node, ctx, tag, feedback)
+  )
+}
+
 async function runPlanRefinement(
   node: TaskNode, ctx: PipelineCtx, feedback: string,
 ): Promise<{ ok: true; parsed: ReturnType<typeof parsePlanOutput> } | { ok: false; reason: string; timeout?: boolean }> {
@@ -802,7 +910,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     } else {
       if (!(await commit(node, 'PLANNING', ctx))) return
-      const res = await runPlanRefinement(node, ctx, feedback)
+      const res = await runPlanPhase(node, ctx, feedback)
       if (!res.ok) { await blockWithReason(node, res.reason, ctx, res.timeout ? 'timeout' : undefined); return }
       const parsed = res.parsed
       node.kind = parsed.kind

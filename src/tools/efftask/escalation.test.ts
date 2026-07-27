@@ -96,7 +96,7 @@ describe('触阀升级卡 (spec §9/§11)', () => {
   it('says WHICH phase a retry re-runs, so the cost is visible before spending it', () => {
     expect(lines('rework', 'r', { kind: 'executable' })).toContain('执行 → 验收')
     expect(lines('cap-iteration', 'r', { kind: 'unknown' })).toContain('分析 → 质疑讨论')
-    expect(lines('rework', 'r', { childIds: ['a'] })).toContain('集成提交')
+    expect(lines('rework', 'r', { childIds: ['a'] })).toContain('集成验收')
   })
 
   it('评审超限的可执行节点,说的是"方案会重新生成" —— 不能说反', () => {
@@ -110,8 +110,8 @@ describe('触阀升级卡 (spec §9/§11)', () => {
     expect(t).not.toContain('本节点将重跑「执行 → 验收」')
   })
 
-  it('但有子节点时仍然是集成提交 —— reseat 的规则 1 优先', () => {
-    expect(lines('cap-iteration', 'r', { childIds: ['a'] })).toContain('集成提交')
+  it('但有子节点时仍然是集成验收 —— reseat 的规则 1 优先', () => {
+    expect(lines('cap-iteration', 'r', { childIds: ['a'] })).toContain('集成验收')
   })
 
   it('prescribes a DIFFERENT fix per valve — "just try again" is useless for all of them', () => {

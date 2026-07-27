@@ -293,6 +293,21 @@ export function validateLoadedNodes(
     else for (const k of ['solution', 'keyPoints', 'risks', 'acceptance'] as const) {
       if (typeof n.plan[k] !== 'string') n.plan[k] = ''
     }
+    // alternatives 是 validateLoadedNodes 唯一不碰的 plan 字段 —— 它就地补字段,所以
+    // `alternatives: 'boom'` 能原样穿过去,而 serializeNode 会把它渲染进 body,一条
+    // {staff:1} 会渲染成 [object Object]。逐条校验,坏的丢掉并记进 repairs。
+    const rawAlts = (n.plan as { alternatives?: unknown }).alternatives
+    if (rawAlts !== undefined) {
+      const arr = Array.isArray(rawAlts) ? rawAlts : []
+      const kept = arr.filter((x): x is { staff: string; solution: string } =>
+        !!x && typeof x === 'object'
+        && typeof (x as { staff?: unknown }).staff === 'string'
+        && typeof (x as { solution?: unknown }).solution === 'string')
+      const dropped = (Array.isArray(rawAlts) ? arr.length : 1) - kept.length
+      if (dropped > 0) repairs.push(`节点 ${n.id} 的备选方案有 ${dropped} 条格式非法,已剔除`)
+      if (kept.length > 0) n.plan.alternatives = kept
+      else delete (n.plan as { alternatives?: unknown }).alternatives
+    }
     // Entries, not just the array. serializeNode's body now walks `r.verdicts` and
     // `v.blocking`, so a half-written entry — exactly what a crash leaves behind — makes
     // every persist THROW. commit() catches it and blocks the node with a bare JS TypeError
@@ -605,6 +620,7 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   if (caps.maxSeatsPerPhase !== undefined) rebuilt.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
   if (caps.quorum !== undefined) rebuilt.quorum = clampInt(caps.quorum, 1, 100, 100)
   if (caps.quorumSeats !== undefined) rebuilt.quorumSeats = clampInt(caps.quorumSeats, 1, 20, 1)
+  if (caps.planConverge === '圆桌' || caps.planConverge === '精化') rebuilt.planConverge = caps.planConverge
   base.caps = rebuilt
 
   const pr = (fm.phaseRoles ?? {}) as Record<string, unknown>

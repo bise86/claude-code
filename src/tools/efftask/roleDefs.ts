@@ -44,6 +44,9 @@ const PHASE_SET = new Set<string>(PHASE_NAMES)
  * - single:只跑一个 agent,多出来的席位永远不会被派发(execute / observer)
  */
 export const PHASE_SEATING: Record<PhaseName, 'roundtable' | 'sequential' | 'single'> = {
+  // plan 的形态由 caps.planConverge 决定:'精化' 是顺序,'圆桌' 是并行+合成。两者都允许
+  // 多席位,所以这里记 'sequential' 只是「不是圆桌合成裁决」的意思 —— allowsMultipleSeats
+  // 才是这张表真正被消费的地方,两种模式下它都必须是 true。
   plan: 'sequential', review: 'roundtable', execute: 'single',
   verify: 'roundtable', accept: 'roundtable', integrate: 'roundtable',
   // 观察也是多席位:各自独立打分,取最低分收敛成一个结论,其余理由挂在 ScoreRecord.others

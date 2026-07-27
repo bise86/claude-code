@@ -29,7 +29,7 @@ export const PHASE_NAMES: PhaseName[] =
 /** 环节的中文名 —— 用户文档、关口、错误信息都用它。内部 phase 名不对用户暴露。 */
 export const PHASE_LABEL: Record<PhaseName, string> = {
   plan: '分析', review: '质疑讨论', execute: '执行',
-  verify: '测试验证', accept: '验收', integrate: '集成提交', observer: '观察',
+  verify: '测试验证', accept: '验收', integrate: '集成验收', observer: '观察',
 }
 
 /**
@@ -42,7 +42,12 @@ export const STEP_ALIASES: Record<string, PhaseName> = {
   ...Object.fromEntries(PHASE_NAMES.map(p => [p, p])),
   ...Object.fromEntries(PHASE_NAMES.map(p => [PHASE_LABEL[p], p])),
   // 常见的另一种说法,收下比让用户猜要好。
-  方案: 'plan', 评审: 'review', 打分: 'observer', 评分: 'observer', 集成验收: 'integrate',
+  方案: 'plan', 评审: 'review', 打分: 'observer', 评分: 'observer',
+  // 「集成提交」是这个环节的**旧名**。它不做任何合并 —— 合并早在每个执行型子节点
+  // 自己通过验收时就发生了(stepExecute 里的 mergeAndRelease);这一关判的是
+  // 「子任务的结果合起来达没达成父目标」。名字改成集成验收,旧名继续收,
+  // 已经按旧名写过配置的人不会一夜作废。
+  集成提交: 'integrate',
 }
 
 export type NodeKind = 'decompose' | 'executable' | 'unknown'
@@ -107,7 +112,20 @@ export interface RoleBinding {
 }
 /** 「主模型兼任」的员工名。见 RoleBinding.roleName。 */
 export const MAIN_STAFF = ''
-export interface NodePlan { solution: string; keyPoints: string; risks: string; acceptance: string }
+export interface NodePlan {
+  solution: string; keyPoints: string; risks: string; acceptance: string
+  /**
+   * 圆桌模式下**落选的那几份稿**(见 caps.planConverge)。
+   *
+   * 只留 solution 一段并单独夹取到 ALT_SOLUTION_CHARS —— plan 的四个字段各自已经是
+   * 8000 上限,再挂 4 份完整稿会让 plan 从 32KB 翻到 64KB,而 node.md 每次 commit 全量重写。
+   *
+   * 存它的理由是不静默截断:三份稿只产出一份,另外两份不能凭空消失。
+   */
+  alternatives?: { staff: string; solution: string }[]
+}
+/** 落选稿单条的字符上限。远小于 MAX_FIELD_CHARS,理由见 NodePlan.alternatives。 */
+export const ALT_SOLUTION_CHARS = 1500
 /**
  * `infra: true` marks a verdict the reviewer never actually rendered — the call itself
  * failed (network, provider error). It is NOT a judgement about the work, so a caller
@@ -345,6 +363,19 @@ export interface Caps {
    * 而且错在**放宽**方向。人数说法必须有自己的字段。
    */
   quorumSeats?: number
+  /**
+   * 分析环节多员工时怎么收敛成一份方案。默认 `'精化'`。
+   *
+   * - `'精化'` —— 顺序:第一位起草,后面每一位在**前一稿**上修订。全程一份稿子。
+   * - `'圆桌'` —— 并行:N 位各自从零起草,再由**最后一席**融合成一份最优解。
+   *
+   * 为什么在 caps 而不是角色上:席位是 (角色 × 员工) 展平成的一个扁平列表,两个分析
+   * 角色时「谁的模式说了算」无定义;而最常见的配置路径(按名字直接指定员工)根本没有
+   * 角色定义,字段无处可挂。caps 这一层已经有读回 + 夹取 + 关口展示的现成范式。
+   *
+   * 默认保持精化:改默认会让已经配了多席的用户什么都没动,而成本和形态都变了。
+   */
+  planConverge?: '圆桌' | '精化'
 }
 export const DEFAULT_CAPS: Caps = { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 600_000 }
 /** 一个阶段的席位上限默认值。 */

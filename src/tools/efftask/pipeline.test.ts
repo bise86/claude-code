@@ -8,6 +8,7 @@ import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, pla
 import type { RunAgentFn } from './roundtable.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 import { reseatTransientNodes } from './reseat.js'
+import { createSlotPool } from './slotPool.js'
 import type { RoleDef } from './roleDefs.js'
 
 // Verdict prompts carry a per-call random tag; a cooperative reviewer answers under THAT tag.
@@ -2963,9 +2964,9 @@ describe('达成结论的圆桌不该因为有席位没打通而被重试', () =
   })
 })
 
-describe('集成提交是自己的环节,不再借用验收席位', () => {
+describe('集成验收是自己的环节,不再借用验收席位', () => {
   // 此前 stepIntegrate 用 phaseRoles.accept:用户只配「验收」,他的验收角色被悄悄拿去
-  // 跑集成验收;用户配了「集成提交」,席位根本到不了这里。规范告诉用户这是两个环节,
+  // 跑集成验收;用户配了「集成验收」,席位根本到不了这里。规范告诉用户这是两个环节,
   // 系统却当成一个。
   const parentWithChild = (roles: Partial<Record<string, { roleName: string; roleTag?: string }[]>>) => {
     const parent = root()
@@ -2988,7 +2989,7 @@ describe('集成提交是自己的环节,不再借用验收席位', () => {
     return { seen, runAgent }
   }
 
-  it('配了集成提交 → 用它的席位,不用验收的', async () => {
+  it('配了集成验收 → 用它的席位,不用验收的', async () => {
     const { seen, runAgent } = seatsSeen()
     const { parent, child } = parentWithChild({
       accept: [{ roleName: '验收员' }], integrate: [{ roleName: '集成员' }],
@@ -2997,15 +2998,15 @@ describe('集成提交是自己的环节,不再借用验收席位', () => {
     expect(seen).toEqual(['集成员'])
   })
 
-  it('没配集成提交 → 回落验收席位,老 run 行为不变', async () => {
+  it('没配集成验收 → 回落验收席位,老 run 行为不变', async () => {
     const { seen, runAgent } = seatsSeen()
     const { parent, child } = parentWithChild({ accept: [{ roleName: '验收员' }] })
     await stepIntegrate(parent, ctxFor([parent, child], runAgent, { ...cfg, phaseRoles: parent.phaseRoles }))
     expect(seen).toEqual(['验收员'])
   })
 
-  it('叶子验收仍然用验收席位,不会被集成提交抢走', async () => {
-    // 两个环节各归各的:配了集成提交不该改变叶子节点的验收由谁跑。
+  it('叶子验收仍然用验收席位,不会被集成验收抢走', async () => {
+    // 两个环节各归各的:配了集成验收不该改变叶子节点的验收由谁跑。
     const seen: (string | undefined)[] = []
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'accept') seen.push(req.role?.roleName)
@@ -3021,7 +3022,7 @@ describe('集成提交是自己的环节,不再借用验收席位', () => {
     expect(seen).toEqual(['验收员'])
   })
 
-  it('集成提交席位拿到的是**集成提交**那个角色的简报', async () => {
+  it('集成验收席位拿到的是**集成验收**那个角色的简报', async () => {
     let prompt = ''
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'accept') prompt = req.prompt
@@ -3493,5 +3494,174 @@ describe('工作区闸门:两个守卫各自守的是什么', () => {
     await stepExecute(n, { ...ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles }), worktrees: pool as never })
     expect(n.status).toBe('ACCEPTED')
     expect(n.execStatus).not.toContain('改动了工作区')
+  })
+})
+
+describe('分析环节:圆桌(各自出稿 → 融合成一份)', () => {
+  const draft = (solution: string, children: string[] = []) =>
+    '```json\n' + JSON.stringify({
+      kind: children.length > 0 ? 'decompose' : 'executable',
+      solution, keyPoints: 'k', risks: 'r', acceptance: 'a',
+      children: children.map(t => ({ title: t, deps: [] })),
+    }) + '\n```'
+  const threeSeat = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
+  const roundtableCfg = (pr = threeSeat) => ({ ...cfg, phaseRoles: pr, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } })
+
+  it('三席并行各自起草,再由**最后一席**融合', async () => {
+    const calls: { role?: string; isFuse: boolean }[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      const isFuse = req.prompt.includes('请合成**一份**最优方案')
+      calls.push({ role: req.role?.roleName, isFuse })
+      return draft(isFuse ? '融合稿' : `${req.role?.roleName} 的稿`)
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, roundtableCfg()))
+    expect(calls.filter(c => !c.isFuse).map(c => c.role)).toEqual(['a', 'b', 'c'])
+    const fuse = calls.filter(c => c.isFuse)
+    expect(fuse).toHaveLength(1)
+    // 最后一席,不是第一席 —— 精化的不变式就是「最终产出来自最后一席」,融合沿用它。
+    expect(fuse[0].role).toBe('c')
+    expect(n.plan.solution).toBe('融合稿')
+  })
+
+  it('落选稿全部留在 node.plan.alternatives 上', async () => {
+    // node.plan = parsed.plan 是**整体替换**,融合结果必须带着 alternatives 一起过去,
+    // 否则那一行会把它清掉。
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      return draft(req.prompt.includes('请合成') ? '融合稿' : `${req.role?.roleName} 的稿`)
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, roundtableCfg()))
+    expect(n.plan.alternatives?.map(x => x.staff)).toEqual(['a', 'b', 'c'])
+    expect(n.plan.alternatives?.map(x => x.solution)).toEqual(['a 的稿', 'b 的稿', 'c 的稿'])
+  })
+
+  it('融合提示词里的稿是**匿名**的 —— 融合者自己也交了一份', async () => {
+    let fusePrompt = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.prompt.includes('请合成')) { fusePrompt = req.prompt; return draft('融合稿') }
+      return draft(`${req.role?.roleName} 的稿`)
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, roundtableCfg()))
+    expect(fusePrompt).toContain('稿 A')
+    expect(fusePrompt).toContain('稿 C')
+    // 署名会让最后一席偏袒自己那份。
+    expect(fusePrompt).not.toContain('员工「c」')
+    expect(fusePrompt).toContain('不是选一份')
+  })
+
+  it('单席位时不走圆桌,也不多花那次融合调用', async () => {
+    let planCalls = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') { planCalls++; return draft('唯一稿') }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }] }
+    await stepStart(n, ctxFor([n], runAgent, roundtableCfg(n.phaseRoles)))
+    expect(planCalls).toBe(1)
+    expect(n.plan.alternatives).toBeUndefined()
+  })
+
+  it('默认(不配 planConverge)仍走精化,行为不变', async () => {
+    const seen: (string | undefined)[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      seen.push(req.role?.roleName)
+      return draft('稿')
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, { ...cfg, phaseRoles: threeSeat }))
+    expect(seen).toEqual(['a', 'b', 'c'])   // 三次,没有第四次融合
+    expect(n.plan.alternatives).toBeUndefined()
+  })
+
+  it('一席起草失败 → 用其余的融合,并留痕', async () => {
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.role?.roleName === 'b') throw new Error('provider down')
+      return draft(req.prompt.includes('请合成') ? '融合稿' : `${req.role?.roleName} 的稿`)
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, roundtableCfg()))
+    expect(n.plan.solution).toBe('融合稿')
+    expect(n.plan.alternatives?.map(x => x.staff)).toEqual(['a', 'c'])
+    expect(n.execStatus).toContain('有席位调用失败')
+  })
+
+  it('融合那一次失败 → 回落第一份草稿,不整体阻断', async () => {
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.prompt.includes('请合成')) throw new Error('fuse boom')
+      return draft(`${req.role?.roleName} 的稿`)
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, roundtableCfg()))
+    expect(n.status).not.toBe('BLOCKED')
+    expect(n.plan.solution).toBe('a 的稿')
+    expect(n.execStatus).toContain('方案融合调用失败')
+  })
+
+  it('全部席位失败 → 照旧阻断', async () => {
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') throw new Error('all down')
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, roundtableCfg()))
+    expect(n.status).toBe('BLOCKED')
+  })
+
+  it('留痕带编排器前缀 —— 否则集成验收会当成执行产出', async () => {
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.prompt.includes('请合成')) throw new Error('boom')
+      return draft(`${req.role?.roleName} 的稿`)
+    }
+    const n = root()
+    n.phaseRoles = threeSeat
+    await stepStart(n, ctxFor([n], runAgent, roundtableCfg()))
+    expect(n.execStatus.startsWith('(注:')).toBe(true)
+  })
+})
+
+describe('圆桌起草必须走并发池', () => {
+  it('峰值并发受 slots 上限约束,不是无边界扇出', async () => {
+    // roundtable.ts 记录过这个已修缺陷:「Absent = unbounded fan-out, which is what
+    // shipped: parallelism 2 with a 3-role panel measured a peak of 6 concurrent calls」。
+    // runPlanRefinement 是串行的所以 plan 阶段今天没有这个问题;圆桌是 N 路并行,
+    // 不套池子就把它原样搬回来,而且是在 parallelism 个节点同时开的情况下。
+    let live = 0
+    let peak = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      live++
+      peak = Math.max(peak, live)
+      await new Promise(r => setTimeout(r, 5))
+      live--
+      return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    }
+    const seats = ['a', 'b', 'c', 'd', 'e'].map(roleName => ({ roleName }))
+    const n = root()
+    n.phaseRoles = { ...emptyPhaseRoles(), plan: seats }
+    const ctx = {
+      ...ctxFor([n], runAgent, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }),
+      // 上限 1:mapWithinPool 的第一项蹭调用方的槽位,其余要租 —— 所以峰值应当是 2,
+      // 而不是 5。
+      slots: createSlotPool(() => 1),
+    }
+    await stepStart(n, ctx)
+    expect(peak).toBeLessThanOrEqual(2)
   })
 })

@@ -149,6 +149,12 @@ export function serializeNode(node: TaskNode): string {
     `## 验收点\n${c(node.plan.acceptance)}\n\n` +
     `## 执行状态\n${c(node.execStatus)}\n\n` +
     (node.blockedReason ? `## 阻断原因\n${c(node.blockedReason)}\n\n` : '') +
+    // 落选稿。只落进 frontmatter 而 body 不渲染的话,「不静默截断」只做到了机器可读那一半
+    // —— body 才是人读的那一半。
+    (node.plan.alternatives && node.plan.alternatives.length > 0
+      ? `## 备选方案(圆桌落选稿)\n${node.plan.alternatives
+          .map(alt => `### ${stripControl(alt.staff)}\n${clipBody(stripControl(alt.solution))}`).join('\n')}\n\n`
+      : '') +
     `## 评审记录\n${roundtableBody(node.reviewLog)}\n\n` +
     `## 验收记录\n${roundtableBody(node.acceptLog)}\n\n` +
     `## 评分\n${scoreBody(node)}\n`

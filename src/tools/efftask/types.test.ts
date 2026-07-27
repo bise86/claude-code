@@ -45,7 +45,7 @@ describe('createNode', () => {
     expect(DEFAULT_CAPS.maxIterations).toBe(3)
     expect(DEFAULT_PARALLELISM).toBe(5)
     // 这个列表**会随版本增长**(这一版从 5 个长到 7 个:新增 verify 测试验证、
-    // integrate 集成提交)。断言它是为了让「加一个环节」必须是一次自觉的改动 ——
+    // integrate 集成验收)。断言它是为了让「加一个环节」必须是一次自觉的改动 ——
     // 顺手加一个环节会牵动状态机、工具档位、恢复校验和成本预估。
     expect(PHASE_NAMES).toEqual(['plan','review','execute','verify','accept','integrate','observer'])
   })

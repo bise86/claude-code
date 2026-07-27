@@ -839,7 +839,7 @@ describe('新环节的成本必须计入,而默认配置的数字不能动', () 
     expect(two - one).toBe(9)
   })
 
-  it('配了集成提交 → 数字涨', () => {
+  it('配了集成验收 → 数字涨', () => {
     const withInt = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), integrate: [{ roleName: 'i' }] } })))
     expect(withInt - 24).toBe(9)
   })
@@ -865,9 +865,9 @@ describe('关口不能对没配角色的环节撒谎', () => {
     expect(line).toContain('不做验证')
   })
 
-  it('集成提交 0 席 → 说它回落到验收席位,不说「主模型」', () => {
+  it('集成验收 0 席 → 说它回落到验收席位,不说「主模型」', () => {
     // 0 席时用的是验收的人。说「主模型」会让用户以为是另一批人在跑。
-    const line = row(mk({ phaseRoles: { ...emptyPhaseRoles(), accept: [{ roleName: 'qa' }] } }), '集成提交')
+    const line = row(mk({ phaseRoles: { ...emptyPhaseRoles(), accept: [{ roleName: 'qa' }] } }), '集成验收')
     expect(line).not.toMatch(/主模型\(/)
     expect(line).toContain('验收席位')
   })
