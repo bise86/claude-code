@@ -480,6 +480,14 @@ describe('改回去要变红的四处', () => {
     const gate = readFileSync(new URL('./ConfirmRedo.tsx', import.meta.url), 'utf8')
     expect(gate).toMatch(/color=\{isWarningLine\(l\) \? 'warning' : undefined\}/)
   })
+  it('等人批准时面板真的会收到 suspended', () => {
+    // 三跳都在这个挂不起来的文件里:makeRunAgentFn 拿到 onHumanWait、组件把通知口填进
+    // humanWaitOut、RunningView 把 waiting 传给面板。任何一跳断掉,用户按回车批准工具的
+    // 同一下就又会打开节点详情 —— 而组件档和计数器档都照样绿。
+    expect(SRC).toContain('onHumanWait: w => { humanWaitOut.current?.(w) }')
+    expect(SRC).toMatch(/props\.humanWaitOut\.current = \(w: boolean\) =>/)
+    expect(element('RunningView')).toContain('suspended={humanWait.waiting}')
+  })
   it('只查看模式不给重做入口', () => {
     // 那个 run 的编排器根本没起来过。给了重做就是**替用户决定**把它跑起来,
     // 而他刚刚明确选了不跑。

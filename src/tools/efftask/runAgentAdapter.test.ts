@@ -786,6 +786,55 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     // 照样全绿 —— 拦 setInterval 时把 delay 一起记下来才看得见。
     expect(pollIntervalMs(10_000)).toBe(500)
   })
+  /** 一个用一次工具、然后正常收尾的生成器。 */
+  async function* usesOneTool(args: { canUseTool: () => Promise<unknown> }): AsyncGenerator<never> {
+    yield { type: 'assistant', message: { content: [{ type: 'text', text: '开始' }] } } as never
+    await args.canUseTool()
+    yield { type: 'assistant', message: { content: [{ type: 'text', text: '结束' }] } } as never
+  }
+
+  it('等人批准工具时通知界面让出键盘,答完再还回去', async () => {
+    // 用户报的:「需要用户确认接受时,光标选中的任务回车同时会进入任务详情」。
+    // /et 声明了 spawnsSubagents,权限对话框因此画在任务树面板**之上**,两个组件同时
+    // 挂着而 useInput 是广播的 —— 一下回车,对话框收到,面板也收到。
+    const edges: boolean[] = []
+    const allow = (async () => ({ behavior: 'allow' })) as never
+    await call(makeRunAgentFn(deps(usesOneTool, {
+      canUseTool: allow, onHumanWait: (w: boolean) => edges.push(w),
+    })))
+    expect(edges).toEqual([true, false])
+  })
+
+  it('用户**拒绝**时也要把键盘还回去', async () => {
+    // 少了这一半,一次拒绝之后面板永久失聪 —— 比原来的 bug 更糟:用户既动不了树,
+    // 也退不出去,而屏幕上没有任何解释。
+    const edges: boolean[] = []
+    const deny = (async () => ({ behavior: 'deny', message: '不允许' })) as never
+    await call(makeRunAgentFn(deps(usesOneTool, {
+      canUseTool: deny, onHumanWait: (w: boolean) => edges.push(w),
+    })))
+    expect(edges).toEqual([true, false])
+  })
+
+  it('canUseTool 抛异常时同样还回去', async () => {
+    const edges: boolean[] = []
+    const boom = (() => { throw new Error('权限系统挂了') }) as never
+    try {
+      await call(makeRunAgentFn(deps(usesOneTool, {
+        canUseTool: boom, onHumanWait: (w: boolean) => edges.push(w),
+      })))
+    } catch { /* 这条用例只关心边沿 */ }
+    expect(edges).toEqual([true, false])
+  })
+
+  it('通知回调自己抛异常,不能把这次工具调用带走', async () => {
+    // 它就在带写工具的执行环节的关键路径上。一个崩溃的 UI 回调不该让运行失败。
+    const allow = (async () => ({ behavior: 'allow' })) as never
+    const text = await call(makeRunAgentFn(deps(usesOneTool, {
+      canUseTool: allow, onHumanWait: () => { throw new Error('渲染炸了') },
+    })))
+    expect(text).toContain('结束')
+  })
   it('两种超时带着不同的 kind —— 处理方式相反,不能合并', async () => {
     async function* silent(): AsyncGenerator<never> {
       await new Promise(r => setTimeout(r, 5000))

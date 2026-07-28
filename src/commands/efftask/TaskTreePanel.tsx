@@ -163,6 +163,13 @@ export function TaskTreePanel(props: {
   maxRows?: number
   onExitKey?: () => void
   /**
+   * 让出键盘。
+   *
+   * 有权限确认对话框画在面板之上时必须为真:两个组件同时挂着,而 useInput 是广播的 ——
+   * 用户按回车批准工具,同一下回车也会打开光标所在节点的详情页。
+   */
+  suspended?: boolean
+  /**
    * 重做入口。给了才有 `r` 键 —— 运行中的树不给,因为编排器正握着这些节点。
    *
    * 传的是节点本身而不是 id:调用方要立刻拿它的标题去渲染关口标题,而它手上那份
@@ -259,7 +266,7 @@ export function TaskTreePanel(props: {
         return n
       })
     }
-  }, { isActive: props.interactive === true })
+  }, { isActive: props.interactive === true && props.suspended !== true })
 
   if (detail) {
     return (
@@ -356,8 +363,10 @@ export function TaskTreePanel(props: {
         // 多一行就是 25 行,而 24 行是极常见的默认 —— 底部的计数和提示会被顶出去。
         // 分隔符不用 '·':「待定」那个字形本身就是 '·',读起来会变成三项。
         <Text dimColor wrap="truncate-end">
-          {KIND_GLYPH.decompose}拆分 {KIND_GLYPH.executable}执行 {KIND_GLYPH.unknown}待定{'    '}
-          ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · 回车看详情{props.onRedo ? ' · r 重做' : ''} · Esc/q 退出
+          {props.suspended === true
+            // 不说的话,用户会按着方向键发现树不动,以为界面卡死了。
+            ? '⏸ 等你回答上面那个权限确认 —— 这期间按键归它'
+            : `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定    ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · 回车看详情${props.onRedo ? ' · r 重做' : ''} · Esc/q 退出`}
         </Text>
       ) : null}
     </Box>

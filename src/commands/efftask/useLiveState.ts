@@ -26,3 +26,26 @@ export function useLiveState<T>(initial: T): [T, (next: T | ((cur: T) => T)) => 
   }, [])
   return [value, set, ref as React.RefObject<T>]
 }
+
+/**
+ * 「此刻有几次工具权限确认在等人回答」。
+ *
+ * **计数,不是布尔。** 并行度大于 1 时可以同时有几个执行节点各自等一个确认;用布尔的话,
+ * 其中一个被回答完就会把面板的键盘放回来,而屏幕上还有下一个对话框 —— 回车照样会同时
+ * 批准工具**和**打开节点详情,也就是这个函数要修的那个 bug 只修好了一半。
+ *
+ * 返回的 `begin` / `end` 是给 runAgentAdapter 的 canUseTool 包装用的边沿;`waiting`
+ * 供渲染。ref 那一路是因为边沿可能在一次 render 提交之前连着来两下。
+ */
+export function useHumanWaitCount(): {
+  waiting: boolean
+  begin: () => void
+  end: () => void
+} {
+  const [count, setCount, ref] = useLiveState(0)
+  const begin = React.useCallback(() => { setCount(ref.current + 1) }, [setCount, ref])
+  // 夹在 0:一次多余的 end(重复回调、或者将来某处补发)不能让计数变成负数 ——
+  // 那会让**后面所有**的确认都不再挂起面板,而且没有任何迹象。
+  const end = React.useCallback(() => { setCount(Math.max(0, ref.current - 1)) }, [setCount, ref])
+  return { waiting: count > 0, begin, end }
+}

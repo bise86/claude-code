@@ -128,6 +128,17 @@ export function makeRunAgentFn(deps: {
    */
   humanTimeoutMs?: number | (() => number)
   /**
+   * 「有一次工具权限确认正在等人回答」的开关。
+   *
+   * 存在的理由是一个真实的按键冲突:`/et` 声明了 spawnsSubagents,于是权限对话框会画在
+   * 任务树面板**之上**(processSlashCommand 的 shouldContinueAnimation)。两个组件同时
+   * 挂着,而 useInput 是广播的 —— 用户按回车批准工具,**同一下回车也会打开光标所在
+   * 节点的详情页**。用户报的就是这个。
+   *
+   * 引出来的是这一次 canUseTool 的边沿,由调用方自己去数并发数(见 efftask.tsx)。
+   */
+  onHumanWait?: (waiting: boolean) => void
+  /**
    * 工具摘要解析器。适配层手上有 `availableTools`,每个 Tool 自带 `userFacingName(input)`,
    * 主 REPL 就是用它渲染每一行工具调用的。接上它,新工具进来自动有好摘要;缺席则落到
    * agentEvents 里那张静态表。
@@ -181,11 +192,17 @@ export function makeRunAgentFn(deps: {
      */
     const canUseTool: CanUseToolFn = (async (...args: Parameters<CanUseToolFn>) => {
       humanWaitFrom = Date.now()
+      // 通知**必须**用 try/catch 包住:一个抛异常的 UI 回调不能把这次工具调用带走,
+      // 而它就在带写工具的执行环节的关键路径上。
+      try { deps.onHumanWait?.(true) } catch { /* UI only */ }
       try {
         return await deps.canUseTool(...args)
       } finally {
         humanWaitFrom = undefined
         markProgress()
+        // finally 里发,所以用户拒绝、超时中止、provider 抛错,面板都会拿回键盘。
+        // 少了这一半,一次拒绝之后面板就永久不响应了 —— 比原来的 bug 更糟。
+        try { deps.onHumanWait?.(false) } catch { /* UI only */ }
       }
     }) as CanUseToolFn
     const promptMessages: Message[] = [

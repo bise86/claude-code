@@ -53,6 +53,7 @@ import { buildConflictCard } from '../../tools/efftask/conflictEscalation.js'
 import { buildBlockCard, createEscalationLimiter } from '../../tools/efftask/escalation.js'
 import { ConfirmStartup } from './ConfirmStartup.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
+import { useHumanWaitCount } from './useLiveState.js'
 import { hasPermissionsToUseTool } from '../../utils/permissions/permissions.js'
 import { useAppStateStore, useSetAppState } from '../../state/AppState.js'
 import { getCwd } from '../../utils/cwd.js'
@@ -235,6 +236,10 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   const runAgent: RunAgentFn = makeRunAgentFn({
     toolUseContext: context,
     canUseTool,
+    // 等人批准工具时让任务树面板交出键盘。`/et` 声明了 spawnsSubagents,所以权限对话框
+    // 画在面板**之上**,两个组件同时挂着 —— 而 useInput 是广播的:用户按回车批准工具,
+    // 同一下回车也会打开光标所在节点的详情页。
+    onHumanWait: w => { humanWaitOut.current?.(w) },
     availableTools: context.options.tools, // execute phase only
     readOnlyTools, // plan / review / accept / integrate / observer
     // 测试验证要真的把测试跑起来,所以在只读之上加执行命令的能力。
@@ -297,6 +302,19 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // Same shape, same reason: onExit runs in THIS scope and must be able to report how many
   // escalation cards were dropped.
   const cardLimitOut: { current: number } = { current: 0 }
+  /**
+   * 组件挂载后填进来的「有人在等确认」通知口。
+   *
+   * 必须是 ref 而不是闭包:runAgent 在 `call()` 里就构造好了(它要交给 orchestrator),
+   * 而接收方 `useHumanWaitCount` 只在组件里才存在。和 handoffOut 同一套理由。
+   */
+  const humanWaitOut: { current: ((waiting: boolean) => void) | null } = { current: null }
+  /**
+   * 组件挂载后填进来的「有人在等确认」通知口。
+   *
+   * 必须是 ref 而不是闭包:runAgent 在 `call()` 里就构造好了(它要交给 orchestrator),
+   * 而接收方 `useHumanWaitCount` 只在组件里才存在。和 handoffOut 同一套理由。
+   */
   return (
     <EffTaskRunner
       args={args}
@@ -334,6 +352,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       onTornDown={() => { tornDown = true }}
       handoffOut={handoffOut}
       cardLimitOut={cardLimitOut}
+      humanWaitOut={humanWaitOut}
       // The transcript is the only durable trace once the panel is gone: say how the run
       // ended and where its artifacts live, not just that it ended.
       // Latched: the done view's key handler fires per keypress, and the immediate-command
@@ -537,6 +556,7 @@ type RunnerProps = {
   handoffOut: { current: HandoffSummary | null }
   /** call()-scoped count of escalation cards the limiter dropped, read by onExit. */
   cardLimitOut: { current: number }
+  humanWaitOut: { current: ((waiting: boolean) => void) | null }
   onExit: (outcome: Outcome | null) => void
 }
 
@@ -574,6 +594,18 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [redoTarget, setRedoTarget] = React.useState<TaskNode | null>(null)
   /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
   const [redoProblems, setRedoProblems] = React.useState<string[]>([])
+  /**
+   * 有几次工具权限确认在等人回答。>0 时任务树面板交出键盘。
+   *
+   * 计数而不是布尔:并行度大于 1 时可以同时有几个执行节点各自等一个确认。
+   */
+  const humanWait = useHumanWaitCount()
+  // 把通知口交给 call() 作用域里早就构造好的 runAgent —— 那时组件还不存在。
+  // 卸载时收回:指向一个已卸载组件的 setState 会静默丢事件,而丢的正是「拿回键盘」。
+  React.useEffect(() => {
+    props.humanWaitOut.current = (w: boolean) => { if (w) humanWait.begin(); else humanWait.end() }
+    return () => { props.humanWaitOut.current = null }
+  }, [props.humanWaitOut, humanWait.begin, humanWait.end])
   const handoffRef = React.useRef<HandoffSummary | null>(null)
   // What the gate must SAY. Resolved before the gate opens; 'none' until then.
   const [isolation, setIsolation] = React.useState<'worktree' | 'none'>('none')
@@ -1392,7 +1424,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'running') {
-    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} />
+    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} />
   }
   return (
     <DoneView
@@ -1457,12 +1489,14 @@ function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[]
 // EXPORTED for testing. The three §10.2 hops that live in this file — creating the store,
 // pushing into it, and handing it to each panel — are exactly the shape of wire this repo has
 // cut twice, and nothing else here is importable by a test.
-export function RunningView(props: { nodes: TaskNode[]; runId: string; streams?: StreamStore; pool?: () => { inUse: number; limit: number }; onAbort: () => void }): React.ReactElement {
+export function RunningView(props: { nodes: TaskNode[]; runId: string; streams?: StreamStore; pool?: () => { inUse: number; limit: number }; onAbort: () => void; suspended?: boolean }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
   // different things at once (abort the run vs leave the detail view). The panel owns the
   // keyboard and calls back for exit.
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
+  // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
