@@ -3,6 +3,7 @@ import {
   describeRipgrepFailure,
   resolveRipgrepConfig,
   searchUnavailableReason,
+  statusOf,
 } from './ripgrep.js'
 
 /**
@@ -183,27 +184,26 @@ describe('搜索用不了的时候,说的话必须能照做', () => {
     // PATH 上有 rg —— 找到了,不许报警。
     const found = resolveRipgrepConfig({ ...base, systemRg: () => '/usr/bin/rg' })
     expect(found).toEqual({ mode: 'system', command: 'rg', args: [] })
-    expect(searchUnavailableReason({ mode: found.mode, path: found.command, missing: found.missing }))
-      .toBeUndefined()
+    // 映射**本身**也要钉:searchUnavailableReason 现在故意不看 path(那正是这条 bug 的
+    // 修法),所以只经它断言的话,`path: config.command` 写成别的照样绿 —— 而 doctor 那
+    // 类地方就是照着这个 path 显示的。变异实测:把 path 映射到 config.mode 能活下来。
+    expect(statusOf(found)).toEqual({ mode: 'system', path: 'rg' })
+    expect(searchUnavailableReason(statusOf(found))).toBeUndefined()
 
     // 用户点名要系统 rg 且 PATH 上有 —— 同样不许报警。
     const wanted = resolveRipgrepConfig({ ...base, wantsSystem: true, systemRg: () => '/usr/bin/rg' })
-    expect(searchUnavailableReason({ mode: wanted.mode, path: wanted.command, missing: wanted.missing }))
-      .toBeUndefined()
+    expect(searchUnavailableReason(statusOf(wanted))).toBeUndefined()
 
     // 哪儿都没有 —— 这一条才该报。
     const none = resolveRipgrepConfig({ ...base })
     expect(none.missing).toBe(true)
-    expect(searchUnavailableReason({ mode: none.mode, path: none.command, missing: none.missing }))
-      .toBeTruthy()
+    expect(searchUnavailableReason(statusOf(none))).toBeTruthy()
   })
 
   it('内置的那份和官方构建都不报警', () => {
     const builtin = resolveRipgrepConfig({ ...base, fileExists: () => true })
-    expect(searchUnavailableReason({ mode: builtin.mode, path: builtin.command, missing: builtin.missing }))
-      .toBeUndefined()
+    expect(searchUnavailableReason(statusOf(builtin))).toBeUndefined()
     const embedded = resolveRipgrepConfig({ ...base, isOfficialNativeBuild: true })
-    expect(searchUnavailableReason({ mode: embedded.mode, path: embedded.command, missing: embedded.missing }))
-      .toBeUndefined()
+    expect(searchUnavailableReason(statusOf(embedded))).toBeUndefined()
   })
 })

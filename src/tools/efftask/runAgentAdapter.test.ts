@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { verifyToolPool } from '../../commands/efftask/efftask.js'
-import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs } from './runAgentAdapter.js'
+import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs, providerErrorOf, ProviderApiError } from './runAgentAdapter.js'
+import { createAssistantAPIErrorMessage } from '../../utils/messages.js'
 import { createRunControl } from './control.js'
 import { pwd } from '../../utils/cwd.js'
 
@@ -15,7 +16,11 @@ describe('runAgentAdapter helpers', () => {
   })
   it('pickAgentDefinition returns main default for null role', () => {
     const main = { agentType: 'main', whenToUse: '', tools: undefined } as any
-    expect(pickAgentDefinition(null, [], main)).toBe(main)
+    const coder = { agentType: 'coder' } as any
+    // 名册**非空** —— `[]` 的话 find 的回调一次都不跑,`role.roleName` 永远不被求值,
+    // 守卫删掉照样绿。而 efftask.tsx 的 extractAgent 每次都传 role: null,用户配了
+    // roles[] 时名册正好非空 —— 这条守卫在他那台机器上是承重的。
+    expect(pickAgentDefinition(null, [coder], main)).toBe(main)
   })
   it('pickAgentDefinition finds role by agentType, falls back to main', () => {
     const main = { agentType: 'main' } as any
@@ -75,6 +80,56 @@ describe('runAgentAdapter helpers', () => {
     // 员工解析不到 —— 回落主模型,更不能带着 'K3' 走。
     expect(`解析不到的员工传的 model: ${String(await dispatch('不存在的员工'))}`)
       .toBe('解析不到的员工传的 model: undefined')
+  })
+  it('provider 自己报的错**不许**变成这一席的回答', async () => {
+    /**
+     * 用户截图逐字复现的那一条:方案环节整段是
+     *   「There's an issue with the selected model (K3). It may not exist or you may not
+     *    have access to it. Run /model to pick a different model.」
+     * 而重点/风险点/验收点三行空 ⚠。
+     *
+     * 原因不是模型选错,是 createAssistantAPIErrorMessage 造出来的错误消息**长得和一条
+     * 正常回答一模一样** —— 普通 assistant 消息,content 里一段 text,只有
+     * isApiErrorMessage 这个标记能分开。collectText 把它当正文拼进去,parsePlanOutput
+     * 于是解出 `{solution: 报错原文, keyPoints:'', risks:'', acceptance:''}`,
+     * 而流水线认为这一席**答完了**。
+     *
+     * 用**真构造器**造消息,不手捏形状 —— 手捏的话这条 bug 恰好就在形状之外。
+     */
+    const err = createAssistantAPIErrorMessage({
+      content: "There's an issue with the selected model (K3). It may not exist or you may not have access to it.",
+      error: 'invalid_request',
+    })
+    // 先钉住前提:它确实是一条 assistant 文本消息,collectText 照收不误。
+    expect(collectText([err] as never)).toContain('K3')
+    expect(providerErrorOf([err])).toContain('K3')
+    // 正常回答不许被误伤。
+    expect(providerErrorOf([{ type: 'assistant', message: { content: [{ type: 'text', text: '正常方案' }] } }]))
+      .toBeUndefined()
+
+    async function* fake(): AsyncGenerator<never> { yield err as never }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as never,
+      canUseTool: (async () => ({ behavior: 'allow' })) as never,
+      availableTools: [] as never,
+      readOnlyTools: [] as never,
+      activeAgents: [] as never,
+      mainModelDefault: { agentType: 'main' } as never,
+      runAgentImpl: fake as never,
+    })
+    let outcome = '没有抛,直接把报错当回答返回了'
+    try {
+      const text = await fn({
+        phase: 'plan', node: { id: 'root' } as never, role: null,
+        system: 's', prompt: 'p', signal: new AbortController().signal,
+      })
+      outcome = `返回了文本:${text}`
+    } catch (e) {
+      outcome = e instanceof ProviderApiError ? 'ProviderApiError' : `别的错:${String(e)}`
+    }
+    // 抛出来 = runPhase 判 ok:false,报错进 reason 而不是进 solution;
+    // 圆桌的 allSettled 也只认 reject,所以它同时修好了裁决被伪造那一路。
+    expect(outcome).toBe('ProviderApiError')
   })
   it('makeRunAgentFn concatenates assistant text from an injected runAgentImpl', async () => {
     async function* fakeRun(): AsyncGenerator<any> {

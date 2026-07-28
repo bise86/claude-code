@@ -118,7 +118,45 @@ describe('startupConfirm racer', () => {
     }
     const line = rosterLines(cfg).find(l => l.startsWith('验收: '))!
     expect(Array.from(line).length).toBeLessThanOrEqual(84) // label + 80 budget
-    expect(line.endsWith('…')).toBe(true)
+    // 夹掉了就必须说藏了几席 —— 只留一个「…」等于把「谁在干活」这个问题答了一半。
+    // 数目要**准**:role-1 是 role-15 的子串,子串法数出来的会少报。40 席、装下 k 席,
+    // 藏起来的就是 40-k,一个不多一个不少。
+    const m = /\(另 (\d+) 席未显示\)$/.exec(line)
+    expect(`提示: ${m === null ? '没有' : m[1]}`).not.toBe('提示: 没有')
+    // 剥掉标签和提示再按「、」切 —— 用「名字两侧是分隔符」的正则数会少报两个:
+    // 第一个名字左边是 ': ' 不是 '、',最后一个右边是提示的 '('。
+    const shownPart = line.replace(/^验收: /, '').replace(/\(另 \d+ 席未显示\)$/, '')
+    const visible = shownPart.split('、').filter(n => /^role-\d+$/.test(n)).length
+    expect(`藏起来的: ${m![1]}`).toBe(`藏起来的: ${40 - visible}`)
+  })
+
+  it('藏起来的席位数不许用子串法数 —— 短名字是长名字的子串', () => {
+    /**
+     * 上一条用 role-0…role-39,可见的恰好是 role-0…role-9,而被藏起来的 role-10…role-39
+     * 都**不是**可见那段的子串 —— 方向正好反了,于是子串法在那组数据上碰巧也对。
+     * 变异实测:把计数改成 `shown.includes(n)` 能在那一条下活下来。
+     *
+     * 这一组把短名字排在后面(必然被藏),而它们是前面长名字的子串:seat-1 和 seat-10
+     * 都出现在 seat-100 里面。子串法会把它们当成「显示出来了」,于是**少报**藏了几席 ——
+     * 而这行字存在的全部意义就是把那个数说准。
+     */
+    const roleNames = [
+      ...Array.from({ length: 30 }, (_, i) => `seat-${100 + i}`),
+      'seat-1',
+      'seat-10',
+    ]
+    const cfg: EffTaskConfig = {
+      goalPrompt: 'g', parallelism: 5, caps: { ...DEFAULT_CAPS },
+      phaseRoles: { ...emptyPhaseRoles(), accept: roleNames.map(roleName => ({ roleName })) },
+    }
+    const line = rosterLines(cfg).find(l => l.startsWith('验收: '))!
+    const m = /\(另 (\d+) 席未显示\)$/.exec(line)
+    expect(`提示: ${m === null ? '没有' : m[1]}`).not.toBe('提示: 没有')
+    const shownPart = line.replace(/^验收: /, '').replace(/\(另 \d+ 席未显示\)$/, '')
+    const visible = shownPart.split('、').filter(n => /^seat-\d+$/.test(n)).length
+    expect(`藏起来的: ${m![1]}`).toBe(`藏起来的: ${roleNames.length - visible}`)
+    // 前提:这组数据真的能触发子串误判,否则这条用例只是重复上一条。
+    expect(shownPart.includes('seat-1') && !shownPart.split('、').includes('seat-1')).toBe(true)
   })
 })
 

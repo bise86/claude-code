@@ -22,7 +22,7 @@ const __dirname = path.join(
   process.env.NODE_ENV === 'test' ? '../../../' : '../',
 )
 
-type RipgrepConfig = {
+export type RipgrepConfig = {
   mode: 'system' | 'builtin' | 'embedded'
   command: string
   args: string[]
@@ -656,11 +656,23 @@ export function getRipgrepStatus(): {
   /** 哪儿都没找到 —— 见 RipgrepConfig.missing。 */
   missing?: true
 } {
-  const config = getRipgrepConfig()
+  return { ...statusOf(getRipgrepConfig()), working: ripgrepStatus?.working ?? null }
+}
+
+/**
+ * config → status 的映射。**单独抽出来是为了让它可被测到。**
+ *
+ * 它此前只活在 getRipgrepStatus() 里,而 getRipgrepStatus 读的是 memoize 过的真实环境
+ * —— 测试碰不到。于是每条用例都把这三行**手抄**了一遍:
+ *     searchUnavailableReason({ mode: c.mode, path: c.command, missing: c.missing })
+ * 手抄的替身和真映射长得一样,却不携带真映射的对错:把 `missing` 的透传删掉、或者让它
+ * 恒为 true,全套 2040 条测试一条都不红 —— 而这两个方向分别是「告警从此永远哑掉」和
+ * 「用户报的那个假警报」本身,也就是这段代码存在的全部理由。
+ */
+export function statusOf(config: RipgrepConfig): { mode: RipgrepConfig['mode']; path: string; missing?: true } {
   return {
     mode: config.mode,
     path: config.command,
-    working: ripgrepStatus?.working ?? null,
     ...(config.missing === true ? { missing: true as const } : {}),
   }
 }

@@ -240,7 +240,10 @@ describe('readRunManifest recovers the config the run was started with', () => {
     const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md }), '/r')
     expect(config.parallelism).toBe(3)
     expect(config.goalPrompt).toBe('打通登录')
-    expect(config.phaseRoles.plan[0]).toEqual({ roleName: 'planner', model: 'm1' })
+    // model **故意不读回** —— 它是 annotateRoleModels 每次按当前 settings 重算的显示值,
+    // 读回来会让恢复关口显示上一次运行的旧模型(员工换了模型、甚至被删掉都照旧显示)。
+    // roleName / roleTag 才是恢复的输入。
+    expect(config.phaseRoles.plan[0]).toEqual({ roleName: 'planner' })
     expect(config.caps.maxDepth).toBe(4)
     // scoreThreshold must survive: rebuilding caps field-by-field silently dropped it, so a
     // run configured with a threshold lost it on resume.

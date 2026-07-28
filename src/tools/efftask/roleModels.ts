@@ -62,6 +62,8 @@ export function annotateRoleModels(
     PHASE_NAMES.map(p => [
       p,
       (config.phaseRoles[p] ?? []).map(
+        // `??` 只该挡住**已经点名**的模型。它挡不住盘上的旧值 —— 那是 resumeCore 的事,
+        // 见那边的注释:恢复时**不读回** model,所以走到这里的 r.model 只可能是点名的。
         (r): RoleBinding => ({ ...r, model: r.model ?? effectiveModel(byType.get(r.roleName), mainModel) }),
       ),
     ]),

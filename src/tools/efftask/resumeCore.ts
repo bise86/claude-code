@@ -33,7 +33,18 @@ const roleArray = (v: unknown): RoleBinding[] =>
         // 是二义的)。丢掉它 → 恢复后席位数量、名字、模型全对,只有职责简报静默消失。
         .map(r => ({
           roleName: r.roleName,
-          ...(typeof r.model === 'string' ? { model: r.model } : {}),
+          // model **故意不读回**。
+          //
+          // 它是 annotateRoleModels 算出来的**显示值**(员工现在跑在哪个模型上),不是
+          // 用户的选择 —— parseDirectives 从不给它赋值。读回来的后果是 annotateRoleModels
+          // 的 `r.model ?? …` 被盘上的旧值短路,于是:员工在 settings 里换了模型、甚至被
+          // 整个删掉,--resume 的关口照旧显示 `架构师←架构(MiniMax-M2)`,而实际跑的是主
+          // 模型兜底,一条 ⚠ 都没有。日志流的「(模型)」标注同源,一起错。
+          //
+          // efftask.tsx 恢复分支的注释承诺过不许这样:「a role recorded on disk may no
+          // longer exist, and pickAgentDefinition would silently fall back to the main
+          // model while the gate still displayed the old name」。丢掉这一行,那句承诺才成立。
+          // run.md 里仍然写着它 —— 那是给人读的历史记录,不是下一次运行的输入。
           ...(typeof (r as { roleTag?: unknown }).roleTag === 'string' ? { roleTag: (r as { roleTag: string }).roleTag } : {}),
         }))
     : []

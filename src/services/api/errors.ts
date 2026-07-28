@@ -908,7 +908,14 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       content: fallbackSuggestion
         ? `The model ${model} is not available on your ${getAPIProvider()} deployment. Try ${switchCmd} to switch to ${fallbackSuggestion}, or ask your admin to enable this model.`
-        : `There's an issue with the selected model (${model}). It may not exist or you may not have access to it. Run ${switchCmd} to pick a different model.`,
+        // 404 分不清「模型不存在」和「路径不存在」,而原来的措辞**一口咬定是模型**,还把
+        // 服务器自己的解释整个扔掉(上面 400 那支是带 error.message 的,只有这一支不带)。
+        //
+        // 代价实测过:用户配了 roles[] 员工,apiUrl 是手填的自由文本,拼出 /v1/v1/messages,
+        // 上游明写 `path /v1/v1/messages not found` —— 而屏幕上只有「模型有问题(K3)」。
+        // 于是连着两轮都在改模型名,没人去看路径。而 /model 改的是主会话模型,压根改不到
+        // roles[].model,更改不到 apiUrl:给出的处方在这个场景下是个无效操作。
+        : `There's an issue with the selected model (${model}). A 404 can mean the model doesn't exist, you lack access, OR the endpoint path is wrong (check any custom apiUrl / baseURL). Server said: ${error.message}. Run ${switchCmd} to pick a different model.`,
       error: 'invalid_request',
     })
   }

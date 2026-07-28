@@ -25,6 +25,43 @@ describe('buildRoleFetch anthropic passthrough', () => {
     // must survive — not be dropped by spreading a Headers instance into `{}`.
     expect(seenHeaders.get('anthropic-version')).toBe('2023-06-01')
   })
+
+  it('路径叠加的两个方向都不许发生', async () => {
+    /**
+     * 用户实测:「只写 env 时一切正常,一加 roles[] 就炸」,报的是
+     *   「There's an issue with the selected model (K3)…」
+     * 而上游自己说的是 `path /v1/v1/messages not found` —— 404 被 errors.ts 统一翻译成
+     * 「模型有问题」,一路把人往改模型名上带(我自己就照着误诊了两轮)。
+     *
+     * 叠加有两个方向:
+     *  (a) 会话侧:传进来的 url 是 SDK 按**会话自己的** baseURL 拼的完整路径,带路径的
+     *      ANTHROPIC_BASE_URL 会把自己那一段塞进员工端点;
+     *  (b) 员工侧:apiUrl 本身以 /v1 结尾 —— docs/roles-setup.md 里 openai 的例子正是
+     *      这么写的,而文档没一句说 anthropic 的不能这么写。
+     */
+    const seen: string[] = []
+    const inner = async (url: any) => { seen.push(String(url)); return new Response('{}') }
+    const call = async (apiUrl: string, from: string): Promise<void> => {
+      const f = buildRoleFetch({ apiProtocol: 'anthropic', apiUrl, apiToken: 'sk', backendModel: 'x' }, inner as any)
+      await f(from, { method: 'POST', headers: new Headers(), body: '{}' })
+    }
+    // (b) 员工 apiUrl 自带 /v1
+    await call('https://my-proxy.example.com/v1', 'https://api.anthropic.com/v1/messages')
+    // (a) 会话 baseURL 带路径,员工 apiUrl 也带路径
+    await call('https://vendor.example.com/coding', 'https://vendor.example.com/anthropic/v1/messages')
+    // 两个方向同时踩
+    await call('https://vendor.example.com/coding/v1', 'https://vendor.example.com/anthropic/v1/messages')
+    // 结尾斜杠
+    await call('https://vendor.example.com/coding/', 'https://api.anthropic.com/v1/messages')
+    expect(seen).toEqual([
+      'https://my-proxy.example.com/v1/messages',
+      'https://vendor.example.com/coding/v1/messages',
+      'https://vendor.example.com/coding/v1/messages',
+      'https://vendor.example.com/coding/v1/messages',
+    ])
+    // 已有那条用例钉着 apiUrl 自己的前缀(MiniMax 的 /anthropic)不许被 WHATWG 覆盖掉,
+    // 这一条钉的是反面:前缀只能来自 apiUrl,不能来自会话的 baseURL。
+  })
 })
 
 describe('buildRoleFetch openai translate', () => {

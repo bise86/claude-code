@@ -46,6 +46,9 @@ export interface StartupDecision {
  * Truncate to `max` CODE POINTS. A raw .slice() counts UTF-16 units and can cut an emoji
  * in half, emitting a lone surrogate into a card payload and the terminal.
  */
+/** 名册行的码点预算。夹取、预留提示位置、测试的上限断言必须用同一个数。 */
+export const ROSTER_BUDGET = 80
+
 export function clip(s: string, max = 80): string {
   const cps = Array.from(s)
   return cps.length > max ? `${cps.slice(0, max - 1).join('')}…` : s
@@ -339,7 +342,36 @@ export function rosterLines(config: EffTaskConfig): string[] {
     // same omission as a bare role name: it says a model was chosen without saying which.
     const bare = config.mainModel ? `主模型(${config.mainModel})` : '主模型'
     // Same 80-code-point budget as the goal line, so one long roster can't wreck the layout.
-    return `${PHASE_LABEL[p]}: ${clip(names.length > 0 ? names.join('、') : bare)}`
+    const body = names.length > 0 ? names.join('、') : bare
+    if (names.length === 0 || Array.from(body).length <= ROSTER_BUDGET) {
+      return `${PHASE_LABEL[p]}: ${clip(body, ROSTER_BUDGET)}`
+    }
+    /**
+     * 藏了几席,必须说出来 —— 而且这句话的位置要从**名字**里扣,不能从版面扣。
+     *
+     * 默认每环节席位上限就是 5(README 把它写成正常配置),而 80 码点大约只放得下 3 个
+     * `角色←员工(模型)`。原来夹完只剩一个「…」:关口存在的全部意义是「谁在什么环节
+     * 干活」,而它把这个问题答了一半,还不说自己只答了一半。
+     *
+     * 两处不能偷懒:
+     *  - 提示**不进 clip**。塞进被夹的那一段里,它自己就是最先被夹掉的东西。
+     *  - 数「装下了几个」要**按码点走**,不能用 `shown.includes(n)` —— `role-1` 是
+     *    `role-15` 的子串,子串法会把藏起来的席位数少报。
+     * 预算按 names.length 的位数预留(hidden ≤ names.length),所以整行不会超。
+     */
+    const budget = ROSTER_BUDGET - Array.from(`(另 ${names.length} 席未显示)`).length
+    let used = 0
+    let visible = 0
+    for (const n of names) {
+      const add = (visible === 0 ? 0 : 1) + Array.from(n).length // 1 = 「、」
+      if (used + add > budget) break
+      used += add
+      visible++
+    }
+    // 一个名字就超预算时仍然露出它的头部(带…),比只剩一句「另 N 席未显示」有用。
+    const shown = clip(visible > 0 ? names.slice(0, visible).join('、') : names[0]!, budget)
+    const hidden = names.length - Math.max(visible, 1)
+    return `${PHASE_LABEL[p]}: ${shown}${hidden > 0 ? `(另 ${hidden} 席未显示)` : ''}`
   })
 }
 

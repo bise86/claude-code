@@ -85,6 +85,43 @@ export class PhaseTimeoutError extends Error {
   }
 }
 
+/**
+ * provider 自己报的错 —— 它长得**和一条正常回答一模一样**。
+ *
+ * `createAssistantAPIErrorMessage()`(services/api/errors.ts)造出来的就是一条普通的
+ * assistant 消息:content 里是一段 text,只有 `isApiErrorMessage: true` 这个标记能把它
+ * 和真回答分开。runAgent 原样 yield,适配层照收不误,collectText 把它当正文拼进去。
+ *
+ * 实测后果(用户截图逐字复现):方案环节报
+ *   「There's an issue with the selected model (K3). It may not exist or you may not
+ *    have access to it. Run /model to pick a different model.」
+ * 而 parsePlanOutput 解出来的是 `{solution: 那段报错原文, keyPoints:'', risks:'', acceptance:''}`
+ * —— 关口上三行 ⚠,一次真正的分析都没发生,而流水线认为这一席**答完了**。
+ *
+ * 影响面不止方案:圆桌评审的 Promise.allSettled 只捕获 **reject**,而这条是**正常返回**
+ * 的文本 —— 它会被 parseVerdict 当成一份真实裁决(非 infra,不重试);执行环节则会把
+ * 一段报错记成 execStatus 报「完成」。所以收口在适配层,而不是逐个环节去认。
+ *
+ * 只判标记,不判 SYNTHETIC_MODEL:models 那一侧的 isSyntheticApiErrorMessage 还要求
+ * model 相等,而我们要拦的是**所有** provider 错误,不只是合成的那一类。
+ */
+export function providerErrorOf(messages: readonly unknown[]): string | undefined {
+  for (const m of messages as { type?: string; isApiErrorMessage?: boolean }[]) {
+    if (m?.type !== 'assistant' || m.isApiErrorMessage !== true) continue
+    const text = collectText([m] as never)
+    return text.trim() === '' ? '模型服务返回了一条空的错误消息' : text
+  }
+  return undefined
+}
+
+/** provider 报错被当成回答收下的那一刻抛出来 —— 见 providerErrorOf。 */
+export class ProviderApiError extends Error {
+  constructor(public readonly providerMessage: string) {
+    super(providerMessage)
+    this.name = 'ProviderApiError'
+  }
+}
+
 export function collectText(messages: Message[]): string {
   let out = ''
   for (const m of messages) {
@@ -465,6 +502,10 @@ export function makeRunAgentFn(deps: {
         timeoutKind,
       )
     }
+    // provider 的报错**不是**这一席的回答。排在取消和超时之后:那两个是用户和闸门的
+    // 决定,比 provider 的抱怨更能解释这次失败。
+    const providerError = providerErrorOf(collected)
+    if (providerError !== undefined) throw new ProviderApiError(providerError)
     return collectText(collected)
   }
 }
