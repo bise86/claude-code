@@ -546,11 +546,29 @@ function ctxGoal(node: TaskNode): string { return node.goal }
  * 结果完全相同。放在函数体里实测过 —— 5 席 × 3 轮 × 20 条时单次 752 ms,一轮 15 次 =
  * **11.3 秒的主线程同步阻塞**,期间整个界面(含别的节点正在跑的日志窗)不刷新。
  */
-function reviewPrompt(node: TaskNode, tag: string, brief = '', notice = ''): string {
+function reviewPrompt(
+  node: TaskNode, tag: string, brief = '', notice = '', round = 1, maxRounds = 3,
+): string {
   return brief +
-    `请评审以下方案是否可执行、完整、无重大风险。方案:\n${quote(JSON.stringify(node.plan))}\n` +
+    `请评审以下方案是否**足以开始执行**。方案:\n${quote(JSON.stringify(node.plan))}\n` +
     (notice ? notice + '\n' : '') +
-    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。有任何阻断问题填入 blocking。` +
+    `这是第 ${round}/${maxRounds} 轮评审。` +
+    // 「第 N 轮不过整个任务就中止」不是吓唬,是事实(见 stepStart 的 cap-iteration 分支)。
+    // 评审员不知道自己手上握着什么,就会按「还能更好」的标准打分。
+    `第 ${maxRounds} 轮仍不通过,这个任务会被整个中止,一行代码都不会写。\n` +
+    `判据:\n` +
+    `- blocking 只填**会让执行失败、或让产出没法验收**的问题。\n` +
+    `- 方案不需要完美,只需要「能开始干、干完能按验收点验」。能达到这条就判通过。\n` +
+    `- 可以更好但不阻塞的,写进 comments,**不要**放进 blocking(放进去等同于否决)。\n` +
+    (round > 1
+      // 这一条是冲着实测来的:一次运行里三轮评审提了 **12 条互不相同**的要求
+      // (「缺少执行步骤」「缺少范围界定」「缺少输出物定义」……),全部只出现过一轮。
+      // 方案每轮都在按上一轮改,而评审每轮都换一批新要求 —— 这种组合下迭代上限
+      // 是必然会撞到的,和方案质量无关。
+      ? `- **不要提出上一轮没有提过的新要求**,除非那是这一版新引入的缺陷。\n` +
+        `  上一轮要求改的地方改了,就该判通过;换一个角度再挑一遍,这个任务就会被中止。\n`
+      : '') +
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +
     answerRule(tag)
 }
 function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', syncNote = '', brief = ''): string {
@@ -1030,7 +1048,8 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
       system: 'review',
       // 一轮算一次,不是一席算一次:reviewLog 在这一轮之内不变。
-      buildPrompt: (tag, seat) => reviewPrompt(node, tag, seatBrief(ctx, seat, 'review'), reviewNotice),
+      buildPrompt: (tag, seat) =>
+        reviewPrompt(node, tag, seatBrief(ctx, seat, 'review'), reviewNotice, node.iteration.planReview + 1, caps.maxIterations),
       ctx,
     })
     node.reviewLog.push(rec)

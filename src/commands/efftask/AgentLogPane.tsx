@@ -249,7 +249,13 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
           <Text color="warning">{`↓ 下面还有 ${behind} 行(G 跟随最新)`}</Text>
         ) : null}
         {props.isActive === true ? (
-          <Text dimColor>↑↓/jk 滚动 · PgUp/PgDn 翻页 · g/G 顶部/底部 · Tab 切换环节 · 空格 折叠 · t 思考</Text>
+          <Text dimColor>
+            ↑↓/jk 滚动 · PgUp/PgDn 翻页 · g/G 顶部/底部 · Tab 切换环节 · 空格 折叠 · t 思考{'\n'}
+            {/* 滚轮的代码是活的(logPaneAction 认 wheelUp/wheelDown),但终端要开了鼠标
+                追踪才会发这些序列,而这个 fork 默认非全屏、不开。不写这句的话,用户会
+                再试一次滚轮、再一次没反应,而且没人告诉他为什么。 */}
+            鼠标滚轮需要开启全屏模式(CLAUDE_CODE_NO_FLICKER=1)
+          </Text>
         ) : null}
       </Box>
     </OffscreenFreeze>

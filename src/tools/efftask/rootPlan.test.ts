@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { applyRootDraft, buildRootPlanNoticeCard, childLines, draftBlockers, planGaps, draftRootPlan, makeRootNode, rootTitle, type RootDraft } from './rootPlan.js'
+import { applyRootDraft, buildRootPlanNoticeCard, childLines, draftBlockers, planGaps, isBetterDraft, draftRootPlan, makeRootNode, rootTitle, type RootDraft } from './rootPlan.js'
 import { EffTaskOrchestrator } from './orchestrator.js'
 import { PipelineCtx, stepStart } from './pipeline.js'
 import { byIdMap } from './stateMachine.js'
@@ -574,5 +574,73 @@ describe('空方案自动重拟一次', () => {
     })
     expect(seen).toContain('/home/me/3d-print-web')
     expect(seen).toContain('先真的去看代码')
+  })
+})
+
+describe('自动重拟不许把好方案换成坏的', () => {
+  const wrap = (o: unknown) => '```json\n' + JSON.stringify(o) + '\n```'
+  const GOOD = wrap({
+    kind: 'decompose',
+    solution: '分五步:先读 src/a.ts 与 src/b.ts 理清模块边界,再逐个模块看错误处理,最后汇总',
+    keyPoints: '别只看命名', risks: '', acceptance: '',
+    children: [{ title: '看 a', deps: [] }, { title: '看 b', deps: [] }, { title: '汇总', deps: ['看 a', '看 b'] }],
+  })
+  // 空字段更少(只缺 risks),但方案更浅、子任务全没了 —— 只比个数的话它会赢
+  const SHALLOWER = wrap({
+    kind: 'executable',
+    solution: '看一下代码然后改一改就行了大概是这样子的吧',
+    keyPoints: '注意点', risks: '', acceptance: '验收点',
+  })
+
+  it('子任务从 3 个变 0 个的「改进」要拒掉 —— 这正是用户抱怨的那一行', () => {
+    // 用户截图:「初始任务树 · 第一层(0 个) (不拆分,根任务直接执行)」。
+    // 整体替换会连子任务一起换掉,验收实跑复现过。
+    let n = 0
+    return draftRootPlan({
+      root: makeRootNode(cfg(), NOW), config: cfg(), signal: new AbortController().signal,
+      runAgent: async () => { n++; return n === 1 ? GOOD : SHALLOWER },
+    }).then(res => {
+      expect(n).toBe(2)                                   // 确实重拟了
+      expect(res.ok && res.draft.children).toHaveLength(3) // 但没被换掉
+      expect(res.ok && res.draft.kind).toBe('decompose')
+    })
+  })
+
+  it('isBetterDraft 三条判据各自都要卡住', () => {
+    const prev = { kind: 'decompose' as const, plan: { solution: 's', keyPoints: '', risks: '', acceptance: '' }, children: [{ title: 'a', deps: [] }] }
+    const full = { solution: '分三步做完这件事,先读代码再改再跑测试验证', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    // 空字段没少
+    expect(isBetterDraft({ kind: 'decompose', plan: prev.plan, children: prev.children }, prev, 3)).toBe(false)
+    // 子任务变少
+    expect(isBetterDraft({ kind: 'decompose', plan: full, children: [] }, prev, 3)).toBe(false)
+    // 从「要拆」退回「不拆」
+    expect(isBetterDraft({ kind: 'executable', plan: full, children: prev.children }, prev, 3)).toBe(false)
+    // 三条都过才算更好
+    expect(isBetterDraft({ kind: 'decompose', plan: full, children: prev.children }, prev, 3)).toBe(true)
+  })
+
+  it('重拟要带上用户在第三关输入的修改意见', async () => {
+    // 不带的话,用户亲手写的那句话被丢了,而关口底部还写着「已按你的意见重拟」。
+    const prompts: string[] = []
+    await draftRootPlan({
+      root: makeRootNode(cfg(), NOW), config: cfg(), signal: new AbortController().signal,
+      feedback: '把测试单独拆成一个子任务',
+      runAgent: async req => { prompts.push(req.prompt); return prompts.length === 1 ? SHALLOWER : GOOD },
+    })
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]).toContain('把测试单独拆成一个子任务')
+  })
+
+  it('重拟要让模型看见自己刚写的那一版,不是四个空串', async () => {
+    // planPrompt 读的是 node.plan,而 root 的 plan 要等 draftRootPlan 返回之后才写。
+    // 直接传 root,模型看到的「上一版方案」是 {"solution":"",…} —— 它根本不知道自己
+    // 刚写了什么,「针对性修订」这条通道第一轮就不成立。
+    const prompts: string[] = []
+    await draftRootPlan({
+      root: makeRootNode(cfg(), NOW), config: cfg(), signal: new AbortController().signal,
+      runAgent: async req => { prompts.push(req.prompt); return prompts.length === 1 ? SHALLOWER : GOOD },
+    })
+    expect(prompts[1]).toContain('看一下代码然后改一改')
+    expect(prompts[1]).not.toContain('{"solution":"","keyPoints":"","risks":"","acceptance":""}')
   })
 })

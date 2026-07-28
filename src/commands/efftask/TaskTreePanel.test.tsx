@@ -936,4 +936,22 @@ describe('拆分任务 / 执行任务 要一眼分得开', () => {
     expect(`标题占了 ${rows.length} 个终端行`).toBe('标题占了 1 个终端行')
     app.unmount()
   })
+
+  it('图例三种都列,而且分隔符不能是「待定」那个字形', async () => {
+    // '·' 既是分隔符又是「待定」的字形 —— 图例 `⊞ 拆分任务 · ▪ 执行任务` 读起来像三项。
+    // 而且树上画三种、详情页写三种,只有图例是两种,等于让人猜第三种。
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel as never, {
+        nodes: [mk({ id: 'root', title: '根', status: 'READY', kind: 'unknown' })],
+        runId: '003', interactive: true,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    for (const label of ['拆分任务', '执行任务', '待定']) expect(f).toContain(label)
+    expect(`分隔符和待定字形撞了: ${f.includes(`拆分任务 ${KIND_GLYPH.unknown} `)}`).toBe('分隔符和待定字形撞了: false')
+    app.unmount()
+  })
 })

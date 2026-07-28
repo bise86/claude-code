@@ -2721,7 +2721,7 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
     expect(withoutDefs).toContain('TAG')
     expect(withoutDefs.length).toBeGreaterThan(40)
     // 无标签席位拿到的就是**原样**的评审提示词 —— 这条才是「一字不多」。
-    expect(withoutDefs.startsWith('请评审以下方案是否可执行、完整、无重大风险。')).toBe(true)
+    expect(withoutDefs.startsWith('请评审以下方案是否**足以开始执行**。')).toBe(true)
   })
 })
 
@@ -4342,5 +4342,57 @@ describe('评审收敛真的接上了', () => {
     const body = SRC.slice(SRC.indexOf('function reviewPrompt('), SRC.indexOf('function executePrompt('))
     expect(`reviewPrompt 里还在算: ${body.includes('feedbackItems')}`).toBe('reviewPrompt 里还在算: false')
     expect(SRC).toContain('const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog)')
+  })
+})
+
+describe('评审要有一条「够用就放行」的线', () => {
+  const node = (): TaskNode => createNode({
+    id: 'root', title: 't', parentId: null, deps: [], depth: 0,
+    phaseRoles: emptyPhaseRoles(), now: NOW, goal: 'g',
+  })
+  const grab = async (reject: boolean) => {
+    const prompts: string[] = []
+    const n = node()
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'review') prompts.push(req.prompt)
+      if (req.phase === 'plan') {
+        return '```json\n{"kind":"executable","solution":"分三步做完这件事,先读代码再改再验","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      }
+      return reject
+        ? vtag(req) + '\n{"pass":false,"blocking":["还能更细"],"comments":""}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    })
+    await stepStart(n, ctx)
+    return prompts
+  }
+
+  it('说清什么才算阻断,以及「可以更好」要写进 comments', async () => {
+    // 原来的措辞是「有**任何**阻断问题填入 blocking」。一个 LLM 被这么问,永远答得出
+    // 下一个「还缺 X」—— 而 synthesizeVerdicts 里 blocking 非空就等于否决。
+    const p = (await grab(false))[0]!
+    expect(p).toContain('执行失败')
+    expect(p).toContain('没法验收')
+    expect(p).toContain('不需要完美')
+    // 「可以更好的写进 comments」这一句是**load-bearing**:synthesizeVerdicts 里
+    // blocking 非空就等于否决,哪怕 pass 写的是 true。不引导的话评审员会把改进建议
+    // 塞进 blocking,一条都过不去。
+    expect(p).toContain('写进 comments')
+    expect(p).toContain('等同于否决')
+  })
+
+  it('告诉评审员这是第几轮、以及撞顶的后果', async () => {
+    const p = (await grab(false))[0]!
+    expect(p).toContain('第 1/3 轮')
+    expect(p).toContain('会被整个中止')
+  })
+
+  it('第 2 轮起禁止提新要求 —— 实测一次运行里三轮提了 12 条互不相同的要求', async () => {
+    // 方案每轮都在按上一轮改,评审每轮都换一批新要求。这种组合下迭代上限是必然撞到的,
+    // 和方案质量无关 —— 用户连着两次撞到的就是它。
+    const ps = await grab(true)
+    expect(ps.length).toBeGreaterThan(1)
+    expect(ps[0]).not.toContain('不要提出上一轮没有提过的新要求')
+    expect(ps[1]).toContain('不要提出上一轮没有提过的新要求')
+    expect(ps[1]).toContain('第 2/3 轮')
   })
 })

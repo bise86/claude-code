@@ -133,13 +133,27 @@ export async function draftRootPlan(args: {
     try {
       const again = await runAgent({
         phase: 'plan', node: root, role: config.phaseRoles.plan[0] ?? null, system: 'plan',
-        prompt: planPrompt(root, ctx, retryTag, `上一版方案不合格:${gaps.join(';')}。请重写,四个字段都要有具体内容。`),
+        /**
+         * 重拟的提示词有两处**必须**这么写,验收各踩过一次:
+         *
+         * 1. `{ ...root, plan: parsed.plan }` —— planPrompt 读的是 `node.plan`,而 root 的
+         *    plan 要等这个函数**返回之后**才被写(applyRootDraft)。直接传 root,模型看到的
+         *    「上一版方案」是 `{"solution":"","keyPoints":"",…}` 四个空串 —— 它根本看不到
+         *    自己刚写的那几十个字,「针对性修订」这条通道第一轮就不成立,只能从头再答一次。
+         *    这也正是重拟结果容易比第一版更浅的结构性原因。
+         * 2. **用户的修改意见要带上**。args.feedback 是用户在第三关按 e 亲手输入的;不带的话
+         *    重拟等于把他的话丢了,而关口底部还写着「已按你的意见重拟」。
+         */
+        prompt: planPrompt(
+          { ...root, plan: parsed.plan }, ctx, retryTag,
+          [args.feedback, `上一版方案不合格:${gaps.join(';')}。请补齐这几处,其余部分保留。`]
+            .filter(Boolean).join('\n'),
+        ),
         signal, stream: args.retryStream?.(),
       })
       if (!signal.aborted) {
         const re = parsePlanOutput(again, retryTag)
-        // 只在**确实变好**时采用:重拟更差的话,拿第一版反而不至于更糟。
-        if (planGaps(re.plan).length < gaps.length) parsed = re
+        if (isBetterDraft(re, parsed, gaps.length)) parsed = re
       }
     } catch {
       // 重拟失败就用第一版 —— 关口会把空字段列出来,用户仍然看得见真相。
@@ -249,6 +263,25 @@ export function planGaps(plan: { solution: string; keyPoints: string; risks: str
   if (blank(plan.risks)) out.push('风险点是空的')
   if (blank(plan.acceptance)) out.push('验收点是空的 —— 验收环节拿它当判据,空的就只能凭执行者自述')
   return out
+}
+
+type ParsedPlan = { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] }
+
+/**
+ * 重拟的那一版是不是**真的**更好。
+ *
+ * 判据不能只数空字段个数。验收实跑复现过:第一版是 `decompose` + 3 个子任务、gaps=2,
+ * 重拟版是 `executable` + 0 个子任务、gaps=1 —— 只比个数的话就被换掉了,而 `parsed = re`
+ * 是整体替换,**子任务一起没了**。产出正好是用户抱怨里的那一行:
+ * 「初始任务树 · 第一层(0 个) (不拆分,根任务直接执行)」。
+ *
+ * 所以三条都要满足:空字段确实少了、子任务一个都没丢、没有从「要拆」退回「不拆」。
+ */
+export function isBetterDraft(next: ParsedPlan, prev: ParsedPlan, prevGaps: number): boolean {
+  if (planGaps(next.plan).length >= prevGaps) return false
+  if (next.children.length < prev.children.length) return false
+  if (prev.kind === 'decompose' && next.kind !== 'decompose') return false
+  return true
 }
 
 export function draftBlockers(draft: RootDraft): string[] {

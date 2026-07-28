@@ -323,7 +323,9 @@ export function TaskTreePanel(props: {
       })}
       {props.interactive === true ? (
         <Text dimColor>
-          {KIND_GLYPH.decompose} 拆分任务 · {KIND_GLYPH.executable} 执行任务{'\n'}
+          {/* 分隔符不能用 ' · ' —— 「待定」那个字形本身就是 '·',图例读起来会变成三项。
+               而且三种字形树上都画得出来,图例只列两种等于让人猜第三种。 */}
+          {KIND_GLYPH.decompose} 拆分任务   {KIND_GLYPH.executable} 执行任务   {KIND_GLYPH.unknown} 待定(方案还没出){'\n'}
           ↑↓/jk 移动 · ←/→ 折叠展开 · 空格切换 · 回车看详情 · Esc/q 退出
         </Text>
       ) : null}
