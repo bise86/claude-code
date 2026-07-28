@@ -64,15 +64,34 @@ export async function commitRedo(deps: RedoCommitDeps, plan: RedoPlan): Promise<
     }
   }
 
+  let writeFailed = 0
   for (const n of plan.nodes) {
     try {
       await writeNode(deps.fs, deps.runDir, n)
     } catch (e) {
       // 落盘失败不该拦住重做本身(内存里的树是对的,run 照跑),但**必须说** ——
       // 否则这次重做在下一次 --resume 时会整个消失。
+      writeFailed++
       problems.push(`${n.id} 没能写回盘上(下次恢复会读到旧状态): ${e instanceof Error ? e.message : String(e)}`)
       deps.onError?.(e instanceof Error ? e : new Error(String(e)))
     }
+  }
+  if (writeFailed > 0 && plan.deleted.length > 0) {
+    /**
+     * 「读到旧状态」这句话在**删过子树**的情况下是不完整的,而不完整的部分正是要命的:
+     * 子树的 node.md 已经删掉了,父节点却没能写回去 —— 盘上于是留着一个 childIds 指向
+     * 一批不存在节点的父节点。下一次 `--resume` 会以「子节点缺失」阻断,而用户按这句话
+     * 的字面意思以为只是「回到重做之前」。
+     *
+     * 顺序改不掉这个问题,只能换一种失败:先写后删的话,一次失败的删除会留下一批
+     * node.md 齐全、看起来很新的幽灵。至少「子节点缺失」是 resumeCore **会检测出来并
+     * 明说**的一种,所以保持这个顺序,把话讲全。
+     */
+    problems.push(
+      `${plan.deleted.length} 个子任务已经从盘上删掉,但父节点没写回去 —— ` +
+      `下次 --resume 会以「子节点缺失」阻断。修法:手工把 ${deps.runDir} 里那个父节点 ` +
+      `node.md 的 childIds 清空`,
+    )
   }
 
   try {

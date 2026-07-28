@@ -213,6 +213,15 @@ export async function removeNodeDirs(
   const failed: { id: string; message: string }[] = []
   const deepestFirst = [...ids].sort((x, y) => y.split('/').length - x.split('/').length)
   for (const id of deepestFirst) {
+    /**
+     * id 是从盘上读来的,而 node.md 按设计就是可手工编辑的 —— 所以它**不可信**。
+     * `id: '../../victim'` 会让下面那行拼出 runDir 之外的路径,而这个函数是拿来删文件的。
+     * 影响有界(只删得掉叫 node.md 的文件、只 rmdir 得掉空目录),但「有界」不是理由。
+     */
+    if (id.length === 0 || id.startsWith('/') || id.split('/').includes('..')) {
+      failed.push({ id, message: '节点 id 越出了 run 目录,拒绝删除' })
+      continue
+    }
     const dir = `${runDir}/${id}`
     try {
       // node.md 可能本来就不在(节点还没落过盘),那不算失败 —— 目标是「盘上没有它」。

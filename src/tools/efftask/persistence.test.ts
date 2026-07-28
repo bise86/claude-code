@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS } from './types.js'
 import type { EffTaskConfig } from './types.js'
-import { FsLike, slugify, childId, allocateRunId, serializeNode, parseNodeFile, writeNode, readNode, loadRun, writeRunManifest, renderTreeSnapshot } from './persistence.js'
+import { FsLike, slugify, childId, allocateRunId, serializeNode, parseNodeFile, writeNode, readNode, loadRun, removeNodeDirs, writeRunManifest, renderTreeSnapshot } from './persistence.js'
 
 const NOW = '2026-07-25T00:00:00Z'
 function memFs(seed: Record<string, string> = {}): FsLike & { store: Map<string, string> } {
@@ -475,5 +475,40 @@ describe('落选稿要真的落到人读得到的那一半', () => {
     expect(body.length).toBeLessThan(2000)
     // 而全文确实还在 frontmatter 里 —— 说了去哪儿找,那儿就得真有。
     expect(md.slice(0, md.indexOf('## 备选方案'))).toContain('X'.repeat(2000))
+  })
+})
+
+
+describe('removeNodeDirs 不许删出 run 目录之外', () => {
+  const probeFs = (touched: string[]): FsLike => ({
+    readFile: async () => '', writeFile: async () => {}, mkdir: async () => {},
+    readdir: async () => [], exists: async () => true, mkdirExclusive: async () => true,
+    unlink: async (p: string) => { touched.push('unlink ' + p) },
+    rmdir: async (p: string) => { touched.push('rmdir ' + p) },
+  })
+
+  it('id 里带 .. 时拒绝删除并报出来', async () => {
+    // id 是从盘上读来的,而 node.md 按设计就是可手工编辑的(升级卡片就是这么教用户的)
+    // —— 所以它不可信,而这个函数是拿来删文件的。影响有界不是放行的理由。
+    const touched: string[] = []
+    const { failed } = await removeNodeDirs(probeFs(touched), '/run', ['../../victim'])
+    expect(touched).toEqual([])
+    expect(failed[0]!.message).toContain('越出了 run 目录')
+  })
+
+  it('绝对路径同样拒绝', async () => {
+    const touched: string[] = []
+    const { failed } = await removeNodeDirs(probeFs(touched), '/run', ['/etc/whatever'])
+    expect(touched).toEqual([])
+    expect(failed).toHaveLength(1)
+  })
+
+  it('正常的嵌套 id 照删,而且先深后浅', async () => {
+    const touched: string[] = []
+    const { failed } = await removeNodeDirs(probeFs(touched), '/run', ['root/00-a', 'root/00-a/01-b'])
+    // rmdir 是非递归的:子目录必须先被清空,顺序错了它就失败,留下一地空目录。
+    expect(touched[0]).toBe('unlink /run/root/00-a/01-b/node.md')
+    expect(touched).toContain('unlink /run/root/00-a/node.md')
+    expect(failed).toEqual([])
   })
 })

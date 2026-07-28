@@ -142,6 +142,25 @@ describe('commitRedo 报出来的问题', () => {
     expect(problems.join()).toContain('下次恢复会读到旧状态')
   })
 
+  it('删了子树但父节点写不回去:必须说清盘上现在是什么样', async () => {
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
+    const { fs } = fakeFs({ async writeFile(p: string) { if (p.endsWith('node.md')) throw new Error('ENOSPC') } })
+    const { problems } = await commitRedo({ fs, runDir: '/run', config: CONFIG, before }, plan)
+    // 「读到旧状态」这句话在删过子树的情况下是**不完整**的,而不完整的那部分要命:
+    // 盘上留着一个 childIds 指向一批不存在节点的父节点,下次 --resume 会以
+    // 「子节点缺失」阻断,而用户按字面意思以为只是回到重做之前。
+    expect(problems.join()).toContain('子节点缺失')
+    expect(problems.join()).toContain('childIds')
+  })
+
+  it('没删过子树时不说那句 —— 别吓唬人', async () => {
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root/00-a', 'execute', 'T1'))
+    const { fs } = fakeFs({ async writeFile(p: string) { if (p.endsWith('node.md')) throw new Error('ENOSPC') } })
+    const { problems } = await commitRedo({ fs, runDir: '/run', config: CONFIG, before }, plan)
+    expect(problems.join()).not.toContain('子节点缺失')
+  })
   it('没有隔离池时不报任何工作区问题', async () => {
     const before = TREE()
     const plan = ok(planRedo(before, 'root', 'plan', 'T1'))

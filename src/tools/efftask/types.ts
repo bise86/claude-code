@@ -151,6 +151,16 @@ export interface Verdict {
    */
   timeout?: boolean
   /**
+   * 哪一种超时。**两种的补救办法相反**,所以只记一个 boolean 是不够的:
+   * 静默超时要去提高 caps.nodeTimeoutMs 或把节点拆小,等人超时要去把那个权限确认点掉,
+   * 和节点大小、和 nodeTimeoutMs 都没有关系。
+   *
+   * 只记 boolean 的代价实测过:分析、评审、验收、集成四个环节里三个把「没人来点确认」
+   * 诊断对了,建议却给成了「提高 nodeTimeoutMs 后再重试,或把该节点拆小」—— 一句话的
+   * 前后两半自相矛盾,而用户是照着后半句去做的。
+   */
+  timeoutKind?: 'stall' | 'human'
+  /**
    * 集成验收不通过时,这位角色提出的**补救子任务** —— spec §4.1 的
    * `INTEGRATION_ACCEPT ──fail──▶ (回到 decompose 修订)`。
    *

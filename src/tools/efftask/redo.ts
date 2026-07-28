@@ -191,6 +191,9 @@ function dependsOn(from: string, to: string, byId: ReadonlyMap<string, TaskNode>
 
 /** 目标节点的全部后代,深度优先。 */
 export function descendantsOf(node: TaskNode, byId: ReadonlyMap<string, TaskNode>): string[] {
+  // 只收**真实存在**的后代。childIds 是可手工编辑的,指向不存在节点的条目原来也被计进
+  // `deleted`,于是第一屏那句「删除 N 个子任务」比实际大 —— 而这个数字正是用户判断
+  // 这次不可逆操作值不值得的依据。
   const out: string[] = []
   const stack = [...node.childIds]
   // 环保护:盘上的 childIds 是可手工编辑的,一个自指的 childIds 会让这里死循环 ——
@@ -200,9 +203,10 @@ export function descendantsOf(node: TaskNode, byId: ReadonlyMap<string, TaskNode
     const id = stack.pop()!
     if (seen.has(id)) continue
     seen.add(id)
-    out.push(id)
     const child = byId.get(id)
-    if (child) stack.push(...child.childIds)
+    if (!child) continue
+    out.push(id)
+    stack.push(...child.childIds)
   }
   return out
 }
@@ -303,10 +307,19 @@ export function planRedo(
   if (entry === 'plan') {
     deleted = descendantsOf(target, byId)
     const deletedSet = new Set(deleted)
-    const mergedAway = deleted.filter(id => {
-      const d = byId.get(id)
-      return d?.status === 'ACCEPTED' && d.worktree !== undefined
-    })
+    /**
+     * 判据是 **ACCEPTED 本身**,不是「还挂着 worktree」。
+     *
+     * 原来写的是 `status === 'ACCEPTED' && d.worktree !== undefined`,方向是**反的**:
+     * 干净合并之后 stepExecute 会把 node.worktree 置回 undefined,而 --resume 每次也清它。
+     * 于是这条警告只在「release 拒绝删的脏工作区」时出现 —— 那恰恰是**没有**干净合并
+     * 的那一类;真正已经落进代码的那些反而一句提示都没有。再走一次 resume 连仅有的
+     * 那条也没了。实测过。
+     *
+     * ACCEPTED 就意味着产出已经落进代码:有隔离时是 mergeAndRelease 合进集成分支,
+     * 没隔离时是直接写在用户的工作区里。两种都不会因为删掉一条任务记录而回滚。
+     */
+    const mergedAway = deleted.filter(id => byId.get(id)?.status === 'ACCEPTED')
     for (const id of deleted) {
       const d = byId.get(id)
       if (d?.worktree) worktreesToRelease.push({ nodeId: id, branch: d.worktree.branch, path: d.worktree.path })
@@ -317,8 +330,9 @@ export function planRedo(
       // 就合进集成分支的(stepExecute 里的 mergeAndRelease),删节点删的是任务记录,
       // 不是已经落进 git 的提交。
       warnings.push(
-        `${mergedAway.length} 个已验收子任务的代码**已经合进集成分支**,删除任务不会回滚这些提交;` +
-        `新方案要么在它们之上继续,要么你先自己 revert`,
+        `${mergedAway.length} 个已验收子任务的代码**已经落进代码**(有隔离时已合进集成分支,` +
+        `没隔离时就在你的工作区里),删除任务不会回滚这些改动;新方案要么在它们之上继续,` +
+        `要么你先自己 revert`,
       )
     }
     // 依赖修订。子树外面还指着被删节点的,改指到目标节点本身 —— 那才是接下来会产出
@@ -326,7 +340,10 @@ export function planRedo(
     for (const n of byId.values()) {
       if (n.deps.length === 0) continue
       const next: string[] = []
-      for (const d of n.deps) {
+      // 去重后再逐条处理。`deps: [a, a]` 原来会记成两条改写,屏幕上说「2 条依赖被改写」
+      // 而实际只有一条 —— 计数是用户唯一能核对这次操作规模的东西。
+      const uniqueDeps = [...new Set(n.deps)]
+      for (const d of uniqueDeps) {
         if (!deletedSet.has(d)) { if (!next.includes(d)) next.push(d); continue }
         // 自依赖是死锁,不是依赖 —— 目标节点自己曾经依赖过某个后代时会撞上。
         if (n.id === targetId) { dependencyRewrites.push({ nodeId: n.id, from: d, to: '(已移除)' }); continue }
@@ -443,9 +460,13 @@ export function redoSummary(
   // opt-in,没配角色时根本不存在),而用户是按字面意思选的。
   lines.push(`「${target.title}」将重新走: ${phaseChainText(entry, ctx)}`)
   if (plan.deleted.length > 0) lines.push(`删除 ${plan.deleted.length} 个子任务,重做后按新方案重建`)
-  if (plan.dependencyRewrites.length > 0) {
-    lines.push(`${plan.dependencyRewrites.length} 条依赖被改写为指向本节点`)
-  }
+  // 「改写」和「移除」分开说。合成一句「N 条依赖被改写为指向本节点」时,那些其实被
+  // **删掉**的(目标自己依赖被删后代 / 改指会成环)也被算进去,而它们的后果完全不同:
+  // 改写是下游继续等,移除是下游可能提前起跑。
+  const removed = plan.dependencyRewrites.filter(r => r.to.startsWith('(已移除'))
+  const rewritten = plan.dependencyRewrites.length - removed.length
+  if (rewritten > 0) lines.push(`${rewritten} 条依赖被改写为指向本节点`)
+  if (removed.length > 0) lines.push(`${removed.length} 条依赖被移除(下游可能比预期更早起跑)`)
   if (plan.worktreesToRelease.length > 0) lines.push(`释放 ${plan.worktreesToRelease.length} 个隔离工作区`)
   if (plan.reopenedAncestors.length > 0) {
     lines.push(`上级 ${plan.reopenedAncestors.length} 个任务重新做集成验收`)

@@ -184,22 +184,9 @@ describe('重做关口', () => {
     expect(f).toContain('释放 1 个隔离工作区')
   })
 
-  it('第二屏的 Esc 退回第一屏,不是一路退出去', async () => {
-    let cancels = 0
-    const { t, app } = await mount(
-      <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => { cancels++ }} />,
-    )
-    await tick()
-    t.stdin.press('\r')
-    await tick()
-    t.stdin.press('') // Esc
-    await tick()
-    const f = t.lastFrame()
-    app.unmount()
-    // 看完后果改主意选另一个环节,是这一步最常见的动作。
-    expect(cancels).toBe(0)
-    expect(f).toContain('从哪个环节开始重来')
-  })
+  // 「第二屏 Esc 退回第一屏」不在这里测:假 TTY 送裸 \x1b 时 useInput 收不到,
+  // 而 harness 的 frame 是累加的 —— 两个条件叠在一起让那条用例的两个断言全部恒真,
+  // 把整个 Esc 分支删掉 10 条照样绿(验收实测)。它的语义归 redoGate.test.ts。
 
   it('回车确认后把选中的环节交出去', async () => {
     const got: string[] = []

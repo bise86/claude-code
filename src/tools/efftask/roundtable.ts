@@ -185,7 +185,9 @@ export async function runRoundtable(args: {
     // A DEADLINE is still infra (nobody judged anything), but it is a different fact from
     // an unreachable provider and needs different advice on the escalation card.
     const timedOut = res.reason instanceof PhaseTimeoutError
-    return { role: roleName || 'main', ...tag, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true, ...(timedOut ? { timeout: true } : {}) }
+    // kind 必须跟着走。丢掉它 = 圆桌里所有超时都被当成静默超时,而「没人来点确认」
+    // 这一种拿到的建议是「提高 nodeTimeoutMs 或把节点拆小」—— 和病因完全无关。
+    return { role: roleName || 'main', ...tag, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true, ...(timedOut ? { timeout: true, timeoutKind: res.reason.kind } : {}) }
   })
   // 阻断项**照样全部汇总**,即使已经达到法定人数 —— 少数派的意见不因为没挡住就消失。
   return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts, args.quorum, args.quorumSeats) }

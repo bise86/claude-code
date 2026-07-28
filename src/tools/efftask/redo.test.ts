@@ -383,6 +383,54 @@ describe('planRedo:共通清理', () => {
   })
 })
 
+describe('验收查出来的计数与判据', () => {
+  it('已验收子节点即使 worktree 已经清掉,也要警告代码已经落进代码', () => {
+    // 原判据是 `ACCEPTED && worktree !== undefined`,方向反的:干净合并之后
+    // stepExecute 就把 worktree 置回 undefined,--resume 每次也清它。于是这条警告
+    // 只在「release 拒绝删的脏工作区」时出现 —— 那恰恰是**没有**干净合并的那一类。
+    const t = tree()
+    t[2]!.worktree = undefined // 干净合并后的真实形态
+    const r = ok(planRedo(t, 'a', 'plan', 'T1'))
+    expect(r.warnings.join()).toContain('已经落进代码')
+  })
+
+  it('childIds 里指向不存在节点的条目不计入「要删掉的子任务」', () => {
+    // 这个数字是用户判断这次不可逆操作值不值得的唯一依据,不能虚高。
+    const t = tree()
+    t[1]!.childIds = ['a1', '幽灵']
+    const r = ok(planRedo(t, 'a', 'plan', 'T1'))
+    expect(r.deleted).toEqual(['a1'])
+  })
+
+  it('重复的依赖只算一条改写', () => {
+    const t = tree()
+    t[3]!.deps = ['a1', 'a1']
+    const r = ok(planRedo(t, 'a', 'plan', 'T1'))
+    expect(r.dependencyRewrites).toHaveLength(1)
+    expect(r.nodes.find(n => n.id === 'b')!.deps).toEqual(['a'])
+  })
+
+  it('摘要把「改写」和「移除」分开说 —— 两者后果不同', () => {
+    // 改写 = 下游继续等;移除 = 下游可能提前起跑。混成一句「N 条依赖被改写为指向
+    // 本节点」的话,被移除的那些也被算成改写,而用户据此以为下游还会等。
+    const t = tree()
+    t[1]!.deps = ['a1'] // 目标自己依赖后代 → 会被移除
+    const r = ok(planRedo(t, 'a', 'plan', 'T1'))
+    const lines = redoSummary(r, t[1]!, 'plan').join('\n')
+    expect(lines).toContain('1 条依赖被改写为指向本节点') // b → a
+    expect(lines).toContain('1 条依赖被移除')
+  })
+
+  it('kind 停在 executable 但已经有子任务的节点,不给「执行重做」', () => {
+    // isDecomposed 的 `childIds.length > 0` 这半个条件删掉后全套照绿(变异验证过),
+    // 而实测后果是:一个挂着子任务、kind 还停在 executable 的节点会被摆到 READY,
+    // 交给带写工具的执行者 —— 正是这个模块开头点名要防的那件事。
+    const n = node('p', { kind: 'executable', childIds: ['p/00-x'] })
+    const exec = redoOptions(n, new Map([['p', n]])).find(o => o.entry === 'execute')!
+    expect(exec.disabled).toContain('拆分任务')
+  })
+})
+
 describe('环节实况:屏幕上那句话必须是真的', () => {
   it('默认配置(没配验证角色)下,测试验证根本不跑 —— 就不能写它会跑', () => {
     // 测试验证是 opt-in(phaseRoles.verify.length > 0),而 emptyPhaseRoles() 给的默认是

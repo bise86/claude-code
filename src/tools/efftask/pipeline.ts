@@ -233,6 +233,18 @@ type PhaseResult =
   // timeoutKind 要跟着走:静默超时和等人超时的处理方式**相反**,合并成一个 boolean
   // 就只能给一句通用的话。
   | { ok: false; reason: string; text?: string; timeout?: boolean; timeoutKind?: TimeoutKind }
+
+/**
+ * 方案环节的返回值。
+ *
+ * 抽成具名类型不是为了短:原来三个函数各写一遍内联字面量,而其中调用方要读的
+ * `timeoutKind` **一个都没写** —— 于是 `res.timeoutKind === 'human'` 是一条永远取不到值
+ * 的死分支,分析环节的「没人来点确认」拿到的是静默超时那一版建议(去调 nodeTimeoutMs、
+ * 把节点拆小),和病因完全无关。这个仓库没有 typecheck 会指出来。一处定义,漏不掉。
+ */
+type PlanPhaseResult =
+  | { ok: true; parsed: ReturnType<typeof parsePlanOutput> }
+  | { ok: false; reason: string; timeout?: boolean; timeoutKind?: TimeoutKind }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
 // which records it into node.blockedReason and BLOCKs the node.
@@ -311,6 +323,21 @@ function isInfraOnlyFailure(rec: { verdicts: { pass: boolean; blocking: string[]
 function exhaustionCategory(rec: RoundtableRecord): BlockCategory {
   const failing = rec.verdicts.filter(v => !v.pass || v.blocking.length > 0)
   return failing.length > 0 && failing.every(v => v.timeout === true) ? 'timeout' : 'infra'
+}
+
+/**
+ * 圆桌耗尽时该给哪一版补救建议。
+ *
+ * 「有任何一席是等人超时」就给等人那版:等人超时是所有席位一起等**同一个**权限确认,
+ * 只要有一席在等人,叫用户去调 nodeTimeoutMs 就是白费。返回 undefined = 用按 category
+ * 走的默认那版。
+ *
+ * 不做这一步的实测后果:评审、验收、集成三个环节把「没有人回答工具权限确认」诊断对了,
+ * 建议却给成「提高 caps.nodeTimeoutMs 后再重试,或把该节点拆小」—— 一句话前后两半
+ * 自相矛盾,而用户是照着后半句去做的。
+ */
+function exhaustionRemedyFor(rec: RoundtableRecord): string | undefined {
+  return rec.verdicts.some(v => v.timeoutKind === 'human') ? humanTimeoutRemedy() : undefined
 }
 
 /**
@@ -776,7 +803,7 @@ function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
  */
 async function runPlanPhase(
   node: TaskNode, ctx: PipelineCtx, feedback: string,
-): Promise<{ ok: true; parsed: ReturnType<typeof parsePlanOutput> } | { ok: false; reason: string; timeout?: boolean }> {
+): Promise<PlanPhaseResult> {
   const seats = node.phaseRoles.plan ?? []
   if (ctx.config.caps.planConverge === '圆桌' && seats.length > 1) return runPlanRoundtable(node, ctx, feedback)
   return runPlanRefinement(node, ctx, feedback)
@@ -797,7 +824,7 @@ async function runPlanPhase(
  */
 async function runPlanRoundtable(
   node: TaskNode, ctx: PipelineCtx, feedback: string,
-): Promise<{ ok: true; parsed: ReturnType<typeof parsePlanOutput> } | { ok: false; reason: string; timeout?: boolean }> {
+): Promise<PlanPhaseResult> {
   const seats = node.phaseRoles.plan
   const tag = answerTag(ANSWER_TAGS.plan)
   const settled = await mapWithinPool(
@@ -883,7 +910,7 @@ function fusePrompt(
 
 async function runPlanRefinement(
   node: TaskNode, ctx: PipelineCtx, feedback: string,
-): Promise<{ ok: true; parsed: ReturnType<typeof parsePlanOutput> } | { ok: false; reason: string; timeout?: boolean }> {
+): Promise<PlanPhaseResult> {
   // 空名册 = 主模型一席,与引入本函数之前完全一样。
   const seats: (RoleBinding | null)[] = node.phaseRoles.plan.length > 0 ? node.phaseRoles.plan : [null]
   let parsed!: ReturnType<typeof parsePlanOutput>
@@ -906,7 +933,10 @@ async function runPlanRefinement(
       // 第一位就失败 → 手上没有任何稿子,照旧阻断。后面的人失败 → 已经有一份**解析通过**
       // 的稿子,拿它继续走评审,比把前面的工作全丢掉更诚实 —— 评审那关照样会挡。
       // 但必须留痕:静默降级成「少一位修订者」正是不静默截断要防的。
-      if (i === 0) return { ok: false, reason: res.reason, timeout: res.timeout }
+      // timeoutKind 必须跟着走。少了它,1046 行那句 `res.timeoutKind === 'human'` 就是
+      // 一条**永远为 undefined 的死分支**(返回类型里根本没这个字段,而本仓库没有
+      // typecheck 会说)—— 于是分析环节的等人超时拿到的是静默超时那一版建议。
+      if (i === 0) return { ok: false, reason: res.reason, timeout: res.timeout, timeoutKind: res.timeoutKind }
       node.execStatus = (node.execStatus ? node.execStatus + '\n' : '') +
         ORCHESTRATOR_NOTE + '方案精化第 ' + (i + 1) + ' 位(' + (seat?.roleName || '主模型') +
         ')调用失败,采用前一稿: ' + res.reason + ')'
@@ -1074,7 +1104,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {
       // Nobody judged the plan — say that rather than blaming the plan.
-      await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec))
+      await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec), exhaustionRemedyFor(rec))
       return
     }
     if (!rec.synthesized.pass) {
@@ -1844,7 +1874,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       }
       if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
       if (v.infraExhausted) {
-        await blockWithReason(node, `测试验证角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${v.rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(v.rec))
+        await blockWithReason(node, `测试验证角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${v.rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(v.rec), exhaustionRemedyFor(v.rec))
         return
       }
       if (!v.rec.synthesized.pass) {
@@ -1898,7 +1928,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {
       // Nobody ever judged the work — say that, rather than blaming the work.
-      await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec))
+      await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec), exhaustionRemedyFor(rec))
       return
     }
     if (rec.synthesized.pass) {
@@ -2016,7 +2046,7 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     if (infraExhausted) {
       // A decompose node whose children ALL succeeded must not be thrown away because the
       // reviewer's connection failed three times.
-      await blockWithReason(node, `集成验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec))
+      await blockWithReason(node, `集成验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec), exhaustionRemedyFor(rec))
       return
     }
     if (rec.synthesized.pass) {

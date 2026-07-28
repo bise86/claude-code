@@ -18,6 +18,56 @@ import { useLiveState } from './useLiveState.js'
  * 「删除 3 个子任务、改写 2 条依赖」的时候,那就是接下来真的会发生的事。两边各写一份
  * 的话,它们迟早会不一致 —— 而不一致的那一次,用户是照着屏幕做的决定。
  */
+/**
+ * 关口收到一个按键之后该做什么。
+ *
+ * 抽成纯函数的直接原因是**那条测试是假的**:假 TTY 送裸 `\x1b` 时 vendored ink 的
+ * useInput 收不到,于是「第二屏 Esc 退回第一屏」这条用例里,`cancels === 0` 因为键根本
+ * 没到而恒真,画面断言又因为 harness 累加所有 write、第一屏那帧从没被清掉而恒真 ——
+ * 把整个 Esc 分支删掉,10 条照样全绿(实测)。
+ *
+ * 组件测试仍然守 q / 方向键 / 回车(那些送得进去);Esc 的语义归这里。
+ */
+export type RedoGateState = { cursor: number; picked: RedoEntry | null }
+export type RedoGateAction =
+  | { kind: 'cancel' }
+  | { kind: 'confirm'; entry: RedoEntry }
+  | { kind: 'state'; next: RedoGateState }
+  | { kind: 'none' }
+
+export function redoGateAction(
+  key: { escape?: boolean; return?: boolean; upArrow?: boolean; downArrow?: boolean },
+  input: string,
+  state: RedoGateState,
+  options: readonly { entry: RedoEntry; disabled?: string }[],
+): RedoGateAction {
+  const k = input.toLowerCase()
+  // Esc 和 q 在第二屏上**不是同一件事**,页脚也是这么写的。两个键走同一分支时
+  // 「q 取消」是句假话:按下去只是回到第一屏,想彻底退出得连按两次而屏幕没说。
+  if (key.escape && state.picked !== null) {
+    // 看完后果改主意选另一个环节,是这一步最常见的动作。
+    return { kind: 'state', next: { ...state, picked: null } }
+  }
+  if (key.escape || k === 'q') return { kind: 'cancel' }
+  if (state.picked !== null) {
+    return key.return || k === 'y' ? { kind: 'confirm', entry: state.picked } : { kind: 'none' }
+  }
+  if (key.upArrow || k === 'k') {
+    return { kind: 'state', next: { ...state, cursor: Math.max(0, state.cursor - 1) } }
+  }
+  if (key.downArrow || k === 'j') {
+    return { kind: 'state', next: { ...state, cursor: Math.min(options.length - 1, state.cursor + 1) } }
+  }
+  if (key.return) {
+    const opt = options[state.cursor]
+    // 不可用的条目**留在屏幕上但按不动**。直接不渲染的话,菜单会随节点类型忽隐忽现,
+    // 用户记不住「第二项」是哪一项;而且看不见「为什么这里不能这么做」。
+    if (!opt || opt.disabled) return { kind: 'none' }
+    return { kind: 'state', next: { ...state, picked: opt.entry } }
+  }
+  return { kind: 'none' }
+}
+
 export function ConfirmRedo(props: {
   nodes: TaskNode[]
   targetId: string
@@ -50,28 +100,13 @@ export function ConfirmRedo(props: {
   }, [picked, target, props.nodes, props.targetId, props.now])
 
   useInput((input, key) => {
-    const k = input.toLowerCase()
-    // Esc 和 q 在第二屏上**不是同一件事**,页脚也是这么写的。
-    // 原来两个键走同一分支,于是「q 取消」是句假话:按下去只是回到第一屏,
-    // 用户想彻底退出得连按两次而屏幕没告诉他。
-    if (key.escape && pickedRef.current !== null) {
-      // 看完后果改主意选另一个环节,是这一步最常见的动作。
-      setPicked(null)
-      return
-    }
-    if (key.escape || k === 'q') { props.onCancel(); return }
-    if (pickedRef.current !== null) {
-      if (key.return || k === 'y') props.onConfirm(pickedRef.current)
-      return
-    }
-    if (key.upArrow || k === 'k') { setCursor(Math.max(0, cursorRef.current - 1)); return }
-    if (key.downArrow || k === 'j') { setCursor(Math.min(options.length - 1, cursorRef.current + 1)); return }
-    if (key.return) {
-      const opt = options[cursorRef.current]
-      // 不可用的条目**留在屏幕上但按不动**。直接不渲染的话,菜单会随节点类型忽隐忽现,
-      // 用户记不住「第二项」是哪一项;而且看不见「为什么这里不能这么做」。
-      if (!opt || opt.disabled) return
-      setPicked(opt.entry)
+    // 全部判定归 redoGateAction —— 这里只负责把结果落到 state / 回调上。
+    const act = redoGateAction(key, input, { cursor: cursorRef.current, picked: pickedRef.current }, options)
+    if (act.kind === 'cancel') { props.onCancel(); return }
+    if (act.kind === 'confirm') { props.onConfirm(act.entry); return }
+    if (act.kind === 'state') {
+      if (act.next.cursor !== cursorRef.current) setCursor(act.next.cursor)
+      if (act.next.picked !== pickedRef.current) setPicked(act.next.picked)
     }
   })
 
