@@ -19,6 +19,9 @@ import { AgentLogPane, LOG_COALESCE_MS, useStreamTick } from './AgentLogPane.js'
  * 30ms 的话流的变化根本还没引起重绘,于是「视口没动」是空的 —— 什么都没动过。
  * 这一点是被下面那条正向用例(折叠之后 from 必须变小)顺带暴露出来的。
  */
+// 切流从 Tab 改成 n:Tab 让给了详情页的**区切换**(段落区 ⇄ 输出区)——
+// 详情页原来整个键盘归日志窗,用户没有任何办法把焦点移到上面的段落上。
+const NEXT_STREAM = 'n'
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, LOG_COALESCE_MS + 80))
 
 function fakeTty() {
@@ -86,12 +89,12 @@ async function mountPane(store: ReturnType<typeof createStreamStore>) {
   return { t, app, last: () => state[state.length - 1]! }
 }
 
-describe('Tab 切到哪条流,视口就停在哪条', () => {
-  it('Tab 一下:选中项前进,并且**关掉跟随**', async () => {
+describe('n 切到哪条流,视口就停在哪条', () => {
+  it('n 一下:选中项前进,并且**关掉跟随**', async () => {
     const { store } = twoStreams()
     const m = await mountPane(store)
     expect(m.last().follow).toBe(true) // 初始粘底
-    m.t.stdin.press('\t')
+    m.t.stdin.press(NEXT_STREAM)
     await tick()
     m.app.unmount()
     // 关掉跟随是这条修复的一半:原来只在「找得到表头」时才关,于是切到一条还没渲染出
@@ -103,9 +106,9 @@ describe('Tab 切到哪条流,视口就停在哪条', () => {
   it('切过去之后,正在跑的那条流再吐输出也**抢不走**视口', async () => {
     const { store, exec } = twoStreams()
     const m = await mountPane(store)
-    // Tab 两下回到第 0 条(分析)。
-    m.t.stdin.press('\t'); await tick()
-    m.t.stdin.press('\t'); await tick()
+    // n 两下回到第 0 条(分析)。
+    m.t.stdin.press(NEXT_STREAM); await tick()
+    m.t.stdin.press(NEXT_STREAM); await tick()
     expect(m.last().selected).toBe(0)
     const parked = m.last().from
     const totalBefore = m.last().total
@@ -124,7 +127,7 @@ describe('Tab 切到哪条流,视口就停在哪条', () => {
   it('一条流跑完折叠、上方塌掉时,视口跟着选中的流走', async () => {
     const { store, plan } = twoStreams()
     const m = await mountPane(store)
-    m.t.stdin.press('\t'); await tick() // 选中第 1 条(执行)
+    m.t.stdin.press(NEXT_STREAM); await tick() // 选中第 1 条(执行)
     expect(m.last().selected).toBe(1)
     const before = m.last().from
 
@@ -141,7 +144,7 @@ describe('Tab 切到哪条流,视口就停在哪条', () => {
   it('按 End / G 回到底部会恢复跟随 —— 不然新输出就再也不动了', async () => {
     const { store } = twoStreams()
     const m = await mountPane(store)
-    m.t.stdin.press('\t'); await tick()
+    m.t.stdin.press(NEXT_STREAM); await tick()
     expect(m.last().follow).toBe(false)
     m.t.stdin.press('G'); await tick()
     m.app.unmount()

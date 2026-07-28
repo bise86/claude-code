@@ -19,7 +19,8 @@ import type { StreamState } from '../../tools/efftask/agentStream.js'
 const ESC = String.fromCharCode(27)
 const UP = `${ESC}[A`
 const DOWN = `${ESC}[B`
-const TAB = '\t'
+// 切流从 Tab 改成 n:Tab 让给了详情页的**区切换**(段落区 ⇄ 输出区)。
+const TAB = 'n'
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, 12))
 
 function fakeTty() {
@@ -148,7 +149,7 @@ describe('AgentLogPane 的折叠', () => {
     app.unmount()
   })
 
-  it('Tab 在流之间轮转', async () => {
+  it('n 在流之间轮转(Tab 已让给详情页的区切换)', async () => {
     const { t, app, last } = await mount({
       streams: [stream({ events: lines('甲') }), stream({ events: lines('乙') }), stream({ events: lines('丙') })],
     })

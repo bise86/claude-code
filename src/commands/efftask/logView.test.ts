@@ -338,9 +338,13 @@ describe('logPaneAction —— 按键必须是纯函数', () => {
     expect(logPaneAction('g', key())).toEqual({ t: 'top' })
   })
 
-  it('Tab 换流,空格折叠', () => {
-    expect(logPaneAction('', key({ tab: true }))).toEqual({ t: 'nextStream' })
+  it('n 换流,空格折叠;**Tab 不再归这里**', () => {
+    expect(logPaneAction('n', key())).toEqual({ t: 'nextStream' })
+    expect(logPaneAction('N', key())).toEqual({ t: 'nextStream' })
     expect(logPaneAction(' ', key())).toEqual({ t: 'toggleFold' })
+    // Tab 让给了**区切换**(段落区 ⇄ 输出区)。详情页原来整个键盘归日志窗,
+    // 用户因此没有任何办法把焦点移到上面的段落上 —— 那正是他报的问题。
+    expect(logPaneAction('', key({ tab: true }))).toBeNull()
   })
 
   it('刻意不认 Esc / q / 回车 —— 那三个键归详情视图', () => {

@@ -306,7 +306,10 @@ export type PaneAction =
  */
 export function logPaneAction(input: string, key: Key): PaneAction | null {
   if (key.escape || key.return) return null
-  if (key.tab) return { t: 'nextStream' }
+  // Tab 让给**区切换**(段落区 ⇄ 输出区)——详情页原来整个键盘归这里,
+  // 用户因此没有任何办法把焦点移到上面的段落上。切流改用 n。
+  if (key.tab) return null
+  if (input === 'n' || input === 'N') return { t: 'nextStream' }
   if (key.upArrow) return { t: 'line', d: -1 }
   if (key.downArrow) return { t: 'line', d: 1 }
   // 鼠标滚轮。**能不能收到取决于终端有没有开鼠标追踪**(这个 fork 默认非全屏,不开)——
@@ -425,5 +428,43 @@ export function runControlAction(input: string, key: { ctrl?: boolean; meta?: bo
   if (k === 'p') return 'togglePause'
   if (k === 'i') return 'addDirective'
   if (k === 'x') return 'cancelNode'
+  return null
+}
+
+/**
+ * 任务详情页的**段落区**按键。
+ *
+ * 用户的原话:「任务详情里的目标、完整方案、重点、风险点、验收点等等各个可以通过空格
+ * 展开看详细信息,但是可以通过 Tab 先切到上面吧,或者上下键等。」
+ *
+ * 在这之前详情页的键盘**整个归日志窗** —— 段落只能看被裁到十几行的头尾,没有任何办法
+ * 展开其中一段。所以这里引入两个区:
+ *
+ *  - **段落区**:↑↓ / jk 选段落,空格展开或收起选中那一段
+ *  - **输出区**:原来那套(滚动、折叠、切流)
+ *  - **Tab** 在两个区之间切
+ *
+ * Tab 原来是「切到下一条流」,现在让给区切换,切流改用 `n`。这是有代价的改动,但两个区
+ * 之间没有别的自然键可用,而「切不过去」正是用户报的问题本身。
+ */
+export type SectionPaneAction =
+  | { t: 'move'; d: number }
+  | { t: 'toggle' }
+  | { t: 'switchZone' }
+
+export function sectionPaneAction(
+  input: string, key: { tab?: boolean; upArrow?: boolean; downArrow?: boolean; ctrl?: boolean; meta?: boolean },
+): SectionPaneAction | null {
+  if (key.tab) return { t: 'switchZone' }
+  if (key.ctrl || key.meta) return null
+  if (key.upArrow) return { t: 'move', d: -1 }
+  if (key.downArrow) return { t: 'move', d: 1 }
+  if (input === ' ') return { t: 'toggle' }
+  if (input.length === 0) return null
+  const c = input[0]!
+  // 和 logPaneAction 同一条规矩:只认同一字符的连续重复,否则那是合批带进来的别的输入。
+  if (input !== c.repeat(input.length)) return null
+  if (c === 'j') return { t: 'move', d: input.length }
+  if (c === 'k') return { t: 'move', d: -input.length }
   return null
 }

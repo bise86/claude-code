@@ -1,9 +1,11 @@
 import * as React from 'react'
-import { Box, Text } from '../../ink.js'
+import { Box, Text, useInput } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus } from '../../tools/efftask/stateMachine.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
 import { AgentLogPane } from './AgentLogPane.js'
+import { sectionPaneAction } from './logView.js'
+import { useLiveState } from './useLiveState.js'
 
 const COLOR = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' } as const
 
@@ -33,14 +35,29 @@ function block(text: string, maxLines = 12, width = 100): string[] {
   ]
 }
 
-function Section(props: { title: string; body: string; color?: string; maxLines?: number }): React.ReactElement | null {
+function Section(props: {
+  title: string; body: string; color?: string; maxLines?: number
+  /** 光标停在这一段上。 */
+  selected?: boolean
+  /** 展开:不再裁到 maxLines。 */
+  expanded?: boolean
+}): React.ReactElement | null {
   const trimmed = props.body.trim()
   if (trimmed.length === 0) return null
+  // 展开时给一个很大的上限而不是 Infinity:block 仍然要按宽度折行,而一段几万字的
+  // 执行状态铺开会把整棵树顶出屏幕 —— 那是这个文件为之重写过一次的那件事。
+  const lines = block(trimmed, props.expanded === true ? 400 : props.maxLines)
+  const full = block(trimmed, 400).length
+  const clipped = !props.expanded && full > lines.length
   return (
     <Box flexDirection="column">
-      <Text bold color={props.color}>{props.title}</Text>
-      {block(trimmed, props.maxLines).map((l, i) => (
-        <Text key={`${props.title}-${i}`} color={props.color} dimColor={!props.color}>  {l}</Text>
+      <Text bold color={props.color ?? (props.selected === true ? 'success' : undefined)}>
+        {props.selected === true ? '❯ ' : '  '}{props.title}
+        {clipped ? <Text dimColor>(空格展开,共 {full} 行)</Text> : null}
+        {props.expanded === true ? <Text dimColor>(空格收起)</Text> : null}
+      </Text>
+      {lines.map((l, i) => (
+        <Text key={`${props.title}-${i}`} color={props.color} dimColor={!props.color}>    {l}</Text>
       ))}
     </Box>
   )
@@ -119,6 +136,14 @@ export function NodeDetail(props: {
   historical?: boolean
   /** 日志窗是否接管键盘(详情视图打开时是,只读等待屏不是)。 */
   logActive?: boolean
+  /**
+   * 焦点状态的观测口 —— 和 AgentLogPane 的 onState 同一个理由。
+   *
+   * 这个渲染器只写**增量**,一次光标移动在帧里是几个分散的片段(实测:一个孤零零的
+   * `❯` 和半截「收起)」),按子串断言帧内容既脆又容易恒真。测试要的是「焦点到底在哪」,
+   * 那就把它直接交出来。
+   */
+  onState?: (s: { zone: 'sections' | 'log'; cursor: number; expanded: string[] }) => void
   /** 这一屏能不能按 r 重做。键是父面板处理的,这里只负责**说出来**。 */
   canRedo?: boolean
   /** 可用列宽。 */
@@ -152,6 +177,59 @@ export function NodeDetail(props: {
   // 窗口,标题和目标会被挤出屏幕 —— 这个文件上一次就是为这件事重写过预算分配。
   const perSection = hasLog ? 2 : Math.max(2, Math.floor(budget / 6))
   const ui = uiStatus(n.status)
+
+  /**
+   * 段落是**数据**,不是六个写死的 JSX ——「哪一段被选中、哪一段展开着」需要按下标寻址。
+   * 空的段落不进列表:选中一个什么都没有的「风险点」是死格。
+   */
+  const sections = [
+    { title: '目标', body: n.goal },
+    { title: '完整方案', body: n.plan.solution },
+    { title: '重点', body: n.plan.keyPoints },
+    { title: '风险点', body: n.plan.risks },
+    { title: '验收点', body: n.plan.acceptance },
+    { title: '执行状态', body: n.execStatus },
+  ].filter(x => x.body.trim().length > 0)
+
+  /**
+   * 焦点在哪个区。
+   *
+   * 在这之前详情页的键盘**整个归日志窗**,段落只能看被裁到两三行的头尾,没有任何办法
+   * 展开其中一段 —— 那正是用户报的问题。两个区靠 Tab 切,区内各用各的键。
+   */
+  const [zone, setZone, zoneRef] = useLiveState<'sections' | 'log'>('sections')
+  const [cursor, setCursor, cursorRef] = useLiveState(0)
+  const [expanded, setExpanded, expandedRef] = useLiveState<ReadonlySet<string>>(new Set())
+
+  React.useEffect(() => {
+    props.onState?.({ zone, cursor, expanded: [...expanded].sort() })
+  })
+
+  useInput((input, key) => {
+    const act = sectionPaneAction(input, key)
+    if (!act) return
+    if (act.t === 'switchZone') {
+      // 没有输出可看时不往那边切 —— 切过去会是一个按什么都没反应的空区。
+      if (!hasLog) return
+      setZone(zoneRef.current === 'sections' ? 'log' : 'sections')
+      return
+    }
+    // 焦点不在段落区时,这些键归日志窗。两个 useInput 会同时收到每一个键,
+    // 不冲突全靠这一句 + 键位不重叠(Tab 已经从 logPaneAction 里摘掉了)。
+    if (zoneRef.current !== 'sections') return
+    if (act.t === 'move') {
+      if (sections.length === 0) return
+      const next = Math.max(0, Math.min(sections.length - 1, cursorRef.current + act.d))
+      setCursor(next)
+      return
+    }
+    const title = sections[cursorRef.current]?.title
+    if (title === undefined) return
+    const set = new Set(expandedRef.current)
+    if (set.has(title)) set.delete(title)
+    else set.add(title)
+    setExpanded(set)
+  }, { isActive: props.logActive === true })
   // 日志窗自己一份预算,不吃小节的份额:它要读起来像一个子 agent 的终端,而按小节切
   // 出来的四五行做不到这件事。
   const logHeight = Math.max(8, Math.floor(budget / 2))
@@ -198,12 +276,16 @@ export function NodeDetail(props: {
           })
           .join('\n')}
       />
-      <Section maxLines={perSection} title="目标" body={n.goal} />
-      <Section maxLines={perSection} title="完整方案" body={n.plan.solution} />
-      <Section maxLines={perSection} title="重点" body={n.plan.keyPoints} />
-      <Section maxLines={perSection} title="风险点" body={n.plan.risks} />
-      <Section maxLines={perSection} title="验收点" body={n.plan.acceptance} />
-      <Section maxLines={perSection} title="执行状态" body={n.execStatus} />
+      {sections.map((sec, i) => (
+        <Section
+          key={sec.title}
+          maxLines={perSection}
+          title={sec.title}
+          body={sec.body}
+          selected={zone === 'sections' && i === cursor}
+          expanded={expanded.has(sec.title)}
+        />
+      ))}
       <Section maxLines={perSection} title="阻断原因" body={n.blockedReason} color="error" />
       <Section maxLines={perSection} title="评分" body={scoreBody(n)} />
       {/* 迭代次数 (spec §10.2 lists it). Zero counters render nothing — Section drops an
@@ -231,13 +313,19 @@ export function NodeDetail(props: {
             historical={props.historical}
             height={logHeight}
             width={Math.max(30, props.columns ?? 100)}
-            isActive={props.logActive === true}
+            isActive={props.logActive === true && zone === 'log'}
           />
         </Box>
       ) : null}
       {/* 详情页正是判断「这个节点哪儿错了」的地方,看完就想重做 —— 键能用却不写在
           页脚上,等于没有。 */}
-      <Text dimColor>回车 / Esc / q 返回任务树{props.canRedo ? ' · r 重做本任务' : ''}</Text>
+      <Text dimColor>
+        {sections.length > 0
+          ? (zone === 'sections'
+              ? '↑↓ 选段落 · 空格展开/收起' + (hasLog ? ' · Tab 切到输出' : '') + ' · '
+              : 'Tab 切回段落 · n 换流 · ')
+          : ''}
+        回车 / Esc / q 返回任务树{props.canRedo ? ' · r 重做本任务' : ''}</Text>
     </Box>
   )
 }
