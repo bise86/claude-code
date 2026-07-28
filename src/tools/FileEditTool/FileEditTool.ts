@@ -20,6 +20,7 @@ import { isEnvTruthy } from '../../utils/envUtils.js'
 import { isENOENT } from '../../utils/errors.js'
 import {
   FILE_NOT_FOUND_CWD_NOTE,
+  foreignHomePathHint,
   findSimilarFile,
   getFileModificationTime,
   suggestPathUnderCwd,
@@ -230,6 +231,8 @@ export const FileEditTool = buildTool({
       const similarFilename = findSimilarFile(fullFilePath)
       const cwdSuggestion = await suggestPathUnderCwd(fullFilePath)
       let message = `File does not exist. ${FILE_NOT_FOUND_CWD_NOTE} ${getCwd()}.`
+        const foreign = foreignHomePathHint(fullFilePath, getCwd())
+        if (foreign) message += ` ${foreign}`
 
       if (cwdSuggestion) {
         message += ` Did you mean ${cwdSuggestion}?`

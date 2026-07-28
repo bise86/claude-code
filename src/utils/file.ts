@@ -225,6 +225,42 @@ export const FILE_NOT_FOUND_CWD_NOTE = 'Note: your current working directory is'
  * @param requestedPath - The absolute path that was not found
  * @returns The corrected path if found under cwd, undefined otherwise
  */
+/**
+ * 这条路径是不是**别人机器上的家目录**。
+ *
+ * 用户实测:任务里反复去读
+ * `file:///Users/zhilin/Projects/cesi/app/src/app/App.tsx` —— 而他在 Linux 上跑
+ * `/home/esgyn/work/tmp/3d-print-web`。这种路径最典型的来源是 **source map / 构建产物**
+ * (`.js.map` 的 sources 数组、打包后 JS 里的注释、IDE 配置),里面嵌着**打包那台机器**
+ * 的绝对路径。Grep 一命中,模型就照着去 Read。
+ *
+ * 而它拿到的提示原来只有「File does not exist. Note: your current working directory is …」:
+ * 一个字都没说这条路径根本不属于这台机器。suggestPathUnderCwd 也帮不上 —— 它只处理
+ * 「同级目录写漏了一层」那种。于是模型接着换着法儿试,用户看到的就是一连串同样的报错。
+ *
+ * 判据故意收得很窄(必须是**另一个用户的家目录**),因为这条提示会出现在所有
+ * 读失败的路径上:读 /etc/hosts 失败时扯 source map 是纯噪音。
+ */
+export function foreignHomePathHint(requestedPath: string, cwd: string): string | undefined {
+  const homeOf = (p: string): string | undefined => {
+    const posix = /^(\/(?:Users|home)\/[^/]+)\//.exec(p)
+    if (posix) return posix[1]
+    const win = /^([A-Za-z]:\\Users\\[^\\]+)\\/.exec(p)
+    return win ? win[1] : undefined
+  }
+  const theirs = homeOf(requestedPath)
+  if (theirs === undefined) return undefined
+  // 在**本机同一个家目录**下的路径不算外来的 —— 那只是普通的路径写错。
+  if (cwd === theirs || cwd.startsWith(theirs + sep)) return undefined
+  return (
+    `This absolute path is under a different user's home directory (${theirs}) than the ` +
+    `working directory, so it does not exist on this machine. Paths like this usually come ` +
+    `from build output — source maps (.js.map "sources"), bundled JS comments, or IDE config ` +
+    `— which record the absolute paths of the machine that produced them. Do not read them ` +
+    `literally: locate the file by NAME in this repo (e.g. Glob "**/App.tsx") instead.`
+  )
+}
+
 export async function suggestPathUnderCwd(
   requestedPath: string,
 ): Promise<string | undefined> {

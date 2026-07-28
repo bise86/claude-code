@@ -33,6 +33,7 @@ import { getErrnoCode, isENOENT } from '../../utils/errors.js'
 import {
   addLineNumbers,
   FILE_NOT_FOUND_CWD_NOTE,
+  foreignHomePathHint,
   findSimilarFile,
   getFileModificationTimeAsync,
   suggestPathUnderCwd,
@@ -639,6 +640,8 @@ export const FileReadTool = buildTool({
         const similarFilename = findSimilarFile(fullFilePath)
         const cwdSuggestion = await suggestPathUnderCwd(fullFilePath)
         let message = `File does not exist. ${FILE_NOT_FOUND_CWD_NOTE} ${getCwd()}.`
+        const foreign = foreignHomePathHint(fullFilePath, getCwd())
+        if (foreign) message += ` ${foreign}`
         if (cwdSuggestion) {
           message += ` Did you mean ${cwdSuggestion}?`
         } else if (similarFilename) {
