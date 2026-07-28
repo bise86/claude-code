@@ -1532,7 +1532,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   if (phase === 'running' && directiveOpen) {
     return (
       <AddDirective
-        existing={control.directives().length}
+        // 权限对话框画在它之上时键盘归对话框 —— 否则一下回车既提交指令又批准工具。
+        isActive={!humanWait.waiting}
+        // 丢弃说明行不算「补过的一条」,否则 25 条会报成 21。
+        existing={control.directives().filter(d => !d.startsWith('(较早的')).length}
         onSubmit={t => { control.addDirective(t); setDirectiveOpen(false) }}
         onCancel={() => setDirectiveOpen(false)}
       />

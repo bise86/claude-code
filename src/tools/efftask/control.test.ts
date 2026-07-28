@@ -85,6 +85,18 @@ describe('追加指令', () => {
     expect(c.directives()[0]!.length).toBe(MAX_DIRECTIVE_CHARS)
   })
 
+  it('截断按**码点**,不能把 emoji 劈成两半', () => {
+    // .slice 是按 UTF-16 单元切的:1999 个 ASCII + 一个 emoji 正好卡在边界上,
+    // 尾部会留下一个孤立的高代理(\ud83d),它原样进提示词。UI 侧一直按码点算,
+    // 两边判据不一致时,恰好卡在边界的那条指令就带着半个字符发出去。
+    const c = createRunControl()
+    c.addDirective('a'.repeat(MAX_DIRECTIVE_CHARS - 1) + '😀')
+    const d = c.directives()[0]!
+    expect(Array.from(d)).toHaveLength(MAX_DIRECTIVE_CHARS)
+    // 关键:最后一个码点必须是完整的 emoji,不是半个代理对。
+    expect(Array.from(d).pop()).toBe('😀')
+    expect(/[\ud800-\udbff]$/.test(d)).toBe(false)
+  })
   it('超出条数上限时挤掉最早的,但**说出来**', () => {
     // 静默丢弃用户亲手写的话,他会以为它生效了。
     const c = createRunControl()

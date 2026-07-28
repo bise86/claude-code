@@ -234,10 +234,15 @@ describe('briefOfToolUse —— 像真实终端那一行', () => {
       .toBe('Bash(bun test)')
   })
 
-  it('标签里已经含了参数就不重复', () => {
-    // 有些工具会把路径拼进显示名,直接追加会得到 'Read src/a.ts(src/a.ts)'。
-    expect(briefOfToolUse('Read', { file_path: 'src/a.ts' }, () => 'Read src/a.ts'))
-      .toBe('Read src/a.ts')
+  it('去重用**相等**而不是 includes —— 短参数会被子串判断误杀', () => {
+    // 旧规则是 `!label.includes(arg)`。'Bash'.includes('sh') 为真,于是
+    // Bash {"command":"sh"} 的摘要退回光秃秃的 'Bash' —— 正是这次修复要治的病,
+    // 在短参数上重开。而且本仓库**没有任何**工具会把路径拼进 userFacingName,
+    // 那条 includes 防的是一个当下不存在的情况,却真的会误杀。
+    expect(briefOfToolUse('Bash', { command: 'sh' }, () => 'Bash')).toBe('Bash(sh)')
+    expect(briefOfToolUse('Read', { file_path: 'a.ts' }, () => 'Read a.tsx')).toBe('Read a.tsx(a.ts)')
+    // 完全相同才不重复。
+    expect(briefOfToolUse('Read', { file_path: 'Read' }, () => 'Read')).toBe('Read')
   })
 
   it('注入的解析器抛了,落回静态表而不是带走这次调用', () => {

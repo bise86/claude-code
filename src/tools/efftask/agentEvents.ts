@@ -180,8 +180,19 @@ export function briefOfToolUse(name: string, input: unknown, resolve?: BriefReso
     const arg = staticBrief(name, input)
     // 标签里已经含了这个参数就不再重复 —— 有些工具的 userFacingName 会把路径拼进名字,
     // 直接追加会得到 `Read src/a.ts(src/a.ts)`。
-    return arg && !label.includes(arg) ? `${label}(${arg})` : label
+    /**
+     * 去重用**相等**,不是 includes。
+     *
+     * includes 是子串判断:`'Bash'.includes('sh')` 为真,于是
+     * `Bash {"command":"sh"}` 的摘要退回光秃秃的 `Bash` —— 正是这次修复要治的病,
+     * 在短参数上重开。而且实测本仓库**没有任何**工具会把路径拼进 userFacingName,
+     * 那条 includes 防的是一个当下不存在的情况,却真的会误杀。
+     */
+    return arg && label !== arg ? `${label}(${arg})` : label
   } catch {
+    // 回落到**标签**而不是空串:staticBrief 抛得出来(input 是 getter 会抛的 Proxy 时,
+    // 读属性那一步就炸)。返回空串的话整条工具调用在日志窗里渲染成一个空行 ——
+    // 用户只看到「有一次调用,不知道是什么」。
     return label
   }
 }

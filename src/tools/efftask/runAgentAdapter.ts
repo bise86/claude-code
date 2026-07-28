@@ -369,6 +369,18 @@ export function makeRunAgentFn(deps: {
       } else {
         await work
       }
+    } catch (e) {
+      /**
+       * 子 agent 在 abort 上**抛**出来时,下面那句 wasCancelled 走不到。
+       *
+       * 那一句写在 try/finally **之后**,而抛出路径直接跳过它:拿到的是子 agent 自己的
+       * Error('aborted'),runPhase 的 cancelled 于是为 false,走通用阻断、
+       * interrupted=false —— --resume 救不回来。本仓库主路径不抛(claude.ts 把
+       * APIUserAbortError 吞掉后干净返回),所以触发面窄 —— 但那是别人的实现细节,
+       * 不该是这条语义成立的前提。
+       */
+      if (deps.control?.wasCancelled(req.node.id) === true) throw new NodeCancelledError(req.node.id)
+      throw e
     } finally {
       if (poll) clearInterval(poll)
       if (timer) clearInterval(timer)
@@ -384,9 +396,13 @@ export function makeRunAgentFn(deps: {
        * 内存上限对超过三分之一的流直接失效。
        */
       req.stream?.end(
-        timedOut
-          ? (timeoutKind === 'human' ? '等待人工确认超时' : '静默超时(没有任何输出)')
-          : failure,
+        // 取消排在最前:被取消时 failure 可能是 undefined(生成器干净返回),窗口就会
+        // 收在绿色的「已完成」—— 而用户刚按了取消。这正是这段代码上方修过一次的那个病。
+        deps.control?.wasCancelled(req.node.id) === true
+          ? '已被用户取消'
+          : timedOut
+            ? (timeoutKind === 'human' ? '等待人工确认超时' : '静默超时(没有任何输出)')
+            : failure,
       )
     }
     // Report the deadline rather than returning a truncated answer that the phase would

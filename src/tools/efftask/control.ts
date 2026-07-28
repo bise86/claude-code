@@ -76,6 +76,8 @@ export function createRunControl(): RunControl {
     pause() { paused = true },
     resume() {
       paused = false
+      // 换出来再清空:不清的话 waiters 随暂停次数无界增长(每次 resume 都会把历史上
+      // 所有等待者再唤醒一遍 —— 对已 resolve 的 promise 无害,但那是个只涨不落的表)。
       const w = waiters
       waiters = []
       for (const fn of w) {
@@ -91,7 +93,10 @@ export function createRunControl(): RunControl {
     },
 
     addDirective(text) {
-      const t = text.trim().slice(0, MAX_DIRECTIVE_CHARS)
+      // 按**码点**截,不是按 UTF-16 单元:`.slice` 会把一个 emoji 劈成两半,尾部留下
+      // 一个孤立的高代理(实测 \ud83d),它会原样进提示词。UI 侧一直是按码点算的,
+      // 两边判据不一致时,恰好卡在边界的那条指令就会带着半个字符发出去。
+      const t = Array.from(text.trim()).slice(0, MAX_DIRECTIVE_CHARS).join('')
       if (t.length === 0) return
       directives.push(t)
       // 挤掉最早的,并记下挤掉了几条 —— 静默丢弃用户亲手写的话是这个仓库反复付过代价的
