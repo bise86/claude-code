@@ -11,7 +11,7 @@ import {
   logEvent,
   logEventAsync,
 } from '../services/analytics/index.js'
-import { isInBundledMode } from '../utils/bundledMode.js'
+import { isSelfContainedExecutable } from '../utils/bundledMode.js'
 import { logForDebugging } from '../utils/debug.js'
 import { logForDiagnosticsNoPII } from '../utils/diagLogs.js'
 import { isEnvTruthy, isInProtectedNamespace } from '../utils/envUtils.js'
@@ -117,7 +117,9 @@ function pollSleepDetectionThresholdMs(backoff: BackoffConfig): number {
  * and exits with "bad option: --sdk-url". See anthropics/claude-code#28334.
  */
 function spawnScriptArgs(): string[] {
-  if (isInBundledMode() || !process.argv[1]) {
+  // 单文件产物也要走空数组这一支:它的 argv[1] 是 bunfs 虚拟路径,传给子进程就是
+  // 一条不存在的脚本路径。
+  if (isSelfContainedExecutable() || !process.argv[1]) {
     return []
   }
   return [process.argv[1]]

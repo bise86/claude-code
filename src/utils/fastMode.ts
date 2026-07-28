@@ -16,7 +16,7 @@ import {
   handleOAuth401Error,
   hasProfileScope,
 } from './auth.js'
-import { isInBundledMode } from './bundledMode.js'
+import { isSelfContainedExecutable } from './bundledMode.js'
 import { getGlobalConfig, saveGlobalConfig } from './config.js'
 import { logForDebugging } from './debug.js'
 import { isEnvTruthy } from './envUtils.js'
@@ -87,7 +87,7 @@ export function getFastModeUnavailableReason(): string | null {
   // Previously, fast mode required the native binary (bun build). This is no
   // longer necessary, but we keep this option behind a flag just in case.
   if (
-    !isInBundledMode() &&
+    !isSelfContainedExecutable() &&
     getFeatureValue_CACHED_MAY_BE_STALE('tengu_marble_sandcastle', false)
   ) {
     return 'Fast mode requires the native binary · Install from: https://claude.com/product/claude-code'

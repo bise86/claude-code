@@ -193,7 +193,7 @@ import { onChangeAppState } from './state/onChangeAppState.js';
 import { createStore } from './state/store.js';
 import { asSessionId } from './types/ids.js';
 import { filterAllowedSdkBetas } from './utils/betas.js';
-import { isInBundledMode, isRunningWithBun } from './utils/bundledMode.js';
+import { isInBundledMode, isRunningWithBun, isSelfContainedExecutable } from './utils/bundledMode.js';
 import { logForDiagnosticsNoPII } from './utils/diagLogs.js';
 import { filterExistingPaths, getKnownPathsForRepo } from './utils/githubRepoPathMapping.js';
 import { clearPluginCache, loadAllPluginsCacheOnly } from './utils/plugins/pluginLoader.js';
@@ -2494,7 +2494,7 @@ async function run(): Promise<CommanderCommand> {
     }
     logForDiagnosticsNoPII('info', 'started', {
       version: MACRO.VERSION,
-      is_native_binary: isInBundledMode()
+      is_native_binary: isSelfContainedExecutable()
     });
     registerCleanup(async () => {
       logForDiagnosticsNoPII('info', 'exited');

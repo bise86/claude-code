@@ -10,7 +10,7 @@ import {
   getSessionBypassPermissionsMode,
 } from '../../bootstrap/state.js'
 import { quote } from '../bash/shellQuote.js'
-import { isInBundledMode } from '../bundledMode.js'
+import { isSelfContainedExecutable } from '../bundledMode.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { getTeammateModeFromSnapshot } from './backends/teammateModeSnapshot.js'
 import { TEAMMATE_COMMAND_ENV_VAR } from './constants.js'
@@ -24,7 +24,9 @@ export function getTeammateCommand(): string {
   if (process.env[TEAMMATE_COMMAND_ENV_VAR]) {
     return process.env[TEAMMATE_COMMAND_ENV_VAR]
   }
-  return isInBundledMode() ? process.execPath : process.argv[1]!
+  // 判据是「手上有没有可用的脚本路径」,不是「有没有嵌入资源」。单文件产物的
+  // process.argv[1] 是 /$bunfs/root/… —— 一条虚拟路径,spawn 出去必然 ENOENT。
+  return isSelfContainedExecutable() ? process.execPath : process.argv[1]!
 }
 
 /**

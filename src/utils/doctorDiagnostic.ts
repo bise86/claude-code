@@ -3,7 +3,7 @@ import { readFile, realpath } from 'fs/promises'
 import { homedir } from 'os'
 import { delimiter, join, posix, win32 } from 'path'
 import { checkGlobalInstallPermissions } from './autoUpdater.js'
-import { isInBundledMode } from './bundledMode.js'
+import { isSelfContainedExecutable } from './bundledMode.js'
 import {
   formatAutoUpdaterDisabledReason,
   getAutoUpdaterDisabledReason,
@@ -91,7 +91,7 @@ export async function getCurrentInstallationType(): Promise<InstallationType> {
   const [invokedPath] = getNormalizedPaths()
 
   // Check if running in bundled mode first
-  if (isInBundledMode()) {
+  if (isSelfContainedExecutable()) {
     // Check if this bundled instance was installed by a package manager
     if (
       detectHomebrew() ||
@@ -153,7 +153,7 @@ async function getInstallationPath(): Promise<string> {
   }
 
   // For bundled/native builds, show the binary location
-  if (isInBundledMode()) {
+  if (isSelfContainedExecutable()) {
     // Try to find the actual binary that was invoked
     try {
       return await realpath(process.execPath)
@@ -191,7 +191,8 @@ async function getInstallationPath(): Promise<string> {
 export function getInvokedBinary(): string {
   try {
     // For bundled/compiled executables, show the actual binary path
-    if (isInBundledMode()) {
+    // 单文件产物也走这一支:它的 argv[1] 是 /$bunfs/root/…,报给用户没有意义。
+    if (isSelfContainedExecutable()) {
       return process.execPath || 'unknown'
     }
 

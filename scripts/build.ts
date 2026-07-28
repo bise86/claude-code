@@ -96,6 +96,15 @@ const argOf = (flag: string): string | undefined => {
  */
 const target = argOf('--target')
 const outfile = argOf('--outfile')
+/**
+ * 换一个入口来编。
+ *
+ * 只服务于一件事:**在打包态验证行为**。这个仓库已经被同一类 bug 咬过两次 ——
+ * Windows 的 `.pathname`、以及 ripgrep 的 `/$bunfs/root/…` —— 共同点是
+ * 「从源码跑一切正常、编成单文件才错」,而单元测试全在源码态跑,一条都拦不住。
+ * 有了它就能把探针也用**同一套插件和 define** 编出来,而不是另写一份必然漂移的配置。
+ */
+const entry = argOf('--entry')
 const outdir = 'dist'
 await rm(outdir, { recursive: true, force: true })
 await mkdir(outdir, { recursive: true })
@@ -149,7 +158,7 @@ const externalRelative = {
 }
 
 const result = await Bun.build({
-  entrypoints: ['./src/entrypoints/cli.tsx'],
+  entrypoints: [entry ?? './src/entrypoints/cli.tsx'],
   // compile 模式下 outdir 会和 compile.outfile **叠加**(实测产物落在 dist/dist/),
   // 所以只在打包模式给它。
   ...(compile ? {} : { outdir }),

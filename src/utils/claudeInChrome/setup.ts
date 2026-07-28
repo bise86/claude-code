@@ -10,7 +10,7 @@ import {
 } from '../../bootstrap/state.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
 import type { ScopedMcpServerConfig } from '../../services/mcp/types.js'
-import { isInBundledMode } from '../bundledMode.js'
+import { isSelfContainedExecutable } from '../bundledMode.js'
 import { getGlobalConfig, saveGlobalConfig } from '../config.js'
 import { logForDebugging } from '../debug.js'
 import {
@@ -93,7 +93,9 @@ export function setupClaudeInChrome(): {
   allowedTools: string[]
   systemPrompt: string
 } {
-  const isNativeBuild = isInBundledMode()
+  // 单文件产物也算「没有脚本路径可用」—— 它的 import.meta.url 指向 bunfs 虚拟根,
+  // 拼出来的 cli.js 路径不存在。
+  const isNativeBuild = isSelfContainedExecutable()
   const allowedTools = BROWSER_TOOLS.map(
     tool => `mcp__claude-in-chrome__${tool.name}`,
   )

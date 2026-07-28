@@ -1,4 +1,4 @@
-import { isInBundledMode } from 'src/utils/bundledMode.js';
+import { isSelfContainedExecutable } from 'src/utils/bundledMode.js';
 import { getCurrentInstallationType } from 'src/utils/doctorDiagnostic.js';
 import { isEnvTruthy } from 'src/utils/envUtils.js';
 import { useStartupNotification } from './useStartupNotification.js';
@@ -7,7 +7,8 @@ export function useNpmDeprecationNotification() {
   useStartupNotification(_temp);
 }
 async function _temp() {
-  if (isInBundledMode() || isEnvTruthy(process.env.DISABLE_INSTALLATION_CHECKS)) {
+  // 单文件产物不是 npm 装的,劝它「从 npm 切到 native installer」是句废话。
+  if (isSelfContainedExecutable() || isEnvTruthy(process.env.DISABLE_INSTALLATION_CHECKS)) {
     return null;
   }
   const installationType = await getCurrentInstallationType();

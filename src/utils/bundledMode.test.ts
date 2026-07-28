@@ -1,0 +1,59 @@
+import { afterEach, describe, expect, it } from 'bun:test'
+import { isInBundledMode, isSelfContainedExecutable, isSingleFileExecutable } from './bundledMode.js'
+
+/**
+ * 这三个判据决定了「我从哪儿被调起来、能不能 spawn 自己、内置的东西在不在」。
+ * 混用其中两个的代价是实测过的:
+ * `ENOENT: posix_spawn '/$bunfs/root/vendor/ripgrep/x64-linux/rg'`。
+ *
+ * 单元测试只能覆盖到 argv[1] 这一路(Bun.main 和 import.meta.url 在测试里是真值,
+ * 改不了)。**打包态的那一半由 scripts/verify-binary.ts 守**,那才是这类 bug 的现场。
+ */
+const realArgv1 = process.argv[1]
+afterEach(() => { process.argv[1] = realArgv1 })
+
+describe('isSingleFileExecutable', () => {
+  it('源码态是 false —— 测试自己就跑在源码态', () => {
+    expect(isSingleFileExecutable()).toBe(false)
+  })
+
+  it('argv[1] 落在 bunfs 虚拟根上就是单文件产物', () => {
+    process.argv[1] = '/$bunfs/root/cli'
+    expect(isSingleFileExecutable()).toBe(true)
+  })
+
+  it('Windows 的虚拟根也要认 —— 只认 POSIX 那个的话,Windows 产物会静默走回开发态分支', () => {
+    // 而那条分支拿到的同样是一条不存在的路径,和这次 Linux 上的 bug 一模一样,
+    // 只是换个平台才发现。这个仓库的 Windows 发布已经因为同类问题挂过一次。
+    process.argv[1] = 'B:\\~BUN\\root\\cli'
+    expect(isSingleFileExecutable()).toBe(true)
+  })
+
+  it('长得像但不是的路径不算', () => {
+    for (const p of ['/home/me/bunfs/cli', '/opt/BUN/cli', '/usr/bin/claude', '']) {
+      process.argv[1] = p
+      expect(`${p} 被误判: ${isSingleFileExecutable()}`).toBe(`${p} 被误判: false`)
+    }
+  })
+})
+
+describe('isSelfContainedExecutable', () => {
+  it('单文件产物也算 —— 它没有可用的脚本路径', () => {
+    // 这是所有 `? process.execPath : process.argv[1]` 分支的判据。用「有没有嵌入资源」
+    // 判的话,单文件产物会拿到 /$bunfs/root/… 去 spawn,必然 ENOENT。
+    process.argv[1] = '/$bunfs/root/cli'
+    expect(isSelfContainedExecutable()).toBe(true)
+  })
+
+  it('源码态是 false', () => {
+    expect(isSelfContainedExecutable()).toBe(false)
+  })
+
+  it('和 isInBundledMode 不是同一件事', () => {
+    // 实测:stock bun 的 --compile 产物 Bun.embeddedFiles.length === 0。
+    // 两者混用正是这次 bug 的根。
+    process.argv[1] = '/$bunfs/root/cli'
+    expect(`单文件=${isSingleFileExecutable()} 官方构建=${isInBundledMode()}`)
+      .toBe('单文件=true 官方构建=false')
+  })
+})

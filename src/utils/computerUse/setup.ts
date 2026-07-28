@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url'
 import { buildMcpToolName } from '../../services/mcp/mcpStringUtils.js'
 import type { ScopedMcpServerConfig } from '../../services/mcp/types.js'
 
-import { isInBundledMode } from '../bundledMode.js'
+import { isSelfContainedExecutable } from '../bundledMode.js'
 import { CLI_CU_CAPABILITIES, COMPUTER_USE_MCP_SERVER_NAME } from './common.js'
 import { getChicagoCoordinateMode } from './gates.js'
 
@@ -32,7 +32,8 @@ export function setupComputerUseMCP(): {
   // command/args are never spawned — client.ts intercepts by name and
   // uses the in-process server. The config just needs to exist with
   // type 'stdio' to hit the right branch. Mirrors Chrome's setup.
-  const args = isInBundledMode()
+  // 同上:单文件产物没有 cli.js 可指,只能 re-exec 自己。
+  const args = isSelfContainedExecutable()
     ? ['--computer-use-mcp']
     : [
         join(fileURLToPath(import.meta.url), '..', 'cli.js'),

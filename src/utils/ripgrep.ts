@@ -1,11 +1,12 @@
 import type { ChildProcess, ExecFileException } from 'child_process'
 import { execFile, spawn } from 'child_process'
 import memoize from 'lodash-es/memoize.js'
+import { existsSync } from 'fs'
 import { homedir } from 'os'
 import * as path from 'path'
 import { logEvent } from 'src/services/analytics/index.js'
 import { fileURLToPath } from 'url'
-import { isInBundledMode } from './bundledMode.js'
+import { isInBundledMode, isSingleFileExecutable } from './bundledMode.js'
 import { logForDebugging } from './debug.js'
 import { isEnvDefinedFalsy } from './envUtils.js'
 import { execFileNoThrow } from './execFileNoThrow.js'
@@ -28,40 +29,66 @@ type RipgrepConfig = {
   argv0?: string
 }
 
+/** `vendor/ripgrep/<arch>-<platform>/rg` under a given root. */
+function vendoredRgUnder(root: string): string {
+  const rgRoot = path.resolve(root, 'vendor', 'ripgrep')
+  return process.platform === 'win32'
+    ? path.resolve(rgRoot, `${process.arch}-win32`, 'rg.exe')
+    : path.resolve(rgRoot, `${process.arch}-${process.platform}`, 'rg')
+}
+
+/**
+ * 决定 rg 从哪来。**纯函数 + 注入依赖**,因为下面那个 memoize 让分支在测试里够不着 ——
+ * 而这次的 bug(`ENOENT: posix_spawn '/$bunfs/root/vendor/ripgrep/x64-linux/rg'`)
+ * 恰恰是一条只在打包态才走到的分支。够不着 = 测不到 = 只能等用户来报。
+ */
+export function resolveRipgrepConfig(deps: {
+  wantsSystem: boolean
+  isOfficialNativeBuild: boolean
+  isSingleFile: boolean
+  /** PATH 上有没有 rg。findExecutable 找不到时会原样返回 'rg'。 */
+  systemRg: () => string
+  fileExists: (p: string) => boolean
+  execPath: string
+  moduleDir: string
+  onMissing?: (msg: string) => void
+}): RipgrepConfig {
+  if (deps.wantsSystem && deps.systemRg() !== 'rg') {
+    // SECURITY: Use command name 'rg' instead of the resolved path to prevent PATH hijacking.
+    return { mode: 'system', command: 'rg', args: [] }
+  }
+  if (deps.isOfficialNativeBuild) {
+    return { mode: 'embedded', command: deps.execPath, args: ['--no-config'], argv0: 'rg' }
+  }
+  if (deps.isSingleFile) {
+    const beside = vendoredRgUnder(path.dirname(deps.execPath))
+    if (deps.fileExists(beside)) return { mode: 'builtin', command: beside, args: [] }
+    if (deps.systemRg() === 'rg') {
+      deps.onMissing?.(
+        '找不到 ripgrep:这个单文件产物里没有内置 rg,系统 PATH 上也没有。' +
+          'Grep / Glob / 全局搜索会失败。装一个 ripgrep,或把 vendor/ripgrep 放到可执行文件旁边。',
+      )
+    }
+    return { mode: 'system', command: 'rg', args: [] }
+  }
+  return { mode: 'builtin', command: vendoredRgUnder(deps.moduleDir), args: [] }
+}
+
 const getRipgrepConfig = memoize((): RipgrepConfig => {
   const userWantsSystemRipgrep = isEnvDefinedFalsy(
     process.env.USE_BUILTIN_RIPGREP,
   )
 
-  // Try system ripgrep if user wants it
-  if (userWantsSystemRipgrep) {
-    const { cmd: systemPath } = findExecutable('rg', [])
-    if (systemPath !== 'rg') {
-      // SECURITY: Use command name 'rg' instead of systemPath to prevent PATH hijacking
-      // If we used systemPath, a malicious ./rg.exe in current directory could be executed
-      // Using just 'rg' lets the OS resolve it safely with NoDefaultCurrentDirectoryInExePath protection
-      return { mode: 'system', command: 'rg', args: [] }
-    }
-  }
-
-  // In bundled (native) mode, ripgrep is statically compiled into bun-internal
-  // and dispatches based on argv[0]. We spawn ourselves with argv0='rg'.
-  if (isInBundledMode()) {
-    return {
-      mode: 'embedded',
-      command: process.execPath,
-      args: ['--no-config'],
-      argv0: 'rg',
-    }
-  }
-
-  const rgRoot = path.resolve(__dirname, 'vendor', 'ripgrep')
-  const command =
-    process.platform === 'win32'
-      ? path.resolve(rgRoot, `${process.arch}-win32`, 'rg.exe')
-      : path.resolve(rgRoot, `${process.arch}-${process.platform}`, 'rg')
-
-  return { mode: 'builtin', command, args: [] }
+  return resolveRipgrepConfig({
+    wantsSystem: userWantsSystemRipgrep,
+    isOfficialNativeBuild: isInBundledMode(),
+    isSingleFile: isSingleFileExecutable(),
+    systemRg: () => findExecutable('rg', []).cmd,
+    fileExists: existsSync,
+    execPath: process.execPath,
+    moduleDir: __dirname,
+    onMissing: msg => logError(new Error(msg)),
+  })
 })
 
 export function ripgrepCommand(): {
