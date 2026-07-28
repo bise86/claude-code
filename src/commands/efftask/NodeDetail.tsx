@@ -143,6 +143,8 @@ export function NodeDetail(props: {
    * `❯` 和半截「收起)」),按子串断言帧内容既脆又容易恒真。测试要的是「焦点到底在哪」,
    * 那就把它直接交出来。
    */
+  /** 日志窗自己的状态 —— 用来断言「区焦点真的管住了它的键盘」。 */
+  onLogState?: (s: { selected: number }) => void
   onState?: (s: { zone: 'sections' | 'log'; cursor: number; expanded: string[] }) => void
   /** 这一屏能不能按 r 重做。键是父面板处理的,这里只负责**说出来**。 */
   canRedo?: boolean
@@ -314,6 +316,7 @@ export function NodeDetail(props: {
             height={logHeight}
             width={Math.max(30, props.columns ?? 100)}
             isActive={props.logActive === true && zone === 'log'}
+            onState={s => props.onLogState?.({ selected: s.selected })}
           />
         </Box>
       ) : null}

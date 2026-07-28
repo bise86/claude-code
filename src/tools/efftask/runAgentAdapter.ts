@@ -28,7 +28,19 @@ export type TimeoutKind = 'stall' | 'human'
  * 合成一句「调用失败」的话,阻断卡会去劝用户提高超时——而他刚刚亲手按了取消。
  */
 export class NodeCancelledError extends Error {
-  constructor(public readonly nodeId: string) {
+  constructor(
+    public readonly nodeId: string,
+    /**
+     * 取消发生之前,子 agent **已经吐出来的**那部分文本。
+     *
+     * 必须带上:执行环节是带写工具的,取消的那一刻工作区里很可能已经有改动了,而
+     * 执行者对这些改动的自述就在这段文本里。丢掉它 = 仓库变了而没有任何记录 ——
+     * pipeline 那句「以上为中断时已报告的产出」本来就是给用户看这个的,只是它此前
+     * 拿不到:runPhase 的 `text` 只在「调用成功之后才发现 abort」那条路上才有,
+     * 而取消是**抛**出来的。
+     */
+    public readonly partialText = '',
+  ) {
     super('该节点已被用户取消')
     this.name = 'NodeCancelledError'
   }
@@ -379,7 +391,9 @@ export function makeRunAgentFn(deps: {
        * APIUserAbortError 吞掉后干净返回),所以触发面窄 —— 但那是别人的实现细节,
        * 不该是这条语义成立的前提。
        */
-      if (deps.control?.wasCancelled(req.node.id) === true) throw new NodeCancelledError(req.node.id)
+      if (deps.control?.wasCancelled(req.node.id) === true) {
+        throw new NodeCancelledError(req.node.id, partialTextOf(collected))
+      }
       throw e
     } finally {
       if (poll) clearInterval(poll)
@@ -409,7 +423,9 @@ export function makeRunAgentFn(deps: {
     // parse as a real (empty) reply.
     // 取消要排在超时**之前**判:被取消的调用同样是 abort,而它此刻可能恰好也超时了。
     // 判成超时的话,用户会拿到一句「提高 nodeTimeoutMs」——而他刚刚亲手按了取消。
-    if (deps.control?.wasCancelled(req.node.id) === true) throw new NodeCancelledError(req.node.id)
+    if (deps.control?.wasCancelled(req.node.id) === true) {
+      throw new NodeCancelledError(req.node.id, partialTextOf(collected))
+    }
     if (timedOut) {
       throw new PhaseTimeoutError(
         (timeoutKind === 'human' ? humanLimitMs : limitMs) ?? 0,
@@ -417,5 +433,20 @@ export function makeRunAgentFn(deps: {
       )
     }
     return collectText(collected)
+  }
+}
+
+/**
+ * 取消时把已收到的文本抠出来,**永不抛**。
+ *
+ * collectText 会读 `m.type`,而 collected 里可能有一条畸形消息(provider 给的、
+ * 或者测试里的桩)。这一步的全部目的是「报告这次取消」,一条坏消息把它变成 TypeError
+ * 的话,用户拿到的是一个和取消毫无关系的错 —— 实测踩到过。
+ */
+function partialTextOf(collected: readonly unknown[]): string {
+  try {
+    return collectText(collected as never)
+  } catch {
+    return ''
   }
 }

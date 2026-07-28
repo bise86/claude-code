@@ -284,6 +284,41 @@ describe('取消在**每一个**环节都是取消', () => {
   })
 })
 
+describe('取消不能把已经干的活抹掉', () => {
+  it('执行环节被取消时,已报告的产出留在 execStatus 里', async () => {
+    /**
+     * 执行环节是**带写工具**的:取消的那一刻工作区里很可能已经有改动了,而执行者对这些
+     * 改动的自述就在那段文本里。丢掉它 = 仓库变了而没有任何记录。
+     *
+     * pipeline 里那句「以上为中断时已报告的产出」本来就是给用户看这个的 —— 但它此前
+     * **拿不到**:runPhase 的 text 只在「调用成功之后才发现 abort」那条路上才有,
+     * 而取消是抛出来的。所以那段注释说的「这一处尤其要分开」保护的是一个不可达的东西。
+     */
+    const control = createRunControl()
+    let planned = false
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan' && !planned) {
+        planned = true
+        return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+      }
+      if (req.phase === 'execute') {
+        control.cancelNode(req.node.id)
+        throw new NodeCancelledError(req.node.id, '```exec\n{"execStatus":"已经改了 src/a.ts"}\n```')
+      }
+      return allPass(req)
+    }
+    const orch = new EffTaskOrchestrator(
+      cfg(), { runAgent, control, persist: async () => {}, now: () => NOW, onUpdate: () => {} },
+      new AbortController().signal,
+    )
+    await orch.run()
+    const root = orch.nodes().find(n => n.id === 'root')!
+    expect(root.execStatus).toContain('已经改了 src/a.ts')
+    expect(root.execStatus).toContain('中断时已报告的产出')
+    // 而且仍然是取消,不是别的失败。
+    expect(root.blockedReason).toContain('已被用户取消')
+  })
+})
 describe('追加指令送得到裁判席', () => {
   it('评审 / 验收 的提示词里也有那句话,并且说明它优先', async () => {
     // 少了这一段:用户补「别动 src/legacy」→ 执行者照做 → 验收员拿着**补话之前**定下的

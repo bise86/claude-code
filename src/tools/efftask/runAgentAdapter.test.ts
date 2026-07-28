@@ -859,6 +859,22 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     }
   })
 
+  it('调用跑完之后必须从登记表里摘掉', async () => {
+    // 不摘的话 calls 表只增不减:后来对同一节点的取消会去 abort 一堆早已结束的
+    // controller,掩盖「这个节点此刻根本没在跑」。回归验收造的 R04 变异原来是活的 ——
+    // control 那一层测得到 off() 本身,但**适配器有没有调它**只有这一层看得见。
+    const control = createRunControl()
+    let captured: AbortController | undefined
+    async function* quick(args: { override: { abortController: AbortController } }): AsyncGenerator<never> {
+      captured = args.override.abortController
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '完事' }] } } as never
+    }
+    await call(makeRunAgentFn(deps(quick, { control })))
+    expect(captured).toBeDefined()
+    control.cancelNode('root')
+    // 那次调用早就结束了 —— 取消碰不到它。
+    expect(captured!.signal.aborted).toBe(false)
+  })
   it('取消**之前**登记的调用不受影响 —— 注销要真的注销', async () => {
     const control = createRunControl()
     async function* quick(): AsyncGenerator<never> {

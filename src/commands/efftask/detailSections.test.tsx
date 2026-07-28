@@ -205,6 +205,35 @@ describe('两个区的切换', () => {
     expect(at().cursor).toBe(1)
   })
 
+  it('焦点在段落区时,日志窗**收不到**键 —— 否则 n 会在背后换流', () => {
+    // 这一条守的是 AgentLogPane 的 isActive 真的跟着区焦点走。
+    // 观测口是日志窗自己的 onState:段落区有焦点时按 n,选中的流不许变。
+    return (async () => {
+      const store = createStreamStore()
+      for (const label of ['甲', '乙']) {
+        const h = store.open({ nodeId: 'root', phaseLabel: '执行', label })
+        h.push({ kind: 'text', text: label + '在干活' })
+      }
+      const seen: number[] = []
+      const t = fakeTty()
+      const app = await render(
+        <NodeDetail
+          node={node()} elapsed="12s" logActive columns={110}
+          streams={store.streams('root')}
+          onLogState={x => seen.push(x.selected)}
+        />,
+        { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      const before = seen[seen.length - 1]
+      t.stdin.press('n'); await tick()
+      expect(seen[seen.length - 1]).toBe(before)   // 段落区有焦点,n 不该换流
+      t.stdin.press(TAB); await tick()
+      t.stdin.press('n'); await tick()
+      app.unmount()
+      expect(seen[seen.length - 1]).not.toBe(before) // 切过去之后才换得动
+    })()
+  })
   it('没有输出可看时 Tab 不切走 —— 切过去会是一个按什么都没反应的空区', async () => {
     const { t, app, at } = await mount() // 不传 streams
     t.stdin.press(TAB); await tick()

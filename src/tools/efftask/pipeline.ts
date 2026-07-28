@@ -293,6 +293,9 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: 
       timeout: e instanceof PhaseTimeoutError,
       timeoutKind: e instanceof PhaseTimeoutError ? e.kind : undefined,
       cancelled: e instanceof NodeCancelledError,
+      // 取消带回来的那部分产出。别的失败路径没有它(runPhase 的 text 只在
+      // 「成功之后才发现 abort」那条路上才有),所以这里是取消**独有**的一份。
+      text: e instanceof NodeCancelledError ? e.partialText : undefined,
     }
   }
 }

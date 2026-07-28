@@ -513,6 +513,26 @@ describe('改回去要变红的四处', () => {
     expect(SRC).toContain('control: props.control,')
   })
 
+  it('全文件只许 new 一个 RunControl —— 组件里再建一个,三个键就全废了', () => {
+    /**
+     * 回归验收造的那条变异:把组件里的 `const control = props.control` 换成
+     * `createRunControl()`。上面那四条文本断言**全都还在**(它们查的是「有没有把
+     * control 交出去」,不是「交出去的是不是同一个」),而后果是 p / i / x 三个键
+     * 全部作用在一个孤立实例上:暂停不停、指令进不了提示词、按 x 那个节点继续改代码,
+     * 而提示行照画「⏸ 已暂停」。
+     *
+     * 这条闸门是**结构性**的,不是行为性的:它证明的是「这个文件里只 new 了一次」。
+     * 真正的行为断言要在 runnerMount 里走完三道关口、真按键、数模型调用次数 —— 那是
+     * 更贵也更好的一条,还没做。在那之前,这一条至少让上面那个变异变红。
+     */
+    expect(occurrences('createRunControl()')).toBe(1)
+    // 而且必须在 call() 里、在 makeRunAgentFn **之前** —— 组件会重挂,call() 不会;
+    // 排在后面就是 TDZ(runnerMount 抓到过一次)。
+    const iNew = SRC.indexOf('const control = createRunControl()')
+    const iUse = SRC.indexOf('const runAgent: RunAgentFn = makeRunAgentFn(')
+    expect(iNew).toBeGreaterThanOrEqual(0)
+    expect(iNew).toBeLessThan(iUse)
+  })
   it('三个干预键各自接到不同的动作上', () => {
     // 接错一个的后果都很实:x 接到暂停上 = 用户以为取消了那个节点而它还在改代码。
     const body = SRC.slice(SRC.indexOf('runControl={{'))

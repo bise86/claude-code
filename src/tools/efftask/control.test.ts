@@ -198,6 +198,21 @@ describe('取消单个节点', () => {
     expect(fresh.signal.aborted).toBe(false)
   })
 
+  it('调用结束后注销 —— 表不能只增不减', () => {
+    // 不注销的话 calls 表里堆着一堆早已结束的 controller,取消会去 abort 它们,
+    // 掩盖「这个节点此刻根本没在跑」这件事。回归验收造的 R04 变异原来是活的。
+    const c = createRunControl()
+    const done = new AbortController()
+    const off = c.registerCall('n1', done)
+    off()
+    // 表已经空了:再取消不该碰到那个早就结束的 controller。
+    c.cancelNode('n1')
+    expect(done.signal.aborted).toBe(false)
+    // 而这之后**新**来的调用照样立刻被拦(取消标记还在)。
+    const fresh = new AbortController()
+    c.registerCall('n1', fresh)
+    expect(fresh.signal.aborted).toBe(true)
+  })
   it('中止一个已经 abort 过的 controller 不会抛', () => {
     const c = createRunControl()
     const a = new AbortController()
