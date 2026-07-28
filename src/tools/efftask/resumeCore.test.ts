@@ -251,6 +251,20 @@ describe('readRunManifest recovers the config the run was started with', () => {
     expect(degraded).toEqual([])
   })
 
+
+  it('两个时钟各自的钳位:静默上限 2 小时,人工等待 7 天在范围内', async () => {
+    // 「接口超时可以设置 2 个小时,用户回答响应超时设置 7 天」是用户给的数值。
+    // 静默这条原来钳到 1 小时,写 2 小时会被**静默改回 10 分钟的默认值** ——
+    // clampInt 越界时不取上限,而是回落到 fallback。所以钳位范围本身要被钉住。
+    const md = [
+      '---', 'runId: 001', 'parallelism: 3', 'phaseRoles:', '  plan: []',
+      'caps:', '  nodeTimeoutMs: 7200000', '  humanTimeoutMs: 604800000',
+      'goalPrompt: 目标', '---', '',
+    ].join('\n')
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': md }), '/r')
+    expect(config.caps.nodeTimeoutMs).toBe(7_200_000)
+    expect(config.caps.humanTimeoutMs).toBe(7 * 24 * 60 * 60 * 1000)
+  })
   it('a missing or corrupt manifest degrades to defaults instead of throwing', async () => {
     // The manifest is ONE file. Losing it must not cost the user the whole tree — every
     // node.md is still there, and the roster is re-confirmable at the gate.

@@ -597,7 +597,10 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
     maxDepth: clampInt(caps.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth),
     maxNodes: clampInt(caps.maxNodes, 1, 5000, DEFAULT_CAPS.maxNodes),
     maxIterations: clampInt(caps.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations),
-    nodeTimeoutMs: clampInt(caps.nodeTimeoutMs, 1000, 3_600_000, DEFAULT_CAPS.nodeTimeoutMs),
+    // 上限 2 小时。原来是 1 小时,而这条阀量的已经是**静默时长**不是总时长了 ——
+    // 「两个小时一条消息都没吐」在任何 provider 上都只可能是挂死,所以让它可配到 2 小时
+    // 不会削弱它,只是把「我这台机器网络就是烂」这种情况留给用户自己定。
+    nodeTimeoutMs: clampInt(caps.nodeTimeoutMs, 1000, 7_200_000, DEFAULT_CAPS.nodeTimeoutMs),
     // 上限 30 天:这条阀挡的是「永远没人回答」,不是「回答得慢」。
     humanTimeoutMs: clampInt(caps.humanTimeoutMs, 1000, 30 * 24 * 60 * 60 * 1000, DEFAULT_CAPS.humanTimeoutMs),
   }
