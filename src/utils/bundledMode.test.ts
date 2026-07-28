@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { isInBundledMode, isSelfContainedExecutable, isSingleFileExecutable } from './bundledMode.js'
+import { isInBundledMode, isSelfContainedExecutable, isSingleFileExecutable,
+  isLocallyBuiltExecutable,
+} from './bundledMode.js'
 
 /**
  * 这三个判据决定了「我从哪儿被调起来、能不能 spawn 自己、内置的东西在不在」。
@@ -60,5 +62,30 @@ describe('isSelfContainedExecutable', () => {
     process.argv[1] = '/$bunfs/root/cli'
     expect(`单文件=${isSingleFileExecutable()} 官方构建=${isInBundledMode()}`)
       .toBe('单文件=true 官方构建=false')
+  })
+})
+
+describe('isLocallyBuiltExecutable', () => {
+  // 四个组合都要在,因为两个信号各自都能被误删。
+  const cases: Array<[boolean, boolean, boolean, string]> = [
+    [true, false, true, '自己 bun build --compile 编的 —— 就是要禁更的那一种'],
+    [true, true, false, '官方 native 构建:单文件 + 带嵌入资源,照常更新'],
+    [false, false, false, '从源码跑,根本不是单文件'],
+    [false, true, false, '带嵌入资源但不是单文件(理论组合),也不算本地构建'],
+  ]
+  for (const [isSingleFile, isOfficial, want, why] of cases) {
+    it(`single=${isSingleFile} official=${isOfficial} → ${want}(${why})`, () => {
+      expect(
+        isLocallyBuiltExecutable({
+          isSingleFile: () => isSingleFile,
+          isOfficial: () => isOfficial,
+        }),
+      ).toBe(want)
+    })
+  }
+
+  it('默认参数接的是真谓词 —— 测试进程里不是单文件,所以是 false', () => {
+    // 这条守的是「接线」:纯函数写对了但没接上去,是这个仓库里反复出现的一类。
+    expect(isLocallyBuiltExecutable()).toBe(false)
   })
 })

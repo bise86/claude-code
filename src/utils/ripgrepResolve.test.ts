@@ -114,4 +114,22 @@ describe('resolveRipgrepConfig', () => {
     expect(seen[0]).toContain('/repo/src/utils/vendor/ripgrep')
     expect(seen[1]).toContain('/usr/local/bin/vendor/ripgrep')
   })
+
+  it('USE_BUILTIN_RIPGREP 时 PATH 上有 rg 也不许改用系统的', () => {
+    // 重构把原来的嵌套 if 压成了 `wantsSystem && systemRg() !== 'rg'`,而没有一条
+    // 用例是「不想要系统的 + PATH 上恰好有」。漏掉半个条件的后果是:凡是装了 rg 的
+    // 机器都会静默改用系统那份,USE_BUILTIN_RIPGREP 这个 opt-in 完全失效 —— 而全套
+    // 测试照绿。这条用例就是为了让那半个条件死不掉。
+    const cfg = resolveRipgrepConfig({
+      wantsSystem: false,
+      isOfficialNativeBuild: false,
+      isSingleFile: false,
+      systemRg: () => '/usr/bin/rg',
+      fileExists: (p: string) => p.includes('vendor/ripgrep'),
+      execPath: '/opt/claude/bin/claude',
+      moduleDir: '/opt/claude/lib',
+    })
+    expect(cfg.mode).toBe('builtin')
+    expect(cfg.command).toContain('vendor/ripgrep')
+  })
 })

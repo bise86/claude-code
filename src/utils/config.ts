@@ -17,6 +17,7 @@ import { registerCleanup } from './cleanupRegistry.js'
 import { logForDebugging } from './debug.js'
 import { logForDiagnosticsNoPII } from './diagLogs.js'
 import { getGlobalClaudeFile } from './env.js'
+import { isLocallyBuiltExecutable } from './bundledMode.js'
 import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
 import { ConfigParseError, getErrnoCode } from './errors.js'
 import { writeFileSyncAndFlush_DEPRECATED } from './file.js'
@@ -1716,6 +1717,8 @@ export function shouldSkipPluginAutoupdate(): boolean {
 
 export type AutoUpdaterDisabledReason =
   | { type: 'development' }
+  /** 自己编出来的单文件产物 —— 见 getAutoUpdaterDisabledReason 里那段。 */
+  | { type: 'local-build' }
   | { type: 'env'; envVar: string }
   | { type: 'config' }
 
@@ -1725,6 +1728,8 @@ export function formatAutoUpdaterDisabledReason(
   switch (reason.type) {
     case 'development':
       return 'development build'
+    case 'local-build':
+      return 'locally built binary'
     case 'env':
       return `${reason.envVar} set`
     case 'config':
@@ -1735,6 +1740,22 @@ export function formatAutoUpdaterDisabledReason(
 export function getAutoUpdaterDisabledReason(): AutoUpdaterDisabledReason | null {
   if (process.env.NODE_ENV === 'development') {
     return { type: 'development' }
+  }
+  /**
+   * 自己 `bun build --compile` 编出来的产物,**绝不能自动更新**。
+   *
+   * 这条不是防御性编程,是一颗实弹拆下来的:把 NODE_ENV 钉成 production 之后,
+   * getCurrentInstallationType() 会把这个 fork 判成 'native' → AutoUpdaterWrapper
+   * 选中 NativeAutoUpdater → installLatest() 从 Anthropic 的发布桶下载**官方的
+   * claude** 装进 ~/.local/bin/claude,把本 fork 覆盖掉,并把 installMethod 写成
+   * 'native'。installer 里那条 `version === MACRO.VERSION` 的 early-exit 拦不住:
+   * 本地版本号是 999.0.0-local,永远不等于官方版本号。
+   *
+   * 判据用「单文件 且 不带嵌入资源」:带嵌入资源的才是官方 native 构建
+   * (见 bundledMode.ts 里两个谓词为什么必须分开)。
+   */
+  if (isLocallyBuiltExecutable()) {
+    return { type: 'local-build' }
   }
   if (isEnvTruthy(process.env.DISABLE_AUTOUPDATER)) {
     return { type: 'env', envVar: 'DISABLE_AUTOUPDATER' }

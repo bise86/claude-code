@@ -76,3 +76,22 @@ export function isSingleFileExecutable(): boolean {
 export function isSelfContainedExecutable(): boolean {
   return isInBundledMode() || isSingleFileExecutable()
 }
+
+/**
+ * 「这份可执行文件是用户自己编出来的」。
+ *
+ * = 单文件产物 **且不是**官方 native 构建。用途见 getAutoUpdaterDisabledReason():
+ * 自动更新会把它换成官方的 claude,所以必须能把两者分开。
+ *
+ * 做成可注入的纯函数不是为了好看:在测试进程里 `Bun.embeddedFiles` 恒为空数组,
+ * 于是 `!isOfficial()` 这半个条件**在真实进程里永远杀不掉** —— 删掉它全套测试照绿,
+ * 而后果是官方构建也被禁更。只有把两个信号做成参数,四个组合才测得到。
+ */
+export function isLocallyBuiltExecutable(
+  deps: { isSingleFile: () => boolean; isOfficial: () => boolean } = {
+    isSingleFile: isSingleFileExecutable,
+    isOfficial: isInBundledMode,
+  },
+): boolean {
+  return deps.isSingleFile() && !deps.isOfficial()
+}
