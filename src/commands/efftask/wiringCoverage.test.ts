@@ -458,6 +458,12 @@ describe('改回去要变红的四处', () => {
     expect(body.slice(0, 2000)).toContain('await commitRedo(')
   })
 
+  it('中断过的 run 按 r 会被挡住并说明下一步', () => {
+    // 中断标记对整个 /et 进程有效且无法撤销。不挡的话用户会看到同一屏「已中断」,
+    // 一次模型调用都没发生,也没有任何东西解释为什么。
+    expect(SRC).toContain('redoUnavailableReason({ aborted: props.signal.aborted')
+  })
+
   it('只查看模式不给重做入口', () => {
     // 那个 run 的编排器根本没起来过。给了重做就是**替用户决定**把它跑起来,
     // 而他刚刚明确选了不跑。

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
-import { descendantsOf, planRedo, redoOptions, redoSummary, type RedoPlan } from './redo.js'
+import { descendantsOf, planRedo, redoOptions, redoSummary, redoUnavailableReason, type RedoPlan } from './redo.js'
 import { PHASE_NAMES, type NodeKind, type NodeStatus, type TaskNode } from './types.js'
 
 function node(id: string, over: Partial<TaskNode> = {}): TaskNode {
@@ -305,6 +305,24 @@ describe('planRedo:共通清理', () => {
   it('节点不存在时给错误而不是抛异常', () => {
     const r = planRedo(tree(), '不存在', 'plan', 'T1')
     expect('error' in r && r.error).toContain('不存在')
+  })
+})
+
+describe('redoUnavailableReason', () => {
+  it('没中断就没理由', () => {
+    expect(redoUnavailableReason({ aborted: false, runId: '004' })).toBeUndefined()
+  })
+
+  it('中断过的 run 给出能照做的下一步,并带上 run id', () => {
+    // 不挡的话:按 r → 选环节 → 看后果 → 确认 → 编排器在第一个循环里就走中断分支,
+    // 返回同一屏同一句「已中断」,一次模型调用都没有,也没有任何东西解释为什么。
+    const why = redoUnavailableReason({ aborted: true, runId: '004' })!
+    expect(why).toContain('/et --resume 004')
+  })
+
+  it('没有 run id 时给占位符而不是 undefined 拼进命令里', () => {
+    expect(redoUnavailableReason({ aborted: true })).toContain('<run id>')
+    expect(redoUnavailableReason({ aborted: true, runId: '' })).toContain('<run id>')
   })
 })
 

@@ -294,3 +294,20 @@ export function redoSummary(plan: RedoPlan, target: TaskNode, entry: RedoEntry):
   for (const w of plan.warnings) lines.push(`⚠ ${w}`)
   return lines
 }
+
+/**
+ * 「这次能不能重做」—— 不看树,看**进程状态**。
+ *
+ * 中断标记(runController.signal)一旦置上,对整个 `/et` 进程都有效,而且没有办法撤销。
+ * 于是「Esc 中断 → 落到 done 视图 → 按 r 重做」这条完全自然的路径,会让编排器在
+ * run() 的第一个循环里就走 `if (this.signal.aborted)` 那一支:扫一遍 propagateBlocked,
+ * 返回「已中断」。用户看到的是同一屏、同一句话,而他刚刚明明操作了一次 —— 一次模型
+ * 调用都没有发生,也没有任何东西告诉他为什么。
+ *
+ * 所以这里**提前挡住并且给出能照做的下一步**,而不是让他按下去再看一遍失败。
+ */
+export function redoUnavailableReason(opts: { aborted: boolean; runId?: string }): string | undefined {
+  if (!opts.aborted) return undefined
+  return `本次运行已被中断,中断标记对整个 /et 进程有效 —— 在这里重做会立刻再次阻断。` +
+    `请退出后执行: /et --resume ${opts.runId && opts.runId.length > 0 ? opts.runId : '<run id>'}`
+}

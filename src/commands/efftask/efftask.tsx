@@ -15,7 +15,7 @@ import { createWorktreePool, type GitRunner, type WorktreePool } from '../../too
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
-import { planRedo, type RedoEntry } from '../../tools/efftask/redo.js'
+import { planRedo, redoUnavailableReason, type RedoEntry } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
 import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
@@ -1388,7 +1388,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       redoProblems={redoProblems}
       // 只查看模式下不给重做:那个 run 的编排器根本没起来过,重做等于**替用户决定**
       // 把它跑起来 —— 而他刚刚明确选了不跑。
-      onRedo={viewOnly ? undefined : node => { setRedoTarget(node); setPhase('confirmRedo') }}
+      onRedo={viewOnly ? undefined : node => {
+        // 中断过的 run 在这里重做会立刻再次阻断(见 redoUnavailableReason)。
+        // 挡在**按键这一刻**,而不是让他选完环节、看完后果、确认完再看一遍失败。
+        const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
+        if (why) { setRedoProblems([why]); return }
+        setRedoTarget(node); setPhase('confirmRedo')
+      }}
     />
   )
 }
