@@ -507,7 +507,20 @@ const gitRunner: GitRunner = (args, cwd) =>
  */
 async function makeWorktreePool(
   runId: string, cwd: string,
-): Promise<{ pool?: WorktreePool; reason?: string; notARepo?: boolean }> {
+): Promise<{
+  pool?: WorktreePool; reason?: string; notARepo?: boolean
+  /**
+   * 「是仓库,但一个提交都没有」。
+   *
+   * 和 notARepo **必须分开**,因为补救动作不同:notARepo 要 `git init`(在 cwd),
+   * 而这一种**绝不能** init —— 用户可能正站在一个没有提交的仓库的**子目录**里,
+   * 在那儿 init 会造出一个遮蔽父仓库的嵌套仓库(实测:rev-parse --show-toplevel 从此
+   * 回答子目录),而代码里没有任何地方会清理它。这一种只需要在**仓库根**上补一个空提交。
+   */
+  needsFirstCommit?: boolean
+  /** 仓库根 —— 补空提交要用它,不能用 cwd(见上)。 */
+  gitRoot?: string
+}> {
   const top = await gitRunner(['rev-parse', '--show-toplevel'], cwd)
   // notARepo is reported SEPARATELY from the reason string because it is the only condition
   // under which offering `git init` is correct. Every other failure below happens AFTER this
@@ -517,6 +530,19 @@ async function makeWorktreePool(
   // `rev-parse --show-toplevel` answer /repo/sub, and nothing in this codebase ever cleans it up.
   if (top.code !== 0) return { reason: '当前目录不是 git 仓库', notARepo: true }
   const gitRoot = top.stdout.trim()
+  /**
+   * 「是仓库,但一个提交都没有」以前是个**死胡同**。
+   *
+   * pool.init() 会以「不是 git 仓库或没有提交」失败,而 notARepo 是 false —— 于是关口
+   * 既不给 g 键,也只会说「需要先解决上面这条原因」。可修法和 g 做的事**一模一样**
+   * (建一个空提交),用户却看不到入口,只能带着串行执行跑完整轮。
+   *
+   * 单独探一次而不是解析 init 的错误串:那个串是 git 给的,措辞会随版本变。
+   */
+  const head = await gitRunner(['rev-parse', '--verify', '--quiet', 'HEAD'], gitRoot)
+  if (head.code !== 0) {
+    return { reason: '这个 git 仓库还没有任何提交,建不出集成分支', needsFirstCommit: true, gitRoot }
+  }
   const pool = createWorktreePool({ runId, gitRoot, git: gitRunner, worktreeRoot: `${gitRoot}/.efftask-worktrees` })
   const init = await pool.init()
   if (!init.ok) return { reason: init.reason }
@@ -608,6 +634,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // Whether offering `git init` is CORRECT — i.e. the directory is not a repo at all. Every
   // other pool failure happens after that check passed, so init would create a nested repo.
   const [canInitGit, setCanInitGit] = React.useState(false)
+  /**
+   * 按 g 时要在哪儿、做什么。
+   *
+   * null = 不是仓库 → 在 cwd 上 `git init` + 空提交。
+   * 字符串 = 是仓库但没提交 → **只**在这个仓库根上补空提交,绝不 init。
+   */
+  const firstCommitRoot = React.useRef<string | null>(null)
   const [, setInitingGit] = React.useState(false)
   const initingGit = React.useRef(false)
   const [outcome, setOutcome] = React.useState<Outcome | null>(null)
@@ -890,7 +923,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // spec §8's 「允许选择」: carried as its own state so the gate can present it as a
         // decision, instead of a line buried in the prompt-parsing notices.
         setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
-        setCanInitGit(iso.pool ? false : iso.notARepo === true)
+        firstCommitRoot.current = iso.needsFirstCommit === true ? (iso.gitRoot ?? null) : null
+        setCanInitGit(iso.pool ? false : (iso.notARepo === true || iso.needsFirstCommit === true))
         // ALSO recorded in run.md. Replacing the notices.push with component state alone meant
         // the manifest stopped saying the run was un-isolated, while the resume path still did.
         if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
@@ -933,11 +967,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     initingGit.current = true
     setInitingGit(true)
     try {
-      const cwd = getCwd()
-      const init = await gitRunner(['init'], cwd)
-      if (init.code !== 0) {
-        setIsolationReason(`git init 失败: ${(init.stderr || init.stdout).trim() || '未知错误'}`)
-        return
+      /**
+       * 已经是仓库(只是没有提交)时**跳过 git init**。
+       *
+       * init 跑在 cwd 上,而用户可能正站在那个仓库的**子目录**里 —— 在那儿 init 会造出
+       * 一个遮蔽父仓库的嵌套仓库(实测:rev-parse --show-toplevel 从此回答子目录),
+       * 一次按键、无确认、无撤销,代码里也没有任何地方会清理它。
+       */
+      const cwd = firstCommitRoot.current ?? getCwd()
+      if (firstCommitRoot.current === null) {
+        const init = await gitRunner(['init'], cwd)
+        if (init.code !== 0) {
+          setIsolationReason(`git init 失败: ${(init.stderr || init.stdout).trim() || '未知错误'}`)
+          return
+        }
       }
       /**
        * A FIRST COMMIT, because without one `git init` cannot deliver what the key promises.
@@ -965,7 +1008,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       poolRef.current = iso.pool
       setIsolation(iso.pool ? 'worktree' : 'none')
       setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
-      setCanInitGit(iso.pool ? false : iso.notARepo === true)
+      firstCommitRoot.current = iso.needsFirstCommit === true ? (iso.gitRoot ?? null) : null
+        setCanInitGit(iso.pool ? false : (iso.notARepo === true || iso.needsFirstCommit === true))
     } finally {
       initingGit.current = false
       setInitingGit(false)

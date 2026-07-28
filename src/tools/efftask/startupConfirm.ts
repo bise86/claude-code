@@ -666,8 +666,12 @@ export function isolationChoiceLines(reason: string, canInitGit: boolean): strin
     // `rev-parse --show-toplevel` answer /repo/sub, and nothing here ever cleans that up).
     // In those cases the reason above is the actionable thing, so point at it instead of
     // telling someone already inside a repo to find one.
+    // 「不是仓库」和「是仓库但没提交」要说不同的话:对着一个已经在仓库里的人说
+    // 「初始化 git 仓库」,他会以为工具没认出他的仓库,从而不敢按。
     canInitGit
-      ? '想要隔离并行执行,可以按 g 在当前目录初始化 git 仓库(会建一个空提交)后重试。'
+      ? (reason.includes('还没有任何提交')
+          ? '想要隔离并行执行,可以按 g 建一个空提交(仓库已经有了,只差第一个提交)后重试。'
+          : '想要隔离并行执行,可以按 g 在当前目录初始化 git 仓库(会建一个空提交)后重试。')
       : '想要隔离并行执行,需要先解决上面这条原因;也可以取消,处理好之后重新运行 /et。',
   ]
 }

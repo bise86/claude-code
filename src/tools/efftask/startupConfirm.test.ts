@@ -542,6 +542,23 @@ describe('spec §8:非 git 仓库要给用户一个选择,而不是自动降级'
     expect(t).toContain('空提交')
   })
 
+  it('「是仓库但没提交」要说人话 —— 别叫一个已经在仓库里的人去初始化仓库', () => {
+    // 用户实测:「本身就是一个 git 目录仓库,但还是没有并行起来」。这一种以前是死胡同:
+    // notARepo 是 false,于是 g 键根本不出现,而修法和 g 做的事一模一样(补个空提交)。
+    const t = isolationChoiceLines('这个 git 仓库还没有任何提交,建不出集成分支', true).join('\n')
+    expect(t).toContain('按 g')
+    expect(t).toContain('空提交')
+    expect(t).toContain('仓库已经有了')
+    // 对着一个已经在仓库里的人说「初始化 git 仓库」,他会以为工具没认出他的仓库,
+    // 从而不敢按 —— 那这个入口等于没有。
+    expect(t).not.toContain('初始化 git 仓库')
+  })
+
+  it('不是仓库那一种仍然说初始化', () => {
+    const t = isolationChoiceLines('当前目录不是 git 仓库', true).join('\n')
+    expect(t).toContain('初始化 git 仓库')
+    expect(t).not.toContain('仓库已经有了')
+  })
   it('不能初始化时不宣传那个键,改说怎么办', () => {
     // 宣传一个按不动的键,正是这个仓库反复在修的那类问题。
     const text = isolationChoiceLines('r', false).join('\n')

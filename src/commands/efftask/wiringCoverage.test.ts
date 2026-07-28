@@ -97,7 +97,14 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     // initGitAndRetry's re-build), so `toContain` was satisfied by the other one and cutting
     // either left the gate green — measured. Same trap as three identically-worded filters in
     // one file earlier this session.
-    expect(occurrences('setCanInitGit(iso.pool ? false : iso.notARepo === true)')).toBe(2)
+    // 现在两种情况都给 g,但**补救动作不同**:notARepo 在 cwd 上 git init;
+    // 「是仓库但没提交」只在**仓库根**上补空提交,绝不 init —— 用户可能站在子目录里,
+    // 在那儿 init 会造出遮蔽父仓库的嵌套仓库(一次按键、无确认、无撤销)。
+    expect(occurrences('setCanInitGit(iso.pool ? false : (iso.notARepo === true || iso.needsFirstCommit === true))')).toBe(2)
+    expect(occurrences('firstCommitRoot.current = iso.needsFirstCommit === true ? (iso.gitRoot ?? null) : null')).toBe(2)
+    // 跳过 init 的那道守卫是这条不变量的**唯一**执行点。
+    expect(SRC).toContain('if (firstCommitRoot.current === null) {')
+    expect(SRC).toContain("const cwd = firstCommitRoot.current ?? getCwd()")
     expect(SRC).toContain('onInitGit={canInitGit ?')
   })
 
