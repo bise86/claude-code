@@ -38,14 +38,35 @@ export const LOG_COALESCE_MS = 250
 export function useStreamTick(store: StreamStore | undefined, active: boolean): void {
   const [, setTick] = React.useState(0)
   const pending = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const lastAt = React.useRef(0)
   React.useEffect(() => {
     if (!store || !active) return
+    const fire = (): void => {
+      lastAt.current = Date.now()
+      setTick(t => t + 1)
+    }
     const off = store.subscribe(() => {
+      /**
+       * **首个事件立刻上屏**,后续才合批。
+       *
+       * 纯尾部合批(第一版)有个要命的后果:窗口开出来之后要等满一个 250ms 才第一次重绘,
+       * 而「正在解析需求…」那次调用本身可能就几秒甚至更短 —— 屏一换,窗口一次都没画过,
+       * 用户看到的是**全程什么都没有**。这正是「第一关第二关看不到子 TUI」的成因,
+       * 挂载测试复现了它:tick 到期之前 phase 已经走了。
+       *
+       * 前沿触发 + 尾部合批:第一条事件零延迟,连续刷屏仍然按 250ms 收敛。
+       */
+      const now = Date.now()
+      const since = now - lastAt.current
+      if (since >= LOG_COALESCE_MS) { fire(); return }
       if (pending.current) return
       pending.current = setTimeout(() => {
         pending.current = undefined
-        setTick(t => t + 1)
-      }, LOG_COALESCE_MS)
+        fire()
+        // `- since` 不是微调,是这条前沿语义的另一半:写成固定的 LOG_COALESCE_MS,
+        // 一条刚过完合批窗口的事件又要再等满 250ms。变异测试上这两处**必须一起**改回去
+        // 才会变红 —— 只删上面那个 if,这一行照样让首个事件零延迟上屏。
+      }, LOG_COALESCE_MS - since)
     })
     return () => {
       off()

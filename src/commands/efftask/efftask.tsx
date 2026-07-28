@@ -595,6 +595,26 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 老毛病(orchestrator.ts 的注释里记着它已经发生过两次)。
    */
   useStreamTick(streams.current, phase === 'parsing' || phase === 'drafting')
+  /**
+   * 等待屏上「已经等了多久」。
+   *
+   * 这两屏背后各是一次完整的模型调用,起草那次是整个运行里最长的之一。没有秒数的话,
+   * 一屏静止的文字分不出「在读代码」和「卡死了」—— 而这正是这个功能存在的理由。
+   *
+   * 事件驱动的重绘(useStreamTick)在**静默期不会触发**,所以秒数要自己有心跳。
+   */
+  const waiting = phase === 'parsing' || phase === 'drafting'
+  const [waitStart, setWaitStart] = React.useState(() => Date.now())
+  const [waitNow, setWaitNow] = React.useState(() => Date.now())
+  React.useEffect(() => {
+    if (!waiting) return
+    setWaitStart(Date.now())
+    setWaitNow(Date.now())
+    const t = setInterval(() => setWaitNow(Date.now()), 1000)
+    return () => clearInterval(t)
+    // phase 进来一次就重新起表 —— 解析和起草是两段独立的等待,不该续着算。
+  }, [waiting, phase])
+  const waitedSec = Math.max(0, Math.round((waitNow - waitStart) / 1000))
   // 真实列宽。写死 100 的话,80 列终端上表头右半段(运行中/工具数/耗时)会被整段切掉 ——
   // justify() 放不下时退化成 left + ' ' + right,而 truncate-end 是从右边吃的,先没的
   // 正好是状态。80 列是极常见的默认,而 ParsingView 是敲完 /et 看到的第一屏。
@@ -890,6 +910,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 子 agent 实时输出:每次模型调用一条流。缓冲三层有界,长跑不会无限涨;详情
         // 视图在 render 期直接读它。
         openStream: meta => streams.current.open(meta),
+        // 方案环节要知道自己在哪 —— 缺了它,「review 当前目录下的代码」这类目标只能
+        // 照着标题写一句正确的废话(实测:重点/风险点/验收点全空)。
+        cwd: getCwd(),
         // 并行占用 (spec §10.1). One call, storing a live reader for the status bar.
         onPool: read => { poolRead.current = read },
         // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
@@ -987,7 +1010,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         root, config: approved, runAgent: props.runAgent, signal: props.signal, feedback,
         worktrees: poolRef.current,
         // 第三关的窗口。整个运行里最长的单次调用之一,此前是纯黑屏。
+        cwd: getCwd(),
         stream: streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '根方案', label: '主模型', round: redrafts + 1 }),
+        // 空方案自动重拟那一次也有自己的窗口 —— 否则界面上看不出它为什么多花了一倍时间。
+        retryStream: () => streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '根方案(重拟)', label: '主模型', round: redrafts + 1 }),
       })
       if (cancelled) return
       if (res.ok) {
@@ -1212,7 +1238,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'parsing' || !config) {
-    return <ParsingView onCancel={bail} log={preStreams()} columns={termColumns} />
+    return <ParsingView onCancel={bail} log={preStreams()} columns={termColumns} waited={waitedSec} />
   }
   if (phase === 'confirmResume' && summary) {
     return <ConfirmResume
@@ -1258,7 +1284,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return (
       <MessageView
         title="高效任务模式 · 第三关"
-        body={redrafts > 0 ? '正在按你的意见重拟根方案与首层任务树…' : '正在起草根方案与首层任务树…'}
+        body={`${redrafts > 0 ? '正在按你的意见重拟根方案与首层任务树…' : '正在起草根方案与首层任务树…'}(已等待 ${waitedSec}s)`}
         tone="dim"
         onDismiss={bail}
         log={preStreams()}
@@ -1301,7 +1327,7 @@ function MessageView(props: {
       <Text bold>{props.title}</Text>
       <Text color={props.tone === 'error' ? 'error' : undefined} dimColor={props.tone === 'dim'}>{props.body}</Text>
       {props.log && props.log.length > 0 ? (
-        <AgentLogPane streams={props.log} height={10} width={props.columns ?? 100} isActive={false} />
+        <AgentLogPane streams={props.log} height={10} width={props.columns ?? 100} isActive />
       ) : null}
       <Text dimColor>回车 / q / Esc 退出</Text>
     </Box>
@@ -1309,16 +1335,16 @@ function MessageView(props: {
 }
 
 // 'parsing' phase: the extraction model call is in flight. Esc/q must work here too.
-function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[]; columns?: number }): React.ReactElement {
+function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[]; columns?: number; waited?: number }): React.ReactElement {
   useInput((input, key) => {
     if (key.escape || input.toLowerCase() === 'q') props.onCancel()
   })
   return (
     <Box flexDirection="column">
-      <Text dimColor>正在解析需求…</Text>
+      <Text dimColor>正在解析需求…{props.waited !== undefined ? `(已等待 ${props.waited}s)` : ''}</Text>
       {/* 这一屏是用户敲完 /et 看到的**第一屏**,背后是一次真实的模型调用。 */}
       {props.log && props.log.length > 0 ? (
-        <AgentLogPane streams={props.log} height={8} width={props.columns ?? 100} isActive={false} />
+        <AgentLogPane streams={props.log} height={8} width={props.columns ?? 100} isActive />
       ) : null}
       <Text dimColor>Esc/q 取消</Text>
     </Box>

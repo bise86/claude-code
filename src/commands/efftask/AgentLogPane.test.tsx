@@ -11,8 +11,8 @@
 import { describe, expect, it } from 'bun:test'
 import * as React from 'react'
 import { EventEmitter } from 'node:events'
-import { render } from '../../ink.js'
-import { AgentLogPane } from './AgentLogPane.js'
+import { render, Text } from '../../ink.js'
+import { AgentLogPane, useStreamTick } from './AgentLogPane.js'
 import type { AgentEvent } from '../../tools/efftask/agentEvents.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
 
@@ -248,6 +248,33 @@ describe('AgentLogPane 的边界', () => {
   it('resume 的历史节点即使没有流也说实话', async () => {
     const { t, app } = await mount({ streams: [], historical: true })
     expect(t.lastFrame()).toContain('上一次运行')
+    app.unmount()
+  })
+})
+
+describe('useStreamTick:首个事件要立刻上屏', () => {
+  it('前沿触发 —— 纯尾部合批会让短调用全程什么都不显示', async () => {
+    // 第一版是纯尾部合批:窗口开出来之后要等满一个 250ms 才第一次重绘,而「正在解析
+    // 需求…」那次调用本身可能就几秒甚至更短 —— 屏一换,窗口一次都没画过。挂载测试
+    // 复现过这个:tick 到期之前 phase 已经走了。
+    const { createStreamStore } = await import('../../tools/efftask/agentStream.js')
+    const store = createStreamStore()
+    let repaints = 0
+    const Probe = (): React.ReactElement => {
+      useStreamTick(store, true)
+      repaints++
+      return React.createElement(Text, null, `r${repaints}`)
+    }
+    const t = fakeTty()
+    const app = await render(React.createElement(Probe), {
+      stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false,
+    })
+    await tick()
+    const before = repaints
+    store.open({ nodeId: 'n', phaseLabel: '需求解析', label: '主模型' }).push({ kind: 'text', text: '第一条' })
+    // 只等几个宏任务,远小于 250ms 的合批窗口
+    await tick()
+    expect(`立刻重绘了: ${repaints > before}`).toBe('立刻重绘了: true')
     app.unmount()
   })
 })

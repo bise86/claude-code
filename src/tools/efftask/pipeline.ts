@@ -87,6 +87,12 @@ export interface PipelineCtx {
    */
   openStream?: (meta: StreamMeta) => StreamHandle
   /**
+   * 方案环节告诉模型「你在哪」用的工作目录。见 PlanPromptCtx.cwd。
+   *
+   * 不是给子 agent 换 cwd 的(那是 req.cwd 的事),只进提示词 —— 方案环节读的是主工作树。
+   */
+  cwd?: string
+  /**
    * 全局并发池 (spec §6): "评审/验收的多角色调用…受同一全局池约束,避免总并发爆炸".
    *
    * The step already holds a slot; the roundtable's extra reviewers lease from the same pool,
@@ -314,7 +320,16 @@ function exhaustionCategory(rec: RoundtableRecord): BlockCategory {
  * a shared tree the execute phase is serialised, so that advice would be describing a hazard
  * the run cannot have.
  */
-export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId' | 'worktrees'>
+export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId' | 'worktrees'> & {
+  /**
+   * 方案环节看到的工作目录。
+   *
+   * 缺了它,「认真 review 下当前目录下的代码」这类目标的方案作者**根本不知道自己在哪**
+   * —— 实测产出是一句「对 X 项目进行全面的代码审查」,重点/风险点/验收点全空。它有
+   * Read/Glob/Grep,只是没人告诉它该用、也没告诉它对着哪个目录用。
+   */
+  cwd?: string
+}
 
 // A node with deps must SEE what its dependencies produced, otherwise it replans from
 // scratch and redoes upstream work.
@@ -434,6 +449,9 @@ export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feed
   return (
     brief +
     `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
+    // 「在哪」和「可以看」。这两句缺席时,方案作者只能照着标题写一句正确的废话。
+    (ctx.cwd ? `工作目录:${quote(ctx.cwd)}\n` : '') +
+    `你有 Read / Glob / Grep,**先真的去看代码,再定方案** —— 不要只凭任务标题推测。\n` +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
     // The depth budget lives IN THE PROMPT so the model self-limits, instead of us
@@ -477,7 +495,15 @@ export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feed
         `不必为了躲冲突牺牲并行。\n`
       : '') +
     `请输出一个 json 代码块:{ "kind":"decompose"|"executable", "solution", "keyPoints", "risks", "acceptance", "children":[{"title","deps":["兄弟标题"]}] }。` +
-    `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。` +
+    `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。\n` +
+    // 四个字段此前只在 schema 里出现过名字,没说要什么 —— 于是模型只填 solution,其余
+    // 三个返回空串,而解析层默认成 ''、关口照样渲染成「(空)」。空的验收点尤其糟:
+    // 验收环节拿它当判据。
+    `四个字段都不许留空,各写具体内容:\n` +
+    `- solution:怎么做,分几步,每步动到哪些文件/模块。不要复述目标。\n` +
+    `- keyPoints:执行时最容易做错或做漏的地方。\n` +
+    `- risks:这么做可能破坏什么、哪些地方不确定。\n` +
+    `- acceptance:**可检验**的完成标准(跑什么命令、看到什么结果、改了哪些文件),验收环节按它判。\n` +
     answerRule(tag)
   )
 }

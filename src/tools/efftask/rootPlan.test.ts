@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { applyRootDraft, buildRootPlanNoticeCard, childLines, draftBlockers, draftRootPlan, makeRootNode, rootTitle, type RootDraft } from './rootPlan.js'
+import { applyRootDraft, buildRootPlanNoticeCard, childLines, draftBlockers, planGaps, draftRootPlan, makeRootNode, rootTitle, type RootDraft } from './rootPlan.js'
 import { EffTaskOrchestrator } from './orchestrator.js'
 import { PipelineCtx, stepStart } from './pipeline.js'
 import { byIdMap } from './stateMachine.js'
@@ -24,7 +24,7 @@ function ctxFor(nodes: TaskNode[], runAgent: RunAgentFn, config = cfg()): Pipeli
 }
 
 const PLAN_REPLY =
-  '```json\n{"kind":"decompose","solution":"三步走","keyPoints":"要点","risks":"风险","acceptance":"验收点",' +
+  '```json\n{"kind":"decompose","solution":"三步走:先设计接口,再实现服务,最后补集成测试并接上回调验签","keyPoints":"要点","risks":"风险","acceptance":"验收点",' +
   '"children":[{"title":"设计接口","deps":[]},{"title":"实现服务","deps":["设计接口"]}]}\n```'
 
 describe('根方案关口 · 起草', () => {
@@ -35,7 +35,7 @@ describe('根方案关口 · 起草', () => {
     expect(res.ok).toBe(true)
     if (!res.ok) return
     expect(res.draft.kind).toBe('decompose')
-    expect(res.draft.plan.solution).toBe('三步走')
+    expect(res.draft.plan.solution).toContain('三步走')
     expect(res.draft.plan.acceptance).toBe('验收点')
     expect(res.draft.children.map(c2 => c2.title)).toEqual(['设计接口', '实现服务'])
     // Only the first level: nothing here creates grandchildren.
@@ -60,7 +60,7 @@ describe('根方案关口 · 起草', () => {
     root.plan = { solution: '上一版方案文本', keyPoints: '', risks: '', acceptance: '' }
     let seen = ''
     await draftRootPlan({
-      root, config: c, runAgent: async req => { seen = req.prompt; return PLAN_REPLY },
+      root, config: c, runAgent: async req => { if (!seen) seen = req.prompt; return PLAN_REPLY },
       signal: new AbortController().signal, feedback: '拆成三步,把测试单独拆出来',
     })
     expect(seen).toContain('拆成三步,把测试单独拆出来')
@@ -240,7 +240,7 @@ describe('根方案关口 · 确认后真的生效', () => {
 
 describe('根方案关口 · 任务树渲染', () => {
   it('names each child and its sibling dependencies', () => {
-    const lines = childLines({ kind: 'decompose', plan: emptyPlan(), children: [
+    const lines = childLines({ kind: 'decompose', plan: fullPlan(), children: [
       { title: '设计接口', deps: [] }, { title: '实现服务', deps: ['设计接口'] },
     ] })
     expect(lines[0]).toContain('1. 设计接口')
@@ -251,7 +251,7 @@ describe('根方案关口 · 任务树渲染', () => {
   it('flags a dependency that names no sibling, because the run will DROP it', () => {
     // createChildren silently discards a dep whose title matches no sibling. This gate is
     // the only place a human can see the ordering they think they approved is not real.
-    const lines = childLines({ kind: 'decompose', plan: emptyPlan(), children: [
+    const lines = childLines({ kind: 'decompose', plan: fullPlan(), children: [
       { title: 'A', deps: ['不存在的任务'] }, { title: 'B', deps: ['B'] },
     ] })
     expect(lines[0]).toContain('无效依赖(将被忽略): 不存在的任务')
@@ -259,7 +259,7 @@ describe('根方案关口 · 任务树渲染', () => {
   })
 
   it('says so when the plan does not decompose at all', () => {
-    expect(childLines({ kind: 'executable', plan: emptyPlan(), children: [] })).toEqual(['(不拆分,根任务直接执行)'])
+    expect(childLines({ kind: 'executable', plan: fullPlan(), children: [] })).toEqual(['(不拆分,根任务直接执行)'])
   })
 })
 
@@ -306,31 +306,39 @@ describe('根方案确认记录:不能变成"批准了一棵空树"', () => {
   })
 })
 
+/** 一份**填满了**的方案。此前这些用例用 emptyPlan(),而空方案现在自己就是一条告警。 */
+const fullPlan = () => ({
+  solution: '分三步:先读 src/ 下的入口文件理清模块边界,再逐个模块看错误处理与边界条件,最后汇总成一份问题清单',
+  keyPoints: '不要只看命名',
+  risks: '可能漏掉动态加载的模块',
+  acceptance: '产出一份带文件行号的问题清单,且每条都能复现',
+})
+
 describe('draftBlockers:整批被退回的两种草稿', () => {
   it('标题重复', () => {
-    const b = draftBlockers({ kind: 'decompose', plan: emptyPlan(), children: [
+    const b = draftBlockers({ kind: 'decompose', plan: fullPlan(), children: [
       { title: 'A', deps: [] }, { title: 'A', deps: [] }, { title: 'B', deps: [] },
     ] })
     expect(b.join()).toContain('子任务标题重复(A)')
   })
   it('依赖成环', () => {
-    const b = draftBlockers({ kind: 'decompose', plan: emptyPlan(), children: [
+    const b = draftBlockers({ kind: 'decompose', plan: fullPlan(), children: [
       { title: 'A', deps: ['B'] }, { title: 'B', deps: ['C'] }, { title: 'C', deps: ['A'] },
     ] })
     expect(b.join()).toContain('依赖成环')
   })
   it('正常的树没有告警', () => {
-    expect(draftBlockers({ kind: 'decompose', plan: emptyPlan(), children: [
+    expect(draftBlockers({ kind: 'decompose', plan: fullPlan(), children: [
       { title: 'A', deps: [] }, { title: 'B', deps: ['A'] },
     ] })).toEqual([])
   })
   it('自依赖不算环 —— createChildren 只是把那条边丢掉', () => {
     // childLines already flags it as 无效依赖; calling it a cycle would double-report and
     // over-state the consequence (an edge is lost, not the whole batch).
-    expect(draftBlockers({ kind: 'decompose', plan: emptyPlan(), children: [{ title: 'A', deps: ['A'] }] })).toEqual([])
+    expect(draftBlockers({ kind: 'decompose', plan: fullPlan(), children: [{ title: 'A', deps: ['A'] }] })).toEqual([])
   })
   it('起草失败时任务树那一段不假装做过决定', () => {
-    expect(childLines({ kind: 'unknown', plan: emptyPlan(), children: [] }, false))
+    expect(childLines({ kind: 'unknown', plan: fullPlan(), children: [] }, false))
       .toEqual(['(未能起草,运行时由 plan 角色重新拆分)'])
   })
 })
@@ -375,7 +383,7 @@ describe('第三关的飞书通知卡', () => {
   })
 
   it('a failed draft says so instead of showing an empty plan as if it were one', () => {
-    const { text } = body({ draft: { kind: 'unknown', plan: emptyPlan(), children: [] }, drafted: false })
+    const { text } = body({ draft: { kind: 'unknown', plan: fullPlan(), children: [] }, drafted: false })
     expect(text).toContain('未能起草根方案')
     expect(text).toContain('未能起草,运行时由 plan 角色重新拆分')
     expect(text).not.toContain('不拆分,根任务直接执行')
@@ -459,5 +467,112 @@ describe('第三关起草时要用和 run 一样的隔离规则', () => {
     const root = makeRootNode(cfg(), NOW)
     await draftRootPlan({ root, config: cfg(), runAgent, signal: new AbortController().signal })
     expect(prompts[0]).not.toContain('合并冲突')
+  })
+})
+
+describe('空方案不能被当成方案端给用户', () => {
+  const plan = (over: Record<string, string> = {}) => ({
+    solution: '分三步:先读 src/ 下的入口文件理清模块边界,再逐个模块看错误处理,最后汇总问题清单',
+    keyPoints: '不要只看命名', risks: '可能漏掉动态加载的模块', acceptance: '产出带行号的问题清单',
+    ...over,
+  })
+
+  it('填满的方案没有告警', () => {
+    expect(planGaps(plan())).toEqual([])
+  })
+
+  it('四个字段各自空着都要报', () => {
+    expect(planGaps(plan({ solution: '' })).join()).toContain('完整方案是空的')
+    expect(planGaps(plan({ keyPoints: '  ' })).join()).toContain('重点是空的')
+    expect(planGaps(plan({ risks: '' })).join()).toContain('风险点是空的')
+    // 验收点要说清后果:验收环节拿它当判据。
+    expect(planGaps(plan({ acceptance: '' })).join()).toContain('验收环节拿它当判据')
+  })
+
+  it('一句复述目标的「方案」也算空', () => {
+    // 实测产出:「对 X 项目进行全面的代码审查,涵盖架构、安全、性能……」—— 一句正确的
+    // 废话,长度刚好不为零,而三个字段全空。只判空串挡不住它。
+    const g = planGaps(plan({ solution: '对项目进行全面的代码审查' }))
+    expect(g.join()).toContain('基本等于复述目标')
+  })
+
+  it('用户实测那一版会被整条报出来', () => {
+    const g = planGaps({
+      solution: '对 3d-print-web 项目进行全面的代码审查,涵盖架构设计、安全性、性能优化、代码质量、最佳实践等多个维度',
+      keyPoints: '', risks: '', acceptance: '',
+    })
+    expect(g).toHaveLength(3)          // solution 够长,其余三个空
+    expect(g.join()).toContain('重点')
+    expect(g.join()).toContain('风险点')
+    expect(g.join()).toContain('验收点')
+  })
+
+  it('第三关会把这些当阻断项列出来', () => {
+    const b = draftBlockers({ kind: 'executable', plan: { solution: '', keyPoints: '', risks: '', acceptance: '' }, children: [] })
+    expect(b.length).toBeGreaterThanOrEqual(4)
+  })
+})
+
+describe('空方案自动重拟一次', () => {
+  const EMPTY = '```json\n{"kind":"executable","solution":"对项目做全面审查","keyPoints":"","risks":"","acceptance":""}\n```'
+  const FULL = '```json\n{"kind":"executable","solution":"分三步:先读 src 入口理清模块边界,再逐模块看错误处理,最后汇总清单",' +
+    '"keyPoints":"别只看命名","risks":"可能漏掉动态加载","acceptance":"产出带行号的清单"}\n```'
+
+  it('第一版是空的就自己再要一次,不把「(空)」端给用户', async () => {
+    const root = makeRootNode(cfg(), NOW)
+    const prompts: string[] = []
+    const res = await draftRootPlan({
+      root, config: cfg(), signal: new AbortController().signal,
+      runAgent: async req => { prompts.push(req.prompt); return prompts.length === 1 ? EMPTY : FULL },
+    })
+    expect(prompts).toHaveLength(2)
+    // 第二次要带着「哪里不合格」,否则模型没有理由写得不一样
+    expect(prompts[1]).toContain('上一版方案不合格')
+    expect(prompts[1]).toContain('重点是空的')
+    expect(res.ok && res.draft.plan.keyPoints).toBe('别只看命名')
+  })
+
+  it('只重拟一次 —— 再空也不再烧钱', async () => {
+    const root = makeRootNode(cfg(), NOW)
+    let calls = 0
+    const res = await draftRootPlan({
+      root, config: cfg(), signal: new AbortController().signal,
+      runAgent: async () => { calls++; return EMPTY },
+    })
+    expect(calls).toBe(2)
+    // 如实端出去,关口会把空字段逐条列清楚
+    expect(res.ok && planGaps(res.draft.plan).length).toBeGreaterThan(0)
+  })
+
+  it('重拟更差就保留第一版', async () => {
+    const root = makeRootNode(cfg(), NOW)
+    const WORSE = '```json\n{"kind":"executable","solution":"","keyPoints":"","risks":"","acceptance":""}\n```'
+    let n = 0
+    const res = await draftRootPlan({
+      root, config: cfg(), signal: new AbortController().signal,
+      runAgent: async () => { n++; return n === 1 ? EMPTY : WORSE },
+    })
+    expect(res.ok && res.draft.plan.solution).toBe('对项目做全面审查')
+  })
+
+  it('方案已经填满时不多花一次调用', async () => {
+    const root = makeRootNode(cfg(), NOW)
+    let calls = 0
+    await draftRootPlan({
+      root, config: cfg(), signal: new AbortController().signal,
+      runAgent: async () => { calls++; return FULL },
+    })
+    expect(calls).toBe(1)
+  })
+
+  it('提示词里写清了工作目录 —— 「当前目录下的代码」得知道是哪个目录', async () => {
+    const root = makeRootNode(cfg(), NOW)
+    let seen = ''
+    await draftRootPlan({
+      root, config: cfg(), signal: new AbortController().signal, cwd: '/home/me/3d-print-web',
+      runAgent: async req => { if (!seen) seen = req.prompt; return FULL },
+    })
+    expect(seen).toContain('/home/me/3d-print-web')
+    expect(seen).toContain('先真的去看代码')
   })
 })

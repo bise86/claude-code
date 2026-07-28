@@ -48,6 +48,7 @@ export async function runOrchestrator(
     onBlocked?: PipelineCtx['onBlocked']
     /** 子 agent 实时输出 (spec §10.2): streamed per node, for the detail view. */
     openStream?: PipelineCtx['openStream']
+    cwd?: PipelineCtx['cwd']
     /** 并行占用 (spec §10.1): called ONCE with a live reader for the status bar. */
     onPool?: (read: () => { inUse: number; limit: number }) => void
     /**
@@ -173,6 +174,7 @@ export async function runOrchestrator(
         onEscalate: args.onEscalate,
         onBlocked: args.onBlocked,
         openStream: args.openStream,
+        cwd: args.cwd,
         onUpdate: nodes => {
           setNodes([...nodes])
           touch(nodes)

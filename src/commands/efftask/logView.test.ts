@@ -426,3 +426,12 @@ describe('思考:默认折成段数,但要给得出来', () => {
     expect(logPaneAction('ttt', key())).toEqual({ t: 'toggleThinking' })
   })
 })
+
+describe('鼠标滚轮', () => {
+  it('滚轮上下各走三行', () => {
+    // 能不能收到取决于终端有没有开鼠标追踪(这个 fork 默认非全屏,不开)。接上它零成本,
+    // 开了的场景就能用;不接的话,开了也白开。
+    expect(logPaneAction('', key({ wheelUp: true }))).toEqual({ t: 'line', d: -3 })
+    expect(logPaneAction('', key({ wheelDown: true }))).toEqual({ t: 'line', d: 3 })
+  })
+})

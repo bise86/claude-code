@@ -45,6 +45,20 @@ const realCwd = await import('../../utils/cwd.js')
 const TMP = mkdtempSync(join(tmpdir(), 'et-mount-'))
 mock.module('../../utils/cwd.js', () => ({ ...realCwd, getCwd: () => TMP }))
 
+/**
+ * 假的子 agent。抽取那一次调用是**真的模型调用**,不接管它的话这个文件永远测不到
+ * 「窗口里有没有东西」—— 而用户的抱怨正是第一屏什么都看不见。
+ */
+const realRunAgent = await import('../../tools/AgentTool/runAgent.js')
+mock.module('../../tools/AgentTool/runAgent.js', () => ({
+  ...realRunAgent,
+  async *runAgent() {
+    yield { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'README.md' } }] } }
+    yield { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: '读到了' }] } }
+    yield { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: "```json\n{}\n```" }] } }
+  },
+}))
+
 const { render } = await import('../../ink.js')
 const { call } = await import('./efftask.js')
 const { AppStateProvider } = await import('../../state/AppState.js')
@@ -193,6 +207,26 @@ describe('MCP 工具要一路走到关口上', () => {
     const { tty, app } = await mount('把 README 翻译成英文', {}, [{ name: 'Read' }])
     await tick(10)
     expect(`误报 MCP: ${strip(tty.frames()).includes('MCP工具:')}`).toBe('误报 MCP: false')
+    app.unmount()
+  })
+})
+
+describe('第一屏就要看得见模型在干什么', () => {
+  it('解析需求那一屏挂着实时窗口,并且在数秒数', async () => {
+    // 用户实测:第一关/第二关看不到任何子 TUI 终端。这一屏背后是一次**真实的模型调用**
+    // (parseDirectives 的抽取),此前它是一屏静止的「正在解析需求…」——分不出在读代码
+    // 还是卡死了。窗口靠 useStreamTick 重绘,秒数靠自己的 1s 心跳(事件驱动的重绘在
+    // 静默期不触发,而这一屏的常态就是静默)。
+    const { tty, app } = await mount('把 README 翻译成英文', {})
+    await tick(10)
+    const f = strip(tty.frames())
+    expect(`这一屏在数秒数: ${/已等待\s*\d+s/.test(f)}`).toBe('这一屏在数秒数: true')
+    // 而且窗口里真的有东西 —— 「屏在」和「窗口里有内容」是两件事,只测前者会漏掉
+    // 「挂上去了但它是死的」那一类(这个文件的存在理由就是这类)。
+    // 「屏在」和「窗口里有东西」是两件事,只测前者会漏掉「挂上去了但它是死的」——
+    // 这个文件的存在理由就是这一类。断言窗口的表头真的画出来了,而且数到了工具调用。
+    expect(`窗口出现了: ${f.includes('需求解析')}`).toBe('窗口出现了: true')
+    expect(`窗口数到了工具调用: ${/\d+\s*工具/.test(f)}`).toBe('窗口数到了工具调用: true')
     app.unmount()
   })
 })

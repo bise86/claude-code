@@ -44,6 +44,7 @@ export interface OrchestratorDeps {
    * were therefore dead in every real run while their unit tests passed over the cut wire.
    */
   openStream?: PipelineCtx['openStream']
+  cwd?: PipelineCtx['cwd']
   runAgent: RunAgentFn
   persist: (n: TaskNode) => Promise<void>
   now: () => string
@@ -144,6 +145,7 @@ export class EffTaskOrchestrator {
       onBlocked: this.deps.onBlocked,
       runId: this.deps.runId,
       openStream: this.deps.openStream,
+      cwd: this.deps.cwd,
       slots: this.slots,
       byId: this.byId,
       runAgent: this.deps.runAgent,

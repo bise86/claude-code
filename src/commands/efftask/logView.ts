@@ -288,6 +288,10 @@ export function logPaneAction(input: string, key: Key): PaneAction | null {
   if (key.tab) return { t: 'nextStream' }
   if (key.upArrow) return { t: 'line', d: -1 }
   if (key.downArrow) return { t: 'line', d: 1 }
+  // 鼠标滚轮。**能不能收到取决于终端有没有开鼠标追踪**(这个 fork 默认非全屏,不开)——
+  // 接上它零成本,开了的场景就能用;没开的场景键盘照旧。不接的话,开了也白开。
+  if (key.wheelUp) return { t: 'line', d: -3 }
+  if (key.wheelDown) return { t: 'line', d: 3 }
   if (key.pageUp) return { t: 'halfPage', d: -1 }
   if (key.pageDown) return { t: 'halfPage', d: 1 }
   if (key.home) return { t: 'top' }

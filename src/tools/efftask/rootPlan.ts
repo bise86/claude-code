@@ -84,6 +84,8 @@ export async function draftRootPlan(args: {
    * without the constraint the run then enforces.
    */
   worktrees?: PlanPromptCtx['worktrees']
+  /** 告诉方案作者「你在哪」。缺了它,它只能照着标题写一句正确的废话。 */
+  cwd?: string
   /**
    * 第三关的实时窗口。
    *
@@ -91,12 +93,14 @@ export async function draftRootPlan(args: {
    * 用户面对的是一屏纯文字的「正在起草根方案…」,不知道模型是在读文件还是卡死了。
    */
   stream?: StreamHandle
+  /** 自动重拟那一次的窗口。工厂函数:一次调用一个句柄。 */
+  retryStream?: () => StreamHandle
 }): Promise<DraftResult> {
   const { root, config, runAgent, signal } = args
   const tag = answerTag(ANSWER_TAGS.plan)
   // byId holds only the root: it has no deps and no children yet, so depsSection renders
   // empty — the same string the run's first plan call would produce.
-  const ctx = { config, byId: new Map([[root.id, root]]), worktrees: args.worktrees }
+  const ctx = { config, byId: new Map([[root.id, root]]), worktrees: args.worktrees, cwd: args.cwd }
   let text: string
   try {
     text = await runAgent({
@@ -114,7 +118,33 @@ export async function draftRootPlan(args: {
   // An abort observed after the call must not be reported as a plan: the user is bailing
   // out, and rendering a gate for a run they just cancelled is worse than saying nothing.
   if (signal.aborted) return { ok: false, reason: '已中断' }
-  const parsed = parsePlanOutput(text, tag)
+  let parsed = parsePlanOutput(text, tag)
+  /**
+   * 空方案**自动重拟一次**,不要端给用户。
+   *
+   * 实测第一版产出:一句「对 X 项目进行全面的代码审查」,重点/风险点/验收点全空 ——
+   * 而第三关把它原样渲染成「(空)」。让用户按 e 手动提意见,等于把「模型偷懒了」这件事
+   * 转嫁给用户去发现。一次就够:再空就如实端出去,并由 draftBlockers 在关口上列清楚,
+   * 免得无限重试烧钱。
+   */
+  const gaps = planGaps(parsed.plan)
+  if (gaps.length > 0 && !signal.aborted) {
+    const retryTag = answerTag(ANSWER_TAGS.plan)
+    try {
+      const again = await runAgent({
+        phase: 'plan', node: root, role: config.phaseRoles.plan[0] ?? null, system: 'plan',
+        prompt: planPrompt(root, ctx, retryTag, `上一版方案不合格:${gaps.join(';')}。请重写,四个字段都要有具体内容。`),
+        signal, stream: args.retryStream?.(),
+      })
+      if (!signal.aborted) {
+        const re = parsePlanOutput(again, retryTag)
+        // 只在**确实变好**时采用:重拟更差的话,拿第一版反而不至于更糟。
+        if (planGaps(re.plan).length < gaps.length) parsed = re
+      }
+    } catch {
+      // 重拟失败就用第一版 —— 关口会把空字段列出来,用户仍然看得见真相。
+    }
+  }
   return { ok: true, draft: { kind: parsed.kind, plan: parsed.plan, children: parsed.children } }
 }
 
@@ -188,8 +218,43 @@ export function buildRootPlanNoticeCard(args: {
  * Distinct from the per-child 无效依赖 warning below: that one loses an edge, this one loses
  * everything. The gate is the only place a human can see it coming.
  */
+/**
+ * 一份方案里**空着**的字段。
+ *
+ * 实测:目标「认真 review 下当前目录下的代码」产出的根方案是一句
+ * 「对 X 项目进行全面的代码审查,涵盖架构、安全、性能……」,重点/风险点/验收点**全空**,
+ * 而第三关把它原样渲染成「(空)」端给用户看,像那就是方案本身。
+ *
+ * 空的验收点尤其糟:验收环节拿它当判据 —— 判据是空的,那一关就只能凭执行者的自述。
+ *
+ * 这里只做**检测**,不改判定。判定归评审和用户。
+ */
+/**
+ * 「方案」短到这个程度就只能是一句话,不是方案。
+ *
+ * 20 而不是 40:用户实测那一版 solution 有五十多字(「对 X 项目进行全面的代码审查,
+ * 涵盖架构设计、安全性……」),**长度根本挡不住它** —— 真正挡住它的是另外三个字段全空。
+ * 所以这条只当粗筛,拦「三步走」那种三个字的,阈值定高只会误伤小任务的短方案。
+ */
+export const MIN_SOLUTION_CHARS = 20
+
+export function planGaps(plan: { solution: string; keyPoints: string; risks: string; acceptance: string }): string[] {
+  const out: string[] = []
+  const blank = (s: string): boolean => typeof s !== 'string' || s.trim().length === 0
+  if (blank(plan.solution)) out.push('完整方案是空的')
+  else if (Array.from(plan.solution.trim()).length < MIN_SOLUTION_CHARS) {
+    out.push(`完整方案只有 ${Array.from(plan.solution.trim()).length} 个字,基本等于复述目标`)
+  }
+  if (blank(plan.keyPoints)) out.push('重点是空的')
+  if (blank(plan.risks)) out.push('风险点是空的')
+  if (blank(plan.acceptance)) out.push('验收点是空的 —— 验收环节拿它当判据,空的就只能凭执行者自述')
+  return out
+}
+
 export function draftBlockers(draft: RootDraft): string[] {
   const out: string[] = []
+  // 方案本身是不是空的,排在依赖问题前面 —— 一份空方案上讨论子任务依赖没有意义。
+  out.push(...planGaps(draft.plan))
   const titles = draft.children.map(c => c.title)
   const dupes = [...new Set(titles.filter((t, i) => titles.indexOf(t) !== i))]
   if (dupes.length > 0) out.push(`子任务标题重复(${dupes.join('、')})——依赖只能按标题引用,这会让整批子任务被退回重拟`)
