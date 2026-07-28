@@ -211,9 +211,33 @@ describe('briefOfToolUse —— 像真实终端那一行', () => {
     expect(briefOfToolUse('SomeTool', { n: 1 })).toBe('SomeTool')
   })
 
-  it('优先用注入的解析器(工具自己的 userFacingName)', () => {
-    const brief = briefOfToolUse('Read', { file_path: 'a.ts' }, () => '注入的摘要')
-    expect(brief).toBe('Read(注入的摘要)')
+  it('注入的是**标签**,参数仍然来自输入 —— 这条原来编码的就是那个 bug', () => {
+    // 旧断言是 'Read(注入的摘要)':把 resolve() 的结果当成括号里的内容。
+    // 而 resolve 接的是各工具的 userFacingName(input),它返回的是**工具显示名**
+    // (FileReadTool 返回 'Read',BashTool 返回 'Bash')—— 非空,于是一路短路,
+    // 静态表根本轮不到跑。用户看到的就是一串没有文件名的 Read、没有命令的 Bash。
+    expect(briefOfToolUse('Read', { file_path: 'a.ts' }, () => '注入的摘要'))
+      .toBe('注入的摘要(a.ts)')
+  })
+
+  it('工具改了显示名时,标签跟着改而参数不丢', () => {
+    // 读方案文件时 FileReadTool 的 userFacingName 返回 'Reading Plan'。
+    expect(briefOfToolUse('Read', { file_path: '/plans/x.md' }, () => 'Reading Plan'))
+      .toBe('Reading Plan(/plans/x.md)')
+  })
+
+  it('userFacingName 只回工具名时,和没有解析器一样有参数', () => {
+    // 这是**多数**工具的形态,也是用户实际踩到的那一种。
+    expect(briefOfToolUse('Read', { file_path: 'src/a.ts' }, () => 'Read'))
+      .toBe('Read(src/a.ts)')
+    expect(briefOfToolUse('Bash', { command: 'bun test' }, () => 'Bash'))
+      .toBe('Bash(bun test)')
+  })
+
+  it('标签里已经含了参数就不重复', () => {
+    // 有些工具会把路径拼进显示名,直接追加会得到 'Read src/a.ts(src/a.ts)'。
+    expect(briefOfToolUse('Read', { file_path: 'src/a.ts' }, () => 'Read src/a.ts'))
+      .toBe('Read src/a.ts')
   })
 
   it('注入的解析器抛了,落回静态表而不是带走这次调用', () => {

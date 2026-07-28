@@ -152,22 +152,37 @@ function staticBrief(name: string, input: unknown): string {
 
 /** `Read(src/a.ts)` / `Bash(bun test)` / 没有可用参数时就是工具名本身。永不抛。 */
 export function briefOfToolUse(name: string, input: unknown, resolve?: BriefResolver): string {
+  /**
+   * 注入的那个东西是**标签**,不是参数。
+   *
+   * 第一版把 resolve() 的结果直接当成括号里的内容,而它接的是各工具的
+   * `userFacingName(input)` —— 那个函数返回的是**工具的显示名**:FileReadTool 返回
+   * 'Read',BashTool 返回 'Bash'。非空,于是它一路短路,**静态表(它才提取 file_path /
+   * command)根本轮不到跑**。用户看到的就是一串没有文件名的 Read 和没有命令的 Bash。
+   *
+   * 这是一类问题而不是两个个案:凡是 userFacingName 不看输入的工具都这样,而那是多数。
+   * 所以修法也必须是通用的 —— 标签归标签,参数归静态表,两边各取所长:
+   *   - 标签保留工具自己的改写(读方案文件时是「Reading Plan」,sed 原地改写渲染成文件编辑)
+   *   - 参数永远来自输入本身,而静态表最后还有一条「第一个非空字符串属性」的兜底,
+   *     所以没进过表的工具(含 mcp__*)也拿得到东西
+   */
+  let label = name
   try {
-    if (resolve) {
-      const injected = resolve(name, input)
-      if (typeof injected === 'string' && injected.trim().length > 0) {
-        const line = briefValue(injected)
-        if (line) return `${name}(${line})`
-      }
+    const injected = resolve?.(name, input)
+    if (typeof injected === 'string' && injected.trim().length > 0) {
+      const line = briefValue(injected)
+      if (line) label = line
     }
   } catch {
-    // 工具自己的 userFacingName 在畸形输入上抛了。落到静态表,不要带走这次调用。
+    // 工具自己的 userFacingName 在畸形输入上抛了。用原始工具名当标签,继续取参数。
   }
   try {
     const arg = staticBrief(name, input)
-    return arg ? `${name}(${arg})` : name
+    // 标签里已经含了这个参数就不再重复 —— 有些工具的 userFacingName 会把路径拼进名字,
+    // 直接追加会得到 `Read src/a.ts(src/a.ts)`。
+    return arg && !label.includes(arg) ? `${label}(${arg})` : label
   } catch {
-    return name
+    return label
   }
 }
 
