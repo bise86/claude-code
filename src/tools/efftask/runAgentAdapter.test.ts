@@ -870,11 +870,56 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     expect(() => control.cancelNode('root')).not.toThrow()
   })
 
+  it('取消一次**在飞中**的调用,真的把它的信号 abort 掉', async () => {
+    // 只断言错误名的话,把整条 registerCall 删光照样绿 —— 那个错是最后 wasCancelled
+    // 事后补的。回归验收造了三条这样的变异(不登记 / 登记别的 controller / 登记用错 key),
+    // 全部存活。而这条链是整个「取消」功能存在的理由。
+    const control = createRunControl()
+    let aborted = false
+    async function* slow(args: { override: { abortController: AbortController } }): AsyncGenerator<never> {
+      args.override.abortController.signal.addEventListener('abort', () => { aborted = true }, { once: true })
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '开始' }] } } as never
+      control.cancelNode('root')   // 调用已经在飞了,这时才取消
+      await new Promise(r => setTimeout(r, 300))
+      yield null as never
+    }
+    try { await call(makeRunAgentFn(deps(slow, { control }))) } catch { /* 只关心信号 */ }
+    expect(aborted).toBe(true)
+  })
+
+  it('既超时又被取消时,报的是**取消** —— 建议完全不同', async () => {
+    // 判成超时的话,阻断卡去劝用户「提高 nodeTimeoutMs」,而他刚亲手按了取消。
+    const control = createRunControl()
+    async function* silentAfterCancel(): AsyncGenerator<never> {
+      control.cancelNode('root')
+      await new Promise(r => setTimeout(r, 3000))
+      yield null as never
+    }
+    try {
+      await call(makeRunAgentFn(deps(silentAfterCancel, { control, timeoutMs: 60 })))
+      throw new Error('should have thrown')
+    } catch (e) {
+      expect((e as Error).name).toBe('NodeCancelledError')
+    }
+  })
   it('已经被取消过的节点,新一轮派发立刻停 —— 取消和派发可能撞在一起', async () => {
     const control = createRunControl()
     control.cancelNode('root')
-    async function* neverEnds(): AsyncGenerator<never> {
-      await new Promise(r => setTimeout(r, 5000))
+    /**
+     * 生成器**必须真的听 abortSignal**,而且它自己的等待要远短于 bun 的用例超时。
+     *
+     * 原来写的是干等 5000ms —— 而 bun 默认用例超时正好 5000ms,实测这条用例耗时
+     * 5000.43ms,在 CI 上是一颗随时会红的定时炸弹。更要命的是它**反证了取消没生效**:
+     * 调用等满了生成器的 5 秒才结束,只是结果被丢掉了。
+     */
+    let aborted = false
+    // 这个 harness 把内部 controller 放在 override.abortController 上(见本文件别处的
+    // 同样用法),不是 abortSignal —— 取错属性会让断言恒假,看起来像功能坏了。
+    async function* neverEnds(args: { override: { abortController: AbortController } }): AsyncGenerator<never> {
+      // 查**状态**而不是挂监听:这个节点在派发之前就被取消过了,registerCall 在登记的
+      // 那一刻就当场 abort —— 早于生成器被创建,监听器挂上时那一枪已经开完了。
+      aborted = args.override.abortController.signal.aborted
+      await new Promise(r => setTimeout(r, 800))
       yield null as never
     }
     try {
@@ -883,6 +928,9 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     } catch (e) {
       expect((e as Error).name).toBe('NodeCancelledError')
     }
+    // **取消真的把在飞的那次 abort 掉了** —— 只断言错误名的话,把整条登记删光照样绿
+    // (回归验收造了三条这样的变异,全部存活)。那个错是最后 wasCancelled 事后补的。
+    expect(aborted).toBe(true)
   })
   it('两种超时带着不同的 kind —— 处理方式相反,不能合并', async () => {
     async function* silent(): AsyncGenerator<never> {

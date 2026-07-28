@@ -3,7 +3,7 @@ import type { Key } from '../../ink/events/input-event.js'
 import { stringWidth } from '../../ink/stringWidth.js'
 import type { AgentEvent } from '../../tools/efftask/agentEvents.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
-import {
+import { runControlAction,
   budgetRows,
   lastActivity,
   logPaneAction,
@@ -437,5 +437,43 @@ describe('鼠标滚轮', () => {
     // 开了的场景就能用;不接的话,开了也白开。
     expect(logPaneAction('', key({ wheelUp: true }))).toEqual({ t: 'line', d: -3 })
     expect(logPaneAction('', key({ wheelDown: true }))).toEqual({ t: 'line', d: 3 })
+  })
+})
+
+describe('runControlAction —— 运行中的三个干预键', () => {
+  // 这个纯函数原来**一条测试都没有**,而同文件的 logPaneAction / redoGateAction 都有。
+  // 回归验收在它上面造了四条变异,全部存活。
+  const k = (over: Record<string, unknown> = {}) => over as never
+
+  it('p / i / x,大小写都认', () => {
+    expect(runControlAction('p', k())).toBe('togglePause')
+    expect(runControlAction('P', k())).toBe('togglePause')
+    expect(runControlAction('i', k())).toBe('addDirective')
+    expect(runControlAction('x', k())).toBe('cancelNode')
+    expect(runControlAction('X', k())).toBe('cancelNode')
+  })
+
+  it('组合键归终端 —— **Ctrl+X 绝不能取消节点**', () => {
+    // 实测 ink 对 Ctrl+字母给的是 input='x' + key.ctrl=true。去掉这道闸的话,
+    // Ctrl+X 会取消光标选中的节点、Ctrl+P 会把整轮暂停 —— 而用户按的是终端的常用键。
+    expect(runControlAction('x', k({ ctrl: true }))).toBeNull()
+    expect(runControlAction('p', k({ ctrl: true }))).toBeNull()
+    expect(runControlAction('i', k({ meta: true }))).toBeNull()
+  })
+
+  it('别的键一律不认 —— 兜底不能变成「按什么都暂停」', () => {
+    for (const c of ['j', 'k', 'h', 'l', ' ', 'q', 'r', 'n', 'G', '1']) {
+      expect(`${c} → ${String(runControlAction(c, k()))}`).toBe(`${c} → null`)
+    }
+    expect(runControlAction('', k())).toBeNull()
+  })
+
+  it('只认同一字符的连续重复 —— 合批输入不许触发', () => {
+    // 渲染器会把一个 stdin 分片拆成几个事件;'pi' 是两个键被合批带进来的,
+    // 取整串首字符判的话会当成一次暂停。
+    expect(runControlAction('pi', k())).toBeNull()
+    expect(runControlAction('xp', k())).toBeNull()
+    // 按住不放是同一个字符重复,那算一次。
+    expect(runControlAction('ppp', k())).toBe('togglePause')
   })
 })

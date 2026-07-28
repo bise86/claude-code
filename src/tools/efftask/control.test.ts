@@ -115,6 +115,14 @@ describe('追加指令', () => {
   })
 })
 
+describe('两个上限的**值**', () => {
+  it('改了要有人发现 —— 测试都用符号引用,值本身没人守', () => {
+    // 回归验收把它们改成 200 / 3,全套照绿。而用户是按这两个数估算「我能补多少话」的。
+    expect(MAX_DIRECTIVE_CHARS).toBe(2000)
+    expect(MAX_DIRECTIVES).toBe(20)
+  })
+})
+
 describe('取消单个节点', () => {
   it('取消会中止该节点在飞的全部调用', () => {
     const c = createRunControl()
@@ -148,12 +156,19 @@ describe('取消单个节点', () => {
     expect(a.signal.aborted).toBe(false)
   })
 
-  it('注销是幂等的', () => {
-    const c = createRunControl()
-    const a = new AbortController()
-    const off = c.registerCall('n1', a)
+  it('注销是幂等的 —— 多按几次不会连累同节点的别的调用', () => {
+    // 这条原来断言的是 wasCancelled('n1') === false,和幂等**毫无关系**,而且恒真。
+    // 回归验收点名的、我自己写坏的探针。真正要守的是:重复注销不能把别人的登记清掉,
+    // 而同一个节点确实可能有多个在飞调用(圆桌是多席位的,control.ts 的注释自己写了)。
+    const ctl = createRunControl()
+    const mine = new AbortController()
+    const sibling = new AbortController()
+    const off = ctl.registerCall('n1', mine)
+    ctl.registerCall('n1', sibling)
     off(); off(); off()
-    expect(c.wasCancelled('n1')).toBe(false)
+    ctl.cancelNode('n1')
+    expect(mine.signal.aborted).toBe(false)    // 注销过了,碰不到
+    expect(sibling.signal.aborted).toBe(true)  // 没注销的那个必须还在表里
   })
 
   it('取消之后**新登记**的调用立刻被中止', () => {

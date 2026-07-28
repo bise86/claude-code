@@ -220,6 +220,17 @@ describe('briefOfToolUse —— 像真实终端那一行', () => {
       .toBe('注入的摘要(a.ts)')
   })
 
+  it('解析器真的拿得到 input —— 标签要随输入变', () => {
+    // 现有两条用的都是**忽略入参**的假 resolver(`() => 'Reading Plan'`),于是
+    // 「不把 input 转发给 resolver」这条变异照样绿。而真工具的 userFacingName 是**看**
+    // input 的:读方案文件时返回 'Reading Plan',sed 原地改写渲染成文件编辑 ——
+    // 不转发的话这两件事全没了,而它们正是这次修复承诺保留的。
+    const resolver = (_n: string, i: unknown): string =>
+      (i as { file_path?: string }).file_path?.startsWith('/plans') === true ? 'Reading Plan' : 'Read'
+    expect(briefOfToolUse('Read', { file_path: '/plans/x.md' }, resolver)).toBe('Reading Plan(/plans/x.md)')
+    expect(briefOfToolUse('Read', { file_path: '/src/a.ts' }, resolver)).toBe('Read(/src/a.ts)')
+  })
+
   it('工具改了显示名时,标签跟着改而参数不丢', () => {
     // 读方案文件时 FileReadTool 的 userFacingName 返回 'Reading Plan'。
     expect(briefOfToolUse('Read', { file_path: '/plans/x.md' }, () => 'Reading Plan'))
