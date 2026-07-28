@@ -1,4 +1,4 @@
-import type { NodeStatus, TaskNode } from './types.js'
+import { PHASE_LABEL, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
 
 /**
  * 重做 —— 把某个节点退回到某个环节重新跑一遍。
@@ -31,6 +31,61 @@ import type { NodeStatus, TaskNode } from './types.js'
  */
 export type RedoEntry = 'plan' | 'execute' | 'integrate'
 
+/**
+ * 这次重做**实际会跑哪些环节**。
+ *
+ * 为什么要算而不是写死一句话:菜单原来无条件写着「重跑 执行 → 测试验证 → 验收」,
+ * 而这在**默认配置下就是假的** —— 测试验证是 opt-in(`phaseRoles.verify.length > 0`),
+ * 而 emptyPhaseRoles() 给的默认就是 0 席。大多数用户不配角色,所以大多数用户看到的
+ * 那句话是假的。`skipSteps` 还能再关掉执行或验收。
+ *
+ * 同一份代码在别处非常在意这个歧义(执行被跳过时会往节点里写一行「执行环节已跳过」),
+ * 唯独这个关口没跟上。这是本项目反复出的同一种错:**界面告诉用户一件不真的事**。
+ */
+export interface RedoContext {
+  /** 每个环节配了几席。0 席的环节要么不存在(verify),要么回落到别的席位。 */
+  seatCount?: Partial<Record<PhaseName, number>>
+  /** 用户明确要求跳过的环节。 */
+  skipSteps?: readonly PhaseName[]
+}
+
+/** 某个环节这次会不会真的发生。 */
+function phaseRuns(phase: PhaseName, ctx?: RedoContext): boolean {
+  if (ctx?.skipSteps?.includes(phase)) return false
+  // verify 是唯一一个「没配角色就整个不存在」的环节 —— 其余环节没配席位时会回落,
+  // 照样发生。把这条写成通用规则的话,没配 accept 角色的 run 会被告知不做验收,
+  // 而它其实是做的。
+  if (phase === 'verify') return (ctx?.seatCount?.verify ?? 0) > 0
+  return true
+}
+
+/** 一次重做实际会跑过去的环节链,按顺序。 */
+export function phasesOf(entry: RedoEntry, ctx?: RedoContext): PhaseName[] {
+  const chain: PhaseName[] =
+    entry === 'plan' ? ['plan', 'review', 'execute', 'verify', 'accept']
+    : entry === 'execute' ? ['execute', 'verify', 'accept']
+    : ['integrate']
+  return chain.filter(p => phaseRuns(p, ctx))
+}
+
+/** 「执行 → 测试验证 → 验收」这样一句**照实**的描述,以及被跳过的部分。 */
+export function phaseChainText(entry: RedoEntry, ctx?: RedoContext): string {
+  const runs = phasesOf(entry, ctx)
+  const all: PhaseName[] =
+    entry === 'plan' ? ['plan', 'review', 'execute', 'verify', 'accept']
+    : entry === 'execute' ? ['execute', 'verify', 'accept']
+    : ['integrate']
+  const missing = all.filter(p => !runs.includes(p))
+  const body = runs.length > 0 ? runs.map(p => PHASE_LABEL[p]).join(' → ') : '(没有任何环节会跑)'
+  if (missing.length === 0) return body
+  // 说清**为什么**不跑,而不是只说不跑:两种原因的补救办法完全不同 ——
+  // 一个是去配角色,一个是去掉 skipSteps。
+  const why = missing.map(p =>
+    ctx?.skipSteps?.includes(p) ? `${PHASE_LABEL[p]}(本次配置跳过)` : `${PHASE_LABEL[p]}(未配置角色,该环节不存在)`,
+  )
+  return `${body};不跑:${why.join('、')}`
+}
+
 export interface RedoOption {
   entry: RedoEntry
   /** 菜单里那一行。 */
@@ -51,6 +106,13 @@ export interface RedoPlan {
   worktreesToRelease: { nodeId: string; branch: string; path: string }[]
   /** 目标节点被重置成了什么状态。 */
   seatedAt: NodeStatus
+  /**
+   * 被一并放回可推进状态的**祖先**。
+   *
+   * 不带出来的话确认屏没法说这件事,而它是这次重做真实成本的一部分:每个祖先都会
+   * 再花一次集成验收的模型调用。
+   */
+  reopenedAncestors: string[]
   /** 必须说给用户听的话 —— 每一条都是这次重做**做不到**的事。 */
   warnings: string[]
 }
@@ -68,7 +130,9 @@ function isDecomposed(n: TaskNode): boolean {
 }
 
 /** 给一个节点,列出它能从哪些环节重做。**永远返回全部三条**,不可用的带原因。 */
-export function redoOptions(node: TaskNode, byId: ReadonlyMap<string, TaskNode>): RedoOption[] {
+export function redoOptions(
+  node: TaskNode, byId: ReadonlyMap<string, TaskNode>, ctx?: RedoContext,
+): RedoOption[] {
   const kids = descendantsOf(node, byId)
   const acceptedKids = kids.filter(id => byId.get(id)?.status === 'ACCEPTED').length
   return [
@@ -79,12 +143,12 @@ export function redoOptions(node: TaskNode, byId: ReadonlyMap<string, TaskNode>)
         // 数量必须写出来。这是整个功能里唯一一个不可逆的动作,而「重做」两个字听起来像
         // 是可逆的。
         ? `重新分析并拆分;先删除 ${kids.length} 个子任务(其中 ${acceptedKids} 个已验收)`
-        : '重新分析,重新走一遍质疑讨论',
+        : phaseChainText('plan', ctx),
     },
     {
       entry: 'execute',
       label: '从「执行」重做',
-      detail: '方案保留;重跑 执行 → 测试验证 → 验收(这三步是一个整体,分不开)',
+      detail: `方案保留;重跑 ${phaseChainText('execute', ctx)}(它们是一个整体,分不开)`,
       disabled: isDecomposed(node)
         ? '这是拆分任务,它自己没有执行环节 —— 真正干活的是它的子任务'
         : undefined,
@@ -98,6 +162,31 @@ export function redoOptions(node: TaskNode, byId: ReadonlyMap<string, TaskNode>)
         : undefined,
     },
   ]
+}
+
+/**
+ * `from` 是不是(传递地)依赖 `to`。
+ *
+ * 用来挡住一种**重做才会造出来的**死锁:依赖改写把「指向被删子节点」的边一律改指到
+ * 目标节点,而如果目标节点本身(传递地)依赖那个下游节点,改写后两边互指,pickBatch
+ * 从此返回空 —— 重做**之前**那个下游节点是能跑的。屏幕上只会说「1 条依赖被改写为
+ * 指向本节点」,不会说这一改把树锁死了。
+ */
+function dependsOn(from: string, to: string, byId: ReadonlyMap<string, TaskNode>): boolean {
+  const seen = new Set<string>()
+  const stack = [from]
+  while (stack.length > 0) {
+    const id = stack.pop()!
+    if (seen.has(id)) continue
+    seen.add(id)
+    const n = byId.get(id)
+    if (!n) continue
+    for (const d of n.deps) {
+      if (d === to) return true
+      stack.push(d)
+    }
+  }
+  return false
 }
 
 /** 目标节点的全部后代,深度优先。 */
@@ -128,6 +217,51 @@ export function descendantsOf(node: TaskNode, byId: ReadonlyMap<string, TaskNode
  */
 const PROPAGATED: ReadonlySet<string> = new Set(['子节点阻断', '上级任务阻断', '依赖阻断'])
 
+/**
+ * 盘上结构本身坏了的那几种阻断。**这几种不能重开** —— 它们不是「某个环节失败了」,
+ * 是「这棵树自己对不上」。重开只会让一批上游无法核实的工作跑起来,而运行报告成功。
+ * `--retry-blocked` 出于同样的理由拒绝复活它们。
+ */
+const STRUCTURAL = ['依赖节点缺失', '子节点缺失', '依赖成环'] as const
+const isStructural = (reason: string): boolean => STRUCTURAL.some(k => reason.includes(k))
+
+/**
+ * 把一个**祖先**放回可推进的状态。
+ *
+ * 原来这里只解开「被牵连」的三种阻断(PROPAGATED)。那漏掉了最常见的一种祖先:
+ * **ACCEPTED**。而漏掉它的后果是这个功能在最常见的场景下整个失效 ——
+ *
+ * `orchestrator.run()` 的**第一句**是 `if (root.status === 'ACCEPTED') return completed`。
+ * 一个跑成功的 run,root 必然是 ACCEPTED。于是用户在「✓ 高效任务完成」那一屏上重做
+ * 任何非 root 节点:commitRedo 已经把子树从盘上删了,而重启的编排器在第一个循环里
+ * 直接返回,**模型调用 0 次**,界面闪一下回到同一屏。他什么都没得到,还少了一批记录,
+ * 而且 --resume / --retry-blocked 都救不回来(它们只碰 BLOCKED 节点)。实测过。
+ *
+ * 退回 WAITING_CHILDREN 同时**是语义上对的**:祖先那句「子任务合起来达没达成父目标」
+ * 的裁决是对**旧产出**下的。子任务重做之后它不再成立,本来就该重判一次 —— 不重判的话
+ * 树上写着已验收,而验收的是别的东西。
+ *
+ * 预算也要给回去:集成预算已经花完的祖先一被重开就会立刻再耗尽,那等于没重开。
+ */
+function reopenAncestor(n: TaskNode, now: string): boolean {
+  const wasBlocked = n.status === 'BLOCKED'
+  if (wasBlocked && isStructural(n.blockedReason)) return false
+  // 已经在可推进状态上就别动它 —— 尤其别把预算清了。
+  if (!wasBlocked && n.status !== 'ACCEPTED') return false
+  n.status = n.childIds.length > 0 ? 'WAITING_CHILDREN' : n.kind === 'executable' ? 'READY' : 'CREATED'
+  n.blockedReason = ''
+  n.interrupted = false
+  n.capBlocked = false
+  n.capCategory = undefined
+  // 这一轮它要重判的是集成验收,所以给回集成和评分的预算;方案/验收预算不动 ——
+  // 这次重做没打算让祖先重新分析。
+  n.iteration = { ...n.iteration, integration: 0, scoring: 0 }
+  n.startedAt = undefined
+  n.updatedAt = now
+  return true
+}
+
+/** 兄弟/下游那一侧:只解开**被牵连**的阻断,不碰人家自己的判决,也不碰已验收的。 */
 function reopenIfPropagated(n: TaskNode, now: string): void {
   if (n.status !== 'BLOCKED' || !PROPAGATED.has(n.blockedReason)) return
   n.status = n.childIds.length > 0 ? 'WAITING_CHILDREN' : n.kind === 'executable' ? 'READY' : 'CREATED'
@@ -160,6 +294,8 @@ export function planRedo(
   const warnings: string[] = []
   const worktreesToRelease: { nodeId: string; branch: string; path: string }[] = []
   const dependencyRewrites: { nodeId: string; from: string; to: string }[] = []
+  const reopenedAncestors: string[] = []
+  const cycleAvoided: string[] = []
   let deleted: string[] = []
 
   // ---- 三个入口各自的重置 ----
@@ -194,6 +330,14 @@ export function planRedo(
         if (!deletedSet.has(d)) { if (!next.includes(d)) next.push(d); continue }
         // 自依赖是死锁,不是依赖 —— 目标节点自己曾经依赖过某个后代时会撞上。
         if (n.id === targetId) { dependencyRewrites.push({ nodeId: n.id, from: d, to: '(已移除)' }); continue }
+        // 改指之前先问:目标节点会不会反过来(传递地)依赖 n?会的话这一改就是
+        // 一个重做前不存在的环。宁可丢掉这条依赖 —— 下游可能提前起跑,但整棵树
+        // 至少还在动;成环的话 pickBatch 直接返回空,运行就死在那儿。
+        if (dependsOn(targetId, n.id, byId)) {
+          dependencyRewrites.push({ nodeId: n.id, from: d, to: '(已移除:改指会成环)' })
+          cycleAvoided.push(n.id)
+          continue
+        }
         dependencyRewrites.push({ nodeId: n.id, from: d, to: targetId })
         if (!next.includes(targetId)) next.push(targetId)
       }
@@ -203,6 +347,12 @@ export function planRedo(
       }
     }
 
+    if (cycleAvoided.length > 0) {
+      warnings.push(
+        `${cycleAvoided.length} 条依赖被**删掉**而不是改指:改指会和本节点自己的依赖成环。` +
+        `这些节点可能比预期更早起跑`,
+      )
+    }
     target.childIds = []
     // 回到 unknown,让 stepStart 重新判定拆分还是执行 —— 保留旧 kind 的话,一个原本
     // 拆分型的节点会被 advanceableKind 当成执行型直接交给带写工具的执行者。
@@ -260,8 +410,14 @@ export function planRedo(
   const guard = new Set<string>([target.id])
   while (p && !guard.has(p.id)) {
     guard.add(p.id)
-    reopenIfPropagated(p, now)
+    if (reopenAncestor(p, now)) reopenedAncestors.push(p.id)
     p = p.parentId === null ? undefined : byId.get(p.parentId)
+  }
+  if (reopenedAncestors.length > 0) {
+    warnings.push(
+      `上级的 ${reopenedAncestors.length} 个任务会重新做一次集成验收 —— ` +
+      `它们原来那句「子任务合起来达成了父目标」判的是旧产出`,
+    )
   }
   for (const n of byId.values()) {
     if (n.id !== target.id && n.deps.includes(target.id)) reopenIfPropagated(n, now)
@@ -273,24 +429,27 @@ export function planRedo(
     dependencyRewrites,
     worktreesToRelease,
     seatedAt,
+    reopenedAncestors,
     warnings,
   }
 }
 
 /** 关口上那段摘要 —— 按下确认之前,把这次重做**做了什么、做不到什么**摊开。 */
-export function redoSummary(plan: RedoPlan, target: TaskNode, entry: RedoEntry): string[] {
+export function redoSummary(
+  plan: RedoPlan, target: TaskNode, entry: RedoEntry, ctx?: RedoContext,
+): string[] {
   const lines: string[] = []
-  const what: Record<RedoEntry, string> = {
-    plan: '重新分析 → 质疑讨论',
-    execute: '重新执行 → 测试验证 → 验收',
-    integrate: '重新集成验收',
-  }
-  lines.push(`「${target.title}」将 ${what[entry]}`)
+  // 照实说这次会跑哪些环节 —— 写死一句话的版本在默认配置下就是假的(测试验证是
+  // opt-in,没配角色时根本不存在),而用户是按字面意思选的。
+  lines.push(`「${target.title}」将重新走: ${phaseChainText(entry, ctx)}`)
   if (plan.deleted.length > 0) lines.push(`删除 ${plan.deleted.length} 个子任务,重做后按新方案重建`)
   if (plan.dependencyRewrites.length > 0) {
     lines.push(`${plan.dependencyRewrites.length} 条依赖被改写为指向本节点`)
   }
   if (plan.worktreesToRelease.length > 0) lines.push(`释放 ${plan.worktreesToRelease.length} 个隔离工作区`)
+  if (plan.reopenedAncestors.length > 0) {
+    lines.push(`上级 ${plan.reopenedAncestors.length} 个任务重新做集成验收`)
+  }
   for (const w of plan.warnings) lines.push(`⚠ ${w}`)
   return lines
 }

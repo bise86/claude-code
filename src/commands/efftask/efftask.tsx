@@ -1373,6 +1373,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         nodes={nodes}
         targetId={redoTarget.id}
         now={new Date().toISOString()}
+        // 环节实况从**本次 run 的真实配置**里来,不是写死的文案 —— 否则默认配置下
+        // 关口会承诺一个根本不存在的测试验证环节。
+        phases={{
+          seatCount: Object.fromEntries(
+            PHASE_NAMES.map(p => [p, config.phaseRoles[p]?.length ?? 0]),
+          ),
+          skipSteps: config.skipSteps,
+        }}
         onConfirm={entry => applyRedo(redoTarget, entry)}
         onCancel={() => { setRedoTarget(null); setPhase('done') }}
       />

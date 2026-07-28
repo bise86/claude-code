@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'bun:test'
 
-import { descendantsOf, planRedo, redoOptions, redoSummary, redoUnavailableReason, type RedoPlan } from './redo.js'
+import {
+  descendantsOf, phaseChainText, phasesOf, planRedo, redoOptions, redoSummary,
+  redoUnavailableReason, type RedoPlan,
+} from './redo.js'
 import { PHASE_NAMES, type NodeKind, type NodeStatus, type TaskNode } from './types.js'
 
 function node(id: string, over: Partial<TaskNode> = {}): TaskNode {
@@ -143,6 +146,35 @@ describe('planRedo:方案重做', () => {
     expect(r.nodes.find(n => n.id === 'a')!.deps).toEqual([])
   })
 
+  it('改指会成环时,那条依赖是删掉 —— 死锁比早起跑严重得多', () => {
+    // 构造:P(=a)自己依赖 Y(=b),而 Y 依赖 P 的子节点 a1。
+    // 天真地把 Y 的 a1 改指到 a,就得到 a↔b 互指 —— pickBatch 从此返回空,
+    // 而重做**之前** b 是能跑的。这是重做自己造出来的死锁。
+    const t = tree()
+    t[1]!.deps = ['b']
+    const r = ok(planRedo(t, 'a', 'plan', 'T1'))
+    const b = r.nodes.find(n => n.id === 'b')!
+    expect(b.deps).toEqual([])
+    expect(r.warnings.join()).toContain('成环')
+    expect(r.dependencyRewrites[0]!.to).toContain('成环')
+  })
+
+  it('隔着一跳的环也要认出来', () => {
+    // a → x → b,而 b 依赖 a 的子节点 a1。只看一跳的话这个环认不出来,
+    // 改指后 a→x→b→a 闭合,pickBatch 返回空,整棵树死在那儿。
+    const t = tree()
+    t[1]!.deps = ['x']
+    t.push(node('x', { parentId: 'root', deps: ['b'], depth: 1 }))
+    t[0]!.childIds = ['a', 'b', 'x']
+    const r = ok(planRedo(t, 'a', 'plan', 'T1'))
+    expect(r.nodes.find(n => n.id === 'b')!.deps).toEqual([])
+    expect(r.warnings.join()).toContain('成环')
+  })
+  it('不成环时照常改指,别为了保险把所有依赖都删了', () => {
+    const r = ok(planRedo(tree(), 'a', 'plan', 'T1'))
+    expect(r.nodes.find(n => n.id === 'b')!.deps).toEqual(['a'])
+    expect(r.warnings.join()).not.toContain('成环')
+  })
   it('没有子任务的叶子也能从方案重做', () => {
     const r = ok(planRedo(tree(), 'a1', 'plan', 'T1'))
     expect(r.deleted).toEqual([])
@@ -273,11 +305,54 @@ describe('planRedo:共通清理', () => {
     expect(r.nodes.find(n => n.id === 'a')!.status).toBe('WAITING_CHILDREN')
   })
 
-  it('只解开「被牵连」的阻断,自身有判决的祖先不动', () => {
+  it('自身有判决的祖先也要重开 —— 不然这次重做够不到座位', () => {
+    // 这条原来断言的是相反的行为(「自身有判决的祖先不动」),那个假设是错的:
+    // 调度器拒绝挑选任何祖先被阻断的节点,所以留着 = 重做一次模型调用都不会发生。
+    // 祖先那条判决本来也是对**旧子树**下的,子任务重做之后它不再成立。
     const t = tree()
     t[1]!.status = 'BLOCKED'; t[1]!.blockedReason = '连续返工超限'
+    t[1]!.iteration = { ...t[1]!.iteration, integration: 3 }
+    const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
+    const a = r.nodes.find(n => n.id === 'a')!
+    expect(a.status).toBe('WAITING_CHILDREN')
+    // 集成预算也要给回去,否则一重开就立刻再耗尽 = 等于没重开。
+    expect(a.iteration.integration).toBe(0)
+    expect(r.reopenedAncestors).toContain('a')
+  })
+
+  it('已验收的祖先也要重开 —— 这是这个功能最常见的失效场景', () => {
+    // orchestrator.run() 的**第一句**是 `if (root.status === 'ACCEPTED') return completed`。
+    // 跑成功的 run 上重做任何非 root 节点:子树已经从盘上删了,而重启的编排器立刻返回,
+    // 模型调用 0 次,界面闪回「✓ 高效任务完成」。实测过,而且 --resume / --retry-blocked
+    // 都救不回来 —— 它们只碰 BLOCKED 节点。
+    const t = tree()
+    t[0]!.status = 'ACCEPTED'
+    t[1]!.status = 'ACCEPTED'
+    const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
+    expect(r.nodes.find(n => n.id === 'root')!.status).toBe('WAITING_CHILDREN')
+    expect(r.reopenedAncestors.sort()).toEqual(['a', 'root'])
+    // 而且要说出来:每个被重开的祖先都会再花一次集成验收的模型调用。
+    expect(r.warnings.join()).toContain('重新做一次集成验收')
+  })
+
+  it('结构性损坏的祖先**不能**重开', () => {
+    // 「依赖节点缺失 / 子节点缺失 / 依赖成环」不是「某个环节失败了」,是这棵树自己对不上。
+    // 重开只会让一批上游无法核实的工作跑起来,而运行报告成功。--retry-blocked 同样拒绝。
+    const t = tree()
+    t[1]!.status = 'BLOCKED'; t[1]!.blockedReason = '子节点缺失(a2)'
     const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
     expect(r.nodes.find(n => n.id === 'a')!.status).toBe('BLOCKED')
+    expect(r.reopenedAncestors).toEqual([])
+  })
+
+  it('已经在可推进状态的祖先原样不动 —— 别顺手清掉它的预算', () => {
+    const t = tree()
+    t[1]!.iteration = { ...t[1]!.iteration, integration: 2 }
+    const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
+    const a = r.nodes.find(n => n.id === 'a')!
+    expect(a.status).toBe('WAITING_CHILDREN')
+    expect(a.iteration.integration).toBe(2)
+    expect(r.reopenedAncestors).toEqual([])
   })
 
   it('等着它的兄弟也解开', () => {
@@ -305,6 +380,47 @@ describe('planRedo:共通清理', () => {
   it('节点不存在时给错误而不是抛异常', () => {
     const r = planRedo(tree(), '不存在', 'plan', 'T1')
     expect('error' in r && r.error).toContain('不存在')
+  })
+})
+
+describe('环节实况:屏幕上那句话必须是真的', () => {
+  it('默认配置(没配验证角色)下,测试验证根本不跑 —— 就不能写它会跑', () => {
+    // 测试验证是 opt-in(phaseRoles.verify.length > 0),而 emptyPhaseRoles() 给的默认是
+    // 0 席。大多数用户不配角色,所以原来那句无条件的「执行 → 测试验证 → 验收」
+    // 对大多数用户就是假的。
+    expect(phaseChainText('execute', {})).toBe('执行 → 验收;不跑:测试验证(未配置角色,该环节不存在)')
+  })
+
+  it('配了验证角色就三步都写', () => {
+    expect(phaseChainText('execute', { seatCount: { verify: 2 } })).toBe('执行 → 测试验证 → 验收')
+  })
+
+  it('skipSteps 跳过的环节,原因和「没配角色」要分开说', () => {
+    // 两种原因的补救办法完全不同:一个是去配角色,一个是去掉 skipSteps。
+    const t = phaseChainText('execute', { seatCount: { verify: 1 }, skipSteps: ['accept'] })
+    expect(t).toContain('本次配置跳过')
+    expect(t).not.toContain('未配置角色')
+  })
+
+  it('全被跳光时说清楚没有任何环节会跑', () => {
+    const t = phaseChainText('execute', { skipSteps: ['execute', 'accept'] })
+    expect(t).toContain('没有任何环节会跑')
+  })
+
+  it('accept 没配席位不算不存在 —— 它会回落到别的席位,照样发生', () => {
+    // 把「0 席 = 不发生」写成通用规则的话,没配验收角色的 run 会被告知不做验收,
+    // 而它其实是做的。只有 verify 有「没配就整个不存在」这个性质。
+    expect(phaseChainText('execute', { seatCount: { accept: 0, verify: 1 } })).toBe('执行 → 测试验证 → 验收')
+  })
+
+  it('方案重做的链条也照实算', () => {
+    expect(phasesOf('plan', { seatCount: { verify: 1 } }))
+      .toEqual(['plan', 'review', 'execute', 'verify', 'accept'])
+    expect(phasesOf('plan', {})).toEqual(['plan', 'review', 'execute', 'accept'])
+  })
+
+  it('集成验收就一个环节', () => {
+    expect(phasesOf('integrate', {})).toEqual(['integrate'])
   })
 })
 
@@ -340,8 +456,8 @@ describe('redoSummary', () => {
   it('没发生的事不渲染成条目', () => {
     const t = tree()
     const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
-    const lines = redoSummary(r, t[2]!, 'execute').join('\n')
-    expect(lines).toContain('重新执行')
+    const lines = redoSummary(r, t[2]!, 'execute', { seatCount: { verify: 1 } }).join('\n')
+    expect(lines).toContain('执行 → 测试验证 → 验收')
     // 执行重做不删任何东西、不动任何依赖 —— 摘要里就不该出现这两句。
     expect(lines).not.toContain('删除')
     expect(lines).not.toContain('依赖')

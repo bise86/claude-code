@@ -1,7 +1,9 @@
 import * as React from 'react'
 
 import { Box, Text, useInput } from '../../ink.js'
-import { planRedo, redoOptions, redoSummary, type RedoEntry } from '../../tools/efftask/redo.js'
+import {
+  planRedo, redoOptions, redoSummary, type RedoContext, type RedoEntry,
+} from '../../tools/efftask/redo.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { useLiveState } from './useLiveState.js'
 
@@ -20,14 +22,21 @@ export function ConfirmRedo(props: {
   nodes: TaskNode[]
   targetId: string
   now: string
+  /**
+   * 这次 run 的环节实况(哪些环节配了席位、哪些被跳过)。
+   *
+   * 没有它的话屏幕只能写一句无条件的「执行 → 测试验证 → 验收」,而测试验证是 opt-in ——
+   * 默认配置下那句话就是假的。
+   */
+  phases?: RedoContext
   onConfirm: (entry: RedoEntry) => void
   onCancel: () => void
 }): React.ReactElement {
   const byId = React.useMemo(() => new Map(props.nodes.map(n => [n.id, n])), [props.nodes])
   const target = byId.get(props.targetId)
   const options = React.useMemo(
-    () => (target ? redoOptions(target, byId) : []),
-    [target, byId],
+    () => (target ? redoOptions(target, byId, props.phases) : []),
+    [target, byId, props.phases],
   )
   const [cursor, setCursor, cursorRef] = useLiveState(0)
   const [picked, setPicked, pickedRef] = useLiveState<RedoEntry | null>(null)
@@ -42,13 +51,15 @@ export function ConfirmRedo(props: {
 
   useInput((input, key) => {
     const k = input.toLowerCase()
-    if (key.escape || k === 'q') {
-      // 第二屏的 Esc 退回第一屏,而不是一路退出去 —— 看完后果改主意选另一个环节,
-      // 是这一步最常见的动作。
-      if (pickedRef.current !== null) { setPicked(null); return }
-      props.onCancel()
+    // Esc 和 q 在第二屏上**不是同一件事**,页脚也是这么写的。
+    // 原来两个键走同一分支,于是「q 取消」是句假话:按下去只是回到第一屏,
+    // 用户想彻底退出得连按两次而屏幕没告诉他。
+    if (key.escape && pickedRef.current !== null) {
+      // 看完后果改主意选另一个环节,是这一步最常见的动作。
+      setPicked(null)
       return
     }
+    if (key.escape || k === 'q') { props.onCancel(); return }
     if (pickedRef.current !== null) {
       if (key.return || k === 'y') props.onConfirm(pickedRef.current)
       return
@@ -79,7 +90,7 @@ export function ConfirmRedo(props: {
         <Text bold color="warning">确认重做</Text>
         {'error' in preview
           ? <Text color="error">{preview.error}</Text>
-          : redoSummary(preview.plan, target, picked).map(l => (
+          : redoSummary(preview.plan, target, picked, props.phases).map(l => (
               <Text key={l} color={l.startsWith('⚠') ? 'warning' : undefined}>{l}</Text>
             ))}
         {'plan' in preview && preview.plan.deleted.length > 0

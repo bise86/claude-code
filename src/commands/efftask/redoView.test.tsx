@@ -223,6 +223,68 @@ describe('重做关口', () => {
     expect(got).toEqual(['integrate'])
   })
 
+  it('第二屏的 q 是**真的取消**,不是回上一屏', async () => {
+    let cancels = 0
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => { cancels++ }} />,
+    )
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    t.stdin.press('q')
+    await tick()
+    app.unmount()
+    // 页脚写着「Esc 换一个环节 · q 取消」。原来两个键走同一分支,于是「q 取消」是句
+    // 假话:按下去只是回到第一屏,想彻底退出得连按两次,而屏幕没告诉他。
+    expect(cancels).toBe(1)
+  })
+
+  it('默认配置下关口不许承诺一个不存在的测试验证环节', async () => {
+    const { t, app } = await mount(
+      <ConfirmRedo
+        nodes={TREE()} targetId="root/00-a" now={NOW}
+        phases={{ seatCount: { verify: 0 } }}
+        onConfirm={() => {}} onCancel={() => {}}
+      />,
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 测试验证是 opt-in,没配角色就整个不存在。写死「执行 → 测试验证 → 验收」
+    // 对大多数用户(不配角色的)就是假话。
+    expect(f).toContain('未配置角色')
+  })
+
+  it('配了验证角色就照实写三步', async () => {
+    const { t, app } = await mount(
+      <ConfirmRedo
+        nodes={TREE()} targetId="root/00-a" now={NOW}
+        phases={{ seatCount: { verify: 2 } }}
+        onConfirm={() => {}} onCancel={() => {}}
+      />,
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('执行 → 测试验证 → 验收')
+    expect(f).not.toContain('未配置角色')
+  })
+
+  it('详情页页脚在能重做时才写 r —— 键能用却不写等于没有', async () => {
+    const seen: TaskNode[] = []
+    const { t, app } = await mount(
+      <DoneView
+        nodes={TREE()} runId="003" outcome={{ status: 'blocked' }} handoff={null}
+        onExit={() => {}} onRedo={n => seen.push(n)}
+      />,
+    )
+    t.stdin.press('\r') // 打开详情
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('r 重做本任务')
+  })
+
   it('目标节点不在树里时给一屏错误,而不是白屏或崩溃', async () => {
     const { t, app } = await mount(
       <ConfirmRedo nodes={TREE()} targetId="不存在" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,

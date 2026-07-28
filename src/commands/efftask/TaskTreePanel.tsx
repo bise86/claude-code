@@ -264,6 +264,7 @@ export function TaskTreePanel(props: {
   if (detail) {
     return (
       <NodeDetail
+        canRedo={props.onRedo !== undefined}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
         // 在 RENDER 期从活存储读,不复制进 React state:事件流对每个在飞的节点每条消息

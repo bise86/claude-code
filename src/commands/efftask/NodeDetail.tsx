@@ -119,6 +119,8 @@ export function NodeDetail(props: {
   historical?: boolean
   /** 日志窗是否接管键盘(详情视图打开时是,只读等待屏不是)。 */
   logActive?: boolean
+  /** 这一屏能不能按 r 重做。键是父面板处理的,这里只负责**说出来**。 */
+  canRedo?: boolean
   /** 可用列宽。 */
   columns?: number
   /**
@@ -233,7 +235,9 @@ export function NodeDetail(props: {
           />
         </Box>
       ) : null}
-      <Text dimColor>回车 / Esc / q 返回任务树</Text>
+      {/* 详情页正是判断「这个节点哪儿错了」的地方,看完就想重做 —— 键能用却不写在
+          页脚上,等于没有。 */}
+      <Text dimColor>回车 / Esc / q 返回任务树{props.canRedo ? ' · r 重做本任务' : ''}</Text>
     </Box>
   )
 }

@@ -464,6 +464,14 @@ describe('改回去要变红的四处', () => {
     expect(SRC).toContain('redoUnavailableReason({ aborted: props.signal.aborted')
   })
 
+  it('重做关口拿到了本次 run 的环节实况', () => {
+    // 剪断它:关口退回一句无条件的「执行 → 测试验证 → 验收」,而测试验证是 opt-in,
+    // 默认配置下根本不跑 —— 大多数用户看到的那句话就是假的。
+    // 正则带前导空白,不是 toContain:`xphases={{` 也包含 `phases={{`,
+    // 宽断言会被它满足 —— 改个名把线剪断照样绿(变异验证过)。
+    expect(element('ConfirmRedo')).toMatch(/\sphases=\{\{/)
+    expect(element('ConfirmRedo')).toContain('skipSteps: config.skipSteps')
+  })
   it('只查看模式不给重做入口', () => {
     // 那个 run 的编排器根本没起来过。给了重做就是**替用户决定**把它跑起来,
     // 而他刚刚明确选了不跑。
