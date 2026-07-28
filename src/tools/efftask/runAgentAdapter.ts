@@ -17,9 +17,26 @@ import type { RoleBinding } from './types.js'
  * phase failure (提高 nodeTimeoutMs / 拆小节点, rather than "read the reviewer's blockers"),
  * and this reason's text is user-facing Chinese prose that will be reworded.
  */
+export type TimeoutKind = 'stall' | 'human'
+
 export class PhaseTimeoutError extends Error {
-  constructor(public readonly limitMs: number) {
-    super(`阶段调用超时(${limitMs} ms),已中止`)
+  constructor(
+    public readonly limitMs: number,
+    /**
+     * 哪一种超时。**两者的处理方式相反**,所以不能合并:
+     *  - stall:模型/工具一条消息都不吐了 → 提高 nodeTimeoutMs 或把节点拆小
+     *  - human:没人来批工具权限 → 去终端或飞书上把那个确认点掉,和节点大小无关
+     * 合成一句话的时候,一半的用户会被指去调一个和原因无关的旋钮。
+     */
+    public readonly kind: TimeoutKind = 'stall',
+  ) {
+    // 保留 `超时(N ms)` 这个形状:blockedReason 里的这串是用户和测试都在读的锚点,
+    // 而 kind 的区别靠冒号后面那半句说清 —— 两者的处理方式相反,不能只留一句通用的。
+    super(
+      kind === 'human'
+        ? `等待人工确认超时(${limitMs} ms):没有人回答工具权限确认,已中止`
+        : `阶段调用超时(${limitMs} ms):静默超过该时长没有任何输出,已中止`,
+    )
     this.name = 'PhaseTimeoutError'
   }
 }
@@ -86,6 +103,13 @@ export function makeRunAgentFn(deps: {
    */
   timeoutMs?: number | (() => number)
   /**
+   * 等**人**回答一次工具权限确认的预算。默认极大(见 DEFAULT_CAPS.humanTimeoutMs)。
+   *
+   * 和 timeoutMs 分开是实测出来的:canUseTool 就在阶段调用的窗口里被 await,
+   * 合成一个预算时「用户去泡了杯咖啡」和「provider 挂死了」共用同一个 10 分钟。
+   */
+  humanTimeoutMs?: number | (() => number)
+  /**
    * 工具摘要解析器。适配层手上有 `availableTools`,每个 Tool 自带 `userFacingName(input)`,
    * 主 REPL 就是用它渲染每一行工具调用的。接上它,新工具进来自动有好摘要;缺席则落到
    * agentEvents 里那张静态表。
@@ -131,6 +155,21 @@ export function makeRunAgentFn(deps: {
      * 生效,而那一步跑在 MCP 合并**之前**,filterToolsForAgent 对任何 `mcp__*` 都无条件返回 true。
      */
     const agentDefinition: AgentDefinition = picked
+    /**
+     * 把「等人」这段时间从 stall 时钟里摘出去。
+     *
+     * 包在这里而不是在调用方:canUseTool 从这里一路传进 runAgent 的工具循环,
+     * 这是唯一一个既知道「阶段预算」又知道「哪一次 await 是在等人」的地方。
+     */
+    const canUseTool: CanUseToolFn = (async (...args: Parameters<CanUseToolFn>) => {
+      humanWaitFrom = Date.now()
+      try {
+        return await deps.canUseTool(...args)
+      } finally {
+        humanWaitFrom = undefined
+        markProgress()
+      }
+    }) as CanUseToolFn
     const promptMessages: Message[] = [
       createUserMessage({ content: [{ type: 'text', text: `${req.system}\n\n${req.prompt}` }] }),
     ]
@@ -143,10 +182,43 @@ export function makeRunAgentFn(deps: {
     req.signal.addEventListener('abort', relay, { once: true })
     // The deadline aborts the sub-agent the same way a user Esc does, so a hung provider
     // ends the phase instead of parking the pipeline forever.
+    /**
+     * 两个时钟,不是一个。
+     *
+     * 原来是一个 setTimeout 罩住整次调用,于是量的是**总时长**,而且把**等人回答**
+     * 也算了进去。两个后果都实测过:
+     *
+     *  - 一个正常干活、一直在流式输出的执行环节(读二十个文件、跑测试、改代码)
+     *    十几分钟很正常,会被当成挂死杀掉 —— 而它一秒都没卡住;
+     *  - 工具权限确认(canUseTool)就在这个窗口里 await。用户去倒杯水回来,节点已经
+     *    以「阶段调用超时」阻断,而给的建议是「提高超时或把节点拆小」,两条都不对症。
+     *
+     * 现在:
+     *  - stall 时钟量的是**静默时长** —— 每来一条消息就重置。只要还在吐东西就不算超时。
+     *  - human 时钟只在**等人**的那段时间走,预算大得多(默认 7 天)。
+     */
     let timedOut = false
+    let timeoutKind: TimeoutKind = 'stall'
     const limitMs = typeof deps.timeoutMs === 'function' ? deps.timeoutMs() : deps.timeoutMs
-    const timer = limitMs && limitMs > 0
-      ? setTimeout(() => { timedOut = true; inner.abort() }, limitMs)
+    const humanLimitMs = typeof deps.humanTimeoutMs === 'function' ? deps.humanTimeoutMs() : deps.humanTimeoutMs
+    let lastProgressAt = Date.now()
+    /** 正在等人回答的那一刻;不在等人时是 undefined。 */
+    let humanWaitFrom: number | undefined
+    const markProgress = (): void => { lastProgressAt = Date.now() }
+    const fire = (kind: TimeoutKind): void => { timedOut = true; timeoutKind = kind; inner.abort() }
+    // 轮询而不是 setTimeout:deadline 会被「有进展」和「在等人」两件事不断推后,
+    // 用 setTimeout 就得每次重排,而重排的边界条件比一个便宜的轮询更容易写错。
+    const tickMs = Math.min(1000, Math.max(50, Math.floor((limitMs && limitMs > 0 ? limitMs : 1000) / 20)))
+    const timer = (limitMs && limitMs > 0) || (humanLimitMs && humanLimitMs > 0)
+      ? setInterval(() => {
+          const now = Date.now()
+          if (humanWaitFrom !== undefined) {
+            // 在等人:只查人工预算,stall 时钟这段时间不走。
+            if (humanLimitMs && humanLimitMs > 0 && now - humanWaitFrom >= humanLimitMs) fire('human')
+            return
+          }
+          if (limitMs && limitMs > 0 && now - lastProgressAt >= limitMs) fire('stall')
+        }, tickMs)
       : undefined
 
     /**
@@ -181,7 +253,7 @@ export function makeRunAgentFn(deps: {
         agentDefinition,
         promptMessages,
         toolUseContext: deps.toolUseContext,
-        canUseTool: deps.canUseTool,
+        canUseTool,
         isAsync: false,
         querySource: 'agent:custom',
         // NOT validated: an unrecognized alias simply falls through to runAgent's own model
@@ -202,6 +274,8 @@ export function makeRunAgentFn(deps: {
     // factory call has already exited and pwd() would resolve to the shared cwd again.
     const consume = async (): Promise<void> => {
       for await (const message of invoke()) {
+        // 有输出 = 没卡住。stall 时钟从这里重置 —— 这就是「静默时长」和「总时长」的区别。
+        markProgress()
         collected.push(message)
         // 每一条消息都要看,不只是 assistant —— 工具返回值走的是 user 消息,而它此前整条
         // 被跳过,所以「工具返回了什么、报没报错」在界面上一个字都没有。
@@ -237,7 +311,7 @@ export function makeRunAgentFn(deps: {
       }
     } finally {
       if (poll) clearInterval(poll)
-      if (timer) clearTimeout(timer)
+      if (timer) clearInterval(timer)
       req.signal.removeEventListener('abort', relay)
       /**
        * 窗口的收口点。**只能在这里**,不能放在圆桌里。
@@ -248,11 +322,20 @@ export function makeRunAgentFn(deps: {
        * 一个两小时前就跑完的分析环节还在转圈;更要命的是这些流永远不进可淘汰集合,
        * 内存上限对超过三分之一的流直接失效。
        */
-      req.stream?.end(timedOut ? `阶段调用超时(${limitMs ?? 0} ms)` : failure)
+      req.stream?.end(
+        timedOut
+          ? (timeoutKind === 'human' ? '等待人工确认超时' : '静默超时(没有任何输出)')
+          : failure,
+      )
     }
     // Report the deadline rather than returning a truncated answer that the phase would
     // parse as a real (empty) reply.
-    if (timedOut) throw new PhaseTimeoutError(limitMs ?? 0)
+    if (timedOut) {
+      throw new PhaseTimeoutError(
+        (timeoutKind === 'human' ? humanLimitMs : limitMs) ?? 0,
+        timeoutKind,
+      )
+    }
     return collectText(collected)
   }
 }

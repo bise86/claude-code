@@ -105,8 +105,17 @@ const outfile = argOf('--outfile')
  * 有了它就能把探针也用**同一套插件和 define** 编出来,而不是另写一份必然漂移的配置。
  */
 const entry = argOf('--entry')
+// 写了 --entry 却取不到值时,argOf 返回 undefined,于是**静默**编了正式入口 ——
+// 而调用方以为自己编的是探针。宁可硬失败。
+if (process.argv.includes('--entry') && !entry) {
+  console.error('--entry 需要一个入口文件路径')
+  process.exit(1)
+}
 const outdir = 'dist'
-await rm(outdir, { recursive: true, force: true })
+// 只在**用默认产物目录**时清它。--outfile 指到别处还照删的话,
+// scripts/verify-binary.ts 每跑一次就把正式产物抹掉一次(CI 里 build → verify → upload
+// 就会上传一个空目录)。
+if (!outfile) await rm(outdir, { recursive: true, force: true })
 await mkdir(outdir, { recursive: true })
 
 /**
@@ -169,7 +178,22 @@ const result = await Bun.build({
   external: OPTIONAL_PACKAGES,
   // 整体替换 `MACRO`,而不是逐个 `MACRO.VERSION` —— 源码里有 `MACRO.X` 也有对整个
   // 对象的引用,只替字段会漏掉后者。
-  define: { MACRO: JSON.stringify(MACRO_DEFINE) },
+  define: {
+    MACRO: JSON.stringify(MACRO_DEFINE),
+    /**
+     * **必须显式定死。**
+     *
+     * bun 把 `process.env.NODE_ENV` 当编译期常量替换,构建机没设这个变量时固定内联成
+     * `"development"` —— 而且**运行时再设也改不动**(实测 `NODE_ENV=production ./bin`
+     * 里读到的仍是 development)。后果不是「少个优化」:
+     *   - doctorDiagnostic 的 getCurrentInstallationType/getInstallPath 在判断
+     *     isSelfContainedExecutable() **之前**就 `if (NODE_ENV === 'development') return`,
+     *     于是每个二进制都自报「开发态」;
+     *   - config.ts 的自动更新在每个二进制里恒被判为 disabled;
+     *   - ink/reconciler 恒去 import devtools(已 external),编译态多一次 reject。
+     */
+    'process.env.NODE_ENV': JSON.stringify('production'),
+  },
   // biome-ignore lint/suspicious/noExplicitAny: Bun 插件类型在此版本里不够精确
   // biome-ignore lint/suspicious/noExplicitAny: Bun 插件类型在此版本里不够精确
   plugins: [zodAlias as any, externalRelative as any],

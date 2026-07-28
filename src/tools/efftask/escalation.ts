@@ -84,6 +84,8 @@ const REMEDY: Record<BlockCategory, string> = {
   'cap-nodes': '提高 run.md 里 caps.maxNodes 后再重试,或缩小需求范围。',
   rework: '先看该节点的验收记录,按阻断意见改代码或改验收点;必要时提高 caps.maxIterations。',
   timeout: '提高 run.md 里 caps.nodeTimeoutMs 后再重试,或把该节点拆小。',
+  // 注:等人工确认超时走的是同一个 category,但**处理方式相反** —— 见
+  // humanTimeoutRemedy,由 pipeline 以 remedy 覆盖传进来。
   infra: '先确认角色模型/网络可用(角色配置在 .claude/settings.json 的 roles 里),再重试。',
   'cap-depth': '若这些子任务确实该独立成节点,提高 run.md 里 caps.maxDepth 后重跑该节点;否则无需处理。',
   // The only category whose honest advice is 'do nothing'. Saying so beats inventing a knob.
@@ -91,6 +93,19 @@ const REMEDY: Record<BlockCategory, string> = {
 }
 
 /** The one valve that lets its node continue. Everything the card says branches on this. */
+/**
+ * 等人工确认超时的处理方式。
+ *
+ * 和「静默超时」写在一起是错的:一个要你调大超时/把节点拆小,另一个和节点大小
+ * 毫无关系 —— 是那条工具权限确认没人点。给通用的一句话,一半的用户会被指去调一个
+ * 和原因无关的旋钮。
+ */
+export function humanTimeoutRemedy(): string {
+  return '没有人回答工具权限确认。去终端(或飞书卡片)上把那个确认点掉再重试;' +
+    '如果你不打算守着它,可以把要用的工具加进 allowlist,或者用 bypassPermissions 模式。' +
+    '这条和节点大小、和 caps.nodeTimeoutMs 都没有关系。'
+}
+
 export function stopsTheNode(category: BlockCategory): boolean {
   return category !== 'cap-depth' && category !== 'revise'
 }

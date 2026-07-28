@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isInBundledMode, isSelfContainedExecutable, isSingleFileExecutable } from '../../src/utils/bundledMode.js'
 import { ripGrep, ripgrepCommand } from '../../src/utils/ripgrep.js'
+import { getCurrentInstallationType } from '../../src/utils/doctorDiagnostic.js'
 
 const rg = ripgrepCommand()
 
@@ -35,5 +36,10 @@ process.stdout.write(
     argv1: process.argv[1] ?? null,
     globOk,
     globErr,
+    // NODE_ENV 被 bun **编译期内联**:构建机没设它时固定成 'development',而且运行时
+    // 改不动。doctor 的两处判断在 isSelfContainedExecutable() **之前**就按它短路,于是
+    // 每个二进制都自报「开发态」——本轮那两处修改在产物里根本执行不到。
+    nodeEnv: process.env.NODE_ENV ?? null,
+    installationType: await getCurrentInstallationType(),
   }) + '\n',
 )

@@ -1,4 +1,5 @@
 import chalk from 'chalk'
+import { isSelfContainedExecutable } from './bundledMode.js'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
@@ -89,7 +90,9 @@ export async function setupShellCompletion(theme: ThemeName): Promise<string> {
   // Generate the completion script by writing directly to the cache file.
   // Using --output avoids piping through stdout where process.exit() can
   // truncate output before the pipe buffer drains.
-  const claudeBin = process.argv[1] || 'claude'
+  // `|| 'claude'` 兜不住:单文件产物的 argv[1] 是**非空**的虚拟路径
+  // (/$bunfs/root/cli),短路永远不触发,execFileNoThrow 拿到一条不存在的路径。
+  const claudeBin = isSelfContainedExecutable() ? process.execPath : (process.argv[1] || 'claude')
   const result = await execFileNoThrow(claudeBin, [
     'completion',
     shell.shellFlag,
@@ -145,7 +148,9 @@ export async function regenerateCompletionCache(): Promise<void> {
 
   logForDebugging(`update: Regenerating ${shell.name} completion cache`)
 
-  const claudeBin = process.argv[1] || 'claude'
+  // `|| 'claude'` 兜不住:单文件产物的 argv[1] 是**非空**的虚拟路径
+  // (/$bunfs/root/cli),短路永远不触发,execFileNoThrow 拿到一条不存在的路径。
+  const claudeBin = isSelfContainedExecutable() ? process.execPath : (process.argv[1] || 'claude')
   const result = await execFileNoThrow(claudeBin, [
     'completion',
     shell.shellFlag,

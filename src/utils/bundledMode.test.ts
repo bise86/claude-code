@@ -27,6 +27,11 @@ describe('isSingleFileExecutable', () => {
     // 只是换个平台才发现。这个仓库的 Windows 发布已经因为同类问题挂过一次。
     process.argv[1] = 'B:\\~BUN\\root\\cli'
     expect(isSingleFileExecutable()).toBe(true)
+    // **正斜杠那一种才是 import.meta.url 的形态。** 验收从 bun 二进制里提取到两种都在:
+    // `B:\\~BUN\\` 和 `B:/~BUN/`。只写反斜杠的话,删掉 '/~BUN/' 这个 marker
+    // 全套测试照样绿 —— 而 Windows 产物会因此静默走回开发态分支,拿到一条不存在的路径。
+    process.argv[1] = 'B:/~BUN/root/cli'
+    expect(isSingleFileExecutable()).toBe(true)
   })
 
   it('长得像但不是的路径不算', () => {

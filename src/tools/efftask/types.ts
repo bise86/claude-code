@@ -336,7 +336,29 @@ export interface TaskNode {
 }
 
 export interface Caps {
-  maxDepth: number; maxNodes: number; maxIterations: number; nodeTimeoutMs: number
+  maxDepth: number; maxNodes: number; maxIterations: number
+  /**
+   * 一次子 agent 调用**没有任何进展**多久算挂死(毫秒)。
+   *
+   * 量的是「静默时长」,不是「总时长」。只要还在往外吐消息(模型说话、调工具、工具
+   * 返回)就一直不算超时 —— 一个读二十个文件、跑一遍测试、改几处代码的执行环节,
+   * 正常就要十几分钟,而它一秒都没卡住。原来量总时长,这类节点会被当成挂死杀掉,
+   * 阻断信息还教用户「把节点拆小」。
+   *
+   * **等人回答的时间不算在这里**,它有自己的预算(见 humanTimeoutMs)。
+   */
+  nodeTimeoutMs: number
+  /**
+   * 等**人**回答一次工具权限确认最多等多久(毫秒)。
+   *
+   * 和 nodeTimeoutMs 是两件完全不同的事,混成一个是实测出来的坑:权限确认
+   * (canUseTool)就发生在阶段调用的窗口里,于是「用户去泡了杯咖啡」和「provider
+   * 挂死了」共用一个 10 分钟的预算 —— 回来一看节点已经阻断,而给的建议是
+   * 「提高超时或把节点拆小」,两条都不对症。
+   *
+   * 默认给得很大(7 天):人不在键盘前是常态,而这条阀要挡的只是「永远没人回答」。
+   */
+  humanTimeoutMs: number
   scoreThreshold?: number
   /**
    * 一个阶段最多几席。超出的席位被剔除并点名。
@@ -377,7 +399,13 @@ export interface Caps {
    */
   planConverge?: '圆桌' | '精化'
 }
-export const DEFAULT_CAPS: Caps = { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 600_000 }
+export const DEFAULT_CAPS: Caps = {
+  maxDepth: 5, maxNodes: 100, maxIterations: 3,
+  // 静默 10 分钟 = 挂死。作为「一条消息都不吐」的判据,这个数已经很宽松了。
+  nodeTimeoutMs: 600_000,
+  // 7 天。人不在键盘前是常态。
+  humanTimeoutMs: 7 * 24 * 60 * 60 * 1000,
+}
 /** 一个阶段的席位上限默认值。 */
 export const DEFAULT_MAX_SEATS_PER_PHASE = 5
 

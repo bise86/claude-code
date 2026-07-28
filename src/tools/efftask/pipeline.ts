@@ -10,8 +10,8 @@ import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
-import { blockReasonWithRemedy, type BlockCategory } from './escalation.js'
-import { PhaseTimeoutError } from './runAgentAdapter.js'
+import { blockReasonWithRemedy, humanTimeoutRemedy, type BlockCategory } from './escalation.js'
+import { PhaseTimeoutError, type TimeoutKind } from './runAgentAdapter.js'
 
 /** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
 export type NodeSlots = { release: () => void }
@@ -228,7 +228,11 @@ function safeUpdate(ctx: PipelineCtx): void {
 // `text` rides along on the FAILURE branch too: the execute phase runs with write-capable
 // tools, so an abort that arrives after the executor answered may be discarding the only
 // record of changes already made to the repo.
-type PhaseResult = { ok: true; text: string } | { ok: false; reason: string; text?: string; timeout?: boolean }
+type PhaseResult =
+  | { ok: true; text: string }
+  // timeoutKind 要跟着走:静默超时和等人超时的处理方式**相反**,合并成一个 boolean
+  // 就只能给一句通用的话。
+  | { ok: false; reason: string; text?: string; timeout?: boolean; timeoutKind?: TimeoutKind }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
 // which records it into node.blockedReason and BLOCKs the node.
@@ -250,7 +254,12 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: 
   } catch (e) {
     // caps.nodeTimeoutMs is a safety VALVE (spec §11) and escalates differently from an
     // ordinary provider failure, so it travels as a flag rather than as prose to grep.
-    return { ok: false, reason: e instanceof Error ? e.message : String(e), timeout: e instanceof PhaseTimeoutError }
+    return {
+      ok: false,
+      reason: e instanceof Error ? e.message : String(e),
+      timeout: e instanceof PhaseTimeoutError,
+      timeoutKind: e instanceof PhaseTimeoutError ? e.kind : undefined,
+    }
   }
 }
 
@@ -1031,7 +1040,13 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     } else {
       if (!(await commit(node, 'PLANNING', ctx))) return
       const res = await runPlanPhase(node, ctx, feedback)
-      if (!res.ok) { await blockWithReason(node, res.reason, ctx, res.timeout ? 'timeout' : undefined); return }
+      if (!res.ok) {
+        await blockWithReason(
+          node, res.reason, ctx, res.timeout ? 'timeout' : undefined,
+          res.timeoutKind === 'human' ? humanTimeoutRemedy() : undefined,
+        )
+        return
+      }
       const parsed = res.parsed
       node.kind = parsed.kind
       node.plan = parsed.plan
@@ -1720,7 +1735,10 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // write tools, so discarding this can leave the repo changed with no record of it.
       const partial = res.text ? parseExecOutput(res.text, execTag).execStatus.trim() : ''
       if (partial) node.execStatus = `${partial}\n(注:本轮在完成前被中断,以上为中断时已报告的产出)`
-      await blockWithReason(node, res.reason, ctx, res.timeout ? 'timeout' : undefined)
+      await blockWithReason(
+        node, res.reason, ctx, res.timeout ? 'timeout' : undefined,
+        res.timeoutKind === 'human' ? humanTimeoutRemedy() : undefined,
+      )
       return
     }
     const out = parseExecOutput(res.text, execTag)

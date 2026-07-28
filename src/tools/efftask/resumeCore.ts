@@ -598,6 +598,8 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
     maxNodes: clampInt(caps.maxNodes, 1, 5000, DEFAULT_CAPS.maxNodes),
     maxIterations: clampInt(caps.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations),
     nodeTimeoutMs: clampInt(caps.nodeTimeoutMs, 1000, 3_600_000, DEFAULT_CAPS.nodeTimeoutMs),
+    // 上限 30 天:这条阀挡的是「永远没人回答」,不是「回答得慢」。
+    humanTimeoutMs: clampInt(caps.humanTimeoutMs, 1000, 30 * 24 * 60 * 60 * 1000, DEFAULT_CAPS.humanTimeoutMs),
   }
   // Rebuilding field-by-field silently dropped scoreThreshold, so a run configured with one
   // lost it on resume. Carry it when present.

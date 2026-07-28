@@ -28,6 +28,8 @@ type Shape = {
   argv1: string | null
   globOk: boolean
   globErr: string | null
+  nodeEnv: string | null
+  installationType: string
 }
 
 const fail: string[] = []
@@ -64,11 +66,18 @@ check(shape.argv0 === null, 'ripgrep 不走 argv0 分发')
 
 // **这条是本次 bug 的原点。**
 check(!shape.rgPath.includes('$bunfs'), `rg 路径不指向 bunfs 虚拟根(实际: ${shape.rgPath})`)
-check(!shape.rgPath.includes('~BUN'), 'rg 路径不指向 Windows 的 bunfs 虚拟根')
+// 原来这里是 `!rgPath.includes('~BUN')` —— 在 Linux 上恒真,实现改坏也照样绿。
+// Windows 那条判据只能靠源码态单测钉(bundledMode.test.ts 两种斜杠形态都有)。
 
 // **最重要的一条:真的搜一次。** 判据全对但搜不出东西等于没修 —— 第一版就差点停在
 // 「rgPath 不含 $bunfs」上,而那只证明了路径长得对,没证明它能跑。
 check(shape.globOk === true, `打包态里真的能搜出文件(globErr: ${shape.globErr ?? '无'})`)
+
+// NODE_ENV 在产物里必须是 production。不定死的话 bun 会内联成 'development',而且
+// 运行时改不动 —— doctor 的两处判断在新判据**之前**就按它短路,于是每个二进制都
+// 自报「开发态」,本轮那两处修改在产物里是死代码。这正是这道门禁立意要抓的形状。
+check(shape.nodeEnv === 'production', `NODE_ENV 在产物里是 production(实际: ${shape.nodeEnv})`)
+check(shape.installationType !== 'development', `doctor 不把二进制报成开发态(实际: ${shape.installationType})`)
 
 // argv[1] 在单文件产物里就是虚拟路径 —— 这条不是缺陷,是**前提**:它解释了为什么
 // 所有 `? execPath : argv[1]` 的分支都必须按 selfContained 判,而不是按有没有嵌入资源。

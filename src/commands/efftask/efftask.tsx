@@ -174,7 +174,12 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // The phase deadline must follow the RUN's caps, not a frozen default: on resume they come
   // back off run.md, which is hand-editable. The seam below is built before any config
   // exists, so it reads this holder at call time instead of capturing a number now.
-  const capsRef: { nodeTimeoutMs: number } = { nodeTimeoutMs: DEFAULT_CAPS.nodeTimeoutMs }
+  // 两个预算,不是一个:nodeTimeoutMs 量「静默多久」,humanTimeoutMs 量「等人多久」。
+  // 合成一个的话,「用户去倒杯水」和「provider 挂死了」共用同一个 10 分钟。
+  const capsRef: { nodeTimeoutMs: number; humanTimeoutMs: number } = {
+    nodeTimeoutMs: DEFAULT_CAPS.nodeTimeoutMs,
+    humanTimeoutMs: DEFAULT_CAPS.humanTimeoutMs,
+  }
 
   if (resumeArgs.mode === 'new') {
     // Local fs scan only — no model call, no tokens, sub-millisecond. Everything that COSTS
@@ -234,6 +239,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded
     // axis left. The extraction seam below gets it too.
     timeoutMs: () => capsRef.nodeTimeoutMs,
+    humanTimeoutMs: () => capsRef.humanTimeoutMs,
     // 工具摘要用工具自己的 userFacingName —— 主 REPL 每一行工具调用就是这么渲染的。
     // 接上它,以后新增的工具自动有好摘要,不用回来改那张静态表。
     briefResolver: (name, input) => {
@@ -252,6 +258,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     activeAgents,
     mainModelDefault,
     timeoutMs: () => capsRef.nodeTimeoutMs,
+    humanTimeoutMs: () => capsRef.humanTimeoutMs,
   })
 
   const knownRoles = activeAgents.map(a => a.agentType)
@@ -512,7 +519,7 @@ type RunnerProps = {
   /** Mutated once the run is identified, so call()'s onExit closure can release the right lock. */
   active: { runId: string | null; runDir: string | null; resumed: boolean }
   /** Written when the config resolves; the runAgent seam reads it for each phase deadline. */
-  capsRef: { nodeTimeoutMs: number }
+  capsRef: { nodeTimeoutMs: number; humanTimeoutMs: number }
   fs: FsLike
   runAgent: RunAgentFn
   signal: AbortSignal
@@ -743,6 +750,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       // The recovered caps are the run's caps — run.md is hand-editable, so a manifest that
       // declares a different nodeTimeoutMs must actually get it.
       props.capsRef.nodeTimeoutMs = withGuidance.caps.nodeTimeoutMs
+      props.capsRef.humanTimeoutMs = withGuidance.caps.humanTimeoutMs
       const isoR = await makeWorktreePool(runId!, getCwd())
       poolRef.current = isoR.pool
       setIsolation(isoR.pool ? 'worktree' : 'none')
@@ -789,6 +797,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // which model each one runs on. Resolve that here — this is the only layer that can
         // see the agent definitions and the session model.
         props.capsRef.nodeTimeoutMs = cfg.caps.nodeTimeoutMs
+        props.capsRef.humanTimeoutMs = cfg.caps.humanTimeoutMs
         // Isolation is resolved BEFORE the gate opens, because the gate has to tell the user
         // which kind of run this is — and it was telling every isolated run it was serial,
         // i.e. denying the one thing the user asked for. init() only creates a branch and a

@@ -559,3 +559,84 @@ describe('测试验证档的工具池(此前整条接线零覆盖)', () => {
     for (const r of ['Read', 'Glob', 'Grep']) expect(`${r}:${names.includes(r)}`).toBe(`${r}:true`)
   })
 })
+
+describe('两个时钟:等人回答不能算进接口超时', () => {
+  const deps = (runAgentImpl: unknown, over: Record<string, unknown> = {}) => ({
+    toolUseContext: {} as never,
+    canUseTool: (async () => ({ behavior: 'allow' })) as never,
+    availableTools: [] as never,
+    readOnlyTools: [] as never,
+    activeAgents: [],
+    mainModelDefault: { agentType: 'main' } as never,
+    runAgentImpl: runAgentImpl as never,
+    ...over,
+  })
+  const call = (fn: ReturnType<typeof makeRunAgentFn>) =>
+    fn({ phase: 'execute', node: {} as never, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })
+
+  it('一直在吐消息就不算超时 —— 量的是静默时长,不是总时长', async () => {
+    // 原来是一个 setTimeout 罩住整次调用:一个读二十个文件、跑测试、改代码的执行环节
+    // 十几分钟很正常,会被当成挂死杀掉,而它一秒都没卡住。
+    async function* steady(): AsyncGenerator<never> {
+      for (let i = 0; i < 8; i++) {
+        await new Promise(r => setTimeout(r, 30))
+        yield { type: 'assistant', message: { content: [{ type: 'text', text: `第${i}条` }] } } as never
+      }
+    }
+    // 总时长约 240ms,远超 80ms 的预算;但每 30ms 就有一条消息 → 不该超时
+    const text = await call(makeRunAgentFn(deps(steady, { timeoutMs: 80 })))
+    expect(text).toContain('第7条')
+  })
+
+  it('真的静默才超时', async () => {
+    async function* silent(): AsyncGenerator<never> {
+      await new Promise(r => setTimeout(r, 5000))
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } } as never
+    }
+    await expect(call(makeRunAgentFn(deps(silent, { timeoutMs: 60 })))).rejects.toThrow('阶段调用超时')
+  })
+
+  it('等人回答的那段时间不走接口时钟', async () => {
+    // 工具权限确认就在这个窗口里被 await。合成一个预算的话,「用户去倒杯水」和
+    // 「provider 挂死了」共用同一个 10 分钟 —— 回来一看节点已经阻断,而给的建议是
+    // 「提高超时或把节点拆小」,两条都不对症。
+    let asked = false
+    async function* usesTool(args: { canUseTool: () => Promise<unknown> }): AsyncGenerator<never> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '开始' }] } } as never
+      await args.canUseTool()   // 人在这里想了很久
+      asked = true
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '结束' }] } } as never
+    }
+    const slowHuman = (async () => { await new Promise(r => setTimeout(r, 250)); return { behavior: 'allow' } }) as never
+    const text = await call(makeRunAgentFn(deps(usesTool, {
+      canUseTool: slowHuman, timeoutMs: 80, humanTimeoutMs: 60_000,
+    })))
+    expect(asked).toBe(true)
+    expect(text).toContain('结束')
+  })
+
+  it('没人回答到超过人工预算 → 报的是**人工**超时,不是接口超时', async () => {
+    async function* usesTool(args: { canUseTool: () => Promise<unknown> }): AsyncGenerator<never> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '开始' }] } } as never
+      await args.canUseTool()
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '结束' }] } } as never
+    }
+    const neverAnswers = (() => new Promise(() => {})) as never
+    await expect(call(makeRunAgentFn(deps(usesTool, {
+      canUseTool: neverAnswers, timeoutMs: 50_000, humanTimeoutMs: 80,
+    })))).rejects.toThrow('等待人工确认超时')
+  })
+
+  it('两种超时带着不同的 kind —— 处理方式相反,不能合并', async () => {
+    async function* silent(): AsyncGenerator<never> {
+      await new Promise(r => setTimeout(r, 5000))
+      yield null as never
+    }
+    try {
+      await call(makeRunAgentFn(deps(silent, { timeoutMs: 60 })))
+      throw new Error('should have thrown')
+    } catch (e) {
+      expect((e as { kind?: string }).kind).toBe('stall')
+    }
+  })
+})
