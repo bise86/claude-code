@@ -2398,10 +2398,33 @@ describe('spec §16:方案阶段必须被告知"可能冲突的子任务要用�
     // 改动前就存在的 schema 行(`"children":[{"title","deps":[...]}]`)满足 —— 那条断言在
     // 这个 commit 之前就是绿的,证明不了任何事。验收评审据此把整段指示换成字面量
     // 「注意:worktree 合并冲突。」(保留被断言的词、删光所有可执行内容),230 个用例全绿。
-    expect(p).toContain('优先用 deps 串起来')
+    // 「事后串」那半句现在只是兜底,措辞改成了「实在避不开的…用 deps 串起来」——
+    // 断言跟着改,但断言的仍然是**可执行的指示**,不是关键词。
+    expect(p).toContain('用 deps 串起来')
     expect(p).toContain('各自独立的 git worktree')
+    // 「事前拆」那半句是这次新加的,而且它才是首选:按文件边界切不花任何并行度,
+    // 而串起来要花。少了它,planner 只会在事后补救。
+    expect(p).toContain('先按文件/模块边界切')
+    expect(p).toContain('预计会动哪些文件')
   })
 
+  it('按文件边界拆这条**不挂在隔离上** —— 它不是在讲这次运行有没有的风险', () => {
+    // 用户的原话:「拆分任务时,尽量避免不同任务改同一个文件」。
+    // 这是拆分质量本身:边界清楚的子任务,验收点也写得出来、评审也判得动。
+    // 串行运行同样受益 —— 挂在 isolated 上的话,没有隔离的那些运行永远拿不到它。
+    const n = root()
+    const p = planPrompt(n, { config: cfg, byId: byIdMap([n]) }, 'plantag')
+    expect(p).toContain('先按文件/模块边界切')
+    // 但 worktree/合并那段仍然只在有隔离时说 —— 别描述这次运行不会有的风险。
+    expect(p).not.toContain('各自独立的 git worktree')
+  })
+
+  it('到了深度上限就不再讲怎么拆 —— 上一句刚说了不许再拆', () => {
+    const n = root()
+    n.depth = cfg.caps.maxDepth
+    const p = planPrompt(n, { config: cfg, byId: byIdMap([n]), worktrees: fakePool }, 'plantag')
+    expect(p).not.toContain('先按文件/模块边界切')
+  })
   it('同一段话必须同时讲清串联的代价,否则等于叫 planner 全部串行化', () => {
     // §16 原话是「**鼓励**」,同一段还写着「不追求全自动无冲突」并给了
     // 「冲突→自动解决→失败升级人工」的通路。而 deps 是硬调度门,依赖阻断还会传播给所有

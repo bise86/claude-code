@@ -515,9 +515,27 @@ export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feed
     // admits one node at a time and `acquire` branches from the integration branch's CURRENT
     // tip, so the second node already contains the first one's merge. That is the same test
     // used to suppress this for un-isolated runs: do not describe a hazard this run cannot have.
+    /**
+     * **先按文件边界拆。**
+     *
+     * 这一句和下面那段的区别是「事前」和「事后」:下面讲的是「已经会碰同一个文件了,
+     * 用 deps 串起来」—— 而串起来要花掉并行度,还把「一个节点失败」放大成「整条链失败」。
+     * 按文件边界拆是免费的:两个子任务本来就不碰同一批文件时,既不需要串,也不会冲突。
+     *
+     * 不挂在 isolated 上:这不是在描述一个「这次运行不会有的风险」,而是拆分质量本身 ——
+     * 边界清楚的子任务,验收点也写得出来,评审也判得动。串行运行同样受益。
+     *
+     * 要求它**把文件写进 solution**,而不是只在心里想:验收环节按 acceptance 判,而
+     * acceptance 那条已经要求「改了哪些文件」—— 两头对得上,才有人能发现拆歪了。
+     */
+    (node.depth + 1 <= caps.maxDepth
+      ? `拆分时**先按文件/模块边界切**,尽量让不同子任务改到的文件不重叠;` +
+        `每个子任务的 solution 里要写清它预计会动哪些文件。\n`
+      : '') +
     (isolated && node.depth + 1 <= caps.maxDepth && ctx.config.parallelism > 1
-      ? `注意:子任务在**各自独立的 git worktree** 里并行执行,最后逐个合并回集成分支。` +
-        `所以**几乎必然会改到同一个文件的子任务,优先用 deps 串起来**,让它们先后执行。\n` +
+      ? `子任务在**各自独立的 git worktree** 里并行执行,最后逐个合并回集成分支。` +
+        `按文件边界切完之后**实在避不开**的那些(几乎必然会改到同一个文件),用 deps 串起来,` +
+        `让它们先后执行。\n` +
         // The counter-pressure, and it is load-bearing rather than decoration. `deps` is a hard
         // scheduling gate, and 依赖阻断 propagates to every downstream dependant — so
         // over-chaining converts "one node failed" into "the whole chain failed", on top of
