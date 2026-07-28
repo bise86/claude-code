@@ -3,7 +3,6 @@ import type { AgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import type { ToolUseContext, Tools } from '../../Tool.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import type { Message } from '../../types/message.js'
-import type { ModelAlias } from '../../utils/model/aliases.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { runWithCwdOverride } from '../../utils/cwd.js'
 import type { RunControl } from './control.js'
@@ -116,30 +115,38 @@ export function pickAgentDefinition(
 }
 
 /**
- * 这一席的模型别名 —— **只有员工真的解析到了才给**。
+ * 这一席**不从外面指定模型** —— 见派发处 `model` 那一段。
  *
- * 用户实测:配了 `roles[]` 之后,方案环节整段变成
+ * 这个位置以前住着一个 `modelForRole()`,两版都是错的,记在这里免得再长回来:
+ *
+ * 第一版无条件传 `role.model`;第二版改成「员工解析到了才传」。用户实测两版都炸,
+ * 报的是同一句:
  *   「There's an issue with the selected model (K3). It may not exist or you may not have
- *    access to it. Run /model to pick a different model.」
+ *    access to it.」
  * 而重点/风险点/验收点全空 —— 关口上三行 ⚠,一次真正的分析都没发生。
  *
- * 根因:pickAgentDefinition 匹配不到员工时回落到**主模型**的 agent 定义,而调用方仍然
- * 把 `role.model` 传下去。于是「拿 K3 这个名字去问会话自己的 provider」——它当然没有。
- * 员工自己的 apiUrl / apiToken 挂在**它自己的** agent 定义上(roleClientConfig →
- * buildRoleFetch),回落之后那一份根本没被用上。
+ * 真正的根因不在「传不传」,在**这个字段根本不是执行参数**:
  *
- * 旧注释写的是「无法识别的别名会落到 runAgent 自己的模型解析」——**不成立**,它是硬报错。
+ * 1. `RoleBinding.model` 是 `annotateRoleModels()` 填的**显示值**,7 个读者里 6 个是
+ *    渲染(关口名册、日志流的「(模型)」标注)。而 `effectiveModel()` 对 openai 员工
+ *    **故意**返回 `roleClientConfig.backendModel`(比如 'K3')—— 那是给人看的后端名,
+ *    不是引擎认得的别名。它的注释原话:「naming the Claude fallback here would be
+ *    precisely backwards」。
  *
- * 解析不到就退回主模型的默认模型:少一个员工是降质,而拿着一个不存在的模型名开跑是
- * 整个环节报废。名册那一关本来就会告诉用户哪个员工没解析出来。
+ * 2. runAgent 对 openai 员工**故意**传 `undefined`(runAgent.ts 的 `isOpenAIRole`):
+ *    引擎要拿 mainLoopModel 做 Claude 模型的数学运算(token 预算、getRuntimeMainLoopModel),
+ *    真正的后端模型由 buildRoleFetch 的 request-shim 在网线上换。
+ *
+ * 3. 而 `getAgentModel()` 第一句就是 `// Prioritize tool-specified model if provided`
+ *    —— 外面传进来的 model **压倒**第 2 条那道保护。于是 'K3' 成了这个 subagent 的
+ *    mainLoopModel,任何**不经过** buildRoleFetch 的调用就拿着它去问会话自己的
+ *    provider,回 404,再被 errors.ts 统一翻译成上面那句「模型有问题」。
+ *
+ * 也就是说:一个为**显示**算出来的值被喂回**执行**,还正好优先于那道专门拦它的保护。
+ *
+ * 员工要跑在自己的模型和端点上,靠的是 agentDefinition 自己带的 `model` +
+ * `roleClientConfig`,runAgent 已经按协议分好了支。从这里再传一次,只能盖错。
  */
-export function modelForRole(
-  role: RoleBinding | null,
-  activeAgents: AgentDefinition[],
-): string | undefined {
-  if (!role?.model) return undefined
-  return activeAgents.some(a => a.agentType === role.roleName) ? role.model : undefined
-}
 
 export function makeRunAgentFn(deps: {
   toolUseContext: ToolUseContext
@@ -354,9 +361,9 @@ export function makeRunAgentFn(deps: {
         canUseTool,
         isAsync: false,
         querySource: 'agent:custom',
-        // NOT validated: an unrecognized alias simply falls through to runAgent's own model
-        // resolution (which applies its default). We do not pre-check the string here.
-        model: modelForRole(req.role, deps.activeAgents) as ModelAlias | undefined,
+        // model 是**故意不传**的 —— 传了会盖掉 runAgent 按协议分好的那套解析,
+        // 而且 getAgentModel 让外部值优先于专门拦它的保护。上面那段长注释是全部原委。
+        // 员工的模型和端点跟着 agentDefinition 走(pickAgentDefinition 已经选好了)。
         availableTools: tools,
         // runAgent's `worktreePath` is METADATA ONLY — it is recorded for resume and does
         // NOT change the sub-agent's cwd (AgentTool does that separately via
