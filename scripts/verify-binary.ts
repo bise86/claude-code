@@ -26,6 +26,8 @@ type Shape = {
   rgPath: string
   argv0: string | null
   argv1: string | null
+  globOk: boolean
+  globErr: string | null
 }
 
 const fail: string[] = []
@@ -63,6 +65,10 @@ check(shape.argv0 === null, 'ripgrep 不走 argv0 分发')
 // **这条是本次 bug 的原点。**
 check(!shape.rgPath.includes('$bunfs'), `rg 路径不指向 bunfs 虚拟根(实际: ${shape.rgPath})`)
 check(!shape.rgPath.includes('~BUN'), 'rg 路径不指向 Windows 的 bunfs 虚拟根')
+
+// **最重要的一条:真的搜一次。** 判据全对但搜不出东西等于没修 —— 第一版就差点停在
+// 「rgPath 不含 $bunfs」上,而那只证明了路径长得对,没证明它能跑。
+check(shape.globOk === true, `打包态里真的能搜出文件(globErr: ${shape.globErr ?? '无'})`)
 
 // argv[1] 在单文件产物里就是虚拟路径 —— 这条不是缺陷,是**前提**:它解释了为什么
 // 所有 `? execPath : argv[1]` 的分支都必须按 selfContained 判,而不是按有没有嵌入资源。

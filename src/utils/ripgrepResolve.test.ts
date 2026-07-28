@@ -26,7 +26,7 @@ describe('resolveRipgrepConfig', () => {
   })
 
   it('用户要系统 rg 但 PATH 上没有 → 继续往下走,不是硬失败', () => {
-    const c = resolveRipgrepConfig({ ...base, wantsSystem: true })
+    const c = resolveRipgrepConfig({ ...base, wantsSystem: true, fileExists: () => true })
     expect(c.mode).toBe('builtin')
     expect(c.command).toContain('/repo/src/utils')
   })
@@ -39,8 +39,14 @@ describe('resolveRipgrepConfig', () => {
   it('单文件产物:**绝不**拼 moduleDir —— 那是 bunfs 虚拟根', () => {
     // 这就是用户报的那条。moduleDir 在单文件产物里是 /$bunfs/root/,拼出来的
     // /$bunfs/root/vendor/ripgrep/x64-linux/rg 只能读、不能 spawn。
-    const c = resolveRipgrepConfig({ ...base, isSingleFile: true, moduleDir: '/$bunfs/root' })
+    const seen: string[] = []
+    const c = resolveRipgrepConfig({
+      ...base, isSingleFile: true, moduleDir: '/$bunfs/root',
+      fileExists: p => { seen.push(p); return false },
+    })
     expect(c.command).not.toContain('$bunfs')
+    // 连**查**都不该去查那条虚拟路径
+    expect(seen.some(p => p.includes('$bunfs'))).toBe(false)
     expect(c).toEqual({ mode: 'system', command: 'rg', args: [] })
   })
 
@@ -81,9 +87,31 @@ describe('resolveRipgrepConfig', () => {
     expect(c.argv0).toBeUndefined()
   })
 
-  it('开发态照旧:按模块目录拼 vendor/ripgrep', () => {
-    const c = resolveRipgrepConfig(base)
+  it('开发态:内置的那份**在盘上**才用它', () => {
+    const c = resolveRipgrepConfig({ ...base, fileExists: () => true })
     expect(c.mode).toBe('builtin')
     expect(c.command).toContain('/repo/src/utils/vendor/ripgrep')
+  })
+
+  it('开发态但根本没有 vendor/ripgrep → 退到系统 rg,不是拼一条不存在的路径', () => {
+    // 这个 fork 的 vendor/ 里只有 zod-v4.js,**从来没有过 vendor/ripgrep/** ——
+    // 也就是说从源码跑时每一次 Grep/Glob 都在 ENOENT,只是错误信息没有 $bunfs
+    // 那么显眼,一直被当成别的问题。原来这里是无条件返回那条路径。
+    const c = resolveRipgrepConfig({ ...base, systemRg: () => '/usr/bin/rg' })
+    expect(c).toEqual({ mode: 'system', command: 'rg', args: [] })
+  })
+
+  it('哪儿都没有(开发态)→ 也要报那句能照做的话', () => {
+    let warned = ''
+    const c = resolveRipgrepConfig({ ...base, onMissing: m => { warned = m } })
+    expect(c.command).toBe('rg')
+    expect(warned).toContain('装一个 ripgrep')
+  })
+
+  it('候选顺序:模块目录优先于可执行文件旁边', () => {
+    const seen: string[] = []
+    resolveRipgrepConfig({ ...base, fileExists: p => { seen.push(p); return false } })
+    expect(seen[0]).toContain('/repo/src/utils/vendor/ripgrep')
+    expect(seen[1]).toContain('/usr/local/bin/vendor/ripgrep')
   })
 })

@@ -60,18 +60,49 @@ export function resolveRipgrepConfig(deps: {
   if (deps.isOfficialNativeBuild) {
     return { mode: 'embedded', command: deps.execPath, args: ['--no-config'], argv0: 'rg' }
   }
-  if (deps.isSingleFile) {
-    const beside = vendoredRgUnder(path.dirname(deps.execPath))
-    if (deps.fileExists(beside)) return { mode: 'builtin', command: beside, args: [] }
-    if (deps.systemRg() === 'rg') {
-      deps.onMissing?.(
-        '找不到 ripgrep:这个单文件产物里没有内置 rg,系统 PATH 上也没有。' +
-          'Grep / Glob / 全局搜索会失败。装一个 ripgrep,或把 vendor/ripgrep 放到可执行文件旁边。',
-      )
-    }
-    return { mode: 'system', command: 'rg', args: [] }
+
+  /**
+   * 内置的那份**必须先确认它真的在盘上**。
+   *
+   * 原来这里是无条件拼一条路径就返回,踩出两个真实故障:
+   *
+   *  1. 打包态:`moduleDir` 是 bunfs 虚拟根,拼出 `/$bunfs/root/vendor/ripgrep/x64-linux/rg`。
+   *     嵌进单文件产物的东西**只能读、不能 spawn** → 用户报的
+   *     `ENOENT: posix_spawn '/$bunfs/root/…/rg'`。
+   *  2. **开发态也一样坏**:这个 fork 的 `vendor/` 里只有 zod-v4.js,**从来没有过
+   *     vendor/ripgrep/**。所以从源码跑时拼出来的那条路径同样不存在,每一次
+   *     Grep/Glob 都 ENOENT —— 只是错误信息没有 `$bunfs` 那么显眼,一直被当成别的问题。
+   *
+   * 后果远不止「搜索失败」:Glob 是 ripgrep 驱动的,子 agent 因此**列不出文件**,
+   * 只能猜文件名,于是 Read 报 "File does not exist",而方案环节则产出
+   * 「由于文件系统工具无法正常访问…」这种一句话方案。
+   *
+   * 所以顺序改成:候选路径逐个**查存在性** → 系统 rg → 报一句能照做的话。
+   */
+  const candidates = deps.isSingleFile
+    // 单文件产物:只有「挨着可执行文件」这一种放法有意义,moduleDir 是虚拟根。
+    ? [vendoredRgUnder(path.dirname(deps.execPath))]
+    : [vendoredRgUnder(deps.moduleDir), vendoredRgUnder(path.dirname(deps.execPath))]
+  for (const c of candidates) {
+    if (deps.fileExists(c)) return { mode: 'builtin', command: c, args: [] }
   }
-  return { mode: 'builtin', command: vendoredRgUnder(deps.moduleDir), args: [] }
+
+  if (deps.systemRg() !== 'rg') return { mode: 'system', command: 'rg', args: [] }
+
+  /**
+   * 哪儿都没有。仍然返回 `'rg'` —— 让失败发生在一个用户认得、能自己装的名字上,
+   * 而不是一条他从没见过的 `/$bunfs/` 或 `src/utils/vendor/…` 路径。
+   *
+   * 也**不能**退到上面那条 argv0 分发:那依赖官方构建把 ripgrep 静态链进 bun-internal。
+   * 实测 `spawn(本 fork 的二进制, ['--version'], { argv0: 'rg' })` 返回的是 Claude Code
+   * 自己的版本号,不是 ripgrep 的 —— 把搜索结果换成一行版本号,比 ENOENT 更难发现。
+   */
+  deps.onMissing?.(
+    '找不到 ripgrep:本地没有内置的 vendor/ripgrep,系统 PATH 上也没有 rg。' +
+      'Grep / Glob / 全局搜索都会失败,子 agent 会因此列不出文件。' +
+      '装一个 ripgrep(apt install ripgrep / brew install ripgrep),或把 vendor/ripgrep 放到可执行文件旁边。',
+  )
+  return { mode: 'system', command: 'rg', args: [] }
 }
 
 const getRipgrepConfig = memoize((): RipgrepConfig => {
