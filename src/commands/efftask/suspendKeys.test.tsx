@@ -18,6 +18,15 @@ import { render } from '../../ink.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 
+/**
+ * 方向键和 Esc 必须写成**显式转义**。
+ *
+ * 这个文件原来一个 ESC 字节都没有 —— 字面量被写文件的那一步吞掉了,剩下 '[B' 两个普通
+ * 字符。于是「方向键也不动」「Esc 不能中断整个 run」这两条断言是**空的**:键根本没送到,
+ * 什么都没发生自然成立。改成显式转义之后它们才真的在测被测行为。
+ */
+const DOWN = '\u001b[B'
+const ESC = '\u001b'
 const NOW = new Date().toISOString()
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, 15))
 
@@ -121,7 +130,7 @@ describe('suspended 时面板不吃任何键', () => {
     const { t, app } = await mount(
       <TaskTreePanel nodes={TREE()} runId="003" interactive suspended onExitKey={() => { exits++ }} />,
     )
-    t.stdin.press('')
+    t.stdin.press(ESC)
     await tick()
     t.stdin.press('q')
     await tick()
@@ -133,7 +142,7 @@ describe('suspended 时面板不吃任何键', () => {
     const { t, app } = await mount(
       <TaskTreePanel nodes={TREE()} runId="003" interactive suspended onExitKey={() => {}} />,
     )
-    t.stdin.press('[B')
+    t.stdin.press(DOWN)
     await tick()
     t.stdin.press('\r')
     await tick()

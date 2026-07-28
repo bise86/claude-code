@@ -6,6 +6,7 @@ import type { Message } from '../../types/message.js'
 import type { ModelAlias } from '../../utils/model/aliases.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { runWithCwdOverride } from '../../utils/cwd.js'
+import type { RunControl } from './control.js'
 import { eventsFromMessage, type BriefResolver } from './agentEvents.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { RoleBinding } from './types.js'
@@ -18,6 +19,20 @@ import type { RoleBinding } from './types.js'
  * and this reason's text is user-facing Chinese prose that will be reworded.
  */
 export type TimeoutKind = 'stall' | 'human'
+
+/**
+ * 用户点名取消了这一个节点。
+ *
+ * 和超时、provider 故障必须**分得开**:那两种是「出了问题」,要给补救建议、要计入
+ * 返工预算;这一种是用户的决定,节点该干净地停下并保持可恢复(重做 / --resume)。
+ * 合成一句「调用失败」的话,阻断卡会去劝用户提高超时——而他刚刚亲手按了取消。
+ */
+export class NodeCancelledError extends Error {
+  constructor(public readonly nodeId: string) {
+    super('该节点已被用户取消')
+    this.name = 'NodeCancelledError'
+  }
+}
 
 /**
  * 两个时钟的轮询周期。
@@ -127,6 +142,8 @@ export function makeRunAgentFn(deps: {
    * 合成一个预算时「用户去泡了杯咖啡」和「provider 挂死了」共用同一个 10 分钟。
    */
   humanTimeoutMs?: number | (() => number)
+  /** 运行中的人工干预面。给了才有「取消单个节点」。 */
+  control?: RunControl
   /**
    * 「有一次工具权限确认正在等人回答」的开关。
    *
@@ -234,6 +251,14 @@ export function makeRunAgentFn(deps: {
      */
     let timedOut = false
     let timeoutKind: TimeoutKind = 'stall'
+    /**
+     * 登记这次调用,好让 control.cancelNode 中止它。
+     *
+     * 放在**这里**而不是调用方:inner 这个 controller 只在这一层存在,而它正是取消
+     * 唯一能作用的东西。注销放在最外层 finally —— 留着的话,一个早就结束的 controller
+     * 会一直挂在表里。
+     */
+    const unregister = deps.control?.registerCall(req.node.id, inner)
     const limitMs = typeof deps.timeoutMs === 'function' ? deps.timeoutMs() : deps.timeoutMs
     const humanLimitMs = typeof deps.humanTimeoutMs === 'function' ? deps.humanTimeoutMs() : deps.humanTimeoutMs
     let lastProgressAt = Date.now()
@@ -347,6 +372,7 @@ export function makeRunAgentFn(deps: {
     } finally {
       if (poll) clearInterval(poll)
       if (timer) clearInterval(timer)
+      unregister?.()
       req.signal.removeEventListener('abort', relay)
       /**
        * 窗口的收口点。**只能在这里**,不能放在圆桌里。
@@ -365,6 +391,9 @@ export function makeRunAgentFn(deps: {
     }
     // Report the deadline rather than returning a truncated answer that the phase would
     // parse as a real (empty) reply.
+    // 取消要排在超时**之前**判:被取消的调用同样是 abort,而它此刻可能恰好也超时了。
+    // 判成超时的话,用户会拿到一句「提高 nodeTimeoutMs」——而他刚刚亲手按了取消。
+    if (deps.control?.wasCancelled(req.node.id) === true) throw new NodeCancelledError(req.node.id)
     if (timedOut) {
       throw new PhaseTimeoutError(
         (timeoutKind === 'human' ? humanLimitMs : limitMs) ?? 0,

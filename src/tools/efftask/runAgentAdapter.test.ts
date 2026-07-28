@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { verifyToolPool } from '../../commands/efftask/efftask.js'
 import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs } from './runAgentAdapter.js'
+import { createRunControl } from './control.js'
 import { pwd } from '../../utils/cwd.js'
 
 describe('runAgentAdapter helpers', () => {
@@ -571,8 +572,10 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     runAgentImpl: runAgentImpl as never,
     ...over,
   })
+  // node 带上 id:取消是**按节点 id** 登记和触发的,`{}` 的话 id 是 undefined,
+  // 于是 registerCall 和 cancelNode 各按各的键走,取消永远命不中。
   const call = (fn: ReturnType<typeof makeRunAgentFn>) =>
-    fn({ phase: 'execute', node: {} as never, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })
+    fn({ phase: 'execute', node: { id: 'root' } as never, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })
 
   /**
    * 数 setInterval / clearInterval —— 直接拦全局函数。
@@ -834,6 +837,52 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
       canUseTool: allow, onHumanWait: () => { throw new Error('渲染炸了') },
     })))
     expect(text).toContain('结束')
+  })
+  it('取消单个节点:中止在飞的调用,并抛一个可辨别的错', async () => {
+    // 登记 controller 和抛 NodeCancelledError 都只发生在这一层 —— 编排器那一档注入的是
+    // 裸 RunAgentFn,碰不到它。
+    const control = createRunControl()
+    let aborted = false
+    async function* slow(args: { abortSignal?: AbortSignal }): AsyncGenerator<never> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '开始' }] } } as never
+      control.cancelNode('root')
+      await new Promise(r => setTimeout(r, 40))
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '不该到这里' }] } } as never
+    }
+    void aborted
+    try {
+      await call(makeRunAgentFn(deps(slow, { control })))
+      throw new Error('should have thrown')
+    } catch (e) {
+      // 不是超时、不是 provider 故障 —— 那两种会让阻断卡去劝用户提高超时。
+      expect((e as Error).name).toBe('NodeCancelledError')
+    }
+  })
+
+  it('取消**之前**登记的调用不受影响 —— 注销要真的注销', async () => {
+    const control = createRunControl()
+    async function* quick(): AsyncGenerator<never> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '完事' }] } } as never
+    }
+    const text = await call(makeRunAgentFn(deps(quick, { control })))
+    expect(text).toContain('完事')
+    // 调用早就结束了。此刻再取消不该抛,也不该留下悬挂的 controller。
+    expect(() => control.cancelNode('root')).not.toThrow()
+  })
+
+  it('已经被取消过的节点,新一轮派发立刻停 —— 取消和派发可能撞在一起', async () => {
+    const control = createRunControl()
+    control.cancelNode('root')
+    async function* neverEnds(): AsyncGenerator<never> {
+      await new Promise(r => setTimeout(r, 5000))
+      yield null as never
+    }
+    try {
+      await call(makeRunAgentFn(deps(neverEnds, { control })))
+      throw new Error('should have thrown')
+    } catch (e) {
+      expect((e as Error).name).toBe('NodeCancelledError')
+    }
   })
   it('两种超时带着不同的 kind —— 处理方式相反,不能合并', async () => {
     async function* silent(): AsyncGenerator<never> {

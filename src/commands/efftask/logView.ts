@@ -398,3 +398,32 @@ export function anchoredFrom(
   if (at < 0) return 0
   return Math.max(0, Math.min(maxFrom, at + anchor.delta))
 }
+
+/**
+ * 运行中的人工干预键。
+ *
+ * 抽成纯函数和 redoGateAction 同一个理由:面板的按键处理没有别的接缝,而这几个键的
+ * 后果一个比一个重(取消一个正在改代码的节点、把整轮暂停下来)。
+ *
+ * **只在运行中生效**,而且都挑了不与既有键冲突的字母:
+ *  - p/P:暂停 / 恢复调度(在飞的调用不打断)
+ *  - i/I:追加一句指令(作用于之后派发的提示词)
+ *  - x/X:取消**光标选中**的那一个节点
+ *
+ * 大小写都收:用户按住 shift 打字是常事,而一个「按了没反应」的键比没有这个键更糟。
+ */
+export type RunControlKey = 'togglePause' | 'addDirective' | 'cancelNode'
+
+export function runControlAction(input: string, key: { ctrl?: boolean; meta?: boolean }): RunControlKey | null {
+  // 组合键归终端和 REPL,别抢。
+  if (key.ctrl || key.meta) return null
+  if (input.length === 0) return null
+  const c = input[0]!
+  // 只认「同一个字符的连续重复」——否则那是别的输入被合批带进来的(和 logPaneAction 同因)。
+  if (input !== c.repeat(input.length)) return null
+  const k = c.toLowerCase()
+  if (k === 'p') return 'togglePause'
+  if (k === 'i') return 'addDirective'
+  if (k === 'x') return 'cancelNode'
+  return null
+}

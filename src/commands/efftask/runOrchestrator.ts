@@ -1,3 +1,4 @@
+import type { RunControl } from '../../tools/efftask/control.js'
 import { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import type { PipelineCtx } from '../../tools/efftask/pipeline.js'
 import { writeNode, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
@@ -44,6 +45,8 @@ export async function runOrchestrator(
     runAgent: RunAgentFn
     signal: AbortSignal
     seed?: TaskNode[]
+    /** 运行中的人工干预面 —— 暂停 / 追加指令 / 取消单个节点。 */
+    control?: RunControl
     worktrees?: WorktreePool
     /** 升级人工 (spec §8): a conflict the node could not resolve itself. */
     onEscalate?: PipelineCtx['onEscalate']
@@ -171,6 +174,7 @@ export async function runOrchestrator(
         persist,
         now,
         worktrees: args.worktrees,
+        control: args.control,
         // So blockWithReason can write the REAL retry command into blockedReason (run.md is
         // where suppressed escalations have to remain actionable).
         runId: args.taskEntry?.runId,

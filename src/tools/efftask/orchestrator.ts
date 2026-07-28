@@ -2,6 +2,7 @@
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap, isTerminal } from './stateMachine.js'
 import { createStallTracker, pickBatch, type Advanceable } from './scheduler.js'
+import type { RunControl } from './control.js'
 import { stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { WorktreePool } from './worktreePool.js'
@@ -46,6 +47,8 @@ export interface OrchestratorDeps {
   openStream?: PipelineCtx['openStream']
   cwd?: PipelineCtx['cwd']
   runAgent: RunAgentFn
+  /** 运行中的人工干预面。给了才有暂停 / 追加指令 / 单节点取消。 */
+  control?: RunControl
   persist: (n: TaskNode) => Promise<void>
   now: () => string
   onUpdate: (nodes: TaskNode[]) => void
@@ -149,6 +152,7 @@ export class EffTaskOrchestrator {
       slots: this.slots,
       byId: this.byId,
       runAgent: this.deps.runAgent,
+      control: this.deps.control,
       persist: this.deps.persist,
       now: this.deps.now,
       signal: this.signal,
@@ -245,6 +249,20 @@ export class EffTaskOrchestrator {
       // Completion wins over abort: a tree that finished before the signal fired IS done,
       // and reporting 'blocked' would contradict what was persisted.
       if (root.status === 'ACCEPTED') { await this.settleAll(inFlight); return { status: 'completed' } }
+      /**
+       * 暂停。**排在「没有在飞的就算走不动」之前** —— 否则一次暂停会被当成
+       * 「树推不动了」,run 直接以 blocked 收尾,而用户只是想插一句话。
+       *
+       * 在飞的调用不打断:暂停的语义是「先别派新的」,不是「把正在干的活炸掉」。
+       * 所以这里同时等「恢复」和「任一在飞的完成」——后者让 inFlight 表保持收敛,
+       * 不然暂停期间一个已完成的节点会一直挂在表里。
+       */
+      if (this.deps.control?.isPaused() === true) {
+        const waits: Promise<unknown>[] = [this.deps.control.waitForResume()]
+        if (inFlight.size > 0) waits.push(Promise.race([...inFlight.values()]).catch(() => {}))
+        await Promise.race(waits)
+        continue
+      }
       if (this.signal.aborted) {
         // Settle FIRST. propagateBlocked sweeps and returns; a step still running would
         // commit AFTER the sweep, leaving a non-terminal node in a tree we already declared

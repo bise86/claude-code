@@ -27,6 +27,8 @@ import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResum
 import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resumeCore.js'
 import { reseatTransientNodes } from '../../tools/efftask/reseat.js'
 import { acquireRunLock, listRuns, releaseRunLock, reserveRun, type RunSummary } from '../../tools/efftask/runRegistry.js'
+import { createRunControl, type RunControl } from '../../tools/efftask/control.js'
+import { AddDirective } from './AddDirective.js'
 import { ConfirmRedo } from './ConfirmRedo.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
@@ -258,6 +260,11 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // (processSlashCommand.tsx:609) with NO fallback of its own, and it really can be
   // undefined (QueryEngine builds contexts without one). So we supply the same fallback the
   // fork path uses at processSlashCommand.tsx:728.
+  /**
+   * 人工干预面。**必须在这里建**,不能在组件里:runAgent 也是在这里构造的,而取消要
+   * 靠它们共用同一个实例才生效。组件重挂时换一个新的,已经登记的在飞调用就永远取消不掉。
+   */
+  const control = createRunControl()
   const canUseTool = context.canUseTool ?? hasPermissionsToUseTool
   const mainModelDefault = pickMainAgentDefinition(allAgents)
   // 非执行环节的池子:会话里的一切,减去会改盘的(含 MCP —— 见 WRITE_CAPABLE_TOOL_NAMES)。
@@ -270,6 +277,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     // 画在面板**之上**,两个组件同时挂着 —— 而 useInput 是广播的:用户按回车批准工具,
     // 同一下回车也会打开光标所在节点的详情页。
     onHumanWait: w => { humanWaitOut.current?.(w) },
+    control,
     // subAgentToolPool 而不是裸的 context.options.tools:执行环节原来一个都不滤,
     // 所以它是唯一还能拿到 Skill 的地方 —— 而它恰好是最费钱的那个环节。
     availableTools: subAgentToolPool(context.options.tools), // execute phase only
@@ -385,6 +393,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       handoffOut={handoffOut}
       cardLimitOut={cardLimitOut}
       humanWaitOut={humanWaitOut}
+      control={control}
       // The transcript is the only durable trace once the panel is gone: say how the run
       // ended and where its artifacts live, not just that it ended.
       // Latched: the done view's key handler fires per keypress, and the immediate-command
@@ -615,6 +624,8 @@ type RunnerProps = {
   /** call()-scoped count of escalation cards the limiter dropped, read by onExit. */
   cardLimitOut: { current: number }
   humanWaitOut: { current: ((waiting: boolean) => void) | null }
+  /** 运行中的人工干预面 —— 在 call() 里建,和 runAgent 共用同一个实例。 */
+  control: RunControl
   onExit: (outcome: Outcome | null) => void
 }
 
@@ -665,6 +676,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 计数而不是布尔:并行度大于 1 时可以同时有几个执行节点各自等一个确认。
    */
   const humanWait = useHumanWaitCount()
+  /**
+   * 运行中的人工干预面。**在 call() 里就建好**并交给 runAgent / orchestrator ——
+   * 组件重挂时不能换一个新的,否则已经登记的在飞调用就再也取消不掉了。
+   */
+  const control = props.control
+  /** 暂停状态镜像进 state,只为了让提示行重绘。真相在 control 里。 */
+  const [paused, setPaused] = React.useState(false)
+  /** 追加指令输入框开着吗。 */
+  const [directiveOpen, setDirectiveOpen] = React.useState(false)
   // 把通知口交给 call() 作用域里早就构造好的 runAgent —— 那时组件还不存在。
   // 卸载时收回:指向一个已卸载组件的 setState 会静默丢事件,而丢的正是「拿回键盘」。
   React.useEffect(() => {
@@ -1025,6 +1045,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     void runOrchestrator(
       {
         config: cfg, runDir: runDir!, fs: props.fs, runAgent: props.runAgent,
+        // 同一个实例:面板按 x 取消的是它,适配器登记在飞调用的也是它。
+        control: props.control,
         signal: props.signal, seed: rootSeed ?? seed ?? undefined, worktrees: pool,
         // 后台任务登记 (spec §10). Handed to runOrchestrator rather than wired here: that
         // module is importable by a test, this one is not, and the last two features wired
@@ -1499,8 +1521,30 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  if (phase === 'running' && directiveOpen) {
+    return (
+      <AddDirective
+        existing={control.directives().length}
+        onSubmit={t => { control.addDirective(t); setDirectiveOpen(false) }}
+        onCancel={() => setDirectiveOpen(false)}
+      />
+    )
+  }
   if (phase === 'running') {
-    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} serialExecute={poolRef.current === undefined} />
+    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} serialExecute={poolRef.current === undefined}
+      runControl={{
+        paused,
+        // 真相在 control 里,state 只是让提示行重绘 —— 两边分开的话它们迟早不一致,
+        // 而不一致的那一次用户会以为自己暂停成功了。
+        onTogglePause: () => {
+          if (control.isPaused()) control.resume()
+          else control.pause()
+          setPaused(control.isPaused())
+        },
+        onAddDirective: () => setDirectiveOpen(true),
+        onCancelNode: n => control.cancelNode(n.id),
+      }}
+    />
   }
   return (
     <DoneView
@@ -1565,14 +1609,20 @@ function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[]
 // EXPORTED for testing. The three §10.2 hops that live in this file — creating the store,
 // pushing into it, and handing it to each panel — are exactly the shape of wire this repo has
 // cut twice, and nothing else here is importable by a test.
-export function RunningView(props: { nodes: TaskNode[]; runId: string; streams?: StreamStore; pool?: () => { inUse: number; limit: number }; onAbort: () => void; suspended?: boolean; serialExecute?: boolean }): React.ReactElement {
+export function RunningView(props: {
+  nodes: TaskNode[]; runId: string; streams?: StreamStore
+  pool?: () => { inUse: number; limit: number }
+  onAbort: () => void; suspended?: boolean; serialExecute?: boolean
+  /** 运行中的人工干预:暂停 / 追加指令 / 取消单个节点。 */
+  runControl?: React.ComponentProps<typeof TaskTreePanel>['runControl']
+}): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
   // different things at once (abort the run vs leave the detail view). The panel owns the
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.

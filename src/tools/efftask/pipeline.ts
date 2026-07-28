@@ -11,12 +11,19 @@ import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, humanTimeoutRemedy, type BlockCategory } from './escalation.js'
-import { PhaseTimeoutError, type TimeoutKind } from './runAgentAdapter.js'
+import { NodeCancelledError, PhaseTimeoutError, type TimeoutKind } from './runAgentAdapter.js'
+import type { RunControl } from './control.js'
 
 /** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
 export type NodeSlots = { release: () => void }
 
 export interface PipelineCtx {
+  /**
+   * 运行中的人工干预面:暂停、追加指令、取消单个节点。
+   *
+   * 可选 —— 一次性的抽取调用和测试都不需要它。
+   */
+  control?: RunControl
   config: EffTaskConfig
   byId: Map<string, TaskNode>
   runAgent: RunAgentFn
@@ -232,7 +239,7 @@ type PhaseResult =
   | { ok: true; text: string }
   // timeoutKind 要跟着走:静默超时和等人超时的处理方式**相反**,合并成一个 boolean
   // 就只能给一句通用的话。
-  | { ok: false; reason: string; text?: string; timeout?: boolean; timeoutKind?: TimeoutKind }
+  | { ok: false; reason: string; text?: string; timeout?: boolean; timeoutKind?: TimeoutKind; cancelled?: boolean }
 
 /**
  * 方案环节的返回值。
@@ -244,7 +251,7 @@ type PhaseResult =
  */
 type PlanPhaseResult =
   | { ok: true; parsed: ReturnType<typeof parsePlanOutput> }
-  | { ok: false; reason: string; timeout?: boolean; timeoutKind?: TimeoutKind }
+  | { ok: false; reason: string; timeout?: boolean; timeoutKind?: TimeoutKind; cancelled?: boolean }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
 // which records it into node.blockedReason and BLOCKs the node.
@@ -271,13 +278,32 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: 
       reason: e instanceof Error ? e.message : String(e),
       timeout: e instanceof PhaseTimeoutError,
       timeoutKind: e instanceof PhaseTimeoutError ? e.kind : undefined,
+      cancelled: e instanceof NodeCancelledError,
     }
   }
 }
 
 // Records WHY the node died in its own field. It must NOT touch node.execStatus, which may
 // hold real completed-work evidence that acceptance/audit still needs.
-async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx, category?: BlockCategory, remedy?: string): Promise<void> {
+/**
+ * 用户点名取消这个节点时的阻断。
+ *
+ * 和别的阻断有两处**必须**不同:
+ *  - 不带 category。category 会让阻断卡去劝用户「提高超时」「把节点拆小」——而他刚刚
+ *    亲手按了取消,那些建议全都不对症;
+ *  - **保持 interrupted**,这样 `--resume` 会把它重新排队。取消不是判决,是暂时不想跑它。
+ */
+async function blockAsCancelled(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  // keepInterrupted:blockWithReason 默认把 interrupted 按**整个 run 是否在中止**来赋值,
+  // 而这里是单个节点被点名,run 本身好好的。不这么传的话 --resume 不会重新排队它,
+  // 取消就成了永久判决 —— 而取消不是判决。
+  await blockWithReason(
+    node, '已被用户取消(/et --resume 会重新排队,也可以在结束屏上按 r 重做)', ctx,
+    undefined, undefined, true,
+  )
+}
+
+async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx, category?: BlockCategory, remedy?: string, keepInterrupted = false): Promise<void> {
   // The 处理方式 and the retry command travel WITH the reason, exactly as the merge-conflict
   // path does. The escalation limiter drops cards past its cap while telling the user to read
   // run.md — so run.md has to actually contain what the card would have said.
@@ -293,7 +319,9 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx,
   // cleared flag, and if it later fails for real the flag must not linger and resurrect it.
   // (The orchestrator's abort sweep marks the rest; it skips nodes that are already BLOCKED,
   // which is exactly the set this line covers.)
-  node.interrupted = ctx.signal.aborted
+  // keepInterrupted 是「单个节点被用户点名取消」那一路:run 没有中止,但这个节点必须
+  // 保持可恢复。见 blockAsCancelled。
+  node.interrupted = keepInterrupted || ctx.signal.aborted
   await commit(node, 'BLOCKED', ctx)
   // A cancel must never page a human — same rule the conflict path follows. The user is
   // standing at the keyboard, and a card saying 已暂停等待人工 would contradict the run's own
@@ -954,7 +982,7 @@ async function runPlanRefinement(
       // timeoutKind 必须跟着走。少了它,1046 行那句 `res.timeoutKind === 'human'` 就是
       // 一条**永远为 undefined 的死分支**(返回类型里根本没这个字段,而本仓库没有
       // typecheck 会说)—— 于是分析环节的等人超时拿到的是静默超时那一版建议。
-      if (i === 0) return { ok: false, reason: res.reason, timeout: res.timeout, timeoutKind: res.timeoutKind }
+      if (i === 0) return { ok: false, reason: res.reason, timeout: res.timeout, timeoutKind: res.timeoutKind, cancelled: res.cancelled }
       node.execStatus = (node.execStatus ? node.execStatus + '\n' : '') +
         ORCHESTRATOR_NOTE + '方案精化第 ' + (i + 1) + ' 位(' + (seat?.roleName || '主模型') +
         ')调用失败,采用前一稿: ' + res.reason + ')'
@@ -990,9 +1018,26 @@ function isFinished(node: TaskNode): boolean {
  * prompt whose reply is parsed by fence tag, so an unquoted \`\`\` in it could forge one.
  * Only affects unfinished work — an ACCEPTED node is never re-entered.
  */
-function guidanceSection(ctx: Pick<PipelineCtx, 'config'>): string {
+function guidanceSection(ctx: Pick<PipelineCtx, 'config' | 'control'>): string {
+  const out: string[] = []
   const g = ctx.config.resumeGuidance?.trim()
-  return g ? `续跑指引(用户在恢复时补充,优先级高于原方案的枝节):\n${quote(g)}\n` : ''
+  if (g) out.push(`续跑指引(用户在恢复时补充,优先级高于原方案的枝节):\n${quote(g)}`)
+  /**
+   * 运行中补的话。
+   *
+   * 复用这条已有的接缝而不是另开一条:用户在恢复时补的话和在运行中补的话是**同一件事**
+   * ——「照这个改」。两条通道会立刻分叉成「哪一条优先」这种没人答得上来的问题。
+   *
+   * 只作用于**之后**派发的提示词:在飞的调用不打断,那是暂停/取消管的事。
+   */
+  const live = ctx.control?.directives() ?? []
+  if (live.length > 0) {
+    out.push(
+      `运行中的追加指令(用户在这次运行进行时补充,按加入顺序;优先级同上):\n` +
+      live.map((d, i) => `${i + 1}. ${quote(d)}`).join('\n'),
+    )
+  }
+  return out.length > 0 ? out.join('\n') + '\n' : ''
 }
 
 /**
@@ -1089,6 +1134,9 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       if (!(await commit(node, 'PLANNING', ctx))) return
       const res = await runPlanPhase(node, ctx, feedback)
       if (!res.ok) {
+        // 用户点名取消 ≠ 出了故障。走单独一条:不带 category(免得阻断卡去劝他提高超时),
+        // 并保持 interrupted 好让 --resume 重新排队。
+        if (res.cancelled === true) { await blockAsCancelled(node, ctx); return }
         await blockWithReason(
           node, res.reason, ctx, res.timeout ? 'timeout' : undefined,
           res.timeoutKind === 'human' ? humanTimeoutRemedy() : undefined,
@@ -1783,6 +1831,9 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // write tools, so discarding this can leave the repo changed with no record of it.
       const partial = res.text ? parseExecOutput(res.text, execTag).execStatus.trim() : ''
       if (partial) node.execStatus = `${partial}\n(注:本轮在完成前被中断,以上为中断时已报告的产出)`
+      // 同上。而且这一处**尤其**要分开:执行环节被取消时工作区里可能已经有改动了,
+      // 上面那句「以上为中断时已报告的产出」正是给用户看的,不该被一句「调用失败」盖过去。
+      if (res.cancelled === true) { await blockAsCancelled(node, ctx); return }
       await blockWithReason(
         node, res.reason, ctx, res.timeout ? 'timeout' : undefined,
         res.timeoutKind === 'human' ? humanTimeoutRemedy() : undefined,

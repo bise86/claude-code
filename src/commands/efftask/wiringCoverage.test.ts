@@ -500,6 +500,36 @@ describe('改回去要变红的四处', () => {
     // 而顶上那个「并行 1/5」会一直误导用户。
     expect(element('RunningView')).toContain('serialExecute={poolRef.current === undefined}')
   })
+  it('人工干预面是**同一个实例**,三跳都接上了', () => {
+    // 取消要靠面板、适配器、编排器共用同一个 RunControl 才生效:在组件里再 new 一个的话,
+    // 已经登记的在飞调用永远取消不掉,而按 x 之后屏幕上什么都不会变。
+    // 而且它必须在 call() 里建 —— 组件会重挂,call() 不会。
+    expect(SRC).toContain('const control = createRunControl()')
+    // 交给 runAgent(适配器靠它登记在飞调用)
+    expect(SRC).toMatch(/onHumanWait: w => \{ humanWaitOut\.current\?\.\(w\) \},\s*\n\s*control,/)
+    // 交给组件(面板按键用它)
+    expect(element('EffTaskRunner')).toContain('control={control}')
+    // 交给编排器(暂停在调度循环里生效)
+    expect(SRC).toContain('control: props.control,')
+  })
+
+  it('三个干预键各自接到不同的动作上', () => {
+    // 接错一个的后果都很实:x 接到暂停上 = 用户以为取消了那个节点而它还在改代码。
+    const body = SRC.slice(SRC.indexOf('runControl={{'))
+    const head = body.slice(0, 900)
+    expect(head).toContain('onTogglePause')
+    expect(head).toContain('onAddDirective: () => setDirectiveOpen(true)')
+    expect(head).toContain('onCancelNode: n => control.cancelNode(n.id)')
+    // 暂停的真相在 control 里,state 只是让提示行重绘 —— 两边分开迟早不一致。
+    expect(head).toContain('setPaused(control.isPaused())')
+  })
+
+  it('追加指令输入框排在运行视图**之前** —— 否则它永远画不出来', () => {
+    const iBox = SRC.indexOf("phase === 'running' && directiveOpen")
+    const iRun = SRC.indexOf("if (phase === 'running') {")
+    expect(iBox).toBeGreaterThanOrEqual(0)
+    expect(iBox).toBeLessThan(iRun)
+  })
   it('只查看模式不给重做入口', () => {
     // 那个 run 的编排器根本没起来过。给了重做就是**替用户决定**把它跑起来,
     // 而他刚刚明确选了不跑。

@@ -1,11 +1,11 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
-import { uiStatus, type UiStatus } from '../../tools/efftask/stateMachine.js'
+import { isTerminal, uiStatus, type UiStatus } from '../../tools/efftask/stateMachine.js'
 import { NodeDetail } from './NodeDetail.js'
 import type { StreamStore } from '../../tools/efftask/agentStream.js'
 import { useStreamTick } from './AgentLogPane.js'
-import { budgetRows, clipToWidth, lastActivity } from './logView.js'
+import { runControlAction, budgetRows, clipToWidth, lastActivity } from './logView.js'
 import { stringWidth } from '../../ink/stringWidth.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 
@@ -194,6 +194,18 @@ export function TaskTreePanel(props: {
    * 两个执行者共用一棵工作树会互相覆盖对方的改动,**同时**各自向自己的验收员汇报成功。
    */
   serialExecute?: boolean
+  /**
+   * 运行中的人工干预。给了才有 p / i / x 三个键。
+   *
+   * 只在运行视图给 —— 结束之后没有东西可以暂停或取消,而一个按了没反应的键比没有更糟。
+   */
+  runControl?: {
+    paused: boolean
+    onTogglePause: () => void
+    onAddDirective: () => void
+    /** 取消**光标选中**的那个节点。已经终结的节点不会走到这里(面板自己挡)。 */
+    onCancelNode: (node: TaskNode) => void
+  }
 }): React.ReactElement {
   // Tick once a second so elapsed times keep moving even when no node transitions —
   // otherwise the panel only repaints on onUpdate and looks frozen during a long phase.
@@ -248,6 +260,17 @@ export function TaskTreePanel(props: {
     // 重做。放在方向键**之前**,因为它不依赖 rows 之外的任何东西,而且放后面会被
     // 下面那些 `return` 挡掉一半路径。
     if (k === 'r' && props.onRedo && current) { props.onRedo(current); return }
+    // 运行中的人工干预。同样放在方向键之前,同样的理由。
+    if (props.runControl) {
+      const act = runControlAction(input, key)
+      if (act === 'togglePause') { props.runControl.onTogglePause(); return }
+      if (act === 'addDirective') { props.runControl.onAddDirective(); return }
+      if (act === 'cancelNode') {
+        // 终态节点没什么可取消的。不挡的话会给一个「已取消」的错觉,而它早就跑完了。
+        if (current && !isTerminal(current.status)) props.runControl.onCancelNode(current)
+        return
+      }
+    }
     if (key.upArrow || k === 'k') { setCursor(c => Math.max(0, Math.min(c, rows.length - 1) - 1)); return }
     if (key.downArrow || k === 'j') { setCursor(c => Math.min(rows.length - 1, Math.min(c, rows.length - 1) + 1)); return }
     if (key.return) { if (current) setDetailId(current.id); return }
@@ -375,6 +398,9 @@ export function TaskTreePanel(props: {
         // 多一行就是 25 行,而 24 行是极常见的默认 —— 底部的计数和提示会被顶出去。
         // 分隔符不用 '·':「待定」那个字形本身就是 '·',读起来会变成三项。
         <Text dimColor wrap="truncate-end">
+          {props.runControl
+            ? `${props.runControl.paused ? '⏸ 已暂停(p 恢复)' : 'p 暂停'} · i 追加指令 · x 取消选中任务    `
+            : ''}
           {props.suspended === true
             // 不说的话,用户会按着方向键发现树不动,以为界面卡死了。
             ? '⏸ 等你回答上面那个权限确认 —— 这期间按键归它'
