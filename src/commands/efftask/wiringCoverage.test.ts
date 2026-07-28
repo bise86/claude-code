@@ -443,34 +443,42 @@ describe('改回去要变红的四处', () => {
     expect(element('ConfirmRedo')).toContain('onConfirm={entry => applyRedo(redoTarget, entry)}')
   })
 
-  it('重做真的会重新启动编排 —— 不然它只是改了改树', () => {
-    // startRun 是这个文件里 runOrchestrator 的**唯一**调用点。applyRedo 里少了这一行,
-    // 用户按完确认会看到树变了、节点退回排队中,然后永远停在那儿:
-    // 「run 004 ✓0 ◐0 ○0 ✗0」不动、没有报错、也不退出 —— 这个文件已经栽过一次的形状。
+  it('重做的四条出口全都接上了 —— 行为归 redoRun.test.ts,这里只守接线', () => {
+    /**
+     * 「按下确认之后发生什么」现在住在 redoRun.ts,由 redoRun.test.ts 真的调一次并断言
+     * 顺序与参数。这里剩下的只是**把真东西接上去**这一跳 —— 而这一跳恰恰是这个文件
+     * 反复剪断的地方。
+     *
+     * 之所以曾经需要一整组源码文本断言:同样的逻辑长在这个文件里时,验收把每一个被
+     * 断言的字符串原样留着,造出 14 条变异全部存活。搬走之后这里只需要守四条线。
+     */
     const body = SRC.slice(SRC.indexOf('const applyRedo = React.useCallback'))
-    expect(body.slice(0, 3000)).toContain('startRun(cfg, computed.nodes)')
+    const head = body.slice(0, 1200)
+    // 落盘:少了它,树只在内存里改过,下次 --resume 全丢。
+    expect(head).toMatch(/commit:\s*\(plan, before\) => commitRedo\(/)
+    // 重启:startRun 是这个文件里 runOrchestrator 的**唯一**调用点。少了它,用户按完
+    // 确认会看到树变了、节点退回排队中,然后永远停在那儿。
+    expect(head).toMatch(/start:\s*n => startRun\(cfg, n\)/)
+    // 没做成的事上屏:一个删不掉的 node.md 会在下次 --resume 时自己长回来。
+    expect(head).toContain('onProblems: setRedoProblems')
+    // 新树进 state:少了它界面显示的还是重做前那棵。
+    expect(head).toContain('onNodes: setNodes')
   })
 
-  it('重做的落盘走 commitRedo —— 顺序由那个模块的真测试守', () => {
-    // 顺序本身**不在这里**测:源码文本闸门证明不了可达性(实测把删子树那段停用,
-    // 文本还在、顺序还对,闸门照绿)。这里只守这一跳没被剪断,顺序归 redoCommit.test.ts。
-    const body = SRC.slice(SRC.indexOf('const applyRedo = React.useCallback'))
-    expect(body.slice(0, 2000)).toContain('await commitRedo(')
+  it('交给 commitRedo 的 before 是 runRedo 给的那份,不是组件手上的', () => {
+    // 组件手上的 `nodes` 和 runRedo 传出来的 `before` 在正常路径上相同,但把参数
+    // 换成前者就等于**假装**这条线接对了 —— 而 redoRun.test.ts 断言的正是 before 的
+    // 内容。两边指向同一个东西,这条线才是活的。
+    const body = SRC.slice(SRC.indexOf('const applyRedo = React.useCallback'), SRC.indexOf('const applyRedo = React.useCallback') + 1200)
+    expect(body).toMatch(/before,\s*onError:/)
   })
 
-  it('中断过的 run 按 r 会被挡住并说明下一步', () => {
-    // 中断标记对整个 /et 进程有效且无法撤销。不挡的话用户会看到同一屏「已中断」,
-    // 一次模型调用都没发生,也没有任何东西解释为什么。
-    expect(SRC).toContain('redoUnavailableReason({ aborted: props.signal.aborted')
-  })
-
-  it('重做关口拿到了本次 run 的环节实况', () => {
-    // 剪断它:关口退回一句无条件的「执行 → 测试验证 → 验收」,而测试验证是 opt-in,
-    // 默认配置下根本不跑 —— 大多数用户看到的那句话就是假的。
-    // 正则带前导空白,不是 toContain:`xphases={{` 也包含 `phases={{`,
-    // 宽断言会被它满足 —— 改个名把线剪断照样绿(变异验证过)。
-    expect(element('ConfirmRedo')).toMatch(/\sphases=\{\{/)
-    expect(element('ConfirmRedo')).toContain('skipSteps: config.skipSteps')
+  it('警告行真的接上了分色判定', () => {
+    // 这一条**只能**这么测:假 TTY 下 vendored ink 一个 SGR 都不发(实测 FORCE_COLOR
+    // 未设时 0 个色码),所以「渲染出来是不是黄的」从测试接缝里看不见。判定本身由
+    // redoGate.test.ts 的 isWarningLine 用例守着,这里守的是它**被用上了**。
+    const gate = readFileSync(new URL('./ConfirmRedo.tsx', import.meta.url), 'utf8')
+    expect(gate).toMatch(/color=\{isWarningLine\(l\) \? 'warning' : undefined\}/)
   })
   it('只查看模式不给重做入口', () => {
     // 那个 run 的编排器根本没起来过。给了重做就是**替用户决定**把它跑起来,

@@ -37,7 +37,8 @@ function fakeTty() {
   })
   // 注意这条 strip 正则会把 `[方案]` 这类方括号内容也吃掉一部分,所以断言尽量挑中文短语。
   const plain = (): string => frame.replace(/\[[0-9;>?]*[a-zA-Z]/g, ' ').replace(//g, '')
-  return { stdin, stdout, lastFrame: plain }
+  // 未经 strip 的原始帧 —— 查颜色时必须用它,plain() 把色码全吃掉了。
+  return { stdin, stdout, lastFrame: plain, rawFrame: () => frame }
 }
 
 const mk = (id: string, over: Partial<TaskNode> = {}): TaskNode => ({
@@ -307,6 +308,42 @@ describe('重做关口', () => {
     expect(f).toContain('r 重做本任务')
   })
 
+  it('被删的子任务清单真的印出来 —— 而且超过 6 个时说清一共多少', async () => {
+    // 这一屏是用户在按下不可逆动作之前唯一能核对「删的到底是哪些」的地方。
+    const nodes: TaskNode[] = [mk('root', { title: '根任务', kind: 'decompose', status: 'WAITING_CHILDREN' })]
+    for (let i = 0; i < 8; i++) {
+      const id = 'root/0' + i + '-x'
+      nodes[0]!.childIds.push(id)
+      nodes.push(mk(id, { title: '子' + i, parentId: 'root', depth: 1 }))
+    }
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={nodes} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
+    )
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('被删的子任务')
+    // 印的必须是**前** 6 个:descendantsOf 是 LIFO,不排序的话印出来是 07..02,
+    // 而用户最先认得的 00/01 恰好被截掉。
+    expect(f).toContain('root/00-x')
+    expect(f).not.toContain('root/07-x')
+    // 只印前 6 个,但**总数必须说** —— 截断而不说总数,用户会以为只删 6 个。
+    expect(f).toContain('等 8 个')
+  })
+
+  it('没有子任务可删时不渲染那一行空清单', async () => {
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={TREE()} targetId="root/00-a" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
+    )
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).not.toContain('被删的子任务')
+  })
   it('目标节点不在树里时给一屏错误,而不是白屏或崩溃', async () => {
     const { t, app } = await mount(
       <ConfirmRedo nodes={TREE()} targetId="不存在" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,

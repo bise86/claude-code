@@ -12,7 +12,7 @@
  */
 import { describe, expect, it } from 'bun:test'
 
-import { redoGateAction, type RedoGateState } from './ConfirmRedo.js'
+import { isWarningLine, redoGateAction, type RedoGateState } from './ConfirmRedo.js'
 
 const OPTS = [
   { entry: 'plan' as const },
@@ -93,5 +93,23 @@ describe('第二屏', () => {
   it('确认交出去的是第一屏选中的那个环节,不是写死的', () => {
     expect(redoGateAction({ return: true }, '', { cursor: 2, picked: 'integrate' }, OPTS))
       .toEqual({ kind: 'confirm', entry: 'integrate' })
+  })
+})
+
+describe('摘要行的分色判定', () => {
+  it('⚠ 开头的是警告', () => {
+    expect(isWarningLine('⚠ 2 个已验收子任务的代码已经落进代码')).toBe(true)
+  })
+
+  it('普通说明不是', () => {
+    // 一条「删除 2 个子任务」和一条「代码不会回滚」长得一样时,最重的那句会被读成流水账。
+    expect(isWarningLine('删除 2 个子任务,重做后按新方案重建')).toBe(false)
+    expect(isWarningLine('「甲」将重新走: 执行 → 验收')).toBe(false)
+  })
+
+  it('⚠ 出现在中间不算 —— 只认行首那个标记', () => {
+    // 模型写出来的标题里完全可能带这个字符;按「包含」判的话,一条普通说明会被染成
+    // 警告色,而真正的警告就淹没在一片黄里。
+    expect(isWarningLine('删除 1 个子任务(标题里有 ⚠ 的那个)')).toBe(false)
   })
 })

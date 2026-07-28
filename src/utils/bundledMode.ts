@@ -95,3 +95,32 @@ export function isLocallyBuiltExecutable(
 ): boolean {
   return deps.isSingleFile() && !deps.isOfficial()
 }
+
+/**
+ * 「要再启动一次自己,该执行哪个文件」。
+ *
+ * 十三个 `isSelfContainedExecutable()` 消费点里,有**四处逐字相同**:swarm 的
+ * spawnUtils、spawnMultiAgent、以及 completionCache 的两处。四份拷贝、零测试 ——
+ * 把任意一处改回旧判据,全套照绿(实测 9/9 存活)。
+ *
+ * 而且这四份不是全都一样:completionCache 那两份写的是 `process.argv[1] || 'claude'`,
+ * 那个 `||` **永远短路不到** —— 单文件产物里 argv[1] 是 `/$bunfs/root/cli.js`,非空。
+ * 于是「兜底成 claude」这个意图在最需要它的那一种形态下从来没生效过。四份拷贝里只有
+ * 两份带这个兜底,本身就说明它们已经开始分叉了。
+ *
+ * 做成可注入的纯函数,两条分支才测得到:单文件产物里 `process.argv[1]` 指向 bunfs
+ * 虚拟根,**读得到但 spawn 不了**;非单文件时它才是一条真路径。
+ */
+export function selfInvocationPath(
+  fallback?: string,
+  deps: { selfContained: () => boolean; execPath: () => string; argv1: () => string | undefined } = {
+    selfContained: isSelfContainedExecutable,
+    execPath: () => process.execPath,
+    argv1: () => process.argv[1],
+  },
+): string {
+  if (deps.selfContained()) return deps.execPath()
+  const a = deps.argv1()
+  // 空串也要走兜底 —— 这正是四份拷贝里那个 `||` 想做而做不到的事。
+  return a !== undefined && a.length > 0 ? a : (fallback ?? '')
+}

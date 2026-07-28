@@ -1,5 +1,5 @@
 import chalk from 'chalk'
-import { isSelfContainedExecutable } from './bundledMode.js'
+import { selfInvocationPath } from './bundledMode.js'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
@@ -92,7 +92,7 @@ export async function setupShellCompletion(theme: ThemeName): Promise<string> {
   // truncate output before the pipe buffer drains.
   // `|| 'claude'` 兜不住:单文件产物的 argv[1] 是**非空**的虚拟路径
   // (/$bunfs/root/cli),短路永远不触发,execFileNoThrow 拿到一条不存在的路径。
-  const claudeBin = isSelfContainedExecutable() ? process.execPath : (process.argv[1] || 'claude')
+  const claudeBin = selfInvocationPath('claude')
   const result = await execFileNoThrow(claudeBin, [
     'completion',
     shell.shellFlag,
@@ -150,7 +150,7 @@ export async function regenerateCompletionCache(): Promise<void> {
 
   // `|| 'claude'` 兜不住:单文件产物的 argv[1] 是**非空**的虚拟路径
   // (/$bunfs/root/cli),短路永远不触发,execFileNoThrow 拿到一条不存在的路径。
-  const claudeBin = isSelfContainedExecutable() ? process.execPath : (process.argv[1] || 'claude')
+  const claudeBin = selfInvocationPath('claude')
   const result = await execFileNoThrow(claudeBin, [
     'completion',
     shell.shellFlag,

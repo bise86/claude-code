@@ -305,7 +305,10 @@ export function planRedo(
   // ---- 三个入口各自的重置 ----
   let seatedAt: NodeStatus
   if (entry === 'plan') {
-    deleted = descendantsOf(target, byId)
+    // 排序过再用。descendantsOf 是深度优先 + 栈,吐出来是 LIFO —— 8 个子任务时
+    // 确认屏上印的是 07..02,而用户最先认得的 00/01 恰好被截掉了。清单只印前 6 个,
+    // 所以**印哪 6 个**必须是可预测的。id 本身就带序号(NN-slug),字典序即建立顺序。
+    deleted = descendantsOf(target, byId).sort()
     const deletedSet = new Set(deleted)
     /**
      * 判据是 **ACCEPTED 本身**,不是「还挂着 worktree」。

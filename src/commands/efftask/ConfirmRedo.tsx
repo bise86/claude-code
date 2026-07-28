@@ -28,6 +28,20 @@ import { useLiveState } from './useLiveState.js'
  *
  * 组件测试仍然守 q / 方向键 / 回车(那些送得进去);Esc 的语义归这里。
  */
+/**
+ * 摘要里哪一行是**警告**(要用告警色,不能和普通说明混在一起)。
+ *
+ * 抽出来是因为颜色本身**从测试接缝里看不见**:假 TTY 下 vendored ink 一个 SGR 都不发
+ * (实测 FORCE_COLOR 未设时 0 个色码,设成 3 之后才有 `\u001b[93m`)。让断言依赖一个
+ * 环境变量比不测更糟 —— 它会在别人本地绿、在 CI 红,或者反过来。判定是纯的,那就测判定。
+ *
+ * 分色的理由:一条「这些代码已经落进代码、删任务不回滚」和一条「删除 2 个子任务」
+ * 长得一样时,最重的那句会被读成流水账。
+ */
+export function isWarningLine(line: string): boolean {
+  return line.startsWith('⚠')
+}
+
 export type RedoGateState = { cursor: number; picked: RedoEntry | null }
 export type RedoGateAction =
   | { kind: 'cancel' }
@@ -119,6 +133,13 @@ export function ConfirmRedo(props: {
     )
   }
 
+  /**
+   * `&& preview` 这半个条件**当前不可达**,如实记在这里而不是假装它被测过:
+   * preview 只在 `!entry || !target` 时为 null,而 picked !== null 蕴含 entry 存在,
+   * target 不存在时上面那个 `if (!target)` 已经先 return 了。删掉它全套照绿(变异验证过)。
+   * 留着是因为它挡的是「第二屏白屏」——一旦 preview 的依赖数组以后多一个来源,
+   * 这半个条件就是唯一的防线。
+   */
   if (picked !== null && preview) {
     return (
       <Box borderStyle="round" paddingX={1} flexDirection="column">
@@ -126,7 +147,7 @@ export function ConfirmRedo(props: {
         {'error' in preview
           ? <Text color="error">{preview.error}</Text>
           : redoSummary(preview.plan, target, picked, props.phases).map(l => (
-              <Text key={l} color={l.startsWith('⚠') ? 'warning' : undefined}>{l}</Text>
+              <Text key={l} color={isWarningLine(l) ? 'warning' : undefined}>{l}</Text>
             ))}
         {'plan' in preview && preview.plan.deleted.length > 0
           ? <Text dimColor>被删的子任务: {preview.plan.deleted.slice(0, 6).join(', ')}

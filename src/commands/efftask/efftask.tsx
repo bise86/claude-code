@@ -15,8 +15,9 @@ import { createWorktreePool, type GitRunner, type WorktreePool } from '../../too
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
-import { planRedo, redoUnavailableReason, type RedoEntry } from '../../tools/efftask/redo.js'
+import { redoUnavailableReason, type RedoEntry } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
+import { runRedo } from '../../tools/efftask/redoRun.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
 import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
@@ -982,33 +983,34 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 隔离工作区走 pool.release():它对**脏的或者没合入的**工作区会拒绝删除并说明原因。
    * 那正是这里想要的 —— 重做不该顺手毁掉用户还没合并的产出。删不掉的会被显示出来。
    */
+  /**
+   * 执行一次重做。
+   *
+   * **这里只剩接线。** 「按下确认之后到底发生什么」——落盘、上屏、进 state、重启,
+   * 以及它们的顺序——全部住在 redoRun.ts,由 redoRun.test.ts 真的调一次并断言。
+   *
+   * 这么拆是被验收量出来的:同样的逻辑长在这个文件里时,唯一的防线是 wiringCoverage
+   * 里几条源码文本断言,而验收把每一个被断言的字符串**原样留着**,造出 14 条变异
+   * 全部存活 —— 每一条的后果都是「按下确认之后界面纹丝不动」,而全套测试绿。
+   */
   const applyRedo = React.useCallback((target: TaskNode, entry: RedoEntry): void => {
     const cfg = config
     if (!cfg || !runDir) return
-    const computed = planRedo(nodes, target.id, entry, new Date().toISOString())
-    if ('error' in computed) {
-      setRedoProblems([`重做未执行: ${computed.error}`])
-      setPhase('done')
-      return
-    }
     setRedoTarget(null)
-    void (async () => {
-      // 落盘的三步顺序(放工作区 → 删子树 → 写节点)住在 redoCommit.ts 里,不在这里。
-      // 这个文件挂不起来,唯一守得住它的手段是「断言源码里有这行字」—— 而那种闸门
-      // 证明不了顺序和可达性:实测把删子树那段整个停用,文本还在、顺序还对,闸门照绿。
-      const { problems } = await commitRedo(
+    void runRedo(nodes, target.id, entry, new Date().toISOString(), {
+      commit: (plan, before) => commitRedo(
         {
           fs: props.fs, runDir, config: cfg, pool: poolRef.current ?? undefined,
-          before: nodes, onError: e => logError(e),
+          before, onError: e => logError(e),
         },
-        computed,
-      )
-      setRedoProblems(problems)
-      setNodes(computed.nodes)
-      // 重做完就跑 —— 用户按的是「重做」,不是「把树改一改」。
-      startRun(cfg, computed.nodes)
-    })()
-    // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for a mount
+        plan,
+      ),
+      onProblems: setRedoProblems,
+      onNodes: setNodes,
+      start: n => startRun(cfg, n),
+      onDone: () => setPhase('done'),
+    })
+    // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
   }, [config, runDir, nodes, props.fs, startRun])
 
   /**

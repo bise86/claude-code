@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { isInBundledMode, isSelfContainedExecutable, isSingleFileExecutable,
+import {
+  isInBundledMode,
   isLocallyBuiltExecutable,
+  isSelfContainedExecutable,
+  isSingleFileExecutable,
+  selfInvocationPath,
 } from './bundledMode.js'
 
 /**
@@ -87,5 +91,48 @@ describe('isLocallyBuiltExecutable', () => {
   it('默认参数接的是真谓词 —— 测试进程里不是单文件,所以是 false', () => {
     // 这条守的是「接线」:纯函数写对了但没接上去,是这个仓库里反复出现的一类。
     expect(isLocallyBuiltExecutable()).toBe(false)
+  })
+})
+
+describe('selfInvocationPath', () => {
+  // 「要再启动一次自己,该执行哪个文件」—— 十三个消费点里有四处逐字相同,而且**零覆盖**:
+  // 把任意一处改回旧判据全套照绿(验收实测 9/9 存活)。抽出来之后两条分支都测得到。
+  const deps = (over: Partial<Parameters<typeof selfInvocationPath>[1]> = {}) => ({
+    selfContained: () => false,
+    execPath: () => '/opt/claude/bin/claude',
+    argv1: () => '/repo/src/entrypoints/cli.tsx',
+    ...over,
+  })
+
+  it('单文件产物:走 execPath', () => {
+    // argv[1] 在单文件产物里是 `/$bunfs/root/cli.js` —— **读得到但 spawn 不了**。
+    expect(selfInvocationPath(undefined, deps({
+      selfContained: () => true,
+      argv1: () => '/$bunfs/root/cli.js',
+    }))).toBe('/opt/claude/bin/claude')
+  })
+
+  it('从源码跑:走 argv[1]', () => {
+    expect(selfInvocationPath(undefined, deps())).toBe('/repo/src/entrypoints/cli.tsx')
+  })
+
+  it('argv[1] 缺失时用兜底', () => {
+    expect(selfInvocationPath('claude', deps({ argv1: () => undefined }))).toBe('claude')
+  })
+
+  it('argv[1] 是**空串**时也走兜底', () => {
+    // 这正是四份拷贝里那个 `process.argv[1] || 'claude'` 想做的事 —— 而它在单文件产物里
+    // 永远短路不到(argv[1] 非空),所以「兜底成 claude」在最需要它的形态下从未生效。
+    expect(selfInvocationPath('claude', deps({ argv1: () => '' }))).toBe('claude')
+  })
+
+  it('没给兜底又没有 argv[1] 时给空串,不是 undefined', () => {
+    // 调用方拿它去 spawn。返回 undefined 会变成字面量 "undefined" 那条路径。
+    expect(selfInvocationPath(undefined, deps({ argv1: () => undefined }))).toBe('')
+  })
+
+  it('默认参数接的是真谓词 —— 测试进程里不是单文件,所以拿到 argv[1]', () => {
+    // 守「接线」:纯函数写对了但没接上去,是这个仓库反复出现的一类。
+    expect(selfInvocationPath('claude')).toBe(process.argv[1])
   })
 })

@@ -18,7 +18,7 @@ import type { ToolUseContext } from '../../Tool.js'
 import type { InProcessTeammateTaskState } from '../../tasks/InProcessTeammateTask/types.js'
 import { formatAgentId } from '../../utils/agentId.js'
 import { quote } from '../../utils/bash/shellQuote.js'
-import { isSelfContainedExecutable } from '../../utils/bundledMode.js'
+import { selfInvocationPath } from '../../utils/bundledMode.js'
 import { getGlobalConfig } from '../../utils/config.js'
 import { getCwd } from '../../utils/cwd.js'
 import { logForDebugging } from '../../utils/debug.js'
@@ -195,7 +195,7 @@ function getTeammateCommand(): string {
     return process.env[TEAMMATE_COMMAND_ENV_VAR]
   }
   // 与 swarm/spawnUtils 逐字同形:单文件产物的 argv[1] 是 bunfs 虚拟路径。
-  return isSelfContainedExecutable() ? process.execPath : process.argv[1]!
+  return selfInvocationPath()
 }
 
 /**
