@@ -104,6 +104,41 @@ describe('DoneView 的重做入口', () => {
     expect(seen.map(n => n.id)).toEqual(['root/00-a'])
   })
 
+  it('没给 onRedo 时按 r 不许抛异常 —— 键处理里的异常对断言是隐形的', async () => {
+    // `props.onRedo!(current)` 这种写法在 useInput 里会抛 TypeError,而「r 是死键」
+    // 那条用例只断言 exits === 0 和屏幕文案 —— 两个都不会因为抛异常而变。
+    // 这里显式盯着未捕获错误。
+    const errs: unknown[] = []
+    const onErr = (e: unknown): void => { errs.push(e) }
+    process.on('uncaughtException', onErr)
+    const { t, app } = await mount(
+      <DoneView
+        nodes={TREE()} runId="003" outcome={{ status: 'blocked' }} handoff={null}
+        onExit={() => {}}
+      />,
+    )
+    t.stdin.press('r')
+    await tick()
+    app.unmount()
+    process.off('uncaughtException', onErr)
+    expect(errs).toEqual([])
+  })
+
+  it('树面板的图例行在能重做时才写 r —— 正反两个方向都要守', async () => {
+    // 原来只测了「没给 onRedo 时不许出现」。反向没测的话,把那个三元改成恒不显示
+    // 照样绿 —— 键能用却不写在图例上,等于没有。
+    const { t, app } = await mount(
+      <DoneView
+        nodes={TREE()} runId="003" outcome={{ status: 'blocked' }} handoff={null}
+        onExit={() => {}} onRedo={() => {}}
+      />,
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 图例行那一句(和 done 屏底框那句是两处不同的文案)。
+    expect(f).toContain('回车看详情 · r 重做')
+  })
   it('没给 onRedo 时 r 是死键,提示行里也不许写着有这个键', async () => {
     let exits = 0
     const { t, app } = await mount(

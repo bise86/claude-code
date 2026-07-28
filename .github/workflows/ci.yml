@@ -30,3 +30,12 @@ jobs:
         # 单独一步:打包会因为「源码里能跑、bundler 静态解析不了」的可选导入而失败,
         # 而那种失败在 `bun test` 里完全看不见。
         run: bun run build
+
+      - name: 打包态自检
+        # 这一步守的是**只有编成单文件产物之后才会出现**的一类故障:虚拟路径被当成真路径
+        # 去 spawn、NODE_ENV 被编译期内联成 development、ripgrep 解析到一条不存在的路径。
+        # 它们在 `bun test` 里一条都看不见 —— 源码态全绿、产物是坏的。
+        #
+        # 之前这道门禁只在有人**手动**跑时才存在:全仓 grep 不到任何引用,而 build.ts 的
+        # 注释还写着「CI 里 build → verify → upload」,描述的是一条不存在的流水线。
+        run: bun run verify:binary

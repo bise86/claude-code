@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'bun:test'
+
+import { DEFAULT_CAPS } from './types.js'
+import { humanTimeoutRemedy } from './escalation.js'
 import { blockEscalationLines, blockReasonWithRemedy, buildBlockCard, createEscalationLimiter, MAX_ESCALATION_CARDS, stopsTheNode, type BlockCategory} from './escalation.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
@@ -321,5 +324,28 @@ describe('重试提示要说全会重跑哪几个环节', () => {
     const t = lines('rework', 'r', seats([]))
     expect(t).toContain('执行 → 验收')
     expect(t).not.toContain('测试验证')
+  })
+})
+
+describe('两个时钟的默认预算和那句人工建议', () => {
+  it('默认值被钉住 —— 它们可以被改成任意值而全套照绿', () => {
+    // 把 humanTimeoutMs 改回 10 分钟 = 静默退回「合成一个时钟」之前的行为:
+    // 用户去倒杯水回来节点已经阻断。这两个数是这次改动的**全部意义**所在。
+    expect(DEFAULT_CAPS.humanTimeoutMs).toBe(7 * 24 * 60 * 60 * 1000)
+    expect(DEFAULT_CAPS.nodeTimeoutMs).toBe(600_000)
+  })
+
+  it('人工超时那句建议必须真的说清三件事', () => {
+    // 全仓原来**没有任何测试碰过这个函数的返回值** —— 它可以返回空串而全绿。
+    const s = humanTimeoutRemedy()
+    // 1) 病因
+    expect(s).toContain('没有人回答工具权限确认')
+    // 2) 现在就能做的动作
+    expect(s).toContain('把那个确认点掉')
+    // 3) 不想守着时的长期办法
+    expect(s).toContain('allowlist')
+    // 4) 最关键的一句:别去调那个不相干的旋钮。这正是两种超时被合成一句话时的病根。
+    expect(s).toContain('都没有关系')
+    expect(s).toContain('nodeTimeoutMs')
   })
 })

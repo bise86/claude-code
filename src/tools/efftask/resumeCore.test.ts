@@ -252,18 +252,35 @@ describe('readRunManifest recovers the config the run was started with', () => {
   })
 
 
-  it('两个时钟各自的钳位:静默上限 2 小时,人工等待 7 天在范围内', async () => {
+  it('两个时钟各自的钳位:静默上限 2 小时,人工等待按 run.md 里写的来', async () => {
     // 「接口超时可以设置 2 个小时,用户回答响应超时设置 7 天」是用户给的数值。
-    // 静默这条原来钳到 1 小时,写 2 小时会被**静默改回 10 分钟的默认值** ——
-    // clampInt 越界时不取上限,而是回落到 fallback。所以钳位范围本身要被钉住。
+    //
+    // 静默这条原来钳到 1 小时,于是写 7200000 会被**静默钳成 3600000** —— 用户在
+    // run.md 里写的数字不生效,而且没有任何提示。(clampInt 是钳位:
+    // `Math.min(hi, Math.max(lo, n))`,dflt 只在非数字时才用到。这句话上一版写成
+    // 「回落到默认值」是错的,后果被说得比实际更严重,而真实后果已经足够坏。)
+    //
+    // 人工那条填的**必须是非默认值**:填 7 天(604800000)的话,这条断言无法区分
+    // 「从 run.md 读到并钳住了」和「根本没读、直接用了 DEFAULT_CAPS」—— 把整条钳位
+    // 换成常量默认值,用例照样绿。实测过。
     const md = [
       '---', 'runId: 001', 'parallelism: 3', 'phaseRoles:', '  plan: []',
-      'caps:', '  nodeTimeoutMs: 7200000', '  humanTimeoutMs: 604800000',
+      'caps:', '  nodeTimeoutMs: 7200000', '  humanTimeoutMs: 259200000',
       'goalPrompt: 目标', '---', '',
     ].join('\n')
     const { config } = await readRunManifest(fsWith({ '/r/run.md': md }), '/r')
     expect(config.caps.nodeTimeoutMs).toBe(7_200_000)
-    expect(config.caps.humanTimeoutMs).toBe(7 * 24 * 60 * 60 * 1000)
+    expect(config.caps.humanTimeoutMs).toBe(3 * 24 * 60 * 60 * 1000)
+  })
+
+  it('两端都要钉住 —— 只钉一个点的话范围可以随便挪', async () => {
+    // 只有「2 小时能配上」这一个点被守时,把上限抬到 24 小时或把下限放到 0 都照样绿。
+    // 上限管的是「多久没吐东西算挂死」,下限管的是「别把它配成一个必然误杀的数」。
+    const md = (caps: string[]) => ['---', 'runId: 001', 'parallelism: 3', 'phaseRoles:', '  plan: []', 'caps:', ...caps, 'goalPrompt: 目标', '---', ''].join('\n')
+    const over = await readRunManifest(fsWith({ '/r/run.md': md(['  nodeTimeoutMs: 86400000']) }), '/r')
+    expect(over.config.caps.nodeTimeoutMs).toBe(7_200_000)
+    const under = await readRunManifest(fsWith({ '/r/run.md': md(['  nodeTimeoutMs: 0']) }), '/r')
+    expect(under.config.caps.nodeTimeoutMs).toBe(1000)
   })
   it('a missing or corrupt manifest degrades to defaults instead of throwing', async () => {
     // The manifest is ONE file. Losing it must not cost the user the whole tree — every

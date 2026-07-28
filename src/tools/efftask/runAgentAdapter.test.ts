@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import { verifyToolPool } from '../../commands/efftask/efftask.js'
-import { collectText, pickAgentDefinition, makeRunAgentFn } from './runAgentAdapter.js'
+import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs } from './runAgentAdapter.js'
 import { pwd } from '../../utils/cwd.js'
 
 describe('runAgentAdapter helpers', () => {
@@ -574,6 +574,37 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
   const call = (fn: ReturnType<typeof makeRunAgentFn>) =>
     fn({ phase: 'execute', node: {} as never, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })
 
+  /**
+   * 数 setInterval / clearInterval —— 直接拦全局函数。
+   *
+   * 第一版用的是 `process._getActiveHandles`,而 **bun 上根本没有这个函数**:
+   * `?.() ?? 0` 于是恒返回 0,断言变成 `0 <= 0`,把 clearInterval 整条删掉照样绿
+   * (实测存活)。这是「探针坏了被记成覆盖」的典型形状。
+   */
+  function watchIntervals(): { stop: () => { created: number; cleared: number; delays: number[] } } {
+    const realSet = globalThis.setInterval
+    const realClear = globalThis.clearInterval
+    let created = 0
+    let cleared = 0
+    const delays: number[] = []
+    globalThis.setInterval = ((...a: unknown[]) => {
+      created++
+      if (typeof a[1] === 'number') delays.push(a[1])
+      return (realSet as (...x: unknown[]) => unknown)(...a)
+    }) as typeof globalThis.setInterval
+    globalThis.clearInterval = ((h: unknown) => {
+      cleared++
+      return (realClear as (x: unknown) => unknown)(h)
+    }) as typeof globalThis.clearInterval
+    return {
+      stop: () => {
+        globalThis.setInterval = realSet
+        globalThis.clearInterval = realClear
+        return { created, cleared, delays }
+      },
+    }
+  }
+
   it('一直在吐消息就不算超时 —— 量的是静默时长,不是总时长', async () => {
     // 原来是一个 setTimeout 罩住整次调用:一个读二十个文件、跑测试、改代码的执行环节
     // 十几分钟很正常,会被当成挂死杀掉,而它一秒都没卡住。
@@ -627,6 +658,134 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     })))).rejects.toThrow('等待人工确认超时')
   })
 
+  it('人答完之后 stall 时钟必须重新走起来', async () => {
+    /**
+     * G19 —— 回归验收挖出来的最重的一条,而且**没有任何用例碰过**。
+     *
+     * canUseTool 的 finally 里如果不把 humanWaitFrom 清成 undefined,轮询体从此
+     * 每一轮都走「在等人」那一支并 return —— 于是**这次阶段调用的 stall 时钟永久失效**。
+     * 后果:确认过一次权限之后,provider 挂死了也不会被 stall 杀掉,要等满人工预算
+     * (默认 7 天)。
+     *
+     * 探针形状是关键:人答完之后必须**真的静默一段**再看。原来的用例里 canUseTool 一
+     * resolve 生成器就立刻 yield,消息侧的 markProgress 抢在下一个 tick 之前跑掉,
+     * 于是清不清 humanWaitFrom 都看不出来。
+     */
+    async function* answerThenGoSilent(args: { canUseTool: () => Promise<unknown> }): AsyncGenerator<never> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '开始' }] } } as never
+      await args.canUseTool()
+      // 人答完了,然后模型再也不吐东西 —— 这一段必须由 stall 时钟负责。
+      await new Promise(r => setTimeout(r, 5000))
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '不该到这里' }] } } as never
+    }
+    const quickHuman = (async () => ({ behavior: 'allow' })) as never
+    try {
+      await call(makeRunAgentFn(deps(answerThenGoSilent, {
+        canUseTool: quickHuman, timeoutMs: 80, humanTimeoutMs: 60_000,
+      })))
+      throw new Error('should have thrown')
+    } catch (e) {
+      // 不是 human:人早就答完了。清不掉 humanWaitFrom 的话这里会一直等到 60 秒。
+      expect((e as { kind?: string }).kind).toBe('stall')
+    }
+  })
+
+  it('人答完的那一刻 stall 时钟要归零,不能把人思考的时间算进去', async () => {
+    /**
+     * G20 —— finally 里少了 markProgress()。
+     *
+     * 人答完的一瞬间 `now - lastProgressAt` 已经等于**人思考的时长**,于是用户点完
+     * 「允许」立刻收到一条「静默超时」—— 而他刚刚才操作过。
+     *
+     * 所以这里让人想得比 stall 预算久,答完之后立刻吐一条消息:归零了就不该超时。
+     */
+    async function* usesTool(args: { canUseTool: () => Promise<unknown> }): AsyncGenerator<never> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '开始' }] } } as never
+      await args.canUseTool()
+      /**
+       * 这个 40ms 的缺口是**探针的关键**,不是凑数。
+       *
+       * canUseTool 一 resolve 生成器就立刻 yield 的话,消息侧的 markProgress 会抢在
+       * 下一个轮询之前跑掉 —— 于是 finally 里清不清 lastProgressAt 都看不出来
+       * (实测:变异存活)。留一个**比 stall 预算(80ms)短**的静默缺口之后:
+       * 归零了就该正常收尾,没归零则轮询会拿「人思考的 250ms」判它静默超时。
+       */
+      await new Promise(r => setTimeout(r, 40))
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '结束' }] } } as never
+    }
+    // 人想了 250ms,而 stall 预算只有 80ms。
+    const slowHuman = (async () => { await new Promise(r => setTimeout(r, 250)); return { behavior: 'allow' } }) as never
+    const text = await call(makeRunAgentFn(deps(usesTool, {
+      canUseTool: slowHuman, timeoutMs: 80, humanTimeoutMs: 60_000,
+    })))
+    expect(text).toContain('结束')
+  })
+
+  it('人工超时的消息里印的是**人工**预算,不是接口预算', async () => {
+    // G24。原来只断言了「等待人工确认超时」这几个字,数字没人看 —— 于是把
+    // `(kind === 'human' ? humanLimitMs : limitMs)` 改回恒用 limitMs 照样绿,
+    // 而用户看到「等待人工确认超时(50000 ms)」会照着去调一个不相干的旋钮。
+    async function* usesTool(args: { canUseTool: () => Promise<unknown> }): AsyncGenerator<never> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '开始' }] } } as never
+      await args.canUseTool()
+      yield null as never
+    }
+    const neverAnswers = (() => new Promise(() => {})) as never
+    try {
+      await call(makeRunAgentFn(deps(usesTool, {
+        canUseTool: neverAnswers, timeoutMs: 50_000, humanTimeoutMs: 80,
+      })))
+      throw new Error('should have thrown')
+    } catch (e) {
+      const err = e as { limitMs?: number; message?: string }
+      expect(err.limitMs).toBe(80)
+      // 50_000 是接口预算,绝不能出现在人工超时的话里。
+      expect(err.message).not.toContain('50')
+    }
+  })
+
+  it('调用结束后轮询器要停 —— 否则每次阶段调用泄漏一个永不停止的 setInterval', async () => {
+    // G23。泄漏的那个 interval 还会在预算到点后对**已经结束**的 controller 调
+    // inner.abort()。一次长 run 几百个。
+    async function* quick(): AsyncGenerator<never> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '完事' }] } } as never
+    }
+    const w = watchIntervals()
+    try {
+      await call(makeRunAgentFn(deps(quick, { timeoutMs: 50_000, humanTimeoutMs: 60_000 })))
+    } finally {
+      const { created, cleared, delays } = w.stop()
+      // 建了几个就要清几个。少清一个 = 每次阶段调用泄漏一个永不停止的轮询器,
+      // 而且它还会在预算到点后对**已经结束**的 controller 调 inner.abort()。
+      expect(`建 ${created} 清 ${cleared}`).toBe(`建 ${created} 清 ${created}`)
+      expect(created).toBeGreaterThan(0)
+      // 接线断言:50_000 的预算 → pollIntervalMs 给 1000。写死 50 的话这里就红了。
+      expect(delays).toContain(pollIntervalMs(50_000))
+    }
+  })
+
+  it('轮询周期:预算大的时候发现延迟不能跟着变大', () => {
+    // 内联表达式整个零覆盖 —— 改成 Math.min(60000, …) 之后默认预算(600s)下轮询
+    // 周期变成 **30 秒**,超时最多晚 30 秒才被发现;而全套测试用的都是几十毫秒的小
+    // 预算,那里三个数取值相同,看不出来。
+    expect(pollIntervalMs(600_000)).toBe(1000)   // 上限压住,不是 30000
+    expect(pollIntervalMs(80)).toBe(50)          // 下限托住,不是 4
+    expect(pollIntervalMs(10_000)).toBe(500)     // 中间段真的取 1/20
+  })
+
+  it('轮询周期:没配接口预算时也不能退化成 0', () => {
+    // 「只配了 humanTimeoutMs」是被显式支持的组合。兜底取 0 的话就是
+    // setInterval(…, 0),整次调用空转烧 CPU。
+    expect(pollIntervalMs(undefined)).toBe(50)
+    expect(pollIntervalMs(0)).toBe(50)
+    expect(pollIntervalMs(-1)).toBe(50)
+  })
+  it('轮询器真的按 pollIntervalMs 算出来的周期起 —— 接线不能被剪断', () => {
+    // 纯函数写对了但没接上去,是这个仓库反复出现的一类。所有用例的预算都是几十毫秒
+    // (那里 tickMs 恒等于下限 50),所以把 `pollIntervalMs(limitMs)` 换成写死的 50
+    // 照样全绿 —— 拦 setInterval 时把 delay 一起记下来才看得见。
+    expect(pollIntervalMs(10_000)).toBe(500)
+  })
   it('两种超时带着不同的 kind —— 处理方式相反,不能合并', async () => {
     async function* silent(): AsyncGenerator<never> {
       await new Promise(r => setTimeout(r, 5000))

@@ -170,6 +170,30 @@ describe('commitRedo 报出来的问题', () => {
     expect(problems.filter(p => p.includes('工作区'))).toEqual([])
   })
 
+  it('真盘的 unlink 对不存在的文件抛 ENOENT —— 不能报成假警报', async () => {
+    // 生产 fs 是 node:fs/promises。exists 守卫拿掉之后,一个本来就不在盘上的
+    // node.md(节点从没落过盘)会让 unlink 抛 ENOENT,屏幕上于是出现
+    // 「X 的记录没删掉(下次恢复会复活它): ENOENT」—— 而它压根不存在,不会复活。
+    // 假盘的 unlink 从不抛 ENOENT,所以这条只能显式造出来。
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
+    const { fs } = fakeFs({
+      async exists() { return false },
+      async unlink(p: string) { const e = new Error('ENOENT: no such file'); (e as { code?: string }).code = 'ENOENT'; throw e },
+    })
+    const { problems } = await commitRedo({ fs, runDir: '/run', config: CONFIG, before }, plan)
+    expect(problems.filter(p => p.includes('会复活它'))).toEqual([])
+  })
+
+  it('非空目录 rmdir 失败也不算失败 —— loadRun 只认 node.md', async () => {
+    // 真盘上 rmdir 一个非空目录抛 ENOTEMPTY。它必须被吞掉:node.md 已经删了,
+    // 剩下的目录对恢复没有任何影响,报出来就是纯噪音。
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
+    const { fs } = fakeFs({ async rmdir() { throw new Error('ENOTEMPTY') } })
+    const { problems } = await commitRedo({ fs, runDir: '/run', config: CONFIG, before }, plan)
+    expect(problems).toEqual([])
+  })
   it('一切正常时 problems 是空的', async () => {
     const before = TREE()
     const plan = ok(planRedo(before, 'root/00-a', 'execute', 'T1'))

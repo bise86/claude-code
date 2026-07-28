@@ -19,6 +19,24 @@ import type { RoleBinding } from './types.js'
  */
 export type TimeoutKind = 'stall' | 'human'
 
+/**
+ * 两个时钟的轮询周期。
+ *
+ * 用轮询而不是重排 setTimeout:deadline 会被「有进展」和「在等人」两件事不断推后,
+ * 重排的边界条件比一个便宜的轮询更容易写错。
+ *
+ * 三个数各有各的理由,而且**都不是随便取的**:
+ *  - `/20`:超时最多晚一个周期被发现,取预算的 5% 是可以接受的延迟;
+ *  - 下限 50ms:再密就是纯烧 CPU,而超时本身是个稀有事件;
+ *  - **上限 1000ms**:预算很大时(默认 600s → 30s)不能让发现延迟也跟着长到 30 秒。
+ *
+ * 抽出来是因为内联表达式**整个零覆盖**:改成 `Math.min(60000, …)` 后默认预算下轮询
+ * 周期变成 30 秒,而全套测试用的都是几十毫秒的小预算 —— 那里三个数取值相同,看不出来。
+ */
+export function pollIntervalMs(limitMs: number | undefined): number {
+  return Math.min(1000, Math.max(50, Math.floor((limitMs && limitMs > 0 ? limitMs : 1000) / 20)))
+}
+
 export class PhaseTimeoutError extends Error {
   constructor(
     public readonly limitMs: number,
@@ -208,7 +226,7 @@ export function makeRunAgentFn(deps: {
     const fire = (kind: TimeoutKind): void => { timedOut = true; timeoutKind = kind; inner.abort() }
     // 轮询而不是 setTimeout:deadline 会被「有进展」和「在等人」两件事不断推后,
     // 用 setTimeout 就得每次重排,而重排的边界条件比一个便宜的轮询更容易写错。
-    const tickMs = Math.min(1000, Math.max(50, Math.floor((limitMs && limitMs > 0 ? limitMs : 1000) / 20)))
+    const tickMs = pollIntervalMs(limitMs)
     const timer = (limitMs && limitMs > 0) || (humanLimitMs && humanLimitMs > 0)
       ? setInterval(() => {
           const now = Date.now()

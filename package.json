@@ -11,6 +11,7 @@
     "start": "bun run ./bin/claude-haha",
     "build": "bun run scripts/build.ts",
     "build:compile": "bun run scripts/build.ts --compile",
+    "verify:binary": "bun run scripts/verify-binary.ts",
     "test": "bun test",
     "vendor:zod": "bun run scripts/vendor-zod.ts"
   },

@@ -383,6 +383,69 @@ describe('planRedo:共通清理', () => {
   })
 })
 
+describe('目标节点自己的隔离工作区', () => {
+  it('执行重做要释放它,并且把 node.worktree 清掉', () => {
+    /**
+     * 不清的话屏幕说了一件不真的事:execStatus 刚被补上「隔离工作区已重置为集成分支
+     * 最新状态」,而 stepExecute 的 `ctx.worktrees && !node.worktree` 因为 worktree
+     * 还在而**短路** —— 执行者在上一轮留下的**脏工作区**里重跑,池里同时泄漏一个。
+     */
+    const r = ok(planRedo(tree(), 'a1', 'execute', 'T1'))
+    expect(r.worktreesToRelease).toEqual([{ nodeId: 'a1', branch: 'br-a1', path: '/wt/a1' }])
+    expect(r.nodes.find(n => n.id === 'a1')!.worktree).toBeUndefined()
+  })
+
+  it('方案重做也一样 —— 叶子从方案重来时同样要放掉', () => {
+    // 原来只有「被删子任务」的工作区被覆盖到,目标节点自己那个没人守。
+    const r = ok(planRedo(tree(), 'a1', 'plan', 'T1'))
+    expect(r.worktreesToRelease.map(w => w.nodeId)).toEqual(['a1'])
+    expect(r.nodes.find(n => n.id === 'a1')!.worktree).toBeUndefined()
+  })
+
+  it('本来就没有工作区时不凭空造一条释放请求', () => {
+    const t = tree()
+    t[2]!.worktree = undefined
+    expect(ok(planRedo(t, 'a1', 'execute', 'T1')).worktreesToRelease).toEqual([])
+  })
+})
+
+describe('方案重做要归还的一次性额度', () => {
+  it('revised 清掉 —— 否则补救拆分那次机会拿不回来', () => {
+    // pipeline.ts 的 `if (node.revised === true) return {kind:'no'}` 是一次性的。
+    // 方案重做后再撞上 planReview 上限时,本该重新给的补救拆分直接没有了,节点阻断。
+    const t = tree()
+    t[1]!.revised = true
+    expect(ok(planRedo(t, 'a', 'plan', 'T1')).nodes.find(n => n.id === 'a')!.revised).toBeUndefined()
+  })
+})
+
+describe('被牵连的三种阻断理由,一个都不能少', () => {
+  /**
+   * PROPAGATED 现在只管**下游**那一侧(祖先走 reopenAncestor,它不看理由)。
+   *
+   * 三个字符串里原来只有一个被测到。少任何一个的后果都一样:那个在等目标节点的
+   * 下游任务留在 BLOCKED 上,而它的阻断理由说的是**别人**的失败 —— 目标重做完之后
+   * 它永远等不到调度,树上一直渲染着一条早就不成立的「✗」。
+   */
+  for (const reason of ['子节点阻断', '上级任务阻断', '依赖阻断']) {
+    it(`等着它的下游写着「${reason}」时要解开`, () => {
+      const t = tree()
+      t[3]!.status = 'BLOCKED'
+      t[3]!.blockedReason = reason
+      const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
+      expect(r.nodes.find(n => n.id === 'b')!.status).not.toBe('BLOCKED')
+    })
+  }
+
+  it('下游自己有判决时不动它 —— 那不是被牵连', () => {
+    const t = tree()
+    t[3]!.status = 'BLOCKED'
+    t[3]!.blockedReason = '连续返工超限'
+    const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
+    expect(r.nodes.find(n => n.id === 'b')!.status).toBe('BLOCKED')
+  })
+})
+
 describe('验收查出来的计数与判据', () => {
   it('已验收子节点即使 worktree 已经清掉,也要警告代码已经落进代码', () => {
     // 原判据是 `ACCEPTED && worktree !== undefined`,方向反的:干净合并之后
