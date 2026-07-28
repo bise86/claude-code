@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
-import { DEFAULT_CAPS, emptyPhaseRoles, PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName } from './types'
+import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
+import { redoOptions, redoUnavailableReason } from './redo'
 
 /**
  * 文档必须说真话。
@@ -128,3 +129,64 @@ function rosterLineFor(p: PhaseName): string {
   }
   return line
 }
+
+/**
+ * README 的重做一节必须说真话。
+ *
+ * 和上面那些断言同一个理由:不查「文档里有没有这个词」(那种断言删掉代码照样绿),
+ * 而是把文档的说法**钉在代码的取值上** —— 三个入口的名字、两条不可用原因、返工上限、
+ * 中断后的那句话。改了代码,文档不跟着改就红。
+ */
+describe('README 的重做一节说的和代码干的是同一件事', () => {
+  // 重做说明写在 README 里,不是单独一份文档 —— 用户要求的。
+  const DOC = README
+  const leaf = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({
+      id: 'root', title: 't', parentId: null, deps: [], depth: 0,
+      phaseRoles: emptyPhaseRoles(), now: '2026-07-28T00:00:00Z',
+    }),
+    kind: 'executable',
+    ...over,
+  })
+
+  it('三个入口的名字逐字对得上', () => {
+    // 文档里写错一个名字,用户就会在屏幕上找一个不存在的条目。
+    const n = leaf()
+    for (const o of redoOptions(n, new Map([[n.id, n]]))) {
+      expect(DOC).toContain(norm(o.label))
+    }
+  })
+
+  it('两条「不可用」的原因逐字对得上', () => {
+    const dec = leaf({ kind: 'decompose', childIds: ['root/00-a'] })
+    const exec = redoOptions(dec, new Map([[dec.id, dec]])).find(o => o.entry === 'execute')!
+    expect(DOC).toContain(norm(exec.disabled!))
+
+    const lf = leaf()
+    const integ = redoOptions(lf, new Map([[lf.id, lf]])).find(o => o.entry === 'integrate')!
+    expect(DOC).toContain(norm(integ.disabled!))
+  })
+
+  it('返工上限写的是代码里的那个数', () => {
+    // 「默认 3」改成别的值而文档不动,用户会按一个错的数去估算成本。
+    expect(DOC).toContain(`默认 ${DEFAULT_CAPS.maxIterations}`)
+  })
+
+  it('中断后那句挡话,文档和代码是同一句', () => {
+    const why = redoUnavailableReason({ aborted: true, runId: '<run id>' })!
+    // 挑那半句可照做的命令 —— 它是用户真正会照抄的东西。
+    expect(DOC).toContain(norm('/et --resume <run id>'))
+    expect(why).toContain('/et --resume <run id>')
+  })
+
+  it('结构性损坏那三种理由,文档一个都不少', () => {
+    // 少写一种,用户就会以为自己那种情况也能被重开。
+    for (const r of ['依赖节点缺失', '子节点缺失', '依赖成环']) {
+      expect(DOC).toContain(r)
+    }
+  })
+
+  it('落盘三步的顺序,文档和代码一致', () => {
+    expect(DOC).toContain('放隔离工作区 → 删子树 → 写节点')
+  })
+})
