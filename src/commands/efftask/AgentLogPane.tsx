@@ -3,6 +3,7 @@ import { Box, Text, useInput } from '../../ink.js'
 import { OffscreenFreeze } from '../../components/OffscreenFreeze.js'
 import type { StreamState, StreamStore } from '../../tools/efftask/agentStream.js'
 import {
+  anchoredFrom,
   budgetRows,
   logPaneAction,
   renderStreamLines,
@@ -10,6 +11,7 @@ import {
   scrollWindow,
   droppedNotice,
   type LogLine,
+  type LogAnchor,
 } from './logView.js'
 import { useLiveState } from './useLiveState.js'
 
@@ -108,7 +110,14 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
   // 滚动条占一列。
   const contentWidth = Math.max(20, Math.floor(props.width) - 1)
 
-  const [, setOffset, offsetRef] = useLiveState(0)
+  /**
+   * 视口锚在**哪条流的表头 + 偏移几行**,而不是一个绝对行号。
+   *
+   * 用户报的:「切到某个阶段,上下键却在展示正在执行的那个子 agent 的数据」。
+   * 绝对行号的问题是**它上方的内容一直在变**——一条流跑完就从展开变折叠,那几十行当场
+   * 塌掉,同一个行号于是指向了别的流(通常正是还在动的那条)。锚在选中的流上就跟着它走。
+   */
+  const [, setAnchor, anchorRef] = useLiveState<LogAnchor>({ stream: 0, delta: 0 })
   const [, setFollow, followRef] = useLiveState(true)
   const [, setSelected, selectedRef] = useLiveState(0)
   /**
@@ -122,16 +131,28 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
   /** 展开了思考原文的流。默认空 —— 思考会淹掉工具调用,但用户点名要看得到。 */
   const [, setThinking, thinkingRef] = useLiveState<ReadonlySet<number>>(new Set())
 
-  const folded = React.useMemo(() => {
-    const s = new Set<number>()
+  /**
+   * **每帧重算,不 memo。**
+   *
+   * 原来是 `useMemo(..., [props.streams, overrideRef.current])`,而这两个依赖的 identity
+   * **永远不变**:store.streams(id) 返回的是 byNode 里那个**活数组本身**(新流是 push 进去
+   * 的,数组没换),overrideRef 是个 ref。于是这个 memo **只在挂载时算过一次**。
+   *
+   * 后果是用户报的那个现象的另一半:一条流跑完之后 `closed` 变 true,但折叠集合是挂载
+   * 那一刻的快照,**它永远不会被折起来**。日志窗于是无限长,正在跑的输出被埋在几百行
+   * 之下,而用户以为是自己切不过去。
+   *
+   * 重算的代价是每帧遍历 ≤40 条流(MAX_STREAMS_PER_NODE),而这一帧本来就要
+   * renderStreamLines 整个列表 —— memo 省下的那点远小于它掩盖的错。
+   */
+  const folded = ((): Set<number> => {
+    const set = new Set<number>()
     props.streams.forEach((st, i) => {
       const ov = overrideRef.current.get(i)
-      if (ov === undefined ? st.closed : ov) s.add(i)
+      if (ov === undefined ? st.closed : ov) set.add(i)
     })
-    return s
-    // overrideRef 是 ref,变更靠 setOverride 触发的重绘带出来;把它列进依赖没有意义。
-    // biome-ignore lint/correctness/useExhaustiveDependencies: see above
-  }, [props.streams, overrideRef.current])
+    return set
+  })()
 
   const lines: LogLine[] = renderStreamLines({
     streams: props.streams,
@@ -145,42 +166,53 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
 
   const total = lines.length
   const maxFrom = Math.max(0, total - height)
+  const headerIdxOf = (i: number): number =>
+    lines.findIndex(l => l.isHeader === true && l.streamIndex === i)
   // 粘底:跟随时永远停在最后一屏。新事件进来自然往上顶,这就是「实时终端」的手感。
-  const rawFrom = followRef.current ? maxFrom : offsetRef.current
+  // 不跟随时按**锚**解算——见 anchorRef 的注释。
+  const rawFrom = followRef.current
+    ? maxFrom
+    : anchoredFrom(total, height, anchorRef.current, headerIdxOf)
   const { from } = scrollWindow(total, height, rawFrom)
 
   useInput(
     (input, key) => {
       const act = logPaneAction(input, key)
       if (!act) return
-      const headerIdx = (i: number): number => lines.findIndex(l => l.isHeader === true && l.streamIndex === i)
+      const headerIdx = headerIdxOf
+      /** 把「我想让视口停在第 n 行」翻译成锚(相对当前选中流的表头)。 */
+      const anchorAt = (line: number): LogAnchor => {
+        const i = selectedRef.current
+        const at = headerIdx(i)
+        return at >= 0 ? { stream: i, delta: line - at } : { stream: i, delta: line }
+      }
       switch (act.t) {
         case 'line':
         case 'halfPage': {
           const step = act.t === 'line' ? act.d : act.d * Math.floor(height / 2)
           const next = Math.max(0, Math.min(maxFrom, from + step))
-          setOffset(next)
+          setAnchor(anchorAt(next))
           // 滚到底就恢复跟随 —— 否则用户一路按 ↓ 到底之后,新输出反而不动了。
           setFollow(next >= maxFrom)
           return
         }
         case 'top':
-          setOffset(0)
+          setAnchor(anchorAt(0))
           setFollow(false)
           return
         case 'bottom':
-          setOffset(maxFrom)
+          setAnchor(anchorAt(maxFrom))
           setFollow(true)
           return
         case 'nextStream': {
           if (props.streams.length === 0) return
           const next = (selectedRef.current + 1) % props.streams.length
           setSelected(next)
-          const at = headerIdx(next)
-          if (at >= 0) {
-            setOffset(Math.max(0, Math.min(maxFrom, at)))
-            setFollow(false)
-          }
+          // **切换到哪,展示哪**:锚直接钉到那条流的表头,delta 归零。
+          // 而且**无条件**关掉跟随——原来只在找得到表头时才关,于是切到一条还没渲染出
+          // 表头的流时,视口继续粘在底部那条正在跑的流上,正是用户抱怨的现象。
+          setAnchor({ stream: next, delta: 0 })
+          setFollow(false)
           return
         }
         case 'toggleThinking': {

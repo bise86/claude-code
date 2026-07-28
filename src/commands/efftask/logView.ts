@@ -359,3 +359,42 @@ export function budgetRows(cost: readonly number[], from: number, height: number
   // 至少画一行:否则一个「运行中 + 活动行」的节点在 height=1 时会让树整个空掉。
   return Math.max(1, n)
 }
+
+/**
+ * 视口的锚。
+ *
+ * **不是绝对行号。** 这是用户报出来的:「切到某个阶段,上下键却在展示正在执行的那个
+ * 子 agent 的数据」。根因是偏移量记的是行号,而**行号上方的内容一直在变**:
+ *
+ *  - 一条流跑完就从「运行中(展开)」变成「已收口(折叠)」,它那几十行当场塌掉;
+ *  - 新阶段开一条新流,又在别处插进一段。
+ *
+ * 于是同一个行号,一秒之前指着「分析」的输出,一秒之后指着正在跑的「执行」——用户没动
+ * 过键,画面自己跳了;他再按上下键,就是在滚那条正在跑的流。
+ *
+ * 钉在**选中的流**上就没有这个问题:那一段自己塌了或长了,锚跟着走;别处怎么变都与它无关。
+ * 这也正好是用户要的语义——**切换到哪,展示哪**。
+ */
+export interface LogAnchor {
+  /** 锚在第几条流的表头上。 */
+  stream: number
+  /** 从那条表头往下偏移几行(负数 = 往上,能看到前一条流的尾巴)。 */
+  delta: number
+}
+
+/**
+ * 把锚解算成这一帧的起始行号。
+ *
+ * @param headerAt 第 i 条流的表头在 lines 里的下标;-1 表示这条流当前没有表头行
+ *                 (它被上游过滤掉了,或者流列表刚变短)
+ */
+export function anchoredFrom(
+  total: number, height: number, anchor: LogAnchor, headerAt: (i: number) => number,
+): number {
+  const maxFrom = Math.max(0, total - height)
+  const at = headerAt(anchor.stream)
+  // 锚指向的流不见了(流被淘汰/列表变短):退回顶部而不是底部。
+  // 退到底部的话,用户会正好落在那条一直在动的运行流上——就是他抱怨的那个现象。
+  if (at < 0) return 0
+  return Math.max(0, Math.min(maxFrom, at + anchor.delta))
+}
