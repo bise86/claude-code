@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import { verifyToolPool } from '../../commands/efftask/efftask.js'
-import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs } from './runAgentAdapter.js'
+import { collectText, modelForRole, pickAgentDefinition, makeRunAgentFn, pollIntervalMs } from './runAgentAdapter.js'
 import { createRunControl } from './control.js'
 import { pwd } from '../../utils/cwd.js'
 
@@ -24,6 +24,50 @@ describe('runAgentAdapter helpers', () => {
     expect(pickAgentDefinition({ roleName: 'ghost' }, [coder], main)).toBe(main)
   })
 
+  it('员工没解析出来时,**不许**把它的模型名传下去', () => {
+    /**
+     * 用户实测:配了 roles[] 之后方案环节整段变成
+     *   「There's an issue with the selected model (K3). It may not exist or you may not
+     *    have access to it.」
+     * 而重点/风险点/验收点全空 —— 关口上三行 ⚠,一次真正的分析都没发生。
+     *
+     * 根因:员工匹配不到 agent 定义时回落到主模型,而调用方仍然把 role.model 传下去,
+     * 于是拿着 'K3' 去问会话自己的 provider。员工自己的 apiUrl/apiToken 挂在它自己的
+     * agent 定义上,回落之后那一份根本没被用上。
+     */
+    const coder = { agentType: '架构' } as never
+    // 解析到了 → 用它自己的模型(它的 apiUrl 也跟着那份定义走)。
+    expect(modelForRole({ roleName: '架构', model: 'K3' } as never, [coder])).toBe('K3')
+    // 没解析到 → **退回主模型的默认模型**,而不是硬塞一个不存在的名字。
+    expect(modelForRole({ roleName: '不存在的员工', model: 'K3' } as never, [coder])).toBeUndefined()
+    // 没写 model 的员工本来就跟主模型走。
+    expect(modelForRole({ roleName: '架构' } as never, [coder])).toBeUndefined()
+    expect(modelForRole(null, [coder])).toBeUndefined()
+  })
+  it('派发时真的用的是 modelForRole,不是裸的 role.model', async () => {
+    // 纯函数写对了但没接上去 —— 这个仓库反复付过的代价。这条从**真派发**看:
+    // 一个解析不出来的员工,传给 runAgent 的 model 必须是 undefined。
+    let seen: unknown = 'NOT-SET'
+    async function* fake(args: { model?: unknown }): AsyncGenerator<never> {
+      seen = args.model
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } } as never
+    }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as never,
+      canUseTool: (async () => ({ behavior: 'allow' })) as never,
+      availableTools: [] as never,
+      readOnlyTools: [] as never,
+      activeAgents: [{ agentType: '架构' } as never],
+      mainModelDefault: { agentType: 'main' } as never,
+      runAgentImpl: fake as never,
+    })
+    await fn({
+      phase: 'plan', node: { id: 'root' } as never,
+      role: { roleName: '不存在的员工', model: 'K3' } as never,
+      system: 's', prompt: 'p', signal: new AbortController().signal,
+    })
+    expect(`传给 runAgent 的 model: ${String(seen)}`).toBe('传给 runAgent 的 model: undefined')
+  })
   it('makeRunAgentFn concatenates assistant text from an injected runAgentImpl', async () => {
     async function* fakeRun(): AsyncGenerator<any> {
       yield { type: 'assistant', message: { content: [{ type: 'text', text: 'part1 ' }] } }

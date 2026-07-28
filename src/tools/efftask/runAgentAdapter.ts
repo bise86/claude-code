@@ -115,6 +115,32 @@ export function pickAgentDefinition(
   return activeAgents.find(a => a.agentType === role.roleName) ?? mainModelDefault
 }
 
+/**
+ * 这一席的模型别名 —— **只有员工真的解析到了才给**。
+ *
+ * 用户实测:配了 `roles[]` 之后,方案环节整段变成
+ *   「There's an issue with the selected model (K3). It may not exist or you may not have
+ *    access to it. Run /model to pick a different model.」
+ * 而重点/风险点/验收点全空 —— 关口上三行 ⚠,一次真正的分析都没发生。
+ *
+ * 根因:pickAgentDefinition 匹配不到员工时回落到**主模型**的 agent 定义,而调用方仍然
+ * 把 `role.model` 传下去。于是「拿 K3 这个名字去问会话自己的 provider」——它当然没有。
+ * 员工自己的 apiUrl / apiToken 挂在**它自己的** agent 定义上(roleClientConfig →
+ * buildRoleFetch),回落之后那一份根本没被用上。
+ *
+ * 旧注释写的是「无法识别的别名会落到 runAgent 自己的模型解析」——**不成立**,它是硬报错。
+ *
+ * 解析不到就退回主模型的默认模型:少一个员工是降质,而拿着一个不存在的模型名开跑是
+ * 整个环节报废。名册那一关本来就会告诉用户哪个员工没解析出来。
+ */
+export function modelForRole(
+  role: RoleBinding | null,
+  activeAgents: AgentDefinition[],
+): string | undefined {
+  if (!role?.model) return undefined
+  return activeAgents.some(a => a.agentType === role.roleName) ? role.model : undefined
+}
+
 export function makeRunAgentFn(deps: {
   toolUseContext: ToolUseContext
   canUseTool: CanUseToolFn
@@ -330,7 +356,7 @@ export function makeRunAgentFn(deps: {
         querySource: 'agent:custom',
         // NOT validated: an unrecognized alias simply falls through to runAgent's own model
         // resolution (which applies its default). We do not pre-check the string here.
-        model: req.role?.model as ModelAlias | undefined,
+        model: modelForRole(req.role, deps.activeAgents) as ModelAlias | undefined,
         availableTools: tools,
         // runAgent's `worktreePath` is METADATA ONLY — it is recorded for resume and does
         // NOT change the sub-agent's cwd (AgentTool does that separately via
