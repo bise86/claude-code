@@ -42,6 +42,43 @@ function vendoredRgUnder(root: string): string {
  * 而这次的 bug(`ENOENT: posix_spawn '/$bunfs/root/vendor/ripgrep/x64-linux/rg'`)
  * 恰恰是一条只在打包态才走到的分支。够不着 = 测不到 = 只能等用户来报。
  */
+/**
+ * 「搜索用不了」这件事该说的话。
+ *
+ * 一句话为什么要出现在**两个**地方:
+ *
+ *  - `onMissing` 那次是**解析时**说的,而它只走 logError —— 进内部缓冲和遥测,
+ *    终端上一个字都不打(实测 stderr 完全为空)。用户和模型都看不见。
+ *  - 真正致命的是模型看不见:Grep/Glob 的 spawn 失败之后,工具结果里是一句裸的
+ *    `spawn rg ENOENT`。模型不知道这意味着「这台机器上搜索整个不可用」,于是它
+ *    **开始猜文件名** —— 用户看到的就是一连串
+ *    「File does not exist. Note: your current working directory is …」。
+ *
+ * 这条链是实测走通过的,而且用户报了两次。所以同一句话必须接到工具结果上。
+ */
+export const RIPGREP_MISSING_MESSAGE =
+  '找不到 ripgrep:本地没有内置的 vendor/ripgrep,系统 PATH 上也没有 rg。' +
+  'Grep / Glob / 全局搜索都会失败,子 agent 会因此列不出文件。' +
+  '装一个 ripgrep(apt install ripgrep / brew install ripgrep),或把 vendor/ripgrep 放到可执行文件旁边。'
+
+/**
+ * 把一次 spawn 失败翻译成模型能照做的话。
+ *
+ * 只管 ENOENT/EACCES/EPERM —— 那三种是「rg 这个程序有问题」,不是「这次搜索没匹配」。
+ * 其余错误原样透传:替一个不认识的错误编故事,比原样交出去更糟。
+ */
+export function describeRipgrepFailure(err: { code?: unknown; message?: string }): string {
+  const code = typeof err.code === 'string' ? err.code : ''
+  if (code === 'ENOENT') {
+    return `${RIPGREP_MISSING_MESSAGE}(原始错误: ${err.message ?? 'ENOENT'})`
+  }
+  if (code === 'EACCES' || code === 'EPERM') {
+    return `ripgrep 存在但没有执行权限(${code})。搜索不可用,子 agent 会因此列不出文件。` +
+      `给它加上可执行位,或装一个系统的 ripgrep。(原始错误: ${err.message ?? code})`
+  }
+  return err.message ?? String(code || '未知错误')
+}
+
 export function resolveRipgrepConfig(deps: {
   wantsSystem: boolean
   isOfficialNativeBuild: boolean
@@ -97,11 +134,7 @@ export function resolveRipgrepConfig(deps: {
    * 实测 `spawn(本 fork 的二进制, ['--version'], { argv0: 'rg' })` 返回的是 Claude Code
    * 自己的版本号,不是 ripgrep 的 —— 把搜索结果换成一行版本号,比 ENOENT 更难发现。
    */
-  deps.onMissing?.(
-    '找不到 ripgrep:本地没有内置的 vendor/ripgrep,系统 PATH 上也没有 rg。' +
-      'Grep / Glob / 全局搜索都会失败,子 agent 会因此列不出文件。' +
-      '装一个 ripgrep(apt install ripgrep / brew install ripgrep),或把 vendor/ripgrep 放到可执行文件旁边。',
-  )
+  deps.onMissing?.(RIPGREP_MISSING_MESSAGE)
   return { mode: 'system', command: 'rg', args: [] }
 }
 
@@ -333,7 +366,11 @@ async function ripGrepFileCount(
     child.on('error', err => {
       if (settled) return
       settled = true
-      reject(err)
+      // 和 ripGrep 同因:裸的 spawn 错误对模型没有信息量,它会转而猜文件名。
+      // 这两条是 Glob(--files)和流式搜索走的路,一样要说人话。
+      const wrapped = new Error(describeRipgrepFailure(err as { code?: unknown; message?: string }))
+      ;(wrapped as { code?: unknown }).code = (err as { code?: unknown }).code
+      reject(wrapped)
     })
   })
 }
@@ -395,7 +432,11 @@ export async function ripGrepStream(
     child.on('error', err => {
       if (settled) return
       settled = true
-      reject(err)
+      // 和 ripGrep 同因:裸的 spawn 错误对模型没有信息量,它会转而猜文件名。
+      // 这两条是 Glob(--files)和流式搜索走的路,一样要说人话。
+      const wrapped = new Error(describeRipgrepFailure(err as { code?: unknown; message?: string }))
+      ;(wrapped as { code?: unknown }).code = (err as { code?: unknown }).code
+      reject(wrapped)
     })
   })
 }
@@ -441,7 +482,12 @@ export async function ripGrep(
       // These should be surfaced to the user rather than silently returning empty results
       const CRITICAL_ERROR_CODES = ['ENOENT', 'EACCES', 'EPERM']
       if (CRITICAL_ERROR_CODES.includes(error.code as string)) {
-        reject(error)
+        // 裸的 `spawn rg ENOENT` 对模型是没有信息量的:它不知道这意味着「这台机器上
+        // 搜索整个不可用」,于是**开始猜文件名**,用户看到一连串 "File does not exist"。
+        // 换成一句能照做的话。
+        const wrapped = new Error(describeRipgrepFailure(error))
+        ;(wrapped as { code?: unknown }).code = error.code
+        reject(wrapped)
         return
       }
 
@@ -734,4 +780,22 @@ async function codesignRipgrepIfNecessary() {
   } catch (e) {
     logError(e)
   }
+}
+
+/**
+ * 「这次运行里搜索能不能用」。
+ *
+ * 给 /et 的启动关口用。搜索用不了是**比隔离降级更严重**的降质:子 agent 列不出文件,
+ * 于是猜文件名,于是 Read 一路报 "File does not exist",而方案环节产出的是
+ * 「由于文件系统工具无法正常访问…」这种一句话方案 —— 用户为此付了一整轮的钱。
+ * 用户报过两次,两次都是先烧掉一次运行才发现。所以要在**开跑之前**说。
+ *
+ * 判据是 `mode === 'system' && command === 'rg'`:resolveRipgrepConfig 在哪儿都找不到时
+ * 就返回这个形状(故意让失败发生在一个用户认得的名字上)。这里把它翻译回「找不到」。
+ */
+export function searchUnavailableReason(
+  status: { mode: string; path: string } = getRipgrepStatus(),
+): string | undefined {
+  if (status.mode === 'system' && status.path === 'rg') return RIPGREP_MISSING_MESSAGE
+  return undefined
 }

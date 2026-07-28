@@ -41,6 +41,11 @@ export function ConfirmStartup(props: {
    */
   isolationReason?: string
   /**
+   * 搜索不可用的原因。比隔离降级更严重 —— 子 agent 会列不出文件,方案环节因此产出
+   * 「由于文件系统工具无法正常访问…」这种一句话方案,而用户已经付了一整轮的钱。
+   */
+  searchReason?: string
+  /**
    * 「或初始化 git」 (spec §8). Absent → the gate offers only the degrade-or-cancel choice and
    * says so, rather than advertising a key that does nothing.
    */
@@ -172,6 +177,13 @@ export function ConfirmStartup(props: {
           「你的请求中有以下部分不会生效」 list — a heading about the PROMPT's directives —
           so a change to how the entire run executes read as a parsing footnote, and the spec's
           「允许选择」 amounted to accept-or-cancel. */}
+      {props.searchReason && !editing && (
+        <Box flexDirection="column">
+          <Text color="error">搜索不可用,本次运行会严重降质:</Text>
+          <Text color="error">  · {props.searchReason}</Text>
+          <Text color="error">  · 子 agent 列不出文件,只能猜文件名 —— 你会看到一连串 "File does not exist"</Text>
+        </Box>
+      )}
       {props.isolationReason && !editing && (
         <Box flexDirection="column">
           <Text color="warning">隔离并行不可用,本次将降级执行:</Text>

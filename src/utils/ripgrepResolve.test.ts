@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'bun:test'
-import { resolveRipgrepConfig } from './ripgrep.js'
+import {
+  describeRipgrepFailure,
+  resolveRipgrepConfig,
+  searchUnavailableReason,
+} from './ripgrep.js'
 
 /**
  * rg 从哪来 —— 四条分支。
@@ -131,5 +135,45 @@ describe('resolveRipgrepConfig', () => {
     })
     expect(cfg.mode).toBe('builtin')
     expect(cfg.command).toContain('vendor/ripgrep')
+  })
+})
+
+describe('搜索用不了的时候,说的话必须能照做', () => {
+  it('ENOENT 换成「装一个 ripgrep」,并保留原始错误', () => {
+    // 模型收到裸的 `spawn rg ENOENT` 时不知道这意味着「这台机器上搜索整个不可用」,
+    // 于是**开始猜文件名** —— 用户看到的就是一连串
+    // 「File does not exist. Note: your current working directory is …」。用户报过两次。
+    const msg = describeRipgrepFailure({ code: 'ENOENT', message: 'spawn rg ENOENT' })
+    expect(msg).toContain('装一个 ripgrep')
+    expect(msg).toContain('列不出文件')
+    // 原始错误不能丢:排查的人需要它。
+    expect(msg).toContain('spawn rg ENOENT')
+  })
+
+  it('EACCES / EPERM 是另一件事 —— 文件在,但不能执行', () => {
+    // 叫用户去 apt install 一个已经装好的东西是白费。
+    for (const code of ['EACCES', 'EPERM']) {
+      const msg = describeRipgrepFailure({ code, message: `spawn ${code}` })
+      expect(msg).toContain('没有执行权限')
+      expect(msg).not.toContain('apt install')
+    }
+  })
+
+  it('别的错误原样透传 —— 替不认识的错误编故事更糟', () => {
+    expect(describeRipgrepFailure({ code: 'EAGAIN', message: 'resource unavailable' }))
+      .toBe('resource unavailable')
+  })
+
+  it('哪儿都找不到时,启动关口要能问出来', () => {
+    // resolveRipgrepConfig 在哪儿都找不到时故意返回 {system, 'rg'} —— 让失败发生在一个
+    // 用户认得的名字上。这条把那个形状翻译回「找不到」,好在**开跑之前**告诉用户。
+    expect(searchUnavailableReason({ mode: 'system', path: 'rg' })).toBeTruthy()
+  })
+
+  it('真的找到了就不报警 —— 三种正常形态都不能误报', () => {
+    // 误报的代价是关口上多一条红字,用户会开始怀疑所有告警。
+    expect(searchUnavailableReason({ mode: 'system', path: '/usr/bin/rg' })).toBeUndefined()
+    expect(searchUnavailableReason({ mode: 'builtin', path: '/opt/vendor/ripgrep/rg' })).toBeUndefined()
+    expect(searchUnavailableReason({ mode: 'embedded', path: '/opt/claude' })).toBeUndefined()
   })
 })

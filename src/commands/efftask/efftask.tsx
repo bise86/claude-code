@@ -10,6 +10,7 @@ import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
 import { collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
 import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
+import { searchUnavailableReason } from '../../utils/ripgrep.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
@@ -1338,6 +1339,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // spec §8:非 git 仓库时「允许选择『改用共享工作目录串行执行』降级(**或初始化 git**)」。
         // 降级本身一直是自动发生的;这两个 prop 才让它成为一个"选择"。
         isolationReason={isolationReason ?? undefined}
+        // 开跑之前就说。用户报过两次这条,两次都是先烧掉一次运行才发现。
+        searchReason={searchUnavailableReason()}
         onInitGit={canInitGit ? () => { void initGitAndRetry() } : undefined}
         onDecision={d => terminalClaim.current?.('terminal', d)}
       />

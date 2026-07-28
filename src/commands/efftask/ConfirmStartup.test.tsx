@@ -291,6 +291,24 @@ describe('spec §8:隔离不可用时,关口把它呈现成一个选择', () => 
     return { ...t, app }
   }
 
+  it('搜索不可用要单独报出来,而且比隔离降级更重', async () => {
+    // 用户报过两次「File does not exist. Note: your current working directory is …」,
+    // 两次都是先烧掉一次运行才发现。根因是这台机器上没有 ripgrep:子 agent 列不出
+    // 文件,只能猜文件名。这条必须在**开跑之前**说。
+    const { lastFrame, app } = await mountIso({ searchReason: '找不到 ripgrep:装一个 ripgrep' })
+    const f = lastFrame()
+    expect(f).toContain('搜索不可用')
+    expect(f).toContain('装一个 ripgrep')
+    // 光说「不可用」不够 —— 要说清用户会看到什么,否则他下次还是不知道那串报错是这回事。
+    expect(f).toContain('File does not exist')
+    app.unmount()
+  })
+
+  it('搜索正常时一个字都不提 —— 误报会让人开始怀疑所有告警', async () => {
+    const { lastFrame, app } = await mountIso({ isolation: 'worktree' })
+    expect(lastFrame()).not.toContain('搜索不可用')
+    app.unmount()
+  })
   it('单独成块,不再混在"你的请求不会生效"里', async () => {
     // 那个标题讲的是提示词里的指令没生效;而这里变的是整个 run 的执行方式。把后者塞进前者,
     // 就是让一次用户从没选择过的降级读起来像一条解析脚注。
