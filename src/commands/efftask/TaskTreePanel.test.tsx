@@ -8,7 +8,7 @@ import { describe, expect, it } from 'bun:test'
 import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
-import { TaskTreePanel, visibleRows, viewport, elapsed, budgetedViewport } from './TaskTreePanel.js'
+import { TaskTreePanel, visibleRows, viewport, elapsed, budgetedViewport, kindGlyph, KIND_GLYPH } from './TaskTreePanel.js'
 import { NodeDetail, phaseTimeBody } from './NodeDetail.js'
 import { PHASE_LABEL, PHASE_NAMES } from '../../tools/efftask/types.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
@@ -858,5 +858,82 @@ describe('budgetedViewport —— 画出去的终端行数不能超预算', () =
 
   it('至少画一行 —— 预算再紧也不能把树整个变空', () => {
     expect(budgetedViewport(rows(5), [2, 2, 2, 2, 2], 0, 1).slice.length).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe('拆分任务 / 执行任务 要一眼分得开', () => {
+  it('kindGlyph:三种 kind 三个符号', () => {
+    expect(kindGlyph({ kind: 'decompose', childIds: [] })).toBe(KIND_GLYPH.decompose)
+    expect(kindGlyph({ kind: 'executable', childIds: [] })).toBe(KIND_GLYPH.executable)
+    expect(kindGlyph({ kind: 'unknown', childIds: [] })).toBe(KIND_GLYPH.unknown)
+    // 三个必须互不相同,否则「分得开」这件事根本不成立
+    expect(new Set(Object.values(KIND_GLYPH)).size).toBe(3)
+  })
+
+  it('有孩子就是拆分节点,哪怕 kind 还写着 executable', () => {
+    // 动态生长会把子节点嫁接到一个已经判成 executable 的节点上(spec §4),此时 kind
+    // 还没被改写。只看 kind 的话,一个明明有 3 个孩子的行会画成「执行任务」—— 树上
+    // 直接说假话。
+    expect(kindGlyph({ kind: 'executable', childIds: ['a', 'b', 'c'] })).toBe(KIND_GLYPH.decompose)
+  })
+
+  it('标记不和已有的字形撞', () => {
+    // 撞了就分不出「这是折叠箭头还是任务类型」。已有的:光标、折叠、状态、活动行。
+    const taken = ['❯', '▾', '▸', '●', '◐', '○', '✗', '⎿', ' ']
+    for (const g of Object.values(KIND_GLYPH)) {
+      expect(`${g} 撞了: ${taken.includes(g)}`).toBe(`${g} 撞了: false`)
+    }
+  })
+
+  it('树上真的画出来了,而且拆分和执行画的不是同一个', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel as never, {
+        nodes: [
+          mk({ id: 'root', title: '根任务', status: 'WAITING_CHILDREN', kind: 'decompose', childIds: ['root/01-a'] }),
+          mk({ id: 'root/01-a', title: '写代码', parentId: 'root', depth: 1, status: 'EXECUTING', kind: 'executable' }),
+        ],
+        runId: '003', interactive: true,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    // 两个符号都在屏幕上,而且图例也在 —— 只画符号不给图例等于让人猜。
+    expect(f).toContain(KIND_GLYPH.decompose)
+    expect(f).toContain(KIND_GLYPH.executable)
+    expect(f).toContain('拆分任务')
+    expect(f).toContain('执行任务')
+    app.unmount()
+  })
+
+  it('详情页用文字说清是哪一种', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: mk({ id: 'n', title: '写代码', kind: 'executable' }), elapsed: '1m',
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).toContain('执行任务')
+    app.unmount()
+  })
+
+  it('长标题被截断,不回流成两行 —— 一行一个终端行是行预算的前提', async () => {
+    // 行预算(budgetedViewport)按「一行 = 一个终端行」结算。默认 wrap 会把一个超长标题
+    // 回流成好几行,预算就白算了,底部的计数和按键提示照样被顶出屏幕。
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel as never, {
+        nodes: [mk({ id: 'root', title: 'x'.repeat(500), status: 'READY', kind: 'executable' })],
+        runId: '003', interactive: true,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const rows = t.lastFrame().split('\n').filter(l => l.includes('xxx'))
+    expect(`标题占了 ${rows.length} 个终端行`).toBe('标题占了 1 个终端行')
+    app.unmount()
   })
 })

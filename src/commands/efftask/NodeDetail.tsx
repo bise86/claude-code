@@ -159,6 +159,11 @@ export function NodeDetail(props: {
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold color={COLOR[ui]}>{n.title}</Text>
       <Text dimColor>
+        {/* 树上用 ⊞ / ▪ 两个符号区分,这里有地方写字就直接写字 —— 详情页不该逼人回去
+            对照图例。判据和树上那一处保持一致(见 TaskTreePanel.kindGlyph):同时看
+            childIds,因为动态生长会把子节点嫁接到一个已判 executable 的节点上。 */}
+        {n.childIds.length > 0 || n.kind === 'decompose' ? '拆分任务' : n.kind === 'executable' ? '执行任务' : '待定'}
+        {' · '}
         {n.id} · {n.status} · {props.elapsed}
         {/* 依赖 used to be a bare count here. It now has its own section listing each one by
             title and status, so a count on this line is duplication — and worse, it made the

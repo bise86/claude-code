@@ -152,7 +152,8 @@ describe('跳过分析:run 必须真的启动', () => {
     const f = strip(tty.frames())
     // 编排器跑起来的证据 = 任务树上真的出现了一个节点。setPhase('running') 那个 bug 下
     // 界面是「✓0 ◐0 ○0 ✗0」且一行节点都没有 —— 计数全 0 正是它的指纹。
-    expect(`任务树上有节点: ${/[◐✓✗]\s*把 README 翻译成英文/.test(f)}`).toBe('任务树上有节点: true')
+    // 状态字形和标题之间多了一个类型标记(⊞ 拆分 / ▪ 执行 / · 待定)。
+    expect(`任务树上有节点: ${/[◐✓✗○]\s*[⊞▪·]\s*把 README 翻译成英文/.test(f)}`).toBe('任务树上有节点: true')
     expect(`停在空树: ${/✓0◐0○0✗0/.test(f)}`).toBe('停在空树: false')
     app.unmount()
   })

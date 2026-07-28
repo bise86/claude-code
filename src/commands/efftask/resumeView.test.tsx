@@ -198,8 +198,9 @@ describe('ConfirmResume (vendored renderer)', () => {
     //     实测把 GLYPH[ui] 换成 '@',用例照样绿。
     // 所以改成用树里独有的标题、以及"字形 + 标题同处一行"来钉。
     expect(f).toContain('登录子任务')                 // 只出现在树里,不在目标行里
-    expect(f).toMatch(/✗\s*登录子任务/)              // 状态字形必须贴在那一行上
-    expect(f).toMatch(/▾\s*○\s*根任务/)              // 折叠标记 + 排队字形 + 根标题
+    // 行格式是「状态字形 + 类型标记 + 标题」,中间那个是 ⊞/▪/· —— 只写 \s* 会漏掉它。
+    expect(f).toMatch(/✗\s*[⊞▪·]\s*登录子任务/)     // 状态字形必须贴在那一行上
+    expect(f).toMatch(/▾\s*○\s*[⊞▪·]\s*根任务/)       // 折叠标记 + 排队字形 + 类型标记 + 根标题
     app.unmount()
   })
 

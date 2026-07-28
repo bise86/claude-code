@@ -12,6 +12,30 @@ const COLOR: Record<UiStatus, string> = { done: 'success', running: 'warning', q
 const GLYPH: Record<UiStatus, string> = { done: '●', running: '◐', queued: '○', failed: '✗' }
 
 /**
+ * 拆分任务 / 执行任务 的标记。
+ *
+ * 状态那个圆点回答的是「跑到哪了」,回答不了「这是一个要往下拆的节点,还是一个真的
+ * 会改代码的节点」—— 而这两种节点在树上长得一模一样,只有展开之后才看得出来谁有孩子。
+ *
+ * 字形都是宽度 1 的几何符号(实测过),不和已有的 `▾ ▸ ● ◐ ○ ✗ ❯ ⎿` 撞。这个文件里
+ * 的状态字形本来就是裸写的几何符号,这里跟着来,不为两个符号引入 figures 依赖。
+ */
+export const KIND_GLYPH = { decompose: '⊞', executable: '▪', unknown: '·' } as const
+
+/**
+ * 一个节点该画哪个标记。
+ *
+ * **同时看 kind 和 childIds**,不只看 kind:动态生长会把子节点嫁接到一个已经判成
+ * `executable` 的节点上(spec §4),此时 kind 还没被改写,而它事实上已经是拆分节点了。
+ * 只看 kind 的话,一个明明有 3 个孩子的行会画成「执行任务」——树上直接说假话。
+ */
+export function kindGlyph(node: Pick<TaskNode, 'kind' | 'childIds'>): string {
+  if (node.childIds.length > 0 || node.kind === 'decompose') return KIND_GLYPH.decompose
+  if (node.kind === 'executable') return KIND_GLYPH.executable
+  return KIND_GLYPH.unknown
+}
+
+/**
  * Wall-clock age of a node. A node that reached a terminal state freezes at the moment it
  * got there; a live one keeps counting against `nowMs`.
  *
@@ -278,10 +302,12 @@ export function TaskTreePanel(props: {
         const act = activity.get(n.id)
         return (
           <Box key={n.id} flexDirection="column">
-            <Text color={COLOR[ui]} inverse={selected}>
+            {/* truncate-end,不让长标题回流成两行:一行一个终端行是 budgetedViewport 的
+                前提,行数一旦对不上,底部的计数和按键提示就会被顶出屏幕。 */}
+            <Text color={COLOR[ui]} inverse={selected} wrap="truncate-end">
               {selected ? '❯' : ' '}
               {'  '.repeat(depth)}
-              {fold} {GLYPH[ui]} {n.title}{' '}
+              {fold} {GLYPH[ui]} {kindGlyph(n)} {n.title}{' '}
               <Text dimColor>
                 [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{scoreTag(n)}{hidden}
               </Text>
@@ -296,7 +322,10 @@ export function TaskTreePanel(props: {
         )
       })}
       {props.interactive === true ? (
-        <Text dimColor>↑↓/jk 移动 · ←/→ 折叠展开 · 空格切换 · 回车看详情 · Esc/q 退出</Text>
+        <Text dimColor>
+          {KIND_GLYPH.decompose} 拆分任务 · {KIND_GLYPH.executable} 执行任务{'\n'}
+          ↑↓/jk 移动 · ←/→ 折叠展开 · 空格切换 · 回车看详情 · Esc/q 退出
+        </Text>
       ) : null}
     </Box>
   )
