@@ -1456,7 +1456,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'running') {
-    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} />
+    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} serialExecute={poolRef.current === undefined} />
   }
   return (
     <DoneView
@@ -1521,14 +1521,14 @@ function ParsingView(props: { onCancel: () => void; log?: readonly StreamState[]
 // EXPORTED for testing. The three §10.2 hops that live in this file — creating the store,
 // pushing into it, and handing it to each panel — are exactly the shape of wire this repo has
 // cut twice, and nothing else here is importable by a test.
-export function RunningView(props: { nodes: TaskNode[]; runId: string; streams?: StreamStore; pool?: () => { inUse: number; limit: number }; onAbort: () => void; suspended?: boolean }): React.ReactElement {
+export function RunningView(props: { nodes: TaskNode[]; runId: string; streams?: StreamStore; pool?: () => { inUse: number; limit: number }; onAbort: () => void; suspended?: boolean; serialExecute?: boolean }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
   // different things at once (abort the run vs leave the detail view). The panel owns the
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.

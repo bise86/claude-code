@@ -71,6 +71,35 @@ async function mount(el: React.ReactElement) {
   return { t, app }
 }
 
+describe('执行串行时顶上要说实话', () => {
+  it('没有隔离工作区时,明说执行是串行的', async () => {
+    // 不说的话顶上那个「并行 1/5」是在误导:用户看着 5 的上限却发现子任务一个一个来,
+    // 只能怀疑是不是自己配错了 —— 而真实原因是 orchestrator 的 serialiseExecute。
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive serialExecute
+        pool={() => ({ inUse: 1, limit: 5 })} onExitKey={() => {}}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('并行 1/5')
+    expect(f).toContain('执行串行(无隔离工作区)')
+  })
+
+  it('有隔离时不提 —— 那句话此时是假的', async () => {
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        pool={() => ({ inUse: 3, limit: 5 })} onExitKey={() => {}}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('并行 3/5')
+    expect(f).not.toContain('执行串行')
+  })
+})
 describe('suspended 时面板不吃任何键', () => {
   it('回车不再打开详情 —— 这就是用户报的那一下', async () => {
     const { t, app } = await mount(

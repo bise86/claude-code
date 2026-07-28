@@ -185,6 +185,15 @@ export function TaskTreePanel(props: {
   streams?: StreamStore
   /** 并行占用 (spec §10.1). Read at render time; see `chunks` for why it is not state. */
   pool?: () => { inUse: number; limit: number }
+  /**
+   * 执行环节是不是被串行化了(没有隔离工作区时是)。
+   *
+   * 必须显示,因为不显示的话顶上那个「并行 1/5」是**在误导**:用户看着 5 的上限,
+   * 却发现子任务一个一个来,只能怀疑是不是自己配错了。而真实原因是
+   * orchestrator 的 `serialiseExecute = kind === 'execute' && worktrees === undefined` ——
+   * 两个执行者共用一棵工作树会互相覆盖对方的改动,**同时**各自向自己的验收员汇报成功。
+   */
+  serialExecute?: boolean
 }): React.ReactElement {
   // Tick once a second so elapsed times keep moving even when no node transitions —
   // otherwise the panel only repaints on onUpdate and looks frozen during a long phase.
@@ -320,6 +329,9 @@ export function TaskTreePanel(props: {
         {/* 并行占用 n/N (spec §10.1). The POOL's occupancy, which includes the reviewers a
             roundtable is running — that is the number the confirmation gate capped. */}
         {props.pool ? <Text dimColor>{'  '}并行 {props.pool().inUse}/{props.pool().limit}</Text> : null}
+        {props.serialExecute === true
+          ? <Text color="warning">{'  '}执行串行(无隔离工作区)</Text>
+          : null}
         {rows.length > view.slice.length ? <Text dimColor>{'  '}{idx + 1}/{rows.length}</Text> : null}
       </Text>
       {view.slice.map(({ node: n, depth, hasKids }, vi) => {

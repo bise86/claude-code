@@ -489,6 +489,9 @@ describe('改回去要变红的四处', () => {
     expect(SRC).toContain('onHumanWait: w => { humanWaitOut.current?.(w) }')
     expect(SRC).toMatch(/props\.humanWaitOut\.current = \(w: boolean\) =>/)
     expect(element('RunningView')).toContain('suspended={humanWait.waiting}')
+    // 串行提示要真的按**池子在不在**来,写死 false 的话它永远不出现,
+    // 而顶上那个「并行 1/5」会一直误导用户。
+    expect(element('RunningView')).toContain('serialExecute={poolRef.current === undefined}')
   })
   it('只查看模式不给重做入口', () => {
     // 那个 run 的编排器根本没起来过。给了重做就是**替用户决定**把它跑起来,
