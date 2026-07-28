@@ -159,6 +159,9 @@ export async function draftRootPlan(args: {
       // 重拟失败就用第一版 —— 关口会把空字段列出来,用户仍然看得见真相。
     }
   }
+  // 重拟途中被中断时也要报中断,别端出一份半成品。第一次调用后 abort 走的是上面那条
+  // ok:false,两条路径的语义必须一样 —— 不一样的话,调用方按 ok 分支处理就会分叉。
+  if (signal.aborted) return { ok: false, reason: '已中断' }
   return { ok: true, draft: { kind: parsed.kind, plan: parsed.plan, children: parsed.children } }
 }
 
@@ -246,22 +249,51 @@ export function buildRootPlanNoticeCard(args: {
 /**
  * 「方案」短到这个程度就只能是一句话,不是方案。
  *
- * 20 而不是 40:用户实测那一版 solution 有五十多字(「对 X 项目进行全面的代码审查,
+ * 12 而不是 40:用户实测那一版 solution 有五十多字(「对 X 项目进行全面的代码审查,
  * 涵盖架构设计、安全性……」),**长度根本挡不住它** —— 真正挡住它的是另外三个字段全空。
- * 所以这条只当粗筛,拦「三步走」那种三个字的,阈值定高只会误伤小任务的短方案。
+ * 所以这条只当粗筛,拦「三步走」那种三个字的。
+ *
+ * 阈值从 20 降到 12 是验收实测逼的:中文码点密度约是英文的 1.6 倍,20 会误伤
+ * 「把 README 第一行标题改成 X」(15 码点)这类**合理的**小任务方案,而同义英文
+ * (21 字符)却放行。误伤的代价是白烧一次重拟调用 + 关口上一条吓人的警告。
  */
-export const MIN_SOLUTION_CHARS = 20
+export const MIN_SOLUTION_CHARS = 12
 
-export function planGaps(plan: { solution: string; keyPoints: string; risks: string; acceptance: string }): string[] {
+/**
+ * 占位词。写了字但等于没写。
+ *
+ * 验收实测:`keyPoints/risks/acceptance` 填 `'无'/'无'/'无'`、`'a'/'b'/'c'`、`'-'`、`'。'`
+ * 时 planGaps **一条都不报** —— 这个函数的立意是挡「模型偷懒」,而模型写三个「无」就
+ * 完全绕过,连那次自动重拟都不会触发。只判空白是不够的。
+ */
+const PLACEHOLDER = new Set([
+  '无', '暂无', '没有', '不适用', '略', '待定', '待补充', '同上', 'n/a', 'na', 'none', 'nil', 'tbd', 'todo', '-', '--', '/',
+])
+/** 字段短到这个程度也只能是占位。 */
+export const MIN_FIELD_CHARS = 4
+
+function hollow(v: unknown): boolean {
+  if (typeof v !== 'string') return true
+  const t = v.trim()
+  if (t.length === 0) return true
+  // 去掉标点空白再判,'。'、'——'、'…' 这类也算空
+  const core = t.replace(/[\s\-—…·。,.;:!?、"'`~*#\[\]()（）【】]/g, '')
+  if (core.length === 0) return true
+  if (PLACEHOLDER.has(core.toLowerCase())) return true
+  return Array.from(core).length < MIN_FIELD_CHARS
+}
+
+export function planGaps(plan: { solution: string; keyPoints: string; risks: string; acceptance: string } | null | undefined): string[] {
+  // 它是 export 的,而且唯一调用链之外没人保证传得进对象。守 plan 本身,不只守字段。
+  if (!plan || typeof plan !== 'object') return ['方案整个是空的']
   const out: string[] = []
-  const blank = (s: string): boolean => typeof s !== 'string' || s.trim().length === 0
-  if (blank(plan.solution)) out.push('完整方案是空的')
-  else if (Array.from(plan.solution.trim()).length < MIN_SOLUTION_CHARS) {
-    out.push(`完整方案只有 ${Array.from(plan.solution.trim()).length} 个字,基本等于复述目标`)
+  if (hollow(plan.solution)) out.push('完整方案是空的')
+  else if (Array.from(String(plan.solution).trim()).length < MIN_SOLUTION_CHARS) {
+    out.push(`完整方案只有 ${Array.from(String(plan.solution).trim()).length} 个字,基本等于复述目标`)
   }
-  if (blank(plan.keyPoints)) out.push('重点是空的')
-  if (blank(plan.risks)) out.push('风险点是空的')
-  if (blank(plan.acceptance)) out.push('验收点是空的 —— 验收环节拿它当判据,空的就只能凭执行者自述')
+  if (hollow(plan.keyPoints)) out.push('重点是空的(或只填了「无」这类占位)')
+  if (hollow(plan.risks)) out.push('风险点是空的(或只填了「无」这类占位)')
+  if (hollow(plan.acceptance)) out.push('验收点是空的 —— 验收环节拿它当判据,空的就只能凭执行者自述')
   return out
 }
 

@@ -75,6 +75,27 @@ export function wrapDisplayWidth(s: string, width: number): string[] {
   return out.length > 0 ? out : ['']
 }
 
+/**
+ * 按**显示宽度**截断,超出补省略号。
+ *
+ * 给「标题 + 状态 + 耗时」这类行用:整行交给 truncate-end 的话,从右边吃掉的正好是
+ * 状态和耗时 —— 实测 80 列 + 27 字中文标题,`[WAITING_CHILDREN]` 被截成
+ * `[WAITING_CHIL…`,耗时整个没了。这个仓库为日志窗表头已经记过一次同样的坑。
+ */
+export function clipToWidth(s: string, width: number): string {
+  if (width <= 0) return ''
+  if (stringWidth(s) <= width) return s
+  let out = ''
+  let w = 0
+  for (const ch of s) {
+    const cw = stringWidth(ch)
+    if (w + cw > width - 1) break
+    out += ch
+    w += cw
+  }
+  return out + '…'
+}
+
 /** 右对齐地把左右两段拼进一行;放不下就只留左边(截断由渲染层的 truncate-end 兜)。 */
 function justify(left: string, right: string, width: number): string {
   const pad = width - stringWidth(left) - stringWidth(right)

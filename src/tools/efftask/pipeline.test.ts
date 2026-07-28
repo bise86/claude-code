@@ -4396,3 +4396,16 @@ describe('评审要有一条「够用就放行」的线', () => {
     expect(ps[1]).toContain('第 2/3 轮')
   })
 })
+
+describe('方案提示词里那段「四个字段都不许留空」', () => {
+  it('删掉整段要变红 —— 它是「根方案是空的」三个洞里的第二个', () => {
+    const SRC = readFileSync(new URL('./pipeline.ts', import.meta.url), 'utf8')
+    const body = SRC.slice(SRC.indexOf('export function planPrompt('), SRC.indexOf('function reviewPrompt('))
+    for (const must of ['四个字段都不许留空', 'solution:', 'keyPoints:', 'risks:', 'acceptance:', '可检验']) {
+      expect(`提示词里有「${must}」: ${body.includes(must)}`).toBe(`提示词里有「${must}」: true`)
+    }
+    // 「你在哪」和「可以看」那两句同样零覆盖过
+    expect(body).toContain('工作目录')
+    expect(body).toContain('先真的去看代码')
+  })
+})

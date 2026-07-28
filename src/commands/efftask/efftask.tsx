@@ -777,7 +777,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   React.useEffect(() => {
     if (isResume) return // resume recovers its config from run.md; no model call, no roster overwrite
     let cancelled = false
-    const preStream = streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '需求解析', label: '主模型' })
+    const preStream = streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '需求解析', label: '主模型', pinned: true })
     void parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, modelJson: p => extractJson(p, preStream) })
       // belt & braces: parseDirectives already swallows extraction failures, but a rejection
       // here would otherwise strand the UI on 'parsing' forever. Keep unsupportedRoles here
@@ -1011,9 +1011,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         worktrees: poolRef.current,
         // 第三关的窗口。整个运行里最长的单次调用之一,此前是纯黑屏。
         cwd: getCwd(),
-        stream: streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '根方案', label: '主模型', round: redrafts + 1 }),
+        stream: streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '根方案', label: '主模型', round: redrafts + 1, pinned: true }),
         // 空方案自动重拟那一次也有自己的窗口 —— 否则界面上看不出它为什么多花了一倍时间。
-        retryStream: () => streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '根方案(重拟)', label: '主模型', round: redrafts + 1 }),
+        retryStream: () => streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '根方案(重拟)', label: '主模型', round: redrafts + 1, pinned: true }),
       })
       if (cancelled) return
       if (res.ok) {

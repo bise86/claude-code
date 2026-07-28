@@ -84,6 +84,14 @@ export interface StreamMeta {
    */
   label: string
   model?: string
+  /**
+   * 永不淘汰。
+   *
+   * 树外那几条(需求解析、根方案、根方案重拟)挂在 root 上,而它们恰好是 root 上**最老**的
+   * 三条 —— 淘汰按插入顺序压最旧的已收口流,于是它们成了第一批被扔的。而把它们挂到
+   * root 的理由正是「事后最想回看」。5 席名册下 root 自己就有五十条流,这不是边角情况。
+   */
+  pinned?: boolean
 }
 
 export interface StreamHandle {
@@ -172,6 +180,9 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
   const enforceGlobal = (): void => {
     while (total > MAX_TOTAL_EVENTS && closedQueue.length > 0) {
       const victim = closedQueue.shift()!
+      // 钉住的流跳过 —— 出了队就不再回来,所以全局上限对它们无效。数量是常数级
+      // (一次运行最多三条),不构成新的无界项。
+      if (victim.meta.pinned === true) continue
       tombstone(victim)
     }
     // closedQueue 空了还超限 = 所有流都还活着。活着的流永不压缩:它正在被人看。
@@ -195,7 +206,7 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
     let over = intact - MAX_STREAMS_PER_NODE
     for (const s of list) {
       if (over <= 0) break
-      if (!s.closed || s.tombstone) continue
+      if (!s.closed || s.tombstone || s.meta.pinned === true) continue
       tombstone(s)
       over--
     }

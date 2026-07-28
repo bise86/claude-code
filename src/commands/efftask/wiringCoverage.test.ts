@@ -406,3 +406,38 @@ describe('席位署名的取值必须短路(六个调用点)', () => {
     expect((PIPE.match(/\|\| '主模型'/g) ?? []).length).toBeGreaterThanOrEqual(6)
   })
 })
+
+/**
+ * 验收实测「改回去也全绿」的四处。
+ *
+ * 这四条都是**行为正确、但零防线** —— 变异测试把它们逐个改回旧行为,1667 条全绿。
+ * 这个文件存在的理由就是这类:代码是活的,拦不住有人把它改死。
+ */
+describe('改回去要变红的四处', () => {
+  it('等待屏的窗口是可交互的 —— 改回 isActive={false} 就是用户抱怨的「不能滚」', () => {
+    // 两处:drafting 的 MessageView 和 ParsingView。
+    const active = SRC.match(/<AgentLogPane[^>]*isActive(?!=\{false\})/g) ?? []
+    expect(`可交互的等待屏窗口: ${active.length}`).toBe('可交互的等待屏窗口: 2')
+    expect(SRC).not.toContain('isActive={false}')
+  })
+
+  it('「已等待」的心跳真的在改状态,不是一个空回调', () => {
+    // 现有那条断言是 /已等待\s*\d+s/ —— 秒数冻死在 0 也照样匹配。
+    expect(SRC).toContain('setInterval(() => setWaitNow(Date.now()), 1000)')
+    expect(SRC).toContain('const waitedSec = Math.max(0, Math.round((waitNow - waitStart) / 1000))')
+  })
+
+  it('cwd 真的交给了 draftRootPlan —— 单测只测到 planPrompt 内部那一半', () => {
+    // planPrompt 里去掉 cwd 会被单测杀掉,但**接线**没人守:这正是这个文件开篇
+    // 列的「函数写好了但生产上零调用点」的形状。
+    const draft = SRC.slice(SRC.indexOf('await draftRootPlan({'))
+    expect(`draftRootPlan 拿到了 cwd: ${draft.slice(0, 400).includes('cwd: getCwd()')}`)
+      .toBe('draftRootPlan 拿到了 cwd: true')
+  })
+
+  it('树外那几条流是钉住的 —— 否则它们是第一批被淘汰的', () => {
+    // 它们挂在 root 上,而且是 root 上最老的三条;淘汰按插入顺序压最旧的已收口流。
+    // 把它们挂到 root 的理由正是「事后最想回看」。
+    expect((SRC.match(/pinned: true/g) ?? []).length).toBe(3)
+  })
+})

@@ -5,7 +5,8 @@ import { uiStatus, type UiStatus } from '../../tools/efftask/stateMachine.js'
 import { NodeDetail } from './NodeDetail.js'
 import type { StreamStore } from '../../tools/efftask/agentStream.js'
 import { useStreamTick } from './AgentLogPane.js'
-import { budgetRows, lastActivity } from './logView.js'
+import { budgetRows, clipToWidth, lastActivity } from './logView.js'
+import { stringWidth } from '../../ink/stringWidth.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 
 const COLOR: Record<UiStatus, string> = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' }
@@ -186,7 +187,7 @@ export function TaskTreePanel(props: {
   // 订阅事件流,合批重绘。放在这里而不是放在窗口自己身上:窗口拿到的 streams 是这个组件
   // 在 render 期读出来的,窗口自己重绘并不会让这里重新去读。
   useStreamTick(props.streams, live)
-  const { columns } = useTerminalSize()
+  const { columns, rows: termRows } = useTerminalSize()
 
   const [collapsed, setCollapsed] = React.useState<ReadonlySet<string>>(() => new Set())
   const [cursor, setCursor] = React.useState(0)
@@ -194,7 +195,14 @@ export function TaskTreePanel(props: {
 
   const rows = visibleRows(props.nodes, collapsed)
   // Rows of TREE to draw at once; the border, header and key hint live outside it.
-  const height = Math.max(3, props.maxRows ?? 20)
+  /**
+   * 树画多少行。跟着**终端行数**走,不是写死 20。
+   *
+   * 写死 20 时面板总高 = 边框 2 + 表头 1 + 20 + 提示 1 = 24,而 24 行是极常见的默认 ——
+   * 一点富余都没有,再多一行提示就溢出。减 8 是给边框、表头、提示、以及 /et 上方
+   * REPL 里的其它内容留的余量。
+   */
+  const height = Math.max(3, props.maxRows ?? Math.min(20, Math.max(6, termRows - 8)))
   // The tree grows while it runs, so a cursor parked past the end must not render a blank
   // selection — clamp on every paint rather than trying to fix it up on each mutation.
   const idx = rows.length === 0 ? 0 : Math.min(cursor, rows.length - 1)
@@ -300,6 +308,14 @@ export function TaskTreePanel(props: {
         const fold = hasKids ? (collapsed.has(n.id) ? '▸' : '▾') : ' '
         const hidden = hasKids && collapsed.has(n.id) ? ` (+${countSubtree(props.nodes, n)})` : ''
         const act = activity.get(n.id)
+        // 标题先按剩余宽度截,状态和耗时才不会被 truncate-end 从右边吃掉。
+        // 前缀 = 光标 1 + 缩进 2×depth + 折叠 1 + 空格 1 + 状态字形 1 + 空格 1 + 类型 1 + 空格 1
+        const suffix = ` [${n.status}]${n.mergeConflict === true ? ' 待人工解冲突' : ''} ${elapsed(n, nowMs)}${scoreTag(n)}${hidden}`
+        // stringWidth 而不是 .length:后缀里有中文(「待人工解冲突」7 个 UTF-16 单元、
+        // 13 列),按 .length 算会少扣一半宽度,行照样溢出 —— truncate-end 就得替它兜,
+        // 而从右边吃掉的正是状态和耗时。
+        const room = columns - (8 + depth * 2) - stringWidth(suffix)
+        const title = clipToWidth(n.title, Math.max(6, room))
         return (
           <Box key={n.id} flexDirection="column">
             {/* truncate-end,不让长标题回流成两行:一行一个终端行是 budgetedViewport 的
@@ -307,7 +323,7 @@ export function TaskTreePanel(props: {
             <Text color={COLOR[ui]} inverse={selected} wrap="truncate-end">
               {selected ? '❯' : ' '}
               {'  '.repeat(depth)}
-              {fold} {GLYPH[ui]} {kindGlyph(n)} {n.title}{' '}
+              {fold} {GLYPH[ui]} {kindGlyph(n)} {title}{' '}
               <Text dimColor>
                 [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{scoreTag(n)}{hidden}
               </Text>
@@ -322,11 +338,12 @@ export function TaskTreePanel(props: {
         )
       })}
       {props.interactive === true ? (
-        <Text dimColor>
-          {/* 分隔符不能用 ' · ' —— 「待定」那个字形本身就是 '·',图例读起来会变成三项。
-               而且三种字形树上都画得出来,图例只列两种等于让人猜第三种。 */}
-          {KIND_GLYPH.decompose} 拆分任务   {KIND_GLYPH.executable} 执行任务   {KIND_GLYPH.unknown} 待定(方案还没出){'\n'}
-          ↑↓/jk 移动 · ←/→ 折叠展开 · 空格切换 · 回车看详情 · Esc/q 退出
+        // 图例和按键**同一行**:面板高度 = 边框 2 + 表头 1 + height 20 + 提示,
+        // 多一行就是 25 行,而 24 行是极常见的默认 —— 底部的计数和提示会被顶出去。
+        // 分隔符不用 '·':「待定」那个字形本身就是 '·',读起来会变成三项。
+        <Text dimColor wrap="truncate-end">
+          {KIND_GLYPH.decompose}拆分 {KIND_GLYPH.executable}执行 {KIND_GLYPH.unknown}待定{'    '}
+          ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · 回车看详情 · Esc/q 退出
         </Text>
       ) : null}
     </Box>

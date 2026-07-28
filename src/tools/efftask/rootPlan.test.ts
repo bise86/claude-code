@@ -492,8 +492,11 @@ describe('空方案不能被当成方案端给用户', () => {
   it('一句复述目标的「方案」也算空', () => {
     // 实测产出:「对 X 项目进行全面的代码审查,涵盖架构、安全、性能……」—— 一句正确的
     // 废话,长度刚好不为零,而三个字段全空。只判空串挡不住它。
-    const g = planGaps(plan({ solution: '对项目进行全面的代码审查' }))
+    const g = planGaps(plan({ solution: '全面审查代码' }))
     expect(g.join()).toContain('基本等于复述目标')
+    // 反向:小任务的合理短方案不该被拦。阈值从 20 降到 12 就是为这个 ——
+    // 中文码点密度约是英文的 1.6 倍,20 会把它误伤,而同义英文却放行。
+    expect(planGaps(plan({ solution: '把 README 第一行标题改成 X' }))).toEqual([])
   })
 
   it('用户实测那一版会被整条报出来', () => {
@@ -608,7 +611,7 @@ describe('自动重拟不许把好方案换成坏的', () => {
 
   it('isBetterDraft 三条判据各自都要卡住', () => {
     const prev = { kind: 'decompose' as const, plan: { solution: 's', keyPoints: '', risks: '', acceptance: '' }, children: [{ title: 'a', deps: [] }] }
-    const full = { solution: '分三步做完这件事,先读代码再改再跑测试验证', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    const full = { solution: '分三步做完这件事,先读代码再改再跑测试验证', keyPoints: '别只看命名', risks: '可能漏掉动态加载', acceptance: '产出带行号的清单' }
     // 空字段没少
     expect(isBetterDraft({ kind: 'decompose', plan: prev.plan, children: prev.children }, prev, 3)).toBe(false)
     // 子任务变少
@@ -642,5 +645,48 @@ describe('自动重拟不许把好方案换成坏的', () => {
     })
     expect(prompts[1]).toContain('看一下代码然后改一改')
     expect(prompts[1]).not.toContain('{"solution":"","keyPoints":"","risks":"","acceptance":""}')
+  })
+})
+
+describe('planGaps 要挡住「写了字但等于没写」', () => {
+  const base = {
+    solution: '分三步:先读 src 入口理清模块边界,再逐模块看错误处理,最后汇总清单',
+    keyPoints: '别只看命名', risks: '可能漏掉动态加载', acceptance: '产出带行号的清单',
+  }
+  it('三个「无」不算填了 —— 只判空白的话模型写三个字就全绕过', () => {
+    // 这个函数的立意是挡「模型偷懒」。验收实测:'无'/'无'/'无' 一条都不报,连自动重拟
+    // 都不会触发。
+    for (const junk of ['无', '暂无', '没有', '略', 'N/A', 'TODO', '-', '。', '…']) {
+      const g = planGaps({ ...base, keyPoints: junk })
+      expect(`${junk} 被当成填了: ${g.length === 0}`).toBe(`${junk} 被当成填了: false`)
+    }
+  })
+  it('单字符也算占位', () => {
+    expect(planGaps({ ...base, risks: 'a' }).length).toBeGreaterThan(0)
+    expect(planGaps({ ...base, acceptance: '好' }).length).toBeGreaterThan(0)
+  })
+  it('正常内容不误伤', () => {
+    expect(planGaps(base)).toEqual([])
+    expect(planGaps({ ...base, risks: '并发写冲突' })).toEqual([])
+  })
+  it('plan 本身是 null / 非对象也不抛', () => {
+    // 它是 export 的,唯一调用链之外没人保证传得进对象。
+    for (const bad of [null, undefined, 42, 'x', []]) {
+      expect(() => planGaps(bad as never)).not.toThrow()
+      expect(planGaps(bad as never).length).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe('重拟途中被中断', () => {
+  it('报中断,不端出半成品 —— 和第一次调用后中断的语义保持一致', async () => {
+    const EMPTY = '```json\n{"kind":"executable","solution":"对项目做全面审查看看","keyPoints":"","risks":"","acceptance":""}\n```'
+    const ac = new AbortController()
+    let n = 0
+    const res = await draftRootPlan({
+      root: makeRootNode(cfg(), NOW), config: cfg(), signal: ac.signal,
+      runAgent: async () => { n++; if (n === 2) ac.abort(); return EMPTY },
+    })
+    expect(res.ok).toBe(false)
   })
 })

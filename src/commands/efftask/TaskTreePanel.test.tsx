@@ -902,8 +902,8 @@ describe('拆分任务 / 执行任务 要一眼分得开', () => {
     // 两个符号都在屏幕上,而且图例也在 —— 只画符号不给图例等于让人猜。
     expect(f).toContain(KIND_GLYPH.decompose)
     expect(f).toContain(KIND_GLYPH.executable)
-    expect(f).toContain('拆分任务')
-    expect(f).toContain('执行任务')
+    expect(f).toContain('拆分')
+    expect(f).toContain('执行')
     app.unmount()
   })
 
@@ -950,8 +950,57 @@ describe('拆分任务 / 执行任务 要一眼分得开', () => {
     )
     await tick()
     const f = t.lastFrame()
-    for (const label of ['拆分任务', '执行任务', '待定']) expect(f).toContain(label)
-    expect(`分隔符和待定字形撞了: ${f.includes(`拆分任务 ${KIND_GLYPH.unknown} `)}`).toBe('分隔符和待定字形撞了: false')
+    for (const label of ['拆分', '执行', '待定']) expect(f).toContain(label)
+    // 图例内部和图例↔按键之间都不能用 '·' 分隔 —— 那正是「待定」的字形,读起来会多出一项。
+    const legend = f.split('\n').find(l => l.includes('待定')) ?? ''
+    expect(`图例里用了点号分隔: ${/待定\s*·/.test(legend)}`).toBe('图例里用了点号分隔: false')
+    app.unmount()
+  })
+
+  it('状态和耗时永远留在屏幕上 —— 哪怕标题很长、后缀是中文', async () => {
+    // 整行交给 truncate-end 的话,从右边吃掉的正好是状态和耗时。实测 80 列 + 27 字中文
+    // 标题:`[WAITING_CHILDREN]` 被截成 `[WAITING_CHIL…`,耗时整个没了。
+    // 后缀宽度要按 stringWidth 量:「待人工解冲突」是 7 个 UTF-16 单元但占 13 列。
+    const t = fakeTty()
+    t.stdout.columns = 80
+    const app = await render(
+      React.createElement(TaskTreePanel as never, {
+        nodes: [mk({
+          id: 'root', title: '这是一个非常非常长的中文任务标题用来把这一行撑爆掉',
+          status: 'WAITING_CHILDREN', kind: 'decompose', childIds: ['x'], mergeConflict: true,
+        })],
+        runId: '003', interactive: true,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    // 这个夹具的 ANSI 剥离正则会把 `[W` 当成转义序列吃掉,所以断言的是幸存的那半截。
+    // (`[WAITING_CHILDREN]` → ` AITING_CHILDREN]`,这是夹具的老毛病,不是本次改动。)
+    expect(`状态还在: ${f.includes('AITING_CHILDREN')}`).toBe('状态还在: true')
+    expect(`冲突标记还在: ${f.includes('待人工解冲突')}`).toBe('冲突标记还在: true')
+    expect(`标题被截断了: ${f.includes('…')}`).toBe('标题被截断了: true')
+    app.unmount()
+  })
+
+  it('24 行终端上整个面板不超屏 —— 高度要跟着终端行数走', async () => {
+    // 写死 20 时:边框 2 + 表头 1 + 20 + 提示 1 = 24,一点富余都没有,而 24 行是极常见
+    // 的默认。budgetedViewport 的注释自己说「溢出的那几行顶掉的正是底部的计数与按键
+    // 提示」—— 行预算算得再准,也被面板外的固定开销吃掉。
+    const t = fakeTty()
+    t.stdout.rows = 24
+    const nodes = [...Array(60)].map((_, i) => mk({ id: `n${i}`, title: `任务${i}`, status: 'READY', kind: 'executable' }))
+    const app = await render(
+      React.createElement(TaskTreePanel as never, { nodes, runId: '003', interactive: true } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const lines = t.lastFrame().split('\n').filter(l => l.trim().length > 0)
+    // 不是「不超过 24」——写死 20 时正好是 24,占满整屏、一点余量都没有,而 /et 是
+    // 渲染在 REPL 消息流里的,上面还有对话内容、下面还有输入行。要留出余量。
+    expect(`面板占了 ${lines.length} 行(终端 24,要留余量)`).toBe('面板占了 20 行(终端 24,要留余量)')
+    // 底部提示必须还在屏幕上 —— 它是被顶掉的第一个
+    expect(t.lastFrame()).toContain('Esc/q 退出')
     app.unmount()
   })
 })
