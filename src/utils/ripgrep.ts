@@ -27,6 +27,19 @@ type RipgrepConfig = {
   command: string
   args: string[]
   argv0?: string
+  /**
+   * 「哪儿都没找到」。
+   *
+   * 这个字段是三条 `{mode:'system', command:'rg'}` 里**唯一**能把它们分开的东西:
+   * 前两条是「**找到了**系统 rg」——它们故意返回命令名而不是解析出的绝对路径,防 PATH
+   * 劫持;最后一条是「哪儿都没有」,仍然用 'rg' 是为了让失败发生在一个用户认得的名字上。
+   * 三者形状一模一样。
+   *
+   * 代价实测过:启动关口那条「搜索不可用」原来是照形状判的,于是在 rg **装好了、也真的
+   * 能用**的机器上照样弹红字,而红字里还写着「子 agent 列不出文件」—— 一句彻头彻尾的
+   * 假话,出现在用户决定要不要花钱开跑的那一屏上。
+   */
+  missing?: true
 }
 
 /** `vendor/ripgrep/<arch>-<platform>/rg` under a given root. */
@@ -135,7 +148,7 @@ export function resolveRipgrepConfig(deps: {
    * 自己的版本号,不是 ripgrep 的 —— 把搜索结果换成一行版本号,比 ENOENT 更难发现。
    */
   deps.onMissing?.(RIPGREP_MISSING_MESSAGE)
-  return { mode: 'system', command: 'rg', args: [] }
+  return { mode: 'system', command: 'rg', args: [], missing: true }
 }
 
 const getRipgrepConfig = memoize((): RipgrepConfig => {
@@ -640,12 +653,15 @@ export function getRipgrepStatus(): {
   mode: 'system' | 'builtin' | 'embedded'
   path: string
   working: boolean | null // null if not yet tested
+  /** 哪儿都没找到 —— 见 RipgrepConfig.missing。 */
+  missing?: true
 } {
   const config = getRipgrepConfig()
   return {
     mode: config.mode,
     path: config.command,
     working: ripgrepStatus?.working ?? null,
+    ...(config.missing === true ? { missing: true as const } : {}),
   }
 }
 
@@ -794,8 +810,14 @@ async function codesignRipgrepIfNecessary() {
  * 就返回这个形状(故意让失败发生在一个用户认得的名字上)。这里把它翻译回「找不到」。
  */
 export function searchUnavailableReason(
-  status: { mode: string; path: string } = getRipgrepStatus(),
+  status: { mode: string; path: string; missing?: true } = getRipgrepStatus(),
 ): string | undefined {
-  if (status.mode === 'system' && status.path === 'rg') return RIPGREP_MISSING_MESSAGE
-  return undefined
+  /**
+   * 判**标记**,不判形状。
+   *
+   * 原来写的是 `mode === 'system' && path === 'rg'` —— 而「找到了系统 rg」那两条返回的
+   * 也正是这个形状(故意用命令名防 PATH 劫持)。于是 rg 装好了的机器上照样报「搜索不可用」。
+   * 用户实测:`whichSync('rg')` 返回了真实路径,搜索也真的能用,而关口上一片红字。
+   */
+  return status.missing === true ? RIPGREP_MISSING_MESSAGE : undefined
 }

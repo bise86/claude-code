@@ -26,6 +26,7 @@ describe('resolveRipgrepConfig', () => {
   it('用户点名要系统 rg,且 PATH 上有 → system', () => {
     const c = resolveRipgrepConfig({ ...base, wantsSystem: true, systemRg: () => '/usr/bin/rg' })
     // 传的是命令名而不是解析出来的绝对路径:防 PATH 劫持(当前目录里的 ./rg)。
+    // **不带 missing** —— 这一条是「找到了」,和「哪儿都没有」形状相同但语义相反。
     expect(c).toEqual({ mode: 'system', command: 'rg', args: [] })
   })
 
@@ -51,7 +52,7 @@ describe('resolveRipgrepConfig', () => {
     expect(c.command).not.toContain('$bunfs')
     // 连**查**都不该去查那条虚拟路径
     expect(seen.some(p => p.includes('$bunfs'))).toBe(false)
-    expect(c).toEqual({ mode: 'system', command: 'rg', args: [] })
+    expect(c).toEqual({ mode: 'system', command: 'rg', args: [], missing: true })
   })
 
   it('单文件产物:可执行文件旁边有 vendor/ripgrep 就用那一份', () => {
@@ -70,6 +71,7 @@ describe('resolveRipgrepConfig', () => {
     const c = resolveRipgrepConfig({
       ...base, isSingleFile: true, systemRg: () => '/usr/bin/rg', onMissing: m => { warned = m },
     })
+    // 找到了 → **不带 missing**。带上的话启动关口会在 rg 装好的机器上报「搜索不可用」。
     expect(c).toEqual({ mode: 'system', command: 'rg', args: [] })
     expect(warned).toBe('')
   })
@@ -102,6 +104,7 @@ describe('resolveRipgrepConfig', () => {
     // 也就是说从源码跑时每一次 Grep/Glob 都在 ENOENT,只是错误信息没有 $bunfs
     // 那么显眼,一直被当成别的问题。原来这里是无条件返回那条路径。
     const c = resolveRipgrepConfig({ ...base, systemRg: () => '/usr/bin/rg' })
+    // 同上:找到了就不带 missing。
     expect(c).toEqual({ mode: 'system', command: 'rg', args: [] })
   })
 
@@ -164,16 +167,43 @@ describe('搜索用不了的时候,说的话必须能照做', () => {
       .toBe('resource unavailable')
   })
 
-  it('哪儿都找不到时,启动关口要能问出来', () => {
-    // resolveRipgrepConfig 在哪儿都找不到时故意返回 {system, 'rg'} —— 让失败发生在一个
-    // 用户认得的名字上。这条把那个形状翻译回「找不到」,好在**开跑之前**告诉用户。
-    expect(searchUnavailableReason({ mode: 'system', path: 'rg' })).toBeTruthy()
+  it('判据必须用**真解析器**的输出,不能用手捏的形状', () => {
+    /**
+     * 这是这条 bug 的现场。三条返回都是 `{mode:'system', command:'rg'}`:
+     *  - 用户点名要系统 rg 且 PATH 上有 → 故意返回命令名(防 PATH 劫持)
+     *  - 别处都没有但 PATH 上有   → 同上
+     *  - 哪儿都没有               → 也是 'rg',好让失败发生在用户认得的名字上
+     *
+     * 原来的判据照形状分辨,于是**装好了 rg 的机器**上照样报「搜索不可用」,红字里还写着
+     * 「子 agent 列不出文件」。用户实测:whichSync('rg') 返回真实路径、搜索真的能用,
+     * 而关口一片红。
+     *
+     * 原来那两条用例喂的都是**手捏的对象**,所以一条都没红。这一条改喂真解析器。
+     */
+    // PATH 上有 rg —— 找到了,不许报警。
+    const found = resolveRipgrepConfig({ ...base, systemRg: () => '/usr/bin/rg' })
+    expect(found).toEqual({ mode: 'system', command: 'rg', args: [] })
+    expect(searchUnavailableReason({ mode: found.mode, path: found.command, missing: found.missing }))
+      .toBeUndefined()
+
+    // 用户点名要系统 rg 且 PATH 上有 —— 同样不许报警。
+    const wanted = resolveRipgrepConfig({ ...base, wantsSystem: true, systemRg: () => '/usr/bin/rg' })
+    expect(searchUnavailableReason({ mode: wanted.mode, path: wanted.command, missing: wanted.missing }))
+      .toBeUndefined()
+
+    // 哪儿都没有 —— 这一条才该报。
+    const none = resolveRipgrepConfig({ ...base })
+    expect(none.missing).toBe(true)
+    expect(searchUnavailableReason({ mode: none.mode, path: none.command, missing: none.missing }))
+      .toBeTruthy()
   })
 
-  it('真的找到了就不报警 —— 三种正常形态都不能误报', () => {
-    // 误报的代价是关口上多一条红字,用户会开始怀疑所有告警。
-    expect(searchUnavailableReason({ mode: 'system', path: '/usr/bin/rg' })).toBeUndefined()
-    expect(searchUnavailableReason({ mode: 'builtin', path: '/opt/vendor/ripgrep/rg' })).toBeUndefined()
-    expect(searchUnavailableReason({ mode: 'embedded', path: '/opt/claude' })).toBeUndefined()
+  it('内置的那份和官方构建都不报警', () => {
+    const builtin = resolveRipgrepConfig({ ...base, fileExists: () => true })
+    expect(searchUnavailableReason({ mode: builtin.mode, path: builtin.command, missing: builtin.missing }))
+      .toBeUndefined()
+    const embedded = resolveRipgrepConfig({ ...base, isOfficialNativeBuild: true })
+    expect(searchUnavailableReason({ mode: embedded.mode, path: embedded.command, missing: embedded.missing }))
+      .toBeUndefined()
   })
 })
