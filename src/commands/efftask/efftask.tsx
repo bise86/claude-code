@@ -15,6 +15,8 @@ import { createWorktreePool, type GitRunner, type WorktreePool } from '../../too
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
+import { planRedo, type RedoEntry } from '../../tools/efftask/redo.js'
+import { commitRedo } from '../../tools/efftask/redoCommit.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
 import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
@@ -22,6 +24,7 @@ import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResum
 import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resumeCore.js'
 import { reseatTransientNodes } from '../../tools/efftask/reseat.js'
 import { acquireRunLock, listRuns, releaseRunLock, reserveRun, type RunSummary } from '../../tools/efftask/runRegistry.js'
+import { ConfirmRedo } from './ConfirmRedo.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
@@ -565,6 +568,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [pendingHandoff, setPendingHandoff] = React.useState<PendingHandoff | null>(null)
   // 收口动作的结果。必须显示出来:合并冲突/推送失败时,用户看到的不能是一个安静的 done。
   const [handoffResult, setHandoffResult] = React.useState<HandoffResult | null>(null)
+  /** 正在被重做的节点(done 视图按 r 选中的那个)。null = 没有重做在进行。 */
+  const [redoTarget, setRedoTarget] = React.useState<TaskNode | null>(null)
+  /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
+  const [redoProblems, setRedoProblems] = React.useState<string[]>([])
   const handoffRef = React.useRef<HandoffSummary | null>(null)
   // What the gate must SAY. Resolved before the gate opens; 'none' until then.
   const [isolation, setIsolation] = React.useState<'worktree' | 'none'>('none')
@@ -959,6 +966,51 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
   }, [runDir, runId, seed, props.fs, props.runAgent, props.signal, props.controller, recordOutcome, store, setAppState])
 
+
+  /**
+   * 执行一次重做,然后**重新启动编排**。
+   *
+   * 这一整段的顺序是有讲究的,每一步都能单独毁掉这次重做:
+   *
+   *  1. 先算(planRedo 是纯函数,算错了这里就停,盘上什么都没动);
+   *  2. 再删盘上的子树 —— 不删的话 loadRun 下次 `--resume` 会把它们**原样复活**,
+   *     而内存里的父节点 childIds 已经不认它们了;
+   *  3. 再落盘剩下的节点 —— 依赖被改写过的那些必须写下去,否则重启后读回的是旧依赖;
+   *  4. 最后才 startRun。它是这个文件里 runOrchestrator 的**唯一**调用点,绕开它
+   *     只会把界面翻到运行视图然后永远不动。
+   *
+   * 隔离工作区走 pool.release():它对**脏的或者没合入的**工作区会拒绝删除并说明原因。
+   * 那正是这里想要的 —— 重做不该顺手毁掉用户还没合并的产出。删不掉的会被显示出来。
+   */
+  const applyRedo = React.useCallback((target: TaskNode, entry: RedoEntry): void => {
+    const cfg = config
+    if (!cfg || !runDir) return
+    const computed = planRedo(nodes, target.id, entry, new Date().toISOString())
+    if ('error' in computed) {
+      setRedoProblems([`重做未执行: ${computed.error}`])
+      setPhase('done')
+      return
+    }
+    setRedoTarget(null)
+    void (async () => {
+      // 落盘的三步顺序(放工作区 → 删子树 → 写节点)住在 redoCommit.ts 里,不在这里。
+      // 这个文件挂不起来,唯一守得住它的手段是「断言源码里有这行字」—— 而那种闸门
+      // 证明不了顺序和可达性:实测把删子树那段整个停用,文本还在、顺序还对,闸门照绿。
+      const { problems } = await commitRedo(
+        {
+          fs: props.fs, runDir, config: cfg, pool: poolRef.current ?? undefined,
+          before: nodes, onError: e => logError(e),
+        },
+        computed,
+      )
+      setRedoProblems(problems)
+      setNodes(computed.nodes)
+      // 重做完就跑 —— 用户按的是「重做」,不是「把树改一改」。
+      startRun(cfg, computed.nodes)
+    })()
+    // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for a mount
+  }, [config, runDir, nodes, props.fs, startRun])
+
   /**
    * 执行收口选择,然后把待收口记录从 run.md 里划掉。
    *
@@ -1315,10 +1367,30 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  if (phase === 'confirmRedo' && redoTarget) {
+    return (
+      <ConfirmRedo
+        nodes={nodes}
+        targetId={redoTarget.id}
+        now={new Date().toISOString()}
+        onConfirm={entry => applyRedo(redoTarget, entry)}
+        onCancel={() => { setRedoTarget(null); setPhase('done') }}
+      />
+    )
+  }
   if (phase === 'running') {
     return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} />
   }
-  return <DoneView nodes={nodes} runId={runId ?? ''} streams={streams.current} outcome={outcome} handoff={handoff} handoffResult={handoffResult} viewOnly={viewOnly} onExit={props.onExit} />
+  return (
+    <DoneView
+      nodes={nodes} runId={runId ?? ''} streams={streams.current} outcome={outcome}
+      handoff={handoff} handoffResult={handoffResult} viewOnly={viewOnly} onExit={props.onExit}
+      redoProblems={redoProblems}
+      // 只查看模式下不给重做:那个 run 的编排器根本没起来过,重做等于**替用户决定**
+      // 把它跑起来 —— 而他刚刚明确选了不跑。
+      onRedo={viewOnly ? undefined : node => { setRedoTarget(node); setPhase('confirmRedo') }}
+    />
+  )
 }
 
 /** A one-line status/error screen that can always be dismissed. */
@@ -1394,6 +1466,10 @@ export function DoneView(props: {
    * a failure the user's own keystroke caused, about a run that is still perfectly resumable.
    */
   viewOnly?: boolean
+  /** 上一次重做**没做成**的事。空 = 干净;非空必须显示,每条都是会自己长回来的问题。 */
+  redoProblems?: string[]
+  /** 给了才有 r 键。 */
+  onRedo?: (node: TaskNode) => void
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -1407,6 +1483,7 @@ export function DoneView(props: {
         interactive
         // "完成后保留最终输出" — the buffer outlives the run, so the done view keeps it.
         streams={props.streams}
+        onRedo={props.onRedo}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">
@@ -1426,7 +1503,10 @@ export function DoneView(props: {
         {props.handoff
           ? handoffLines(props.handoff, props.runId).map(l => <Text key={l} dimColor>{l}</Text>)
           : null}
-        <Text dimColor>q / Esc 退出 · 回车看节点详情</Text>
+        {props.redoProblems?.map(l => <Text key={l} color="warning">⚠ {l}</Text>) ?? null}
+        <Text dimColor>
+          q / Esc 退出 · 回车看节点详情{props.onRedo ? ' · r 重做选中的任务' : ''}
+        </Text>
       </Box>
     </Box>
   )

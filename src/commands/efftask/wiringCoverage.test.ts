@@ -435,6 +435,35 @@ describe('改回去要变红的四处', () => {
       .toBe('draftRootPlan 拿到了 cwd: true')
   })
 
+  it('重做关口挂在渲染树上 —— 否则按 r 之后什么都不会发生', () => {
+    // 这一跳没有运行时接缝:setPhase('confirmRedo') 之后能不能渲染出关口,取决于
+    // EffTaskRunner 的 JSX 里有没有这个分支,而这个组件挂不起来。剪断它的形状是
+    // 「按 r → 界面纹丝不动」,而全套测试照绿。
+    expect(SRC).toContain("phase === 'confirmRedo' && redoTarget")
+    expect(element('ConfirmRedo')).toContain('onConfirm={entry => applyRedo(redoTarget, entry)}')
+  })
+
+  it('重做真的会重新启动编排 —— 不然它只是改了改树', () => {
+    // startRun 是这个文件里 runOrchestrator 的**唯一**调用点。applyRedo 里少了这一行,
+    // 用户按完确认会看到树变了、节点退回排队中,然后永远停在那儿:
+    // 「run 004 ✓0 ◐0 ○0 ✗0」不动、没有报错、也不退出 —— 这个文件已经栽过一次的形状。
+    const body = SRC.slice(SRC.indexOf('const applyRedo = React.useCallback'))
+    expect(body.slice(0, 3000)).toContain('startRun(cfg, computed.nodes)')
+  })
+
+  it('重做的落盘走 commitRedo —— 顺序由那个模块的真测试守', () => {
+    // 顺序本身**不在这里**测:源码文本闸门证明不了可达性(实测把删子树那段停用,
+    // 文本还在、顺序还对,闸门照绿)。这里只守这一跳没被剪断,顺序归 redoCommit.test.ts。
+    const body = SRC.slice(SRC.indexOf('const applyRedo = React.useCallback'))
+    expect(body.slice(0, 2000)).toContain('await commitRedo(')
+  })
+
+  it('只查看模式不给重做入口', () => {
+    // 那个 run 的编排器根本没起来过。给了重做就是**替用户决定**把它跑起来,
+    // 而他刚刚明确选了不跑。
+    expect(SRC).toContain('onRedo={viewOnly ? undefined :')
+  })
+
   it('树外那几条流是钉住的 —— 否则它们是第一批被淘汰的', () => {
     // 它们挂在 root 上,而且是 root 上最老的三条;淘汰按插入顺序压最旧的已收口流。
     // 把它们挂到 root 的理由正是「事后最想回看」。

@@ -194,6 +194,39 @@ export async function writeNode(fs: FsLike, runDir: string, node: TaskNode): Pro
   await fs.writeFile(nodeMdPath(runDir, node.id), serializeNode(node))
 }
 
+/**
+ * 把一批节点从盘上抹掉 —— 父任务重做时删子树用。
+ *
+ * **不删干净等于没删。** loadRun 是照着目录树走的:留在盘上的 node.md 会在下一次
+ * `--resume` 时原样复活,而内存里的树已经不认它了 —— 于是恢复出来一批父节点 childIds
+ * 里根本没有的幽灵兄弟,validateLoadedNodes 那一关会因为 parentId 指向的节点还在而放行,
+ * 然后 childrenAllAccepted 永远等不到它们。
+ *
+ * 顺序是**先深后浅**:id 就是相对路径(childId = `${parentId}/NN-slug`),所以按 '/'
+ * 的个数倒序排一遍,子目录一定在父目录之前被清空。rmdir 是非递归的,顺序错了它就失败。
+ *
+ * 失败**返回而不是吞掉**。一个删不掉的 node.md 是会自己长回来的东西,用户必须看见。
+ */
+export async function removeNodeDirs(
+  fs: FsLike, runDir: string, ids: readonly string[],
+): Promise<{ failed: { id: string; message: string }[] }> {
+  const failed: { id: string; message: string }[] = []
+  const deepestFirst = [...ids].sort((x, y) => y.split('/').length - x.split('/').length)
+  for (const id of deepestFirst) {
+    const dir = `${runDir}/${id}`
+    try {
+      // node.md 可能本来就不在(节点还没落过盘),那不算失败 —— 目标是「盘上没有它」。
+      if (await fs.exists(nodeMdPath(runDir, id))) await fs.unlink(nodeMdPath(runDir, id))
+      // 目录留着是无害的(loadRun 只认 node.md),但留下一地空目录会让 run 目录难读。
+      // 删不掉就算了 —— 里面可能还有别的东西,那更不该动。
+      try { await fs.rmdir(dir) } catch { /* 非空或已不在,都无所谓 */ }
+    } catch (e) {
+      failed.push({ id, message: e instanceof Error ? e.message : String(e) })
+    }
+  }
+  return { failed }
+}
+
 export async function readNode(fs: FsLike, runDir: string, nodeId: string): Promise<TaskNode> {
   return parseNodeFile(await fs.readFile(nodeMdPath(runDir, nodeId)))
 }

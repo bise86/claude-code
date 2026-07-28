@@ -163,6 +163,13 @@ export function TaskTreePanel(props: {
   maxRows?: number
   onExitKey?: () => void
   /**
+   * 重做入口。给了才有 `r` 键 —— 运行中的树不给,因为编排器正握着这些节点。
+   *
+   * 传的是节点本身而不是 id:调用方要立刻拿它的标题去渲染关口标题,而它手上那份
+   * nodes 可能比这次按键晚一拍(树是一直在长的)。
+   */
+  onRedo?: (node: TaskNode) => void
+  /**
    * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
    * 活存储而不是 React state:事件流对每个在飞的节点每条消息都要触发一次,镜像进 state
@@ -214,11 +221,17 @@ export function TaskTreePanel(props: {
     // Detail view owns Esc/q/Enter while it is open; only after it closes do those keys mean
     // "leave the panel" again.
     if (detail) {
+      // 详情页是判断「这个节点到底哪儿错了」的地方 —— 看完就想重做,最不该逼用户先退回
+      // 树上再按一次 r。
+      if (k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
       if (key.return || key.escape || k === 'q') setDetailId(null)
       return
     }
     if (key.escape || k === 'q') { props.onExitKey?.(); return }
     if (rows.length === 0) return
+    // 重做。放在方向键**之前**,因为它不依赖 rows 之外的任何东西,而且放后面会被
+    // 下面那些 `return` 挡掉一半路径。
+    if (k === 'r' && props.onRedo && current) { props.onRedo(current); return }
     if (key.upArrow || k === 'k') { setCursor(c => Math.max(0, Math.min(c, rows.length - 1) - 1)); return }
     if (key.downArrow || k === 'j') { setCursor(c => Math.min(rows.length - 1, Math.min(c, rows.length - 1) + 1)); return }
     if (key.return) { if (current) setDetailId(current.id); return }
@@ -343,7 +356,7 @@ export function TaskTreePanel(props: {
         // 分隔符不用 '·':「待定」那个字形本身就是 '·',读起来会变成三项。
         <Text dimColor wrap="truncate-end">
           {KIND_GLYPH.decompose}拆分 {KIND_GLYPH.executable}执行 {KIND_GLYPH.unknown}待定{'    '}
-          ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · 回车看详情 · Esc/q 退出
+          ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · 回车看详情{props.onRedo ? ' · r 重做' : ''} · Esc/q 退出
         </Text>
       ) : null}
     </Box>

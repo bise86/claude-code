@@ -1,0 +1,235 @@
+/**
+ * 重做入口的**真组件**验证。
+ *
+ * 这个仓库在这里割断过三次线:函数写对了、单测全绿、生产上零调用点。所以这一档不 import
+ * 任何内部函数,只做用户做的事 —— 把真组件挂起来,按真键,看真帧。
+ *
+ * 具体守的是:
+ *  - DoneView 上按 `r` 真的会带着**光标所在那个节点**回调(不是根、不是第一个);
+ *  - 不给 onRedo 时 `r` 是死键,提示行里也不许出现「r 重做」;
+ *  - 详情页里按 `r` 同样能进,不用先退回树上;
+ *  - 重做关口第二屏在要确认之前,把删除数量/依赖改写/警告**真的印在屏幕上**。
+ */
+import { describe, expect, it } from 'bun:test'
+import * as React from 'react'
+import { EventEmitter } from 'node:events'
+
+import { render } from '../../ink.js'
+import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
+import { ConfirmRedo } from './ConfirmRedo.js'
+import { DoneView } from './efftask.js'
+
+const NOW = new Date().toISOString()
+const tick = (): Promise<void> => new Promise(r => setTimeout(r, 15))
+
+function fakeTty() {
+  let pending: string | null = null
+  const stdin = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    setRawMode() {}, resume() {}, pause() {}, setEncoding() {}, unref() {}, ref() {},
+    read: () => { const v = pending; pending = null; return v },
+    press(seq: string) { pending = seq; stdin.emit('readable') },
+  })
+  let frame = ''
+  const stdout = Object.assign(new EventEmitter(), {
+    isTTY: true, columns: 120, rows: 40,
+    write: (s: string) => { frame += s; return true },
+  })
+  // 注意这条 strip 正则会把 `[方案]` 这类方括号内容也吃掉一部分,所以断言尽量挑中文短语。
+  const plain = (): string => frame.replace(/\[[0-9;>?]*[a-zA-Z]/g, ' ').replace(//g, '')
+  return { stdin, stdout, lastFrame: plain }
+}
+
+const mk = (id: string, over: Partial<TaskNode> = {}): TaskNode => ({
+  ...createNode({
+    id, title: `任务${id}`, parentId: null, deps: [], depth: 0,
+    phaseRoles: emptyPhaseRoles(), now: NOW,
+  }),
+  kind: 'executable',
+  ...over,
+})
+
+/** root ─┬─ 甲(已验收) └─ 乙(阻断) */
+const TREE = (): TaskNode[] => [
+  mk('root', { title: '根任务', kind: 'decompose', childIds: ['root/00-a', 'root/01-b'], status: 'WAITING_CHILDREN' }),
+  mk('root/00-a', { title: '甲', parentId: 'root', depth: 1, status: 'ACCEPTED' }),
+  mk('root/01-b', { title: '乙', parentId: 'root', depth: 1, status: 'BLOCKED', blockedReason: '连续返工超限' }),
+]
+
+async function mount(el: React.ReactElement) {
+  const t = fakeTty()
+  const app = await render(el, {
+    stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false,
+  })
+  await tick()
+  return { t, app }
+}
+
+describe('DoneView 的重做入口', () => {
+  it('按 r 带着**光标所在**的节点回调,而不是根节点', async () => {
+    const seen: TaskNode[] = []
+    const { t, app } = await mount(
+      <DoneView
+        nodes={TREE()} runId="003" outcome={{ status: 'blocked' }} handoff={null}
+        onExit={() => {}} onRedo={n => seen.push(n)}
+      />,
+    )
+    t.stdin.press('[B') // ↓ 到「甲」
+    await tick()
+    t.stdin.press('[B') // ↓ 到「乙」
+    await tick()
+    t.stdin.press('r')
+    await tick()
+    app.unmount()
+    // 回调固定传根节点的话,用户在树上选了半天的那一下就白费了 —— 而屏幕上光标明明在「乙」。
+    expect(seen.map(n => n.id)).toEqual(['root/01-b'])
+  })
+
+  it('详情页里按 r 也能进,不用先退回树上', async () => {
+    const seen: TaskNode[] = []
+    const { t, app } = await mount(
+      <DoneView
+        nodes={TREE()} runId="003" outcome={{ status: 'blocked' }} handoff={null}
+        onExit={() => {}} onRedo={n => seen.push(n)}
+      />,
+    )
+    t.stdin.press('[B')
+    await tick()
+    t.stdin.press('\r') // 打开详情
+    await tick()
+    t.stdin.press('r')
+    await tick()
+    app.unmount()
+    // 详情页正是判断「这个节点哪儿错了」的地方,看完就想重做。
+    expect(seen.map(n => n.id)).toEqual(['root/00-a'])
+  })
+
+  it('没给 onRedo 时 r 是死键,提示行里也不许写着有这个键', async () => {
+    let exits = 0
+    const { t, app } = await mount(
+      <DoneView
+        nodes={TREE()} runId="003" outcome={{ status: 'blocked' }} handoff={null}
+        onExit={() => { exits++ }}
+      />,
+    )
+    t.stdin.press('r')
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 提示里写了一个不存在的键,比没有这个键更糟。
+    expect(f).not.toContain('r 重做')
+    expect(exits).toBe(0)
+  })
+
+  it('提示行在给了 onRedo 时才出现 r 重做', async () => {
+    const { t, app } = await mount(
+      <DoneView
+        nodes={TREE()} runId="003" outcome={{ status: 'blocked' }} handoff={null}
+        onExit={() => {}} onRedo={() => {}}
+      />,
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 断言 DoneView **自己那句**,不是光秃秃的「r 重做」—— 面板底部的图例行里也有这四个字,
+    // 所以宽断言会被它满足,把 done 屏这条提示删掉照样绿(变异验证过)。
+    expect(f).toContain('r 重做选中的任务')
+  })
+
+  it('上一次重做没做成的事显示在 done 屏上', async () => {
+    const { t, app } = await mount(
+      <DoneView
+        nodes={TREE()} runId="003" outcome={{ status: 'blocked' }} handoff={null}
+        onExit={() => {}} redoProblems={['甲 的记录没删掉(下次恢复会复活它): EACCES']}
+      />,
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 删不掉的 node.md 会在下一次 --resume 时自己长回来。只写日志等于没说。
+    expect(f).toContain('下次恢复会复活它')
+  })
+})
+
+describe('重做关口', () => {
+  it('第一屏列出三条,不可用的写明原因而不是消失', async () => {
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('从「方案」重做')
+    expect(f).toContain('从「执行」重做')
+    expect(f).toContain('从「集成验收」重做')
+    // 菜单随节点类型忽隐忽现的话,用户记不住第几项是哪一项,也看不见为什么这里不能这么做。
+    expect(f).toContain('拆分任务')
+  })
+
+  it('确认前先把删除数量、依赖改写和警告印出来', async () => {
+    const nodes = TREE()
+    nodes[2]!.deps = ['root/00-a'] // 乙 依赖 甲
+    // 甲 是已验收且有隔离工作区的 —— 这两点合起来才会触发「不会回滚」那句警告。
+    nodes[1]!.worktree = { branch: 'br-a', path: '/wt/a' }
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={nodes} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
+    )
+    await tick()
+    t.stdin.press('\r') // 选中第一条「从方案重做」
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('删除 2 个子任务')
+    expect(f).toContain('不会回滚')
+    expect(f).toContain('释放 1 个隔离工作区')
+  })
+
+  it('第二屏的 Esc 退回第一屏,不是一路退出去', async () => {
+    let cancels = 0
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => { cancels++ }} />,
+    )
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    t.stdin.press('') // Esc
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 看完后果改主意选另一个环节,是这一步最常见的动作。
+    expect(cancels).toBe(0)
+    expect(f).toContain('从哪个环节开始重来')
+  })
+
+  it('回车确认后把选中的环节交出去', async () => {
+    const got: string[] = []
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={e => got.push(e)} onCancel={() => {}} />,
+    )
+    await tick()
+    t.stdin.press('[B') // ↓ 到「执行」(root 上不可用)
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    // 不可用的条目按不动 —— 按下去什么都不该发生,更不该确认成别的环节。
+    expect(got).toEqual([])
+    t.stdin.press('[B') // ↓ 到「集成验收」
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    t.stdin.press('\r') // 第二屏确认
+    await tick()
+    app.unmount()
+    expect(got).toEqual(['integrate'])
+  })
+
+  it('目标节点不在树里时给一屏错误,而不是白屏或崩溃', async () => {
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={TREE()} targetId="不存在" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('节点不存在')
+  })
+})

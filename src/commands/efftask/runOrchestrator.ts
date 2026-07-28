@@ -23,7 +23,10 @@ export type Phase =
   // drafted, then shown for confirmation/modification BEFORE autonomous execution begins.
   // 'handoff' 是收口关口(spec §8):run 早已跑完、终端也早还给用户了,
   // `/et --resume` 进来发现 run.md 里还有 pendingHandoff,就先渲染它。
+  // 'confirmRedo' 是重做关口:从 done 视图按 r 进来,确认后**重新启动一次编排**
+  // (startRun 带着改过的树当 seed)。不是一个新的运行阶段,是 done 的一个岔路。
   | 'confirm' | 'drafting' | 'confirmRoot' | 'confirmResume' | 'handoff' | 'running' | 'done' | 'fatal'
+  | 'confirmRedo'
 
 /**
  * Drive one run to completion and report it.
