@@ -17,7 +17,7 @@
  */
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { nonExecuteToolPool, verifyToolPool } from './efftask.js'
+import { nonExecuteToolPool, subAgentToolPool, verifyToolPool } from './efftask.js'
 
 const SRC = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
 /** 关口组件自己的源码 —— 编辑器接线在这里,不在 efftask.tsx。 */
@@ -293,8 +293,10 @@ describe('工具档位:非执行环节要拿得到 MCP,但拿不到写工具', (
   it('生产接线用的就是这个函数', () => {
     expect(SRC).toContain('const readOnlyTools: Tools = nonExecuteToolPool(context.options.tools)')
     expect(SRC).toContain('verifyTools: verifyToolPool(context.options.tools)')
-    // 执行档必须还是全量 —— 少给了执行者就改不了代码。
-    expect(SRC).toContain('availableTools: context.options.tools, // execute phase only')
+    // 执行档仍然拿全部**写工具** —— 少给了执行者就改不了代码;但要过一遍
+    // subAgentToolPool。它原来是唯一不过滤的地方,于是也是唯一还能拿到 Skill 的地方,
+    // 而那恰好是最费钱的环节(用户实测:Skill(Skill) → Unknown skill: bash)。
+    expect(SRC).toContain('availableTools: subAgentToolPool(context.options.tools), // execute phase only')
   })
 })
 
@@ -498,5 +500,29 @@ describe('改回去要变红的四处', () => {
     // 它们挂在 root 上,而且是 root 上最老的三条;淘汰按插入顺序压最旧的已收口流。
     // 把它们挂到 root 的理由正是「事后最想回看」。
     expect((SRC.match(/pinned: true/g) ?? []).length).toBe(3)
+  })
+})
+
+describe('靠主循环上下文的工具不能进子 agent', () => {
+  it('三个池子都滤掉 Skill', () => {
+    // 用户实测:Skill(Skill) ⎿ Unknown skill: bash。
+    // 技能清单是主循环消息管线的 attachment,efftask 的子 agent 消息是自己拼的 ——
+    // 工具在、清单不在,模型只能猜,每猜一次白烧一轮调用。
+    const all = [{ name: 'Skill' }, { name: 'Read' }, { name: 'Bash' }]
+    expect(nonExecuteToolPool(all).map(t => t.name)).toEqual(['Read'])
+    expect(verifyToolPool(all).map(t => t.name)).toEqual(['Read', 'Bash'])
+    expect(subAgentToolPool(all).map(t => t.name)).toEqual(['Read', 'Bash'])
+  })
+
+  it('别的工具一个都不许多滤 —— MCP 的名字是用户装什么就叫什么', () => {
+    const all = [{ name: 'mcp__x__y' }, { name: 'Glob' }, { name: 'TodoWrite' }]
+    expect(subAgentToolPool(all)).toHaveLength(3)
+  })
+
+  it('三个池子都从同一个底子长出来 —— 少接一个就漏一个', () => {
+    // 黑名单意味着以后新增的这类工具会重复这个坑;共同底子是唯一不会漏的形状。
+    const src = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
+    expect(src).toContain('return subAgentToolPool(all).filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name))')
+    expect(src).toMatch(/verifyToolPool[\s\S]{0,120}subAgentToolPool\(all\)/)
   })
 })

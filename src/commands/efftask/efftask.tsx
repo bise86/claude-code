@@ -11,6 +11,7 @@ import { collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/e
 import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { searchUnavailableReason } from '../../utils/ripgrep.js'
+import { SKILL_TOOL_NAME } from '../../tools/SkillTool/constants.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
@@ -89,6 +90,34 @@ export const READ_ONLY_TOOL_NAMES = new Set(['Read', 'Glob', 'Grep'])
  * 诚实的边界:**挡不住会写的 MCP 工具** —— 没有可靠办法从名字判断 `mcp__x__y` 是否
  * 只读。放开 MCP 就接受了这一点,所以关口要说出来,让用户自己决定给评审席位配什么。
  */
+/**
+ * 靠**主循环注入的上下文**才能用的工具 —— 子 agent 一律拿不到。
+ *
+ * 现在只有 Skill 一个,而它是用户报出来的:
+ *
+ *   Skill(Skill)  ⎿ <tool_use_error>Unknown skill: bash</tool_use_error>
+ *
+ * 根因是这个池子是**黑名单**(「会话里的一切,减去会改盘的」),而 SkillTool 在
+ * tools.ts 里是无条件注册的,于是它进了子 agent 的工具表 —— 但技能清单是主循环消息
+ * 管线里的 attachment(attachments.ts 的 formatCommandsWithinBudget),而 efftask 的
+ * 子 agent 消息是自己拼的,那份清单永远到不了。
+ *
+ * 于是模型看到一个工具,它的说明写着「只用清单里的名字,不要猜」,而清单不存在。
+ * 它就猜了一个 'bash'。每猜一次白烧一轮调用,而且这类无效调用会被验收/评审读成
+ * 「这个节点在瞎折腾」。
+ *
+ * 黑名单意味着**以后新增的这类工具会重复这个坑**。加在这里的判据是:
+ * 「它需要的东西是主循环塞进消息里的吗?」如果是,子 agent 用不了它。
+ */
+export const CONTEXT_DEPENDENT_TOOL_NAMES = new Set([SKILL_TOOL_NAME])
+
+/**
+ * 所有子 agent 池子的共同底子。三个池子都从这里长出来,少一个就漏一个。
+ */
+export function subAgentToolPool<T extends { name: string }>(all: T[]): T[] {
+  return all.filter(t => !CONTEXT_DEPENDENT_TOOL_NAMES.has(t.name))
+}
+
 export const WRITE_CAPABLE_TOOL_NAMES = new Set([
   FILE_EDIT_TOOL_NAME, FILE_WRITE_TOOL_NAME, NOTEBOOK_EDIT_TOOL_NAME, BASH_TOOL_NAME,
 ])
@@ -99,7 +128,7 @@ export const WRITE_CAPABLE_TOOL_NAMES = new Set([
  * 提成可导出的纯函数,和 verifyToolPool 同一个理由 —— 接线要能被单独钉住。
  */
 export function nonExecuteToolPool<T extends { name: string }>(all: T[]): T[] {
-  return all.filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name))
+  return subAgentToolPool(all).filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name))
 }
 /**
  * 测试验证档在只读之上多这些 —— 它得能真的跑测试。
@@ -118,7 +147,8 @@ export const RUN_COMMAND_TOOL_NAMES = new Set([BASH_TOOL_NAME, TASK_OUTPUT_TOOL_
  * 只读工具、跑不了任何命令,也就是这个环节的全部存在理由没了。
  */
 export function verifyToolPool<T extends { name: string }>(all: T[]): T[] {
-  return all.filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name) || RUN_COMMAND_TOOL_NAMES.has(t.name))
+  return subAgentToolPool(all)
+    .filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name) || RUN_COMMAND_TOOL_NAMES.has(t.name))
 }
 
 const CANCELLED: StartupDecision = { parallelism: 0, approved: false }
@@ -240,7 +270,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     // 画在面板**之上**,两个组件同时挂着 —— 而 useInput 是广播的:用户按回车批准工具,
     // 同一下回车也会打开光标所在节点的详情页。
     onHumanWait: w => { humanWaitOut.current?.(w) },
-    availableTools: context.options.tools, // execute phase only
+    // subAgentToolPool 而不是裸的 context.options.tools:执行环节原来一个都不滤,
+    // 所以它是唯一还能拿到 Skill 的地方 —— 而它恰好是最费钱的那个环节。
+    availableTools: subAgentToolPool(context.options.tools), // execute phase only
     readOnlyTools, // plan / review / accept / integrate / observer
     // 测试验证要真的把测试跑起来,所以在只读之上加执行命令的能力。
     verifyTools: verifyToolPool(context.options.tools),
