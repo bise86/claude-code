@@ -89,6 +89,46 @@ describe('暂停', () => {
   })
 })
 
+describe('暂停之后还能中止', () => {
+  // 评审实测出来的 P0:用户按 p 暂停、想了想不跑了、按 Esc —— abort 信号原来不在暂停
+  // 那个 race 里,而 `if (signal.aborted)` 又排在暂停分支后面。在飞的调用排空之后
+  // waits 只剩 waitForResume(),run() **永远不返回**;而 setPhase('done') 只挂在
+  // runOrchestrator 的收尾上 —— 界面永久停在运行视图,Esc 毫无反应。
+  const hangGuard = async (setup: (c: ReturnType<typeof createRunControl>, ac: AbortController) => void | Promise<void>) => {
+    const control = createRunControl()
+    const ac = new AbortController()
+    const runAgent: RunAgentFn = async req => allPass(req)
+    const orch = new EffTaskOrchestrator(
+      cfg(), { runAgent, control, persist: async () => {}, now: () => NOW, onUpdate: () => {} },
+      ac.signal,
+    )
+    const run = orch.run()
+    await setup(control, ac)
+    return Promise.race([
+      run.then(() => 'RETURNED'),
+      new Promise(r => setTimeout(() => r('HUNG'), 800)),
+    ])
+  }
+
+  it('先暂停、再中止', async () => {
+    expect(await hangGuard(async (c, ac) => {
+      c.pause()
+      await new Promise(r => setTimeout(r, 40))
+      ac.abort()
+    })).toBe('RETURNED')
+  })
+
+  it('跑一会儿再暂停、等在飞的排空之后才中止', async () => {
+    // 这一条走的是**另一条**路:abort 到达时循环已经在暂停分支的 await 里了,
+    // 靠的是 race 里那一项而不是前面的早退。
+    expect(await hangGuard(async (c, ac) => {
+      await new Promise(r => setTimeout(r, 60))
+      c.pause()
+      await new Promise(r => setTimeout(r, 120))
+      ac.abort()
+    })).toBe('RETURNED')
+  })
+})
 describe('取消单个节点', () => {
   /**
    * 这一层注入的是**裸 RunAgentFn**,绕过了真适配器 —— 而登记 controller、判定
@@ -172,6 +212,112 @@ describe('取消单个节点', () => {
     expect(jia.blockedReason).toContain('r 重做')
   })
 })
+describe('取消在**每一个**环节都是取消', () => {
+  /**
+   * 评审出来的 P0:res.cancelled 原来只在分析和执行两处被检查,而 runPhase 有六个调用点,
+   * 圆桌那条路根本不经过 runPhase(roundtable 把任何 rejection 一律合成 infra)。
+   *
+   * 实测后果:在评审 / 验收 / 集成验收里按 x,拿到的是
+   *   「评审角色连续 3 次调用失败,未能取得任何裁决 · 先确认角色模型/网络可用 …」
+   *   capCategory='infra'  interrupted=false
+   * 三条全错 —— 劝他去查网络(他刚按了取消)、白烧三桌、而且 --resume 救不回来。
+   */
+  const cancelAt = (phase: string, control: ReturnType<typeof createRunControl>): RunAgentFn => {
+    let planned = false
+    return async req => {
+      if (req.phase === phase) {
+        control.cancelNode(req.node.id)
+        throw new NodeCancelledError(req.node.id)
+      }
+      if (req.phase === 'plan' && !planned) {
+        planned = true
+        return '\u0060\u0060\u0060plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n\u0060\u0060\u0060'
+      }
+      return allPass(req)
+    }
+  }
+
+  const roles = { ...emptyPhaseRoles(), review: [{ roleName: '评审甲' }], accept: [{ roleName: '验收甲' }] }
+
+  for (const phase of ['review', 'accept'] as const) {
+    it(`在 ${phase} 环节取消,拿到的是「已被用户取消」而不是「请检查网络」`, async () => {
+      const control = createRunControl()
+      const orch = new EffTaskOrchestrator(
+        cfg({ phaseRoles: roles as never }),
+        { runAgent: cancelAt(phase, control), control, persist: async () => {}, now: () => NOW, onUpdate: () => {} },
+        new AbortController().signal,
+      )
+      await orch.run()
+      const root = orch.nodes().find(n => n.id === 'root')!
+      expect(root.blockedReason).toContain('已被用户取消')
+      // 这三条是原来错的那三条,逐条钉住。
+      expect(root.blockedReason).not.toContain('网络')
+      expect(root.capCategory).toBeUndefined()
+      expect(root.interrupted).toBe(true)
+    })
+  }
+
+  it('取消之后圆桌**立刻停**,不再替他试满 maxIterations 桌', async () => {
+    // 用户按了一次 x,系统替他又派了两遍(角色多的话 ×角色数)。
+    const control = createRunControl()
+    let reviewCalls = 0
+    let planned = false
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'review') {
+        reviewCalls++
+        control.cancelNode(req.node.id)
+        throw new NodeCancelledError(req.node.id)
+      }
+      if (req.phase === 'plan' && !planned) {
+        planned = true
+        return '\u0060\u0060\u0060plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n\u0060\u0060\u0060'
+      }
+      return allPass(req)
+    }
+    const orch = new EffTaskOrchestrator(
+      cfg({ phaseRoles: roles as never }),
+      { runAgent, control, persist: async () => {}, now: () => NOW, onUpdate: () => {} },
+      new AbortController().signal,
+    )
+    await orch.run()
+    expect(`取消后评审被派发的次数: ${reviewCalls}`).toBe('取消后评审被派发的次数: 1')
+  })
+})
+
+describe('追加指令送得到裁判席', () => {
+  it('评审 / 验收 的提示词里也有那句话,并且说明它优先', async () => {
+    // 少了这一段:用户补「别动 src/legacy」→ 执行者照做 → 验收员拿着**补话之前**定下的
+    // 验收点对照产出 → 判不通过 → 返工 → 撞满上限阻断。
+    // **用户自己那句纠正成了失败的直接原因**,而屏幕上没有东西让他把两件事联系起来。
+    const control = createRunControl()
+    control.addDirective('别动 src/legacy')
+    const byPhase = new Map<string, string[]>()
+    const runAgent: RunAgentFn = async req => {
+      byPhase.set(req.phase, [...(byPhase.get(req.phase) ?? []), req.prompt])
+      return allPass(req)
+    }
+    const orch = new EffTaskOrchestrator(
+      cfg({ phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: '评审甲' }], accept: [{ roleName: '验收甲' }] } as never }),
+      { runAgent, control, persist: async () => {}, now: () => NOW, onUpdate: () => {} },
+      new AbortController().signal,
+    )
+    await orch.run()
+    for (const phase of ['plan', 'execute', 'review', 'accept']) {
+      const ps = byPhase.get(phase) ?? []
+      expect(`${phase} 有提示词`).toBe(`${phase} 有提示词`)
+      expect(ps.length).toBeGreaterThan(0)
+      expect(`${phase} 里有那句指令: ${ps.every(p => p.includes('别动 src/legacy'))}`)
+        .toBe(`${phase} 里有那句指令: true`)
+    }
+    // 裁判席还要多一句「以它为准」—— 否则他们会因为执行者听了用户的话而判它没做完。
+    for (const phase of ['review', 'accept']) {
+      expect((byPhase.get(phase) ?? []).every(p => p.includes('优先于原方案的枝节'))).toBe(true)
+    }
+    // 执行侧不需要那句(它本来就照着做)。
+    expect((byPhase.get('execute') ?? []).some(p => p.includes('都不算未完成'))).toBe(false)
+  })
+})
+
 describe('追加指令', () => {
   it('运行中补的话,出现在**之后**派发的提示词里', async () => {
     const control = createRunControl()

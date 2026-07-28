@@ -257,12 +257,15 @@ export class EffTaskOrchestrator {
        * 所以这里同时等「恢复」和「任一在飞的完成」——后者让 inFlight 表保持收敛,
        * 不然暂停期间一个已完成的节点会一直挂在表里。
        */
-      if (this.deps.control?.isPaused() === true) {
-        const waits: Promise<unknown>[] = [this.deps.control.waitForResume()]
-        if (inFlight.size > 0) waits.push(Promise.race([...inFlight.values()]).catch(() => {}))
-        await Promise.race(waits)
-        continue
-      }
+      /**
+       * **中止排在暂停之前。**
+       *
+       * 反过来的话:用户按 p 暂停、想了想不跑了、按 Esc —— abort 信号不在下面那个 race 里,
+       * 而 `if (this.signal.aborted)` 又排在暂停分支后面,于是在飞的调用排空之后 waits
+       * 就只剩 waitForResume() 一项,run() **永远不返回**。而 setPhase('done') 只挂在
+       * runOrchestrator 的收尾上 —— 界面就永久停在运行视图,Esc 毫无反应,屏幕上也不会
+       * 有任何东西告诉他要先按 p 恢复。实测过(暂停后 abort,700ms 预算内不返回)。
+       */
       if (this.signal.aborted) {
         // Settle FIRST. propagateBlocked sweeps and returns; a step still running would
         // commit AFTER the sweep, leaving a non-terminal node in a tree we already declared
@@ -271,6 +274,21 @@ export class EffTaskOrchestrator {
         if (this.byId.get('root')!.status === 'ACCEPTED') return { status: 'completed' }
         await this.propagateBlocked(true)
         return { status: 'blocked', reason: '已中断' }
+      }
+
+      /**
+       * 暂停:不挑新批次,也不把「没有在飞的」当成走不动。
+       *
+       * 在飞的调用不打断 —— 暂停的语义是「先别派新的」。所以这里同时等三件事:
+       * 恢复、任一在飞的完成、以及**中止**。少了最后一项就是上面那条注释里的永久挂死;
+       * 这里带上它是第二道保险(上面那个早退是第一道),因为 abort 可能正好发生在
+       * 我们已经进入 await 之后。
+       */
+      if (this.deps.control?.isPaused() === true) {
+        const waits: Promise<unknown>[] = [this.deps.control.waitForResume(), abortSignalPromise(this.signal)]
+        if (inFlight.size > 0) waits.push(Promise.race([...inFlight.values()]).catch(() => {}))
+        await Promise.race(waits)
+        continue
       }
 
       const budget = Math.max(1, this.cfg.parallelism) - running()
@@ -391,4 +409,20 @@ export class EffTaskOrchestrator {
     }
     this.safeUpdate()
   }
+}
+
+/**
+ * 一个在 signal 中止时兑现的 promise。
+ *
+ * 暂停分支要同时等「恢复」和「中止」。没有它的话,一个在 await 之后才到达的 abort
+ * 会等到下一次恢复才被看见 —— 而用户可能永远不会再按 p。
+ *
+ * 监听器用 `once: true`:暂停/恢复可以来回很多次,每次都挂一个不摘的监听器会在
+ * 一次长跑里堆起来(AbortSignal 上超过 10 个监听器 node 还会打警告)。
+ */
+function abortSignalPromise(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  return new Promise<void>(res => {
+    signal.addEventListener('abort', () => res(), { once: true })
+  })
 }

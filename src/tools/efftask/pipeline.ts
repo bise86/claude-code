@@ -142,6 +142,20 @@ const ACTIVE_STATUSES = new Set([
 
 async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineCtx): Promise<boolean> {
   /**
+   * **被取消的节点不再往前走。**
+   *
+   * 收在 commit 上,因为每一次状态推进都必经它 —— 而各个环节的**外层**循环(评审重拟、
+   * 验收返工)不看单次调用的失败原因,只看「没通过就再来一轮」。实测:在评审里按 x,
+   * 圆桌内部虽然立刻停了,外层还是又重拟并重评了两轮 —— 用户按一次取消,系统替他
+   * 派了三次。
+   *
+   * 不拦 BLOCKED:blockWithReason 自己要走这条路把节点落定,拦了就永远落不了盘。
+   */
+  if (status !== 'BLOCKED' && ctx.control?.wasCancelled(node.id) === true) {
+    await blockWithReason(node, '已被用户取消', ctx)
+    return false
+  }
+  /**
    * 各阶段耗时 (spec §10.2 lists it among what the node detail view must show).
    *
    * Accumulated on the way OUT of a status, measured from `updatedAt` — which every commit
@@ -307,6 +321,29 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx,
   // The 处理方式 and the retry command travel WITH the reason, exactly as the merge-conflict
   // path does. The escalation limiter drops cards past its cap while telling the user to read
   // run.md — so run.md has to actually contain what the card would have said.
+  /**
+   * **取消统一在这里认。**
+   *
+   * 原来只有分析和执行两处调用点检查 res.cancelled,而 runPhase 有六个调用点、圆桌那条路
+   * 根本不经过 runPhase(roundtable 把任何 rejection 一律合成 infra)。实测后果:在评审 /
+   * 验收 / 集成验收里按 x,拿到的是
+   *
+   *     「评审角色连续 3 次调用失败,未能取得任何裁决 · 先确认角色模型/网络可用 …」
+   *     capCategory='infra'  interrupted=false
+   *
+   * 三条全错:劝他去查网络(他刚按了取消)、白烧三桌、而且 interrupted=false 意味着
+   * --resume 不会重排它 —— 取消成了永久判决,正是这段代码承诺它不是的那件事。
+   *
+   * 收在这一个收口点而不是逐个补:runPhase 的调用点会继续长,下一个环节又会漏。
+   */
+  if (ctx.control?.wasCancelled(node.id) === true) {
+    node.blockedReason = '已被用户取消(/et --resume 会重新排队,也可以在结束屏上按 r 重做)'
+    node.capBlocked = false
+    node.capCategory = undefined
+    node.interrupted = true
+    await commit(node, 'BLOCKED', ctx)
+    return
+  }
   node.blockedReason = category !== undefined ? blockReasonWithRemedy(reason, category, ctx.runId, remedy) : reason
   // Assigned in BOTH directions, like `interrupted`: a node that previously tripped a valve
   // and is now blocked for a structural reason must not keep a flag that offers a retry.
@@ -466,6 +503,14 @@ async function roundtableWithInfraRetry(args: {
       slots: args.ctx.slots,
     })
     if (args.ctx.signal.aborted) return { rec, infraExhausted: false }
+    /**
+     * 用户取消了这个节点就**立刻停**,不要再试。
+     *
+     * 圆桌把任何 rejection 一律合成 infra,于是取消看起来就是「调用失败」,而 infra 是
+     * 要重试的 —— 用户按了一次 x,系统替他又派了两遍(角色多的话 ×角色数)。
+     * 实测:默认 caps 下白烧 3 桌,最后给一句「连续 3 次调用失败,请检查网络」。
+     */
+    if (args.ctx.control?.wasCancelled(args.node.id) === true) return { rec, infraExhausted: false }
     // 已经达成结论就收工 —— 哪怕有席位没打通。
     //
     // 这里此前只看 isInfraOnlyFailure,完全不看 pass。放宽 quorum 之后,「2 席赞成 +
@@ -629,9 +674,11 @@ function ctxGoal(node: TaskNode): string { return node.goal }
  * **11.3 秒的主线程同步阻塞**,期间整个界面(含别的节点正在跑的日志窗)不刷新。
  */
 function reviewPrompt(
-  node: TaskNode, tag: string, brief = '', notice = '', round = 1, maxRounds = 3,
+  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>,
+  tag: string, brief = '', notice = '', round = 1, maxRounds = 3,
 ): string {
   return brief +
+    judgeGuidance(ctx) +
     `请评审以下方案是否**足以开始执行**。方案:\n${quote(JSON.stringify(node.plan))}\n` +
     (notice ? notice + '\n' : '') +
     `这是第 ${round}/${maxRounds} 轮评审。` +
@@ -681,9 +728,12 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
  * 和验收的关键差别:它要求**真的把命令跑起来并贴出原始输出**,而不是判断产出描述。
  * 没有这一步,验收员只能给执行者的散文盖章 —— 这是本 fork 自己反复付过代价的那件事。
  */
-function verifyPrompt(node: TaskNode, tag: string, brief = ''): string {
+function verifyPrompt(
+  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '',
+): string {
   return (
     brief +
+    judgeGuidance(ctx) +
     `请**实际运行**验证这次改动,不要只读执行者的自述。\n` +
     `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
     `执行者的自述(仅供参考,不能作为通过依据):${quote(node.execStatus) || '(没有报告任何产出)'}\n` +
@@ -694,9 +744,12 @@ function verifyPrompt(node: TaskNode, tag: string, brief = ''): string {
     answerRule(tag)
   )
 }
-function acceptPrompt(node: TaskNode, tag: string, brief = ''): string {
+function acceptPrompt(
+  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '',
+): string {
   return (
     brief +
+    judgeGuidance(ctx) +
     `请验收执行结果是否达成验收点。\n` +
     `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
     `执行状态:${quote(node.execStatus) || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
@@ -707,6 +760,7 @@ function acceptPrompt(node: TaskNode, tag: string, brief = ''): string {
 // Integration acceptance judges CHILD evidence against the parent goal. acceptPrompt would
 // show only the parent's own execStatus — which for a decompose node is empty.
 function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', brief = ''): string {
+  const judge = judgeGuidance(ctx)
   // A child missing from the map is REPORTED, not filtered away: silently shrinking the
   // evidence list would let a parent be accepted on the strength of the children that
   // happen to still be there.
@@ -755,6 +809,7 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
     : ''
   return (
     brief +
+    judge +
     (ownWork
       ? `请验收"本节点自己的执行产出 + 全部子任务的结果,合起来是否达成本节点目标"。\n`
       : `请验收"全部子任务的结果合起来是否达成本节点目标"。\n`) +
@@ -1018,6 +1073,27 @@ function isFinished(node: TaskNode): boolean {
  * prompt whose reply is parsed by fence tag, so an unquoted \`\`\` in it could forge one.
  * Only affects unfinished work — an ACCEPTED node is never re-entered.
  */
+/**
+ * 裁判席(评审 / 测试验证 / 验收 / 集成验收)看到的那一段。
+ *
+ * 和执行侧同一份内容,**但多一句「以它为准」**。少了这一句的后果是实测推演出来的:
+ * 用户补一句「别动 src/legacy」→ 执行者照做 → 验收员拿着**补话之前**定下的
+ * plan.acceptance 对照产出,发现该改的没改 → 判不通过 → 返工 → 执行者下一轮同时拿到
+ * 用户那句话和「方案要求修改 legacy,未见改动」的反馈,两条直接打架 → 撞满
+ * maxIterations 以「验收迭代超限」阻断。
+ *
+ * **用户自己那句纠正,成了这个节点失败的直接原因**,而屏幕上没有任何东西会让他把这两件
+ * 事联系起来。
+ */
+function judgeGuidance(ctx: Pick<PipelineCtx, 'config' | 'control'>): string {
+  const g = guidanceSection(ctx)
+  return g ? g + JUDGE_NOTE : ''
+}
+
+const JUDGE_NOTE =
+  '(用户在运行中补充的约束**优先于原方案的枝节**:执行者按它做了而原方案里没有、' +
+  '或原方案里有而按它跳过了,都不算未完成 —— 请按补充后的意图判。)\n'
+
 function guidanceSection(ctx: Pick<PipelineCtx, 'config' | 'control'>): string {
   const out: string[] = []
   const g = ctx.config.resumeGuidance?.trim()
@@ -1160,7 +1236,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       system: 'review',
       // 一轮算一次,不是一席算一次:reviewLog 在这一轮之内不变。
       buildPrompt: (tag, seat) =>
-        reviewPrompt(node, tag, seatBrief(ctx, seat, 'review'), reviewNotice, node.iteration.planReview + 1, caps.maxIterations),
+        reviewPrompt(node, ctx, tag, seatBrief(ctx, seat, 'review'), reviewNotice, node.iteration.planReview + 1, caps.maxIterations),
       ctx,
     })
     node.reviewLog.push(rec)
@@ -1631,7 +1707,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           }
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
             phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
-            system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
+            system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
           })
           node.acceptLog.push(rec)
           if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
@@ -1757,7 +1833,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // 验收记录 rendered 第 2 轮 twice, once before and once after 第 3 轮 — and the card sends
       // the user to exactly that record.
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
-      system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
+      system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
     })
     node.acceptLog.push(rec)
     if (!infraExhausted && rec.synthesized.pass) {
@@ -1919,7 +1995,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       const v = await roundtableWithInfraRetry({
         phase: 'verify', node, roles: node.phaseRoles.verify, round: node.iteration.acceptance + 1,
         system: 'verify',
-        buildPrompt: (tag, seat) => verifyPrompt(node, tag, seatBrief(ctx, seat, 'verify')),
+        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatBrief(ctx, seat, 'verify')),
         ctx, cwd: node.worktree?.path,
       })
       node.acceptLog.push({ ...v.rec, step: 'verify' })
@@ -1991,7 +2067,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
-      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, tag, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree?.path,
+      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, ctx, tag, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree?.path,
     })
     node.acceptLog.push(rec)
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }

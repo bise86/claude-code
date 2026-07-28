@@ -42,8 +42,18 @@ export interface RunControl {
   cancelNode(nodeId: string): void
   /** 这个节点被用户取消过吗 —— 用来把它和超时/provider 故障区分开。 */
   wasCancelled(nodeId: string): boolean
-  /** 节点重新开跑时清掉标记(重做 / --resume)。 */
+  /** 节点重新开跑时清掉标记。 */
   clearCancel(nodeId: string): void
+  /**
+   * 清掉**全部**取消标记 —— 一次新的编排开始时调。
+   *
+   * 必须有:同会话里按 r 重做走的是 applyRedo → startRun → runOrchestrator,用的是
+   * **同一个** RunControl,而 redo 是原地重置节点、**id 不变**。不清的话 registerCall
+   * 一登记就发现该 id 在 cancelled 里,立刻 abort → 又抛 NodeCancelledError:
+   * 用户按 r 之后界面闪一下,节点又变回 BLOCKED,理由还是那句「可以在结束屏上按 r 重做」
+   * —— 阻断信息本身在推荐一条已经死掉的路。评审实测复现过。
+   */
+  clearAllCancels(): void
 }
 
 /** 一条追加指令的长度上限。整段提示词是要付钱的,而用户可能粘一整个文件进来。 */
@@ -124,5 +134,6 @@ export function createRunControl(): RunControl {
     },
     wasCancelled: nodeId => cancelled.has(nodeId),
     clearCancel(nodeId) { cancelled.delete(nodeId) },
+    clearAllCancels() { cancelled.clear() },
   }
 }

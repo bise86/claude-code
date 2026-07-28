@@ -1038,6 +1038,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
 
   const startRun = React.useCallback((cfg: EffTaskConfig, rootSeed?: TaskNode[]): void => {
     setPhase('running')
+    /**
+     * 新的一轮编排 = 每个节点都重新拿到一次机会。
+     *
+     * 少了这一句,同会话里按 r 重做一个**被取消过**的节点会立刻再次被取消:redo 是原地
+     * 重置、id 不变,而 cancelled 集合活在 call() 的整个生命周期里。用户看到的是界面闪
+     * 一下、节点又变回 BLOCKED,理由还是那句「可以按 r 重做」。
+     */
+    props.control.clearAllCancels()
     // Built at gate time, before the first step: init() creates the integration branch and
     // its worktree, which is real work the user has consented to. A failure is not fatal —
     // the run continues honestly un-isolated.
