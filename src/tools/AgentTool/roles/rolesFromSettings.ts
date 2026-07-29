@@ -28,9 +28,35 @@ export interface RoleLoadIssue {
 /** 按来源存,重解析同一个来源时覆盖而不是叠加。 */
 const ISSUES = new Map<string, RoleLoadIssue[]>()
 
+/**
+ * 把 zod 的第一条 issue 翻成一句**可照做**的中文,合法取值排在最前面。
+ *
+ * 排序不是审美:关口把整条诊断夹到 100 字,而这条信息的**全部价值**就是让用户知道
+ * 该写成什么。英文原文里合法取值排在末尾,实测正好被切掉。
+ */
+function zhIssue(issues: readonly { code?: string; message: string; path?: (string | number | symbol)[] }[]): string | undefined {
+  const first = issues[0]
+  if (!first) return undefined
+  const field = (first.path ?? []).join('.')
+  const opts = /expected one of (.+)$/.exec(first.message)?.[1]?.replace(/"/g, '').replace(/\|/g, ' / ')
+  if (opts) return `${field || '某个字段'} 不是合法取值,可用:${opts}`
+  if (/expected string, received number/.test(first.message)) return `${field} 要写成字符串(加引号)`
+  return field ? `${field}: ${first.message}` : first.message
+}
+
 /** 载入员工时所有「没按你写的生效」的条目。给 `/et` 关口和任何想显示它的界面用。 */
 export function roleLoadIssues(): RoleLoadIssue[] {
-  return [...ISSUES.values()].flat()
+  return [...ISSUES.values(), EXTRA].flat()
+}
+
+/**
+ * 不在 parseRoles 里发生的那些诊断(比如名字撞上内置 agent —— 那要等全部来源汇总之后
+ * 才判得出来)。单独一格,免得被某个来源的重解析覆盖掉。
+ */
+const EXTRA: RoleLoadIssue[] = []
+export function addRoleLoadIssue(issue: RoleLoadIssue): void {
+  if (EXTRA.some(e => e.name === issue.name && e.source === issue.source && e.reason === issue.reason)) return
+  EXTRA.push(issue)
 }
 
 const RoleSchema = z.object({
@@ -130,12 +156,17 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
             : `index ${i}`
           const reason = parsed.error.issues.map(iss => iss.message).join('; ')
           logError(new Error(`invalid role config (${label}): ${parsed.error.message}`))
+          // 关口那侧的 noticeLines 会把整条夹到 100 字。zod 的英文原文里,**可照做的那半句**
+          // (合法取值)排在最后 —— 实测 apiProtocol 写错时正好被切在
+          // `"anthropic"|"openai"|"open…`,用户看得见自己错了,看不见该写成什么。
+          // 所以自己组一句中文,把字段名和合法值放最前面。
+          const zh = zhIssue(parsed.error.issues)
           // console.error 在交互式会话里被 ink 的 patchConsole 吞掉(只进 debug 日志),
           // 所以真正让用户看得见的是下面这条 issue。两条都留:非交互(--print)那侧
           // console 还是有用的。
           // biome-ignore lint/suspicious/noConsole: 非交互模式下这是唯一的出口
           console.error(`[roles] "${label}" from ${source} skipped: ${reason}`)
-          skipped.push({ name: label, source, reason: `配置有误,这条员工没有被载入:${reason}` })
+          skipped.push({ name: label, source, reason: `${zh ?? `配置有误:${reason}`}(整条员工未载入)` })
         }
       })
     }

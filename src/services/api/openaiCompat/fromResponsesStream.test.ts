@@ -264,3 +264,89 @@ describe('两种错误形状都要接', () => {
     expect(types(es)).not.toContain('message_stop')
   })
 })
+
+/**
+ * 验收在这几条上跑出了**存活变异** —— 不是代码错,是「这段代码在不在」没人问过。
+ * 共同病根:每条用例喂的 `output_item.done` 都带全了 call_id+name+arguments,
+ * 于是整个累加器被短路,改坏它测试照绿。
+ */
+describe('累加器真的在用', () => {
+  it('`.done` 不带参数时,用增量拼出来的那份 —— 而且两者**不相等**', async () => {
+    // 原来那条用例喂的增量拼起来恰好等于 `.done` 的串,两个分支产出同一个值,
+    // 它物理上分辨不出自己在测什么。
+    const es = await run([
+      created,
+      { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_1', call_id: 'c1', name: 'X' } },
+      { type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"from":' },
+      { type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '"delta"}' },
+      { type: 'response.function_call_arguments.done', item_id: 'fc_1', arguments: '{"from":"done"}' },
+      { type: 'response.output_item.done', item: { type: 'function_call', id: 'fc_1', call_id: 'c1', name: 'X' } },
+      completed(),
+    ])
+    // `.done` 优先。删掉那一支的话这里会读到 {"from":"delta"}。
+    expect(es.find(e => e.data?.delta?.type === 'input_json_delta')!.data.delta.partial_json).toBe('{"from":"done"}')
+  })
+
+  it('流断在半路时,攒着的那次调用**连身份一起**发出去', async () => {
+    // 原来只断言「blocks 里有 tool_use」—— 而 call_id 和 name 正是 `.added` 唯一的用处,
+    // 丢了它们下一轮 tool_call_id 撞不上、工具也查不到。
+    const es = await run([
+      created,
+      { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_1', call_id: 'call_keep', name: 'Bash' } },
+      { type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"command":"ls"}' },
+    ])
+    const start = es.find(e => e.event === 'content_block_start' && e.data.content_block.type === 'tool_use')!
+    expect(start.data.content_block.id).toBe('call_keep')
+    expect(start.data.content_block.name).toBe('Bash')
+    expect(es.find(e => e.data?.delta?.type === 'input_json_delta')!.data.delta.partial_json).toBe('{"command":"ls"}')
+  })
+
+  it('`response.failed` 之后也要**立刻收口**,不是接着往下发', async () => {
+    // 原来「报错之后就收口」那条只走了顶层 error 事件,failed 那一支的 return 改成 break 存活。
+    const es = await run([
+      created, { type: 'response.failed', response: { error: { message: '炸了' } } },
+      { type: 'response.output_text.delta', delta: '不该出现' },
+    ])
+    expect(textOf(es)).toBe('')
+    expect(types(es)).not.toContain('message_stop')
+  })
+})
+
+describe('相邻两条推理片段,两条密文都要活着', () => {
+  it('中间没有正文隔开时也不能覆盖', async () => {
+    /**
+     * `signature()` 只在没开着思考块时才开新块,而 claude.ts 处理 signature_delta 是
+     * **赋值不是追加** —— 两条 reasoning item 挨着来时,第一条的密文被第二条盖掉,
+     * 静默消失。gpt-5.1-codex 系一轮里交替吐 [reasoning, 正文, reasoning, function_call]
+     * 是这条协议的典型输出,唯独相邻这一种排布中招。
+     */
+    const es = await run([
+      created,
+      { type: 'response.output_item.done', item: { type: 'reasoning', id: 'rs_1', encrypted_content: 'C1' } },
+      { type: 'response.output_item.done', item: { type: 'reasoning', id: 'rs_2', encrypted_content: 'C2' } },
+      completed(),
+    ])
+    const sigs = es.filter(e => e.data?.delta?.type === 'signature_delta')
+      .map(e => decodeReasoningSignature(e.data.delta.signature)?.enc)
+    expect(sigs).toEqual(['C1', 'C2'])
+    // 而且它们必须落在**两个不同**的思考块上,否则下游那次赋值照样只留最后一条。
+    const idx = new Set(es.filter(e => e.data?.delta?.type === 'signature_delta').map(e => e.data.index))
+    expect(idx.size).toBe(2)
+  })
+
+  it('正文开着时签名也接得住 —— 会先把文本块关掉', async () => {
+    const es = await run([
+      created,
+      { type: 'response.output_text.delta', delta: '我想想' },
+      { type: 'response.output_item.done', item: { type: 'reasoning', id: 'rs_3', encrypted_content: 'C3' } },
+      completed(),
+    ])
+    let open = 0
+    for (const e of es) {
+      if (e.event === 'content_block_start') open++
+      if (e.event === 'content_block_stop') open--
+      expect(open).toBeLessThanOrEqual(1)
+    }
+    expect(es.some(e => e.data?.delta?.type === 'signature_delta')).toBe(true)
+  })
+})

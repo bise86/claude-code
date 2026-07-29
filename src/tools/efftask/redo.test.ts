@@ -60,10 +60,31 @@ describe('redoOptions', () => {
     // 用户想重跑的那件事通常还是做得到的,只是入口在别处。
     const n = node('x', { kind: 'executable', childIds: [] })
     const opts = redoOptions(n, new Map([['x', n]]), { seatCount: { verify: 3, observer: 3 } })
-    for (const [entry, hint] of [['verify', '从执行重做'], ['accept', '从执行重做'], ['observer', '从集成验收重做']] as const) {
+    for (const entry of ['verify', 'accept', 'observer'] as const) {
       const o = opts.find(x => x.entry === entry)!
       expect(`${entry}:${o.disabled ? 'disabled' : 'ENABLED'}`).toBe(`${entry}:disabled`)
-      expect(o.disabled).toContain(hint)
+      expect(o.disabled).toContain('从执行重做')
+    }
+  })
+
+  it('禁用理由指的那一条,在同一个节点上必须是**按得动的**', () => {
+    /**
+     * 第一版无条件写「请选『从执行重做』」,而拆分任务上那一条本身就是禁用的 ——
+     * 用户被指到一行按不动的字上,而且「验收跑在执行环节内部」对拆分任务本来就是错的:
+     * 它自己的裁决是集成验收。
+     */
+    const dec = node('p', { kind: 'decompose', childIds: ['p/00-a'] })
+    const kid = node('p/00-a', { parentId: 'p' })
+    const byId = new Map([[dec.id, dec], [kid.id, kid]])
+    const opts = redoOptions(dec, byId)
+    const enabled = new Set(opts.filter(o => !o.disabled).map(o => o.label))
+    for (const entry of ['verify', 'accept', 'observer'] as const) {
+      const why = opts.find(x => x.entry === entry)!.disabled!
+      // 理由里点名的那个条目(如果点名了),必须在这个节点上是可用的。
+      const named = [...enabled].find(l => why.includes(l))
+      const namedAny = opts.map(o => o.label).find(l => why.includes(l))
+      expect(`${entry}: 点名了「${namedAny ?? '(没点名)'}」,它可用吗 = ${named !== undefined || namedAny === undefined}`)
+        .toBe(`${entry}: 点名了「${namedAny ?? '(没点名)'}」,它可用吗 = true`)
     }
   })
 
@@ -77,11 +98,15 @@ describe('redoOptions', () => {
       .toBeUndefined()
   })
 
-  it('本次配置把某个环节整个跳掉时,从它重做按不动', () => {
-    // 按下去一个环节都不会跑 —— 那就不该能按下去。
+  it('入口环节自己被跳过时,从它重做按不动', () => {
+    /**
+     * 只看「整条链是不是空的」不够:跳过质疑讨论之后,「从质疑讨论重做」的链上还剩
+     * 执行那一段 —— 链非空、条目可用,而用户按下去得到的是一次执行重做。
+     * 条目叫什么名字,那个环节就必须发生。
+     */
     const planned = node('y', { kind: 'executable', plan: { solution: '这么干', keyPoints: '', risks: '', acceptance: '' } })
     const o = redoOptions(planned, new Map([['y', planned]]), { skipSteps: ['review'] }).find(x => x.entry === 'review')!
-    expect(o.disabled).toContain('不会跑任何环节')
+    expect(o.disabled).toContain('本次配置跳过了质疑讨论')
   })
 
   it('拆分任务不给「执行重做」—— 它自己没有执行环节', () => {
@@ -591,8 +616,22 @@ describe('环节实况:屏幕上那句话必须是真的', () => {
     expect(t).toContain('测试验证、观察(未配置角色,这些环节不存在)')
   })
 
-  it('质疑讨论重做只跑一个环节', () => {
-    expect(phasesOf('review', {})).toEqual(['review'])
+  it('质疑讨论重做**不止**跑一个环节 —— 通过之后还会往下走', () => {
+    /**
+     * 第一版把这条链写成 `['review']`,而那是一句假话:stepStart 的 reviewOnly 分支
+     * 通过之后走的是普通路由 —— 执行型节点 commit(READY),调度器接着分派 stepExecute。
+     * 实测真实链条是质疑讨论 → 执行 → 验收(→ 测试验证/观察,配了席位的话)。
+     * 代价少报一个数量级。
+     */
+    const leaf = node('x', { kind: 'executable' })
+    expect(phasesOf('review', {}, leaf)).toEqual(['review', 'execute', 'accept'])
+    // 拆分型节点通过之后是「等子任务」→ 集成验收,不碰代码。
+    const dec = node('p', { kind: 'decompose', childIds: ['p/00-a'] })
+    expect(phasesOf('review', {}, dec)).toEqual(['review', 'integrate'])
+  })
+
+  it('不传节点时按**更贵**的那一条算 —— 宁可高报不可低报', () => {
+    expect(phasesOf('review', {})).toEqual(['review', 'execute', 'accept'])
   })
 
   it('不能单独重入的三个,链是空的', () => {
@@ -701,7 +740,7 @@ describe('从「质疑讨论」重做', () => {
     expect(t.status).toBe('CREATED')
   })
 
-  it('方案、子任务、工作区一律不动 —— 这一条不碰代码', () => {
+  it('拆分型节点上,方案、子任务、工作区一律不动 —— 这一条不碰代码', () => {
     const parent = planned({ kind: 'decompose', childIds: ['x/00-k'], worktree: { branch: 'b', path: '/wt/x' } })
     const kid = node('x/00-k', { parentId: 'x', status: 'ACCEPTED' })
     const p = ok(planRedo([parent, kid], 'x', 'review', 'T1'))
@@ -713,9 +752,26 @@ describe('从「质疑讨论」重做', () => {
     expect(p.worktreesToRelease).toEqual([])
   })
 
-  it('不往 execStatus 里写重做注记 —— 工作区没有被重置,那句话会是假的', () => {
-    const p = ok(planRedo([planned({ execStatus: '我改了 a.ts' })], 'x', 'review', 'T1'))
+  it('**拆分型**节点不写重做注记 —— 它通过之后走集成验收,不碰代码', () => {
+    const dec = planned({ kind: 'decompose', childIds: ['x/00-k'], execStatus: '我改了 a.ts' })
+    const kid = node('x/00-k', { parentId: 'x', status: 'ACCEPTED' })
+    const p = ok(planRedo([dec, kid], 'x', 'review', 'T1'))
     expect(p.nodes.find(n => n.id === 'x')!.execStatus).toBe('我改了 a.ts')
+    expect(p.worktreesToRelease).toEqual([])
+  })
+
+  it('**执行型**节点要写重做注记、要放工作区 —— 它通过之后会被交给执行者重跑', () => {
+    /**
+     * stepStart 的 reviewOnly 分支通过之后 commit(READY),调度器接着分派 stepExecute:
+     * 工作区被重新 acquire、执行者重跑。不做这套重置的话 execStatus 里还写着
+     * 「我实现了 feature.ts」而没有任何注记,执行者会在一棵已经有产出的树上从零重做。
+     */
+    const leaf = planned({ kind: 'executable', execStatus: '我改了 a.ts', worktree: { branch: 'b', path: '/wt/x' } })
+    const p = ok(planRedo([leaf], 'x', 'review', 'T1'))
+    const t = p.nodes.find(n => n.id === 'x')!
+    expect(t.execStatus).toContain('本节点被手工重做')
+    expect(t.worktree).toBeUndefined()
+    expect(p.worktreesToRelease).toEqual([{ nodeId: 'x', branch: 'b', path: '/wt/x' }])
   })
 
   it('清掉启动关口的确认稿 —— 用户要重判的是**现在这份**方案', () => {

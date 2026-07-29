@@ -1,4 +1,5 @@
 import { modelSupportsEffort, modelSupportsMaxEffort } from '../../../utils/effort.js'
+import { parseUserSpecifiedModel } from '../../../utils/model/model.js'
 
 /**
  * 员工的**思考级别**。
@@ -66,16 +67,28 @@ export function resolveRoleThinking(args: {
   const translating = protocol !== 'anthropic'
 
   if (!translating) {
-    if (!modelSupportsEffort(model)) {
-      return { note: `思考级别 ${level}:模型 ${model} 不支持 effort 参数,本次不会发送思考级别` }
+    /**
+     * **先解析别名再判能力。**
+     *
+     * 这一层跑在**解析期**,拿到的是用户写的原始串;而 `configureEffortParams` 跑在
+     * **请求期**,拿到的是 `getAgentModel` 解析过别名的全名。实测
+     * `modelSupportsEffort('opus') === false` 而 `modelSupportsEffort('claude-opus-4-6') === true` ——
+     * 于是 `model: "opus"` 会在关口上印一句「模型 opus 不支持 effort 参数」(假话),
+     * 同时把用户配的档位静默丢掉。这正是这一层立志消灭的那类错,只是换了个位置。
+     */
+    const resolved = model.length > 0 ? parseUserSpecifiedModel(model) : model
+    // 模型名为空(cli 角色可以不写 model)时不要印一个空洞的「模型 ␣ 不支持」。
+    const named = resolved.length > 0 ? `模型 ${resolved} ` : ''
+    if (!modelSupportsEffort(resolved)) {
+      return { note: `思考级别 ${level}:${named}不支持 effort 参数,本次不会发送思考级别` }
     }
     if (level === 'xhigh') {
       // Anthropic 没有这一档(BetaOutputConfig.effort 只收 low/medium/high/max)。
       return { value: 'high', note: `思考级别 xhigh:Anthropic 协议没有这一档,已按 high 发送` }
     }
-    if (level === 'max' && !modelSupportsMaxEffort(model)) {
+    if (level === 'max' && !modelSupportsMaxEffort(resolved)) {
       // resolveAppliedEffort 会把它降成 high,而屏幕上此前一句都没说。
-      return { value: 'max', note: `思考级别 max:模型 ${model} 不支持 max,实际会按 high 发送` }
+      return { value: 'max', note: `思考级别 max:${named}不支持 max,实际会按 high 发送` }
     }
     return { value: level }
   }

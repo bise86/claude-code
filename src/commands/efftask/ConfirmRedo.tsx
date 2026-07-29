@@ -185,6 +185,35 @@ export function redoMenuLayout(
   return { from, capacity, detailed: false }
 }
 
+/**
+ * 确认屏那几行摘要,**按显示宽度折行并夹进预算**。
+ *
+ * 这一屏此前一行预算都没有,而它才是最长、也最要命的那一屏:实测 80×24 上一个带
+ * 9 个子任务 + 依赖改写/移除 + 祖先重开 + 工作区的父节点,光这个框就 21 行,
+ * 加上 REPL 自己那 5 行 = 26 > 24 —— ink 不裁剪,终端自己滚,**滚掉的是最上面 4 行**,
+ * 而这次新加的三条披露(退出终态 / salvage 分支 / 执行者会读到什么)正好排在那儿。
+ *
+ * 夹的时候留最前面的:摘要是**按重要性排的**(先说会重新走哪些环节、再说退出终态、
+ * 再说删了什么)。被夹掉的那几条印一行计数,而计数行占的是**预算之内**的一行。
+ */
+export function redoSummaryLines(
+  lines: readonly string[], rows: number, columns: number,
+): { shown: string[]; hidden: number } {
+  const budget = Math.max(2, rows - MENU_CHROME_ROWS)
+  const wrapped: string[][] = lines.map(l => wrapDisplayWidth(l, Math.max(8, columns - 4)))
+  const out: string[] = []
+  let used = 0
+  for (let i = 0; i < wrapped.length; i++) {
+    const need = wrapped[i]!.length
+    // 还有没画的就得给计数行留一行。
+    const reserve = i < wrapped.length - 1 ? 1 : 0
+    if (used + need + reserve > budget) return { shown: out, hidden: lines.length - i }
+    out.push(...wrapped[i]!)
+    used += need
+  }
+  return { shown: out, hidden: 0 }
+}
+
 /** 一屏清单。窗口、隐藏计数、说明行的开关都在这里,两级菜单共用。 */
 function OptionList(props: {
   options: readonly { label: string; detail: string; disabled?: string }[]
@@ -218,6 +247,23 @@ function OptionList(props: {
       })}
       {above > 0 || below > 0
         ? <Text dimColor>{above > 0 ? `↑ 上面还有 ${above} 条` : ''}{above > 0 && below > 0 ? ' · ' : ''}{below > 0 ? `↓ 下面还有 ${below} 条` : ''}</Text>
+        : null}
+    </Box>
+  )
+}
+
+/** 确认屏的正文。折行、夹取、以及「另 N 条未显示」都在这里。 */
+function SummaryBody(props: { lines: readonly string[]; rows: number; columns: number }): React.ReactElement {
+  const { shown, hidden } = redoSummaryLines(props.lines, props.rows, props.columns)
+  return (
+    <Box flexDirection="column">
+      {shown.map((l, i) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: 折行结果按位置定义,内容可重复
+        <Text key={i} wrap="truncate-end" color={isWarningLine(l) ? 'warning' : undefined}>{l}</Text>
+      ))}
+      {hidden > 0
+        // 计数行**在预算之内**,不是挤在预算之外让终端去滚 —— 否则最先滚掉的就是它。
+        ? <Text dimColor>…另有 {hidden} 条后果未显示(终端太矮);放大窗口或见 run.md</Text>
         : null}
     </Box>
   )
@@ -297,13 +343,15 @@ export function ConfirmRedo(props: {
         <Text bold color="warning">确认重做</Text>
         {'error' in preview
           ? <Text color="error">{preview.error}</Text>
-          : redoSummary(preview.plan, target, picked, props.phases).map(l => (
-              <Text key={l} color={isWarningLine(l) ? 'warning' : undefined}>{l}</Text>
-            ))}
-        {'plan' in preview && preview.plan.deleted.length > 0
-          ? <Text dimColor>被删的子任务: {preview.plan.deleted.slice(0, 6).join(', ')}
-              {preview.plan.deleted.length > 6 ? ` 等 ${preview.plan.deleted.length} 个` : ''}</Text>
-          : null}
+          : <SummaryBody
+              lines={[
+                ...redoSummary(preview.plan, target, picked, props.phases),
+                ...(preview.plan.deleted.length > 0
+                  ? [`被删的子任务: ${preview.plan.deleted.slice(0, 6).join(', ')}${preview.plan.deleted.length > 6 ? ` 等 ${preview.plan.deleted.length} 个` : ''}`]
+                  : []),
+              ]}
+              rows={rows} columns={columns}
+            />}
         <Text dimColor>回车 / y 确认 · Esc 返回重选 · q 取消</Text>
       </Box>
     )

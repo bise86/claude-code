@@ -113,6 +113,17 @@ export async function* responsesEventsToAnthropicEvents(
            */
           const enc = typeof item.encrypted_content === 'string' ? item.encrypted_content : ''
           if (enc.length > 0) yield* w.signature(encodeReasoningSignature(String(item.id ?? ''), enc))
+          /**
+           * 盖完签名**立刻收口这个思考块**。
+           *
+           * 不收的话下一条 reasoning item 的签名会落在**同一个块**上,而 claude.ts 处理
+           * signature_delta 是 `contentBlock.signature = delta.signature` —— **赋值不是追加**,
+           * 后写的把先写的盖掉。实测一轮里相邻两条 reasoning item,第一条的密文静默消失。
+           *
+           * gpt-5.1-codex 系在一轮里交替吐 [reasoning, 正文, reasoning, function_call] 是这条
+           * 协议的典型输出,中间隔着正文时 w.text 会顺手关掉;**唯独相邻**这一种排布中招。
+           */
+          yield* w.closeThinking()
           break
         }
         if (item?.type !== 'function_call') break

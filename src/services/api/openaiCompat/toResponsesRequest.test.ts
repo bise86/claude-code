@@ -173,3 +173,29 @@ describe('anthropic 专有字段一个都不带过去', () => {
     }
   })
 })
+
+describe('验收补的那几条', () => {
+  it('stream 原样转发 —— 丢了的话上游返回 JSON,SSE 一帧都吐不出,员工一片空白', () => {
+    expect(build({ messages: [], stream: true }).stream).toBe(true)
+    expect(build({ messages: [], stream: false }).stream).toBe(false)
+    expect(build({ messages: [] }).stream).toBeUndefined()
+  })
+
+  it('temperature 原样转发', () => {
+    expect(build({ messages: [], temperature: 0.2 }).temperature).toBe(0.2)
+  })
+
+  it('前缀守卫真的在把关 —— 拿一个**合法 JSON 但没有前缀**的签名去试', () => {
+    /**
+     * 原来那条用的是 `'ErUBCkYIBBgCKkA…'`,它不是合法 JSON,JSON.parse 抛了被 catch 兜住,
+     * 前缀守卫压根没参与判断 —— 把 REASONING_SIG_PREFIX 改成空串同样通过。
+     * 而它声称要防的正是「别把 anthropic 自己的签名当成密文发出去」。
+     */
+    expect(decodeReasoningSignature('{"id":"rs_x","enc":"NOT_OURS"}')).toBeUndefined()
+    const r = build({ messages: [{ role: 'assistant', content: [
+      { type: 'thinking', thinking: '想', signature: '{"id":"rs_x","enc":"NOT_OURS"}' },
+      { type: 'tool_use', id: 'call_1', name: 'Bash', input: {} },
+    ] }] })
+    expect(r.input.some((i: any) => i.type === 'reasoning')).toBe(false)
+  })
+})

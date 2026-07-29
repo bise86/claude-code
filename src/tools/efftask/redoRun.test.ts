@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'bun:test'
 
 import { runRedo, type RedoRunDeps } from './redoRun.js'
-import type { RedoPlan } from './redo.js'
+import { phasesOf, type RedoPlan } from './redo.js'
 import { PHASE_NAMES, type NodeKind, type NodeStatus, type TaskNode } from './types.js'
 
 function node(id: string, over: Partial<TaskNode> = {}): TaskNode {
@@ -133,5 +133,62 @@ describe('算不出来的时候', () => {
     await runRedo(TREE(), '不存在的节点', 'plan', 'T1', deps)
     expect(seen.problems?.join()).toContain('重做未执行')
     expect(log).toEqual(['problems', 'done'])
+  })
+})
+
+/**
+ * 「关口算给你看的」和「真正执行的」必须是**同一次计算**。
+ *
+ * 验收在这一条上跑出四条**全部存活**的变异:runRedo 不把 ctx 传给 planRedo、applyRedo 不传
+ * ctx 给 runRedo、关口的 phases 换回 run 配置、关口干脆不传 phases —— 后两条就是把这次修的
+ * bug 原样放回去,而 89 条测试照绿。也就是说这次改动最核心的那条不变量,一条测试都没有。
+ */
+describe('预演与执行用同一份环节实况', () => {
+  const leaf = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...node('x'), kind: 'executable', status: 'ACCEPTED',
+    plan: { solution: '干', keyPoints: '', risks: '', acceptance: '' }, ...over,
+  })
+
+  it('ctx 真的被传到 planRedo —— 不传的话链条文案会变', async () => {
+    // 判据挑的是**看得见的产出差异**:配了测试验证席位时链里有它,不配就没有。
+    // ctx 丢在半路的话,执行出来的树和关口预演的那次算的不是一回事。
+    const seen: string[][] = []
+    const deps = (): RedoRunDeps => ({
+      commit: async () => ({ problems: [] }),
+      onProblems: () => {}, onNodes: () => {}, start: () => {}, onDone: () => {},
+    })
+    for (const ctx of [undefined, { seatCount: { verify: 2 as number } }]) {
+      const nodes = [leaf()]
+      await runRedo(nodes, 'x', 'execute', 'T1', deps(), ctx)
+      seen.push(phasesOf('execute', ctx, nodes[0]))
+    }
+    // 两次 ctx 不同 → 两条链不同。若 runRedo 把 ctx 吞了,下面这条断言仍然成立,
+    // 所以真正的判据在下一个用例里。
+    expect(seen[0]).not.toEqual(seen[1])
+  })
+
+  it('ctx 决定的 disabled 判据,planRedo 也照着拒绝 —— 不是只有屏幕拒绝', async () => {
+    /**
+     * 这才是「同一份 ctx」真正要防的东西:屏幕上禁用而 planRedo 放行 = 两个真相源。
+     * 跳过质疑讨论之后,「从质疑讨论重做」在菜单上是禁用的;planRedo 必须也拒绝。
+     */
+    const problems: string[][] = []
+    const deps: RedoRunDeps = {
+      commit: async () => ({ problems: [] }),
+      onProblems: p => problems.push(p), onNodes: () => {}, start: () => {}, onDone: () => {},
+    }
+    await runRedo([leaf()], 'x', 'review', 'T1', deps, { skipSteps: ['review'] })
+    expect(problems.flat().join()).toContain('重做未执行')
+    expect(problems.flat().join()).toContain('本次配置跳过了质疑讨论')
+  })
+
+  it('不传 ctx 时同一次重做是放行的 —— 排除「这条恒拒绝」', async () => {
+    let started = 0
+    const deps: RedoRunDeps = {
+      commit: async () => ({ problems: [] }),
+      onProblems: () => {}, onNodes: () => {}, start: () => { started++ }, onDone: () => {},
+    }
+    await runRedo([leaf()], 'x', 'review', 'T1', deps)
+    expect(started).toBe(1)
   })
 })

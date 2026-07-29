@@ -57,8 +57,10 @@ const TREE = (): TaskNode[] => [
   mk('root/01-b', { title: '乙', parentId: 'root', depth: 1, status: 'BLOCKED', blockedReason: '连续返工超限' }),
 ]
 
-async function mount(el: React.ReactElement) {
+async function mount(el: React.ReactElement, size?: { rows?: number; columns?: number }) {
   const t = fakeTty()
+  if (size?.rows) (t.stdout as unknown as { rows: number }).rows = size.rows
+  if (size?.columns) (t.stdout as unknown as { columns: number }).columns = size.columns
   const app = await render(el, {
     stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false,
   })
@@ -239,7 +241,10 @@ describe('重做关口', () => {
     seen += t.lastFrame()
     app.unmount()
     expect(seen).toContain('跑在执行环节内部')
-    expect(seen).toContain('观察评分跟在验收')
+    // 默认配置下 verify/observer 都是 0 席,理由说的是「这次压根不跑它」——
+    // 而不是把用户指到一条同屏可见、却写着「不跑测试验证」的条目上。
+    expect(seen).toContain('本次运行没有测试验证环节')
+    expect(seen).toContain('本次运行没有观察环节')
   })
 
   it('确认前先把删除数量、依赖改写和警告印出来', async () => {
@@ -400,5 +405,114 @@ describe('重做关口', () => {
     const f = t.lastFrame()
     app.unmount()
     expect(f).toContain('节点不存在')
+  })
+})
+
+
+/**
+ * 屏幕上**画出来了没有** —— 五条被验收抓到的存活变异。
+ *
+ * 它们的共同点:纯函数那一层钉得很死(`redoGateAction` / `redoMenuLayout` 全绿),
+ * 而「这句话有没有出现在屏幕上」一条都没人守。把 `❯`、窗口提示行、第一屏的可选清单、
+ * 两处页脚整个删掉,95 条测试照样绿 —— 而这个仓库出过反向的同一种错:页脚写着
+ * 「回车/空格 进入」而两个键都是死键,还有一条测试钉住了那句假话的字面量。
+ */
+describe('菜单画出来的样子', () => {
+  const gate = (over: Record<string, unknown> = {}) => (
+    <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => {}} {...over} />
+  )
+
+  it('光标标记 ❯ 在屏幕上 —— 一个会删子树的菜单,得看得出停在哪一项', async () => {
+    const { t, app } = await mount(gate())
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('❯')
+  })
+
+  it('第一屏写明**这个节点**能选哪几个环节 —— 进去才发现全灰是白走一趟', async () => {
+    const { t, app } = await mount(gate())
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('本节点可选')
+    expect(f).toContain('集成验收')
+  })
+
+  it('第二屏页脚说清「分析」在上一级 —— 这是屏幕上唯一说这件事的地方', async () => {
+    const { t, app } = await mount(gate())
+    await tick()
+    t.stdin.press('[B'); await tick()
+    t.stdin.press('\r'); await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('上一级')
+    expect(f).toContain('分析')
+  })
+
+  it('确认屏页脚写着 Esc 能返回重选 —— 键是活的,那就得说', async () => {
+    const { t, app } = await mount(gate())
+    await tick()
+    t.stdin.press('\r')     // 任务重做直接进确认屏
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('Esc 返回重选')
+  })
+
+  it('放不下时窗口提示行**画出来**,不是只在算出来', async () => {
+    // redoGate.test.ts 只断言 redoMenuLayout 的 from/capacity —— 那一行字有没有上屏,
+    // 此前没有任何东西问过。
+    const { t, app } = await mount(gate(), { rows: 16 })
+    await tick()
+    t.stdin.press('[B'); await tick()
+    t.stdin.press('\r'); await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('下面还有')
+  })
+
+  it('确认屏放不下时,**印出少了几条** —— 截断提示必须活过截断本身', async () => {
+    /**
+     * 这一屏此前一行预算都没有。实测 80×24 上一个带 9 个子任务 + 依赖改写/移除 +
+     * 祖先重开 + 工作区的父节点,光这个框就 21 行,加 REPL 的 5 行 = 26 > 24 ——
+     * ink 不裁剪,终端自己滚,**滚掉的是最上面 4 行**,而新加的三条披露正好排在那儿。
+     *
+     * 现在按预算夹,并印一行「另有 N 条未显示」。那一行占的是**预算之内**的一行 ——
+     * 挤在预算之外的话,它自己就是最先被滚掉的东西。
+     */
+    const nodes = TREE()
+    // 造一棵够长的:9 个子任务 + 一条跨子树依赖 + 一个隔离工作区。
+    const kids = Array.from({ length: 9 }, (_, i) => mk(`root/1${i}-k`, { title: `子${i}`, parentId: 'root', depth: 1, status: 'ACCEPTED' as const }))
+    nodes[0]!.childIds = [...nodes[0]!.childIds, ...kids.map(k => k.id)]
+    kids[0]!.worktree = { branch: 'b', path: '/wt/k0' }
+    nodes[2]!.deps = [kids[1]!.id]
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={[...nodes, ...kids]} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
+      { rows: 14 },
+    )
+    await tick()
+    t.stdin.press('\r')     // 任务重做 → 确认屏
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('另有')
+    expect(f).toContain('条后果未显示')
+  })
+
+  it('禁用的条目按下回车**什么都不发生** —— 不是只有文案灰着', async () => {
+    // 原来那条只断言了文案在不在,名字承诺的「按不动」那一半从没测过。
+    const got: string[] = []
+    const { t, app } = await mount(gate({ onConfirm: (e: string) => got.push(e) }))
+    await tick()
+    t.stdin.press('[B'); await tick()
+    t.stdin.press('\r'); await tick()
+    // 光标停在「质疑讨论」(root 没有方案 → 禁用)。逐条往下按,凡是禁用的都不该确认。
+    for (let i = 0; i < 4; i++) {
+      t.stdin.press('\r'); await tick()
+      expect(`第 ${i} 行按下之后确认了几次: ${got.length}`).toBe(`第 ${i} 行按下之后确认了几次: 0`)
+      t.stdin.press('[B'); await tick()
+    }
+    app.unmount()
   })
 })

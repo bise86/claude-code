@@ -19,6 +19,10 @@ import { toResponsesRequest } from './toResponsesRequest.js'
  * 一个静态字符串装不下。到那时这个接口要再长出 `applyAuth` 和 `parseFrames` 两个钩子。
  *
  * 现在不加是 YAGNI,不是因为它已经够通用了。
+ *
+ * **还有一处不在这张表里,加协议时必须手动同步**:`roleTypes.ts` 的 `apiProtocol` 是手写的
+ * 字面量联合(那个模块 import 本文件,从表派生会成环)。仓库没有 typecheck,所以漏掉它
+ * 不会有任何东西报错 —— 而这段自述如果不提它,它自己就是它想防的那种假话。
  */
 export interface TranslatingProtocol {
   /** 接在 apiUrl 后面的路由段。 */

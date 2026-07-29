@@ -36,7 +36,9 @@ describe('新协议真的配得进去', () => {
      * 员工凭空消失、屏幕一言不发,用户分不清是自己打错字还是这个功能没做。
      */
     const reasons = issuesOf([api({ apiProtocol: 'openai-response' })], 'probe-b')
-    expect(reasons.join('\n')).toContain('没有被载入')
+    expect(reasons.join('\n')).toContain('整条员工未载入')
+    // 可照做的那半句必须排在**最前面** —— 它被夹到 100 字时最先活下来的应该是它。
+    expect(reasons.join('\n')).toContain('apiProtocol 不是合法取值')
     expect(reasons.join('\n')).toContain('openai-responses')
   })
 

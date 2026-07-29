@@ -84,13 +84,21 @@ function fakeTty() {
 }
 
 const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise(r => setTimeout(r, 0)) }
-/** 去掉 ANSI,否则渲染出来的中文之间夹着控制序列,任何 includes 都是碰运气。 */
-const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+
 /**
- * 再把空格也去掉。带边框的 Box 里那一行渲出来是 `q/Esc退出·回车看节点详情·r重做选中的任务` ——
- * 词之间的空格没了(实测)。按源码里的写法带空格去匹配,断言会恒假,而恒假的断言
- * 在这个文件里正是要防的东西。
+ * 去掉 ANSI 转义。**这是「这段文字有没有被写出去过」,不是「屏幕上现在有它」。**
+ *
+ * 区别是真的:本仓库 vendored 的 ink 做**逐格差分渲染** —— 已经在屏幕上对的字符不重发,
+ * 改发 `ESC[NC`(光标右移 N 格)跳过去。验收实测过原始帧里出现
+ * `修掉 ERESC[1COR`,strip 之后读回来是 `EROR`。所以下面这些 includes 会**漏检**
+ * (不会误报:被吃掉的字符只会让匹配不上)。
+ *
+ * 这个缺陷此前是致命的,因为「整命令的存活闸门」正是靠字符串匹配判崩溃的 ——
+ * 现在崩溃判定改走 `waitUntilExit()` 的真接缝(见 watchCrash),不再依赖这里。
+ * 剩下的用法都是**正向**断言:漏检会让测试变红,不会让它假绿。
  */
+const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+/** 再把空格去掉:带边框的 Box 里那一行渲出来是 `q/Esc退出·回车看节点详情·r重做选中的任务`,词间空格没了(实测)。 */
 const squash = (s: string) => strip(s).replace(/[ \t]/g, '')
 
 async function mount(args: string, settings: Record<string, unknown>, tools: { name: string }[] = []) {
@@ -110,47 +118,48 @@ async function mount(args: string, settings: Record<string, unknown>, tools: { n
     } as never,
     args,
   )
-  if (node === null) return { tty, done, node: null, instance: null }
+  if (node === null) return { tty, done, node: null, instance: null, crash: { current: null } as CrashBox }
   // 必须裹 AppStateProvider:组件在 :540 调 useAppStore,没有 provider 就抛。
   const app = await render(
     React.createElement(AppStateProvider, null, node as React.ReactElement),
     { stdin: tty.stdin as never, stdout: tty.stdout as never, exitOnCtrlC: false, patchConsole: false },
   )
+  const crash = watchCrash(app)
   await tick()
-  return { tty, done, node, app }
+  return { tty, done, node, app, crash }
 }
 
 /**
- * 这一帧里有没有「渲染抛了」。
+ * 渲染有没有抛 —— **从真接缝读,不从画面猜**。
  *
- * **原来那个谓词是假的。** 它写的是 `/ReferenceError|is not defined|at EffTaskRunner/`,
- * 而 ink 的错误框根本不印这些字。实测(拿一个引用未导入标识符的组件真挂进本仓库的
- * ink,120×40 假 TTY):
+ * 两代都错过:
  *
- *     ERRORPHASE_NAMES_NOT_IMPORTEDisnotdefined
- *     /path/to/file.tsx:21:79
- *     - Boom(/path/to/file.tsx:21:79)
- *     - react_stack_bottom_frame(node_modules/react-reconciler/…)
+ *  1. 最早写的是 `/ReferenceError|is not defined|at EffTaskRunner/`,而 ink 的错误框
+ *     印的是 `ERROR PHASE_NAMESis notdefined`(列式排版吃掉词间空格)——三个分支一个
+ *     都命中不了,这条「整命令的存活闸门」在真崩溃上返回 false;
+ *  2. 换成 `ERROR` + 源码定位行之后**两个方向都还是错的**:用户目标里写一句
+ *     「构建失败 ERROR at foo.ts:42:9 请修」就会误报(对编码工具这是最常见的一类需求
+ *     描述,执行者报编译失败时也一定同时有这两样);而抛的不是 Error 时
+ *     `ErrorOverview` 的定位那半块整个不渲染,又漏报。
  *
- * 前缀是 `ERROR` 不是 `ReferenceError`;列式排版把词之间的空格全吃掉,所以
- * `is not defined` 匹配不到(帧里是 `isnotdefined`);栈行是 `- Boom(` 不是 `at Boom`。
- * 三个分支**一个都命中不了** —— 这条「整命令的存活闸门」在真崩溃上返回 false。
- *
- * 而它本该拦住的正是 `phase === 'confirmRedo'` 那一屏里没导入的 `PHASE_NAMES`:
- * 按下 r 就是一屏堆栈,而 2189 条测试全绿。
- *
- * 现在用两个**互相独立**的信号:错误框的标题,和它下面那行源码定位。
+ * 真接缝在这儿:ink 的 App 用 `componentDidCatch` 接住渲染异常 → `handleExit(error)`
+ * → `rejectExitPromise(error)`。所以 `waitUntilExit()` 的 rejection **就是**「渲染抛了」,
+ * 不多不少,和画面上印了什么无关。
  */
-function renderCrashed(frame: string): boolean {
-  const f = frame.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
-  return /ERROR/.test(f) && /\.tsx?:\d+:\d+/.test(f)
+type CrashBox = { current: Error | null }
+function watchCrash(app: { waitUntilExit?: () => Promise<void> }): CrashBox {
+  const box: CrashBox = { current: null }
+  void app.waitUntilExit?.().catch((e: unknown) => {
+    box.current = e instanceof Error ? e : new Error(String(e))
+  })
+  return box
 }
 
 describe('/et 真的能挂起来(整命令的存活闸门)', () => {
   it('挂载不抛异常 —— 裸 effRoot 那类错误在这里现形', async () => {
-    const { tty, app } = await mount('把 README 翻译成英文', {})
+    const { tty, app, crash } = await mount('把 README 翻译成英文', {})
     const f = tty.frames()
-    expect(`渲染出错: ${renderCrashed(f)}`).toBe('渲染出错: false')
+    expect(`渲染出错: ${crash.current?.message ?? 'no'}`).toBe('渲染出错: no')
     expect(f.length).toBeGreaterThan(0)
     app.unmount()
   })
@@ -278,7 +287,7 @@ describe('第一屏就要看得见模型在干什么', () => {
 describe('重做关口:从 done 屏按 r 真的能画出来', () => {
   it('按 r 出现的是重做菜单,不是一屏堆栈', async () => {
     // 跳过分析 → 节点直接 READY → 执行者(假的)报不出产出 → 撞返工上限 → 阻断 → done。
-    const { tty, app } = await mount('把 README 翻译成英文', { efftaskSkipSteps: ['分析'] })
+    const { tty, app, crash } = await mount('把 README 翻译成英文', { efftaskSkipSteps: ['分析'] })
     await tick(12)
     tty.stdin.press('y')
     // 阻断要跑满 maxIterations 轮评审,给足时间落到 done 视图。
@@ -289,7 +298,7 @@ describe('重做关口:从 done 屏按 r 真的能画出来', () => {
     await tick(20)
     const f = squash(tty.frames())
     app.unmount()
-    expect(`按 r 之后渲染出错: ${renderCrashed(tty.frames())}`).toBe('按 r 之后渲染出错: false')
+    expect(`按 r 之后渲染出错: ${crash.current?.message ?? 'no'}`).toBe('按 r 之后渲染出错: no')
     // 菜单第一屏那两条。**正向**断言 —— 不画出来就红。
     expect(`菜单出现了: ${f.includes('任务重做') && f.includes('阶段重做')}`).toBe('菜单出现了: true')
   })
@@ -318,7 +327,9 @@ describe('员工配置写错 → 原因到得了启动关口', () => {
     const f = squash(tty.frames())
     app.unmount()
     expect(`关口提到了这个员工: ${f.includes('gpt5')}`).toBe('关口提到了这个员工: true')
-    expect(`说清了没被载入: ${f.includes('没有被载入')}`).toBe('说清了没被载入: true')
+    expect(`说清了没被载入: ${f.includes('整条员工未载入')}`).toBe('说清了没被载入: true')
+    // **可照做的那半句必须在**:诊断被夹到 100 字,而合法取值排在末尾时正好被切掉。
+    expect(`列出了合法取值: ${f.includes('openai-responses')}`).toBe('列出了合法取值: true')
   })
 
   it('思考级别写错时也说,并且列出可用值', async () => {
@@ -346,6 +357,6 @@ describe('员工配置写错 → 原因到得了启动关口', () => {
     await tick(12)
     const f = squash(tty.frames())
     app.unmount()
-    expect(`误报: ${f.includes('没有被载入') || f.includes('无法识别')}`).toBe('误报: false')
+    expect(`误报: ${f.includes('整条员工未载入') || f.includes('无法识别')}`).toBe('误报: false')
   })
 })

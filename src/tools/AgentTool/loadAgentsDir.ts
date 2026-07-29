@@ -53,7 +53,7 @@ import {
   initializeFromSnapshot,
 } from './agentMemorySnapshot.js'
 import { getBuiltInAgents } from './builtInAgents.js'
-import { parseRoles, roleLoadIssues, type RoleLoadIssue } from './roles/rolesFromSettings.js'
+import { addRoleLoadIssue, parseRoles, roleLoadIssues, type RoleLoadIssue } from './roles/rolesFromSettings.js'
 
 // Type for MCP server specification in agent definitions
 // Can be either a reference to an existing server by name, or an inline definition as { [name]: config }
@@ -237,7 +237,7 @@ export function getActiveAgentsFromList(
  * (logging an error so the collision isn't silent), keeping the rest. Built-in
  * agents must never be shadowed by a user/project/local-configured role.
  */
-export function filterCollidingRoles<T extends { agentType: string }>(
+export function filterCollidingRoles<T extends { agentType: string; source?: string }>(
   roles: T[],
   builtinTypes: Set<string>,
 ): T[] {
@@ -248,8 +248,20 @@ export function filterCollidingRoles<T extends { agentType: string }>(
           `role "${r.agentType}" collides with built-in agent; ignored`,
         ),
       )
-      // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+      // biome-ignore lint/suspicious/noConsole: 非交互模式下这是唯一的出口
       console.error(`[roles] "${r.agentType}" collides with built-in agent; ignored`)
+      /**
+       * 名字撞上内置 agent 也要**交给界面**。
+       *
+       * 解析失败那条已经改成数据了,唯独这一条还只走 console.error —— 而 ink 的
+       * patchConsole 把它吞进 debug 日志。表现和解析失败一模一样:员工凭空消失、
+       * 屏幕一言不发。文档还在叫用户去终端找那行 `[roles] …` 警告。
+       */
+      addRoleLoadIssue({
+        name: r.agentType,
+        source: r.source ?? '(未知来源)',
+        reason: '名字和内置 agent 撞了,这条员工没有被载入 —— 换一个名字即可',
+      })
       return false
     }
     return true
@@ -275,7 +287,9 @@ const ROLE_SETTING_SOURCES = ['userSettings', 'projectSettings', 'localSettings'
  * 所以这里重读一遍是安全的。
  */
 export function collectRoleLoadIssues(): RoleLoadIssue[] {
-  for (const s of ROLE_SETTING_SOURCES) parseRoles(getSettingsForSource(s)?.roles, s)
+  // 走完整条装载路径,不只是 parseRoles —— 名字撞内置 agent 那一条要等全部来源汇总
+  // 之后才判得出来,而它和解析失败对用户是同一种现象(员工凭空消失)。
+  collectRoleAgents()
   return roleLoadIssues()
 }
 
