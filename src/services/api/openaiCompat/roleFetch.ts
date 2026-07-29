@@ -1,46 +1,7 @@
 import type { RoleClientConfig } from '../../../tools/AgentTool/roles/roleTypes.js'
-import { logError } from '../../../utils/log.js'
-import { toOpenAIRequest } from './toOpenAIRequest.js'
-import { openaiChunksToAnthropicEvents, anthropicEventsToSSE } from './fromOpenAIStream.js'
-
-async function* parseOpenAISSE(res: Response): AsyncGenerator<any> {
-  const reader = res.body!.getReader(); const dec = new TextDecoder(); let buf = ''
-  for (;;) {
-    const { done, value } = await reader.read(); if (done) break
-    // Normalize CRLF to LF so frames terminated by `\r\n\r\n` (some upstreams)
-    // are recognized the same as the spec-standard `\n\n`.
-    buf += dec.decode(value, { stream: true }).replace(/\r\n/g, '\n')
-    let i; while ((i = buf.indexOf('\n\n')) >= 0) {
-      const frame = buf.slice(0, i); buf = buf.slice(i + 2)
-      // Per the SSE spec, a frame may contain multiple `data:` lines whose
-      // values must be concatenated (joined with `\n`) before parsing.
-      const dataLines = frame.split('\n').filter(l => l.startsWith('data:'))
-      if (dataLines.length === 0) continue
-      const payload = dataLines.map(l => l.slice(5).trimStart()).join('\n').trim()
-      if (payload === '[DONE]') return
-      try {
-        yield JSON.parse(payload)
-      } catch {
-        // Skip (don't throw) a malformed OpenAI SSE frame, same as
-        // cliAgentRunner.ts's parseJsonLines does for bad protocol lines —
-        // one bad frame shouldn't take down the whole stream. Still worth
-        // a log line so a consistently-malformed upstream isn't silently
-        // invisible.
-        const snippet = payload.length > 200 ? `${payload.slice(0, 200)}…` : payload
-        logError(new Error(`roleFetch: skipping malformed SSE frame: ${snippet}`))
-      }
-    }
-  }
-}
-
-// Join `base` (an arbitrary API root, possibly with a trailing slash and/or a
-// path prefix like `/v1`) with the OpenAI `chat/completions` route without
-// losing that prefix — `new URL('/chat/completions', base)` would discard it.
-function chatCompletionsUrl(base: string): string {
-  const u = new URL(base)
-  u.pathname = u.pathname.replace(/\/+$/, '') + '/chat/completions'
-  return u.toString()
-}
+import { anthropicEventsToSSE } from './blocks.js'
+import { TRANSLATING_PROTOCOLS } from './protocols.js'
+import { joinRoute, parseSSE } from './sse.js'
 
 export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetch): typeof fetch {
   const target = new URL(cfg.apiUrl)
@@ -81,18 +42,25 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
       return inner(dest.toString(), { ...init, headers })
     }
 
-    // openai
+    /**
+     * 要翻译的协议。**查表**,不是 if 链 —— 新增一种 OpenAI 系方言时这个文件一行不动。
+     *
+     * 认不出来的协议名走 openai(chat/completions)兜底:配置那一侧的 zod enum 已经
+     * 挡住了写错的值,能到这里的只有「表里新加了名字但忘了加表项」这一种内部不一致,
+     * 而那时候退化成最常见的方言,比抛一个用户看不懂的异常要好。
+     */
+    const proto = TRANSLATING_PROTOCOLS[cfg.apiProtocol] ?? TRANSLATING_PROTOCOLS.openai!
     headers.delete('x-api-key')
     headers.set('authorization', `Bearer ${cfg.apiToken}`)
     headers.set('content-type', 'application/json')
     const anthropicBody = JSON.parse(init.body as string)
-    const openaiBody = toOpenAIRequest(anthropicBody, cfg.backendModel, cfg.thinkingDepth)
-    const res = await inner(chatCompletionsUrl(target.toString()), { ...init, method: 'POST', headers, body: JSON.stringify(openaiBody) })
+    const outBody = proto.buildBody(anthropicBody, cfg)
+    const res = await inner(joinRoute(target.toString(), proto.route), { ...init, method: 'POST', headers, body: JSON.stringify(outBody) })
     if (!res.ok || !res.body) {
       const errText = await res.text().catch(() => '')
       return new Response(JSON.stringify({ type: 'error', error: { type: 'api_error', message: errText || res.statusText } }), { status: res.ok ? 502 : res.status, headers: { 'content-type': 'application/json' } })
     }
-    const events = openaiChunksToAnthropicEvents(parseOpenAISSE(res), { anthropicModel: anthropicBody.model })
+    const events = proto.toAnthropicEvents(parseSSE(res), { anthropicModel: anthropicBody.model })
     return new Response(anthropicEventsToSSE(events), { status: 200, headers: { 'content-type': 'text/event-stream' } })
   }) as typeof fetch
 }

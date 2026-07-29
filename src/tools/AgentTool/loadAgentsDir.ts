@@ -53,7 +53,7 @@ import {
   initializeFromSnapshot,
 } from './agentMemorySnapshot.js'
 import { getBuiltInAgents } from './builtInAgents.js'
-import { parseRoles } from './roles/rolesFromSettings.js'
+import { parseRoles, roleLoadIssues, type RoleLoadIssue } from './roles/rolesFromSettings.js'
 
 // Type for MCP server specification in agent definitions
 // Can be either a reference to an existing server by name, or an inline definition as { [name]: config }
@@ -263,11 +263,26 @@ export function filterCollidingRoles<T extends { agentType: string }>(
  * from so getActiveAgentsFromList's existing per-source dedup/precedence
  * applies to them the same as markdown-defined custom agents.
  */
+/** 员工配置的三个来源。collectRoleAgents 和 collectRoleLoadIssues 共用,免得两边看到不同的配置。 */
+const ROLE_SETTING_SOURCES = ['userSettings', 'projectSettings', 'localSettings'] as const
+
+/**
+ * 载入员工时**没按你写的那样生效**的那些事。
+ *
+ * 单独一个入口而不是复用 collectRoleAgents 的副作用:诊断的消费者(/et 的启动关口)
+ * 不一定跑在 agent 装载之后 —— 依赖调用顺序的话,先跑 /et 的那一次就什么都不显示,
+ * 而那正是用户最需要看到它的时候。parseRoles 对同一个来源是幂等的(诊断按来源覆盖),
+ * 所以这里重读一遍是安全的。
+ */
+export function collectRoleLoadIssues(): RoleLoadIssue[] {
+  for (const s of ROLE_SETTING_SOURCES) parseRoles(getSettingsForSource(s)?.roles, s)
+  return roleLoadIssues()
+}
+
 export function collectRoleAgents(): ReturnType<
   typeof parseRoles
 >[number]['agentDef'][] {
-  const sources = ['userSettings', 'projectSettings', 'localSettings'] as const
-  const all = sources.flatMap(s =>
+  const all = ROLE_SETTING_SOURCES.flatMap(s =>
     parseRoles(getSettingsForSource(s)?.roles, s).map(x => x.agentDef),
   )
   const builtinTypes = new Set(getBuiltInAgents().map(a => a.agentType))

@@ -80,6 +80,7 @@ import {
 import type { ContentReplacementState } from '../../utils/toolResultStorage.js'
 import { createAgentId } from '../../utils/uuid.js'
 import { resolveAgentTools } from './agentToolUtils.js'
+import { isTranslatingProtocol } from '../../services/api/openaiCompat/protocols.js'
 import { type AgentDefinition, isBuiltInAgent } from './loadAgentsDir.js'
 
 /**
@@ -345,7 +346,10 @@ export async function* runAgent({
   // an openai model name through getAgentModel. Falling back to `undefined`
   // (i.e. no agent-specific model) makes getAgentModel treat this like the
   // 'inherit' default and resolve to the parent/session's Claude model.
-  const isOpenAIRole = agentDefinition.roleClientConfig?.apiProtocol === 'openai'
+  // 判据是「**不是** anthropic」:写死 'openai' 的话,openai-responses 员工的
+  // 'gpt-5.1' 会一路进 getAgentModel 成为引擎的 mainLoopModel,而引擎要拿它做
+  // Claude 模型的算术(别名解析、token 预算)。
+  const isOpenAIRole = isTranslatingProtocol(agentDefinition.roleClientConfig?.apiProtocol)
   const resolvedAgentModel = getAgentModel(
     isOpenAIRole ? undefined : agentDefinition.model,
     toolUseContext.options.mainLoopModel,

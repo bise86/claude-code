@@ -109,6 +109,9 @@ function richNode(): TaskNode {
   n.revised = true
   n.phaseMs = { EXECUTING: 42_000, ACCEPTANCE: 7_000 }
   n.confirmedDraft = { children: [{ title: '甲', deps: [] }] }
+  // 手工重做的一次性重入点。和 confirmedDraft 同类:一个持久化的标志选 step **内部**的
+  // 入口,而 node.md 是可手工编辑的 —— 一个垃圾值决定节点从哪个环节重入。
+  n.redoFrom = 'review'
   n.worktree = { branch: 'b', path: '/wt/root' }
   n.startedAt = NOW
   n.score = {

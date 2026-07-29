@@ -168,7 +168,9 @@ describe('角色定义的接线', () => {
     // 不对称,而这一条是静默的那一条。
     // 两条录入口的诊断都要接住:角色定义的,和跳过环节的。
     const el = element('EffTaskRunner')
-    expect(el).toContain('baseRoleNotices={[...collectedRoles.notices, ...collectedSkip.notices]}')
+    // 三条录入口的诊断都要接住:角色定义的、跳过环节的,和**员工载入失败**的。
+    // 最后那条另有一条挂载级的真探针(runnerMount.test.tsx),这里只守接线不掉。
+    expect(el).toContain('baseRoleNotices={[...roleLoadNotices(), ...collectedRoles.notices, ...collectedSkip.notices]}')
     expect(SRC).toContain('cfg.notices.unshift(...baseRoleNotices)')
   })
 })

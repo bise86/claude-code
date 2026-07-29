@@ -1149,6 +1149,20 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
    * from it ("每个方案经多角色圆桌评审").
    */
   let confirmed = node.confirmedDraft
+  /**
+   * 「从质疑讨论重做」的一次性入口(`node.redoFrom`,由重做关口写下)。
+   *
+   * CREATED 这一个座位对应本函数里的**两个**起点,光靠 status 分不开:分析 → 质疑讨论,
+   * 还是保留现有方案只重判一次。这个标志就是那一个字。
+   *
+   * **一次性,而且不返工。** 判据不是偷懒:失败走 `continue` 的话会回到循环顶部重新出方案,
+   * 而对一个已经有子任务的拆分型节点,新方案里的子任务规格会被下面 `childIds.length > 0`
+   * 那条守卫丢掉 —— 结果是方案改了、子任务没改,树上两者互相矛盾。菜单上写的也正是这一条:
+   * 不通过就阻断并附评审意见,要按意见重出方案请用「任务重做」。
+   */
+  const reviewOnly = node.redoFrom === 'review'
+  // 上一轮启动关口批准过的首层拆分在这条路上没有意义 —— 用户要重判的是**现在这份**方案。
+  if (reviewOnly) confirmed = undefined
   // plan → review loop. A rejected child GROUP (dependency cycle) re-enters this same
   // loop, so replanning is bounded by the SAME maxIterations budget — a cycle costs a
   // retry, it does not instantly kill the run.
@@ -1182,7 +1196,17 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       confirmed = undefined
       node.confirmedDraft = undefined
     }
-    if (confirmed) {
+    if (reviewOnly) {
+      // NO plan call, and nothing about the plan or the children changes — this entry exists
+      // precisely to re-judge what is already there. lastChildren stays empty because it is
+      // only read by createChildren, and a node reaching here through 重做 either has its
+      // children already (decompose) or legitimately has none (executable leaf).
+      lastChildren = []
+      // 消费掉。写在 commit **之前**,和 confirmedDraft 同因:commit 是把它写进盘的那一步,
+      // 崩在中间的话标记不能留着让下一次恢复再跳过一次分析。
+      node.redoFrom = undefined
+      if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
+    } else if (confirmed) {
       // NO plan call. Re-drafting here would ask the plan role the question the user just
       // answered and silently throw their edits away — the gate would render, they would
       // approve a tree, and the run would build a different one.
@@ -1254,6 +1278,15 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
     }
     if (!rec.synthesized.pass) {
       node.iteration.planReview++
+      if (reviewOnly) {
+        // 一次性,不返工 —— 见循环上方 reviewOnly 的说明,以及菜单上那一行
+        // 「不通过则本节点阻断并附评审意见」。这里要和它逐字对得上。
+        await blockWithReason(
+          node, `质疑讨论重做未通过: ${rec.synthesized.blockingSummary}`, ctx, 'rework',
+          '要按这些意见重新出方案,请对本节点做一次「任务重做」(方案会重出;有子任务的会先删子树)',
+        )
+        return
+      }
       // **累积**反馈,不是只带最后一轮。
       //
       // 此前是 `feedback = rec.synthesized.blockingSummary`,每轮覆盖 —— 方案作者从来

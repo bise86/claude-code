@@ -1,4 +1,4 @@
-import { PHASE_LABEL, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
+import { PHASE_LABEL, PHASE_NAMES, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
 
 /**
  * 重做 —— 把某个节点退回到某个环节重新跑一遍。
@@ -8,18 +8,33 @@ import { PHASE_LABEL, type NodeStatus, type PhaseName, type TaskNode } from './t
  * ACCEPTED 但结果不对的节点、一个方案就跑偏了的父任务,都没有任何入口。用户的原话是
  * 「降低恢复成本」:出了问题不该只能整轮重来。
  *
- * ## 为什么只有三个入口,而环节有七个
+ * ## 两级:任务重做 / 阶段重做
  *
- * 七个环节里能**单独重入**的只有三处,这是状态机的形状决定的,不是偷懒:
+ * 第一级只有两条:**任务重做**(整任务重来,会删子树)和**阶段重做**(从某个环节重新开始)。
+ * 分开是因为它们的代价差着数量级,而「重做」两个字对两者听起来一样。
  *
- *  - `stepStart` 跑 plan → review,是一个整体;
- *  - `stepExecute` 跑 execute → verify → accept → observer → merge,**也是一个整体** ——
+ * ## 为什么阶段重做里有一半是禁用的
+ *
+ * 能**单独重入**的点由状态机的形状决定,不是偷懒 —— `advanceableKind` 只认三个:
+ * `CREATED→stepStart`、`READY && executable→stepExecute`、`WAITING_CHILDREN && 子全绿→stepIntegrate`。
+ * 其余环节全都跑在这三个之内:
+ *
+ *  - `stepStart` 跑 plan → review。两个环节各自可以是第一轮的入口(见 `redoFrom`),
+ *    所以**分析和质疑讨论都是真入口**;
+ *  - `stepExecute` 跑 execute → verify → accept → observer → merge,是**一个整体** ——
  *    它只有一个入口(READY),中途没有第二个可进入的点(唯一的例外是人工解决冲突后从
  *    ACCEPTANCE 续跑,而那条路要求 mergeConflict 为真,是给冲突用的,不是给重做用的);
  *  - `stepIntegrate` 跑 integrate → observer,是拆分任务在子任务全绿后的那一场裁决。
  *
- * 所以菜单里给「验收重做」这样一个条目会是**假的**:它做不到只重跑验收,实际会连执行
- * 一起重跑,而用户是按字面意思选的。宁可给三个真的,并在每条上写清连带跑什么。
+ * 所以菜单里给「验收重做」这样一个**能按下去**的条目会是假的:它做不到只重跑验收。
+ * 三份验收各自量过它要付的代价 —— 已验收节点的隔离工作区早被 `mergeAndRelease` 放掉了,
+ * 重新 acquire 拿到的是集成分支 tip(含此后所有兄弟合入的改动);通过之后那次空合并会往
+ * `execStatus` 里**永久追加**一句「该节点没有向集成分支贡献任何改动」,而它对一个确实
+ * 贡献过的节点是假的,并且会被喂进之后每一次验收提示词;验收不通过还会 `continue` 回到
+ * 执行者。三条假话换一个条目,不值。
+ *
+ * **禁用的条目留在屏幕上并写明原因**,不是不渲染:菜单随节点类型忽隐忽现时用户记不住
+ * 「第三项」是哪一项,而且看不见「为什么这里不能这么做」。
  *
  * ## 父任务重做为什么必须先删子树
  *
@@ -29,7 +44,47 @@ import { PHASE_LABEL, type NodeStatus, type PhaseName, type TaskNode } from './t
  * 标题相同的会**覆盖**旧节点(可能覆盖掉已经 ACCEPTED 的),标题不同的会留下一批
  * 永远等不到的幽灵兄弟,`childrenAllAccepted` 于是永久卡住。删干净是唯一自洽的做法。
  */
-export type RedoEntry = 'plan' | 'execute' | 'integrate'
+/**
+ * 一次重做从**哪个环节**重新进入。
+ *
+ * 就是 `PhaseName` 本身,不再是自成一套的三值枚举 —— 菜单要按环节列,而两套词汇
+ * (`'plan'|'execute'|'integrate'` 和七个环节名)之间的翻译层是纯粹的漂移源。
+ * 哪几个真能按下去由 `redoOptions()` 判定,不由类型判定。
+ */
+export type RedoEntry = PhaseName
+
+/** 菜单第一级:整任务重来,还是从某个环节重来。 */
+export type RedoScope = 'task' | 'phase'
+
+/**
+ * 从某个环节重做时,**会跑过去的环节链**(还没按本次配置过滤)。
+ *
+ * 一张表,不是散在 `phasesOf` 和 `phaseChainText` 里的两份 —— 原来那两份各写了一遍
+ * `chain` 和 `all`,两边都得记得改;这次要从 3 条长到 7 条,漂移是必然的而不是可能的。
+ *
+ * 空数组 = 这个环节不能单独重入(原因见 `PHASE_ENTRY_BLOCKED`)。
+ */
+const REDO_CHAIN: Record<PhaseName, PhaseName[]> = {
+  plan: ['plan', 'review', 'execute', 'verify', 'accept', 'observer'],
+  // 一次性:第一轮跳过分析直接评审。不通过**不重新出方案**,见 stepStart 里 redoFrom 的消费点。
+  review: ['review'],
+  execute: ['execute', 'verify', 'accept', 'observer'],
+  verify: [],
+  accept: [],
+  integrate: ['integrate', 'observer'],
+  observer: [],
+}
+
+/**
+ * 不能单独重入的环节,以及**能照做的下一步**。
+ *
+ * 只说「不可用」是半句话:用户想重跑的那件事通常还是做得到的,只是入口在别处。
+ */
+const PHASE_ENTRY_BLOCKED: Partial<Record<PhaseName, string>> = {
+  verify: '测试验证跑在执行环节内部,没有自己的入口 —— 要重跑它请选「从执行重做」',
+  accept: '验收跑在执行环节内部,没有自己的入口 —— 要重跑它请选「从执行重做」',
+  observer: '观察评分跟在验收/集成验收通过之后跑,没有自己的入口 —— 要重新评分请选「从执行重做」或「从集成验收重做」',
+}
 
 /**
  * 这次重做**实际会跑哪些环节**。
@@ -49,45 +104,77 @@ export interface RedoContext {
   skipSteps?: readonly PhaseName[]
 }
 
-/** 某个环节这次会不会真的发生。 */
-function phaseRuns(phase: PhaseName, ctx?: RedoContext): boolean {
+/**
+ * 某个环节这次会不会真的发生。
+ *
+ * verify 和 observer 是**仅有的两个**「没配角色就整个不存在」的环节 —— `scoreNode` 的
+ * 第一句判据就是 `seats.length === 0 → return false`。其余环节没配席位时会回落
+ * (0 席在 plan/review/execute/accept 上是「主模型顶上跑一次」,在 integrate 上是
+ * 「回落到 accept 席位」),照样发生。口径与 pipeline.ts 里 isSkipped 那段注释逐字对齐
+ * (「只有 verify/observer 真的不发生」)。
+ *
+ * 把这条写成通用规则的话,没配 accept 角色的 run 会被告知不做验收,而它其实是做的。
+ *
+ * 导出是因为菜单的 disabled 判据要用同一份 —— 屏幕上禁用而 planRedo 放行,就是两个真相源。
+ */
+export function phaseRuns(phase: PhaseName, ctx?: RedoContext): boolean {
   if (ctx?.skipSteps?.includes(phase)) return false
-  // verify 是唯一一个「没配角色就整个不存在」的环节 —— 其余环节没配席位时会回落,
-  // 照样发生。把这条写成通用规则的话,没配 accept 角色的 run 会被告知不做验收,
-  // 而它其实是做的。
-  if (phase === 'verify') return (ctx?.seatCount?.verify ?? 0) > 0
+  if (phase === 'verify' || phase === 'observer') return (ctx?.seatCount?.[phase] ?? 0) > 0
   return true
 }
 
-/** 一次重做实际会跑过去的环节链,按顺序。 */
+/** 一次重做实际会跑过去的环节链,按顺序。不能单独重入的环节返回空数组。 */
 export function phasesOf(entry: RedoEntry, ctx?: RedoContext): PhaseName[] {
-  const chain: PhaseName[] =
-    entry === 'plan' ? ['plan', 'review', 'execute', 'verify', 'accept']
-    : entry === 'execute' ? ['execute', 'verify', 'accept']
-    : ['integrate']
-  return chain.filter(p => phaseRuns(p, ctx))
+  return REDO_CHAIN[entry].filter(p => phaseRuns(p, ctx))
 }
 
 /** 「执行 → 测试验证 → 验收」这样一句**照实**的描述,以及被跳过的部分。 */
 export function phaseChainText(entry: RedoEntry, ctx?: RedoContext): string {
   const runs = phasesOf(entry, ctx)
-  const all: PhaseName[] =
-    entry === 'plan' ? ['plan', 'review', 'execute', 'verify', 'accept']
-    : entry === 'execute' ? ['execute', 'verify', 'accept']
-    : ['integrate']
-  const missing = all.filter(p => !runs.includes(p))
+  const missing = REDO_CHAIN[entry].filter(p => !runs.includes(p))
   const body = runs.length > 0 ? runs.map(p => PHASE_LABEL[p]).join(' → ') : '(没有任何环节会跑)'
   if (missing.length === 0) return body
   // 说清**为什么**不跑,而不是只说不跑:两种原因的补救办法完全不同 ——
   // 一个是去配角色,一个是去掉 skipSteps。
-  const why = missing.map(p =>
-    ctx?.skipSteps?.includes(p) ? `${PHASE_LABEL[p]}(本次配置跳过)` : `${PHASE_LABEL[p]}(未配置角色,该环节不存在)`,
-  )
-  return `${body};不跑:${why.join('、')}`
+  //
+  // **按原因归并**,不是一个环节一个括号。链从 3 条长到 6 条之后,默认配置(verify 和
+  // observer 都没席位)下逐条写出来是「测试验证(未配置角色,该环节不存在)、观察(未配置
+  // 角色,该环节不存在)」—— 同一句理由印两遍,而这一行本来就已经在 80 列上折行了。
+  const skipped = missing.filter(p => ctx?.skipSteps?.includes(p))
+  const unconfigured = missing.filter(p => !ctx?.skipSteps?.includes(p))
+  const why: string[] = []
+  if (skipped.length > 0) why.push(`${skipped.map(p => PHASE_LABEL[p]).join('、')}(本次配置跳过)`)
+  if (unconfigured.length > 0) {
+    why.push(`${unconfigured.map(p => PHASE_LABEL[p]).join('、')}(未配置角色,${unconfigured.length > 1 ? '这些环节' : '该环节'}不存在)`)
+  }
+  return `${body};不跑:${why.join(';')}`
+}
+
+/**
+ * 这次重做的**环节实况** —— 席位从**目标节点**上取,不是从 run 配置上取。
+ *
+ * 席位来源搞错会让关口承诺一个这个节点上根本不存在的环节:`applyRosterToNodes` 的第一句
+ * 是 `if (n.status === 'ACCEPTED') continue`,而重做目标**绝大多数就是 ACCEPTED 节点** ——
+ * resume 时新加一个测试验证席位,run 配置上有了,那个节点上没有;而真正决定环节跑不跑的
+ * 是 pipeline 里读的 `node.phaseRoles.verify`,不是 config。
+ *
+ * 这个函数原来长在 efftask.tsx 的 JSX 里,而那一句用了一个**没有导入**的 `PHASE_NAMES` ——
+ * 仓库没有 typecheck,于是它一路过了打包,按下 r 就是一屏 ReferenceError。搬进来是为了
+ * 让它有接缝可测,不只是为了修那一行。
+ */
+export function redoContextOf(node: TaskNode, cfg?: { skipSteps?: readonly PhaseName[] }): RedoContext {
+  return {
+    seatCount: Object.fromEntries(
+      PHASE_NAMES.map(p => [p, (node.phaseRoles?.[p] ?? []).length]),
+    ) as Record<PhaseName, number>,
+    skipSteps: cfg?.skipSteps,
+  }
 }
 
 export interface RedoOption {
   entry: RedoEntry
+  /** 归第一级的哪一条:整任务重来,还是从某个环节重来。 */
+  scope: RedoScope
   /** 菜单里那一行。 */
   label: string
   /** 这一条**连带**会跑什么、会毁掉什么 —— 用户按下去之前就该看见。 */
@@ -117,7 +204,19 @@ export interface RedoPlan {
   warnings: string[]
 }
 
-const REDO_NOTE = '(注:本节点被手工重做,隔离工作区已重置为集成分支最新状态;上面描述的产出在当前工作区里不存在)'
+/**
+ * 重做后写进 execStatus 的注记 —— **按产出去哪儿了分两种**。
+ *
+ * 原来只有一句「上面描述的产出在当前工作区里不存在」,而它对 ACCEPTED 节点是**假的**:
+ * 通过验收的那一刻 `mergeAndRelease` 已经把产出合进集成分支了,而重做后重新 acquire 的
+ * 工作区正是基于集成分支 tip 建的 —— 文件就在那儿。执行者被告知要从零开始,却在树里
+ * 找到自己上一轮的产出,要么重做一遍造成冲突,要么报告困惑。
+ *
+ * 而「已验收但你看了不满意」正是 README 把重做宣传出去的主用例。
+ */
+const REDO_NOTE_PREFIX = '(注:本节点被手工重做'
+const REDO_NOTE_LOST = `${REDO_NOTE_PREFIX},隔离工作区已重置为集成分支最新状态;上面描述的产出**不在**当前工作区里)`
+const REDO_NOTE_MERGED = `${REDO_NOTE_PREFIX},隔离工作区已重置为集成分支最新状态;上面描述的产出此前已通过验收并合入集成分支,所以在当前工作区里**能看到**它 —— 请在它之上继续改,不要从零重做)`
 
 /**
  * 「这个节点是拆分型的吗」。
@@ -129,39 +228,91 @@ function isDecomposed(n: TaskNode): boolean {
   return n.childIds.length > 0 || n.kind === 'decompose'
 }
 
-/** 给一个节点,列出它能从哪些环节重做。**永远返回全部三条**,不可用的带原因。 */
+/** 这个节点有没有可评审的方案。空方案上重跑质疑讨论 = 让评审员对着空白发表意见。 */
+function hasPlan(n: TaskNode): boolean {
+  return `${n.plan?.solution ?? ''}${n.plan?.keyPoints ?? ''}${n.plan?.acceptance ?? ''}`.trim().length > 0
+}
+
+/**
+ * 给一个节点,列出**全部七个环节**,不可用的带原因。
+ *
+ * 七条永远都在(菜单忽隐忽现时用户记不住「第三项」是哪一项),`scope` 决定它出现在哪一级:
+ * `plan` 是第一级的「任务重做」,其余六条在第二级的「阶段重做」里。
+ *
+ * 这是**唯一**的授权判据 —— `planRedo` 也照它拒绝,所以屏幕上按不动的东西不可能从别的
+ * 门进去。原来 planRedo 调它时不传 ctx,一旦 disabled 依赖席位数就会出现「屏幕禁用而
+ * planRedo 放行」的两个真相源。
+ */
 export function redoOptions(
   node: TaskNode, byId: ReadonlyMap<string, TaskNode>, ctx?: RedoContext,
 ): RedoOption[] {
   const kids = descendantsOf(node, byId)
   const acceptedKids = kids.filter(id => byId.get(id)?.status === 'ACCEPTED').length
-  return [
+  const decomposed = isDecomposed(node)
+  /** 这一条在本次配置下一个环节都不跑 —— 按下去什么都不会发生,那就不该能按下去。 */
+  const runsNothing = (entry: RedoEntry): string | undefined =>
+    REDO_CHAIN[entry].length > 0 && phasesOf(entry, ctx).length === 0
+      ? `本次配置下这一条不会跑任何环节(${PHASE_LABEL[entry]}被跳过了)`
+      : undefined
+
+  const opts: RedoOption[] = [
     {
       entry: 'plan',
-      label: '从「方案」重做',
+      scope: 'task',
+      label: '任务重做',
       detail: node.childIds.length > 0
         // 数量必须写出来。这是整个功能里唯一一个不可逆的动作,而「重做」两个字听起来像
         // 是可逆的。
         ? `重新分析并拆分;先删除 ${kids.length} 个子任务(其中 ${acceptedKids} 个已验收)`
-        : phaseChainText('plan', ctx),
+        : `重新分析并拆分。本次实际跑:${phaseChainText('plan', ctx)}`,
+      disabled: runsNothing('plan'),
+    },
+    {
+      entry: 'review',
+      scope: 'phase',
+      label: '从「质疑讨论」重做',
+      // **一次性**,而且要说清不通过会怎样 —— 这一条是本次唯一新开的状态机入口,
+      // 它和「从执行重做」最大的不同就是失败之后的去向。
+      detail: decomposed
+        ? '保留现有方案,只重跑一次质疑讨论;通过后会重新做一次集成验收。不通过则本节点阻断并附评审意见 —— 要按意见重出方案请用「任务重做」'
+        : '保留现有方案,只重跑一次质疑讨论。不通过则本节点阻断并附评审意见 —— 要按意见重出方案请用「任务重做」',
+      disabled: runsNothing('review')
+        ?? (hasPlan(node) ? undefined : '本节点还没有方案,没有可评审的东西 —— 请用「任务重做」'),
     },
     {
       entry: 'execute',
+      scope: 'phase',
+      // 「它们是一个整体,分不开」原来挂在整句最后,排在「不跑:…」子句**后面**,
+      // 读起来像在修饰测试验证;而且整句 91 列,80 列终端上折成两行。
+      // 这个事实现在由测试验证/验收那两条的**不可用原因**说(「跑在执行环节内部」)——
+      // 那正是用户会去找它的地方,而这一行因此短得下。
+      detail: `方案保留;本次实际跑:${phaseChainText('execute', ctx)}`,
       label: '从「执行」重做',
-      detail: `方案保留;重跑 ${phaseChainText('execute', ctx)}(它们是一个整体,分不开)`,
-      disabled: isDecomposed(node)
+      disabled: decomposed
         ? '这是拆分任务,它自己没有执行环节 —— 真正干活的是它的子任务'
-        : undefined,
+        : runsNothing('execute'),
     },
     {
       entry: 'integrate',
+      scope: 'phase',
       label: '从「集成验收」重做',
       detail: '子任务全部保留,只重新裁决一次「合起来达没达成父目标」',
       disabled: node.childIds.length === 0
         ? '没有子任务,不存在集成验收'
-        : undefined,
+        : runsNothing('integrate'),
     },
   ]
+  // 不能单独重入的三个。留在屏幕上、按不动、并给出**能照做的下一步** —— 用户想重跑的
+  // 那件事通常还是做得到的,只是入口在别处。
+  for (const p of ['verify', 'accept', 'observer'] as const) {
+    opts.push({
+      entry: p, scope: 'phase', label: `从「${PHASE_LABEL[p]}」重做`,
+      detail: '', disabled: PHASE_ENTRY_BLOCKED[p],
+    })
+  }
+  // 按环节顺序排,和 PHASE_NAMES 一致 —— 屏幕上的次序和用户在别处(名册、跳过设置、
+  // 节点详情的环节耗时)看到的次序必须是同一个。
+  return opts.sort((a, b) => PHASE_NAMES.indexOf(a.entry) - PHASE_NAMES.indexOf(b.entry))
 }
 
 /**
@@ -285,13 +436,16 @@ export function planRedo(
   targetId: string,
   entry: RedoEntry,
   now: string,
+  // 和菜单**同一份** ctx。不传的话「屏幕上禁用、planRedo 放行」就成立了 ——
+  // 一旦 disabled 依赖席位数(测试验证/观察就是这么判的),两条路会给出不同的答案。
+  ctx?: RedoContext,
 ): RedoPlan | { error: string } {
   const nodes = input.map(n => structuredClone(n) as TaskNode)
   const byId = new Map(nodes.map(n => [n.id, n]))
   const target = byId.get(targetId)
   if (!target) return { error: `节点不存在: ${targetId}` }
 
-  const opt = redoOptions(target, byId).find(o => o.entry === entry)
+  const opt = redoOptions(target, byId, ctx).find(o => o.entry === entry)
   if (!opt) return { error: `未知的重做入口: ${entry}` }
   if (opt.disabled) return { error: opt.disabled }
 
@@ -387,14 +541,29 @@ export function planRedo(
       target.worktree = undefined
     }
     seatedAt = 'CREATED'
+  } else if (entry === 'review') {
+    /**
+     * 只重跑一次质疑讨论。**方案、子任务、工作区一律不动** —— 这一条不碰代码,
+     * 所以没有 REDO_NOTE、没有工作区释放,也不删任何东西。
+     *
+     * 座位同样是 CREATED(`advanceableKind` 只在 CREATED 上返回 'start'),
+     * 真正让它跳过分析的是 `redoFrom`,由 stepStart 在第一轮消费掉。
+     */
+    target.iteration = { ...target.iteration, planReview: 0 }
+    // 上一轮启动关口批准过的首层拆分。留着它 stepStart 会拿它当「已确认方案」再走一遍,
+    // 而用户这次要的是重新评审**现在这份**方案。
+    target.confirmedDraft = undefined
+    seatedAt = 'CREATED'
   } else if (entry === 'execute') {
     // acceptLog **保留**。它是上一轮验收说了什么的唯一记录,而返工提示词正是拿它当
     // 反馈的 —— 清掉等于让执行者从零开始猜,那是提高恢复成本,不是降低。
     target.iteration = { ...target.iteration, acceptance: 0, scoring: 0, mergeResolve: 0 }
-    if (target.execStatus.length > 0 && !target.execStatus.includes(REDO_NOTE)) {
+    if (target.execStatus.length > 0 && !target.execStatus.includes(REDO_NOTE_PREFIX)) {
       // 和 reseat 的 RETRY_NOTE 同因:工作区会被重置回集成分支基线,而 execStatus 里
-      // 写着「我实现了 feature.ts」。不加这句,执行者会去找一个已经不在那儿的文件。
-      target.execStatus = `${target.execStatus}\n${REDO_NOTE}`
+      // 写着「我实现了 feature.ts」。不加这句,执行者要么去找一个已经不在那儿的文件,
+      // 要么把一份已经在那儿的产出从零再做一遍。**判据是重做前的 status** ——
+      // 这一段跑在下面 `target.status = seatedAt` 之前。
+      target.execStatus = `${target.execStatus}\n${target.status === 'ACCEPTED' ? REDO_NOTE_MERGED : REDO_NOTE_LOST}`
     }
     if (target.worktree) {
       worktreesToRelease.push({ nodeId: target.id, branch: target.worktree.branch, path: target.worktree.path })
@@ -403,6 +572,10 @@ export function planRedo(
     seatedAt = 'READY'
   } else {
     // integrate:子任务一个不动,只把父节点退回等子任务的位置重新裁决。
+    //
+    // verify / accept / observer **到不了这里** —— PHASE_ENTRY_BLOCKED 无条件禁用它们,
+    // 上面 `opt.disabled` 那一句就返回了。写成 else 而不是 `else if (entry === 'integrate')`
+    // 是为了 seatedAt 必然被赋值;真正的守门人是 disabled,不是这个分支形状。
     target.iteration = { ...target.iteration, integration: 0, scoring: 0 }
     const unfinished = target.childIds.filter(id => byId.get(id)?.status !== 'ACCEPTED')
     if (unfinished.length > 0) {
@@ -413,7 +586,17 @@ export function planRedo(
     seatedAt = 'WAITING_CHILDREN'
   }
 
-  // ---- 三条入口共通的清理 ----
+  // ---- 各入口共通的清理 ----
+  /**
+   * 一次性的重入点标记,由 stepStart 在**第一轮**消费后立刻清掉。
+   *
+   * 只有质疑讨论用得上它 —— 其余入口靠 `status` 就能被 `advanceableKind` 分派到正确的
+   * step,而 CREATED 有两个可能的起点(分析 / 质疑讨论),必须多一个字才分得开。
+   *
+   * **每条入口都要写**,包括写成 undefined 的那几条:上一次质疑讨论重做留下的标记
+   * 不清掉的话,这次「任务重做」会跳过分析 —— 那正是它唯一要做的事。
+   */
+  target.redoFrom = entry === 'review' ? 'review' : undefined
   target.status = seatedAt
   target.blockedReason = ''
   target.interrupted = false
@@ -462,6 +645,16 @@ export function redoSummary(
   // 照实说这次会跑哪些环节 —— 写死一句话的版本在默认配置下就是假的(测试验证是
   // opt-in,没配角色时根本不存在),而用户是按字面意思选的。
   lines.push(`「${target.title}」将重新走: ${phaseChainText(entry, ctx)}`)
+  /**
+   * 节点自己会**退出终态**。
+   *
+   * `plan.seatedAt` 一直是算出来的、也一直在返回值里,但一行都没渲染过 —— 于是屏幕上
+   * 那份「代价清单」漏掉了最直接的一项:一个已验收的节点重做之后,本次运行立刻不再算完成。
+   * 用户是在「✓ 高效任务完成」那一屏上按的 r,他有理由以为这只是加跑一轮。
+   */
+  if (target.status === 'ACCEPTED') {
+    lines.push('本节点从「已验收」退回重跑 —— 在它重新通过之前,本次运行不再算完成')
+  }
   if (plan.deleted.length > 0) lines.push(`删除 ${plan.deleted.length} 个子任务,重做后按新方案重建`)
   // 「改写」和「移除」分开说。合成一句「N 条依赖被改写为指向本节点」时,那些其实被
   // **删掉**的(目标自己依赖被删后代 / 改指会成环)也被算进去,而它们的后果完全不同:
@@ -470,7 +663,24 @@ export function redoSummary(
   const rewritten = plan.dependencyRewrites.length - removed.length
   if (rewritten > 0) lines.push(`${rewritten} 条依赖被改写为指向本节点`)
   if (removed.length > 0) lines.push(`${removed.length} 条依赖被移除(下游可能比预期更早起跑)`)
-  if (plan.worktreesToRelease.length > 0) lines.push(`释放 ${plan.worktreesToRelease.length} 个隔离工作区`)
+  if (plan.worktreesToRelease.length > 0) {
+    /**
+     * 「释放」读起来像清理,而对一个**脏的**工作区它不是。
+     *
+     * release 在工作区仍有未提交/被忽略的文件时会拒删(keptBecause),目录留在原地;
+     * 下一次 acquire 走复用分支:`git add -A` → `commit --no-verify` →
+     * `branch -f efftask/<run>/salvage/<节点>` → `checkout -B <分支> <集成分支>`。
+     * 也就是说用户手改的东西被提交进一条他从没听说过的分支,目录被重置 —— 不会丢,
+     * 但也不在原处了。屏幕只写「释放 N 个」的话,这件事按下去之前完全看不见。
+     */
+    lines.push(
+      `释放 ${plan.worktreesToRelease.length} 个隔离工作区;里面**未提交**的改动会先被固化到 ` +
+      `efftask/<run>/salvage/… 分支再重置目录 —— 不会丢,但不在原处了`,
+    )
+  }
+  // 返工额度会重新给。这是这次重做的直接成本(每一轮都是真实的模型调用),
+  // 而它此前只体现在代码里。
+  lines.push('相关环节的返工计数清零 —— 会重新占满一轮返工额度')
   if (plan.reopenedAncestors.length > 0) {
     lines.push(`上级 ${plan.reopenedAncestors.length} 个任务重新做集成验收`)
   }

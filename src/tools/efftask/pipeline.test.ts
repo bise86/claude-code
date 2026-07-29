@@ -4432,3 +4432,91 @@ describe('方案提示词里那段「四个字段都不许留空」', () => {
     expect(body).toContain('先真的去看代码')
   })
 })
+
+/**
+ * 「从质疑讨论重做」的一次性入口。
+ *
+ * `advanceableKind` 只认三个座位,而 CREATED 这一个座位对应 stepStart 里的**两个**起点:
+ * 分析 → 质疑讨论,还是保留现有方案只重判一次。`redoFrom` 就是分开它们的那一个字。
+ */
+describe('redoFrom: 从质疑讨论重做', () => {
+  const planned = (): TaskNode => {
+    const n = root()
+    n.kind = 'executable'
+    n.plan = { solution: '上一轮的方案', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.redoFrom = 'review'
+    return n
+  }
+
+  it('跳过分析调用,直接评审现有方案', async () => {
+    const seen: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      seen.push(req.phase)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = planned()
+    await stepStart(n, ctxFor([n], runAgent))
+    // 一次 plan 调用都不该发生 —— 用户要重判的就是**现在这份**方案。
+    expect(seen).toEqual(['review'])
+    expect(n.plan.solution).toBe('上一轮的方案')
+    expect(n.status).toBe('READY')
+    expect(n.reviewLog).toHaveLength(1)
+  })
+
+  it('标记被消费掉,不跨轮生效', async () => {
+    const runAgent: RunAgentFn = async req => vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    const n = planned()
+    await stepStart(n, ctxFor([n], runAgent))
+    // 留着的话下一次恢复会再跳过一次分析 —— 而那一次用户没要求。
+    expect(n.redoFrom).toBeUndefined()
+  })
+
+  it('评审不通过时**阻断并附意见**,不回头重出方案', async () => {
+    /**
+     * 一次性,不返工。走 `continue` 的话会回到循环顶部重新出方案,而对一个已经有子任务的
+     * 拆分型节点,新方案里的子任务规格会被 `childIds.length > 0` 那条守卫丢掉 ——
+     * 结果是方案改了、子任务没改,树上两者互相矛盾。菜单上写的也正是这一条。
+     */
+    const seen: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      seen.push(req.phase)
+      return vtag(req) + '\n{"pass":false,"blocking":["没写回滚"],"comments":"c"}\n```'
+    }
+    const n = planned()
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(seen).toEqual(['review'])          // 没有第二轮,更没有 plan 调用
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('质疑讨论重做未通过')
+    expect(n.blockedReason).toContain('没写回滚')
+    // 阻断信息要带着能照做的下一步。
+    expect(n.blockedReason).toContain('任务重做')
+  })
+
+  it('拆分型节点重做评审通过后回到「等子任务」,子任务一个不动', async () => {
+    const parent = planned()
+    parent.kind = 'decompose'
+    parent.childIds = ['root/00-a']
+    const kid = createNode({ id: 'root/00-a', title: 'a', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'
+    const runAgent: RunAgentFn = async req => vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    await stepStart(parent, ctxFor([parent, kid], runAgent))
+    expect(parent.status).toBe('WAITING_CHILDREN')
+    expect(parent.childIds).toEqual(['root/00-a'])
+  })
+
+  it('没有这个标记时,行为和以前逐字一样(照常先出方案)', async () => {
+    // 反向锚:标记恒真的话这一条会红。
+    const seen: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      seen.push(req.phase)
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"新方案","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = planned()
+    n.redoFrom = undefined
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(seen).toEqual(['plan', 'review'])
+    expect(n.plan.solution).toBe('新方案')
+  })
+})

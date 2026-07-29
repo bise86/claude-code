@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test'
 
 import {
-  descendantsOf, phaseChainText, phasesOf, planRedo, redoOptions, redoSummary,
-  redoUnavailableReason, type RedoPlan,
+  descendantsOf, phaseChainText, phaseRuns, phasesOf, planRedo, redoContextOf, redoOptions,
+  redoSummary, redoUnavailableReason, type RedoPlan,
 } from './redo.js'
 import { PHASE_NAMES, type NodeKind, type NodeStatus, type TaskNode } from './types.js'
 
@@ -35,11 +35,53 @@ const ok = (r: RedoPlan | { error: string }): RedoPlan => {
 }
 
 describe('redoOptions', () => {
-  it('三条永远都在,不可用的带原因 —— 菜单不能忽隐忽现', () => {
+  it('七个环节永远都在,不可用的带原因 —— 菜单不能忽隐忽现', () => {
     const t = tree()
     const byId = new Map(t.map(n => [n.id, n]))
     const opts = redoOptions(byId.get('a')!, byId)
-    expect(opts.map(o => o.entry)).toEqual(['plan', 'execute', 'integrate'])
+    // 次序和 PHASE_NAMES 一致:屏幕上的次序,和用户在名册、跳过设置、节点详情的
+    // 环节耗时里看到的次序,必须是同一个。
+    expect(opts.map(o => o.entry)).toEqual(PHASE_NAMES)
+  })
+
+  it('分析归第一级(任务重做),其余六条归第二级(阶段重做)', () => {
+    // 任务重做会删整棵子树,而阶段重做只重跑一个环节 —— 代价差着数量级,
+    // 并排放在同一张单子上时选错一行的后果完全不同。
+    const t = tree()
+    const byId = new Map(t.map(n => [n.id, n]))
+    const opts = redoOptions(byId.get('a')!, byId)
+    expect(opts.filter(o => o.scope === 'task').map(o => o.entry)).toEqual(['plan'])
+    expect(opts.filter(o => o.scope === 'phase').map(o => o.entry))
+      .toEqual(['review', 'execute', 'verify', 'accept', 'integrate', 'observer'])
+  })
+
+  it('测试验证 / 验收 / 观察永远禁用,而且给出能照做的下一步', () => {
+    // 它们跑在别的 step 内部,没有自己的入口。只说「不可用」是半句话 ——
+    // 用户想重跑的那件事通常还是做得到的,只是入口在别处。
+    const n = node('x', { kind: 'executable', childIds: [] })
+    const opts = redoOptions(n, new Map([['x', n]]), { seatCount: { verify: 3, observer: 3 } })
+    for (const [entry, hint] of [['verify', '从执行重做'], ['accept', '从执行重做'], ['observer', '从集成验收重做']] as const) {
+      const o = opts.find(x => x.entry === entry)!
+      expect(`${entry}:${o.disabled ? 'disabled' : 'ENABLED'}`).toBe(`${entry}:disabled`)
+      expect(o.disabled).toContain(hint)
+    }
+  })
+
+  it('质疑讨论重做:没有方案就按不动', () => {
+    // 空方案上重跑评审 = 让评审员对着空白发表意见。
+    const empty = node('x', { kind: 'executable' })
+    expect(redoOptions(empty, new Map([['x', empty]])).find(o => o.entry === 'review')!.disabled)
+      .toContain('还没有方案')
+    const planned = node('y', { kind: 'executable', plan: { solution: '这么干', keyPoints: '', risks: '', acceptance: '' } })
+    expect(redoOptions(planned, new Map([['y', planned]])).find(o => o.entry === 'review')!.disabled)
+      .toBeUndefined()
+  })
+
+  it('本次配置把某个环节整个跳掉时,从它重做按不动', () => {
+    // 按下去一个环节都不会跑 —— 那就不该能按下去。
+    const planned = node('y', { kind: 'executable', plan: { solution: '这么干', keyPoints: '', risks: '', acceptance: '' } })
+    const o = redoOptions(planned, new Map([['y', planned]]), { skipSteps: ['review'] }).find(x => x.entry === 'review')!
+    expect(o.disabled).toContain('不会跑任何环节')
   })
 
   it('拆分任务不给「执行重做」—— 它自己没有执行环节', () => {
@@ -499,17 +541,17 @@ describe('环节实况:屏幕上那句话必须是真的', () => {
     // 测试验证是 opt-in(phaseRoles.verify.length > 0),而 emptyPhaseRoles() 给的默认是
     // 0 席。大多数用户不配角色,所以原来那句无条件的「执行 → 测试验证 → 验收」
     // 对大多数用户就是假的。
-    expect(phaseChainText('execute', {})).toBe('执行 → 验收;不跑:测试验证(未配置角色,该环节不存在)')
+    expect(phaseChainText('execute', {})).toBe('执行 → 验收;不跑:测试验证、观察(未配置角色,这些环节不存在)')
   })
 
   it('配了验证角色就三步都写', () => {
-    expect(phaseChainText('execute', { seatCount: { verify: 2 } })).toBe('执行 → 测试验证 → 验收')
+    expect(phaseChainText('execute', { seatCount: { verify: 2, observer: 1 } })).toBe('执行 → 测试验证 → 验收 → 观察')
   })
 
   it('skipSteps 跳过的环节,原因和「没配角色」要分开说', () => {
     // 两种原因的补救办法完全不同:一个是去配角色,一个是去掉 skipSteps。
-    const t = phaseChainText('execute', { seatCount: { verify: 1 }, skipSteps: ['accept'] })
-    expect(t).toContain('本次配置跳过')
+    const t = phaseChainText('execute', { seatCount: { verify: 1, observer: 1 }, skipSteps: ['accept'] })
+    expect(t).toContain('验收(本次配置跳过)')
     expect(t).not.toContain('未配置角色')
   })
 
@@ -521,7 +563,7 @@ describe('环节实况:屏幕上那句话必须是真的', () => {
   it('accept 没配席位不算不存在 —— 它会回落到别的席位,照样发生', () => {
     // 把「0 席 = 不发生」写成通用规则的话,没配验收角色的 run 会被告知不做验收,
     // 而它其实是做的。只有 verify 有「没配就整个不存在」这个性质。
-    expect(phaseChainText('execute', { seatCount: { accept: 0, verify: 1 } })).toBe('执行 → 测试验证 → 验收')
+    expect(phaseChainText('execute', { seatCount: { accept: 0, verify: 1, observer: 1 } })).toBe('执行 → 测试验证 → 验收 → 观察')
   })
 
   it('方案重做的链条也照实算', () => {
@@ -532,6 +574,31 @@ describe('环节实况:屏幕上那句话必须是真的', () => {
 
   it('集成验收就一个环节', () => {
     expect(phasesOf('integrate', {})).toEqual(['integrate'])
+  })
+
+  it('观察和测试验证一样是 opt-in —— 没配席位就整个不存在', () => {
+    // scoreNode 的第一句判据就是 seats.length === 0 → return false。把「0 席 = 不发生」
+    // 写成通用规则的话,没配验收角色的 run 会被告知不做验收,而它其实是做的。
+    expect(phaseRuns('observer', {})).toBe(false)
+    expect(phaseRuns('observer', { seatCount: { observer: 1 } })).toBe(true)
+    expect(phaseRuns('accept', {})).toBe(true)
+  })
+
+  it('两种「不跑」的理由分组写,不是一个环节一个括号', () => {
+    // 链从 3 条长到 6 条之后逐条写就是同一句理由印两遍,而这一行本来就已经在 80 列上折行。
+    const t = phaseChainText('plan', { skipSteps: ['review'] })
+    expect(t).toContain('质疑讨论(本次配置跳过)')
+    expect(t).toContain('测试验证、观察(未配置角色,这些环节不存在)')
+  })
+
+  it('质疑讨论重做只跑一个环节', () => {
+    expect(phasesOf('review', {})).toEqual(['review'])
+  })
+
+  it('不能单独重入的三个,链是空的', () => {
+    for (const p of ['verify', 'accept', 'observer'] as const) {
+      expect(`${p}:${phasesOf(p, { seatCount: { verify: 9, observer: 9 } }).join()}`).toBe(`${p}:`)
+    }
   })
 })
 
@@ -573,5 +640,158 @@ describe('redoSummary', () => {
     expect(lines).not.toContain('删除')
     expect(lines).not.toContain('依赖')
     expect(lines).not.toContain('⚠')
+  })
+})
+
+/**
+ * 席位来源。
+ *
+ * 这一段是崩溃那条的正面:`Object.fromEntries(PHASE_NAMES.map(…))` 原来就地长在
+ * efftask.tsx 的 JSX 里,而 `PHASE_NAMES` **没有被导入** —— 仓库没有 typecheck,
+ * 于是它一路过了打包,按下 r 就是一屏 ReferenceError。搬进来不只是为了修那一行,
+ * 更是为了让「席位从哪儿取」这件事有接缝可测 —— 而它取错了地方。
+ */
+describe('redoContextOf', () => {
+  it('席位从**目标节点**上取,不是从 run 配置上取', () => {
+    /**
+     * applyRosterToNodes 的第一句是 `if (n.status === 'ACCEPTED') continue`,而重做目标
+     * 绝大多数正是 ACCEPTED 节点。resume 时新加一个测试验证席位:run 配置上有了,
+     * 那个节点上没有 —— 而真正决定环节跑不跑的是 pipeline 里读的 node.phaseRoles.verify。
+     * 拿 config 去算的话,关口会承诺一个这个节点上根本不存在的环节。
+     */
+    const n = node('x', {
+      status: 'ACCEPTED',
+      phaseRoles: { ...Object.fromEntries(PHASE_NAMES.map(p => [p, []])), verify: [] } as TaskNode['phaseRoles'],
+    })
+    expect(redoContextOf(n).seatCount?.verify).toBe(0)
+    expect(phaseChainText('execute', redoContextOf(n))).toContain('测试验证')
+    expect(phaseChainText('execute', redoContextOf(n))).toContain('未配置角色')
+  })
+
+  it('节点上真的有席位时就照实算', () => {
+    const seat = { roleTag: 'v', roleName: '测试员' } as unknown as TaskNode['phaseRoles']['verify'][number]
+    const n = node('x', {
+      phaseRoles: { ...Object.fromEntries(PHASE_NAMES.map(p => [p, []])), verify: [seat] } as TaskNode['phaseRoles'],
+    })
+    expect(redoContextOf(n).seatCount?.verify).toBe(1)
+    expect(phaseChainText('execute', redoContextOf(n))).toContain('执行 → 测试验证 → 验收')
+  })
+
+  it('skipSteps 从 run 配置来 —— 那本来就是 run 级的', () => {
+    const n = node('x')
+    expect(redoContextOf(n, { skipSteps: ['accept'] }).skipSteps).toEqual(['accept'])
+  })
+
+  it('phaseRoles 整个缺失(手改过的 node.md)也不抛', () => {
+    const broken = { ...node('x'), phaseRoles: undefined } as unknown as TaskNode
+    expect(redoContextOf(broken).seatCount?.execute).toBe(0)
+  })
+})
+
+describe('从「质疑讨论」重做', () => {
+  const planned = (over: Partial<TaskNode> = {}): TaskNode => node('x', {
+    plan: { solution: '这么干', keyPoints: '', risks: '', acceptance: '' },
+    status: 'ACCEPTED', ...over,
+  })
+
+  it('写下一次性的重入标记 —— CREATED 这一个座位对应两个起点,光靠 status 分不开', () => {
+    const p = ok(planRedo([planned()], 'x', 'review', 'T1'))
+    const t = p.nodes.find(n => n.id === 'x')!
+    expect(t.redoFrom).toBe('review')
+    expect(t.status).toBe('CREATED')
+  })
+
+  it('方案、子任务、工作区一律不动 —— 这一条不碰代码', () => {
+    const parent = planned({ kind: 'decompose', childIds: ['x/00-k'], worktree: { branch: 'b', path: '/wt/x' } })
+    const kid = node('x/00-k', { parentId: 'x', status: 'ACCEPTED' })
+    const p = ok(planRedo([parent, kid], 'x', 'review', 'T1'))
+    const t = p.nodes.find(n => n.id === 'x')!
+    expect(t.plan.solution).toBe('这么干')
+    expect(t.childIds).toEqual(['x/00-k'])
+    expect(t.worktree).toEqual({ branch: 'b', path: '/wt/x' })
+    expect(p.deleted).toEqual([])
+    expect(p.worktreesToRelease).toEqual([])
+  })
+
+  it('不往 execStatus 里写重做注记 —— 工作区没有被重置,那句话会是假的', () => {
+    const p = ok(planRedo([planned({ execStatus: '我改了 a.ts' })], 'x', 'review', 'T1'))
+    expect(p.nodes.find(n => n.id === 'x')!.execStatus).toBe('我改了 a.ts')
+  })
+
+  it('清掉启动关口的确认稿 —— 用户要重判的是**现在这份**方案', () => {
+    const p = ok(planRedo([planned({ confirmedDraft: { children: [{ title: '旧', deps: [] }] } })], 'x', 'review', 'T1'))
+    expect(p.nodes.find(n => n.id === 'x')!.confirmedDraft).toBeUndefined()
+  })
+
+  it('评审轮次清零,别的预算不动', () => {
+    const p = ok(planRedo([planned({ iteration: { planReview: 3, acceptance: 2, integration: 1, scoring: 1, mergeResolve: 1 } })], 'x', 'review', 'T1'))
+    const t = p.nodes.find(n => n.id === 'x')!
+    expect(t.iteration).toEqual({ planReview: 0, acceptance: 2, integration: 1, scoring: 1, mergeResolve: 1 })
+  })
+
+  it('别的入口会把上一次留下的标记**清掉**', () => {
+    // 不清的话,这次「任务重做」会跳过分析 —— 那正是它唯一要做的事。
+    const p = ok(planRedo([planned({ redoFrom: 'review' })], 'x', 'execute', 'T1'))
+    expect(p.nodes.find(n => n.id === 'x')!.redoFrom).toBeUndefined()
+  })
+})
+
+describe('重做注记按产出去哪儿了分两种', () => {
+  const leaf = (over: Partial<TaskNode> = {}) => node('x', { execStatus: '我实现了 feature.ts', ...over })
+
+  it('已验收的节点:产出已合进集成分支,新工作区里**能看到**它', () => {
+    // 原来无条件写「产出在当前工作区里不存在」,而这对 ACCEPTED 节点是假的:
+    // 通过验收那一刻 mergeAndRelease 已经把它合进集成分支,而重做后重新 acquire 的
+    // 工作区正是基于集成分支 tip 建的。执行者被告知从零开始,却在树里找到自己上一轮的产出。
+    const p = ok(planRedo([leaf({ status: 'ACCEPTED' })], 'x', 'execute', 'T1'))
+    const s = p.nodes.find(n => n.id === 'x')!.execStatus
+    expect(s).toContain('能看到')
+    expect(s).toContain('不要从零重做')
+  })
+
+  it('没走到验收的节点:产出确实不在了', () => {
+    const p = ok(planRedo([leaf({ status: 'BLOCKED', blockedReason: '返工上限' })], 'x', 'execute', 'T1'))
+    expect(p.nodes.find(n => n.id === 'x')!.execStatus).toContain('不在')
+  })
+
+  it('两种注记只写一次 —— 重做两轮不会叠', () => {
+    const once = ok(planRedo([leaf({ status: 'ACCEPTED' })], 'x', 'execute', 'T1'))
+    const twice = ok(planRedo(once.nodes, 'x', 'execute', 'T2'))
+    const s = twice.nodes.find(n => n.id === 'x')!.execStatus
+    expect(s.split('本节点被手工重做')).toHaveLength(2)
+  })
+})
+
+describe('确认屏要摊开的后果', () => {
+  it('已验收的节点会退出终态 —— 本次运行不再算完成', () => {
+    // seatedAt 一直算出来了、也一直在返回值里,但一行都没渲染过。用户是在
+    // 「✓ 高效任务完成」那一屏上按的 r,他有理由以为这只是加跑一轮。
+    const t = node('x', { status: 'ACCEPTED' })
+    const p = ok(planRedo([t], 'x', 'execute', 'T1'))
+    const lines = redoSummary(p, t, 'execute')
+    expect(lines.some(l => l.includes('不再算完成'))).toBe(true)
+  })
+
+  it('还没验收的节点不说这句 —— 它本来就没算完成', () => {
+    const t = node('x', { status: 'BLOCKED', blockedReason: '返工上限' })
+    const p = ok(planRedo([t], 'x', 'execute', 'T1'))
+    expect(redoSummary(p, t, 'execute').some(l => l.includes('不再算完成'))).toBe(false)
+  })
+
+  it('「释放工作区」要说清脏改动会被固化到 salvage 分支 —— 那不是清理', () => {
+    // release 在工作区仍有未提交文件时拒删,下一次 acquire 走复用分支:add -A →
+    // commit --no-verify → branch -f efftask/<run>/salvage/… → checkout -B。
+    // 用户手改的东西被提交进一条他从没听说过的分支,目录被重置。
+    const t = node('x', { status: 'ACCEPTED', worktree: { branch: 'b', path: '/wt/x' } })
+    const p = ok(planRedo([t], 'x', 'execute', 'T1'))
+    const line = redoSummary(p, t, 'execute').find(l => l.includes('释放'))!
+    expect(line).toContain('salvage')
+    expect(line).toContain('未提交')
+  })
+
+  it('返工额度会重新给 —— 这是这次重做的直接成本', () => {
+    const t = node('x')
+    const p = ok(planRedo([t], 'x', 'execute', 'T1'))
+    expect(redoSummary(p, t, 'execute').some(l => l.includes('返工计数清零'))).toBe(true)
   })
 })

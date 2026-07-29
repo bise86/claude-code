@@ -53,6 +53,7 @@ import { buildForkedMessages, buildWorktreeNotice, FORK_AGENT, isForkSubagentEna
 import type { AgentDefinition } from './loadAgentsDir.js';
 import { filterAgentsByMcpRequirements, hasRequiredMcpServers, isBuiltInAgent } from './loadAgentsDir.js';
 import { getPrompt } from './prompt.js';
+import { isTranslatingProtocol } from '../../services/api/openaiCompat/protocols.js';
 import { runAgent } from './runAgent.js';
 import { renderGroupedAgentToolUse, renderToolResultMessage, renderToolUseErrorMessage, renderToolUseMessage, renderToolUseProgressMessage, renderToolUseRejectedMessage, renderToolUseTag, userFacingName, userFacingNameBackgroundColor } from './UI.js';
 
@@ -421,7 +422,8 @@ export const AgentTool = buildTool({
     // selectedAgent.model for these (it passes undefined instead), so the engine
     // actually runs a Claude alias. Mirror that guard here so telemetry reports
     // the model the engine actually used rather than the openai backend model string.
-    const isOpenAIRole = selectedAgent.roleClientConfig?.apiProtocol === 'openai';
+    // 同 runAgent.ts:判据是「不是 anthropic」,否则新协议的员工遥测记的是错的模型。
+    const isOpenAIRole = isTranslatingProtocol(selectedAgent.roleClientConfig?.apiProtocol);
     const resolvedAgentModel = getAgentModel(isOpenAIRole ? undefined : selectedAgent.model, toolUseContext.options.mainLoopModel, isForkPath ? undefined : model, permissionMode);
     logEvent('tengu_agent_tool_selected', {
       agent_type: selectedAgent.agentType as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,

@@ -1,4 +1,4 @@
-import { planRedo, type RedoEntry, type RedoPlan } from './redo.js'
+import { planRedo, type RedoContext, type RedoEntry, type RedoPlan } from './redo.js'
 import type { TaskNode } from './types.js'
 
 /**
@@ -40,8 +40,11 @@ export async function runRedo(
   entry: RedoEntry,
   now: string,
   deps: RedoRunDeps,
+  // 关口预演用的是同一份 ctx。不传下来的话「屏幕上算给你看的」和「真的执行的」会是
+  // 两次不同的计算 —— 而用户是照着屏幕做的决定。
+  ctx?: RedoContext,
 ): Promise<void> {
-  const computed = planRedo(nodes, targetId, entry, now)
+  const computed = planRedo(nodes, targetId, entry, now, ctx)
   if ('error' in computed) {
     // 算不出来就**什么都不做**:planRedo 是纯函数,到这里盘上一个字节都没动过。
     // 关口关掉、把原因显示出来,用户可以换一个环节再试。

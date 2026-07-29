@@ -180,13 +180,28 @@
 角色通过 HTTP API 调用第三方 LLM 服务进行推理。需要配置 API 连接参数。
 
 **额外必需字段：**
-- `apiProtocol`：API 协议类型（`'anthropic'` \| `'openai'`）
+- `apiProtocol`：API 协议类型（`'anthropic'` \| `'openai'` \| `'openai-responses'`）
+  - `'openai'` 走 `{apiUrl}/chat/completions`；`'openai-responses'` 走 `{apiUrl}/responses`（OpenAI Responses API）
+  - 写错的协议名会让**整条员工不被载入**（不是「这个字段不生效」）。原因会显示在 `/et` 的启动关口上
 - `apiUrl`：API 端点 URL
 - `apiToken`：API 认证令牌（明文存储；生产环境建议使用环境变量）
 - `model`：使用的模型标识符
 
 **可选字段：**
-- `thinkingDepth`：思考深度（仅 Anthropic 协议支持）。可选值：`'low'` \| `'medium'` \| `'high'` \| `'max'` 或一个数字。无效值会被忽略
+- `thinkingDepth`：思考深度。可选值：`'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`，或一个整数。大小写不敏感
+
+  **三种协议收得下的档位不一样**，所以这个值会按「协议 + 模型」翻译一次，翻不过去的时候会在 `/et` 启动关口上说出来（而不是静默丢掉）：
+
+  | 你写的 | anthropic | openai / openai-responses |
+  |--------|-----------|---------------------------|
+  | low / medium / high | 原样发 `output_config.effort` | 原样发 `reasoning_effort` / `reasoning.effort` |
+  | `xhigh` | **降成 high**（Anthropic 没有这一档） | 原样发 |
+  | `max` | 原样发（模型不支持 max 时 API 侧按 high 处理） | **译成 xhigh**（OpenAI 没有这一档） |
+  | 整数 | ant-only 的 `effort_override` | **不发**（OpenAI 只收档位名） |
+
+  还有一条和模型有关的：**Anthropic 协议下模型不支持 effort 参数时，这个值整段不发**。判据是 `modelSupportsEffort`，`claude-3-5-sonnet-20241022` 这类旧模型不在名单里。这种情况关口上会写明。
+
+  认不出来的值（比如 `'deep'`）会被忽略，并在关口上列出可用值。
 
 #### `cli` 模式
 
@@ -234,12 +249,12 @@
 **说明：**
 - `apiUrl` 可以是 Anthropic 官方地址（`https://api.anthropic.com`）或任何兼容的第三方服务
 - `model` 由服务提供商指定；MiniMax 使用 `gpt-4o`，Anthropic 官方使用 `claude-3-5-sonnet-20241022` 等
-- `thinkingDepth` 值（如 `'high'` 或 `'max'`）会映射到 Anthropic API 的 `output_config.effort` 参数
-- 无效的 `thinkingDepth` 值（如 `'deep'`、大小写错误等）会被忽略，不会发送到 API
+- `thinkingDepth` 值（如 `'high'` 或 `'max'`）会映射到 Anthropic API 的 `output_config.effort` 参数——**前提是这个模型支持 effort**（见上面 `thinkingDepth` 那一节）
+- 无效的 `thinkingDepth` 值（比如 `'deep'`）会被忽略。**大小写不算无效**：`'HIGH'` 和 `'high'` 一样有效
 
-#### OpenAI 协议
+#### OpenAI 协议（chat/completions）
 
-用于接入 OpenAI 官方 API 或兼容的第三方 OpenAI 格式服务。
+用于接入 OpenAI 官方 API 或兼容的第三方 OpenAI 格式服务（DeepSeek / Kimi / GLM / 通义 / MiniMax / vLLM / SGLang / OpenRouter 等）。请求发往 `{apiUrl}/chat/completions`。
 
 **配置示例：**
 
@@ -254,6 +269,34 @@
       "apiUrl": "https://api.openai.com/v1",
       "apiToken": "sk-proj-your-openai-key-here",
       "model": "gpt-4o",
+      "tools": ["bash", "grep"]
+    }
+  ]
+}
+```
+
+#### OpenAI Responses 协议
+
+用于接入 OpenAI 的 **Responses API**（`{apiUrl}/responses`）。和 chat/completions 的区别不只是路由：
+
+- **思考过程能上屏**。请求里带 `reasoning.summary: 'auto'`，模型的推理摘要会作为思考内容显示在子 agent 输出里。
+- **推理片段跨轮往返**。带工具调用的轮次必须把上一轮的 reasoning item 一起回传，否则上游直接 400（`function_call was provided without its required reasoning item`）。这条桥是无状态的，所以请求里带 `store: false` + `include: ['reasoning.encrypted_content']`，密文搭 Anthropic thinking 块的签名往返——**你不需要配置任何东西**，但这解释了为什么这个协议的请求体里有这两个字段。
+- **对话不留在 OpenAI 侧**（`store: false`）。
+
+**配置示例：**
+
+```json
+{
+  "roles": [
+    {
+      "name": "gpt5-architect",
+      "whenToUse": "复杂架构设计，需要深度推理",
+      "execMode": "api",
+      "apiProtocol": "openai-responses",
+      "apiUrl": "https://api.openai.com/v1",
+      "apiToken": "sk-proj-your-openai-key-here",
+      "model": "gpt-5.1",
+      "thinkingDepth": "xhigh",
       "tools": ["bash", "grep"]
     }
   ]
@@ -494,7 +537,7 @@ main()
       "apiProtocol": "anthropic",
       "apiUrl": "https://api.anthropic.com",
       "apiToken": "sk-ant-your-key-here",
-      "model": "claude-3-5-sonnet-20241022",
+      "model": "claude-opus-4-6",
       "thinkingDepth": "max",
       "tools": ["web_search", "file_read", "bash"],
       "prompt": "你是一个专业的研究分析师，需要深入思考并给出准确结论。"

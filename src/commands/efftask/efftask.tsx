@@ -8,6 +8,7 @@ import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from '../../Tool.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
 import { collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
+import { collectRoleLoadIssues } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { searchUnavailableReason } from '../../utils/ripgrep.js'
@@ -17,7 +18,7 @@ import { createWorktreePool, type GitRunner, type WorktreePool } from '../../too
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
-import { redoUnavailableReason, type RedoEntry } from '../../tools/efftask/redo.js'
+import { redoContextOf, redoUnavailableReason, type RedoEntry } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
 import { runRedo } from '../../tools/efftask/redoRun.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
@@ -363,6 +364,20 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     humanTimeoutMs: () => capsRef.humanTimeoutMs,
   })
 
+  /**
+   * 载入员工时**没按你写的那样生效**的那些事,搬到关口上。
+   *
+   * 此前它们只走 `console.error`,而实测 ink 的 `patchConsole` 把 warn/error/trace 全部
+   * 改写成 `logError` —— 只进 debug 日志文件,交互式会话的屏幕上一个字都不会出现。
+   * 后果:`apiProtocol` 少写一个 s、`thinkingDepth` 写成 JSON 数字,整条员工被跳过,
+   * 而用户只看到「这个员工不存在」,分不清是自己打错字还是这个功能没做。
+   *
+   * 落点选 notices 是因为那一块的标题恰好就是「你的请求中有以下部分不会生效」——
+   * 语义严丝合缝,而且它跟着 run.md 落盘,`--resume` 之后还在。
+   */
+  const roleLoadNotices = (): string[] =>
+    collectRoleLoadIssues().map(i => `员工「${i.name}」(来自 ${i.source}): ${i.reason}`)
+
   const knownRoles = activeAgents.map(a => a.agentType)
   // execMode:'cli' roles are dispatched by AgentTool, not runAgent — this seam cannot run
   // them, so they must be reported at the gate rather than silently downgraded to the main
@@ -415,7 +430,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       // settings.json 里配好的角色定义。读在这里而不是 parseDirectives 里面,是因为那个
       // 文件是纯函数、不碰全局状态,整套解析/合并/展平才能不搭环境地测。
       baseRoleDefs={collectedRoles.defs}
-      baseRoleNotices={[...collectedRoles.notices, ...collectedSkip.notices]}
+      baseRoleNotices={[...roleLoadNotices(), ...collectedRoles.notices, ...collectedSkip.notices]}
       baseSkipSteps={collectedSkip.steps}
       mcpToolNames={context.options.tools.filter(t => t.name.startsWith('mcp__')).map(t => t.name)}
       // The roster must say which model each seat runs on, and that answer lives in the
@@ -1200,7 +1215,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       onNodes: setNodes,
       start: n => startRun(cfg, n),
       onDone: () => setPhase('done'),
-    })
+    // 关口预演和真正执行用**同一份**环节实况,否则屏幕上算出来的后果和实际发生的
+    // 可以不一样,而用户是照着屏幕按的确认。
+    }, redoContextOf(target, cfg))
     // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
   }, [config, runDir, nodes, props.fs, startRun])
 
@@ -1568,14 +1585,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         nodes={nodes}
         targetId={redoTarget.id}
         now={new Date().toISOString()}
-        // 环节实况从**本次 run 的真实配置**里来,不是写死的文案 —— 否则默认配置下
-        // 关口会承诺一个根本不存在的测试验证环节。
-        phases={{
-          seatCount: Object.fromEntries(
-            PHASE_NAMES.map(p => [p, config.phaseRoles[p]?.length ?? 0]),
-          ),
-          skipSteps: config.skipSteps,
-        }}
+        // 环节实况从**目标节点自己的名册**里来,不是写死的文案、也不是 run 配置 ——
+        // 否则默认配置下关口会承诺一个根本不存在的测试验证环节,而拿 config 去算又会
+        // 承诺一个**这个节点上**不存在的环节(applyRosterToNodes 的第一句就是
+        // `if (n.status === 'ACCEPTED') continue`,而重做目标绝大多数正是 ACCEPTED)。
+        //
+        // 这一句原来是就地展开的 `Object.fromEntries(PHASE_NAMES.map(…))`,而 PHASE_NAMES
+        // **没有被导入**(第 35 行的值导入里没它,第 36 行是 import type,编译期就擦掉了)。
+        // 仓库没有 typecheck,于是它一路过了打包 —— 按下 r 就是一屏 ReferenceError,
+        // 而重做这个功能从任何路径都到不了。搬进 redo.ts 是为了让它有接缝可测。
+        phases={redoContextOf(redoTarget, config)}
         onConfirm={entry => applyRedo(redoTarget, entry)}
         onCancel={() => { setRedoTarget(null); setPhase('done') }}
       />

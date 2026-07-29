@@ -284,6 +284,20 @@ export interface TaskNode {
    * the gate's tree different ids from the run's.
    */
   confirmedDraft?: { children: { title: string; deps: string[] }[] }
+  /**
+   * 手工重做指定的**重入环节**。一次性,由 step* 在第一轮消费后立刻清掉。
+   *
+   * 为什么需要多这一个字:`advanceableKind` 只认三个座位(CREATED / READY / WAITING_CHILDREN),
+   * 而 CREATED 这一个座位对应 `stepStart` 里的**两个**起点 —— 分析和质疑讨论。
+   * 「从质疑讨论重做」要保留现有方案只重判一次,光靠 status 分不出来。
+   *
+   * 形状照 `confirmedDraft` / `mergeConflict`:一个持久化的标志选 step **内部**的入口,
+   * 座位只负责让调度器把节点捡起来。这不是新发明,是这个文件里已经用了两次的模式。
+   *
+   * 落盘是白拿的(serializeNode 整节点倾倒),所以真正要补的是**读回**校验 ——
+   * node.md 按设计可以手工编辑,而这个字段决定节点从哪个环节重入。见 resumeCore。
+   */
+  redoFrom?: PhaseName
   reviewLog: RoundtableRecord[]
   acceptLog: RoundtableRecord[]
   score: { plan?: ScoreRecord; exec?: ScoreRecord }

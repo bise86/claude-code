@@ -414,6 +414,29 @@ describe('恢复:capCategory 也必须校验', () => {
   it('非字符串也被清掉', () => {
     expect(validateLoadedNodes([b({ capBlocked: true, capCategory: true })], o).nodes[0].capCategory).toBeUndefined()
   })
+
+  /**
+   * 手工重做的重入点。和 capCategory 完全同因:node.md 是可手工编辑的(升级卡片就在叫
+   * 用户去改它),而这个字段决定节点**从哪个环节重入**。落盘是白拿的(serializeNode
+   * 整节点倾倒,没有白名单),所以唯一的缺口正是在读回这一侧 —— 实测垃圾值原样穿过。
+   */
+  it('合法环节名原样保留', () => {
+    expect(validateLoadedNodes([b({ redoFrom: 'review' })], o).nodes[0].redoFrom).toBe('review')
+  })
+
+  it('不是环节名的重入点被清掉并记一笔', () => {
+    const { nodes, repairs } = validateLoadedNodes([b({ redoFrom: '随便写的' })], o)
+    expect(nodes[0].redoFrom).toBeUndefined()
+    expect(repairs.some(r => r.includes('重做入口'))).toBe(true)
+  })
+
+  it('非字符串的重入点也被清掉', () => {
+    expect(validateLoadedNodes([b({ redoFrom: 42 })], o).nodes[0].redoFrom).toBeUndefined()
+  })
+
+  it('旧盘上没有这个字段时不误报修复 —— 兼容不能靠运气', () => {
+    expect(validateLoadedNodes([b({})], o).repairs.some(r => r.includes('重做入口'))).toBe(false)
+  })
 })
 
 

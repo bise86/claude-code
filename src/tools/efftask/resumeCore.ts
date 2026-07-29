@@ -379,6 +379,14 @@ export function validateLoadedNodes(
       repairs.push(`节点 ${n.id}:安全阀类别 ${String(n.capCategory)} 无法识别,已清除`)
       n.capCategory = undefined
     }
+    // 手工重做的重入点。和上面 capCategory 完全同因:node.md 是可手工编辑的(升级卡片
+    // 就在叫用户去改它),而这个字段决定节点**从哪个环节重入**。落盘是白拿的
+    // (serializeNode 整节点倾倒,没有白名单),所以唯一的缺口正是在这一侧 ——
+    // 实测垃圾值原样穿过。不认识的一律清掉,退化成「从分析重来」,而不是一个未定义的入口。
+    if (n.redoFrom !== undefined && !(PHASE_NAMES as string[]).includes(n.redoFrom as string)) {
+      repairs.push(`节点 ${n.id}:重做入口 ${String(n.redoFrom)} 不是合法环节名,已清除`)
+      n.redoFrom = undefined
+    }
     // 根方案关口 (spec §2 第三关) 的确认结果。Reachable on disk when the run was aborted
     // before the root's first commit consumed it, so it must survive — but it is also the one
     // field that SKIPS the plan phase, and a malformed one would send an empty plan straight

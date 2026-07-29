@@ -1,3 +1,4 @@
+import { isTranslatingProtocol } from '../../services/api/openaiCompat/protocols.js'
 import { PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from './types.js'
 
@@ -27,7 +28,10 @@ export interface AgentModelInfo {
  */
 export function effectiveModel(agent: AgentModelInfo | undefined, mainModel: string): string {
   if (!agent) return mainModel // no such role → pickAgentDefinition falls back to the main default
-  if (agent.roleClientConfig?.apiProtocol === 'openai') {
+  // 判据是「**不是** anthropic」,不是「等于 openai」—— 写死一个协议名的话,
+  // openai-responses 员工会在这里回落到 Claude 兜底模型,而 /et 启动关口正是拿这个
+  // 函数算「角色←员工(模型)」那一行:屏幕上会**把员工的模型显示错**。
+  if (isTranslatingProtocol(agent.roleClientConfig?.apiProtocol)) {
     return agent.roleClientConfig.backendModel || mainModel
   }
   const m = agent.model?.trim()

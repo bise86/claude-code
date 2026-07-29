@@ -3,6 +3,10 @@ import { readFileSync } from 'node:fs'
 import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
 import { redoOptions, redoUnavailableReason } from './redo'
+import { ROLE_API_PROTOCOLS } from '../../services/api/openaiCompat/protocols'
+import { toResponsesRequest } from '../../services/api/openaiCompat/toResponsesRequest'
+import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from '../AgentTool/roles/roleThinking'
+import { modelSupportsEffort } from '../../utils/effort'
 import { REASONING_FIELDS } from '../../services/api/openaiCompat/fromOpenAIStream'
 import { logPaneAction, sectionPaneAction, detailEntryHint, collapsedLinesFor } from '../../commands/efftask/logView'
 import type { Key } from '../../ink/events/input-event'
@@ -288,6 +292,87 @@ describe('README 列的推理字段名,和协议转换层认的是同一份', ()
     for (const [name, doc] of DOCS) {
       expect(`${name} 有没有说「想看到思考就得配 thinkingDepth」: ${doc.includes(norm('想看到思考就得配'))}`)
         .toBe(`${name} 有没有说「想看到思考就得配 thinkingDepth」: false`)
+    }
+  })
+})
+
+/**
+ * 员工协议与思考级别:文档说的和代码干的是同一件事。
+ *
+ * 这一节是被两句**已经上线的错话**逼出来的,而且它们互相矛盾:
+ * `roles-setup.md` 写着「thinkingDepth 仅 Anthropic 协议支持」,README 同时写着它在
+ * openai 上译成 `reasoning_effort` —— 两份已发布文档在同一件事上说反话,而闸门只钉住了
+ * README 那一半。
+ */
+describe('员工协议与思考级别', () => {
+  it('三种协议名两份文档都列全 —— 少写一个,用户就配不出来', () => {
+    for (const [name, doc] of DOCS) {
+      for (const p of ROLE_API_PROTOCOLS) {
+        expect(`${name} 列了 ${p}: ${doc.includes(p)}`).toBe(`${name} 列了 ${p}: true`)
+      }
+    }
+  })
+
+  it('「仅 Anthropic 协议支持」这句已经作废,不许留在任何一份文档里', () => {
+    for (const [name, doc] of DOCS) {
+      expect(`${name} 还留着那句话: ${doc.includes(norm('思考深度（仅 Anthropic 协议支持）'))}`)
+        .toBe(`${name} 还留着那句话: false`)
+    }
+  })
+
+  it('五个档位逐字对得上代码里的那个列表', () => {
+    // 文档少写一档,用户就不会去用它;多写一档,他配了会被静默忽略。
+    for (const l of ROLE_THINKING_LEVELS) {
+      expect(`roles-setup 列了 ${l}: ${ROLES_DOC.includes(l)}`).toBe(`roles-setup 列了 ${l}: true`)
+    }
+  })
+
+  it('两条翻译规则,文档写的方向和代码一致', () => {
+    // xhigh 在 anthropic 上降成 high;max 在 OpenAI 两条协议上译成 xhigh。
+    const a = resolveRoleThinking({ level: 'xhigh', protocol: 'anthropic', model: 'claude-opus-4-6-x' })
+    expect(a.value).toBe('high')
+    expect(ROLES_DOC).toContain(norm('**降成 high**'))
+
+    const o = resolveRoleThinking({ level: 'max', protocol: 'openai-responses', model: 'gpt-5.1' })
+    expect(o.value).toBe('xhigh')
+    expect(ROLES_DOC).toContain(norm('**译成 xhigh**'))
+  })
+
+  it('「数字只有 anthropic 收」这句是真的', () => {
+    expect(resolveRoleThinking({ level: 120, protocol: 'openai', model: 'gpt-5.1' }).value).toBeUndefined()
+    expect(resolveRoleThinking({ level: 120, protocol: 'anthropic', model: 'claude-opus-4-6-x' }).value).toBe(120)
+    expect(ROLES_DOC).toContain(norm('**不发**（OpenAI 只收档位名）'))
+  })
+
+  it('文档不能再说「大小写错误会被忽略」—— 解析是大小写不敏感的', () => {
+    expect(parseRoleThinking('HIGH')).toBe('high')
+    for (const [name, doc] of DOCS) {
+      expect(`${name} 还说大小写会被忽略: ${doc.includes(norm('`\'deep\'`、大小写错误等'))}`)
+        .toBe(`${name} 还说大小写会被忽略: false`)
+    }
+  })
+
+  it('文档里那个「配 thinkingDepth」的 anthropic 示例,模型必须真的支持 effort', () => {
+    /**
+     * 原来配的是 claude-3-5-sonnet-20241022 + thinkingDepth:"max" —— 而
+     * configureEffortParams 的第一句就是 `if (!modelSupportsEffort(model)) return`,
+     * 那份示例做不到它自己写的事,而屏幕上一句提示都没有。
+     */
+    // norm() 把 ASCII 冒号换成了全角,所以这里按全角匹配 —— 按 ASCII 写的话正则永远
+    // 不命中,而「找不到示例」会被当成通过,这条断言就成了一句永远为真的话。
+    const m = ROLES_DOC.match(/"model"：\s*"(claude[^"]+)"，\s*"thinkingDepth"/)
+    expect(`找到了那个示例: ${m !== null}`).toBe('找到了那个示例: true')
+    expect(`${m![1]} 支持 effort: ${modelSupportsEffort(m![1])}`).toBe(`${m![1]} 支持 effort: true`)
+  })
+
+  it('Responses 那三个请求字段,文档说的和代码发的一致', () => {
+    const body = toResponsesRequest({ messages: [] }, { backendModel: 'gpt-5.1', effort: 'high' }) as any
+    expect(body.store).toBe(false)
+    expect(body.include).toEqual(['reasoning.encrypted_content'])
+    expect(body.reasoning.summary).toBe('auto')
+    for (const s of ['store: false', 'reasoning.encrypted_content', "summary: 'auto'"]) {
+      expect(`README 或 roles-setup 提到 ${s}: ${README.includes(norm(s)) || ROLES_DOC.includes(norm(s))}`)
+        .toBe(`README 或 roles-setup 提到 ${s}: true`)
     }
   })
 })

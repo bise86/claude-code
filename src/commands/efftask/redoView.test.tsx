@@ -188,18 +188,58 @@ describe('DoneView 的重做入口', () => {
 })
 
 describe('重做关口', () => {
-  it('第一屏列出三条,不可用的写明原因而不是消失', async () => {
+  it('第一屏先选粒度 —— 任务重做和阶段重做的代价差着数量级', async () => {
     const { t, app } = await mount(
       <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
     )
     await tick()
     const f = t.lastFrame()
     app.unmount()
-    expect(f).toContain('从「方案」重做')
+    expect(f).toContain('任务重做')
+    expect(f).toContain('阶段重做')
+    // 不可逆的那一条,数量必须在第一屏就看得见。
+    expect(f).toContain('2 个子任务')
+  })
+
+  it('第二屏列出六个环节,不可用的写明原因而不是消失', async () => {
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
+    )
+    await tick()
+    t.stdin.press('[B') // ↓ 到「阶段重做」
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('从「质疑讨论」重做')
     expect(f).toContain('从「执行」重做')
+    expect(f).toContain('从「测试验证」重做')
+    expect(f).toContain('从「验收」重做')
     expect(f).toContain('从「集成验收」重做')
+    expect(f).toContain('从「观察」重做')
     // 菜单随节点类型忽隐忽现的话,用户记不住第几项是哪一项,也看不见为什么这里不能这么做。
     expect(f).toContain('拆分任务')
+  })
+
+  it('测试验证 / 验收 / 观察在屏幕上按不动,而且写着去哪儿重跑', async () => {
+    // 这三个跑在别的 step 内部,没有自己的入口。只写「不可用」是半句话 ——
+    // 用户想重跑的那件事通常还是做得到的,只是入口在别处。
+    const { t, app } = await mount(
+      <ConfirmRedo nodes={TREE()} targetId="root/00-a" now={NOW} onConfirm={() => {}} onCancel={() => {}} />,
+    )
+    await tick()
+    t.stdin.press('[B')
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    // 窄屏时只有光标那一条带说明,所以逐条走一遍把三条原因都看到。
+    let seen = ''
+    for (let i = 0; i < 6; i++) { seen += t.lastFrame(); t.stdin.press('[B'); await tick() }
+    seen += t.lastFrame()
+    app.unmount()
+    expect(seen).toContain('跑在执行环节内部')
+    expect(seen).toContain('观察评分跟在验收')
   })
 
   it('确认前先把删除数量、依赖改写和警告印出来', async () => {
@@ -230,17 +270,19 @@ describe('重做关口', () => {
       <ConfirmRedo nodes={TREE()} targetId="root" now={NOW} onConfirm={e => got.push(e)} onCancel={() => {}} />,
     )
     await tick()
-    t.stdin.press('[B') // ↓ 到「执行」(root 上不可用)
+    t.stdin.press('[B') // ↓ 到「阶段重做」
+    await tick()
+    t.stdin.press('\r')       // 进环节清单,光标落在「质疑讨论」(root 没有方案,不可用)
     await tick()
     t.stdin.press('\r')
     await tick()
     // 不可用的条目按不动 —— 按下去什么都不该发生,更不该确认成别的环节。
     expect(got).toEqual([])
-    t.stdin.press('[B') // ↓ 到「集成验收」
-    await tick()
+    // ↓×4:质疑讨论 → 执行 → 测试验证 → 验收 → 集成验收
+    for (let i = 0; i < 4; i++) { t.stdin.press('[B'); await tick() }
     t.stdin.press('\r')
     await tick()
-    t.stdin.press('\r') // 第二屏确认
+    t.stdin.press('\r') // 确认屏
     await tick()
     app.unmount()
     expect(got).toEqual(['integrate'])
@@ -278,18 +320,24 @@ describe('重做关口', () => {
     expect(f).toContain('未配置角色')
   })
 
-  it('配了验证角色就照实写三步', async () => {
+  it('配了验证和观察角色就照实把四步都写出来', async () => {
     const { t, app } = await mount(
       <ConfirmRedo
         nodes={TREE()} targetId="root/00-a" now={NOW}
-        phases={{ seatCount: { verify: 2 } }}
+        phases={{ seatCount: { verify: 2, observer: 1 } }}
         onConfirm={() => {}} onCancel={() => {}}
       />,
     )
     await tick()
+    t.stdin.press('[B') // ↓ 到「阶段重做」
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    t.stdin.press('[B') // ↓ 到「执行」—— 光标那一条一定带说明
+    await tick()
     const f = t.lastFrame()
     app.unmount()
-    expect(f).toContain('执行 → 测试验证 → 验收')
+    expect(f).toContain('执行 → 测试验证 → 验收 → 观察')
     expect(f).not.toContain('未配置角色')
   })
 

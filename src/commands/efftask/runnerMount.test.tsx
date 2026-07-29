@@ -86,6 +86,12 @@ function fakeTty() {
 const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise(r => setTimeout(r, 0)) }
 /** 去掉 ANSI,否则渲染出来的中文之间夹着控制序列,任何 includes 都是碰运气。 */
 const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+/**
+ * 再把空格也去掉。带边框的 Box 里那一行渲出来是 `q/Esc退出·回车看节点详情·r重做选中的任务` ——
+ * 词之间的空格没了(实测)。按源码里的写法带空格去匹配,断言会恒假,而恒假的断言
+ * 在这个文件里正是要防的东西。
+ */
+const squash = (s: string) => strip(s).replace(/[ \t]/g, '')
 
 async function mount(args: string, settings: Record<string, unknown>, tools: { name: string }[] = []) {
   FAKE_SETTINGS = settings
@@ -114,13 +120,37 @@ async function mount(args: string, settings: Record<string, unknown>, tools: { n
   return { tty, done, node, app }
 }
 
+/**
+ * 这一帧里有没有「渲染抛了」。
+ *
+ * **原来那个谓词是假的。** 它写的是 `/ReferenceError|is not defined|at EffTaskRunner/`,
+ * 而 ink 的错误框根本不印这些字。实测(拿一个引用未导入标识符的组件真挂进本仓库的
+ * ink,120×40 假 TTY):
+ *
+ *     ERRORPHASE_NAMES_NOT_IMPORTEDisnotdefined
+ *     /path/to/file.tsx:21:79
+ *     - Boom(/path/to/file.tsx:21:79)
+ *     - react_stack_bottom_frame(node_modules/react-reconciler/…)
+ *
+ * 前缀是 `ERROR` 不是 `ReferenceError`;列式排版把词之间的空格全吃掉,所以
+ * `is not defined` 匹配不到(帧里是 `isnotdefined`);栈行是 `- Boom(` 不是 `at Boom`。
+ * 三个分支**一个都命中不了** —— 这条「整命令的存活闸门」在真崩溃上返回 false。
+ *
+ * 而它本该拦住的正是 `phase === 'confirmRedo'` 那一屏里没导入的 `PHASE_NAMES`:
+ * 按下 r 就是一屏堆栈,而 2189 条测试全绿。
+ *
+ * 现在用两个**互相独立**的信号:错误框的标题,和它下面那行源码定位。
+ */
+function renderCrashed(frame: string): boolean {
+  const f = frame.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+  return /ERROR/.test(f) && /\.tsx?:\d+:\d+/.test(f)
+}
+
 describe('/et 真的能挂起来(整命令的存活闸门)', () => {
   it('挂载不抛异常 —— 裸 effRoot 那类错误在这里现形', async () => {
     const { tty, app } = await mount('把 README 翻译成英文', {})
     const f = tty.frames()
-    // ReferenceError 会被 React 冒泡成一屏堆栈。断言「没有堆栈」而不是「有某句话」:
-    // 前者对渲染内容的变化免疫,只对「组件挂不起来」敏感。
-    expect(`渲染出错: ${/ReferenceError|is not defined|at EffTaskRunner/.test(f)}`).toBe('渲染出错: false')
+    expect(`渲染出错: ${renderCrashed(f)}`).toBe('渲染出错: false')
     expect(f.length).toBeGreaterThan(0)
     app.unmount()
   })
@@ -228,5 +258,94 @@ describe('第一屏就要看得见模型在干什么', () => {
     expect(`窗口出现了: ${f.includes('需求解析')}`).toBe('窗口出现了: true')
     expect(`窗口数到了工具调用: ${/\d+\s*工具/.test(f)}`).toBe('窗口数到了工具调用: true')
     app.unmount()
+  })
+})
+
+/**
+ * 重做关口能不能**画出来**。
+ *
+ * 这一屏此前从没被挂载过:`redoGate.test.ts` 测 `redoGateAction`、`redoView.test.tsx`
+ * 直接挂 `ConfirmRedo`,两边都不经过 `EffTaskRunner`;而 `wiringCoverage.test.ts` 守这一跳
+ * 用的是**源码文本**断言(它的注释自己写着「这一跳没有运行时接缝」)。
+ *
+ * 于是 `efftask.tsx` 里那一句用了没导入的 `PHASE_NAMES` 时:2189 条全绿,而用户按下 r
+ * 拿到的是一屏 ReferenceError —— 重做这个功能**从任何路径都到不了**,连 `--resume`
+ * 回来再按也是同一屏。
+ *
+ * 断言是**正向**的(帧里出现菜单那句话),不是「帧里没有堆栈」:后者被上面那个
+ * renderCrashed 的教训证明过太容易写成一句永远为真的话。
+ */
+describe('重做关口:从 done 屏按 r 真的能画出来', () => {
+  it('按 r 出现的是重做菜单,不是一屏堆栈', async () => {
+    // 跳过分析 → 节点直接 READY → 执行者(假的)报不出产出 → 撞返工上限 → 阻断 → done。
+    const { tty, app } = await mount('把 README 翻译成英文', { efftaskSkipSteps: ['分析'] })
+    await tick(12)
+    tty.stdin.press('y')
+    // 阻断要跑满 maxIterations 轮评审,给足时间落到 done 视图。
+    for (let i = 0; i < 80 && !squash(tty.frames()).includes('r重做选中的任务'); i++) await tick(10)
+    expect(`到了 done 屏: ${squash(tty.frames()).includes('r重做选中的任务')}`).toBe('到了 done 屏: true')
+
+    tty.stdin.press('r')
+    await tick(20)
+    const f = squash(tty.frames())
+    app.unmount()
+    expect(`按 r 之后渲染出错: ${renderCrashed(tty.frames())}`).toBe('按 r 之后渲染出错: false')
+    // 菜单第一屏那两条。**正向**断言 —— 不画出来就红。
+    expect(`菜单出现了: ${f.includes('任务重做') && f.includes('阶段重做')}`).toBe('菜单出现了: true')
+  })
+})
+
+/**
+ * 员工配置写错时,原因**到得了屏幕**。
+ *
+ * 此前唯一的出口是 `console.error`,而实测 ink 的 `patchConsole` 把 warn/error/trace
+ * 全部改写成 `logError` —— 只进 debug 日志文件。也就是说 `rolesFromSettings.ts` 里那三处
+ * 「must be visible without --debug」的注释本身就是假话:交互式会话里屏幕上一个字都没有。
+ *
+ * 用户能观察到的现象是「这个员工不存在」,而他分不清是自己打错了字,还是这个功能没做 ——
+ * 需求二要加一个新协议名,不修这条的话,新协议上线之后这个歧义只会更常见。
+ */
+describe('员工配置写错 → 原因到得了启动关口', () => {
+  it('协议名少写一个字母时,关口说出来,而不是让员工凭空消失', async () => {
+    const { tty, app } = await mount('把 README 翻译成英文', {
+      roles: [{
+        name: 'gpt5', whenToUse: '架构', execMode: 'api',
+        apiProtocol: 'openai-response',   // 少一个 s
+        apiUrl: 'https://x.example/v1', apiToken: 'sk', model: 'gpt-5.1',
+      }],
+    })
+    await tick(12)
+    const f = squash(tty.frames())
+    app.unmount()
+    expect(`关口提到了这个员工: ${f.includes('gpt5')}`).toBe('关口提到了这个员工: true')
+    expect(`说清了没被载入: ${f.includes('没有被载入')}`).toBe('说清了没被载入: true')
+  })
+
+  it('思考级别写错时也说,并且列出可用值', async () => {
+    const { tty, app } = await mount('把 README 翻译成英文', {
+      roles: [{
+        name: 'ds', whenToUse: '测试', execMode: 'api', apiProtocol: 'openai',
+        apiUrl: 'https://x.example/v1', apiToken: 'sk', model: 'deepseek-chat',
+        thinkingDepth: 'deep',
+      }],
+    })
+    await tick(12)
+    const f = squash(tty.frames())
+    app.unmount()
+    expect(`说了无法识别: ${f.includes('无法识别')}`).toBe('说了无法识别: true')
+    expect(`列出了可用值: ${f.includes('xhigh')}`).toBe('列出了可用值: true')
+  })
+
+  it('配置全对时关口不无中生有 —— 排除「这句话恒显示」', async () => {
+    const { tty, app } = await mount('把 README 翻译成英文', {
+      roles: [{
+        name: 'ok', whenToUse: '架构', execMode: 'api', apiProtocol: 'openai-responses',
+        apiUrl: 'https://x.example/v1', apiToken: 'sk', model: 'gpt-5.1', thinkingDepth: 'xhigh',
+      }],
+    })
+    await tick(12)
+    const f = squash(tty.frames())
+    app.unmount()
+    expect(`误报: ${f.includes('没有被载入') || f.includes('无法识别')}`).toBe('误报: false')
   })
 })

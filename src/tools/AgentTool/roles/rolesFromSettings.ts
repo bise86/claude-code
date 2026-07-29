@@ -1,7 +1,37 @@
 import { z } from 'zod/v4'
 import { logError } from '../../../utils/log.js'
-import { parseEffortValue, type EffortValue } from '../../../utils/effort.js'
+import type { EffortValue } from '../../../utils/effort.js'
+import { ROLE_API_PROTOCOLS } from '../../../services/api/openaiCompat/protocols.js'
+import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from './roleThinking.js'
 import type { RoleClientConfig } from './roleTypes.js'
+
+/**
+ * 载入员工时**没能按你写的那样生效**的一条。
+ *
+ * 为什么要做成数据而不是继续 `console.error`:实测 ink 的 `patchConsole` 把
+ * `console.warn/error/trace` 全部改写成 `logError`,只进 debug 日志文件 ——
+ * 交互式会话里屏幕上**一个字都不会出现**。所以下面那几处
+ * `// biome-ignore …: must be visible without --debug` 的注释本身就是假话。
+ *
+ * 后果是用户把 `apiProtocol` 少写一个 s、或者 thinkingDepth 写成 JSON 数字时,
+ * 整条员工被跳过,而他只会看到「这个员工不存在」,分不清是自己打错字还是这个功能没做。
+ * 交出去之后 `/et` 会把它渲进启动关口的 notices(那一块的标题恰好就是
+ * 「你的请求中有以下部分不会生效」)。
+ */
+export interface RoleLoadIssue {
+  /** 员工名;取不到名字时是 `index N`。 */
+  name: string
+  source: string
+  reason: string
+}
+
+/** 按来源存,重解析同一个来源时覆盖而不是叠加。 */
+const ISSUES = new Map<string, RoleLoadIssue[]>()
+
+/** 载入员工时所有「没按你写的生效」的条目。给 `/et` 关口和任何想显示它的界面用。 */
+export function roleLoadIssues(): RoleLoadIssue[] {
+  return [...ISSUES.values()].flat()
+}
 
 const RoleSchema = z.object({
   name: z.string().min(1),
@@ -9,11 +39,16 @@ const RoleSchema = z.object({
   execMode: z.enum(['api', 'cli']),
   tools: z.array(z.string()).optional(),
   prompt: z.string().optional(),
-  apiProtocol: z.enum(['anthropic', 'openai']).optional(),
+  // 取值从协议注册表派生,不写字面量 —— 加一种协议时这里忘了改,表现是「配了但整条
+  // 员工被跳过」,而用户看到的是「这个员工不存在」。
+  apiProtocol: z.enum(ROLE_API_PROTOCOLS).optional(),
   apiUrl: z.string().optional(),
   apiToken: z.string().optional(),
   model: z.string().optional(),
-  thinkingDepth: z.string().optional(),
+  // 数字也收。原来是 `z.string()` + `.strict()`,于是 `"thinkingDepth": 80`(JSON 数字)
+  // 会让**整条员工**校验失败被跳过 —— 而 docs/roles-setup.md 明写着可以填一个数字。
+  // 用户读到的是「无效值会被忽略」,以为最坏是这个字段不生效。
+  thinkingDepth: z.union([z.string(), z.number()]).optional(),
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   interactive: z.boolean().optional(),
@@ -77,11 +112,13 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
   // silently drop every OTHER valid role from this source too. Iterating and
   // safeParse-ing element-by-element means one bad role only costs itself.
   const items: z.infer<typeof RoleSchema>[] = []
+  const skipped: RoleLoadIssue[] = []
   if (rawRoles != null) {
     if (!Array.isArray(rawRoles)) {
       logError(new Error('invalid roles config: expected an array'))
-      // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+      // biome-ignore lint/suspicious/noConsole: 非交互模式下这是唯一的出口
       console.error(`[roles] invalid roles config from ${source}: expected an array`)
+      skipped.push({ name: 'roles', source, reason: 'roles 不是一个数组,整份员工配置都没有被载入' })
     } else {
       rawRoles.forEach((raw, i) => {
         const parsed = RoleSchema.safeParse(raw)
@@ -93,27 +130,44 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
             : `index ${i}`
           const reason = parsed.error.issues.map(iss => iss.message).join('; ')
           logError(new Error(`invalid role config (${label}): ${parsed.error.message}`))
-          // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+          // console.error 在交互式会话里被 ink 的 patchConsole 吞掉(只进 debug 日志),
+          // 所以真正让用户看得见的是下面这条 issue。两条都留:非交互(--print)那侧
+          // console 还是有用的。
+          // biome-ignore lint/suspicious/noConsole: 非交互模式下这是唯一的出口
           console.error(`[roles] "${label}" from ${source} skipped: ${reason}`)
+          skipped.push({ name: label, source, reason: `配置有误,这条员工没有被载入:${reason}` })
         }
       })
     }
   }
+  const issues: RoleLoadIssue[] = []
   const out: { role: any; agentDef: RoleAgentDefinition }[] = []
   for (const r of items) {
     try {
-      // thinkingDepth is free-text in settings (z.string().optional()), so it
-      // must be validated/normalized before it can be trusted as an
-      // EffortValue. An unrecognized value (e.g. 'deep', a typo, wrong case)
-      // is dropped to undefined rather than forwarded — sending an invalid
-      // value to the Anthropic API's output_config.effort would build a bad
-      // request. We normalize the SAME parsed value into both `effort` (used
-      // by runAgent.ts) and `roleClientConfig.thinkingDepth` (used by the
-      // future openai shim) so the two never disagree about validity.
-      const parsedEffort = parseEffortValue(r.thinkingDepth)
-      const normalizedThinkingDepth = parsedEffort !== undefined ? String(parsedEffort) : undefined
+      const protocol = r.apiProtocol ?? 'anthropic'
+      /**
+       * 思考级别。settings 里是自由文本,必须先归一才能当参数用。
+       *
+       * **两个字段都从同一个 `resolveRoleThinking` 取值**,不是各 clamp 一次:
+       * 一份判据两个调用点,没有第二处可以漂移。而且翻译型协议下
+       * `agentDef.effort` 直接置 undefined —— 那条路上它是**死代码**
+       * (它进 claude.ts 的 output_config,而 toOpenAIRequest / toResponsesRequest
+       * 都是显式白名单,output_config 从来没被拷进出网请求),留一个值只会坑下一个人。
+       *
+       * 认不出来的值不再静默丢弃:记一条 issue 交给界面。
+       */
+      const level = parseRoleThinking(r.thinkingDepth)
+      if (r.thinkingDepth !== undefined && r.thinkingDepth !== '' && level === undefined) {
+        issues.push({ name: r.name, source, reason: `thinkingDepth "${String(r.thinkingDepth)}" 无法识别,已忽略;可用值:${ROLE_THINKING_LEVELS.join(' / ')} 或一个整数` })
+      }
+      const translating = protocol !== 'anthropic'
+      const wire = r.execMode === 'api'
+        ? resolveRoleThinking({ level, protocol, model: r.model ?? '' })
+        : resolveRoleThinking({ level, protocol: 'anthropic', model: r.model ?? '' })
+      if (wire.note) issues.push({ name: r.name, source, reason: wire.note })
+      const parsedEffort = translating ? undefined : (wire.value as EffortValue | undefined)
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
-        ? { apiProtocol: r.apiProtocol ?? 'anthropic', apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: normalizedThinkingDepth }
+        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value) }
         : undefined
       const promptStr = r.prompt
       out.push({ role: r, agentDef: {
@@ -135,9 +189,12 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
     } catch (e) {
       logError(e)
       const reason = e instanceof Error ? e.message : String(e)
-      // biome-ignore lint/suspicious/noConsole: user-actionable role config error; must be visible without --debug
+      // biome-ignore lint/suspicious/noConsole: 非交互模式下这是唯一的出口
       console.error(`[roles] "${r.name}" from ${source} skipped: ${reason}`)
+      issues.push({ name: r.name, source, reason: `载入失败,这条员工没有生效:${reason}` })
     }
   }
+  // 覆盖而不是叠加 —— 同一个来源被重新解析时,旧的诊断不该留着。
+  ISSUES.set(source, [...skipped, ...issues])
   return out
 }

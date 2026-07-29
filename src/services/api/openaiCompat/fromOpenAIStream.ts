@@ -1,6 +1,12 @@
 import { logError } from '../../../utils/log.js'
+import { anthropicEventsToSSE, createBlockWriter, type Evt } from './blocks.js'
+
+/** 上游的 finish_reason → anthropic 的 stop_reason。**chat 独有** —— responses 没有这个字段。 */
 const STOP: Record<string, string> = { stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use', content_filter: 'end_turn' }
-type Evt = { event: string; data: any }
+
+// 两个协议的翻译层共用同一个 SSE 序列化。从这里再导出一次,免得调用方要记住它搬去了哪。
+export { anthropicEventsToSSE }
+export type { Evt }
 
 /**
  * OpenAI 兼容后端把「思考」放在哪个字段上。
@@ -58,9 +64,9 @@ export function reasoningTextOf(delta: unknown): string {
 interface ToolAcc { id?: string; name?: string; args: string }
 
 export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>, ctx: { anthropicModel: string }): AsyncGenerator<Evt> {
-  let started = false, textOpen = false, textIndex = -1, nextIndex = 0
-  // 思考块。和 text 完全对称:同一时刻只能开着一个内容块,谁来了就先把对方关掉。
-  let thinkOpen = false, thinkIndex = -1
+  // 块的开合记账归 blocks.ts —— 它维护的两条不变量(同一时刻只开一个块、stop 必须配得上
+  // 一个先发出去的 start)在两个协议上逐字相同,而破了它 claude.ts 直接抛 RangeError。
+  const w = createBlockWriter(ctx)
   /**
    * 工具调用**攒到流末尾再发**,不是边收边发。
    *
@@ -89,37 +95,20 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
   const byId = new Map<string, string>()
   let stopReason = 'end_turn'
   let usage = { input_tokens: 0, output_tokens: 0 }
-  const startIfNeeded = function* (id?: string): Generator<Evt> {
-    if (started) return
-    started = true
-    yield { event: 'message_start', data: { type: 'message_start', message: {
-      id: id ?? 'msg_openai', type: 'message', role: 'assistant', model: ctx.anthropicModel,
-      content: [], stop_reason: null, stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } } }
-  }
-  const closeText = function* (): Generator<Evt> {
-    if (!textOpen) return
-    textOpen = false
-    yield { event: 'content_block_stop', data: { type: 'content_block_stop', index: textIndex } }
-  }
-  const closeThinking = function* (): Generator<Evt> {
-    if (!thinkOpen) return
-    thinkOpen = false
-    yield { event: 'content_block_stop', data: { type: 'content_block_stop', index: thinkIndex } }
-  }
   for await (const c of chunks) {
     if (c.error) {
       logError(new Error(`OpenAI-compat upstream error: ${c.error?.message ?? JSON.stringify(c.error)}`))
       // Emit message_start first even when the error is the very first chunk —
       // callers expect a message_start to always precede any other event.
-      yield* startIfNeeded(c.id)
-      yield { event: 'error', data: { type: 'error', error: { type: 'api_error', message: c.error?.message ?? 'upstream error' } } }
+      yield* w.error(c.error?.message ?? 'upstream error', c.id)
       return
     }
     if (c.usage) usage = { input_tokens: c.usage.prompt_tokens ?? 0, output_tokens: c.usage.completion_tokens ?? 0 }
     const choice = c.choices?.[0]; if (!choice && !c.usage) continue
     const delta = choice?.delta ?? {}
-    yield* startIfNeeded(c.id)
+    // 显式带上 chunk 的 id —— message_start 的 id 取的是**第一条 chunk** 的 id,
+    // 交给 w.thinking()/w.text() 内部那次兜底调用的话就成了合成 id。
+    yield* w.startIfNeeded(c.id)
     /**
      * 思考排在正文**之前**判。
      *
@@ -129,20 +118,8 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
      * signature 初始化成空串(注释原话:ensure field exists even if signature_delta never
      * arrives),所以这里**不需要伪造 signature_delta**。
      */
-    const reasoning = reasoningTextOf(delta)
-    if (reasoning.length > 0) {
-      yield* closeText()
-      if (!thinkOpen) {
-        thinkOpen = true; thinkIndex = nextIndex++
-        yield { event: 'content_block_start', data: { type: 'content_block_start', index: thinkIndex, content_block: { type: 'thinking', thinking: '' } } }
-      }
-      yield { event: 'content_block_delta', data: { type: 'content_block_delta', index: thinkIndex, delta: { type: 'thinking_delta', thinking: reasoning } } }
-    }
-    if (typeof delta.content === 'string' && delta.content.length) {
-      yield* closeThinking()
-      if (!textOpen) { textOpen = true; textIndex = nextIndex++; yield { event: 'content_block_start', data: { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } } } }
-      yield { event: 'content_block_delta', data: { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta.content } } }
-    }
+    yield* w.thinking(reasoningTextOf(delta))
+    if (typeof delta.content === 'string') yield* w.text(delta.content)
     for (const tc of delta.tool_calls ?? []) {
       let key: string
       if (typeof tc.index === 'number') {
@@ -181,29 +158,6 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
     }
     if (choice?.finish_reason) stopReason = STOP[choice.finish_reason] ?? 'end_turn'
   }
-  yield* startIfNeeded()
-  yield* closeThinking()
-  yield* closeText()
-  for (const acc of toolAcc.values()) {
-    const index = nextIndex++
-    /**
-     * 缺 id 就合成一个,缺 name 就发空串 —— **不丢块**。
-     *
-     * 丢块的话模型这次调用的意图凭空消失,而用户只会看到「它什么都没干」;发出去的话
-     * agentEvents 把空名渲染成「未知工具」、工具循环回一条 tool_result 报错 ——
-     * 一个看得见、查得到的失败,永远好过一个安静的空白。
-     */
-    yield { event: 'content_block_start', data: { type: 'content_block_start', index, content_block: { type: 'tool_use', id: acc.id ?? `call_${index}`, name: acc.name ?? '', input: {} } } }
-    if (acc.args.length > 0) yield { event: 'content_block_delta', data: { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: acc.args } } }
-    yield { event: 'content_block_stop', data: { type: 'content_block_stop', index } }
-  }
-  yield { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens } } }
-  yield { event: 'message_stop', data: { type: 'message_stop' } }
-}
-export function anthropicEventsToSSE(events: AsyncIterable<Evt>): ReadableStream<Uint8Array> {
-  const enc = new TextEncoder()
-  return new ReadableStream({ async start(ctrl) {
-    for await (const e of events) ctrl.enqueue(enc.encode(`event: ${e.event}\ndata: ${JSON.stringify(e.data)}\n\n`))
-    ctrl.close()
-  }})
+  for (const acc of toolAcc.values()) yield* w.toolUse(acc)
+  yield* w.finish(stopReason, usage)
 }

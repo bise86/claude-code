@@ -26,6 +26,20 @@ describe('effectiveModel mirrors runAgent instead of guessing', () => {
     expect(effectiveModel(agent, MAIN)).toBe('gpt-4o')
   })
 
+  it('openai-responses 员工也报后端模型 —— 判据是「不是 anthropic」,不是「等于 openai」', () => {
+    /**
+     * 写死 'openai' 的话,responses 员工在这里会回落到 Claude 兜底模型 ——
+     * 而 /et 启动关口的「角色←员工(模型)」那一行正是拿这个函数算的:
+     * 屏幕上会**把员工的模型显示错**,而这是这个项目的惯犯类别。
+     */
+    const agent: AgentModelInfo = {
+      agentType: 'gpt5',
+      model: 'claude-sonnet-5',
+      roleClientConfig: { apiProtocol: 'openai-responses', backendModel: 'gpt-5.1' },
+    }
+    expect(effectiveModel(agent, MAIN)).toBe('gpt-5.1')
+  })
+
   it('an openai role with no backendModel falls back to the main model rather than empty', () => {
     const agent: AgentModelInfo = { agentType: 'x', roleClientConfig: { apiProtocol: 'openai' } }
     expect(effectiveModel(agent, MAIN)).toBe(MAIN)
