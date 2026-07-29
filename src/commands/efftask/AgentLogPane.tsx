@@ -1,13 +1,12 @@
 import * as React from 'react'
-import { Box, Text, useInput } from '../../ink.js'
-import { OffscreenFreeze } from '../../components/OffscreenFreeze.js'
+import { Text, useInput } from '../../ink.js'
 import type { StreamState, StreamStore } from '../../tools/efftask/agentStream.js'
+import { ScrollPane } from './ScrollPane.js'
 import {
   anchoredFrom,
   budgetRows,
   logPaneAction,
   renderStreamLines,
-  scrollbarColumn,
   scrollWindow,
   droppedNotice,
   type LogLine,
@@ -106,7 +105,18 @@ export interface AgentLogPaneProps {
 export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
   // 「丢了多少」钉在滚动区之外,占一行 —— 它跟着滚的话会被粘底行为直接埋掉。
   const notice = droppedNotice(props.droppedEvents)
-  const height = Math.max(4, Math.floor(props.height) - (notice ? 1 : 0))
+  /**
+   * 「↓ 下面还有 N 行」那一行**也要从预算里扣**,而且**无条件**扣。
+   *
+   * 原来没扣,于是这个窗口实打印的行数比 `props.height` 多 1(不跟随时);再加上它自己
+   * 那两行页脚(已删,见文件尾),最坏超 3 行。调用方按 height 排好的版面因此被顶掉
+   * 最底下几行 —— 而详情页最底下正是页签条和页脚。
+   *
+   * 「跟随时不扣」看着更省地方,但它会让 height 随 follow 抖:不跟随 → height 变小 →
+   * maxFrom 变大 → 到底的判据跟着变。恒定预留换来的是**恒定的可用行数**,跟随时空一行,
+   * 代价远小于一个会自己伸缩的窗口。
+   */
+  const height = Math.max(4, Math.floor(props.height) - (notice ? 1 : 0) - 1)
   // 滚动条占一列。
   const contentWidth = Math.max(20, Math.floor(props.width) - 1)
 
@@ -130,6 +140,7 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
   const [, setOverride, overrideRef] = useLiveState<ReadonlyMap<number, boolean>>(new Map())
   /** 展开了思考原文的流。默认空 —— 思考会淹掉工具调用,但用户点名要看得到。 */
   const [, setThinking, thinkingRef] = useLiveState<ReadonlySet<number>>(new Set())
+
 
   /**
    * **每帧重算,不 memo。**
@@ -254,42 +265,28 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
   }
 
   const slice = lines.slice(from, from + height)
-  const bar = scrollbarColumn(total, height, from)
   const behind = followRef.current ? 0 : Math.max(0, maxFrom - from)
 
+  /**
+   * **这个窗口不再画自己的页脚。**
+   *
+   * 它原来那两行里有一句是**假的**:「Tab 切换环节」—— 而 `logPaneAction` 第三行就是
+   * `if (key.tab) return null`,Tab 早就让给区切换了,切流是 `n`,页脚从没提过 `n`。
+   * 详情页做成两个页卡之后,这两行还会和 NodeDetail 自己的页脚**同屏**,一条说 Tab
+   * 切环节、一条说 Tab 切段落,互相打脸。
+   *
+   * 页脚职责收归 NodeDetail 一行(按当前 zone 变文案):省 2 行版面、消一条假话、
+   * 键位说明只有一个出处。
+   */
   return (
-    // 视口之上的内容变化会逼出整屏重置。ShellProgressMessage 为同一个理由裹了同一个东西。
-    <OffscreenFreeze>
-      <Box flexDirection="column">
-        {notice ? <Text dimColor>{notice}</Text> : null}
-        {slice.map((l, i) => (
-          <Box key={`log-${from + i}`} flexDirection="row">
-            <Text
-              color={l.color}
-              dimColor={l.dim === true}
-              bold={l.bold === true}
-              inverse={l.selected === true}
-              wrap="truncate-end"
-            >
-              {l.text}
-            </Text>
-            <Box flexGrow={1} />
-            <Text dimColor>{bar[i] ?? ' '}</Text>
-          </Box>
-        ))}
-        {behind > 0 ? (
-          <Text color="warning">{`↓ 下面还有 ${behind} 行(G 跟随最新)`}</Text>
-        ) : null}
-        {props.isActive === true ? (
-          <Text dimColor>
-            ↑↓/jk 滚动 · PgUp/PgDn 翻页 · g/G 顶部/底部 · Tab 切换环节 · 空格 折叠 · t 思考{'\n'}
-            {/* 滚轮的代码是活的(logPaneAction 认 wheelUp/wheelDown),但终端要开了鼠标
-                追踪才会发这些序列,而这个 fork 默认非全屏、不开。不写这句的话,用户会
-                再试一次滚轮、再一次没反应,而且没人告诉他为什么。 */}
-            鼠标滚轮需要开启全屏模式(CLAUDE_CODE_NO_FLICKER=1)
-          </Text>
-        ) : null}
-      </Box>
-    </OffscreenFreeze>
+    <ScrollPane
+      slice={slice}
+      total={total}
+      from={from}
+      height={height}
+      notice={notice}
+      behind={behind}
+      behindHint="G 跟随最新"
+    />
   )
 }

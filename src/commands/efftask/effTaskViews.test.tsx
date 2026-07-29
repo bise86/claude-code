@@ -47,7 +47,13 @@ const node = (over: Partial<TaskNode> = {}): TaskNode => ({
   ...over,
 })
 
-async function openDetail(View: unknown, props: Record<string, unknown>) {
+/**
+ * 打开光标那一行的详情页。`toLog` 再按一下 → 切到「子 agent 输出」页卡。
+ *
+ * 输出现在住在第二个页卡上,所以「详情里看得到输出」这件事要多走一跳 —— 而多走的
+ * 这一跳恰好把整条线都串上了:树 → 回车 → 详情 → 切页卡 → 日志窗拿到的是**这个**节点的流。
+ */
+async function openDetail(View: unknown, props: Record<string, unknown>, toLog = false) {
   const t = fakeTty()
   const app = await render(
     React.createElement(View as never, props as never),
@@ -56,6 +62,10 @@ async function openDetail(View: unknown, props: Record<string, unknown>) {
   await tick()
   t.stdin.press('\r') // Enter on the cursor row opens that node's detail
   await tick()
+  if (toLog) {
+    t.stdin.press('\u001b[C') // →
+    await tick()
+  }
   const f = t.lastFrame()
   app.unmount()
   return f
@@ -67,7 +77,7 @@ describe('运行中的面板把输出缓冲交到详情视图手里', () => {
     streams.open({ nodeId: 'root', phaseLabel: '执行', label: '甲员工' }).push({ kind: 'text', text: '正在改 src/login.ts' })
     const f = await openDetail(RunningView, {
       nodes: [node({ status: 'EXECUTING' })], runId: '003', streams, onAbort: () => {},
-    })
+    }, true)
     expect(f).toContain('子 agent 输出')
     expect(f).toContain('正在改 src/login.ts')
   })
@@ -78,7 +88,7 @@ describe('运行中的面板把输出缓冲交到详情视图手里', () => {
     const f = await openDetail(DoneView, {
       nodes: [node({ status: 'ACCEPTED' })], runId: '003', streams,
       outcome: { status: 'completed' }, handoff: null, onExit: () => {},
-    })
+    }, true)
     expect(f).toContain('最终产出:12 个测试通过')
   })
 
@@ -86,9 +96,11 @@ describe('运行中的面板把输出缓冲交到详情视图手里', () => {
     // `streams` 在两个视图上都是可选的;一次什么都没流过的运行照样要能打开。
     const f = await openDetail(RunningView, {
       nodes: [node({ status: 'EXECUTING' })], runId: '003', onAbort: () => {},
-    })
+    }, true)
     expect(f).toContain('根任务')
-    expect(f).not.toContain('子 agent 输出')
+    // 页签在(版面不许随有没有输出而变形),但切过去说的是实话。
+    expect(f).toContain('暂无输出')
+    expect(f).not.toContain('输出(')
   })
 })
 

@@ -22,6 +22,8 @@ const tick = (): Promise<void> => new Promise(r => setTimeout(r, 30))
 const DOWN = '\u001b[B'
 const UP = '\u001b[A'
 const TAB = '\t'
+const RIGHT = '\u001b[C'
+const LEFT = '\u001b[D'
 
 function fakeTty() {
   let pending: string | null = null
@@ -75,7 +77,7 @@ const node = (): TaskNode => ({
 
 async function mount(over: Record<string, unknown> = {}) {
   const t = fakeTty()
-  const seen: { zone: string; cursor: number; expanded: string[] }[] = []
+  const seen: { zone: string; tab: string; cursor: number; expanded: string[] }[] = []
   const app = await render(
     <NodeDetail
       node={node()} elapsed="12s" logActive columns={110}
@@ -96,7 +98,9 @@ describe('段落区', () => {
     // 帧里那一行是用户真看得到的东西,单行渲染所以子串匹配是可靠的。
     expect(t.lastFrame()).toContain('目标')
     app.unmount()
-    expect(at()).toEqual({ zone: 'sections', cursor: 0, expanded: [] })
+    // from 一起断言:它是「视口停在第几行」的观测口(和 AgentLogPane 同一个理由),
+    // 刚打开时必须停在最顶上,否则用户一进详情页就已经滚到半截了。
+    expect(at()).toEqual({ zone: 'content', tab: 'task', cursor: 0, expanded: [], from: 0 })
   })
 
   it('↑↓ 在段落之间移动', async () => {
@@ -166,7 +170,7 @@ describe('段落区', () => {
   })
 })
 
-describe('两个区的切换', () => {
+describe('两个页卡', () => {
   const withLog = () => {
     const store = createStreamStore()
     const h = store.open({ nodeId: 'root', phaseLabel: '执行', label: '甲' })
@@ -174,10 +178,10 @@ describe('两个区的切换', () => {
     return store.streams('root')
   }
 
-  it('Tab 切到输出区之后,↓ 和空格都不再动段落', async () => {
+  it('→ 切到输出页卡之后,↓ 和空格都不再动段落', async () => {
     const { t, app, at } = await mount({ streams: withLog() })
-    t.stdin.press(TAB); await tick()
-    expect(at().zone).toBe('log')
+    t.stdin.press(RIGHT); await tick()
+    expect(at().tab).toBe('log')
     t.stdin.press(DOWN); await tick()
     t.stdin.press(' '); await tick()
     app.unmount()
@@ -186,26 +190,58 @@ describe('两个区的切换', () => {
     expect(at().expanded).toEqual([])
   })
 
-  it('在输出区时,段落的内容一行都不会多出来', async () => {
+  it('在输出页卡上,段落的内容一行都不会多出来', async () => {
     const { t, app } = await mount({ streams: withLog() })
-    t.stdin.press(TAB); await tick()
+    t.stdin.press(RIGHT); await tick()
     t.stdin.press(' '); await tick()
     const f = t.lastFrame()
     app.unmount()
     expect(f).not.toContain('目标第25行')
   })
 
-  it('Tab 再按一次切回段落区', async () => {
+  it('← 切回任务页卡,段落键又管用了', async () => {
     const { t, app, at } = await mount({ streams: withLog() })
-    t.stdin.press(TAB); await tick()
-    t.stdin.press(TAB); await tick()
-    expect(at().zone).toBe('sections')
+    t.stdin.press(RIGHT); await tick()
+    t.stdin.press(LEFT); await tick()
+    expect(at().tab).toBe('task')
     t.stdin.press(DOWN); await tick()
     app.unmount()
     expect(at().cursor).toBe(1)
   })
 
-  it('焦点在段落区时,日志窗**收不到**键 —— 否则 n 会在背后换流', () => {
+  it('页卡是绕圈的 —— 两个页卡时 → 两下回到原地', async () => {
+    const { t, app, at } = await mount({ streams: withLog() })
+    t.stdin.press(RIGHT); await tick()
+    t.stdin.press(RIGHT); await tick()
+    app.unmount()
+    expect(at().tab).toBe('task')
+  })
+
+  it('Tab 把焦点交给页签条,再按一次交回内容区', async () => {
+    // 用户原话:「最下面点击或回车可选择不同的页卡内容展示」。焦点态是「回车」那半句
+    // 的落点 —— 回车本身归 TaskTreePanel(返回任务树),只有焦点在页签条上时才让路。
+    const { t, app, at } = await mount({ streams: withLog() })
+    t.stdin.press(TAB); await tick()
+    expect(at().zone).toBe('tabs')
+    // 焦点在页签条上时,↓ 不许动段落光标。
+    t.stdin.press(DOWN); await tick()
+    expect(at().cursor).toBe(0)
+    t.stdin.press(TAB); await tick()
+    expect(at().zone).toBe('content')
+    t.stdin.press(DOWN); await tick()
+    app.unmount()
+    expect(at().cursor).toBe(1)
+  })
+
+  it('焦点在页签条上时,←→ 照样切页卡', async () => {
+    const { t, app, at } = await mount({ streams: withLog() })
+    t.stdin.press(TAB); await tick()
+    t.stdin.press(RIGHT); await tick()
+    app.unmount()
+    expect(`${at().zone} ${at().tab}`).toBe('tabs log')
+  })
+
+  it('在任务页卡上时,日志窗**收不到**键 —— 否则 n 会在背后换流', () => {
     // 这一条守的是 AgentLogPane 的 isActive 真的跟着区焦点走。
     // 观测口是日志窗自己的 onState:段落区有焦点时按 n,选中的流不许变。
     return (async () => {
@@ -227,19 +263,27 @@ describe('两个区的切换', () => {
       await tick()
       const before = seen[seen.length - 1]
       t.stdin.press('n'); await tick()
-      expect(seen[seen.length - 1]).toBe(before)   // 段落区有焦点,n 不该换流
-      t.stdin.press(TAB); await tick()
+      expect(seen[seen.length - 1]).toBe(before)   // 在任务页卡上,n 不该换流
+      t.stdin.press(RIGHT); await tick()
       t.stdin.press('n'); await tick()
       app.unmount()
-      expect(seen[seen.length - 1]).not.toBe(before) // 切过去之后才换得动
+      expect(seen[seen.length - 1]).not.toBe(before) // 切到输出页卡之后才换得动
     })()
   })
-  it('没有输出可看时 Tab 不切走 —— 切过去会是一个按什么都没反应的空区', async () => {
+  it('没有输出时,输出页卡照样在,而且说的是实话', async () => {
+    /**
+     * 老版本在这里是「没有输出就不许切过去」。页卡化之后那条守不住也不该守:
+     * 页签条的宽度不能随节点有没有输出而变(版面会跳),而且用户看到「子 agent 输出」
+     * 这个页签、切过去发现是空的,本身就是一个准确的回答 —— 比一个按了不动的 Tab 好。
+     * 要守的是**别撒谎**:说「暂无输出」,而不是画一个空窗口。
+     */
     const { t, app, at } = await mount() // 不传 streams
-    t.stdin.press(TAB); await tick()
-    expect(at().zone).toBe('sections')
+    t.stdin.press(RIGHT); await tick()
+    expect(at().tab).toBe('log')
+    expect(t.lastFrame()).toContain('暂无输出')
+    // 焦点确实交给了输出页卡:↓ 不再动段落光标。
     t.stdin.press(DOWN); await tick()
     app.unmount()
-    expect(at().cursor).toBe(1)
+    expect(at().cursor).toBe(0)
   })
 })

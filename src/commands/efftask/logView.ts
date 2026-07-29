@@ -21,16 +21,30 @@ import { BLACK_CIRCLE, TEARDROP_ASTERISK } from '../../constants/figures.js'
  */
 export type LogColor = 'success' | 'warning' | 'error' | 'inactive' | undefined
 
-export interface LogLine {
+/**
+ * 一个终端行。**两个页卡共用**的最小单位。
+ *
+ * 「一条 ViewLine = 一个终端行」是这一层的硬不变量,而它不是洁癖:详情页做成满屏之后,
+ * 一个带 `height` 的 Box 里,超量的子节点会被 yoga **按比例压缩**,不是被裁掉 ——
+ * 实测 50 行塞进 10 行的框,拿到的是 `L004,L009,L014,…`(每 5 行采样 1 行),而且标题行
+ * 本身也一起消失。也就是说:一个残缺的视图看起来完完整整。
+ *
+ * 所以行数必须由**我们自己**算准、自己切片,`height` 只当最后一道保险。而要算得准,
+ * 前提就是每一条数据结构上只对应一个终端行。
+ */
+export interface ViewLine {
   text: string
   color?: LogColor
   dim?: boolean
   bold?: boolean
+  /** 反显。选中的流表头、选中的段落标题。 */
+  inverse?: boolean
+}
+
+export interface LogLine extends ViewLine {
   /** 属于第几条流。-1 = 全局提示行。 */
   streamIndex: number
   isHeader?: boolean
-  /** 选中的流的表头 —— 组件据此加 inverse。 */
-  selected?: boolean
 }
 
 /** 折叠/展开的三角。走 figures,它在不支持 Unicode 的终端上自动退 ASCII。 */
@@ -106,6 +120,20 @@ function secs(ms: number): string {
   return `${Math.max(0, Math.round(ms / 1000))}s`
 }
 
+/**
+ * 单次工具调用的耗时。表头那个 `secs()` 量的是整场,秒级够用;这里量的是一次调用,
+ * 而一次 Read 常常是几十毫秒 —— 全都渲染成 `0s` 的话,这个数字就等于没有。
+ *
+ * 三档:亚秒给毫秒、一分钟内给一位小数、再长给分秒。
+ */
+export function formatDur(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return ''
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
+  const s = Math.round(ms / 1000)
+  return `${Math.floor(s / 60)}m${s % 60}s`
+}
+
 /** 一条流的状态短语 + 颜色。 */
 function statusOf(s: StreamState, nowMs: number): { text: string; color: LogColor } {
   const end = s.endedAt ?? nowMs
@@ -162,18 +190,32 @@ function foldThinking(events: readonly AgentEvent[], expanded: boolean): AgentEv
 
 interface EventLine { prefix: string; body: string; color: LogColor; dim: boolean }
 
-function eventLine(e: AgentEvent): EventLine {
+/**
+ * @param showOwner 这条返回的**上一行不是它自己的那次调用** —— 要把归属写出来。
+ */
+function eventLine(e: AgentEvent, showOwner = false): EventLine {
   switch (e.kind) {
     case 'text': return { prefix: GUTTER, body: e.text, color: undefined, dim: false }
     case 'thinking': return { prefix: GUTTER, body: e.text, color: undefined, dim: true }
     case 'tool': return { prefix: `${GUTTER}${BLACK_CIRCLE} `, body: e.brief, color: 'warning', dim: false }
-    case 'result':
+    case 'result': {
+      /**
+       * 归属和耗时放在 body 的**开头**,不是结尾,也不进 prefix。
+       *
+       *  - 放结尾:body 会被 wrapDisplayWidth 折行,耗时会掉到续行上,而续行看起来
+       *    像是返回内容的一部分。
+       *  - 放 prefix:prefix 的宽度决定续行缩进(见 renderStreamLines 里的 cont),
+       *    一条长归属会把整段返回挤成一条窄缝。
+       */
+      const dur = e.durMs === undefined ? '' : formatDur(e.durMs)
+      const head = [showOwner ? e.ofBrief : '', dur].filter(x => x !== undefined && x !== '')
       return {
         prefix: `${GUTTER}  ${RESULT_ARROW}`,
-        body: e.brief,
+        body: head.length > 0 ? `${head.join(' · ')} · ${e.brief}` : e.brief,
         color: e.isError ? 'error' : undefined,
         dim: !e.isError,
       }
+    }
   }
 }
 
@@ -216,7 +258,7 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
       bold: true,
       streamIndex: i,
       isHeader: true,
-      selected: i === args.selected,
+      inverse: i === args.selected,
     })
 
     if (isFolded) {
@@ -233,8 +275,24 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
     if (s.tombstone === true) {
       out.push({ text: `${GUTTER}… 这一场的窗口已收起,只留最后几条`, dim: true, streamIndex: i })
     }
+    /**
+     * 上一条渲染出来的事件,当且仅当它是一次工具调用。
+     *
+     * `⎿` 在终端里的公认语义是「**上一行**的返回」。并行工具调用下,返回是按到达顺序
+     * 到的,和调用顺序对不上 —— 实测两个 MCP 调用之后连着两条 `⎿`,第一条画在第二个
+     * 工具那行底下,而它其实是第一个工具的返回。事件里明明带着 useId,却一次都没用过。
+     *
+     * 非工具事件要把它清空:中间隔了一段文本的话,`⎿` 就已经不是「上一行的返回」了。
+     */
+    let prevTool: Extract<AgentEvent, { kind: 'tool' }> | null = null
     for (const e of foldThinking(s.events, args.expandedThinking?.has(i) === true)) {
-      const { prefix, body, color, dim } = eventLine(e)
+      // 空 useId(provider 没给 id)时只能靠位置判断:上一行就是工具调用就认它。
+      // 这和 agentStream 的先进先出配对是同一条假设,串行调用下永远成立。
+      const showOwner = e.kind === 'result' && e.ofBrief !== undefined && !(
+        prevTool !== null && (e.useId.length > 0 ? prevTool.useId === e.useId : true)
+      )
+      const { prefix, body, color, dim } = eventLine(e, showOwner)
+      prevTool = e.kind === 'tool' ? e : null
       const avail = Math.max(4, w - stringWidth(prefix))
       // 续行对齐到内容列,并保住左边那根 gutter —— 真实终端就是这么折的。
       const cont = GUTTER + ' '.repeat(Math.max(0, stringWidth(prefix) - stringWidth(GUTTER)))
@@ -244,6 +302,140 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
     }
   })
   return out
+}
+
+/**
+ * 详情页的版面算术。**纯函数,单独钉。**
+ *
+ * 抽出来不是洁癖:内容区是 `flexGrow` + `overflow:hidden`,所以这里少算一行的后果
+ * **不是**画面溢出,而是**静默少画一行** —— 变异测试实测,把 chrome 减 1、或者不给
+ * 「↓ 下面还有 N 行」预留位置,整套渲染断言一条都不红。算错了没人告诉你,正是这个仓库
+ * 反复付学费的形状。
+ *
+ * @param budget    这一屏一共能用多少个终端行(调用方声明)
+ * @param columns   可用列宽
+ * @param inModal   是不是画在 FullscreenLayout 的 modal 槽里(那里不需要自己的边框)
+ */
+export function detailLayout(args: { budget: number; columns: number; inModal: boolean }): {
+  /** 内容区(两个页卡共用)有多少行。 */
+  contentRows: number
+  /** 内容区里真正铺行的高度 —— 比 contentRows 少一行,留给「↓ 下面还有 N 行」。 */
+  paneRows: number
+  /** 内容区列宽(含滚动条那一列)。 */
+  contentWidth: number
+} {
+  const budget = Math.max(10, Math.floor(args.budget))
+  // 标题 1 + 元信息 1 + 页签条 1 + 页脚 1(+ 非模态下自己那圈边框 2)。
+  const chrome = 4 + (args.inModal ? 0 : 2)
+  const contentRows = Math.max(3, budget - chrome)
+  return {
+    contentRows,
+    paneRows: Math.max(2, contentRows - 1),
+    // paddingX={1} 吃掉 2 列;非模态下边框再吃 2 列。
+    contentWidth: Math.max(24, Math.floor(args.columns) - (args.inModal ? 2 : 4)),
+  }
+}
+
+/** 详情页「任务」页卡里的一段。空 body 的段落由调用方过滤掉 —— 选中一个空段是死格。 */
+export interface SectionSpec {
+  title: string
+  body: string
+  color?: LogColor
+  /** 未展开时这一段留几行。省略则用 `collapsedLines`。 */
+  maxLines?: number
+}
+
+/**
+ * 展开一段之后最多铺多少行。
+ *
+ * 有滚动之后本来可以不设上限,但 `execStatus` 是**逐轮追加**的(每次返工都往后写),
+ * 单字段上限 8000 字乘上返工轮数并没有硬顶。留一个很大的数,超了照样用「中间省略 N 行」
+ * 兑现 —— 不假装那是全部。
+ */
+export const EXPANDED_MAX_LINES = 2000
+
+/**
+ * 一段正文 → 若干终端行,超量时**掐头留尾**。
+ *
+ * 留尾是有来历的:这个功能里每一轮追加的内容都追加在**末尾**(执行状态后面会长出
+ * 「(合并冲突解决)…」,验收记录后面长出最新一轮裁决)。只留头的话,三份验收都量到过
+ * 同一件事 —— 屏幕上最后一行还写着「自测全绿」,而把节点挡下来的那条拒绝理由被裁掉了,
+ * 在整个 TUI 里再也找不到。
+ */
+function bodyLines(body: string, width: number, maxLines: number): { lines: string[]; total: number } {
+  // **按显示宽度折行,不是按码点。** 老的 block() 写死 `width = 100` 并按码点判断,
+  // 于是 100 个汉字(=200 列)被判成「不用折」,交给 Text 默认的 wrap 回流成两三个终端行。
+  // 实测同一份内容,中文比 ASCII 多出 24 行 —— 行预算是假的,而且 80 列和 100 列的终端
+  // 算出来一模一样(列宽根本没参与)。
+  const wrapped = body.split('\n').flatMap(l => wrapDisplayWidth(l, width))
+  const total = wrapped.length
+  const cap = Math.max(1, Math.floor(maxLines))
+  if (total <= cap) return { lines: wrapped, total }
+  /**
+   * 「中间省略 N 行」**自己也占一行**,所以它要从预算里扣。
+   *
+   * 老的 block() 没扣,产出的是 `maxLines + 1` 行 —— 那时候没人按行算总高,所以看不出来;
+   * 现在两个页卡的高度都是精确算出来的,多一行就会把最底下的页签条顶出屏幕。
+   *
+   * 尾巴优先于头:每一轮追加的内容都追加在**末尾**,只留头的话,把节点挡下来的那条
+   * 拒绝理由在整个 TUI 里都找不到(三份验收量到过同一件事)。
+   */
+  if (cap <= 1) return { lines: [`… 共 ${total} 行,这里放不下`], total }
+  const tail = Math.min(2, cap - 2 >= 1 ? cap - 2 : 1)
+  const head = Math.max(0, cap - 1 - tail)
+  return {
+    // 省略的行数按**真实**留下的算,不是 total - cap —— 那个数会少报一行,
+    // 而这一行字的全部意义就是把这个数说准。
+    lines: [...wrapped.slice(0, head), `… 中间省略 ${total - head - tail} 行`, ...wrapped.slice(total - tail)],
+    total,
+  }
+}
+
+/**
+ * 「任务」页卡的段落 → 行数组 + 每段标题行的下标。
+ *
+ * 和 `renderStreamLines` 并列:两个页卡各有一个「产行」函数,下游(切片、滚动条、
+ * 逐行渲染)完全共用。新增第三个页卡只需要再写一个这样的函数。
+ *
+ * @returns headerAt 第 i 段的标题行在 lines 里的下标(-1 = 不存在)。直接喂给 `anchoredFrom`
+ *          当锚 —— 展开/收起一段会让它下面所有行的行号整体位移,锚在绝对行号上会当场跳走。
+ */
+export function sectionLines(args: {
+  sections: readonly SectionSpec[]
+  /** 光标停在第几段。-1 = 没有光标(只读)。 */
+  cursor: number
+  /** 展开了哪几段(按标题)。 */
+  expanded: ReadonlySet<string>
+  /** 内容区列宽(**不含**滚动条那一列)。 */
+  width: number
+  /** 未展开的段落默认留几行。 */
+  collapsedLines: number
+}): { lines: ViewLine[]; headerAt: (i: number) => number } {
+  const w = Math.max(10, args.width)
+  // 正文缩进 4 列,和这个页面原来的排版一致。
+  const bodyWidth = Math.max(6, w - 4)
+  const lines: ViewLine[] = []
+  const headers: number[] = []
+  args.sections.forEach((sec, i) => {
+    const isExpanded = args.expanded.has(sec.title)
+    const selected = i === args.cursor
+    const { lines: body, total } = bodyLines(
+      sec.body.trim(),
+      bodyWidth,
+      isExpanded ? EXPANDED_MAX_LINES : (sec.maxLines ?? args.collapsedLines),
+    )
+    const clipped = body.length < total
+    const hint = isExpanded ? '(空格收起)' : clipped ? `(空格展开,共 ${total} 行)` : ''
+    headers.push(lines.length)
+    lines.push({
+      text: clipToWidth(`${selected ? '❯ ' : '  '}${sec.title}${hint}`, w),
+      bold: true,
+      color: sec.color ?? (selected ? 'success' : undefined),
+      inverse: selected,
+    })
+    for (const l of body) lines.push({ text: `    ${l}`, color: sec.color, dim: sec.color === undefined })
+  })
+  return { lines, headerAt: i => headers[i] ?? -1 }
 }
 
 /**
@@ -450,12 +642,42 @@ export function runControlAction(input: string, key: { ctrl?: boolean; meta?: bo
 export type SectionPaneAction =
   | { t: 'move'; d: number }
   | { t: 'toggle' }
-  | { t: 'switchZone' }
+  /** Tab / Shift+Tab:在 页签条 ⇄ 内容区 之间轮转。 */
+  | { t: 'switchZone'; d: number }
+  /** ←/→:切页卡。**在详情页里这两个键原来是死键**,零冲突白捡。 */
+  | { t: 'tab'; d: number }
+  /** 半页滚动。ctrl+u / ctrl+d,以及 PgUp/PgDn(收到就用,收不到也不写进页脚)。 */
+  | { t: 'scroll'; d: number }
 
+/**
+ * 任务详情页**内容区之外**的按键。
+ *
+ * 详情页同时挂着三个 `useInput`,而 vendored 的 `useInput` 是**广播**的、不做
+ * stopPropagation(`AgentLogPane` 文件头有原话)—— 不冲突全靠键位不重叠 + 各自判 zone。
+ * 这里认的每一个键都对照过另外两处:
+ *  - `←/→`:`logPaneAction` 不认左右箭头;`TaskTreePanel` 的 detail 分支直接 return。空的。
+ *  - `Tab`:`logPaneAction` 第三行就是 `if (key.tab) return null`,专门让给这里。
+ *  - `ctrl+u/d`、`PgUp/PgDn`:只在 zone 不是 log 时由调用方派发,和 `logPaneAction` 互斥。
+ *
+ * **回车不在这里。** 它归 `TaskTreePanel`(返回任务树),只有焦点落在页签条上时才让路 ——
+ * 而那一让也必须由 TaskTreePanel 自己做:`useInput` 的 listener 槽位按 mount 时刻固定,
+ * TaskTreePanel 比 NodeDetail 先挂,所以它**永远先跑**,在 NodeDetail 里调
+ * stopImmediatePropagation 已经来不及了。
+ */
 export function sectionPaneAction(
-  input: string, key: { tab?: boolean; upArrow?: boolean; downArrow?: boolean; ctrl?: boolean; meta?: boolean },
+  input: string,
+  key: {
+    tab?: boolean; upArrow?: boolean; downArrow?: boolean; leftArrow?: boolean; rightArrow?: boolean
+    pageUp?: boolean; pageDown?: boolean; shift?: boolean; ctrl?: boolean; meta?: boolean
+  },
 ): SectionPaneAction | null {
-  if (key.tab) return { t: 'switchZone' }
+  if (key.tab) return { t: 'switchZone', d: key.shift === true ? -1 : 1 }
+  if (key.leftArrow) return { t: 'tab', d: -1 }
+  if (key.rightArrow) return { t: 'tab', d: 1 }
+  if (key.pageUp) return { t: 'scroll', d: -1 }
+  if (key.pageDown) return { t: 'scroll', d: 1 }
+  if (key.ctrl && input === 'u') return { t: 'scroll', d: -1 }
+  if (key.ctrl && input === 'd') return { t: 'scroll', d: 1 }
   if (key.ctrl || key.meta) return null
   if (key.upArrow) return { t: 'move', d: -1 }
   if (key.downArrow) return { t: 'move', d: 1 }
@@ -467,4 +689,72 @@ export function sectionPaneAction(
   if (c === 'j') return { t: 'move', d: input.length }
   if (c === 'k') return { t: 'move', d: -input.length }
   return null
+}
+
+/**
+ * 焦点在哪 → 段落区该不该画光标 / 哪个页签该反显。
+ *
+ * 两个都是一行表达式,抽出来是因为**它们在组件里根本观测不到**:这个渲染器只写增量,
+ * 一次焦点切换在帧里是几个分散的片段,而 `lastFrame()` 又把转义换成空格,连
+ * 「有没有反显」都看不出来。而它们说的是同一件事 —— **别画一个「选中了、但按键不归它」
+ * 的假象**,那正是这个仓库反复付学费的那类谎。
+ */
+export function sectionCursor(
+  zone: 'tabs' | 'content',
+  activeTabIsTask: boolean,
+  cursor: number,
+): number {
+  // -1 = 不画光标。焦点在页签条上、或者当前是别的页卡时,段落上那个 ❯ 就是假的。
+  return zone === 'content' && activeTabIsTask ? cursor : -1
+}
+
+/** 这个页签该不该反显 —— 只有「焦点在页签条上」且「它就是当前页卡」时才反显。 */
+export function tabFocused(zone: 'tabs' | 'content', isActiveTab: boolean): boolean {
+  return zone === 'tabs' && isActiveTab
+}
+
+/**
+ * 鼠标点击到底能不能用。
+ *
+ * 三道闸门,少判一道就会在页脚上写一句假话,而「一个按了没反应的键比没有更糟」是这个
+ * 仓库反复付过学费的那条:
+ *  - 非全屏:终端根本没被要求上报鼠标(`ENABLE_MOUSE_TRACKING` 只在 AlternateScreen 里写出),
+ *    而且 `Ink.dispatchClick` 第一句就是 `if (!this.altScreenActive) return false`;
+ *  - `CLAUDE_CODE_DISABLE_MOUSE=1`:全屏但不开追踪;
+ *  - `CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1`:开追踪但吞掉点击(滚轮仍然有效)。
+ *
+ * env 由调用方注入 —— 纯函数才测得动,而这三个开关的组合正是最容易写错的地方。
+ */
+export type MouseAvailability = 'on' | 'needs-fullscreen' | 'tracking-disabled' | 'clicks-disabled'
+
+export function mouseAvailability(env: {
+  fullscreen: boolean
+  tracking: boolean
+  clicks: boolean
+}): MouseAvailability {
+  if (!env.fullscreen) return 'needs-fullscreen'
+  if (!env.tracking) return 'tracking-disabled'
+  if (!env.clicks) return 'clicks-disabled'
+  return 'on'
+}
+
+/**
+ * 任务树页脚里「怎么进详情页」那半句。
+ *
+ * 能点才说能点。不能点时**一个字都不多写** —— 那一行是 truncate-end 的,多塞一句
+ * 「需要开全屏」会把右边的 `Esc/q 退出` 直接吃掉,等于用「解释一个用不了的功能」
+ * 换掉「怎么退出去」。为什么点不了,由详情页页签条右侧那个专门的位置来说。
+ */
+export function detailEntryHint(a: MouseAvailability): string {
+  return a === 'on' ? '回车/点击看详情' : '回车看详情'
+}
+
+/** 页脚里那半句话。可用时说「或点击」,不可用时说清为什么,而不是闭口不提。 */
+export function mouseHint(a: MouseAvailability): string {
+  switch (a) {
+    case 'on': return '鼠标点击'
+    case 'needs-fullscreen': return '鼠标需全屏模式(CLAUDE_CODE_NO_FLICKER=1)'
+    case 'tracking-disabled': return '鼠标被 CLAUDE_CODE_DISABLE_MOUSE 关掉了'
+    case 'clicks-disabled': return '点击被 CLAUDE_CODE_DISABLE_MOUSE_CLICKS 关掉了'
+  }
 }

@@ -25,6 +25,15 @@
 import type { AgentEvent } from './agentEvents.js'
 
 /**
+ * 按**码点**夹取。不用 logView 的 clipToWidth:那是按显示宽度算的渲染件,而这里只是给
+ * 一个内存里的字段封顶,不该把存储层拖去依赖渲染层。
+ */
+function clipCodePoints(s: string, max: number): string {
+  const cps = Array.from(s)
+  return cps.length <= max ? s : cps.slice(0, max).join('') + '…'
+}
+
+/**
  * 树还没建起来时的调用(需求解析、根方案)挂在哪个节点下。
  *
  * **就是根节点的 id,不是一个伪节点。** 用 '__pre__' 的话,这两条流在树出来之后
@@ -67,6 +76,18 @@ export const MAX_TOTAL_EVENTS = 20000
 
 /** 墓碑保留的末尾事件数 —— 折叠态本来也只显示一行「最新: …」。 */
 export const TOMBSTONE_KEEP = 3
+
+/**
+ * 「已经发出、还没等到返回」的调用最多记几条。
+ *
+ * 有上限是因为这张表**活在 events 数组之外**(那正是它的价值,见下),所以环形缓冲管不到
+ * 它。一个只调工具、永远收不到返回的病态流不该把它撑成无界项。256 条远大于任何一次真实
+ * 的并行工具调用数。
+ */
+export const MAX_PENDING_CALLS = 256
+
+/** 归属摘要在 result 事件里留多长。整条 brief 最长 300 码点,乘以事件数就太贵了。 */
+const OF_BRIEF_MAX = 60
 
 export interface StreamMeta {
   /** 真实节点 id;树外调用用 PRE_TREE_NODE。 */
@@ -214,6 +235,23 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
 
   return {
     open(meta) {
+      /**
+       * 「这次调用是什么时候发出的」。**活在 events 数组之外**,这是关键。
+       *
+       * 配对如果放在渲染期(按 useId 在 `s.events` 里找对手),会在两种常见情况下失败,
+       * 而且都是静默的:
+       *  - 环形缓冲把 tool 事件挤掉了、result 还在(实测:灌 100+ 条文本之后
+       *    「events 里还有 tool 事件吗? false / 还有 result 事件吗? true」);
+       *  - 墓碑只留最后 3 条,配对几乎必然断。
+       * 放在这里就都不受影响 —— 淘汰规则动的是 events,动不到这张表。
+       */
+      const pending = new Map<string, { at: number; brief: string }>()
+      /**
+       * provider 没给 id 的调用(`agentEvents.asId` 在畸形输入上返回空串,而 openai 兼容
+       * 后端恰恰是最容易缺 id 的那一档)按**先进先出**配对。
+       * 全塞进 Map 的话它们会共用 `''` 这一个键,后一次调用直接盖掉前一次。
+       */
+      const pendingAnon: { at: number; brief: string }[] = []
       const state: StreamState = {
         meta,
         events: [],
@@ -239,10 +277,41 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
             addDropped(state.meta.nodeId, 1)
             return
           }
+          /**
+           * 盖时间戳并配对。**在这里做,不在渲染期做** —— 见 pending 的注释。
+           *
+           * 配不上就只盖 `atMs`,**不填 durMs** —— 一个猜出来的耗时比没有耗时更坏。
+           */
+          const ev = ((): AgentEvent => {
+            if (e.kind === 'tool') {
+              const at = now()
+              const entry = { at, brief: clipCodePoints(e.brief, OF_BRIEF_MAX) }
+              if (e.useId.length > 0) {
+                if (pending.size < MAX_PENDING_CALLS) pending.set(e.useId, entry)
+              } else if (pendingAnon.length < MAX_PENDING_CALLS) {
+                pendingAnon.push(entry)
+              }
+              return { ...e, atMs: at }
+            }
+            if (e.kind === 'result') {
+              const at = now()
+              let started: { at: number; brief: string } | undefined
+              if (e.useId.length > 0) {
+                started = pending.get(e.useId)
+                if (started) pending.delete(e.useId)
+              } else {
+                started = pendingAnon.shift()
+              }
+              return started
+                ? { ...e, atMs: at, durMs: Math.max(0, at - started.at), ofBrief: started.brief }
+                : { ...e, atMs: at }
+            }
+            return e
+          })()
           // **换引用,不原地 push。** chunkBuffer 每次都造新数组,所以 React.memo /
           // useMemo([streams]) 能看见变化。原地追加的话数组引用永不变,一个 memo 过的窗口
           // 会永远停在第一帧。
-          const next = [...state.events, e]
+          const next = [...state.events, ev]
           if (next.length > MAX_EVENTS_PER_STREAM) {
             /**
              * 满了先丢**思考**,丢不够再从头丢。
@@ -273,7 +342,7 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
             state.events = next
             total++
           }
-          if (e.kind === 'tool') state.toolCount++
+          if (ev.kind === 'tool') state.toolCount++
           enforceGlobal()
           notify()
         },

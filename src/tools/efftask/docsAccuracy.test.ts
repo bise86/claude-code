@@ -3,6 +3,9 @@ import { readFileSync } from 'node:fs'
 import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
 import { redoOptions, redoUnavailableReason } from './redo'
+import { REASONING_FIELDS } from '../../services/api/openaiCompat/fromOpenAIStream'
+import { logPaneAction, sectionPaneAction, detailEntryHint } from '../../commands/efftask/logView'
+import type { Key } from '../../ink/events/input-event'
 
 /**
  * 文档必须说真话。
@@ -188,5 +191,78 @@ describe('README 的重做一节说的和代码干的是同一件事', () => {
 
   it('落盘三步的顺序,文档和代码一致', () => {
     expect(DOC).toContain('放隔离工作区 → 删子树 → 写节点')
+  })
+})
+
+/**
+ * 界面那一节写的键位,必须和真的按键处理函数是同一套。
+ *
+ * 键位说明在这个仓库里已经撒过一次谎:日志窗页脚写着「Tab 切换环节」,而 `logPaneAction`
+ * 第三行就是 `if (key.tab) return null` —— Tab 早就让给区切换了,切流改成了 `n`,
+ * 而页脚从没提过 `n`。那句话活了很久,因为没有任何东西核对过它。
+ */
+describe('README 的键位表和按键处理函数说的是同一件事', () => {
+  const key = (over: Partial<Key> = {}): Key => ({
+    upArrow: false, downArrow: false, leftArrow: false, rightArrow: false,
+    pageDown: false, pageUp: false, wheelUp: false, wheelDown: false,
+    home: false, end: false, return: false, escape: false, ctrl: false,
+    shift: false, fn: false, tab: false, backspace: false, delete: false,
+    meta: false, super: false, ...over,
+  })
+
+  it('说 ←→ 换页卡,那 ←→ 就得真的产出换页卡的动作', () => {
+    expect(README).toContain(norm('| `←` / `→` | 换页卡 |'))
+    expect(sectionPaneAction('', key({ leftArrow: true }))?.t).toBe('tab')
+    expect(sectionPaneAction('', key({ rightArrow: true }))?.t).toBe('tab')
+  })
+
+  it('说 Tab 切焦点区,那 Tab 就不能同时还归日志窗', () => {
+    expect(README).toContain(norm('焦点在「页签条」和「内容区」之间切'))
+    expect(sectionPaneAction('', key({ tab: true }))?.t).toBe('switchZone')
+    // 日志窗必须放手,否则一个 Tab 会同时干两件事(两个 useInput 都收得到每个键)。
+    expect(logPaneAction('', key({ tab: true }))).toBeNull()
+  })
+
+  it('说 n 换流,那 n 就得真的换流 —— 而且页脚以前从没提过它', () => {
+    expect(README).toContain(norm('| `n` | 输出页卡换一条流 |'))
+    expect(logPaneAction('n', key())?.t).toBe('nextStream')
+  })
+
+  it('说 ^u/^d 翻页,那它们就得归段落区,而不是被日志窗吃掉', () => {
+    expect(README).toContain(norm('| `^u` / `^d` | 任务页卡翻页 |'))
+    expect(sectionPaneAction('u', key({ ctrl: true }))?.t).toBe('scroll')
+    expect(sectionPaneAction('d', key({ ctrl: true }))?.t).toBe('scroll')
+  })
+
+  it('说「任何时候都能返回」,那 Esc 就不能被这两个处理函数截走', () => {
+    expect(README).toContain(norm('**任何时候都能返回**'))
+    // Esc 归任务树面板(它负责关掉详情页)。这两个都必须放手。
+    expect(logPaneAction('', key({ escape: true }))).toBeNull()
+    expect(sectionPaneAction('', key({ escape: true }))).toBeNull()
+  })
+
+  it('说「只在真的能点时才写回车/点击」,那文案就得跟着可用性变', () => {
+    expect(README).toContain(norm('点不了的时候它一个字都不多说'))
+    expect(detailEntryHint('on')).toContain('点击')
+    expect(detailEntryHint('needs-fullscreen')).not.toContain('点击')
+  })
+})
+
+describe('README 列的推理字段名,和协议转换层认的是同一份', () => {
+  it('每一个列出来的字段名都真的被认', () => {
+    // 少认一个方言 = 那一批后端的思考整段丢失,而且是**静默**的 —— 用户只会看到
+    // 「这个员工不会思考」。所以文档和名单必须锁在一起。
+    for (const f of ['reasoning_content', 'reasoning']) {
+      expect(`README 提到 ${f}: ${README.includes(f)}`).toBe(`README 提到 ${f}: true`)
+      expect(`名单里有 ${f}: ${(REASONING_FIELDS as readonly string[]).includes(f)}`).toBe(`名单里有 ${f}: true`)
+    }
+  })
+
+  it('说了「不需要配 thinkingDepth」,那就不能反过来在别处要求配', () => {
+    expect(README).toContain(norm('不需要配 `thinkingDepth`'))
+    for (const [name, doc] of DOCS) {
+      expect(`${name} 有没有说「想看到思考就得配 thinkingDepth」: ${doc.includes(norm('想看到思考就得配'))}`)
+        .toBe(`${name} 有没有说「想看到思考就得配 thinkingDepth」: false`)
+    }
   })
 })

@@ -32,11 +32,37 @@ export const MAX_EVENT_CHARS = 300
  */
 export const MAX_LINES_PER_BLOCK = 60
 
+/**
+ * 时间与归属字段**全部可选**,而且**不由本模块填**。
+ *
+ * 本模块是纯的、不碰时钟(文件头有原委),盖时间戳的是 `agentStream` 的 `push` ——
+ * 那里已经注入了 `now()`,而且它手上有一张活在 events 数组**之外**的配对表,所以
+ * 环形缓冲把 tool 事件淘汰掉之后,result 仍然算得出耗时。
+ *
+ * 必填会静默出错:本仓库**没有 typecheck**,而 `logView.foldThinking` 会**合成**一条
+ * `{kind:'thinking'}` 事件 —— 必填字段在那里会零反馈地缺席。
+ */
 export type AgentEvent =
   | { kind: 'text'; text: string }
   | { kind: 'thinking'; text: string }
-  | { kind: 'tool'; useId: string; name: string; brief: string }
-  | { kind: 'result'; useId: string; brief: string; isError: boolean }
+  | { kind: 'tool'; useId: string; name: string; brief: string; atMs?: number }
+  | {
+      kind: 'result'
+      useId: string
+      brief: string
+      isError: boolean
+      atMs?: number
+      /**
+       * 从工具调用发出到返回的**墙钟**。
+       *
+       * 口径必须说清:这一段里**包含等人批准权限的时间**(canUseTool 就在这个窗口里
+       * await,humanTimeoutMs 默认 7 天),也包含一次模型往返。主 REPL 是同一个口径。
+       * 所以渲染成 `· 1.8s`,不写「工具执行耗时」—— 那是另一件事。
+       */
+      durMs?: number
+      /** 这条返回属于哪次调用(工具摘要,已夹取)。配不上就是 undefined,**不猜**。 */
+      ofBrief?: string
+    }
 
 /**
  * 工具摘要的外部解析器。

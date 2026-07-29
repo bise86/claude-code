@@ -1665,12 +1665,30 @@ export function DoneView(props: {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
   // node's detail — the run is over, so reading the tree matters more than leaving it fast.
   const ok = props.outcome?.status === 'completed'
+  const handoff = props.handoff ? handoffLines(props.handoff, props.runId) : []
+  /**
+   * 下面那个总结框到底占几行。**数出来,不是估**。
+   *
+   * 面板(以及它里面的详情页)要按可用高度排版,而这个框画在它**下面**、高度随内容变。
+   * 组件自己看不见它 —— 只有这里知道。少算一行,详情页最底下那条页签条就会被顶出屏幕。
+   *
+   * 2 = 上下边框,1 = 标题行,1 = 底部按键提示行。
+   */
+  const summaryRows =
+    4 +
+    (props.viewOnly === true ? 1 : 0) +
+    (props.viewOnly !== true && props.outcome?.reason ? 1 : 0) +
+    (props.handoffResult ? 1 : 0) +
+    (props.handoffResult?.followUps?.length ?? 0) +
+    handoff.length +
+    (props.redoProblems?.length ?? 0)
   return (
     <Box flexDirection="column">
       <TaskTreePanel
         nodes={props.nodes}
         runId={props.runId}
         interactive
+        reservedRows={summaryRows}
         // "完成后保留最终输出" — the buffer outlives the run, so the done view keeps it.
         streams={props.streams}
         onRedo={props.onRedo}
@@ -1690,9 +1708,7 @@ export function DoneView(props: {
           ? <Text color={props.handoffResult.ok ? 'success' : 'error'}>{props.handoffResult.message}</Text>
           : null}
         {props.handoffResult?.followUps?.map(l => <Text key={l} dimColor>{l}</Text>) ?? null}
-        {props.handoff
-          ? handoffLines(props.handoff, props.runId).map(l => <Text key={l} dimColor>{l}</Text>)
-          : null}
+        {handoff.map(l => <Text key={l} dimColor>{l}</Text>)}
         {props.redoProblems?.map(l => <Text key={l} color="warning">⚠ {l}</Text>) ?? null}
         <Text dimColor>
           q / Esc 退出 · 回车看节点详情{props.onRedo ? ' · r 重做选中的任务' : ''}

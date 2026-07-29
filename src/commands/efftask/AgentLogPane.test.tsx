@@ -69,7 +69,9 @@ describe('AgentLogPane 的滚动', () => {
   it('默认粘底 —— 实时终端就该停在最新一屏', async () => {
     const { app, last } = await mount({ streams: long() })
     expect(last().follow).toBe(true)
-    expect(last().from).toBe(last().total - 6)
+    // height=6,可用 5 行:「↓ 下面还有 N 行」那一行**无条件**从预算里扣,
+    // 否则这个窗口实打印比 props.height 多一行,把调用方最底下那行顶掉。
+    expect(last().from).toBe(last().total - 5)
     app.unmount()
   })
 
@@ -78,7 +80,7 @@ describe('AgentLogPane 的滚动', () => {
     t.stdin.press(UP)
     await tick()
     expect(last().follow).toBe(false)
-    expect(last().from).toBe(last().total - 7)
+    expect(last().from).toBe(last().total - 6)
     app.unmount()
   })
 
@@ -96,7 +98,7 @@ describe('AgentLogPane 的滚动', () => {
     expect(last().from).toBe(0)
     expect(last().follow).toBe(false)
     t.stdin.press('G'); await tick()
-    expect(last().from).toBe(last().total - 6)
+    expect(last().from).toBe(last().total - 5)
     expect(last().follow).toBe(true)
     app.unmount()
   })
@@ -220,14 +222,44 @@ describe('AgentLogPane 的边界', () => {
     app.unmount()
   })
 
-  it('钉住的提示自己占一行,不把最后一行挤出去', async () => {
-    // 不扣这一行的话,窗口会画 height+1 行,把它下面的东西顶掉一行。
+  it('实打印行数不许超过 props.height —— 钉的是不变量,不是某个数字', async () => {
+    /**
+     * 这个窗口一共有三样东西会占行:钉住的「丢了多少」提示、内容切片、
+     * 「↓ 下面还有 N 行」。三样加起来必须 ≤ props.height。
+     *
+     * 原来只扣了第一样,于是不跟随时实打印 height+1;它自己那两行页脚(已删)再加 2,
+     * 最坏超 3 行 —— 而详情页最底下正是页签条和页脚,超出去顶掉的就是它们。
+     * 钉具体数字的话,任何一次预算改动都要回来改测试,而改错了照样绿。
+     */
     const many = [stream({ events: lines(...[...Array(40)].map((_, i) => `行${i}`)) })]
-    const a = await mount({ streams: many })
-    const b = await mount({ streams: many, droppedEvents: 7 })
-    expect(`无提示时窗口高 ${a.last().total - a.last().from}`).toBe('无提示时窗口高 6')
-    expect(`有提示时窗口高 ${b.last().total - b.last().from}`).toBe('有提示时窗口高 5')
-    a.app.unmount(); b.app.unmount()
+    for (const [label, props] of [
+      ['跟随 · 无提示', { streams: many }],
+      ['跟随 · 有提示', { streams: many, droppedEvents: 7 }],
+    ] as [string, Record<string, unknown>][]) {
+      const m = await mount(props)
+      const noticeRows = props.droppedEvents ? 1 : 0
+      const behindRows = m.last().follow ? 0 : 1
+      const printed = noticeRows + (m.last().total - m.last().from) + behindRows
+      expect(`${label} 实打印 ${printed} 行,预算 6`).toBe(`${label} 实打印 ${Math.min(printed, 6)} 行,预算 6`)
+      m.app.unmount()
+    }
+  })
+
+  it('滚上去之后,「下面还有 N 行」那一行是真的有位置画', async () => {
+    // 不跟随时这一行才出现。它和内容切片加起来仍然不能超预算 —— 这是上一条的另一半,
+    // 而上一条只能测到跟随态(mount 完默认粘底)。
+    const many = [stream({ events: lines(...[...Array(40)].map((_, i) => `行${i}`)) })]
+    const m = await mount({ streams: many })
+    // 跟随时 from 正好是 total-height,所以这一步量到的就是窗口真实高度。
+    // 不跟随之后 `total - from` 是「离结尾还有多远」,不再等于高度 —— 不能拿它当行数。
+    const height = m.last().total - m.last().from
+    m.t.stdin.press(UP)
+    await tick()
+    expect(m.last().follow).toBe(false)
+    const printed = height + 1 // 内容切片 + 「↓ 下面还有 N 行」
+    expect(`实打印 ${printed} 行,预算 6`).toBe(`实打印 ${Math.min(printed, 6)} 行,预算 6`)
+    expect(m.t.lastFrame()).toContain('下面还有')
+    m.app.unmount()
   })
 
   it('内容溢出时画滚动条,装得下时不画', async () => {

@@ -12,6 +12,16 @@ import { runControlAction,
   scrollWindow,
   droppedNotice,
   wrapDisplayWidth,
+  formatDur,
+  sectionLines,
+  sectionPaneAction,
+  mouseAvailability,
+  mouseHint,
+  detailEntryHint,
+  EXPANDED_MAX_LINES,
+  detailLayout,
+  sectionCursor,
+  tabFocused,
   type LogLine,
 } from './logView.js'
 
@@ -39,6 +49,8 @@ const text = (t: string): AgentEvent => ({ kind: 'text', text: t })
 const think = (t: string): AgentEvent => ({ kind: 'thinking', text: t })
 const tool = (n: string, b: string): AgentEvent => ({ kind: 'tool', useId: n, name: n, brief: b })
 const result = (b: string, isError = false): AgentEvent => ({ kind: 'result', useId: 'x', brief: b, isError })
+const resultOf = (useId: string, b: string, durMs?: number, ofBrief?: string): AgentEvent =>
+  ({ kind: 'result', useId, brief: b, isError: false, durMs, ofBrief })
 
 const render = (over: Partial<Parameters<typeof renderStreamLines>[0]> = {}): LogLine[] =>
   renderStreamLines({ streams: [], folded: new Set(), selected: -1, nowMs: 5000, width: 60, ...over })
@@ -189,8 +201,8 @@ describe('renderStreamLines', () => {
   it('选中的表头带标记', () => {
     const ls = render({ streams: [stream(), stream()], selected: 1, width: 60 })
     const heads = ls.filter(l => l.isHeader)
-    expect(heads[0]!.selected).toBe(false)
-    expect(heads[1]!.selected).toBe(true)
+    expect(heads[0]!.inverse).toBe(false)
+    expect(heads[1]!.inverse).toBe(true)
   })
 
   it('流内的「滚出缓冲」跟着那条流走', () => {
@@ -475,5 +487,285 @@ describe('runControlAction —— 运行中的三个干预键', () => {
     expect(runControlAction('xp', k())).toBeNull()
     // 按住不放是同一个字符重复,那算一次。
     expect(runControlAction('ppp', k())).toBe('togglePause')
+  })
+})
+
+describe('工具调用的耗时与归属(渲染)', () => {
+  it('耗时紧跟在 ⎿ 后面,不在行尾 —— 行尾会被折行甩到续行上', () => {
+    const ls = plain(render({
+      streams: [stream({ events: [tool('T1', 'Bash(bun test)'), resultOf('T1', '2043 pass', 1800, 'Bash(bun test)')] })],
+    }))
+    const line = ls.find(l => l.includes('2043 pass'))!
+    expect(line).toContain('1.8s · 2043 pass')
+    // 上一行就是它自己的调用,归属是多余的。
+    expect(line.includes('Bash(bun test)')).toBe(false)
+  })
+
+  it('并行调用错序返回时,把归属写出来 —— ⎿ 的语义是「上一行的返回」', () => {
+    const ls = plain(render({
+      streams: [stream({ events: [
+        tool('T1', 'gitlab - List Issues (MCP)(acme/web)'),
+        tool('T2', 'ctx7 - resolve-library-id (MCP)(react)'),
+        resultOf('T1', '#412 登录页 500', 1800, 'gitlab - List Issues (MCP)(acme/web)'),
+        resultOf('T2', 'MCP error -32001', 900, 'ctx7 - resolve-library-id (MCP)(react)'),
+      ] })],
+      width: 200,
+    }))
+    const first = ls.find(l => l.includes('#412'))!
+    const second = ls.find(l => l.includes('-32001'))!
+    // 第一条返回的上一行是 ctx7 那次调用,不是它自己的 —— 必须报出归属。
+    expect(first).toContain('gitlab - List Issues (MCP)(acme/web) · 1.8s · #412 登录页 500')
+    // 第二条的上一行是第一条返回(不是工具),同样要报。
+    // 900ms 走亚秒那一档 —— 亚秒不许被渲染成 0s(见下面那条格式测试)。
+    expect(second).toContain('ctx7 - resolve-library-id (MCP)(react) · 900ms · MCP error -32001')
+  })
+
+  it('没有耗时就什么都不加 —— 不画 0s', () => {
+    const ls = plain(render({
+      streams: [stream({ events: [tool('T1', 'Read(a.ts)'), resultOf('T1', '读到了')] })],
+    }))
+    const line = ls.find(l => l.includes('读到了'))!
+    expect(line.trim()).toBe('│   ⎿ 读到了')
+  })
+
+  it('耗时的三档格式', () => {
+    expect([formatDur(85), formatDur(1800), formatDur(133000)]).toEqual(['85ms', '1.8s', '2m13s'])
+    // 亚秒不许显示成 0s:一次 Read 常常就是几十毫秒,全渲染成 0s 等于没有这个数。
+    expect(formatDur(40)).not.toBe('0s')
+    expect(formatDur(Number.NaN)).toBe('')
+  })
+})
+
+describe('sectionLines —— 「任务」页卡的产行函数', () => {
+  const base = { cursor: 0, expanded: new Set<string>(), width: 40, collapsedLines: 3 }
+
+  it('按显示宽度折行,不是按码点 —— 中文一个字占两列', () => {
+    /**
+     * 夹具的方向很容易搞反,搞反了这条测试就是恒真的。
+     *
+     * 要触发的老毛病是 block() 的 `Array.from(l).length <= width`:**码点数没超、显示宽度
+     * 超了**的那一行会被判成「不用折」,交给 Text 默认 wrap 回流成两三个终端行,
+     * 而窗口按「一行」记了账。所以这一行必须挑在这个夹缝里:
+     *   正文可用 36 列;30 个汉字 = 30 码点(**没超**)= 60 列(**超了一倍**)。
+     * 用 60 个汉字反而测不到 —— 码点数也超了,按码点判的实现照样会折。
+     */
+    const body = '中'.repeat(30)
+    expect(Array.from(body).length).toBeLessThanOrEqual(36) // 前提:码点数没超
+    expect(stringWidth(body)).toBeGreaterThan(36)           // 前提:显示宽度超了
+    const { lines } = sectionLines({ ...base, sections: [{ title: '目标', body }], collapsedLines: 50 })
+    for (const l of lines.slice(1)) expect(stringWidth(l.text)).toBeLessThanOrEqual(40)
+    // 折成了两行正文,不是一行。
+    expect(lines.length).toBe(3)
+  })
+
+  it('列宽真的参与计算 —— 窄终端要折出更多行', () => {
+    const wide = sectionLines({ ...base, sections: [{ title: '目标', body: 'a'.repeat(200) }], width: 100, collapsedLines: 50 })
+    const narrow = sectionLines({ ...base, sections: [{ title: '目标', body: 'a'.repeat(200) }], width: 40, collapsedLines: 50 })
+    expect(narrow.lines.length).toBeGreaterThan(wide.lines.length)
+  })
+
+  it('折叠时掐头**留尾** —— 最新的那几行不许被裁掉', () => {
+    // 每一轮追加的内容都追加在末尾(执行状态后面长出「(合并冲突解决)…」,验收记录后面
+    // 长出最新一轮裁决)。只留头的话,把节点挡下来的那条拒绝理由在整个 TUI 里都找不到。
+    const body = Array.from({ length: 30 }, (_, i) => `第${i}行`).join('\n')
+    const { lines } = sectionLines({ ...base, sections: [{ title: '执行状态', body }], collapsedLines: 4 })
+    const texts = lines.map(l => l.text)
+    expect(texts.some(t => t.includes('第0行'))).toBe(true)
+    expect(texts.some(t => t.includes('第29行'))).toBe(true)
+    expect(texts.some(t => t.includes('中间省略'))).toBe(true)
+    // 标题 + 4 行正文,一行不多。
+    expect(lines.length).toBe(5)
+  })
+
+  it('标题上写清一共多少行,展开之后换成「空格收起」', () => {
+    const body = Array.from({ length: 30 }, (_, i) => `第${i}行`).join('\n')
+    const collapsed = sectionLines({ ...base, sections: [{ title: '目标', body }] })
+    expect(collapsed.lines[0]!.text).toContain('共 30 行')
+    const open = sectionLines({ ...base, sections: [{ title: '目标', body }], expanded: new Set(['目标']) })
+    expect(open.lines[0]!.text).toContain('空格收起')
+    // 展开之后整段铺开(30 行 + 1 行标题)。
+    expect(open.lines.length).toBe(31)
+  })
+
+  it('装得下就不提「共 N 行」—— 一句没用的提示也是噪声', () => {
+    const { lines } = sectionLines({ ...base, sections: [{ title: '重点', body: '就一行' }] })
+    expect(lines[0]!.text).not.toContain('共')
+    expect(lines[0]!.text).not.toContain('空格')
+  })
+
+  it('展开也有上限,超了照样说省略了多少 —— 不假装那是全部', () => {
+    const body = Array.from({ length: EXPANDED_MAX_LINES + 500 }, (_, i) => `第${i}行`).join('\n')
+    const { lines } = sectionLines({ ...base, sections: [{ title: '执行状态', body }], expanded: new Set(['执行状态']) })
+    // 标题 1 行 + 正文恰好 EXPANDED_MAX_LINES 行(含「中间省略」那一行本身)。
+    expect(lines.length).toBe(EXPANDED_MAX_LINES + 1)
+    // 省略的行数按真实留下的算:总行数 - 头 - 尾 = 2500 - 1997 - 2。
+    expect(lines.map(l => l.text).some(t => t.includes(`中间省略 ${2500 - (EXPANDED_MAX_LINES - 3) - 2} 行`))).toBe(true)
+  })
+
+  it('光标那一段带 ❯ 和反显,别的段没有', () => {
+    const { lines, headerAt } = sectionLines({
+      ...base, cursor: 1, sections: [{ title: '目标', body: 'a' }, { title: '重点', body: 'b' }],
+    })
+    expect(lines[headerAt(0)]!.text).not.toContain('❯')
+    expect(lines[headerAt(0)]!.inverse).toBe(false)
+    expect(lines[headerAt(1)]!.text).toContain('❯')
+    expect(lines[headerAt(1)]!.inverse).toBe(true)
+  })
+
+  it('headerAt 指的是那一段的标题行 —— 展开上面一段之后它也要跟着走', () => {
+    // 锚在绝对行号上的话,展开一段会让下面所有行整体位移,视口当场跳到别处 ——
+    // 这是日志窗那边已经付过一次学费的坑。
+    const secs = [{ title: '目标', body: 'x\n'.repeat(20) }, { title: '重点', body: '重点正文' }]
+    const before = sectionLines({ ...base, sections: secs })
+    const after = sectionLines({ ...base, sections: secs, expanded: new Set(['目标']) })
+    expect(after.headerAt(1)).toBeGreaterThan(before.headerAt(1))
+    expect(after.lines[after.headerAt(1)]!.text).toContain('重点')
+    expect(before.lines[before.headerAt(1)]!.text).toContain('重点')
+  })
+
+  it('段落自带颜色时,正文不再 dim —— 阻断原因要看得见', () => {
+    const { lines } = sectionLines({ ...base, sections: [{ title: '阻断原因', body: '验收未通过', color: 'error' }] })
+    expect(lines[0]!.color).toBe('error')
+    expect(lines[1]!.color).toBe('error')
+    expect(lines[1]!.dim).toBe(false)
+  })
+})
+
+describe('详情页的按键(段落区 / 页签条)', () => {
+  it('←/→ 切页卡 —— 这两个键在详情页原来是死键', () => {
+    expect(sectionPaneAction('', key({ leftArrow: true }))).toEqual({ t: 'tab', d: -1 })
+    expect(sectionPaneAction('', key({ rightArrow: true }))).toEqual({ t: 'tab', d: 1 })
+    // 日志窗**不认**左右箭头 —— 两个 useInput 会同时收到每一个键,不冲突全靠这一点。
+    expect(logPaneAction('', key({ leftArrow: true }))).toBeNull()
+    expect(logPaneAction('', key({ rightArrow: true }))).toBeNull()
+  })
+
+  it('Tab 轮转焦点区,Shift+Tab 反向', () => {
+    expect(sectionPaneAction('', key({ tab: true }))).toEqual({ t: 'switchZone', d: 1 })
+    expect(sectionPaneAction('', key({ tab: true, shift: true }))).toEqual({ t: 'switchZone', d: -1 })
+    // Tab 是专门从日志窗那边让出来的。
+    expect(logPaneAction('', key({ tab: true }))).toBeNull()
+  })
+
+  it('ctrl+u / ctrl+d 半页滚动 —— 挑的是没被 REPL 抢走的那两个键', () => {
+    // 全屏下 PgUp/PgDn/滚轮已经被 REPL 的 ScrollKeybindingHandler 绑走并
+    // stopImmediatePropagation 掉了(它比详情页先挂),所以页脚只承诺 ^u/^d。
+    expect(sectionPaneAction('u', key({ ctrl: true }))).toEqual({ t: 'scroll', d: -1 })
+    expect(sectionPaneAction('d', key({ ctrl: true }))).toEqual({ t: 'scroll', d: 1 })
+    expect(sectionPaneAction('', key({ pageUp: true }))).toEqual({ t: 'scroll', d: -1 })
+    expect(sectionPaneAction('', key({ pageDown: true }))).toEqual({ t: 'scroll', d: 1 })
+  })
+
+  it('↑↓/jk 选段落,空格展开;别的组合键一律不认', () => {
+    expect(sectionPaneAction('', key({ upArrow: true }))).toEqual({ t: 'move', d: -1 })
+    expect(sectionPaneAction('jjj', key())).toEqual({ t: 'move', d: 3 })
+    expect(sectionPaneAction(' ', key())).toEqual({ t: 'toggle' })
+    expect(sectionPaneAction('x', key({ meta: true }))).toBeNull()
+    // 合批带进来的别的输入不认(和 logPaneAction 同一条规矩)。
+    expect(sectionPaneAction('jk', key())).toBeNull()
+  })
+})
+
+describe('鼠标可用性 —— 三道闸门', () => {
+  it('全开才是能点', () => {
+    expect(mouseAvailability({ fullscreen: true, tracking: true, clicks: true })).toBe('on')
+  })
+
+  it('三个不同的原因要分得开 —— 否则用户不知道该动哪个开关', () => {
+    expect(mouseAvailability({ fullscreen: false, tracking: true, clicks: true })).toBe('needs-fullscreen')
+    expect(mouseAvailability({ fullscreen: true, tracking: false, clicks: true })).toBe('tracking-disabled')
+    expect(mouseAvailability({ fullscreen: true, tracking: true, clicks: false })).toBe('clicks-disabled')
+  })
+
+  it('非全屏时,后面两个开关怎么设都不改变结论', () => {
+    // 非全屏下终端根本不上报鼠标,说「被 DISABLE_MOUSE 关掉了」会把人指去改一个
+    // 和现象无关的开关。
+    expect(mouseAvailability({ fullscreen: false, tracking: false, clicks: false })).toBe('needs-fullscreen')
+  })
+
+  it('每一种不可用都给得出一句能照着做的话', () => {
+    for (const a of ['needs-fullscreen', 'tracking-disabled', 'clicks-disabled'] as const) {
+      // 提示里必须点名那个环境变量,否则等于只说了「不能用」。
+      expect(`${a}: ${/CLAUDE_CODE_[A-Z_]+/.test(mouseHint(a))}`).toBe(`${a}: true`)
+    }
+    expect(mouseHint('on')).toBe('鼠标点击')
+  })
+})
+
+describe('detailLayout —— 详情页的版面算术', () => {
+  /**
+   * 单独钉这几个数,是因为算错的后果**不是画面溢出**:内容区是 flexGrow +
+   * overflow:hidden,少算一行只会**静默少画一行**。变异实测:把 chrome 减 1、
+   * 或者不给「↓ 下面还有 N 行」预留位置,整套渲染断言一条都不红。
+   */
+  it('非模态:标题 + 元信息 + 页签条 + 页脚 + 上下边框,一共 6 行', () => {
+    const l = detailLayout({ budget: 30, columns: 100, inModal: false })
+    expect(l.contentRows).toBe(24)
+    expect(l.contentWidth).toBe(96) // paddingX 2 + 边框 2
+  })
+
+  it('模态槽里不画自己的边框,省下 2 行 2 列', () => {
+    const l = detailLayout({ budget: 30, columns: 100, inModal: true })
+    expect(l.contentRows).toBe(26)
+    expect(l.contentWidth).toBe(98)
+  })
+
+  it('paneRows 比 contentRows 少一行 —— 那一行留给「下面还有 N 行」', () => {
+    for (const budget of [10, 16, 24, 40, 60]) {
+      const l = detailLayout({ budget, columns: 100, inModal: false })
+      expect(`budget=${budget} pane=${l.paneRows}`).toBe(`budget=${budget} pane=${l.contentRows - 1}`)
+    }
+  })
+
+  it('全部加起来正好是预算,一行不多一行不少', () => {
+    for (const inModal of [true, false]) {
+      for (const budget of [12, 20, 24, 40, 60]) {
+        const l = detailLayout({ budget, columns: 100, inModal })
+        const chrome = 4 + (inModal ? 0 : 2)
+        expect(`${inModal}/${budget}: ${l.contentRows + chrome}`).toBe(`${inModal}/${budget}: ${budget}`)
+      }
+    }
+  })
+
+  it('预算小到荒唐时也不返回负数', () => {
+    const l = detailLayout({ budget: 1, columns: 10, inModal: false })
+    expect(l.contentRows).toBeGreaterThanOrEqual(3)
+    expect(l.paneRows).toBeGreaterThanOrEqual(2)
+    expect(l.contentWidth).toBeGreaterThanOrEqual(24)
+  })
+})
+
+describe('焦点标记不许说假话', () => {
+  it('焦点在页签条上时,段落区不画光标', () => {
+    // 画了的话就是「这一段选中了」——而此刻 ↑↓ 和空格都不归它。
+    expect(sectionCursor('content', true, 3)).toBe(3)
+    expect(sectionCursor('tabs', true, 3)).toBe(-1)
+  })
+
+  it('当前是别的页卡时,段落区也不画光标', () => {
+    expect(sectionCursor('content', false, 3)).toBe(-1)
+    expect(sectionCursor('tabs', false, 3)).toBe(-1)
+  })
+
+  it('页签只在焦点真的落在页签条上时才反显', () => {
+    // 「当前页卡」和「焦点在页签条上」是两件事:前者用加粗和颜色表示,
+    // 后者才是反显。合成一个的话,用户永远看不出键盘此刻归谁。
+    expect(tabFocused('tabs', true)).toBe(true)
+    expect(tabFocused('tabs', false)).toBe(false)
+    expect(tabFocused('content', true)).toBe(false)
+  })
+})
+
+describe('任务树页脚里「怎么进详情页」那半句', () => {
+  it('能点才说能点', () => {
+    expect(detailEntryHint('on')).toBe('回车/点击看详情')
+  })
+
+  it('不能点时一个字都不多写 —— 那一行是 truncate-end 的', () => {
+    // 多塞一句「需要开全屏」会把右边的「Esc/q 退出」吃掉,等于用「解释一个用不了的
+    // 功能」换掉「怎么退出去」。为什么点不了由详情页页签条右侧那个专门的位置去说。
+    for (const a of ['needs-fullscreen', 'tracking-disabled', 'clicks-disabled'] as const) {
+      expect(`${a}: ${detailEntryHint(a)}`).toBe(`${a}: 回车看详情`)
+    }
   })
 })

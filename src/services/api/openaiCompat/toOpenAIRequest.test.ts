@@ -74,4 +74,60 @@ describe('toOpenAIRequest', () => {
     const out = toOpenAIRequest({ model: 'm', system: '', messages: [] }, 'gpt-4o')
     expect(out.messages.find((m: any) => m.role === 'system')).toBeUndefined()
   })
+
+  /**
+   * 「只有 thinking 的 assistant 轮次」是 fromOpenAIStream 认思考之后**新出现**的形状:
+   * 在那之前,推理中撞 max_tokens、或后端吐完 reasoning_content 就 finish 的那一轮
+   * 根本不产生 assistant 消息。现在它是一条只含 thinking 块的消息,而 textOf 只留 text ——
+   * 出网就是 `{"role":"assistant","content":""}`,一部分兼容后端(DeepSeek 尤甚)直接 400。
+   */
+  it('只有 thinking 块的 assistant 消息不出网', () => {
+    const out = toOpenAIRequest({ model: 'm', messages: [
+      { role: 'user', content: [{ type: 'text', text: '干活' }] },
+      { role: 'assistant', content: [{ type: 'thinking', thinking: '想了很久', signature: '' }] },
+      { role: 'user', content: [{ type: 'text', text: '继续' }] },
+    ] }, 'deepseek-reasoner')
+    expect(out.messages).toEqual([
+      { role: 'user', content: '干活' },
+      { role: 'user', content: '继续' },
+    ])
+  })
+
+  it('thinking + text 的 assistant 消息照常出网(防上一条误伤)', () => {
+    const out = toOpenAIRequest({ model: 'm', messages: [
+      { role: 'assistant', content: [{ type: 'thinking', thinking: 'x' }, { type: 'text', text: '我来读一下。' }] },
+    ] }, 'm')
+    expect(out.messages).toEqual([{ role: 'assistant', content: '我来读一下。' }])
+  })
+
+  it('user 的空消息不受影响 —— 这条改动只挡 assistant', () => {
+    const out = toOpenAIRequest({ model: 'm', messages: [{ role: 'user', content: [] }] }, 'm')
+    expect(out.messages).toEqual([{ role: 'user', content: '' }])
+  })
+
+  it('没有 input_schema 的服务端工具不往外发', () => {
+    // anthropic 的服务端工具(web_search / advisor 一类)没有 input_schema,claude.ts 会把
+    // 它们拼进同一个 tools 数组。原样映射得到一个没有 parameters 的函数:严格后端 400,
+    // 宽松后端会让模型去调一个这条桥根本执行不了的工具。
+    const out = toOpenAIRequest({ model: 'm', messages: [], tools: [
+      { type: 'web_search_20250305', name: 'web_search' },
+      { name: 'Read', description: 'r', input_schema: { type: 'object' } },
+    ] }, 'm')
+    expect(out.tools).toEqual([{ type: 'function', function: { name: 'Read', description: 'r', parameters: { type: 'object' } } }])
+  })
+
+  it('工具被滤光时不发空的 tools 字段', () => {
+    const out = toOpenAIRequest({ model: 'm', messages: [], tools: [{ type: 'advisor_20260301', name: 'advisor' }] }, 'm')
+    expect('tools' in out).toBe(false)
+  })
+
+  it("tool_choice 'none' 不许拼成一个没名字的强制调用", () => {
+    // 漏了 none 会掉进最后那一支,发出 {type:'function',function:{name:undefined}} ——
+    // 本意「这轮别调工具」,出网成了「必须调某个没名字的工具」,语义完全相反。
+    expect(toOpenAIRequest({ model: 'm', messages: [], tool_choice: { type: 'none' } }, 'm').tool_choice).toBe('none')
+    expect(toOpenAIRequest({ model: 'm', messages: [], tool_choice: { type: 'auto' } }, 'm').tool_choice).toBe('auto')
+    expect(toOpenAIRequest({ model: 'm', messages: [], tool_choice: { type: 'any' } }, 'm').tool_choice).toBe('required')
+    expect(toOpenAIRequest({ model: 'm', messages: [], tool_choice: { type: 'tool', name: 'Bash' } }, 'm').tool_choice)
+      .toEqual({ type: 'function', function: { name: 'Bash' } })
+  })
 })

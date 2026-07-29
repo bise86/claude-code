@@ -2,12 +2,14 @@ import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { isTerminal, uiStatus, type UiStatus } from '../../tools/efftask/stateMachine.js'
-import { NodeDetail } from './NodeDetail.js'
+import { NodeDetail, type DetailZone } from './NodeDetail.js'
 import type { StreamStore } from '../../tools/efftask/agentStream.js'
 import { useStreamTick } from './AgentLogPane.js'
-import { runControlAction, budgetRows, clipToWidth, lastActivity } from './logView.js'
+import { runControlAction, budgetRows, clipToWidth, lastActivity, detailEntryHint } from './logView.js'
+import { currentMouseAvailability } from './mouseEnv.js'
 import { stringWidth } from '../../ink/stringWidth.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
+import { useIsInsideModal, useModalOrTerminalSize } from '../../context/modalContext.js'
 
 const COLOR: Record<UiStatus, string> = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' }
 const GLYPH: Record<UiStatus, string> = { done: '●', running: '◐', queued: '○', failed: '✗' }
@@ -105,10 +107,16 @@ export function visibleRows(
  * every key, and the running view's Esc means "abort the run" while the detail view's means
  * "go back". `onExitKey` is how the parent still gets its abort/exit.
  *
- * ON MOUSE: the request was "点击展开". The vendored renderer does parse SGR mouse events,
- * but mouse tracking is only enabled in fullscreen mode, and turning it on inside the REPL
- * takes away the user's ability to select and copy terminal text — a worse trade than
- * keyboard folding. Arrow/hjkl folding is the equivalent affordance here.
+ * ## 鼠标
+ *
+ * 每一行挂一个 `onClick`(移光标 + 打开详情),等价于在这一行上按回车 —— 用户点名要的。
+ *
+ * 这里**不主动去开**鼠标追踪:开了会夺走终端自己的选中复制。接的是「已经开着时把点击
+ * 收下来」,而追踪只在全屏模式下开(`Ink.dispatchClick` 第一句就是
+ * `if (!this.altScreenActive) return false`,更上游的终端在非全屏下根本不发这些序列)。
+ * 所以非全屏下这段代码是**惰性**的:零成本、不会崩、也不会改变任何既有行为。
+ * 页脚会按 `currentMouseAvailability()` 如实说明此刻能不能点 —— 一个按了没反应的
+ * affordance 比没有更糟。
  */
 /**
  * The slice of rows to actually draw, and where that slice starts.
@@ -161,6 +169,13 @@ export function TaskTreePanel(props: {
   interactive?: boolean
   /** Rows of tree drawn at once; the rest scrolls with the cursor. */
   maxRows?: number
+  /**
+   * 这个面板**下面**还画着多少行别的东西。
+   *
+   * 完成视图在树的下面挂着一个总结框(收口结果 / 后续动作 / 重做遗留问题),行数运行时
+   * 可变;运行视图则是独占的。详情页要算自己的高度,而它看不见那个框 —— 只有调用方知道。
+   */
+  reservedRows?: number
   onExitKey?: () => void
   /**
    * 让出键盘。
@@ -222,11 +237,29 @@ export function TaskTreePanel(props: {
   // 订阅事件流,合批重绘。放在这里而不是放在窗口自己身上:窗口拿到的 streams 是这个组件
   // 在 render 期读出来的,窗口自己重绘并不会让这里重新去读。
   useStreamTick(props.streams, live)
-  const { columns, rows: termRows } = useTerminalSize()
+  /**
+   * 尺寸走 `useModalOrTerminalSize`,不是裸的 `useTerminalSize`。
+   *
+   * 全屏时 `/et` 是 local-jsx,渲染在 FullscreenLayout 的 modal 槽里,而那个槽给的是
+   * `rows - 3` / `columns - 4`,外面还罩着 `overflow="hidden"` —— 按终端行数排版会
+   * **恒定多算 3 行**,多出来的从底部剪掉。
+   */
+  const { columns, rows: termRows } = useModalOrTerminalSize(useTerminalSize())
+  const inModal = useIsInsideModal()
+  const reserved = Math.max(0, props.reservedRows ?? 0)
 
   const [collapsed, setCollapsed] = React.useState<ReadonlySet<string>>(() => new Set())
   const [cursor, setCursor] = React.useState(0)
   const [detailId, setDetailId] = React.useState<string | null>(null)
+  /**
+   * 详情页此刻的焦点区。**功能性的,不只是观测。**
+   *
+   * 回车归这里(返回任务树),而用户要的是「最下面点击或回车可选择不同的页卡」——
+   * 所以焦点落在页签条上时这一下回车要让给详情页。让路只能由**这里**做:
+   * vendored 的 `useInput` 把 listener 槽位定在 mount 时刻,本面板比 NodeDetail 先挂、
+   * 永远先跑,在 NodeDetail 里调 stopImmediatePropagation 已经来不及了。
+   */
+  const detailZone = React.useRef<DetailZone>('content')
 
   const rows = visibleRows(props.nodes, collapsed)
   // Rows of TREE to draw at once; the border, header and key hint live outside it.
@@ -237,7 +270,15 @@ export function TaskTreePanel(props: {
    * 一点富余都没有,再多一行提示就溢出。减 8 是给边框、表头、提示、以及 /et 上方
    * REPL 里的其它内容留的余量。
    */
-  const height = Math.max(3, props.maxRows ?? Math.min(20, Math.max(6, termRows - 8)))
+  const height = Math.max(3, props.maxRows ?? Math.min(20, Math.max(6, termRows - 8 - reserved)))
+  /**
+   * 详情页能用多少个终端行。
+   *
+   * 模态槽里可以吃满(那个槽给的已经是可用值);非全屏时留 8 行余量 —— `/et` 渲染在
+   * 对话流里,帧高一旦超过视口,上面那个 1s tick 每跳一次就逼出一次整屏重置,而且被
+   * 切掉的是**顶部**(标题和目标),和全屏正好相反。
+   */
+  const detailRows = Math.max(10, (inModal ? termRows : termRows - 8) - reserved)
   // The tree grows while it runs, so a cursor parked past the end must not render a blank
   // selection — clamp on every paint rather than trying to fix it up on each mutation.
   const idx = rows.length === 0 ? 0 : Math.min(cursor, rows.length - 1)
@@ -252,6 +293,9 @@ export function TaskTreePanel(props: {
       // 详情页是判断「这个节点到底哪儿错了」的地方 —— 看完就想重做,最不该逼用户先退回
       // 树上再按一次 r。
       if (k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
+      // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
+      // Esc / q 任何时候都是返回 —— 返回这条路不许有死角。
+      if (key.return && detailZone.current === 'tabs') return
       if (key.return || key.escape || k === 'q') setDetailId(null)
       return
     }
@@ -306,6 +350,8 @@ export function TaskTreePanel(props: {
         canRedo={props.onRedo !== undefined}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
+        maxRows={detailRows}
+        onState={s => { detailZone.current = s.zone }}
         // 在 RENDER 期从活存储读,不复制进 React state:事件流对每个在飞的节点每条消息
         // 都要触发一次,镜像进 state 会让整棵树在每条消息上重绘。
         streams={props.streams?.streams(detail.id)}
@@ -342,6 +388,7 @@ export function TaskTreePanel(props: {
   const view = budgetedViewport(rows, cost, idx, height)
   const counts: Record<UiStatus, number> = { done: 0, running: 0, queued: 0, failed: 0 }
   for (const n of props.nodes) counts[uiStatus(n.status)]++
+  const mouse = currentMouseAvailability()
 
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
@@ -373,7 +420,20 @@ export function TaskTreePanel(props: {
         const room = columns - (8 + depth * 2) - stringWidth(suffix)
         const title = clipToWidth(n.title, Math.max(6, room))
         return (
-          <Box key={n.id} flexDirection="column">
+          <Box
+            key={n.id}
+            flexDirection="column"
+            flexShrink={0}
+            /**
+             * 点这一行 = 在这一行上按回车:先把光标移过来,再打开详情。
+             *
+             * 挂在**每一行自己**的 Box 上,而不是在容器上挂一个再用 `event.localRow`
+             * 反推行号 —— 命中测试本来就是取最深的那个节点(hit-test 反向遍历),
+             * 而 localCol/localRow 只在 nodeCache 里有这个节点时才被填,反推等于给自己
+             * 加一条会静默失效的假设。
+             */
+            onClick={() => { setCursor(i); setDetailId(n.id) }}
+          >
             {/* truncate-end,不让长标题回流成两行:一行一个终端行是 budgetedViewport 的
                 前提,行数一旦对不上,底部的计数和按键提示就会被顶出屏幕。 */}
             <Text color={COLOR[ui]} inverse={selected} wrap="truncate-end">
@@ -404,7 +464,17 @@ export function TaskTreePanel(props: {
           {props.suspended === true
             // 不说的话,用户会按着方向键发现树不动,以为界面卡死了。
             ? '⏸ 等你回答上面那个权限确认 —— 这期间按键归它'
-            : `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定    ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · 回车看详情${props.onRedo ? ' · r 重做' : ''} · Esc/q 退出`}
+            /**
+             * 鼠标**只在真的能点的时候才提**。
+             *
+             * 不能点时这里一个字都不多写 —— 原因有两条:
+             *  1. 承诺一个按了没反应的 affordance 比没有更糟(这条这个仓库付过好几次学费);
+             *  2. 这一行已经很挤,而它是 `wrap="truncate-end"` —— 多塞一句「需要开全屏」
+             *     会把右边的 `Esc/q 退出` 直接吃掉,也就是用「解释一个用不了的功能」
+             *     换掉「怎么退出去」。
+             * 「为什么点不了」由详情页页签条右侧那个专门的位置来说,那里有地方。
+             */
+            : `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定    ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · ${detailEntryHint(mouse)}${props.onRedo ? ' · r 重做' : ''} · Esc/q 退出`}
         </Text>
       ) : null}
     </Box>

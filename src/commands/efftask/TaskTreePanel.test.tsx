@@ -414,6 +414,7 @@ describe('节点详情里的子 agent 实时输出 (spec §10.2)', () => {
         node: mk({ id: 'n', title: '打通接口', status: 'EXECUTING', kind: 'executable' }),
         elapsed: '1m',
         columns: 100,
+        initialTab: 'log',
         streams: [mkStream({ events: lines('正在改 src/login.ts', '跑测试:12 通过') })],
       } as never),
       { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
@@ -431,7 +432,7 @@ describe('节点详情里的子 agent 实时输出 (spec §10.2)', () => {
     const app = await render(
       React.createElement(NodeDetail as never, {
         node: mk({ id: 'n', status: 'EXECUTING', kind: 'executable' }),
-        elapsed: '1m', maxLines: 24, columns: 100,
+        elapsed: '1m', maxRows: 24, columns: 100, initialTab: 'log',
         streams: [mkStream({ events: lines(...[...Array(60)].map((_, i) => `行 ${i}`)) })],
       } as never),
       { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
@@ -448,7 +449,7 @@ describe('节点详情里的子 agent 实时输出 (spec §10.2)', () => {
     const app = await render(
       React.createElement(NodeDetail as never, {
         node: mk({ id: 'n', status: 'EXECUTING', kind: 'executable' }),
-        elapsed: '1m', columns: 100,
+        elapsed: '1m', columns: 100, initialTab: 'log',
         streams: [mkStream({ events: lines('最后一行'), dropped: 143 })],
       } as never),
       { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
@@ -459,14 +460,38 @@ describe('节点详情里的子 agent 实时输出 (spec §10.2)', () => {
     app.unmount()
   })
 
-  it('renders nothing at all when the node never produced output', async () => {
+  it('没有输出时,输出页卡说「暂无输出」,不画一个空窗口假装有内容', async () => {
+    // 页卡本身是**常在**的(它是版面的一部分,不能忽有忽无 —— 那会让页签条的宽度
+    // 每次运行都不一样)。要守的是:切过去看到的是一句实话,而不是一个空框。
     const t = fakeTty()
     const app = await render(
-      React.createElement(NodeDetail as never, { node: mk({ id: 'n' }), elapsed: '1m', streams: [] } as never),
+      React.createElement(NodeDetail as never, { node: mk({ id: 'n' }), elapsed: '1m', streams: [], initialTab: 'log' } as never),
       { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
     )
     await tick()
-    expect(t.lastFrame()).not.toContain('子 agent 输出')
+    expect(t.lastFrame()).toContain('暂无输出')
+    // 页签上那个「(N)」只在真有流的时候才出现 —— 否则它自己就是一句假话。
+    expect(t.lastFrame()).not.toContain('输出(')
+    app.unmount()
+  })
+
+  it('按 → 就能从任务页卡切到输出页卡 —— 键真的接通了', async () => {
+    // 上面那几条是用 initialTab 直接开在输出页卡上的,它证明不了**切**得过去。
+    // ←/→ 在这一屏原来是死键,这条钉的就是它现在真的管用。
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: mk({ id: 'n', status: 'EXECUTING', kind: 'executable' }),
+        elapsed: '1m', columns: 100, logActive: true,
+        streams: [mkStream({ events: lines('切过来才看得到这句') })],
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).not.toContain('切过来才看得到这句')
+    t.stdin.press('\u001b[C') // →
+    await tick()
+    expect(t.lastFrame()).toContain('切过来才看得到这句')
     app.unmount()
   })
 
@@ -576,7 +601,7 @@ describe('实时输出面板不能只交代一半的截断', () => {
     // user was told 300 were hidden while 492 were. Same "starts in the middle but looks
     // complete" lie block() had to fix in this very file.
     const f = await mountDetail({
-      columns: 100, maxLines: 24,
+      columns: 100, maxRows: 24, initialTab: 'log',
       streams: [mkStream({ events: lines(...[...Array(200)].map((_, i) => `行${i}`)), dropped: 42 })],
       droppedEvents: 342,
     })
@@ -591,7 +616,7 @@ describe('实时输出面板不能只交代一半的截断', () => {
   })
 
   it('缓冲没丢过东西时,不提"滚出缓冲"', async () => {
-    const f = await mountDetail({ columns: 100, streams: [mkStream({ events: lines('一', '二') })], droppedEvents: 0 })
+    const f = await mountDetail({ columns: 100, streams: [mkStream({ events: lines('一', '二') })], droppedEvents: 0, initialTab: 'log' })
     expect(f).not.toContain('滚出缓冲')
     expect(f).not.toContain('已释放')
   })
@@ -602,7 +627,7 @@ describe('实时输出面板不能只交代一半的截断', () => {
     // Zero-padded: 'L1' is a SUBSTRING of 'L10'..'L19', so an unpadded fixture counted lines
     // that were never rendered and the assertion held no matter what the budget was.
     const names = [...Array(60)].map((_, i) => `L${String(i).padStart(3, '0')}`)
-    const f = await mountDetail({ columns: 100, streams: [mkStream({ events: lines(...names) })], maxLines: 24 })
+    const f = await mountDetail({ columns: 100, streams: [mkStream({ events: lines(...names) })], maxRows: 24, initialTab: 'log' })
     const shown = names.filter(l => f.includes(l))
     expect(shown.length).toBeGreaterThan(8)
   })

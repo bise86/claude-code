@@ -5,6 +5,7 @@ import {
   MAX_EVENTS_PER_STREAM,
   MAX_STREAMS_PER_NODE,
   MAX_TOTAL_EVENTS,
+  MAX_PENDING_CALLS,
   TOMBSTONE_KEEP,
   PRE_TREE_NODE,
   type StreamMeta,
@@ -21,12 +22,96 @@ const meta = (over: Partial<StreamMeta> = {}): StreamMeta => ({
 
 const text = (t: string): AgentEvent => ({ kind: 'text', text: t })
 const tool = (n: string): AgentEvent => ({ kind: 'tool', useId: n, name: n, brief: n })
+const toolAs = (useId: string, brief: string): AgentEvent => ({ kind: 'tool', useId, name: 'T', brief })
+const resultAs = (useId: string, brief = 'ok'): AgentEvent => ({ kind: 'result', useId, brief, isError: false })
+/** 事件数组里第 i 条 result。断言耗时时用 —— 事件是 push 的时候被换掉的,不是原对象。 */
+const results = (s: { events: AgentEvent[] }) => s.events.filter(e => e.kind === 'result') as Extract<AgentEvent, { kind: 'result' }>[]
 
 /** 可注入的假时钟 —— 这个仓库的测试不许摸真实时钟。 */
 function clock(start = 1000): { now: () => number; tick: (ms: number) => void } {
   let t = start
   return { now: () => t, tick: ms => { t += ms } }
 }
+
+/**
+ * 单次工具调用的耗时与归属 —— 用户的原话:「各种工具调用,耗时多少…都要有」。
+ *
+ * 配对**必须在 push 里**做,不能在渲染期做:渲染期是从 events 数组里找对手,而环形
+ * 缓冲和墓碑都会把 tool 事件淘汰掉、只留下 result。
+ */
+describe('工具调用的耗时与归属', () => {
+  it('按 useId 配对,算出这次调用的墙钟耗时,并记下它属于谁', () => {
+    const c = clock()
+    const s = createStreamStore({ now: c.now })
+    const h = s.open(meta())
+    h.push(toolAs('T1', 'Bash(bun test)'))
+    c.tick(1800)
+    h.push(resultAs('T1', '2043 pass'))
+    const [r] = results(s.streams('root/01-a')[0]!)
+    expect(`${r!.durMs} / ${r!.ofBrief}`).toBe('1800 / Bash(bun test)')
+  })
+
+  it('工具事件被环形缓冲挤掉之后,耗时仍然算得出来', () => {
+    // 这一条就是「配对放在渲染期」会死的地方 —— 那时 events 里已经没有 tool 事件了。
+    const c = clock()
+    const s = createStreamStore({ now: c.now })
+    const h = s.open(meta())
+    h.push(toolAs('T1', 'Read(a.ts)'))
+    for (let i = 0; i < MAX_EVENTS_PER_STREAM + 5; i++) h.push(text(`第${i}行`))
+    c.tick(2500)
+    h.push(resultAs('T1', '读到了'))
+    const st = s.streams('root/01-a')[0]!
+    expect(`还有 tool 事件吗: ${st.events.some(e => e.kind === 'tool')}`).toBe('还有 tool 事件吗: false')
+    expect(results(st)[0]!.durMs).toBe(2500)
+  })
+
+  it('provider 没给 id 时按先进先出配对,两次调用不许配到同一个上面', () => {
+    // asId 在畸形输入上返回空串,而 openai 兼容后端正是最容易缺 id 的那一档。
+    // 全塞进 Map 的话它们共用 '' 这一个键,后一次直接盖掉前一次。
+    const c = clock()
+    const s = createStreamStore({ now: c.now })
+    const h = s.open(meta())
+    h.push(toolAs('', '甲'))
+    c.tick(100)
+    h.push(toolAs('', '乙'))
+    c.tick(900)
+    h.push(resultAs('', 'r1'))
+    c.tick(100)
+    h.push(resultAs('', 'r2'))
+    const rs = results(s.streams('root/01-a')[0]!)
+    expect(rs.map(r => `${r.ofBrief}:${r.durMs}`)).toEqual(['甲:1000', '乙:1000'])
+  })
+
+  it('配不上就不填耗时 —— 不猜', () => {
+    const c = clock()
+    const s = createStreamStore({ now: c.now })
+    const h = s.open(meta())
+    c.tick(5000)
+    h.push(resultAs('没人调过它'))
+    const [r] = results(s.streams('root/01-a')[0]!)
+    expect(`durMs=${r!.durMs} ofBrief=${r!.ofBrief} atMs=${r!.atMs}`).toBe('durMs=undefined ofBrief=undefined atMs=6000')
+  })
+
+  it('归属摘要有长度上限', () => {
+    const s = createStreamStore({ now: clock().now })
+    const h = s.open(meta())
+    h.push(toolAs('T1', '甲'.repeat(400)))
+    h.push(resultAs('T1'))
+    const [r] = results(s.streams('root/01-a')[0]!)
+    expect(Array.from(r!.ofBrief!).length).toBeLessThanOrEqual(61) // 60 + 省略号
+  })
+
+  it('一直不返回的调用不会把配对表撑成无界项', () => {
+    const s = createStreamStore({ now: clock().now })
+    const h = s.open(meta())
+    for (let i = 0; i < MAX_PENDING_CALLS + 50; i++) h.push(toolAs(`T${i}`, `调用${i}`))
+    // 超出上限的那些不再登记,所以它们的 result 配不上 —— 这是**明确的**取舍:
+    // 上限之内的照常算,上限之外的宁可没有耗时,也不要一张无界的表。
+    h.push(resultAs(`T${MAX_PENDING_CALLS + 10}`))
+    const [r] = results(s.streams('root/01-a')[0]!)
+    expect(r!.durMs).toBeUndefined()
+  })
+})
 
 describe('一次调用一条流', () => {
   it('按开启顺序保存,不同节点互不相干', () => {

@@ -4,78 +4,50 @@ import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus } from '../../tools/efftask/stateMachine.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
 import { AgentLogPane } from './AgentLogPane.js'
-import { sectionPaneAction } from './logView.js'
+import { ScrollPane } from './ScrollPane.js'
+import {
+  anchoredFrom,
+  clipToWidth,
+  scrollWindow,
+  sectionLines,
+  sectionPaneAction,
+  detailLayout,
+  sectionCursor,
+  tabFocused,
+  mouseHint,
+  type LogAnchor,
+  type SectionSpec,
+} from './logView.js'
+import { currentMouseAvailability } from './mouseEnv.js'
 import { useLiveState } from './useLiveState.js'
+import { stringWidth } from '../../ink/stringWidth.js'
+import { useTerminalSize } from '../../hooks/useTerminalSize.js'
+import { useIsInsideModal, useModalOrTerminalSize } from '../../context/modalContext.js'
 
 const COLOR = { done: 'success', running: 'warning', queued: 'inactive', failed: 'error' } as const
 
-/** Clip to CODE POINTS and cap the line count so one huge plan cannot push the tree off screen. */
-function block(text: string, maxLines = 12, width = 100): string[] {
-  const lines = text.split('\n').flatMap(l => {
-    const cps = Array.from(l)
-    if (cps.length <= width) return [l]
-    const out: string[] = []
-    for (let i = 0; i < cps.length; i += width) out.push(cps.slice(i, i + width).join(''))
-    return out
-  })
-  if (lines.length <= maxLines) return lines
-  // Keep the HEAD and the TAIL, not just the head.
-  //
-  // Every line this run appends is appended at the END: 执行状态 gains "(合并冲突解决)…" and
-  // "(冲突解决后验收未通过: …)", 验收记录 gains the newest verdict. A head-only clip therefore
-  // hid exactly the lines that say what happened most recently — three acceptance reviews
-  // measured a node whose last visible line was "自测全绿" while the rejection that blocked it
-  // was in the part that got dropped, findable nowhere in the TUI.
-  const tail = Math.min(2, maxLines - 1)
-  const head = maxLines - tail
-  return [
-    ...lines.slice(0, head),
-    `… 中间省略 ${lines.length - maxLines} 行`,
-    ...lines.slice(lines.length - tail),
-  ]
-}
-
-function Section(props: {
-  title: string; body: string; color?: string; maxLines?: number
-  /** 光标停在这一段上。 */
-  selected?: boolean
-  /** 展开:不再裁到 maxLines。 */
-  expanded?: boolean
-}): React.ReactElement | null {
-  const trimmed = props.body.trim()
-  if (trimmed.length === 0) return null
-  // 展开时给一个很大的上限而不是 Infinity:block 仍然要按宽度折行,而一段几万字的
-  // 执行状态铺开会把整棵树顶出屏幕 —— 那是这个文件为之重写过一次的那件事。
-  const lines = block(trimmed, props.expanded === true ? 400 : props.maxLines)
-  const full = block(trimmed, 400).length
-  const clipped = !props.expanded && full > lines.length
-  return (
-    <Box flexDirection="column">
-      <Text bold color={props.color ?? (props.selected === true ? 'success' : undefined)}>
-        {props.selected === true ? '❯ ' : '  '}{props.title}
-        {clipped ? <Text dimColor>(空格展开,共 {full} 行)</Text> : null}
-        {props.expanded === true ? <Text dimColor>(空格收起)</Text> : null}
-      </Text>
-      {lines.map((l, i) => (
-        <Text key={`${props.title}-${i}`} color={props.color} dimColor={!props.color}>    {l}</Text>
-      ))}
-    </Box>
-  )
-}
-
 /**
- * One node, in full — the "回车进入看更多任务细节" view.
+ * 两个页卡。
  *
- * Everything here is model-authored and already sanitised on the way to disk
- * (persistence.stripControl); this renders the in-memory node, so it clips by code points
- * rather than trusting either the width or the length of any field.
+ * **是数据,不是两段写死的 JSX。** 这个文件已经为同一条论证改过一次(段落列表),
+ * 原话是:「哪一段被选中、哪一段展开着」需要按下标寻址。页卡一模一样 —— 页签条要枚举它们、
+ * 点击要知道自己是第几个、页脚要按当前页卡换文案。加第三个页卡的成本是这个数组里加一行。
  */
+export const DETAIL_TABS = [
+  { id: 'task', title: '任务' },
+  { id: 'log', title: '子 agent 输出' },
+] as const
+export type DetailTabId = (typeof DETAIL_TABS)[number]['id']
+
+/** 焦点在页签条上,还是在内容区里。 */
+export type DetailZone = 'tabs' | 'content'
+
 /**
  * 观察评分, with the reasons — spec §10.2 lists 评分 among the detail view's contents.
  *
  * It was computed, persisted to node.md's frontmatter and then shown NOWHERE: the tree row
  * omitted it and this view omitted it, so a user who configured an observer got a number
- * that only existed on disk. Section() drops an empty body, so an unscored node adds nothing.
+ * that only existed on disk.
  */
 function scoreBody(n: TaskNode): string {
   const line = (label: string, s?: { score: number; rationale: string }): string =>
@@ -124,105 +96,226 @@ export function phaseTimeBody(n: TaskNode): string {
     .join(' · ')
 }
 
-export function NodeDetail(props: {
-  node: TaskNode
-  elapsed: string
-  maxLines?: number
-  /** 子 agent 实时输出:每次模型调用一条流,带署名。 */
-  streams?: readonly StreamState[]
-  /** 这个节点一共有多少输出没能留下来(环形缓冲 + 被收起的窗口)。 */
-  droppedEvents?: number
-  /** 这个节点是 --resume 带进来的:没有流 ≠ 什么都没干。 */
-  historical?: boolean
-  /** 日志窗是否接管键盘(详情视图打开时是,只读等待屏不是)。 */
-  logActive?: boolean
-  /**
-   * 焦点状态的观测口 —— 和 AgentLogPane 的 onState 同一个理由。
-   *
-   * 这个渲染器只写**增量**,一次光标移动在帧里是几个分散的片段(实测:一个孤零零的
-   * `❯` 和半截「收起)」),按子串断言帧内容既脆又容易恒真。测试要的是「焦点到底在哪」,
-   * 那就把它直接交出来。
-   */
-  /** 日志窗自己的状态 —— 用来断言「区焦点真的管住了它的键盘」。 */
-  onLogState?: (s: { selected: number }) => void
-  onState?: (s: { zone: 'sections' | 'log'; cursor: number; expanded: string[] }) => void
-  /** 这一屏能不能按 r 重做。键是父面板处理的,这里只负责**说出来**。 */
-  canRedo?: boolean
-  /** 可用列宽。 */
-  columns?: number
-  /**
-   * Resolves a dependency id to its node, so 依赖 renders as titles and statuses.
-   *
-   * spec §10.2 lists 依赖 among what this pane must show; it rendered `· 依赖 2 个`. A count
-   * answers neither question the reader actually has — WHICH tasks, and are they finished —
-   * and this pane is exactly where someone goes to find out why a node has been sitting at
-   * READY. Optional, so the component still renders standalone.
-   */
-  resolveNode?: (id: string) => TaskNode | undefined
-}): React.ReactElement {
-  const n = props.node
-  // Per-section clipping was not enough: eight sections at 12 lines each is ~127 lines in
-  // a 40-line terminal, and this view does not scroll, so the title and goal were the first
-  // things pushed off screen. Share one budget across the sections instead.
-  const budget = Math.max(6, props.maxLines ?? 24)
-  const hasLog = (props.streams?.length ?? 0) > 0
-  /**
-   * resume 回来、又没有任何新流的节点:只给**一行**说明,不给一个 12 行的空窗口。
-   *
-   * `historical` 是个只进不出的标记,`--resume` 之后每个节点都带着它。跟着 hasLog 一起
-   * 判的话,perSection 恒为 2 —— 目标、完整方案、执行状态、**阻断原因**、评审记录全被压到
-   * 2 行,而让出来的位置是一个只写着「输出属于上一次运行」的大窗口。用户 resume 一个
-   * BLOCKED 的运行,进详情视图正是为了读阻断原因和方案,结果反而比不 resume 时看得少。
-   */
-  const historyOnly = !hasLog && props.historical === true
-  // 日志窗打开时其余小节收缩到 2 行。不收的话十几个小节各占 4 行,加上一个至少 8 行的
-  // 窗口,标题和目标会被挤出屏幕 —— 这个文件上一次就是为这件事重写过预算分配。
-  const perSection = hasLog ? 2 : Math.max(2, Math.floor(budget / 6))
-  const ui = uiStatus(n.status)
+/** 评审 / 验收记录:每轮一行。 */
+function roundsBody(log: TaskNode['reviewLog']): string {
+  return log
+    .map(r => `第 ${r.round} 轮 ${r.synthesized.pass ? '通过' : '未通过'}${r.synthesized.blockingSummary ? ': ' + r.synthesized.blockingSummary : ''}`)
+    .join('\n')
+}
 
-  /**
-   * 段落是**数据**,不是六个写死的 JSX ——「哪一段被选中、哪一段展开着」需要按下标寻址。
-   * 空的段落不进列表:选中一个什么都没有的「风险点」是死格。
-   */
-  const sections = [
+/**
+ * 依赖 (spec §10.2). Missing deps are REPORTED, not hidden: a dangling id is why the node is
+ * blocked, and silently shrinking the list would hide the cause.
+ */
+function depsBody(n: TaskNode, resolveNode?: (id: string) => TaskNode | undefined): string {
+  return n.deps
+    .map(id => {
+      // No resolver at all is NOT "the node is missing" — it is "the caller did not wire one".
+      // Reporting the first as the second is precisely the class of lie this repo keeps paying
+      // for, so an unwired pane degrades to bare ids and only a resolver that ANSWERS undefined
+      // reports a missing node.
+      if (!resolveNode) return id
+      const d = resolveNode(id)
+      return d ? `${d.title}(${d.status})` : `${id}(节点缺失)`
+    })
+    .join('\n')
+}
+
+/**
+ * 「任务」页卡的全部段落。**纯函数**,和渲染分开。
+ *
+ * 分开不是洁癖:详情页现在是一个会滚动的窗口,屏幕上任何时刻都只有其中一屏 ——
+ * 「评审记录这一段在不在」这类断言如果只能从帧里找,就会变成「它有没有恰好滚到可视区」,
+ * 而那和它存不存在是两件事。段落是数据,可视区是另一回事。
+ *
+ * 空 body 的段落**不进列表**:选中一个什么都没有的「风险点」是死格。
+ */
+export function detailSections(
+  n: TaskNode,
+  resolveNode?: (id: string) => TaskNode | undefined,
+): SectionSpec[] {
+  const all: SectionSpec[] = [
+    // 依赖排在最前,和改造之前的版面一致 —— 一个节点停在 READY 不动时,人是为这一段来的。
+    { title: '依赖', body: depsBody(n, resolveNode) },
     { title: '目标', body: n.goal },
     { title: '完整方案', body: n.plan.solution },
     { title: '重点', body: n.plan.keyPoints },
     { title: '风险点', body: n.plan.risks },
     { title: '验收点', body: n.plan.acceptance },
     { title: '执行状态', body: n.execStatus },
-  ].filter(x => x.body.trim().length > 0)
+    { title: '阻断原因', body: n.blockedReason, color: 'error' },
+    { title: '评分', body: scoreBody(n) },
+    { title: '迭代次数', body: iterationBody(n) },
+    { title: '各阶段耗时', body: phaseTimeBody(n) },
+    { title: '评审记录', body: roundsBody(n.reviewLog) },
+    { title: '验收记录', body: roundsBody(n.acceptLog) },
+  ]
+  if (n.worktree) all.push({ title: '隔离工作区', body: `${n.worktree.branch}\n${n.worktree.path}` })
+  return all.filter(s => s.body.trim().length > 0)
+}
+
+/**
+ * 一个节点,满屏,两个页卡 —— 「回车进入看更多任务细节」那一屏。
+ *
+ * ## 高度从哪来(这里错一个数就会静默丢内容)
+ *
+ * 全屏模式下 `/et` 是 local-jsx,渲染在 FullscreenLayout 的 **modal 槽**里,而那个槽给的是
+ * `rows - 3` / `columns - 4`,外面还罩着 `overflow="hidden"`。所以尺寸走
+ * `useModalOrTerminalSize`(仓库为这件事写的钩子),不是裸的 `useTerminalSize` ——
+ * 后者会**恒定多算 3 行**,而多出来的部分是从**底部**剪掉的,第一个被剪掉的正是
+ * 用户点名要的那条页签条。
+ *
+ * 非全屏时**不做满屏**:`/et` 渲染在对话流里,帧高一旦超过视口,任务树那个 1s tick
+ * 每跳一次就逼出一次整屏重置(实测 29 行终端 + 长历史下 10 分钟 507 次),而且被切掉的
+ * 是**顶部**(标题和目标)—— 和全屏正好相反。所以非全屏留 8 行余量,和任务树面板一致。
+ *
+ * ## 为什么自己切片,而不是给 Box 一个 height 就完事
+ *
+ * 实测:带 height 的 Box 里,超量子节点会被 yoga **按比例压缩**而不是裁掉 ——
+ * 50 行塞进 10 行拿到的是 `L004,L009,L014,…`,而且标题行本身也一起消失。
+ * 所以行数必须自己算准、自己切片,每一行 `flexShrink={0}`,`height` 只当最后一道保险。
+ */
+export function NodeDetail(props: {
+  node: TaskNode
+  elapsed: string
+  /**
+   * 这一屏能用多少个终端行。**由调用方声明**,不由本组件猜。
+   *
+   * 两个调用方的可用高度不一样:运行视图里面板独占屏幕,而完成视图在树的**下面**还画着
+   * 一个总结框(收口结果 / 后续动作 / 重做遗留问题),行数运行时可变。组件看不见那个框。
+   */
+  maxRows?: number
+  /** 子 agent 实时输出:每次模型调用一条流,带署名。 */
+  streams?: readonly StreamState[]
+  /** 这个节点一共有多少输出没能留下来(环形缓冲 + 被收起的窗口)。 */
+  droppedEvents?: number
+  /** 这个节点是 --resume 带进来的:没有流 ≠ 什么都没干。 */
+  historical?: boolean
+  /** 本屏是否接管键盘。 */
+  logActive?: boolean
+  /** 日志窗自己的状态 —— 用来断言「页卡焦点真的管住了它的键盘」。 */
+  onLogState?: (s: { selected: number }) => void
+  /**
+   * 焦点状态的观测口。
+   *
+   * 这个渲染器只写**增量**,一次光标移动在帧里是几个分散的片段,按子串断言既脆又容易恒真。
+   * 测试要的是「焦点到底在哪」,那就把它直接交出来。
+   *
+   * `zone` 还有第二个用途,而且是**功能性**的:回车归 TaskTreePanel(返回任务树),
+   * 只有焦点落在页签条上时才让路 —— 而那一让必须由 TaskTreePanel 自己做,
+   * 因为 `useInput` 的 listener 槽位按 mount 时刻固定,它比本组件先挂、永远先跑。
+   */
+  onState?: (s: {
+    zone: DetailZone
+    tab: DetailTabId
+    cursor: number
+    expanded: string[]
+    /**
+     * 「任务」页卡此刻从第几行开始画。
+     *
+     * 和 AgentLogPane 的 onState 交出 from 是同一个理由,而且是同一个坑:滚动位置在这个
+     * 仓库的 TTY 夹具里**根本观测不到** —— 渲染器只写增量,累积缓冲又把展开前后的两份
+     * 画面混在一起。「展开一段之后视口跳没跳走」只能靠这个数来判。
+     */
+    from: number
+  }) => void
+  /** 这一屏能不能按 r 重做。键是父面板处理的,这里只负责**说出来**。 */
+  canRedo?: boolean
+  /** 可用列宽。省略则跟着终端/模态槽走。 */
+  columns?: number
+  /** Resolves a dependency id to its node, so 依赖 renders as titles and statuses. */
+  resolveNode?: (id: string) => TaskNode | undefined
+  /** 打开时停在哪个页卡。默认「任务」—— 进来先看目标和方案。 */
+  initialTab?: DetailTabId
+}): React.ReactElement {
+  const n = props.node
+  const term = useTerminalSize()
+  const { rows: availRows, columns: availCols } = useModalOrTerminalSize(term)
+  const inModal = useIsInsideModal()
+  const ui = uiStatus(n.status)
 
   /**
-   * 焦点在哪个区。
+   * 非全屏时**留 8 行余量**,不吃满 rows。
    *
-   * 在这之前详情页的键盘**整个归日志窗**,段落只能看被裁到两三行的头尾,没有任何办法
-   * 展开其中一段 —— 那正是用户报的问题。两个区靠 Tab 切,区内各用各的键。
+   * `/et` 渲染在对话流里,帧高一旦超过视口,任务树那个 1s tick 每跳一次就逼出一次整屏
+   * 重置(实测 29 行终端 + 长历史下 10 分钟 507 次),而且被切掉的是**顶部**(标题和
+   * 目标)—— 和全屏正好相反。8 这个数和任务树面板用的是同一个。
    */
-  const [zone, setZone, zoneRef] = useLiveState<'sections' | 'log'>('sections')
+  const budget = Math.max(10, props.maxRows ?? (inModal ? availRows : availRows - 8))
+  const { contentRows, paneRows, contentWidth } = detailLayout({
+    budget,
+    columns: props.columns ?? availCols,
+    inModal,
+  })
+
+  const [zone, setZone, zoneRef] = useLiveState<DetailZone>('content')
+  const [tab, setTab, tabRef] = useLiveState<DetailTabId>(props.initialTab ?? 'task')
   const [cursor, setCursor, cursorRef] = useLiveState(0)
   const [expanded, setExpanded, expandedRef] = useLiveState<ReadonlySet<string>>(new Set())
+  const [, setAnchor, anchorRef] = useLiveState<LogAnchor>({ stream: 0, delta: 0 })
+
+  const sections = detailSections(n, props.resolveNode)
+  /**
+   * 未展开的段落各留几行。
+   *
+   * 跟着内容区高度走,而不是写死:24 行的终端上每段 2 行(十几段刚好扫得完),
+   * 大屏上每段能露出更多。下限 2 —— 一行标题一行正文,少于这个就不叫「摘要」了。
+   */
+  const collapsedLines = Math.max(2, Math.floor(contentRows / 6))
+  // 滚动条占一列。
+  const { lines: secLines, headerAt } = sectionLines({
+    sections,
+    cursor: sectionCursor(zone, tab === 'task', cursor),
+    expanded,
+    width: contentWidth - 1,
+    collapsedLines,
+  })
+  const secTotal = secLines.length
+  const secFrom = scrollWindow(
+    secTotal,
+    paneRows,
+    anchoredFrom(secTotal, paneRows, anchorRef.current, headerAt),
+  ).from
 
   React.useEffect(() => {
-    props.onState?.({ zone, cursor, expanded: [...expanded].sort() })
+    props.onState?.({ zone, tab, cursor, expanded: [...expanded].sort(), from: secFrom })
   })
 
   useInput((input, key) => {
     const act = sectionPaneAction(input, key)
     if (!act) return
-    if (act.t === 'switchZone') {
-      // 没有输出可看时不往那边切 —— 切过去会是一个按什么都没反应的空区。
-      if (!hasLog) return
-      setZone(zoneRef.current === 'sections' ? 'log' : 'sections')
+    /** 把「我想让视口停在第 n 行」翻译成锚(相对当前选中段落的标题行)。 */
+    const anchorAt = (line: number): LogAnchor => {
+      const i = cursorRef.current
+      const at = headerAt(i)
+      return { stream: i, delta: at >= 0 ? line - at : line }
+    }
+    if (act.t === 'tab') {
+      const i = DETAIL_TABS.findIndex(t => t.id === tabRef.current)
+      const next = DETAIL_TABS[(i + act.d + DETAIL_TABS.length) % DETAIL_TABS.length]!
+      setTab(next.id)
       return
     }
-    // 焦点不在段落区时,这些键归日志窗。两个 useInput 会同时收到每一个键,
-    // 不冲突全靠这一句 + 键位不重叠(Tab 已经从 logPaneAction 里摘掉了)。
-    if (zoneRef.current !== 'sections') return
+    if (act.t === 'switchZone') {
+      setZone(zoneRef.current === 'tabs' ? 'content' : 'tabs')
+      return
+    }
+    // 剩下的键归**内容区**,而且只归「任务」页卡 —— 「子 agent 输出」页卡的键盘是
+    // AgentLogPane 自己的 useInput 在管。两个 handler 会同时收到每一个键,
+    // 不冲突全靠这一句 + 键位不重叠(logPaneAction 里 Tab 和左右箭头都是不认的)。
+    if (zoneRef.current !== 'content' || tabRef.current !== 'task') return
+    if (act.t === 'scroll') {
+      const step = act.d * Math.max(1, Math.floor(paneRows / 2))
+      const maxFrom = Math.max(0, secTotal - paneRows)
+      setAnchor(anchorAt(Math.max(0, Math.min(maxFrom, secFrom + step))))
+      return
+    }
     if (act.t === 'move') {
       if (sections.length === 0) return
       const next = Math.max(0, Math.min(sections.length - 1, cursorRef.current + act.d))
       setCursor(next)
+      // **切到哪,展示哪**:锚直接钉到那一段的标题行上。
+      setAnchor({ stream: next, delta: 0 })
       return
     }
     const title = sections[cursorRef.current]?.title
@@ -231,104 +324,136 @@ export function NodeDetail(props: {
     if (set.has(title)) set.delete(title)
     else set.add(title)
     setExpanded(set)
+    // 展开/收起会让下面所有行整体位移,锚重新钉回这一段的标题 —— 否则视口当场跳走。
+    setAnchor({ stream: cursorRef.current, delta: 0 })
   }, { isActive: props.logActive === true })
-  // 日志窗自己一份预算,不吃小节的份额:它要读起来像一个子 agent 的终端,而按小节切
-  // 出来的四五行做不到这件事。
-  const logHeight = Math.max(8, Math.floor(budget / 2))
-  const rounds = (log: TaskNode['reviewLog']) =>
-    log.map(r => `第 ${r.round} 轮 ${r.synthesized.pass ? '通过' : '未通过'}${r.synthesized.blockingSummary ? ': ' + r.synthesized.blockingSummary : ''}`).join('\n')
+
+  const hasLog = (props.streams?.length ?? 0) > 0
+  const mouse = currentMouseAvailability()
+  /** 页签条自己占多宽(每个页签两侧各一个空格)。用来决定右边还放不放得下鼠标说明。 */
+  const tabsWidth = DETAIL_TABS.reduce(
+    (w, t) => w + stringWidth(` ${t.title}${t.id === 'log' && hasLog ? `(${props.streams!.length})` : ''} `),
+    0,
+  )
+  const mouseText = mouse === 'on' ? '可点击' : mouseHint(mouse)
+  /**
+   * 页脚。**「怎么出去」排在最前面。**
+   *
+   * 这一行是 `wrap="truncate-end"`,而窄终端上它一定会被截 —— 实测 100 列时
+   * 「Esc/q 返回任务树」正好是被吃掉的那一截。把出口放在末尾,等于用「还有哪些花活」
+   * 换掉了「怎么退出去」。截断只许吃掉最不重要的那一头。
+   */
+  const redoHint = props.canRedo ? ' · r 重做本任务' : ''
+  const footer = ((): string => {
+    if (zone === 'tabs') return `Esc/q 返回任务树${redoHint} · ←→ 选页卡 · 回车/空格 进入 · Tab 回内容`
+    if (tab === 'log') {
+      return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ↑↓/jk 滚动 · g/G 顶部/底部 · n 换流 · 空格 折叠 · t 思考`
+    }
+    return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ↑↓/jk 选段落 · 空格 展开/收起 · ^u/^d 翻页`
+  })()
+
   return (
-    <Box flexDirection="column" borderStyle="round" paddingX={1}>
-      <Text bold color={COLOR[ui]}>{n.title}</Text>
-      <Text dimColor>
-        {/* 树上用 ⊞ / ▪ 两个符号区分,这里有地方写字就直接写字 —— 详情页不该逼人回去
-            对照图例。判据和树上那一处保持一致(见 TaskTreePanel.kindGlyph):同时看
-            childIds,因为动态生长会把子节点嫁接到一个已判 executable 的节点上。 */}
-        {n.childIds.length > 0 || n.kind === 'decompose' ? '拆分任务' : n.kind === 'executable' ? '执行任务' : '待定'}
-        {' · '}
-        {n.id} · {n.status} · {props.elapsed}
-        {/* 依赖 used to be a bare count here. It now has its own section listing each one by
-            title and status, so a count on this line is duplication — and worse, it made the
-            section's own title untestable: an assertion for 「依赖」 matched this line whether
-            or not the section rendered at all. 子任务 keeps its count because children are
-            not listed anywhere in this pane. */}
-        {n.childIds.length > 0 ? ` · 子任务 ${n.childIds.length} 个` : ''}
-      </Text>
-      {/* 依赖 (spec §10.2). Missing deps are REPORTED, not hidden: a dangling id is why the
-          node is blocked, and silently shrinking the list would hide the cause. */}
-      <Section
-        // Its own allowance, like the live log below, rather than the shared per-section
-        // slice. `perSection` is budget/6 — four lines at the default — and that divisor was
-        // set when there were six sections; 依赖 is now the eleventh. Four lines answers "you
-        // have deps" but not "which ones am I waiting on", which is the entire question that
-        // brings someone to this pane. Lines here are one short row per dependency, so a
-        // larger allowance costs little. Over-long lists still fold through block(), which
-        // says how many it hid.
-        maxLines={Math.max(6, Math.floor(budget / 3))}
-        title="依赖"
-        body={n.deps
-          .map(id => {
-            // No resolver at all is NOT "the node is missing" — it is "the caller did not
-            // wire one". Reporting the first as the second is precisely the class of lie this
-            // repo keeps paying for, so an unwired pane degrades to bare ids and only a
-            // resolver that ANSWERS undefined reports a missing node.
-            if (!props.resolveNode) return id
-            const d = props.resolveNode(id)
-            return d ? `${d.title}(${d.status})` : `${id}(节点缺失)`
-          })
-          .join('\n')}
-      />
-      {sections.map((sec, i) => (
-        <Section
-          key={sec.title}
-          maxLines={perSection}
-          title={sec.title}
-          body={sec.body}
-          selected={zone === 'sections' && i === cursor}
-          expanded={expanded.has(sec.title)}
-        />
-      ))}
-      <Section maxLines={perSection} title="阻断原因" body={n.blockedReason} color="error" />
-      <Section maxLines={perSection} title="评分" body={scoreBody(n)} />
-      {/* 迭代次数 (spec §10.2 lists it). Zero counters render nothing — Section drops an
-          empty body — so an untouched node stays uncluttered. */}
-      <Section maxLines={perSection} title="迭代次数" body={iterationBody(n)} />
-      {/* 各阶段耗时 (spec §10.2). Empty until at least one phase has run for a second, so a
-          node that has barely started stays uncluttered. */}
-      <Section maxLines={perSection} title="各阶段耗时" body={phaseTimeBody(n)} />
-      <Section maxLines={perSection} title="评审记录" body={rounds(n.reviewLog)} />
-      <Section maxLines={perSection} title="验收记录" body={rounds(n.acceptLog)} />
-      {n.worktree ? <Section maxLines={perSection} title="隔离工作区" body={`${n.worktree.branch}\n${n.worktree.path}`} /> : null}
-      {/* 子 agent 实时终端:每次模型调用一条可折叠的流,带滚动条。最新的在下面 ——
-          这是活的流,不是上面那些文档。运行结束后保留最终输出。 */}
-      {historyOnly ? (
-        <Text dimColor>子 agent 输出:属于上一次运行,事件流只在内存里、不落盘,看不到历史。</Text>
-      ) : null}
-      {hasLog ? (
-        <Box flexDirection="column">
-          <Text bold color={ui === 'running' ? 'warning' : undefined}>
-            子 agent 输出{ui === 'running' ? '(进行中)' : ''}
-          </Text>
-          <AgentLogPane
-            streams={props.streams ?? []}
-            droppedEvents={props.droppedEvents}
-            historical={props.historical}
-            height={logHeight}
-            width={Math.max(30, props.columns ?? 100)}
-            isActive={props.logActive === true && zone === 'log'}
-            onState={s => props.onLogState?.({ selected: s.selected })}
-          />
+    <Box
+      flexDirection="column"
+      // height 只是最后一道保险 —— 真正保证不溢出的是上面自己算出来的 contentRows。
+      height={budget}
+      borderStyle={inModal ? undefined : 'round'}
+      paddingX={1}
+    >
+      <Box flexShrink={0}>
+        <Text bold color={COLOR[ui]} wrap="truncate-end">{clipToWidth(n.title, contentWidth)}</Text>
+      </Box>
+      <Box flexShrink={0}>
+        <Text dimColor wrap="truncate-end">
+          {/* 树上用 ⊞ / ▪ 两个符号区分,这里有地方写字就直接写字。判据和树上那一处保持一致
+              (见 TaskTreePanel.kindGlyph):同时看 childIds,因为动态生长会把子节点嫁接到
+              一个已判 executable 的节点上。 */}
+          {n.childIds.length > 0 || n.kind === 'decompose' ? '拆分任务' : n.kind === 'executable' ? '执行任务' : '待定'}
+          {' · '}{n.id} · {n.status} · {props.elapsed}
+          {n.childIds.length > 0 ? ` · 子任务 ${n.childIds.length} 个` : ''}
+          {n.mergeConflict === true ? ' · 待人工解冲突' : ''}
+        </Text>
+      </Box>
+
+      {/* 内容区。flexGrow 吃掉中间所有剩余高度,而它自己画的行数是上面算好的。 */}
+      <Box flexGrow={1} flexDirection="column" overflow="hidden">
+        {tab === 'task'
+          ? sections.length === 0
+            ? <Text dimColor>这个节点还没有任何方案或执行记录。</Text>
+            : (
+              <ScrollPane
+                slice={secLines.slice(secFrom, secFrom + paneRows)}
+                total={secTotal}
+                from={secFrom}
+                height={paneRows}
+                behind={Math.max(0, secTotal - paneRows - secFrom)}
+                behindHint="↑↓ 继续,^d 翻页"
+              />
+            )
+          : null}
+        {/**
+          * 输出页卡**常挂**,不活跃时把高度压成 0,而不是卸载掉。
+          *
+          * 卸载的代价是实打实的:滚动位置、选中哪条流、哪些流被展开、思考展开了没有 ——
+          * 全在 AgentLogPane 自己的 useLiveState 里。切去看一眼方案再切回来,用户会发现
+          * 自己刚挑好的那条流回到了第一条,而他没按过任何键。
+          *
+          * `isActive` 必须**同时**判 tab:它现在一直挂着,不判的话在「任务」页卡上按 n
+          * 会在背后偷偷换流 —— 两个 useInput 都收得到每一个键。
+          */}
+        <Box
+          flexDirection="column"
+          overflow="hidden"
+          {...(tab === 'log' ? { flexGrow: 1 } : { height: 0, flexShrink: 0 })}
+        >
+          {props.historical === true && !hasLog ? (
+            <Text dimColor>子 agent 输出:属于上一次运行,事件流只在内存里、不落盘,看不到历史。</Text>
+          ) : (
+            <AgentLogPane
+              streams={props.streams ?? []}
+              droppedEvents={props.droppedEvents}
+              historical={props.historical}
+              height={contentRows}
+              width={contentWidth}
+              isActive={props.logActive === true && zone === 'content' && tab === 'log'}
+              onState={s => props.onLogState?.({ selected: s.selected })}
+            />
+          )}
         </Box>
-      ) : null}
-      {/* 详情页正是判断「这个节点哪儿错了」的地方,看完就想重做 —— 键能用却不写在
-          页脚上,等于没有。 */}
-      <Text dimColor>
-        {sections.length > 0
-          ? (zone === 'sections'
-              ? '↑↓ 选段落 · 空格展开/收起' + (hasLog ? ' · Tab 切到输出' : '') + ' · '
-              : 'Tab 切回段落 · n 换流 · ')
-          : ''}
-        回车 / Esc / q 返回任务树{props.canRedo ? ' · r 重做本任务' : ''}</Text>
+      </Box>
+
+      {/* 页签条 + 页脚:同一个 flexShrink={0} 的底部块。
+          **必须永远活过裁剪** —— 全屏下 modal 槽是从底部剪的,而用户点名要的就是
+          「最下面点击或回车选页卡」。它一旦成为被剪掉的那一头,这个功能就等于不存在。 */}
+      <Box flexShrink={0} flexDirection="row">
+        {DETAIL_TABS.map(t => {
+          const active = t.id === tab
+          const badge = t.id === 'log' && hasLog ? `(${props.streams!.length})` : ''
+          return (
+            // 裸 Box + onClick,**不带 tabIndex**:带了的话 Tab 会同时轮转 DOM 焦点,
+            // 而 Tab 在这一屏是「页签条 ⇄ 内容区」。写法抄 CoordinatorAgentStatus 的可点行。
+            <Box key={t.id} flexShrink={0} onClick={() => { setTab(t.id); setZone('content') }}>
+              <Text
+                bold={active}
+                inverse={tabFocused(zone, active)}
+                color={active ? 'success' : undefined}
+                dimColor={!active}
+              >
+                {` ${t.title}${badge} `}
+              </Text>
+            </Box>
+          )
+        })}
+        <Box flexGrow={1} />
+        {/* 鼠标说明。窄终端上**整个不画** —— 它会把这一行撑到回流成两行,而
+            「一行 = 一个终端行」一旦破,下面的页脚就被顶出屏幕。宽度不够时宁可不解释。 */}
+        {contentWidth - tabsWidth >= stringWidth(mouseText) + 1 ? (
+          <Text dimColor wrap="truncate-end">{mouseText}</Text>
+        ) : null}
+      </Box>
+      <Box flexShrink={0}>
+        <Text dimColor wrap="truncate-end">{footer}</Text>
+      </Box>
     </Box>
   )
 }
