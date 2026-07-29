@@ -89,6 +89,17 @@ export const MAX_PENDING_CALLS = 256
 /** 归属摘要在 result 事件里留多长。整条 brief 最长 300 码点,乘以事件数就太贵了。 */
 const OF_BRIEF_MAX = 60
 
+/**
+ * 工具摘要 → 存进 `result.ofBrief` 的那个形态。**唯一的口径出处。**
+ *
+ * 导出是因为渲染层要拿它反着比:「这条返回的主人是不是上一行那个工具」在 provider 没给
+ * id 时只能比 brief,而两边夹取长度只要差一个字,长摘要就永远比不上 —— 于是并排的调用
+ * 会一直显示成「错位」。同一个函数用两次,两边就不可能对不上。
+ */
+export function ofBriefOf(brief: string): string {
+  return clipCodePoints(brief, OF_BRIEF_MAX)
+}
+
 export interface StreamMeta {
   /** 真实节点 id;树外调用用 PRE_TREE_NODE。 */
   nodeId: string
@@ -285,7 +296,7 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
           const ev = ((): AgentEvent => {
             if (e.kind === 'tool') {
               const at = now()
-              const entry = { at, brief: clipCodePoints(e.brief, OF_BRIEF_MAX) }
+              const entry = { at, brief: ofBriefOf(e.brief) }
               if (e.useId.length > 0) {
                 if (pending.size < MAX_PENDING_CALLS) pending.set(e.useId, entry)
               } else if (pendingAnon.length < MAX_PENDING_CALLS) {

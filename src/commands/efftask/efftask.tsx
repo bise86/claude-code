@@ -114,6 +114,62 @@ export const READ_ONLY_TOOL_NAMES = new Set(['Read', 'Glob', 'Grep'])
 export const CONTEXT_DEPENDENT_TOOL_NAMES = new Set([SKILL_TOOL_NAME])
 
 /**
+ * 完成视图里那个总结框占几行。**数出来,不是估**,而且**数得对不对要能被单独钉住**。
+ *
+ * 面板(以及它里面的详情页)按可用高度排版,而这个框画在面板**下面**、高度随内容变 ——
+ * 组件自己看不见它,只有调用方知道。少算一行,详情页最底下那条页签条就会被顶出屏幕。
+ *
+ * 提成纯函数是验收逼出来的:这个数原来内联在 JSX 里,而**把整个特性关掉
+ * (`reservedRows={0}`)、或者把常数 4 改成 1,全套 2150 条测试一条都不红** ——
+ * 已有的两条测试量的是消费者(TaskTreePanel 收到 reservedRows 之后有没有让位),
+ * 喂的是写死的数字,生产者一个字都没测。而这个数正是这段注释吹嘘「数出来」的那件事。
+ *
+ * 常数 4 = 上下边框 2 + 标题行 1 + 底部按键提示行 1。
+ */
+export function doneSummaryRows(a: {
+  viewOnly: boolean
+  hasReason: boolean
+  hasHandoffResult: boolean
+  followUps: number
+  handoffLines: number
+  redoProblems: number
+}): number {
+  return (
+    4 +
+    (a.viewOnly ? 1 : 0) +
+    // 仅查看时不显示 reason —— 那会把用户自己按的一下退出报成一次失败。
+    (!a.viewOnly && a.hasReason ? 1 : 0) +
+    (a.hasHandoffResult ? 1 : 0) +
+    a.followUps +
+    a.handoffLines +
+    a.redoProblems
+  )
+}
+
+/**
+ * 工具摘要解析器 —— 从工具表里找 `userFacingName` 并**带着输入**调它。
+ *
+ * 提成可导出的纯函数,和三个工具池同一个理由:验收实测,这一跳的测试**把它手抄了**
+ * 一遍(测试文件里自己写了一份「逐字同构」的 resolver),于是把真的那份改成
+ * `return undefined`、或者把 `input` 参数丢掉,全套 2150 条测试**一条都不红** ——
+ * 而那两种改法产出的正是用户报过的形状:窗口里只剩光秃秃的 `mcp__gitlab__list_issues`,
+ * 或者 `Read` 后面没有文件名。
+ *
+ * `input` 必须传下去:多数工具的 `userFacingName` 不看输入(FileReadTool 永远返回
+ * `Read`),真正把参数补出来的是 agentEvents 那张静态表;但**看输入的那些**(读方案
+ * 文件时显示「Reading Plan」)靠的就是这个参数。
+ */
+export function briefResolverFor(
+  tools: readonly { name: string }[],
+): (name: string, input: unknown) => string | undefined {
+  return (name, input) => {
+    const t = tools.find(x => x.name === name) as
+      | { userFacingName?: (i: unknown) => string } | undefined
+    try { return t?.userFacingName?.(input) } catch { return undefined }
+  }
+}
+
+/**
  * 所有子 agent 池子的共同底子。三个池子都从这里长出来,少一个就漏一个。
  */
 export function subAgentToolPool<T extends { name: string }>(all: T[]): T[] {
@@ -292,11 +348,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     humanTimeoutMs: () => capsRef.humanTimeoutMs,
     // 工具摘要用工具自己的 userFacingName —— 主 REPL 每一行工具调用就是这么渲染的。
     // 接上它,以后新增的工具自动有好摘要,不用回来改那张静态表。
-    briefResolver: (name, input) => {
-      const t = context.options.tools.find(x => x.name === name) as
-        | { userFacingName?: (i: unknown) => string } | undefined
-      try { return t?.userFacingName?.(input) } catch { return undefined }
-    },
+    briefResolver: briefResolverFor(context.options.tools),
   })
   // Separate NO-TOOLS seam for the one-shot config extraction: it only rewrites text into
   // JSON, so it needs neither read nor write tools. This is the ONLY place that passes [].
@@ -1666,22 +1718,14 @@ export function DoneView(props: {
   // node's detail — the run is over, so reading the tree matters more than leaving it fast.
   const ok = props.outcome?.status === 'completed'
   const handoff = props.handoff ? handoffLines(props.handoff, props.runId) : []
-  /**
-   * 下面那个总结框到底占几行。**数出来,不是估**。
-   *
-   * 面板(以及它里面的详情页)要按可用高度排版,而这个框画在它**下面**、高度随内容变。
-   * 组件自己看不见它 —— 只有这里知道。少算一行,详情页最底下那条页签条就会被顶出屏幕。
-   *
-   * 2 = 上下边框,1 = 标题行,1 = 底部按键提示行。
-   */
-  const summaryRows =
-    4 +
-    (props.viewOnly === true ? 1 : 0) +
-    (props.viewOnly !== true && props.outcome?.reason ? 1 : 0) +
-    (props.handoffResult ? 1 : 0) +
-    (props.handoffResult?.followUps?.length ?? 0) +
-    handoff.length +
-    (props.redoProblems?.length ?? 0)
+  const summaryRows = doneSummaryRows({
+    viewOnly: props.viewOnly === true,
+    hasReason: Boolean(props.outcome?.reason),
+    hasHandoffResult: Boolean(props.handoffResult),
+    followUps: props.handoffResult?.followUps?.length ?? 0,
+    handoffLines: handoff.length,
+    redoProblems: props.redoProblems?.length ?? 0,
+  })
   return (
     <Box flexDirection="column">
       <TaskTreePanel

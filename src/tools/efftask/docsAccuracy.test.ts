@@ -4,7 +4,7 @@ import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupC
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
 import { redoOptions, redoUnavailableReason } from './redo'
 import { REASONING_FIELDS } from '../../services/api/openaiCompat/fromOpenAIStream'
-import { logPaneAction, sectionPaneAction, detailEntryHint } from '../../commands/efftask/logView'
+import { logPaneAction, sectionPaneAction, detailEntryHint, collapsedLinesFor } from '../../commands/efftask/logView'
 import type { Key } from '../../ink/events/input-event'
 
 /**
@@ -234,6 +234,31 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(sectionPaneAction('d', key({ ctrl: true }))?.t).toBe('scroll')
   })
 
+  it('说「焦点在页签条上时回车/空格进入内容」,那这两个键就不能是死键', () => {
+    /**
+     * 这一行一度**只写在 README 和页脚上**:`sectionPaneAction` 不认回车,
+     * `NodeDetail` 的内容区闸门又把空格挡了,而 `TaskTreePanel` 已经为这一下回车让了路 ——
+     * 于是它既不进内容、也不返回,彻底消失。两份验收各自独立报了同一条。
+     * 这条闸门当时逐条钉了 ←→/Tab/n/^u^d/Esc/鼠标,**唯独漏掉了这一行**。
+     */
+    expect(README).toContain(norm('焦点在「页签条」和「内容区」之间切；焦点在页签条上时回车/空格进入内容'))
+    expect(sectionPaneAction('', key({ return: true }))?.t).toBe('enterContent')
+    expect(sectionPaneAction(' ', key())?.t).toBe('toggle')
+    // 日志窗必须对回车放手,否则两个 handler 会为它打架。
+    expect(logPaneAction('', key({ return: true }))).toBeNull()
+  })
+
+  it('说折叠预览是「掐头留尾」,那预算就得留得下三行', () => {
+    // 只给 2 行时 head=0,每段都长成「… 中间省略 N 行」+ 一条从中间切开的碎片。
+    expect(README).toContain(norm('跑完的流默认是折叠的'))
+    expect(collapsedLinesFor(6)).toBeGreaterThanOrEqual(3)
+  })
+
+  it('说「窄终端会退化成 鼠标✗」,那就得真的有这个降级', () => {
+    expect(README).toContain(norm('窄终端上那里也放不下整句时会退化成 `鼠标✗`'))
+    expect(readFileSync(new URL('src/commands/efftask/NodeDetail.tsx', ROOT), 'utf8')).toContain('鼠标✗')
+  })
+
   it('说「任何时候都能返回」,那 Esc 就不能被这两个处理函数截走', () => {
     expect(README).toContain(norm('**任何时候都能返回**'))
     // Esc 归任务树面板(它负责关掉详情页)。这两个都必须放手。
@@ -242,7 +267,7 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
   })
 
   it('说「只在真的能点时才写回车/点击」,那文案就得跟着可用性变', () => {
-    expect(README).toContain(norm('点不了的时候它一个字都不多说'))
+    expect(README).toContain(norm('只在真的能点时才写「回车/点击看详情」'))
     expect(detailEntryHint('on')).toContain('点击')
     expect(detailEntryHint('needs-fullscreen')).not.toContain('点击')
   })

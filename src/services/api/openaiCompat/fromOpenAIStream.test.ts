@@ -214,6 +214,63 @@ describe('openaiChunksToAnthropicEvents', () => {
     expect(JSON.parse(jsonAt(starts[1]!.data.index))).toEqual({ command: 'ls' })
   })
 
+  it('不发 index、而是把同一个 id 重复带在每条续块上 —— 那是同一次调用,不是 N 次', async () => {
+    /**
+     * 「不发 index」至少有**两种**方言,第一版只认了一种(每条都是新调用),于是这一档
+     * 被拆成 3 个块:每块的 arguments 是残片(`{"file_`、`path":"` …)各自解析失败 →
+     * `?? {}` → 工具拿空参数;而且 3 个 tool_use 共用同一个 id,下一轮 tool_call_id 撞车。
+     *
+     * **这一档在改造之前是好的**(旧代码 `get(undefined)` 恰好把它们并成一条),
+     * 是那次改动引入的退化 —— 验收用真探针抓出来的。所以这条测试守的是「别再退化回去」。
+     */
+    const evts = await collect([
+      { id: 'x', choices: [{ delta: { tool_calls: [{ id: 't1', function: { name: 'Read', arguments: '{"file_' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ id: 't1', function: { arguments: 'path":"' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ id: 't1', function: { arguments: 'a.ts"}' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+    ])
+    const starts = evts.filter(e => e.event === 'content_block_start' && e.data.content_block.type === 'tool_use')
+    expect(starts.length).toBe(1)
+    expect(starts[0]!.data.content_block.name).toBe('Read')
+    const json = evts.filter(e => e.data?.delta?.type === 'input_json_delta').map(e => e.data.delta.partial_json).join('')
+    expect(JSON.parse(json)).toEqual({ file_path: 'a.ts' })
+  })
+
+  it('同一个 id 连 name 也重复带 —— 仍然是同一次调用', async () => {
+    const evts = await collect([
+      { id: 'x', choices: [{ delta: { tool_calls: [{ id: 't1', function: { name: 'Read', arguments: '{"file_' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ id: 't1', function: { name: 'Read', arguments: 'path":"a.ts"}' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+    ])
+    const starts = evts.filter(e => e.event === 'content_block_start' && e.data.content_block.type === 'tool_use')
+    expect(starts.length).toBe(1)
+    const json = evts.filter(e => e.data?.delta?.type === 'input_json_delta').map(e => e.data.delta.partial_json).join('')
+    expect(JSON.parse(json)).toEqual({ file_path: 'a.ts' })
+  })
+
+  it('不同的 id = 不同的调用 —— 上面那条不许把并行调用也并掉', async () => {
+    const evts = await collect([
+      { id: 'x', choices: [{ delta: { tool_calls: [{ id: 't1', function: { name: 'Read', arguments: '{"file_path":"a.ts"}' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ id: 't2', function: { name: 'Bash', arguments: '{"command":"ls"}' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+    ])
+    const starts = evts.filter(e => e.event === 'content_block_start' && e.data.content_block.type === 'tool_use')
+    expect(starts.map(x => x.data.content_block.name)).toEqual(['Read', 'Bash'])
+    expect(new Set(starts.map(x => x.data.content_block.id)).size).toBe(2)
+  })
+
+  it('缺 name 时发空名,**不丢块** —— 一个查得到的失败好过一段空白', async () => {
+    // 丢块的话模型这次调用的意图凭空消失,用户只看到「它什么都没干」;
+    // 发出去的话 agentEvents 渲染成「未知工具」、工具循环回一条报错,看得见查得到。
+    const evts = await collect([
+      { id: 'x', choices: [{ delta: { tool_calls: [{ index: 0, id: 't1', function: { arguments: '{}' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+    ])
+    const starts = evts.filter(e => e.event === 'content_block_start' && e.data.content_block.type === 'tool_use')
+    expect(starts.length).toBe(1)
+    expect(starts[0]!.data.content_block.name).toBe('')
+  })
+
   it('不发 index 时,只带 arguments 的续块归上一次调用', async () => {
     const evts = await collect([
       { id: 'x', choices: [{ delta: { tool_calls: [{ id: 'c1', function: { name: 'Bash', arguments: '{"command":' } }] } }] },

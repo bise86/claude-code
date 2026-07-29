@@ -12,6 +12,8 @@ import {
   sectionLines,
   sectionPaneAction,
   detailLayout,
+  collapsedLinesFor,
+  MIN_DETAIL_WIDTH,
   sectionCursor,
   tabFocused,
   mouseHint,
@@ -211,6 +213,17 @@ export function NodeDetail(props: {
     cursor: number
     expanded: string[]
     /**
+     * 段落区**实际画出来的**光标下标;-1 = 没画(焦点不在它身上)。
+     *
+     * 和 `cursor` 是两件事:`cursor` 是「光标记在第几段」,这个是「屏幕上有没有画那个 ❯」。
+     * 这三条接线(段落光标跟不跟焦点、页签反显、点页签换不换焦点)此前一条都没被钉住 ——
+     * 把它们逐个改掉,全套 2150 条测试一条不红。而它们说的正是「别画一个『选中了、
+     * 但按键不归它』的假象」,是这个仓库反复付学费的那类谎。
+     */
+    cursorShown: number
+    /** 此刻反显的是哪几个页签(焦点真的落在页签条上时才有)。 */
+    tabsInverse: string[]
+    /**
      * 「任务」页卡此刻从第几行开始画。
      *
      * 和 AgentLogPane 的 onState 交出 from 是同一个理由,而且是同一个坑:滚动位置在这个
@@ -261,7 +274,14 @@ export function NodeDetail(props: {
    * 跟着内容区高度走,而不是写死:24 行的终端上每段 2 行(十几段刚好扫得完),
    * 大屏上每段能露出更多。下限 2 —— 一行标题一行正文,少于这个就不叫「摘要」了。
    */
-  const collapsedLines = Math.max(2, Math.floor(contentRows / 6))
+  /**
+   * 下限是 **3**,不是 2。
+   *
+   * 掐头留尾要占三行:头 1 + 「… 中间省略 N 行」1 + 尾 1。只给 2 行时头会被挤掉,
+   * 24 行终端上每一段都长成「… 中间省略 59 行」+ 一条从中间切开的续行碎片 ——
+   * 零信息量,而那正是用户第一次打开详情页看到的东西。
+   */
+  const collapsedLines = collapsedLinesFor(contentRows)
   // 滚动条占一列。
   const { lines: secLines, headerAt } = sectionLines({
     sections,
@@ -278,7 +298,12 @@ export function NodeDetail(props: {
   ).from
 
   React.useEffect(() => {
-    props.onState?.({ zone, tab, cursor, expanded: [...expanded].sort(), from: secFrom })
+    props.onState?.({
+      zone, tab, cursor, expanded: [...expanded].sort(), from: secFrom,
+      // 交的是**画出来的样子**,不是 state 里的意图 —— 见上面 cursorShown 的注释。
+      cursorShown: sectionCursor(zone, tab === 'task', cursor),
+      tabsInverse: DETAIL_TABS.filter(t => tabFocused(zone, t.id === tab)).map(t => t.id),
+    })
   })
 
   useInput((input, key) => {
@@ -300,10 +325,24 @@ export function NodeDetail(props: {
       setZone(zoneRef.current === 'tabs' ? 'content' : 'tabs')
       return
     }
+    /**
+     * 焦点在页签条上时,回车和空格都是「进入内容区」—— 用户原话「最下面点击或回车
+     * 可选择不同的页卡内容展示」的那一半。
+     *
+     * **必须排在下面那条内容区闸门之前**:空格走到闸门那里会被当成「展开段落」挡掉,
+     * 回车更是连闸门都到不了。这两个键此前只写在页脚上、按下去什么都不会发生,而
+     * TaskTreePanel 已经为回车让了路(不再关详情页)—— 于是它彻底消失。
+     */
+    if (zoneRef.current === 'tabs') {
+      if (act.t === 'enterContent' || act.t === 'toggle') setZone('content')
+      return
+    }
+    // 内容区里的回车不归这里 —— 它是任务树面板的「返回任务树」。原样放过去。
+    if (act.t === 'enterContent') return
     // 剩下的键归**内容区**,而且只归「任务」页卡 —— 「子 agent 输出」页卡的键盘是
     // AgentLogPane 自己的 useInput 在管。两个 handler 会同时收到每一个键,
     // 不冲突全靠这一句 + 键位不重叠(logPaneAction 里 Tab 和左右箭头都是不认的)。
-    if (zoneRef.current !== 'content' || tabRef.current !== 'task') return
+    if (tabRef.current !== 'task') return
     if (act.t === 'scroll') {
       const step = act.d * Math.max(1, Math.floor(paneRows / 2))
       const maxFrom = Math.max(0, secTotal - paneRows)
@@ -329,13 +368,20 @@ export function NodeDetail(props: {
   }, { isActive: props.logActive === true })
 
   const hasLog = (props.streams?.length ?? 0) > 0
+  /**
+   * `--resume` 带进来、又没有任何新流的节点:输出页卡上**根本没有日志窗**,只有一行说明。
+   *
+   * 页脚必须跟着变 —— 不变的话它会列出「n 换流 · 空格 折叠 · t 思考」一整排,而那一排
+   * 此刻全是死键。验收实测抓到的:这一屏此前零覆盖,连那句说明被整个删掉都没人红。
+   */
+  const logPaneMounted = !(props.historical === true && !hasLog)
   const mouse = currentMouseAvailability()
   /** 页签条自己占多宽(每个页签两侧各一个空格)。用来决定右边还放不放得下鼠标说明。 */
   const tabsWidth = DETAIL_TABS.reduce(
     (w, t) => w + stringWidth(` ${t.title}${t.id === 'log' && hasLog ? `(${props.streams!.length})` : ''} `),
     0,
   )
-  const mouseText = mouse === 'on' ? '可点击' : mouseHint(mouse)
+  const mouseText = mouse === 'on' ? '可点击页签' : mouseHint(mouse)
   /**
    * 页脚。**「怎么出去」排在最前面。**
    *
@@ -347,7 +393,9 @@ export function NodeDetail(props: {
   const footer = ((): string => {
     if (zone === 'tabs') return `Esc/q 返回任务树${redoHint} · ←→ 选页卡 · 回车/空格 进入 · Tab 回内容`
     if (tab === 'log') {
-      return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ↑↓/jk 滚动 · g/G 顶部/底部 · n 换流 · 空格 折叠 · t 思考`
+      return logPaneMounted
+        ? `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ↑↓/jk 滚动 · g/G 顶部/底部 · n 换流 · 空格 折叠 · t 思考 · 耗时含等你批权限的时间`
+        : `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签`
     }
     return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ↑↓/jk 选段落 · 空格 展开/收起 · ^u/^d 翻页`
   })()
@@ -377,7 +425,11 @@ export function NodeDetail(props: {
 
       {/* 内容区。flexGrow 吃掉中间所有剩余高度,而它自己画的行数是上面算好的。 */}
       <Box flexGrow={1} flexDirection="column" overflow="hidden">
-        {tab === 'task'
+        {contentWidth < MIN_DETAIL_WIDTH ? (
+          /* 排不出可读的东西就明说,不要硬排 —— 硬排的结果是行回流、最后一行被静默剪掉,
+             而帧的总行数一点没变(一个残缺的视图看起来完完整整)。 */
+          <Box flexShrink={0}><Text color="warning" wrap="truncate-end">终端太窄</Text></Box>
+        ) : tab === 'task'
           ? sections.length === 0
             ? <Text dimColor>这个节点还没有任何方案或执行记录。</Text>
             : (
@@ -428,7 +480,9 @@ export function NodeDetail(props: {
       <Box flexShrink={0} flexDirection="row">
         {DETAIL_TABS.map(t => {
           const active = t.id === tab
-          const badge = t.id === 'log' && hasLog ? `(${props.streams!.length})` : ''
+          // 「(2)」会被读成「2 个子 agent」或「2 条输出」。它其实是**这个节点开过几次
+          // 模型调用**(一次调用一条流,5 席圆桌下能到几十条,上限 40),所以把量纲写出来。
+          const badge = t.id === 'log' && hasLog ? `(${props.streams!.length} 次调用)` : ''
           return (
             // 裸 Box + onClick,**不带 tabIndex**:带了的话 Tab 会同时轮转 DOM 焦点,
             // 而 Tab 在这一屏是「页签条 ⇄ 内容区」。写法抄 CoordinatorAgentStatus 的可点行。
@@ -447,8 +501,14 @@ export function NodeDetail(props: {
         <Box flexGrow={1} />
         {/* 鼠标说明。窄终端上**整个不画** —— 它会把这一行撑到回流成两行,而
             「一行 = 一个终端行」一旦破,下面的页脚就被顶出屏幕。宽度不够时宁可不解释。 */}
+        {/* 放得下整句就说整句;放不下就退化成一个短标记 —— 但**不能什么都不说**。
+            README 写着「具体原因写在页签条的右边」,而窄终端上那句话一度整个不画,
+            于是「为什么点不动」在界面上哪儿都找不到。截断成半句更糟(会得到
+            「鼠标需全屏模…」),所以是两级降级,不是 truncate。 */}
         {contentWidth - tabsWidth >= stringWidth(mouseText) + 1 ? (
           <Text dimColor wrap="truncate-end">{mouseText}</Text>
+        ) : contentWidth - tabsWidth >= stringWidth(mouse === 'on' ? '可点' : '鼠标✗') + 1 ? (
+          <Text dimColor wrap="truncate-end">{mouse === 'on' ? '可点' : '鼠标✗'}</Text>
         ) : null}
       </Box>
       <Box flexShrink={0}>

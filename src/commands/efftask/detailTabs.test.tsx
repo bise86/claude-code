@@ -26,7 +26,7 @@ import { createStreamStore } from '../../tools/efftask/agentStream.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
 import { NodeDetail, detailSections } from './NodeDetail.js'
 import { ScrollPane } from './ScrollPane.js'
-import { detailLayout, sectionLines } from './logView.js'
+import { collapsedLinesFor, detailLayout, sectionLines } from './logView.js'
 import { Box } from '../../ink.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 
@@ -188,9 +188,11 @@ describe('详情页满屏:算得准,而且底部块永远活着', () => {
 describe('页签条', () => {
   it('点一下页签就换页卡 —— 和 →/回车 同一个效果', async () => {
     const t = fakeTty(24, 100)
+    const seen: { zone: string }[] = []
     const el = React.createElement(NodeDetail as never, {
       node: node({ goal: '目标内容' }), elapsed: '1m', columns: 100, maxRows: 20,
       logActive: true, streams: withLog(3),
+      onState: (x: { zone: string }) => seen.push(x),
     } as never)
     const app = await render(
       el,
@@ -219,6 +221,10 @@ describe('页签条', () => {
      *
      * 从右往左是因为「子 agent 输出」在「任务」右边;找到即停,并把命中的列记下来断言。
      */
+    // **先把焦点挪到页签条上**,否则 zone 本来就是 content,那条断言恒真。
+    t.stdin.press(TAB)
+    await tick()
+    expect(seen[seen.length - 1]!.zone).toBe('tabs')
     let hitCol = -1
     for (let col = rowsInFrame[barRow]!.length; col >= 0 && hitCol < 0; col--) {
       t.reset()
@@ -228,6 +234,9 @@ describe('页签条', () => {
     }
     app.unmount()
     expect(`点得到吗: ${hitCol >= 0}`).toBe('点得到吗: true')
+    // 点完焦点要**落到内容区**,不是留在页签条上 —— 留着的话用户点了页签、
+    // 却发现 ↑↓ 还在页签条上打转,而屏幕上那个页签还反显着。
+    expect(`点完的焦点: ${seen[seen.length - 1]!.zone}`).toBe('点完的焦点: content')
   })
 
   it('Tab 把焦点交给页签条,而 Esc/q 任何时候都能返回', async () => {
@@ -770,7 +779,7 @@ describe('详情页画出来的内容行数,必须**等于**算出来的那一�
         cursor: 0,
         expanded: new Set<string>(),
         width: contentWidth - 1,
-        collapsedLines: Math.max(2, Math.floor((paneRows + 1) / 6)),
+        collapsedLines: collapsedLinesFor(paneRows + 1),
       }).lines.slice(0, paneRows).map(l => l.text)
 
       const t = fakeTty(rows, columns)
@@ -789,4 +798,137 @@ describe('详情页画出来的内容行数,必须**等于**算出来的那一�
         .toBe(`${label} 屏内: ${inSlice.join()}`)
     })
   }
+})
+
+describe('页签条上的回车和空格必须真的能进内容区', () => {
+  /**
+   * 用户原话:「最下面**点击或回车**可选择不同的页卡内容展示」。
+   *
+   * 这一条一度只写进了页脚和 README、没有落到代码里:`sectionPaneAction` 不认回车,
+   * `NodeDetail` 的内容区闸门又把空格挡了,而 `TaskTreePanel` 已经为这一下回车让了路
+   * (焦点在页签条上时不再关详情页)—— 于是它**既不进内容,也不返回**,彻底消失。
+   * 两份验收各自独立报了同一条。原来的测试只有负向断言(「回车不关详情页」),
+   * 从来没人问过「那它做了什么」。
+   */
+  for (const [label, seq] of [['回车', '\r'], ['空格', ' ']] as [string, string][]) {
+    it(`焦点在页签条上时,${label} 进内容区`, async () => {
+      const seen: { zone: string; tab: string }[] = []
+      const t = fakeTty(24, 100)
+      const app = await render(
+        React.createElement(NodeDetail as never, {
+          node: node({ goal: '目标内容' }), elapsed: '1m', columns: 100, maxRows: 20, logActive: true,
+          onState: (x: { zone: string; tab: string }) => seen.push(x),
+        } as never),
+        { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      t.stdin.press(TAB); await tick()
+      expect(seen[seen.length - 1]!.zone).toBe('tabs')
+      t.stdin.press(seq); await tick()
+      app.unmount()
+      expect(`${label} 之后: ${seen[seen.length - 1]!.zone}`).toBe(`${label} 之后: content`)
+    })
+  }
+
+  it('内容区里的回车仍然是「返回任务树」,没被这条改动抢走', async () => {
+    const t = fakeTty(30, 100)
+    const app = await render(
+      React.createElement(TaskTreePanel as never, {
+        nodes: [node({ id: 'root', title: '根任务', goal: '目标内容在这里' })], runId: '003', interactive: true,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press('\r'); await tick()   // 打开详情
+    expect(t.lastFrame()).toContain('目标内容在这里')
+    t.reset()
+    t.stdin.press('\r'); await tick()   // 焦点还在内容区 → 这一下是返回
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('Esc/q 退出')
+  })
+})
+
+describe('窄终端:该出现的提示必须真的出现在帧里', () => {
+  /**
+   * **判据不能是「帧行数 ≤ budget」。**
+   *
+   * 版面算错时 yoga 是**按比例压缩**内容区,总行数恒等 —— 那个断言对这一类失败完全无感。
+   * 验收实测:去掉页脚的 `wrap="truncate-end"` 之后,26–88 共 32 个列宽上「↓ 下面还有 N 行」
+   * 整条消失,而仓库全套测试 473 pass 全绿。所以这里断言的是**那句话在不在**。
+   *
+   * 26 列这一档还压着另一个坑:`detailLayout` 的列宽一度有个 `Math.max(24, …)` 的虚高下限,
+   * 真实内宽 22 却算出 24,行按 23 列排、渲进 22 列 → 回流 → 最后一行被剪掉。
+   */
+  for (const columns of [26, 28, 40, 60, 80, 100]) {
+    it(`${columns} 列:「↓ 下面还有 N 行」不许被静默吃掉`, async () => {
+      const marks = Array.from({ length: 42 }, (_, i) => `M${String(i).padStart(3, '0')}`)
+      const seg = (k: number) => marks.slice(k * 7, k * 7 + 7).join('\n')
+      const n = node({
+        goal: seg(0),
+        plan: { solution: seg(1), keyPoints: seg(2), risks: seg(3), acceptance: seg(4) },
+        execStatus: seg(5),
+      })
+      const budget = 20
+      const { paneRows, contentWidth } = detailLayout({ budget, columns, inModal: false })
+      const total = sectionLines({
+        sections: detailSections(n),
+        cursor: 0,
+        expanded: new Set<string>(),
+        width: contentWidth - 1,
+        collapsedLines: collapsedLinesFor(paneRows + 1),
+      }).lines.length
+      // 前提:这一屏确实装不下,否则那句提示本来就不该出现。
+      expect(`${columns} 列 总行 ${total} > 窗口 ${paneRows}`).toBe(`${columns} 列 总行 ${total} > 窗口 ${Math.min(paneRows, total - 1)}`)
+
+      const t = fakeTty(24, columns)
+      const app = await render(
+        React.createElement(NodeDetail as never, { node: n, elapsed: '1m', columns, maxRows: budget, logActive: true } as never),
+        { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      const f = t.lastFrame()
+      app.unmount()
+      expect(`${columns} 列有没有「下面还有」: ${f.includes('下面还有')}`).toBe(`${columns} 列有没有「下面还有」: true`)
+      // 页签条和页脚也必须活着(它们是模态槽里最先被剪的一头)。
+      expect(f).toContain('子 agent 输出')
+      expect(f).toContain('Esc/q 返回任务树')
+    })
+  }
+
+  it('窄到排不出东西时明说「终端太窄」,不硬排', async () => {
+    const t = fakeTty(24, 18)
+    const app = await render(
+      React.createElement(NodeDetail as never, { node: fatNode(), elapsed: '1m', columns: 18, maxRows: 20, logActive: true } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('终端太窄')
+  })
+})
+
+describe('--resume 带进来的节点:输出页卡要说清为什么是空的', () => {
+  it('没有流 ≠ 什么都没干 —— 必须说出原因,不能白屏', async () => {
+    // 这一屏此前零覆盖:把这句说明整个删掉,全套测试仍然全绿(验收实测)。
+    // 而 `--resume` 一个 BLOCKED 的运行、进详情页看输出,正是最容易撞上它的场景。
+    const t = fakeTty(24, 100)
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: node({ goal: '目标内容' }), elapsed: '1m', columns: 100, maxRows: 20,
+        logActive: true, historical: true, streams: [], initialTab: 'log',
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('属于上一次运行')
+    expect(f).toContain('不落盘')
+    // 这一屏没有日志窗,页脚就不许列日志窗的键 —— 那一排全是死键。
+    expect(f).not.toContain('n 换流')
+    expect(f).not.toContain('t 思考')
+    expect(f).toContain('Esc/q 返回任务树')
+  })
 })

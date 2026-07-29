@@ -24,7 +24,7 @@ import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/
 const NOW = new Date().toISOString()
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, 15))
 
-function fakeTty() {
+function fakeTty(rows = 40, columns = 120) {
   let pending: string | null = null
   const stdin = Object.assign(new EventEmitter(), {
     isTTY: true,
@@ -34,7 +34,7 @@ function fakeTty() {
   })
   let frame = ''
   const stdout = Object.assign(new EventEmitter(), {
-    isTTY: true, columns: 120, rows: 40,
+    isTTY: true, columns, rows,
     write: (s: string) => { frame += s; return true },
   })
   const plain = (): string => frame.replace(/\u001b\[[0-9;>?]*[a-zA-Z]/g, ' ').replace(/\u001b/g, '')
@@ -78,7 +78,15 @@ describe('运行中的面板把输出缓冲交到详情视图手里', () => {
     const f = await openDetail(RunningView, {
       nodes: [node({ status: 'EXECUTING' })], runId: '003', streams, onAbort: () => {},
     }, true)
-    expect(f).toContain('子 agent 输出')
+    /**
+     * 断言必须落在**日志窗独有**的形状上。
+     *
+     * 原来断的是 `子 agent 输出` 和那句正文 —— 两条都是恒真的:前者现在是页签标题、
+     * 永远在;后者被**任务树上运行中节点的活动行**满足(树自己会画 `⎿ 执行·甲员工 …`),
+     * 根本没经过详情页。验收实测:把日志窗的 slice 改成 [],这条照样绿。
+     * 流表头(环节 · 署名 + 状态)只有日志窗画得出来。
+     */
+    expect(f).toContain('执行 · 甲员工')
     expect(f).toContain('正在改 src/login.ts')
   })
 
@@ -89,6 +97,7 @@ describe('运行中的面板把输出缓冲交到详情视图手里', () => {
       nodes: [node({ status: 'ACCEPTED' })], runId: '003', streams,
       outcome: { status: 'completed' }, handoff: null, onExit: () => {},
     }, true)
+    expect(f).toContain('执行 · 甲员工')
     expect(f).toContain('最终产出:12 个测试通过')
   })
 
@@ -174,5 +183,40 @@ describe('仅查看后退出 (spec §17.3):只读浏览,不能报成"被阻断"'
     await tick()
     expect(t.lastFrame()).toContain('被阻断')
     app.unmount()
+  })
+})
+
+describe('完成视图必须把下面那个总结框的行数交给面板', () => {
+  /**
+   * 这条接线此前零覆盖:把 `reservedRows={summaryRows}` 换成 `{0}`,**整个特性关掉**,
+   * 全套测试一条都不红(验收在干净副本上实测)。已有的测试量的都是消费者,
+   * 喂的是写死的数字 —— 生产者到消费者这一跳没人走过。
+   *
+   * 判据:总结框变高几行,树上就要少画几行。不让位的话,那个框会把树(以及树里的
+   * 详情页)最底下几行顶出屏幕 —— 而那里正是页签条和「怎么退出去」。
+   */
+  it('总结框多几行,树就少画几行', async () => {
+    const nodes = [
+      node({ id: 'root', title: '根任务', kind: 'decompose', childIds: Array.from({ length: 30 }, (_, i) => `root/${i}`) }),
+      ...Array.from({ length: 30 }, (_, i) => ({ ...node({ id: `root/${i}`, title: `任务${i}` }), parentId: 'root' })),
+    ] as never
+    const visible = async (extra: Record<string, unknown>) => {
+      // 28 行:40 行终端下树的 min(20, …) 上限会把差异整个吃掉,那样这条断言恒真。
+      const t = fakeTty(28)
+      const app = await render(
+        React.createElement(DoneView as never, {
+          nodes, runId: '003', outcome: { status: 'completed' }, handoff: null, onExit: () => {}, ...extra,
+        } as never),
+        { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      const f = t.lastFrame()
+      app.unmount()
+      return Array.from({ length: 30 }, (_, i) => `任务${i} `).filter(x => f.includes(x)).length
+    }
+    const bare = await visible({})
+    // 收口结果 1 行 + 三条后续动作 3 行 = 总结框高 4 行。
+    const fat = await visible({ handoffResult: { ok: true, message: '已合并', followUps: ['甲', '乙', '丙'] } })
+    expect(`空框画 ${bare} 行,厚框画 ${fat} 行`).toBe(`空框画 ${bare} 行,厚框画 ${bare - 4} 行`)
   })
 })

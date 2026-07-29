@@ -85,6 +85,8 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
   // 匿名调用(没有 index)的键空间和带 index 的**分开**,否则 `i0` 和第一个匿名调用会撞。
   let anonSeq = 0
   let lastAnonKey: string | null = null
+  /** 见过的 tool_call id → 它的键。用来认出「同一个 id 又来了」这一种方言。 */
+  const byId = new Map<string, string>()
   let stopReason = 'end_turn'
   let usage = { input_tokens: 0, output_tokens: 0 }
   const startIfNeeded = function* (id?: string): Generator<Evt> {
@@ -145,10 +147,27 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
       let key: string
       if (typeof tc.index === 'number') {
         key = `i${tc.index}`
+      } else if (typeof tc.id === 'string' && tc.id.length > 0 && byId.has(tc.id)) {
+        /**
+         * **同一个 id 又来了 = 同一次调用的续块,不是新调用。**
+         *
+         * 「不发 index」至少有两种方言,我第一版只认了一种:
+         *  - 一种每次给一个**新**调用(id 各不相同)—— 那就是下面那一支;
+         *  - 另一种把**同一个 id 重复带在每一条续块**上,arguments 分片跟在后面。
+         * 第二种被拆成 N 个块之后,每块的 arguments 都是残片(`{"file_`、`path":"` …),
+         * 各自 JSON 解析失败 → `?? {}` → 工具拿空参数;而且 N 个 tool_use 共用同一个 id,
+         * 下一轮的 tool_call_id 会撞,严格后端直接 400。
+         *
+         * 这一档在改造**之前是好的**(旧代码 `get(undefined)` 恰好把它们并成了一条),
+         * 是这次改动引入的退化 —— 验收用真探针抓出来的。
+         */
+        key = byId.get(tc.id)!
+        lastAnonKey = key
       } else if (tc.id != null || tc.function?.name != null) {
-        // 带身份 = 一次**新的**调用。
+        // 带身份、而且这个 id 没见过 = 一次**新的**调用。
         key = `a${anonSeq++}`
         lastAnonKey = key
+        if (typeof tc.id === 'string' && tc.id.length > 0) byId.set(tc.id, key)
       } else {
         // 只有 arguments 的续块,归上一次匿名调用;一次都还没开过就自己开一个。
         key = lastAnonKey ?? (lastAnonKey = `a${anonSeq++}`)

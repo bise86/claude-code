@@ -100,7 +100,12 @@ describe('段落区', () => {
     app.unmount()
     // from 一起断言:它是「视口停在第几行」的观测口(和 AgentLogPane 同一个理由),
     // 刚打开时必须停在最顶上,否则用户一进详情页就已经滚到半截了。
-    expect(at()).toEqual({ zone: 'content', tab: 'task', cursor: 0, expanded: [], from: 0 })
+    // cursorShown / tabsInverse 交的是**画出来的样子**:刚打开时段落光标在第 0 段、
+    // 页签条上没有反显(焦点在内容区)。它们和 cursor/zone 是两件事 —— 见 NodeDetail 的注释。
+    expect(at()).toEqual({
+      zone: 'content', tab: 'task', cursor: 0, expanded: [], from: 0,
+      cursorShown: 0, tabsInverse: [],
+    })
   })
 
   it('↑↓ 在段落之间移动', async () => {

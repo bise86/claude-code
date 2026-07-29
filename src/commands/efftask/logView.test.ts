@@ -20,6 +20,8 @@ import { runControlAction,
   detailEntryHint,
   EXPANDED_MAX_LINES,
   detailLayout,
+  MIN_DETAIL_WIDTH,
+  collapsedLinesFor,
   sectionCursor,
   tabFocused,
   type LogLine,
@@ -727,11 +729,24 @@ describe('detailLayout —— 详情页的版面算术', () => {
     }
   })
 
-  it('预算小到荒唐时也不返回负数', () => {
+  it('行数有下限,但**列宽没有虚高下限** —— 宁可诚实地小', () => {
+    /**
+     * 列宽一度写着 `Math.max(24, …)`:26 列的终端上真实内宽 22、算出来 24,于是行按
+     * 23 列排版、渲进 22 列 → 回流成两个终端行 → ScrollPane 最后一个孩子被
+     * overflow:hidden 剪掉,而**帧的总行数一点没变**。实测被吃掉的正是「↓ 下面还有 8 行」。
+     * 返回一个比真实宽度大的数是最坏的一种错:下游所有算术都成立,只有像素不成立。
+     */
     const l = detailLayout({ budget: 1, columns: 10, inModal: false })
     expect(l.contentRows).toBeGreaterThanOrEqual(3)
     expect(l.paneRows).toBeGreaterThanOrEqual(2)
-    expect(l.contentWidth).toBeGreaterThanOrEqual(24)
+    expect(l.contentWidth).toBe(6) // 10 - 边框2 - padding2,一分不多
+    // 各种窄宽度下都必须**恰好**是真实可用宽度。
+    for (const columns of [26, 28, 40, 100]) {
+      expect(`${columns} 列: ${detailLayout({ budget: 20, columns, inModal: false }).contentWidth}`)
+        .toBe(`${columns} 列: ${columns - 4}`)
+    }
+    // 窄到排不出东西时,由调用方明说「终端太窄」——见 MIN_DETAIL_WIDTH。
+    expect(MIN_DETAIL_WIDTH).toBeGreaterThan(0)
   })
 })
 
@@ -767,5 +782,118 @@ describe('任务树页脚里「怎么进详情页」那半句', () => {
     for (const a of ['needs-fullscreen', 'tracking-disabled', 'clicks-disabled'] as const) {
       expect(`${a}: ${detailEntryHint(a)}`).toBe(`${a}: 回车看详情`)
     }
+  })
+})
+
+describe('同一屏上不许有两套时间格式', () => {
+  it('表头超过一分钟也走分秒,别让人心算 613/60', () => {
+    const ls = render({
+      streams: [stream({ closed: true, endedAt: 1000 + 613000 })],
+      nowMs: 999999, width: 70,
+    })
+    expect(ls[0]!.text).toContain('10m13s')
+    expect(ls[0]!.text).not.toContain('613s')
+  })
+
+  it('一分钟以内保持整秒 —— 那是表头一直以来的样子', () => {
+    const ls = render({ streams: [stream({ closed: true, endedAt: 9000 })], nowMs: 999999, width: 70 })
+    expect(ls[0]!.text).toContain('8s')
+  })
+})
+
+describe('折叠态那一行是回看时的主要形态,不能只剩一句裸 brief', () => {
+  it('「最新: ⎿ …」带上归属和耗时 —— 数据本来就在事件里', () => {
+    // 已收口的流默认就是折叠的,所以事后回看一个跑完的节点时,这一行是绝大多数流的
+    // 全部可见内容。它一度看不出是哪个工具的返回,也没有耗时。
+    const s = stream({
+      closed: true, endedAt: 4000,
+      events: [tool('T1', 'Bash(bun test)'), resultOf('T1', '2043 pass', 1800, 'Bash(bun test)')],
+    })
+    const ls = plain(render({ streams: [s], folded: new Set([0]), width: 80 }))
+    const latest = ls.find(l => l.includes('最新'))!
+    expect(latest).toContain('Bash(bun test)')
+    expect(latest).toContain('1.8s')
+    expect(latest).toContain('2043 pass')
+  })
+
+  it('没有归属和耗时时不硬凑', () => {
+    const s = stream({ closed: true, endedAt: 4000, events: [tool('T1', 'Read(a.ts)'), resultOf('T1', '读到了')] })
+    const ls = plain(render({ streams: [s], folded: new Set([0]), width: 80 }))
+    expect(ls.find(l => l.includes('最新'))!).toContain('⎿ 读到了')
+  })
+})
+
+describe('展开思考之后要看得出哪句是想的', () => {
+  it('每一段思考前插一行标记,并告诉用户怎么收起', () => {
+    // 不插的话,思考正文和模型说的话只差一个 dimColor —— 而 dimColor 在很多终端主题下
+    // 几乎看不出来;而且「t 展开」那一行整个消失了,用户不知道怎么收回去。
+    const ls = plain(render({
+      streams: [stream({ events: [think('先想想'), think('再想想'), text('我来读一下'), think('又想')] })],
+      expandedThinking: new Set([0]), width: 60,
+    }))
+    expect(ls.filter(l => l.includes('t 收起')).length).toBe(2) // 两段思考,各一个标记
+    expect(ls.some(l => l.includes('先想想'))).toBe(true)
+    expect(ls.some(l => l.includes('我来读一下'))).toBe(true)
+  })
+
+  it('不展开时还是一行计数,和原来一样', () => {
+    const ls = plain(render({
+      streams: [stream({ events: [think('a'), think('b'), text('说话')] })],
+      width: 60,
+    }))
+    expect(ls.some(l => l.includes('思考 2 段(t 展开)'))).toBe(true)
+    expect(ls.some(l => l.includes('a'))).toBe(false)
+  })
+})
+
+describe('折叠预览至少留得下「头 + 省略 + 尾」', () => {
+  it('collapsedLines 下限是 3,不是 2 —— 2 会把头挤掉', () => {
+    // 2 行时 head=0,每一段都长成「… 中间省略 59 行」+ 一条从中间切开的续行碎片,
+    // 零信息量。而那正是 24 行终端上用户第一次打开详情页看到的东西。
+    expect(collapsedLinesFor(10)).toBe(3)
+    expect(collapsedLinesFor(6)).toBe(3)
+    expect(collapsedLinesFor(60)).toBe(10)
+  })
+
+  it('三行时头和尾都在', () => {
+    const body = Array.from({ length: 30 }, (_, i) => `第${i}行`).join('\n')
+    const { lines } = sectionLines({
+      sections: [{ title: '目标', body }], cursor: 0, expanded: new Set<string>(),
+      width: 40, collapsedLines: 3,
+    })
+    const texts = lines.map(l => l.text)
+    expect(texts.some(t => t.includes('第0行'))).toBe(true)   // 头
+    expect(texts.some(t => t.includes('中间省略'))).toBe(true)
+    expect(texts.some(t => t.includes('第29行'))).toBe(true)  // 尾
+    expect(lines.length).toBe(4) // 标题 + 3
+  })
+})
+
+describe('⎿ 的归属:provider 没给 id 时也不能瞎认主人', () => {
+  it('两个匿名并行调用错序返回,归属要按 brief 认出来', () => {
+    // 第一版在空 useId 上写的是「上一行是工具就认它」,而先进先出配对是按**发出顺序**
+    // 配的、返回却是错序到的 —— 于是第一条 ⎿ 画在第二个工具底下、还不写归属,
+    // 而事件里明明有 ofBrief。这正是这次改动声称要消灭的「错位却装作没错位」。
+    const ls = plain(render({
+      streams: [stream({ events: [
+        tool('', 'Read(a.ts)'),
+        tool('', 'Bash(ls)'),
+        resultOf('', 'A 的返回', 100, 'Read(a.ts)'),
+        resultOf('', 'B 的返回', 190, 'Bash(ls)'),
+      ] })],
+      width: 200,
+    }))
+    expect(ls.find(l => l.includes('A 的返回'))!).toContain('Read(a.ts)')
+    expect(ls.find(l => l.includes('B 的返回'))!).toContain('Bash(ls)')
+  })
+
+  it('紧跟自己调用行的匿名返回仍然省掉归属', () => {
+    const ls = plain(render({
+      streams: [stream({ events: [tool('', 'Read(a.ts)'), resultOf('', '读到了', 100, 'Read(a.ts)')] })],
+      width: 200,
+    }))
+    const line = ls.find(l => l.includes('读到了'))!
+    expect(line).toContain('100ms · 读到了')
+    expect(line.includes('Read(a.ts)')).toBe(false)
   })
 })

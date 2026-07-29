@@ -10,7 +10,7 @@ import figures from 'figures'
 import type { Key } from '../../ink/events/input-event.js'
 import { stringWidth } from '../../ink/stringWidth.js'
 import type { AgentEvent } from '../../tools/efftask/agentEvents.js'
-import type { StreamState } from '../../tools/efftask/agentStream.js'
+import { ofBriefOf, type StreamState } from '../../tools/efftask/agentStream.js'
 import { BLACK_CIRCLE, TEARDROP_ASTERISK } from '../../constants/figures.js'
 
 /**
@@ -116,8 +116,14 @@ function justify(left: string, right: string, width: number): string {
   return pad > 0 ? left + ' '.repeat(pad) + right : `${left} ${right}`
 }
 
+/**
+ * 一整场调用的耗时。**超过一分钟也走分秒**,不然同一屏上会有两套格式:
+ * 表头写 `613s`、它下面一行的单次调用写 `10m10s`,读的人要心算 613/60。
+ * 一分钟以内保持整秒(`8s`),那是表头一直以来的样子,也够用。
+ */
 function secs(ms: number): string {
-  return `${Math.max(0, Math.round(ms / 1000))}s`
+  const s = Math.max(0, Math.round(ms / 1000))
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`
 }
 
 /**
@@ -147,12 +153,22 @@ function statusOf(s: StreamState, nowMs: number): { text: string; color: LogColo
   return { text: `${BLACK_CIRCLE} 已完成${tools} · ${dur}`, color: 'success' }
 }
 
-/** 折叠态那一行:这条流最后在干什么。工具优先 —— 那是用户第一位想看的。 */
+/**
+ * 折叠态那一行:这条流最后在干什么。工具优先 —— 那是用户第一位想看的。
+ *
+ * **已收口的流默认就是折叠的**,所以事后回看一个跑完的节点时,这一行是绝大多数流的
+ * 全部可见内容。它一度只有一句裸 brief:看不出这是哪个工具的返回,也没有耗时 ——
+ * 而这两样数据早就在事件里躺着了(agentStream 在 push 时配好的)。
+ */
 export function lastActivity(s: StreamState): string {
   for (let i = s.events.length - 1; i >= 0; i--) {
     const e = s.events[i]!
     if (e.kind === 'tool') return `${BLACK_CIRCLE} ${e.brief}`
-    if (e.kind === 'result') return `${RESULT_ARROW}${e.brief}`
+    if (e.kind === 'result') {
+      const head = [e.ofBrief, e.durMs === undefined ? '' : formatDur(e.durMs)]
+        .filter(x => x !== undefined && x !== '')
+      return `${RESULT_ARROW}${head.length > 0 ? `${head.join(' · ')} · ` : ''}${e.brief}`
+    }
   }
   for (let i = s.events.length - 1; i >= 0; i--) {
     const e = s.events[i]!
@@ -172,7 +188,27 @@ function foldThinking(events: readonly AgentEvent[], expanded: boolean): AgentEv
   // 抽了、eventLine 还给它准备了 dim 样式,渲染层却在这里把它整体换成一个计数。
   // 而用户的原话是「看到模型…在思考啥」。默认仍然折叠(思考会淹掉工具调用,这条实测
   // 成立),但必须给得出来。
-  if (expanded) return [...events]
+  /**
+   * 展开时:在每一段思考**前面**插一行标记。
+   *
+   * 直接原样铺开的话,思考正文和模型说的话只差一个 dimColor —— 而 dimColor 在很多
+   * 终端主题下几乎看不出来。用户按完 t 之后分不清哪句是想的、哪句是说的,而且
+   * 「t 展开」那一行整个消失了,他也不知道怎么收回去。
+   */
+  if (expanded) {
+    const out: AgentEvent[] = []
+    let run = 0
+    for (const e of events) {
+      if (e.kind === 'thinking') {
+        if (run === 0) out.push({ kind: 'thinking', text: `${TEARDROP_ASTERISK} 思考(t 收起)` })
+        run++
+      } else {
+        run = 0
+      }
+      out.push(e)
+    }
+    return out
+  }
   const out: AgentEvent[] = []
   let run = 0
   const flush = (): void => {
@@ -286,11 +322,25 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
      */
     let prevTool: Extract<AgentEvent, { kind: 'tool' }> | null = null
     for (const e of foldThinking(s.events, args.expandedThinking?.has(i) === true)) {
-      // 空 useId(provider 没给 id)时只能靠位置判断:上一行就是工具调用就认它。
-      // 这和 agentStream 的先进先出配对是同一条假设,串行调用下永远成立。
-      const showOwner = e.kind === 'result' && e.ofBrief !== undefined && !(
-        prevTool !== null && (e.useId.length > 0 ? prevTool.useId === e.useId : true)
+      /**
+       * 空 `useId`(provider 没给 id,openai 兼容后端最常见)时**不能无条件相信位置**。
+       *
+       * 第一版写的是 `: true` —— 「上一行是工具调用就认它是主人」。而 `agentStream` 的
+       * 先进先出配对是按**发出顺序**配的,返回却是错序到的:实测两个匿名并行调用,
+       * 第一条 `⎿` 画在第二个工具那行底下、还不写归属,而事件里明明有 `ofBrief`。
+       * 这正是这次改动声称要消灭的「错位却装作没错位」。
+       *
+       * 改成比 brief:`agentStream` 存进 `ofBrief` 的就是夹取后的 brief,和这里
+       * `prevTool.brief` 是同一个口径(超长时两边都被夹到 60 码点)。
+       */
+      const ownedByPrev = prevTool !== null && (
+        e.kind === 'result' && e.useId.length > 0
+          ? prevTool.useId === e.useId
+          : e.kind === 'result' && e.ofBrief !== undefined
+            ? ofBriefOf(prevTool.brief) === e.ofBrief
+            : false
       )
+      const showOwner = e.kind === 'result' && e.ofBrief !== undefined && !ownedByPrev
       const { prefix, body, color, dim } = eventLine(e, showOwner)
       prevTool = e.kind === 'tool' ? e : null
       const avail = Math.max(4, w - stringWidth(prefix))
@@ -316,12 +366,37 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
  * @param columns   可用列宽
  * @param inModal   是不是画在 FullscreenLayout 的 modal 槽里(那里不需要自己的边框)
  */
+/**
+ * 未展开的段落各留几行。**唯一口径**,组件和测试都从这里拿。
+ *
+ * 下限是 3,不是 2:掐头留尾要占三行(头 1 + 「… 中间省略 N 行」1 + 尾 1)。只给 2 行时
+ * 头会被挤掉,24 行终端上每一段都长成「… 中间省略 59 行」+ 一条从中间切开的续行碎片 ——
+ * 零信息量,而那正是用户第一次打开详情页看到的东西。
+ */
+export function collapsedLinesFor(contentRows: number): number {
+  return Math.max(3, Math.floor(contentRows / 6))
+}
+
+/** 内容区窄到这个数以下就排不出可读的东西了 —— 与其硬排,不如明说。 */
+export const MIN_DETAIL_WIDTH = 20
+
 export function detailLayout(args: { budget: number; columns: number; inModal: boolean }): {
   /** 内容区(两个页卡共用)有多少行。 */
   contentRows: number
   /** 内容区里真正铺行的高度 —— 比 contentRows 少一行,留给「↓ 下面还有 N 行」。 */
   paneRows: number
-  /** 内容区列宽(含滚动条那一列)。 */
+  /**
+   * 内容区列宽(含滚动条那一列)。
+   *
+   * **可能很小,甚至 ≤0 —— 那是诚实的。** 这里一度写着 `Math.max(24, …)`,于是 26 列的
+   * 终端上真实内宽 22、算出来 24:行按 23 列排版、渲进 22 列 → 回流成两个终端行 →
+   * ScrollPane 的最后一个孩子被 overflow:hidden 剪掉,而**帧的总行数一点没变**。
+   * 实测被吃掉的正是「↓ 下面还有 8 行」那一句 —— 一个残缺的视图看起来完完整整,
+   * 正是这个模块存在的全部理由的反面。
+   *
+   * 返回一个比真实宽度大的数是最坏的一种错:它让下游所有算术都成立,只有像素不成立。
+   * 太窄时由调用方明说「终端太窄」,不要假装排得下。
+   */
   contentWidth: number
 } {
   const budget = Math.max(10, Math.floor(args.budget))
@@ -331,8 +406,8 @@ export function detailLayout(args: { budget: number; columns: number; inModal: b
   return {
     contentRows,
     paneRows: Math.max(2, contentRows - 1),
-    // paddingX={1} 吃掉 2 列;非模态下边框再吃 2 列。
-    contentWidth: Math.max(24, Math.floor(args.columns) - (args.inModal ? 2 : 4)),
+    // paddingX={1} 吃掉 2 列;非模态下边框再吃 2 列。**不设虚高下限** —— 见上面注释。
+    contentWidth: Math.floor(args.columns) - (args.inModal ? 2 : 4),
   }
 }
 
@@ -648,6 +723,17 @@ export type SectionPaneAction =
   | { t: 'tab'; d: number }
   /** 半页滚动。ctrl+u / ctrl+d,以及 PgUp/PgDn(收到就用,收不到也不写进页脚)。 */
   | { t: 'scroll'; d: number }
+  /**
+   * 回车。**只在焦点落在页签条上时才有意义** —— 进入内容区。
+   *
+   * 用户的原话是「最下面点击或**回车**可选择不同的页卡内容展示」,主语是最下面那条页签条。
+   * 这一条一度**只写进了页脚、没有落到代码里**:`TaskTreePanel` 已经为它让了路(焦点在页签条
+   * 上时不再关详情页),而这边没有分支接住 —— 于是那一下回车既不进内容、也不返回,
+   * 彻底消失。两份验收各自独立报了同一条。页脚上写着的键按了没反应,比没有这个键更糟。
+   *
+   * 内容区里这一下仍然归任务树面板(返回任务树),所以调用方必须按 zone 分流。
+   */
+  | { t: 'enterContent' }
 
 /**
  * 任务详情页**内容区之外**的按键。
@@ -672,6 +758,8 @@ export function sectionPaneAction(
   },
 ): SectionPaneAction | null {
   if (key.tab) return { t: 'switchZone', d: key.shift === true ? -1 : 1 }
+  // `logPaneAction` 第一行就把回车挡掉了,所以两个 handler 不会为它打架。
+  if (key.return) return { t: 'enterContent' }
   if (key.leftArrow) return { t: 'tab', d: -1 }
   if (key.rightArrow) return { t: 'tab', d: 1 }
   if (key.pageUp) return { t: 'scroll', d: -1 }
