@@ -198,7 +198,7 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
       if (wire.note) issues.push({ name: r.name, source, reason: wire.note })
       const parsedEffort = translating ? undefined : (wire.value as EffortValue | undefined)
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
-        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value) }
+        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name }
         : undefined
       const promptStr = r.prompt
       out.push({ role: r, agentDef: {

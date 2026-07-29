@@ -62,3 +62,14 @@ export function isTranslatingProtocol(protocol: string | undefined): boolean {
 
 /** 配置里能写哪些协议名。zod enum 和文档都从这里取,免得三处各写一份。 */
 export const ROLE_API_PROTOCOLS = ['anthropic', ...Object.keys(TRANSLATING_PROTOCOLS)] as const
+
+/**
+ * 所有翻译协议的路由段。
+ *
+ * `joinRoute` 拿它去**剥掉 apiUrl 自己带的路由**:厂商文档印的是完整端点
+ * (`https://host/v1/chat/completions`),复制粘贴进 apiUrl 天经地义 —— 不剥就拼成
+ * `/v1/chat/completions/responses`,而网关对这种路径回的常常是一个**空体 502**。
+ *
+ * 是全表而不是「本次这一条」:换协议时 apiUrl 常常还停在上一条协议的路由上。
+ */
+export const PROTOCOL_ROUTES = Object.values(TRANSLATING_PROTOCOLS).map(p => p.route)

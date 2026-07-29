@@ -12,6 +12,9 @@ import { stringWidth } from '../../ink/stringWidth.js'
 import type { AgentEvent } from '../../tools/efftask/agentEvents.js'
 import { ofBriefOf, type StreamState } from '../../tools/efftask/agentStream.js'
 import { BLACK_CIRCLE, TEARDROP_ASTERISK } from '../../constants/figures.js'
+import { clipAnsi, hasAnsi, wrapAnsi } from './ansiText.js'
+import { inlineMarkdown, markdownLines } from './markdownView.js'
+import type { ThemeName } from '../../utils/theme.js'
 
 /**
  * 主题键,不是裸色名。
@@ -39,6 +42,14 @@ export interface ViewLine {
   bold?: boolean
   /** 反显。选中的流表头、选中的段落标题。 */
   inverse?: boolean
+  /**
+   * `text` 里带着 ANSI 转义 —— 渲染层要走 `<Ansi>` 而不是裸 `<Text>`。
+   *
+   * markdown 上色的产物。**是个显式标记,不是「扫一眼有没有 \x1b」**:渲染层每帧对
+   * 每一行扫一遍是白花钱,而且模型的正文里真的可能出现一个孤立的 ESC 字节 ——
+   * 那种情况下我们要的恰恰是**不**把它当格式化指令交给终端。
+   */
+  ansi?: boolean
 }
 
 export interface LogLine extends ViewLine {
@@ -69,6 +80,10 @@ const RESULT_ARROW = '⎿ '
  */
 export function wrapDisplayWidth(s: string, width: number): string[] {
   if (width <= 0) return [s]
+  // 带 ANSI 的走专门那一条:下面这个循环是逐码点的,`\x1b[1m` 在它眼里是**四个字符**
+  // (ESC 宽 0,`[`、`1`、`m` 各宽 1)—— 转义序列自己吃掉三列预算,还随时会被从中间
+  // 劈开,劈开之后终端就把 `1m` 当正文打出来了。
+  if (hasAnsi(s)) return wrapAnsi(s, width)
   if (stringWidth(s) <= width) return [s]
   const out: string[] = []
   let cur = ''
@@ -98,6 +113,7 @@ export function wrapDisplayWidth(s: string, width: number): string[] {
  */
 export function clipToWidth(s: string, width: number): string {
   if (width <= 0) return ''
+  if (hasAnsi(s)) return clipAnsi(s, width)
   if (stringWidth(s) <= width) return s
   let out = ''
   let w = 0
@@ -267,6 +283,13 @@ export interface RenderArgs {
   historical?: boolean
   /** 哪几条流要展开思考原文(下标)。默认全部折叠成段数。 */
   expandedThinking?: ReadonlySet<number>
+  /**
+   * 当前主题。给了才对模型说的话上 markdown 色。
+   *
+   * 只作用于 `text` / `thinking` 两种事件 —— 工具摘要和工具返回是**结构化**的:
+   * 里面全是路径、`--flag`、`[TAG]`,交给 markdown 解析器只会被吃掉记号或改写。
+   */
+  theme?: ThemeName
 }
 
 export function renderStreamLines(args: RenderArgs): LogLine[] {
@@ -321,6 +344,15 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
      * 非工具事件要把它清空:中间隔了一段文本的话,`⎿` 就已经不是「上一行的返回」了。
      */
     let prevTool: Extract<AgentEvent, { kind: 'tool' }> | null = null
+    /**
+     * 正处在一个代码围栏里。
+     *
+     * 事件流在 `agentEvents` 那一层就按 `\n` 拆成一条条事件了,所以这一层手上永远只有
+     * 单行 —— 跨行的块结构里只有围栏是要紧的:围栏内的 `# 注释`、`*ptr`、`__init__`
+     * 全都不是 markdown,逐行上色会把它们改得面目全非。围栏行本身仍然照原样画出来,
+     * 删掉它等于让人分不清代码从哪开始。
+     */
+    let inFence = false
     for (const e of foldThinking(s.events, args.expandedThinking?.has(i) === true)) {
       /**
        * 空 `useId`(provider 没给 id,openai 兼容后端最常见)时**不能无条件相信位置**。
@@ -341,13 +373,31 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
             : false
       )
       const showOwner = e.kind === 'result' && e.ofBrief !== undefined && !ownedByPrev
-      const { prefix, body, color, dim } = eventLine(e, showOwner)
+      const { prefix, body: raw, color, dim } = eventLine(e, showOwner)
+      const prose = e.kind === 'text' || e.kind === 'thinking'
+      const fenceLine = prose && /^\s*(```|~~~)/.test(raw)
+      if (fenceLine) inFence = !inFence
+      const styled = args.theme !== undefined && prose && !inFence && !fenceLine
+      const body = styled ? inlineMarkdown(raw, args.theme!) : raw
       prevTool = e.kind === 'tool' ? e : null
       const avail = Math.max(4, w - stringWidth(prefix))
       // 续行对齐到内容列,并保住左边那根 gutter —— 真实终端就是这么折的。
       const cont = GUTTER + ' '.repeat(Math.max(0, stringWidth(prefix) - stringWidth(GUTTER)))
+      /**
+       * 上过色的行走 ANSI 渲染,但 **`dim` 要留着**。
+       *
+       * 思考正文全靠 dim 和模型说的话分开(foldThinking 那段注释记着这条实测:少了它
+       * 用户分不清哪句是想的、哪句是说的)。`<Ansi dimColor>` 会把整行压暗,同时保住
+       * 行内的加粗和行内代码 —— 两个都要,不是二选一。
+       *
+       * `color` 不带:散文事件的 color 恒为 undefined(见 eventLine),真要带的话它会和
+       * ANSI 里自己的颜色打架。
+       */
+      const ansi = styled && hasAnsi(body)
       wrapDisplayWidth(body, avail).forEach((chunk, k) => {
-        out.push({ text: (k === 0 ? prefix : cont) + chunk, color, dim, streamIndex: i })
+        out.push(ansi
+          ? { text: (k === 0 ? prefix : cont) + chunk, streamIndex: i, ansi: true, dim }
+          : { text: (k === 0 ? prefix : cont) + chunk, color, dim, streamIndex: i })
       })
     }
   })
@@ -418,6 +468,17 @@ export interface SectionSpec {
   color?: LogColor
   /** 未展开时这一段留几行。省略则用 `collapsedLines`。 */
   maxLines?: number
+  /**
+   * 这一段是**模型写的散文**,按 markdown 上色。
+   *
+   * 逐段开关,不是全局开关。机器生成的那几段(依赖、评分、耗时、用量、工作区路径)
+   * 必须留在原样:`src/a-b.ts` 里的下划线、`--flag` 里的连字号、`[WAITING_CHILDREN]`
+   * 这样的方括号,交给 markdown 解析器都会被吃掉或改写 —— 那是把可读性换成好看。
+   *
+   * 带 `color` 的段落也不上 markdown:那一层颜色是**语义**(阻断原因是红的),
+   * 而 ANSI 行走的是 `<Ansi>`,它自己带颜色、盖不住也接不上外面那一层。
+   */
+  md?: boolean
 }
 
 /**
@@ -437,12 +498,20 @@ export const EXPANDED_MAX_LINES = 2000
  * 同一件事 —— 屏幕上最后一行还写着「自测全绿」,而把节点挡下来的那条拒绝理由被裁掉了,
  * 在整个 TUI 里再也找不到。
  */
-function bodyLines(body: string, width: number, maxLines: number): { lines: string[]; total: number } {
+function bodyLines(
+  body: string,
+  width: number,
+  maxLines: number,
+  /** 给了就按 markdown 排版这一段。见 `SectionSpec.md`。 */
+  md?: { theme: ThemeName },
+): { lines: string[]; total: number } {
   // **按显示宽度折行,不是按码点。** 老的 block() 写死 `width = 100` 并按码点判断,
   // 于是 100 个汉字(=200 列)被判成「不用折」,交给 Text 默认的 wrap 回流成两三个终端行。
   // 实测同一份内容,中文比 ASCII 多出 24 行 —— 行预算是假的,而且 80 列和 100 列的终端
   // 算出来一模一样(列宽根本没参与)。
-  const wrapped = body.split('\n').flatMap(l => wrapDisplayWidth(l, width))
+  const wrapped = md
+    ? markdownLines(body, width, md.theme)
+    : body.split('\n').flatMap(l => wrapDisplayWidth(l, width))
   const total = wrapped.length
   const cap = Math.max(1, Math.floor(maxLines))
   if (total <= cap) return { lines: wrapped, total }
@@ -485,6 +554,13 @@ export function sectionLines(args: {
   width: number
   /** 未展开的段落默认留几行。 */
   collapsedLines: number
+  /**
+   * 当前主题。给了才对 `md: true` 的段落上 markdown 色。
+   *
+   * 缺省 = 不上色,而且是**故意**留成可缺省的:这个函数有一堆纯算术的调用点
+   * (行数、锚、切片),它们不该为了算行数去构造一个主题。
+   */
+  theme?: ThemeName
 }): { lines: ViewLine[]; headerAt: (i: number) => number } {
   const w = Math.max(10, args.width)
   // 正文缩进 4 列,和这个页面原来的排版一致。
@@ -494,10 +570,13 @@ export function sectionLines(args: {
   args.sections.forEach((sec, i) => {
     const isExpanded = args.expanded.has(sec.title)
     const selected = i === args.cursor
+    // 带语义颜色的段落不上 markdown —— 见 SectionSpec.md 的注释。
+    const md = sec.md === true && args.theme !== undefined && sec.color === undefined
     const { lines: body, total } = bodyLines(
       sec.body.trim(),
       bodyWidth,
       isExpanded ? EXPANDED_MAX_LINES : (sec.maxLines ?? args.collapsedLines),
+      md ? { theme: args.theme! } : undefined,
     )
     const clipped = body.length < total
     const hint = isExpanded ? '(空格收起)' : clipped ? `(空格展开,共 ${total} 行)` : ''
@@ -508,7 +587,20 @@ export function sectionLines(args: {
       color: sec.color ?? (selected ? 'success' : undefined),
       inverse: selected,
     })
-    for (const l of body) lines.push({ text: `    ${l}`, color: sec.color, dim: sec.color === undefined })
+    for (const l of body) {
+      /**
+       * 判据是**这一行真的有 ANSI**,不是「这一段声明了 md」。
+       *
+       * 两件事:
+       *  - markdown 行自己带颜色,不能再叠 dim —— 叠上去之后加粗的标题和正文一样暗,
+       *    这个改动就白做了;
+       *  - 而终端不支持颜色时(chalk.level === 0)`formatToken` 一个转义都不发,那一行
+       *    就该原样退回旧渲染(带 dim),而不是变成一个既没颜色、又丢了 dim 的怪东西。
+       */
+      lines.push(md && hasAnsi(l)
+        ? { text: `    ${l}`, ansi: true }
+        : { text: `    ${l}`, color: sec.color, dim: sec.color === undefined })
+    }
   })
   return { lines, headerAt: i => headers[i] ?? -1 }
 }

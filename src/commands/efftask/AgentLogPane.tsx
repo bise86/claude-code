@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Text, useInput } from '../../ink.js'
+import { Text, useInput, useTheme } from '../../ink.js'
 import type { StreamState, StreamStore } from '../../tools/efftask/agentStream.js'
 import { ScrollPane } from './ScrollPane.js'
 import {
@@ -103,6 +103,8 @@ export interface AgentLogPaneProps {
  * `logPaneAction` 里有一条测试专门钉这件事。
  */
 export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
+  // markdown 上色要主题(行内代码那一档是主题色)。
+  const [theme] = useTheme()
   // 「丢了多少」钉在滚动区之外,占一行 —— 它跟着滚的话会被粘底行为直接埋掉。
   const notice = droppedNotice(props.droppedEvents)
   /**
@@ -173,6 +175,7 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
     width: contentWidth,
     historical: props.historical,
     expandedThinking: thinkingRef.current,
+    theme,
   })
 
   const total = lines.length

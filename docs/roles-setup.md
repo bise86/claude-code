@@ -737,12 +737,46 @@ main()
 
 模型名写**别名**（`opus`）也可以，判定前会先解析成全名。
 
+### 上游报错该怎么读
+
+翻译层(`openai` / `openai-responses`)的上游失败会给出**一整句**，五样齐全：
+
+```
+员工「评审员甲」(openai-responses 协议)调用失败 · POST https://gw.example/v1/responses → 502 Bad Gateway
+ · 上游原文:(空) · 可能原因:上游或它前面的网关自己出错了。**空体 502 最常见的原因是这个网关
+   没有 /responses 这个路由** —— 先确认 apiUrl 只写到 /v1、再确认它真的支持这套协议，
+   否则把 apiProtocol 改成 openai
+```
+
+按顺序读:**谁** → **哪条协议** → **真正 POST 到了哪个 URL** → **上游说了什么** → **改哪个配置键**。
+那个 URL 是第一手材料:路径叠加(`/v1/responses/responses`)这类错在它上面当场自明。
+
+| 上游状态 | 多半是什么 |
+|---|---|
+| `401` / `403` | `apiToken` 不对，或这个 token 没有该模型的权限 |
+| `404` / `405` | 这个地址上没有那条路由。`apiUrl` 只写到 `/v1`；网关只实现了另一种方言时换 `apiProtocol` |
+| `400` / `422` | 上游拒绝了请求体（原文就在那一句里）。先查 `model`，再看它认不认这套字段 |
+| `429` | 限流。调小 `caps.maxSeatsPerPhase`，或换配额更宽的 `apiToken` |
+| `5xx`（尤其**空体 502**） | 多半是这个网关没有那条路由 |
+| `200 但不是 SSE` | 网关不支持流式，用 HTTP 200 回了一个 JSON 错误体。**这一档以前的表现是一次「成功但完全空白」的回答**，现在会报出来 |
+
+以前这里只有一句 `API Error: 502 {"type":"error","error":{"type":"api_error","message":"Bad Gateway"}}`——
+哪个员工、哪条协议、发到了哪儿，一个字都没有。信息不是在传输中丢的，是从来没被写进去过。
+
+**`apiUrl` 里已经带了路由段的话会被自动剥掉**（厂商文档印的就是完整端点，复制粘贴天经地义）：
+`https://gw/v1/chat/completions` + `openai-responses` 拼出来仍然是 `https://gw/v1/responses`，
+不会变成 `/v1/chat/completions/responses`。两条协议的路由都剥——换协议时 `apiUrl` 常常还停在上一条上。
+
+**Anthropic 专用的请求头不会带到 OpenAI 系端点上**（`anthropic-version` / `anthropic-beta` /
+`x-stainless-*` / `x-api-key`）。它们描述的是 Anthropic 的 SDK，不是这一次出网的请求，
+而严格一点的网关会对陌生头直接 4xx/502——那种 502 恰好是空体的。
+
 ### Responses 协议报错
 
 **症状**：`apiProtocol: "openai-responses"` 的员工调用失败。
 
 **检查清单：**
-1. `apiUrl` 是不是多写了路由。要填到 `/v1` 为止，**不要**写成 `.../v1/responses`——那会拼成 `/v1/responses/responses`
+1. 先读上面那一句报错——它已经把真实 URL 和上游原文写出来了
 2. `model` 是不是这个账号有权限的推理模型。Responses API 对模型的可用性和 chat/completions 不完全一样
 3. 上游报 `function_call was provided without its required reasoning item`：这条桥已经在处理推理片段往返（`store: false` + `include: ['reasoning.encrypted_content']`，密文搭 thinking 块的签名回传），不需要你配置。真出现这个错说明中间有网关改写了请求体，或者对话历史被外部截断过
 4. 协议名少写一个字母（`openai-response`）会让**整条员工不被载入**——不是「这个字段不生效」。原因会显示在 `/et` 启动关口上，并列出三个合法值

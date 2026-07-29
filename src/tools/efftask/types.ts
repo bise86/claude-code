@@ -1,6 +1,7 @@
 // 纯类型导入,编译期擦除 —— roleDefs.ts 对本文件是值依赖(PHASE_NAMES/MAIN_STAFF),
 // 所以这条反向依赖必须是 `import type`,否则就成了真实的运行期循环。
 import type { RoleDef } from './roleDefs.js'
+import type { UsageTotals } from './usage.js'
 
 /**
  * 一个**环节**(用户词汇里的「过程」)—— 流水线上一个真实的派发点。
@@ -342,6 +343,17 @@ export interface TaskNode {
    * mean very different things to someone reading the number.
    */
   phaseMs?: Partial<Record<NodeStatus, number>>
+  /**
+   * 这个节点**自己**花掉的模型调用次数与 token(不含子节点)。口径见 `usage.ts`。
+   *
+   * 只记自己那一份,子树合计在**读的时候**沿 childIds 现算 —— 存合计的话,一个节点的
+   * 用量变化要同时改它到根的每一个祖先,而这条链上任何一次崩溃/重做都会让那些数字
+   * 永久性地对不上,却没有任何东西会报错。现算是 O(子树),而树的上限是 maxNodes。
+   *
+   * 由 `runAgentAdapter` 在每条模型消息到达时累加,`commit()` 顺手落盘(serializeNode
+   * 整节点倾倒)。**重做不清零** —— 钱是真花掉了的。
+   */
+  usage?: UsageTotals
   // Separate budgets. `acceptance` belongs to an executable node's accept loop and
   // `integration` to a decompose node's integrate loop; sharing one counter means a
   // resumed node could arrive at integration with its budget already spent elsewhere.

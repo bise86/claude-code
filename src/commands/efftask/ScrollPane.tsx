@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Box, Text } from '../../ink.js'
+import { Ansi, Box, Text } from '../../ink.js'
 import { OffscreenFreeze } from '../../components/OffscreenFreeze.js'
 import { scrollbarColumn, type ViewLine } from './logView.js'
 
@@ -50,15 +50,33 @@ export function ScrollPane(props: {
         ) : null}
         {props.slice.map((l, i) => (
           <Box key={`vl-${props.from + i}`} flexDirection="row" flexShrink={0}>
-            <Text
-              color={l.color}
-              dimColor={l.dim === true}
-              bold={l.bold === true}
-              inverse={l.inverse === true}
-              wrap="truncate-end"
-            >
-              {l.text}
-            </Text>
+            {l.ansi === true ? (
+              /**
+               * markdown 上过色的行。
+               *
+               * **`wrap="truncate-end"` 留在外层 Text 上,不能省。** 行宽是上面按
+               * `stringWidth` 精确算出来的,而 `<Ansi>` 把内容拆成一串兄弟 span ——
+               * 万一哪一行多出一列(宽度实现之间的分歧、终端对某个字形的判断不同),
+               * 没有这道兜底它就会回流成两个终端行,而「一条 ViewLine = 一个终端行」
+               * 一破,滚动条指的位置和底部的页签条就一起错。
+               *
+               * `dimColor` 透传:思考正文全靠它和模型说的话分开,而 `<Ansi dimColor>`
+               * 压暗整行的同时保住行内的加粗与行内代码。
+               */
+              <Text wrap="truncate-end">
+                <Ansi dimColor={l.dim === true}>{l.text}</Ansi>
+              </Text>
+            ) : (
+              <Text
+                color={l.color}
+                dimColor={l.dim === true}
+                bold={l.bold === true}
+                inverse={l.inverse === true}
+                wrap="truncate-end"
+              >
+                {l.text}
+              </Text>
+            )}
             <Box flexGrow={1} />
             <Text dimColor>{bar[i] ?? ' '}</Text>
           </Box>

@@ -7,6 +7,7 @@ import type { StreamStore } from '../../tools/efftask/agentStream.js'
 import { useStreamTick } from './AgentLogPane.js'
 import { runControlAction, budgetRows, clipToWidth, lastActivity, detailEntryHint } from './logView.js'
 import { currentMouseAvailability } from './mouseEnv.js'
+import { addUsage, EMPTY_USAGE, formatTokens, isEmptyUsage, subtreeUsage, totalTokens, type UsageTotals } from '../../tools/efftask/usage.js'
 import { stringWidth } from '../../ink/stringWidth.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { useIsInsideModal, useModalOrTerminalSize } from '../../context/modalContext.js'
@@ -24,6 +25,38 @@ const GLYPH: Record<UiStatus, string> = { done: '●', running: '◐', queued: '
  * 的状态字形本来就是裸写的几何符号,这里跟着来,不为两个符号引入 figures 依赖。
  */
 export const KIND_GLYPH = { decompose: '⊞', executable: '▪', unknown: '·' } as const
+
+/**
+ * 树行上那个用量标记。
+ *
+ * **算的是含子任务的合计**,不是这个节点自己那一份 —— 树上一个折叠着的拆分节点,人想
+ * 知道的正是「这一整块花了多少」,而它自己那一份通常只有几次分析和评审调用。详情页里
+ * 两个数都给,那儿有地方分得开。
+ *
+ * `⇅` 是宽度 1 的箭头,和这个文件里已有的字形不撞。
+ */
+export function usageTag(n: TaskNode, byId: Map<string, TaskNode>): string {
+  const u = subtreeUsage(n, id => byId.get(id))
+  return isEmptyUsage(u) ? '' : ` ⇅${u.calls}/${formatTokens(totalTokens(u))}`
+}
+
+/**
+ * 标题至少要留下这么多列,用量标记才配上树行。
+ *
+ * 比 `clipToWidth` 那个 6 列的硬下限宽得多,而且是故意的:6 列是「宁可夹成两个字也别
+ * 让行溢出」的兜底,不是一个可读的标题。落到那一档时,用量必须先让位 —— 树行回答的
+ * 第一个问题永远是「这是哪个任务」。
+ */
+export const MIN_TITLE_ROOM = 16
+
+/** 整棵树的用量合计 —— 表头那一句「这一趟花了多少」。 */
+export function runUsage(nodes: readonly TaskNode[]): UsageTotals {
+  // 逐个节点把**自己那一份**加起来,而不是从根做子树合计:孤儿节点(父节点被重做删掉、
+  // 或者盘上结构半损)一样是真花过钱的,从根走会把它们整个漏掉。
+  let out = EMPTY_USAGE
+  for (const n of nodes) out = addUsage(out, n.usage)
+  return out
+}
 
 /**
  * 一个节点该画哪个标记。
@@ -389,6 +422,9 @@ export function TaskTreePanel(props: {
   const counts: Record<UiStatus, number> = { done: 0, running: 0, queued: 0, failed: 0 }
   for (const n of props.nodes) counts[uiStatus(n.status)]++
   const mouse = currentMouseAvailability()
+  const total = runUsage(props.nodes)
+  // 子树合计要按 id 找孩子。建一次给整屏用 —— 每行各建一个是 O(行 × 节点)。
+  const byId = new Map(props.nodes.map(n => [n.id, n]))
 
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
@@ -402,6 +438,12 @@ export function TaskTreePanel(props: {
         {props.serialExecute === true
           ? <Text color="warning">{'  '}执行串行(无隔离工作区)</Text>
           : null}
+        {/* 这一趟一共花了多少。表头是唯一一个「不用挑节点就看得到全局」的位置,而
+            「这次跑掉了多少钱」正是一个人在树上第一眼想确认的事。空的时候整段不画 ——
+            还没有任何调用时印一个 `0 次 · 0` 只是噪音。 */}
+        {isEmptyUsage(total) ? null : (
+          <Text dimColor>{'  '}⇅{total.calls} 次 · {formatTokens(totalTokens(total))} tokens</Text>
+        )}
         {rows.length > view.slice.length ? <Text dimColor>{'  '}{idx + 1}/{rows.length}</Text> : null}
       </Text>
       {view.slice.map(({ node: n, depth, hasKids }, vi) => {
@@ -413,7 +455,18 @@ export function TaskTreePanel(props: {
         const act = activity.get(n.id)
         // 标题先按剩余宽度截,状态和耗时才不会被 truncate-end 从右边吃掉。
         // 前缀 = 光标 1 + 缩进 2×depth + 折叠 1 + 空格 1 + 状态字形 1 + 空格 1 + 类型 1 + 空格 1
-        const suffix = ` [${n.status}]${n.mergeConflict === true ? ' 待人工解冲突' : ''} ${elapsed(n, nowMs)}${scoreTag(n)}${hidden}`
+        const base = ` [${n.status}]${n.mergeConflict === true ? ' 待人工解冲突' : ''} ${elapsed(n, nowMs)}${scoreTag(n)}${hidden}`
+        /**
+         * 用量标记**放得下才画**。
+         *
+         * 这一行已经很挤,而 `room` 的下限是 6 列 —— 硬加一段 11 列的后缀,窄终端上换来的
+         * 是把标题夹成两三个字,也就是用「花了多少」换掉「这是哪个任务」。宽松时给,
+         * 紧张时不给,和这个文件里鼠标提示的两级降级是同一条规矩。
+         */
+        const tag = usageTag(n, byId)
+        const roomWith = columns - (8 + depth * 2) - stringWidth(base + tag)
+        const usage = tag && roomWith >= MIN_TITLE_ROOM ? tag : ''
+        const suffix = base + usage
         // stringWidth 而不是 .length:后缀里有中文(「待人工解冲突」7 个 UTF-16 单元、
         // 13 列),按 .length 算会少扣一半宽度,行照样溢出 —— truncate-end 就得替它兜,
         // 而从右边吃掉的正是状态和耗时。
@@ -441,7 +494,7 @@ export function TaskTreePanel(props: {
               {'  '.repeat(depth)}
               {fold} {GLYPH[ui]} {kindGlyph(n)} {title}{' '}
               <Text dimColor>
-                [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{scoreTag(n)}{hidden}
+                [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{scoreTag(n)}{hidden}{usage}
               </Text>
             </Text>
             {/* 「此刻在调什么工具」—— 不用进详情视图就答得上来。1s 采样,不承诺逐条。 */}

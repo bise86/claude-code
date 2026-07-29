@@ -1,7 +1,37 @@
 import type { RoleClientConfig } from '../../../tools/AgentTool/roles/roleTypes.js'
 import { anthropicEventsToSSE } from './blocks.js'
-import { TRANSLATING_PROTOCOLS } from './protocols.js'
-import { joinRoute, parseSSE } from './sse.js'
+import { PROTOCOL_ROUTES, TRANSLATING_PROTOCOLS } from './protocols.js'
+import { drainText, joinRoute, parseSSE, sniffSSE } from './sse.js'
+import { upstreamFailureMessage } from './upstreamError.js'
+
+/**
+ * 翻译层要**摘掉**的请求头。
+ *
+ * 它们描述的是 Anthropic 的 SDK,不是这一次出网的请求:`anthropic-version` /
+ * `anthropic-beta` 对 OpenAI 系端点毫无意义(而 `anthropic-beta` 常常是好几百字节的
+ * 一长串特性名),`x-stainless-*` 是 SDK 的遥测,`x-api-key` 是另一套鉴权 ——
+ * 这条路径上鉴权走 `Authorization: Bearer`,留着它等于把 token 多发一份到一个
+ * 根本不会用它的头里。
+ *
+ * 严格一点的网关会对陌生头直接 4xx/502,而那种 502 是**空体**的 —— 也就是用户报的
+ * 那一句「Bad Gateway」,什么线索都没有。
+ */
+function scrubAnthropicHeaders(headers: Headers): void {
+  // 先快照再删:一边迭代一边 delete 在 Headers 上是未定义行为。
+  for (const key of [...headers.keys()]) {
+    if (key.startsWith('anthropic-') || key.startsWith('x-stainless-') || key === 'x-api-key' || key === 'x-app') {
+      headers.delete(key)
+    }
+  }
+}
+
+/** 上游失败 → 一条 anthropic 形状的错误响应。**状态码原样透传**,好让上层的重试策略照旧。 */
+function failureResponse(status: number, message: string): Response {
+  return new Response(
+    JSON.stringify({ type: 'error', error: { type: 'api_error', message } }),
+    { status, headers: { 'content-type': 'application/json' } },
+  )
+}
 
 export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetch): typeof fetch {
   const target = new URL(cfg.apiUrl)
@@ -50,17 +80,39 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      * 而那时候退化成最常见的方言,比抛一个用户看不懂的异常要好。
      */
     const proto = TRANSLATING_PROTOCOLS[cfg.apiProtocol] ?? TRANSLATING_PROTOCOLS.openai!
-    headers.delete('x-api-key')
+    scrubAnthropicHeaders(headers)
     headers.set('authorization', `Bearer ${cfg.apiToken}`)
     headers.set('content-type', 'application/json')
     const anthropicBody = JSON.parse(init.body as string)
     const outBody = proto.buildBody(anthropicBody, cfg)
-    const res = await inner(joinRoute(target.toString(), proto.route), { ...init, method: 'POST', headers, body: JSON.stringify(outBody) })
-    if (!res.ok || !res.body) {
-      const errText = await res.text().catch(() => '')
-      return new Response(JSON.stringify({ type: 'error', error: { type: 'api_error', message: errText || res.statusText } }), { status: res.ok ? 502 : res.status, headers: { 'content-type': 'application/json' } })
-    }
-    const events = proto.toAnthropicEvents(parseSSE(res), { anthropicModel: anthropicBody.model })
+    // 拼好的地址要**留在手上**:它是诊断 502 的第一手材料,而此前它只存在于这一行表达式里。
+    const dest = joinRoute(target.toString(), proto.route, PROTOCOL_ROUTES)
+    const res = await inner(dest, { ...init, method: 'POST', headers, body: JSON.stringify(outBody) })
+    /**
+     * **返回给上层的状态码**和**上游自己说的状态码**是两回事,不能共用一个数。
+     *
+     * 上层的重试策略读前者;而报错正文里印的必须是后者 —— 上游 200、我们判定它不是 SSE
+     * 之后返回 502,正文写「502 但不是 SSE」就是在编,用户会拿着 502 去找网关日志,
+     * 而网关那边记的是一次成功的 200。
+     */
+    const fail = (returnStatus: number, body: string, notStreamed?: true): Response =>
+      failureResponse(returnStatus, upstreamFailureMessage({
+        roleName: cfg.roleName, protocol: cfg.apiProtocol, url: dest,
+        status: res.status, statusText: res.statusText, body, notStreamed,
+      }))
+    // 上游报错:状态码原样透传,好让上层的重试策略照旧。
+    if (!res.ok) return fail(res.status, await res.text().catch(() => ''))
+    // 2xx 但根本没有 body —— 和「不是 SSE」是同一件事的极端形态,走同一条解释。
+    if (!res.body) return fail(502, '', true)
+    /**
+     * 200 但不是 SSE —— 单独一条路径,见 sniffSSE 的注释。
+     *
+     * 不判的话这条响应会安安静静地解出**零个事件**,用户拿到一次「成功但完全空白」的
+     * 回答,而流水线把这个空回答当成这一席的真实产出继续往下走。
+     */
+    const sniff = await sniffSSE(res.body)
+    if (!sniff.isSSE) return fail(502, await drainText(sniff.stream), true)
+    const events = proto.toAnthropicEvents(parseSSE(new Response(sniff.stream)), { anthropicModel: anthropicBody.model })
     return new Response(anthropicEventsToSSE(events), { status: 200, headers: { 'content-type': 'text/event-stream' } })
   }) as typeof fetch
 }

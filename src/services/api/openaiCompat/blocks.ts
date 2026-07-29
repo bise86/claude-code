@@ -18,6 +18,17 @@ export interface BlockUsage { input_tokens: number; output_tokens: number }
  * 真正不该共用的东西留在各自的翻译层里(厂商方言的思考字段嗅探、工具调用累加、
  * finish_reason 映射表、错误形状)—— 那几样两边差得远,硬抽只会把差异挤成一堆 if。
  */
+/**
+ * 上游没给 id 时的兜底消息 id 计数器。
+ *
+ * **不能是一个常量。** 原来写死 `'msg_openai'`,于是同一个进程里所有匿名回合共用一个
+ * 消息 id —— 而消息 id 是「这是第几次模型调用」的唯一凭据:任何按 id 去重的统计
+ * (节点用量、遥测、会话记录)都会把一个节点里的几十次调用记成一次。
+ *
+ * 计数器而不是随机数:同一次运行里唯一就够用了,而确定性让测试能直接断言。
+ */
+let anonMessageSeq = 0
+
 export function createBlockWriter(ctx: { anthropicModel: string }) {
   let started = false
   let nextIndex = 0
@@ -30,7 +41,7 @@ export function createBlockWriter(ctx: { anthropicModel: string }) {
     if (started) return
     started = true
     yield { event: 'message_start', data: { type: 'message_start', message: {
-      id: id ?? 'msg_openai', type: 'message', role: 'assistant', model: ctx.anthropicModel,
+      id: id ?? `msg_openai_${++anonMessageSeq}`, type: 'message', role: 'assistant', model: ctx.anthropicModel,
       content: [], stop_reason: null, stop_sequence: null,
       usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } } }
   }

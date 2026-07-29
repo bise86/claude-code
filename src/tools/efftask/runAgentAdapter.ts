@@ -9,6 +9,7 @@ import type { RunControl } from './control.js'
 import { eventsFromMessage, type BriefResolver } from './agentEvents.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { RoleBinding } from './types.js'
+import { addUsage, createUsageMeter, isEmptyUsage } from './usage.js'
 
 /**
  * caps.nodeTimeoutMs tripped (spec §11 的第四个阀).
@@ -414,11 +415,33 @@ export function makeRunAgentFn(deps: {
     // creates the generator: runWithCwdOverride is AsyncLocalStorage-based, and a generator
     // body does not execute until its first next() — by which time a wrapper around the
     // factory call has already exited and pwd() would resolve to the shared cwd again.
+    /**
+     * 这次调用花了多少 —— **记在节点上,当场记**。
+     *
+     * 为什么在这一层:这是**所有** `/et` 模型调用唯一的必经之处(七个环节、圆桌的每一席、
+     * 根方案、自动重拟、冲突自动解决全走这里),而且它拿得到原始的 assistant 消息 ——
+     * 再往上一层 `collectText` 已经把 usage 丢光了。
+     *
+     * 为什么每条消息就结一次账、而不是等收口:这次调用可能超时、可能被取消、可能抛 ——
+     * **token 已经花掉了**,那三条路径上一样要认账。等到 finally 再算不是不行,但
+     * 「花了就记」比「结束时补记」少一整类要证明的东西。
+     *
+     * 直接改 `req.node`:它就是流水线手上那个活节点(不是副本),而 `commit()` 在每次
+     * 状态迁移时把整个节点倾倒进 node.md —— 落盘和 `--resume` 都是白拿的。
+     */
+    const meter = createUsageMeter()
+    const bankUsage = (): void => {
+      const delta = meter.take()
+      if (isEmptyUsage(delta)) return
+      req.node.usage = addUsage(req.node.usage, delta)
+    }
     const consume = async (): Promise<void> => {
       for await (const message of invoke()) {
         // 有输出 = 没卡住。stall 时钟从这里重置 —— 这就是「静默时长」和「总时长」的区别。
         markProgress()
         collected.push(message)
+        meter.observe(message)
+        bankUsage()
         // 每一条消息都要看,不只是 assistant —— 工具返回值走的是 user 消息,而它此前整条
         // 被跳过,所以「工具返回了什么、报没报错」在界面上一个字都没有。
         emit(message)

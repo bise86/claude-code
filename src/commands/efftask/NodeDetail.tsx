@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Box, Text, useInput } from '../../ink.js'
+import { Box, Text, useInput, useTheme } from '../../ink.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus } from '../../tools/efftask/stateMachine.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
@@ -20,6 +20,7 @@ import {
   type LogAnchor,
   type SectionSpec,
 } from './logView.js'
+import { formatTokens, isEmptyUsage, subtreeUsage, totalTokens, type UsageTotals } from '../../tools/efftask/usage.js'
 import { currentMouseAvailability } from './mouseEnv.js'
 import { useLiveState } from './useLiveState.js'
 import { stringWidth } from '../../ink/stringWidth.js'
@@ -98,6 +99,39 @@ export function phaseTimeBody(n: TaskNode): string {
     .join(' · ')
 }
 
+/**
+ * 模型用量 (用户原话:「每个任务都要统计模型调用次数和消耗 token,有子任务的要计算所有
+ * 子任务的总量」)。
+ *
+ * 两行,而且**只有真的分得开时才画第二行**:一个叶子节点的「本节点」和「含子任务」永远
+ * 相等,画两行相同的数字只会让人怀疑自己看错了。
+ *
+ * 缓存读写单列:命中缓存的输入在计费上便宜一个数量级,把它并进 input 会让一个高度复用
+ * 上下文的运行看起来贵得离谱。
+ */
+export function usageBody(n: TaskNode, resolveNode?: (id: string) => TaskNode | undefined): string {
+  const own = n.usage
+  const line = (label: string, u: UsageTotals): string => {
+    const parts = [`${u.calls} 次调用`, `${formatTokens(totalTokens(u))} tokens`]
+    if (u.input > 0 || u.output > 0) parts.push(`输入 ${formatTokens(u.input)} / 输出 ${formatTokens(u.output)}`)
+    if (u.cacheRead > 0 || u.cacheWrite > 0) parts.push(`缓存 读 ${formatTokens(u.cacheRead)} / 写 ${formatTokens(u.cacheWrite)}`)
+    return `${label}: ${parts.join(' · ')}`
+  }
+  const rows: string[] = []
+  if (!isEmptyUsage(own)) rows.push(line('本节点', own!))
+  if (n.childIds.length > 0) {
+    // resolveNode 缺席时**不画这一行**,而不是画一个等于自己的合计 —— 后者是一句假话:
+    // 这个节点明明有子任务,数字却把它们全漏了,而屏幕上看不出漏了。
+    if (resolveNode) {
+      const all = subtreeUsage(n, resolveNode)
+      if (!isEmptyUsage(all)) rows.push(line(`含 ${n.childIds.length} 个子任务合计`, all))
+    } else if (rows.length > 0) {
+      rows.push(`(子任务用量本屏取不到)`)
+    }
+  }
+  return rows.join('\n')
+}
+
 /** 评审 / 验收记录:每轮一行。 */
 function roundsBody(log: TaskNode['reviewLog']): string {
   return log
@@ -138,19 +172,27 @@ export function detailSections(
 ): SectionSpec[] {
   const all: SectionSpec[] = [
     // 依赖排在最前,和改造之前的版面一致 —— 一个节点停在 READY 不动时,人是为这一段来的。
+    // 机器生成的几段(依赖 / 评分 / 迭代 / 耗时 / 用量 / 工作区)**不上 markdown**:
+    // 里面是 id、路径、`[STATUS]`、`--flag`,交给 markdown 解析器只会被吃掉记号。
     { title: '依赖', body: depsBody(n, resolveNode) },
-    { title: '目标', body: n.goal },
-    { title: '完整方案', body: n.plan.solution },
-    { title: '重点', body: n.plan.keyPoints },
-    { title: '风险点', body: n.plan.risks },
-    { title: '验收点', body: n.plan.acceptance },
-    { title: '执行状态', body: n.execStatus },
+    // 以下都是模型写的散文,而且模型本来就在写 markdown。
+    { title: '目标', body: n.goal, md: true },
+    { title: '完整方案', body: n.plan.solution, md: true },
+    { title: '重点', body: n.plan.keyPoints, md: true },
+    { title: '风险点', body: n.plan.risks, md: true },
+    { title: '验收点', body: n.plan.acceptance, md: true },
+    { title: '执行状态', body: n.execStatus, md: true },
+    // 红色是**语义**(这是把节点挡下来的那条),不能被 markdown 的行内颜色顶掉。
     { title: '阻断原因', body: n.blockedReason, color: 'error' },
     { title: '评分', body: scoreBody(n) },
     { title: '迭代次数', body: iterationBody(n) },
     { title: '各阶段耗时', body: phaseTimeBody(n) },
-    { title: '评审记录', body: roundsBody(n.reviewLog) },
-    { title: '验收记录', body: roundsBody(n.acceptLog) },
+    // 紧挨着耗时:两者回答的是同一个问题的两半 ——「这个节点贵在哪」。
+    { title: '模型用量', body: usageBody(n, resolveNode) },
+    // 每轮一行的骨架是我们拼的,但 blockingSummary 是评审员写的散文 —— 上色的收益
+    // (「[架构] **缺回滚**」里的重点看得见)大于骨架被解析的风险(骨架里没有记号)。
+    { title: '评审记录', body: roundsBody(n.reviewLog), md: true },
+    { title: '验收记录', body: roundsBody(n.acceptLog), md: true },
   ]
   if (n.worktree) all.push({ title: '隔离工作区', body: `${n.worktree.branch}\n${n.worktree.path}` })
   return all.filter(s => s.body.trim().length > 0)
@@ -242,6 +284,7 @@ export function NodeDetail(props: {
   initialTab?: DetailTabId
 }): React.ReactElement {
   const n = props.node
+  const [theme] = useTheme()
   const term = useTerminalSize()
   const { rows: availRows, columns: availCols } = useModalOrTerminalSize(term)
   const inModal = useIsInsideModal()
@@ -289,6 +332,7 @@ export function NodeDetail(props: {
     expanded,
     width: contentWidth - 1,
     collapsedLines,
+    theme,
   })
   const secTotal = secLines.length
   const secFrom = scrollWindow(

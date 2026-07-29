@@ -9,6 +9,8 @@ import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from '..
 import { modelSupportsEffort } from '../../utils/effort'
 import { REASONING_FIELDS } from '../../services/api/openaiCompat/fromOpenAIStream'
 import { logPaneAction, sectionPaneAction, detailEntryHint, collapsedLinesFor } from '../../commands/efftask/logView'
+import { detailSections, usageBody } from '../../commands/efftask/NodeDetail'
+import { upstreamAdvice } from '../../services/api/openaiCompat/upstreamError'
 import type { Key } from '../../ink/events/input-event'
 
 /**
@@ -419,5 +421,76 @@ describe('思考级别排查表和代码说同一句话', () => {
       expect(`${name} 的路由 ${proto.route} 在文档里: ${ROLES_DOC.includes(norm(`{apiUrl}/${proto.route}`))}`)
         .toBe(`${name} 的路由 ${proto.route} 在文档里: true`)
     }
+  })
+})
+
+describe('README 的 markdown 与用量两节说的和代码干的是同一件事', () => {
+  /** 一个每一段都非空的节点 —— detailSections 会滤掉空段落。 */
+  const rich = (): TaskNode => {
+    const n = createNode({ id: 'root', title: 't', goal: 'g', parentId: null, deps: ['x'], depth: 0, phaseRoles: emptyPhaseRoles(), now: new Date().toISOString() })
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.execStatus = 'e'
+    n.blockedReason = 'b'
+    n.score = { plan: { role: 'x', score: 80, rationale: 'y' } }
+    n.iteration = { planReview: 1, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 }
+    n.phaseMs = { EXECUTING: 42_000 }
+    n.usage = { calls: 3, input: 10, output: 1, cacheRead: 0, cacheWrite: 0 }
+    n.worktree = { branch: 'b', path: '/p' }
+    n.reviewLog = [{ round: 1, verdicts: [], synthesized: { pass: true, blockingSummary: '' } }]
+    n.acceptLog = [...n.reviewLog]
+    n.childIds = ['root/01-a']
+    return n
+  }
+
+  it('哪几段上 markdown、哪几段不上,文档列的就是代码标的', () => {
+    /**
+     * 这条闸门要挡的是**两句都可能变成假话**的承诺:一句「这几段上色」,一句
+     * 「这几段一个记号都不动」。后者尤其要紧 —— 它是 `--flag` 和 `[STATUS]` 不被
+     * markdown 吃掉的全部保证,而给某一段顺手加个 `md: true` 是零反馈的。
+     */
+    const secs = detailSections(rich(), () => undefined)
+    expect(secs.length).toBeGreaterThan(10)
+    const md = secs.filter(x => x.md === true).map(x => x.title)
+    const plain = secs.filter(x => x.md !== true).map(x => x.title)
+    expect(md.length).toBeGreaterThan(0)
+    expect(plain.length).toBeGreaterThan(0)
+    // 文档里那两行列表,逐个段落名对。
+    const mdLine = README.split('\n').find(l => l.includes('按 markdown 上色'))!
+    for (const t of md) expect(`上色段落 ${t} 在文档那一行里：${mdLine.includes(t)}`).toBe(`上色段落 ${t} 在文档那一行里：true`)
+    const plainLine = README.split('\n').find(l => l.includes('一个记号都不动'))!
+    for (const t of plain) expect(`原样段落 ${t} 在文档那一行里：${plainLine.includes(t)}`).toBe(`原样段落 ${t} 在文档那一行里：true`)
+    // 反向:上色的那几段不许出现在「原样」那一行里,否则两行互相打脸而测试照样绿。
+    for (const t of md) expect(`${t} 不在原样那一行：${!plainLine.includes(t)}`).toBe(`${t} 不在原样那一行：true`)
+  })
+
+  it('用量那两行的标签,文档抄的就是代码产的', () => {
+    const kid = { ...rich(), id: 'root/01-a', childIds: [] as string[] }
+    const body = usageBody(rich(), (id: string) => (id === kid.id ? kid as TaskNode : undefined))
+    for (const label of ['本节点', '含 1 个子任务合计']) {
+      expect(body).toContain(label)
+    }
+    // README 用的是「含 3 个子任务合计」的示例,数字是变量,所以对稳定的两截。
+    expect(README).toContain(norm('本节点：'))
+    expect(README).toContain(norm('个子任务合计：'))
+  })
+
+  it('上游报错的排查表,每一行都对得上 upstreamAdvice 真正会说的话', () => {
+    // 这张表是用户拿着一个 502 来查的第一个地方。它和代码分家的话,人会照着一条
+    // 不存在的建议去改配置。
+    const cases: [number, string][] = [
+      [401, 'apiToken'], [403, 'apiToken'],
+      [404, 'apiUrl'], [405, 'apiUrl'],
+      [400, 'model'], [422, 'model'],
+      [429, 'caps.maxSeatsPerPhase'],
+      [502, '/responses'],
+    ]
+    for (const [status, key] of cases) {
+      const advice = upstreamAdvice({ status, protocol: 'openai-responses' })
+      expect(`${status} 的建议提到 ${key}：${advice.includes(key)}`).toBe(`${status} 的建议提到 ${key}：true`)
+      expect(`${status} 这一档在文档表里：${ROLES_DOC.includes(norm(key))}`).toBe(`${status} 这一档在文档表里：true`)
+    }
+    // 「200 但不是 SSE」那一档:文档写的和代码里的措辞是同一个。
+    expect(ROLES_DOC).toContain(norm('200 但不是 SSE'))
+    expect(upstreamAdvice({ status: 200, protocol: 'openai', notStreamed: true })).toContain('流式')
   })
 })

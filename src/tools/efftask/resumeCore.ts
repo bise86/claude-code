@@ -4,6 +4,7 @@ import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBindin
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
 import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
+import { sanitizeUsage } from './usage.js'
 
 // Exported because they ARE the post-condition: whatever this module hands back, every reader
 // downstream may assume is one of these. hostileDisk.test.ts asserts against them rather than
@@ -363,6 +364,12 @@ export function validateLoadedNodes(
       }
       n.phaseMs = clean as TaskNode['phaseMs']
     }
+    /**
+     * 用量:和 phaseMs 同一个道理,而且更容易看出错来 —— 它会被渲染成
+     * `NaN 次 · NaNk`,还会被子树合计一路传染到根节点那一行。盘上的 node.md 按设计
+     * 可以手工编辑,所以每个字段都当敌意输入过一遍。
+     */
+    if (n.usage !== undefined) n.usage = sanitizeUsage(n.usage)
     const pr = (n.phaseRoles ?? {}) as Record<string, unknown>
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>
     if (typeof n.title !== 'string' || n.title.length === 0) n.title = n.id

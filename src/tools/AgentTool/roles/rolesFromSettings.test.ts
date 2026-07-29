@@ -9,7 +9,9 @@ describe('parseRoles', () => {
     expect(out[0].agentDef.agentType).toBe('rev')
     expect(out[0].agentDef.whenToUse).toBe('review')
     expect(out[0].agentDef.execMode).toBe('api')
-    expect(out[0].agentDef.roleClientConfig).toEqual({ apiProtocol: 'openai', apiUrl: 'https://x/v1', apiToken: 'sk', backendModel: 'gpt-4o', thinkingDepth: 'high' })
+    // roleName 一起带下去:上游失败时那句话要点名是哪个员工 —— 一次 /et 可以有十几个
+    // 员工同时在说话,不点名的话「某个 openai 员工挂了」对手上有三个的人毫无用处。
+    expect(out[0].agentDef.roleClientConfig).toEqual({ apiProtocol: 'openai', apiUrl: 'https://x/v1', apiToken: 'sk', backendModel: 'gpt-4o', thinkingDepth: 'high', roleName: 'rev' })
   })
   it('parses a cli role keeping command/args/interactive', () => {
     const out = parseRoles([{ name: 'c', whenToUse: 'w', execMode: 'cli', command: 'adapter', args: ['--json'], interactive: true }], 'localSettings')
