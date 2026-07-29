@@ -195,7 +195,7 @@
   | 你写的 | anthropic | openai / openai-responses |
   |--------|-----------|---------------------------|
   | low / medium / high | 原样发 `output_config.effort` | 原样发 `reasoning_effort` / `reasoning.effort` |
-  | `xhigh` | **降成 high**（Anthropic 没有这一档） | 原样发 |
+  | `xhigh` | 原样发 | 原样发 |
   | `max` | 原样发（模型不支持 max 时 API 侧按 high 处理） | **译成 xhigh**（OpenAI 没有这一档） |
   | 整数 | ant-only 的 `effort_override` | **不发**（OpenAI 只收档位名） |
 
@@ -316,7 +316,7 @@
 **说明：**
 - `apiUrl` 填到 **`/v1` 为止**（比如 `https://api.openai.com/v1`）。路由 `/responses` 由这条桥自己接上去，你不要写进 `apiUrl`；`apiUrl` 自己带的路径前缀（网关常见的 `/openai/v1`）会被保留，不会被冲掉
 - `model` 要填**推理模型**（`gpt-5.1`、`o4-mini` 之类）。填 `gpt-4o` 这类非推理模型也能跑，只是不会有推理摘要——那样的话用 `openai` 协议更直接
-- `thinkingDepth` 在这条协议上落到 `reasoning.effort`。**`xhigh` 只有这条协议收得下**（Anthropic 没有这一档，会被降成 `high`）
+- `thinkingDepth` 在这条协议上落到 `reasoning.effort`。`xhigh` 和 `high` 两边协议都收得下；只有 `max` 是 Anthropic 独有的，在这条协议上会被译成 `xhigh`
 - **协议翻译**：子 Agent 发出的请求会自动从 Anthropic 格式转译为 Responses 格式，事件流也会自动转译回 Anthropic 流，所以主会话的 Message 流透明一致
 
 #### 从零配一个 openai-responses 员工
@@ -729,8 +729,8 @@ main()
 
 | 关口上写的 | 意思 | 怎么办 |
 |---|---|---|
-| `思考级别 xhigh：Anthropic 协议没有这一档，已按 high 发送` | `xhigh` 是 OpenAI 的档 | 想要 xhigh 就换 `apiProtocol: "openai-responses"` |
-| `思考级别 max：OpenAI 系协议没有这一档，已按 xhigh 发送` | `max` 是 Anthropic 的档 | 直接写 `xhigh` 更准确 |
+| `思考级别 max：OpenAI 系协议没有这一档，已按 xhigh 发送` | `max` 是 Anthropic 独有的档 | 直接写 `xhigh` 更准确 |
+| `思考级别 max：模型 X 不支持 max，实际会按 high 发送` | 这个 Claude 模型不在 max 名单里 | 换成支持的模型，或者写 `high` |
 | `思考级别 max：模型 X 不支持 effort 参数，本次不会发送思考级别` | 这个 Claude 模型不在 effort 支持名单里 | 换成支持的模型（如 `claude-opus-4-6`） |
 | `思考级别 120：OpenAI 系协议只收档位名…数字无效` | 数字档只有 Anthropic 收 | 写档位名 |
 | `thinkingDepth "deep" 无法识别，已忽略` | 拼错了 | 五个合法值：`low` / `medium` / `high` / `xhigh` / `max` |

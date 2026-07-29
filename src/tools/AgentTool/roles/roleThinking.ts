@@ -7,11 +7,13 @@ import { parseUserSpecifiedModel } from '../../../utils/model/model.js'
  * 为什么不直接用 `utils/effort.ts` 的 `EFFORT_LEVELS`:那个列表(low/medium/high/max)
  * 绑着 `/effort` 选择器、settings 的 zod schema、以及 `modelSupportsEffort` /
  * `modelSupportsMaxEffort` 的模型能力判定。为了员工多一个档位去改它,改动面远大于收益,
- * 而且会把 `xhigh` 泄进主循环的 UI —— 那一档是 OpenAI 的,Anthropic 的 API 收不了。
+ * 而且会把 `xhigh` 泄进主循环的 `/effort` 选择器 —— 那是另一个功能的取值范围。
  *
- * 两边的合法值本来就不是一个集合:
- *  - Anthropic 的 `output_config.effort`:low / medium / high / **max**
- *  - OpenAI 的 `reasoning_effort` / `reasoning.effort`:(none / minimal /) low / medium / high / **xhigh**
+ * 两边的合法值不完全一样:
+ *  - Anthropic 的 `output_config.effort`:low / medium / high / xhigh / **max**
+ *  - OpenAI 的 `reasoning_effort` / `reasoning.effort`:(none / minimal /) low / medium / high / xhigh
+ *
+ * 也就是说 `xhigh` **两边都收**,只有 `max` 是 Anthropic 独有的。
  *
  * 所以这一层的职责就一件事:**把用户写的那个词翻译成这个协议+这个模型真正收得下的值,
  * 翻不过去的时候说出来**,而不是静默丢掉。静默丢掉正是今天的行为 ——
@@ -81,10 +83,6 @@ export function resolveRoleThinking(args: {
     const named = resolved.length > 0 ? `模型 ${resolved} ` : ''
     if (!modelSupportsEffort(resolved)) {
       return { note: `思考级别 ${level}:${named}不支持 effort 参数,本次不会发送思考级别` }
-    }
-    if (level === 'xhigh') {
-      // Anthropic 没有这一档(BetaOutputConfig.effort 只收 low/medium/high/max)。
-      return { value: 'high', note: `思考级别 xhigh:Anthropic 协议没有这一档,已按 high 发送` }
     }
     if (level === 'max' && !modelSupportsMaxEffort(resolved)) {
       // resolveAppliedEffort 会把它降成 high,而屏幕上此前一句都没说。

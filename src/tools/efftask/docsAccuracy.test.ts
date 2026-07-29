@@ -327,11 +327,11 @@ describe('员工协议与思考级别', () => {
     }
   })
 
-  it('两条翻译规则,文档写的方向和代码一致', () => {
-    // xhigh 在 anthropic 上降成 high;max 在 OpenAI 两条协议上译成 xhigh。
+  it('翻译规则,文档写的方向和代码一致', () => {
+    // xhigh 两边都收;只有 max 是 Anthropic 独有的,OpenAI 侧译成 xhigh。
     const a = resolveRoleThinking({ level: 'xhigh', protocol: 'anthropic', model: 'claude-opus-4-6-x' })
-    expect(a.value).toBe('high')
-    expect(ROLES_DOC).toContain(norm('**降成 high**'))
+    expect(a.value).toBe('xhigh')
+    expect(ROLES_DOC).toContain(norm('| `xhigh` | 原样发 | 原样发 |'))
 
     const o = resolveRoleThinking({ level: 'max', protocol: 'openai-responses', model: 'gpt-5.1' })
     expect(o.value).toBe('xhigh')
@@ -385,9 +385,10 @@ describe('员工协议与思考级别', () => {
  * 而这张表存在的全部理由就是让他查得到。
  */
 describe('思考级别排查表和代码说同一句话', () => {
-  it('xhigh 在 anthropic 上被降级那句', () => {
-    const note = resolveRoleThinking({ level: 'xhigh', protocol: 'anthropic', model: 'claude-opus-4-6' }).note!
-    expect(ROLES_DOC).toContain(norm(note))
+  it('xhigh 在 anthropic 上不该有话说 —— 它是原样发的', () => {
+    // 排查表里如果还留着一句「已按 high 发送」,用户会照着它去换协议,而根本不用换。
+    expect(resolveRoleThinking({ level: 'xhigh', protocol: 'anthropic', model: 'claude-opus-4-6' }).note).toBeUndefined()
+    expect(ROLES_DOC).not.toContain(norm('思考级别 xhigh：Anthropic 协议没有这一档'))
   })
 
   it('max 在 OpenAI 系上被译成 xhigh 那句', () => {

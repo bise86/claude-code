@@ -258,7 +258,7 @@ bun --env-file=.env ./src/localRecoveryCli.ts
       "apiUrl": "https://api.openai.com/v1",
       "apiToken": "sk-proj-xxx",
       "model": "gpt-5.1",
-      "thinkingDepth": "xhigh"             // xhigh 只有 OpenAI 系协议收得下
+      "thinkingDepth": "xhigh"             // 五档:low/medium/high/xhigh/max
     }
   ],
 
@@ -597,7 +597,7 @@ bun --env-file=.env ./src/localRecoveryCli.ts
 `include: ['reasoning.encrypted_content']`，密文搭 thinking 块的签名往返），你不用配任何东西。
 
 **三种协议收得下的思考档位不一样**，写不进去的会被翻译，而且会在 `/et` 启动关口上说出来：
-`xhigh` 在 anthropic 上降成 `high`，`max` 在 OpenAI 两条协议上译成 `xhigh`，整数只有
+`xhigh` 两边协议都收；`max` 是 Anthropic 独有的，在 OpenAI 两条协议上译成 `xhigh`；整数只有
 anthropic 收。Anthropic 协议下模型不支持 effort 参数时（比如 `claude-3-5-sonnet-20241022`），
 这个值**整段不发**——关口上会写明。详见 `docs/roles-setup.md`。
 

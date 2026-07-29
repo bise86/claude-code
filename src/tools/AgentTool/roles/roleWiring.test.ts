@@ -97,9 +97,9 @@ describe('思考级别一路走到出网请求', () => {
 
   it('anthropic 协议下两个字段仍然一致 —— 一份判据两个调用点', () => {
     const out = parseRoles([api({ apiProtocol: 'anthropic', model: 'claude-opus-4-6-x', thinkingDepth: 'xhigh' })], 'probe-j')
-    // xhigh 在 Anthropic 侧没有,统一降成 high —— 两处不能各降各的。
-    expect(out[0].agentDef.effort).toBe('high')
-    expect(out[0].agentDef.roleClientConfig?.thinkingDepth).toBe('high')
+    // 两处都从 resolveRoleThinking 取值,所以永远不会一个发 xhigh 一个发别的。
+    expect(out[0].agentDef.effort).toBe('xhigh')
+    expect(out[0].agentDef.roleClientConfig?.thinkingDepth).toBe('xhigh')
   })
 })
 

@@ -22,6 +22,12 @@ describe('parseRoleThinking', () => {
     expect(parseRoleThinking('xhigh')).toBe('xhigh')
   })
 
+  it('xhigh 两边都收 —— 只有 max 是 Anthropic 独有的', () => {
+    expect(resolveRoleThinking({ level: 'xhigh', protocol: 'anthropic', model: CLAUDE }).value).toBe('xhigh')
+    expect(resolveRoleThinking({ level: 'xhigh', protocol: 'openai', model: 'gpt-5.1' }).value).toBe('xhigh')
+    expect(resolveRoleThinking({ level: 'max', protocol: 'openai', model: 'gpt-5.1' }).value).toBe('xhigh')
+  })
+
   it('数字和数字字符串都收', () => {
     expect(parseRoleThinking(80)).toBe(80)
     expect(parseRoleThinking('120')).toBe(120)
@@ -44,12 +50,12 @@ describe('anthropic 协议', () => {
     expect(at('low').note).toBeUndefined()
   })
 
-  it('xhigh → high,并且说出来', () => {
-    // Anthropic 的 BetaOutputConfig.effort 只收 low/medium/high/max,没有 xhigh。
+  it('xhigh 原样发,而且**不说废话** —— 没被翻译就没有 note', () => {
+    // 翻译层只在真的改了你写的东西时才出声。无条件出声的话,真正需要注意的那几条
+    // 会淹没在一片「已按 X 发送」里。
     const r = at('xhigh')
-    expect(r.value).toBe('high')
-    expect(r.note).toContain('xhigh')
-    expect(r.note).toContain('high')
+    expect(r.value).toBe('xhigh')
+    expect(r.note).toBeUndefined()
   })
 
   it('模型不支持 effort 时**整段不发**,而且这件事必须说出来', () => {
