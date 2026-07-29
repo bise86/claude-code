@@ -221,6 +221,16 @@
 
 ### 协议类型
 
+三选一,判据是**你的后端说哪种话**,以及**你要不要看到思考过程**:
+
+| `apiProtocol` | 打到哪个路由 | 什么时候选它 | 看得到思考吗 |
+|---|---|---|---|
+| `anthropic` | `{apiUrl}/v1/messages` | 后端是 Anthropic 官方或兼容 Anthropic 协议的网关(MiniMax、部分中转) | 看得到(原生 thinking 块) |
+| `openai` | `{apiUrl}/chat/completions` | 绝大多数「OpenAI 兼容」后端:DeepSeek、Kimi、GLM、通义、MiniMax、vLLM、SGLang、OpenRouter… | **看后端**:把推理放在 `reasoning_content` / `reasoning` 字段的能看到;OpenAI 官方的 chat/completions **不给**推理正文,所以真 OpenAI 走这条看不到 |
+| `openai-responses` | `{apiUrl}/responses` | 你要用 **OpenAI 官方的推理模型**(gpt-5.x、o 系)并且想看到它的思考 | 看得到(推理摘要) |
+
+一句话:**接第三方兼容后端用 `openai`;接 OpenAI 官方的推理模型用 `openai-responses`。**
+
 #### Anthropic 协议
 
 用于接入 Anthropic 官方 API 或兼容的第三方服务（如 MiniMax、OpenRouter 等）。
@@ -304,9 +314,69 @@
 ```
 
 **说明：**
-- `apiUrl` 通常以 `/v1` 结尾（即 OpenAI 的 `/v1/chat/completions` 端点基础 URL）
-- `model` 对应 OpenAI 模型如 `gpt-4o`、`gpt-4-turbo` 等
-- **协议翻译**：子 Agent 发出的请求会自动从 Anthropic 格式转译为 OpenAI 格式，响应也会自动转译回来，所以主会话的 Message 流透明一致
+- `apiUrl` 填到 **`/v1` 为止**（比如 `https://api.openai.com/v1`）。路由 `/responses` 由这条桥自己接上去，你不要写进 `apiUrl`；`apiUrl` 自己带的路径前缀（网关常见的 `/openai/v1`）会被保留，不会被冲掉
+- `model` 要填**推理模型**（`gpt-5.1`、`o4-mini` 之类）。填 `gpt-4o` 这类非推理模型也能跑，只是不会有推理摘要——那样的话用 `openai` 协议更直接
+- `thinkingDepth` 在这条协议上落到 `reasoning.effort`。**`xhigh` 只有这条协议收得下**（Anthropic 没有这一档，会被降成 `high`）
+- **协议翻译**：子 Agent 发出的请求会自动从 Anthropic 格式转译为 Responses 格式，事件流也会自动转译回 Anthropic 流，所以主会话的 Message 流透明一致
+
+#### 从零配一个 openai-responses 员工
+
+只写 `roles[]` 得到的是一个**没人派遣**的员工。要让它在 `/et` 里真的干活，还得把它绑到一个**任务角色**上——两步都做完才算配好。
+
+**第 1 步：声明员工（`roles[]`）**
+
+```jsonc
+{
+  "roles": [
+    {
+      "name": "gpt5-架构",              // 员工名，任意取；后面按这个名字引用
+      "whenToUse": "复杂架构设计与拆分合理性评审",
+      "execMode": "api",
+      "apiProtocol": "openai-responses",
+      "apiUrl": "https://api.openai.com/v1",
+      "apiToken": "sk-proj-xxx",
+      "model": "gpt-5.1",
+      "thinkingDepth": "xhigh"          // 见下面「思考级别」一节
+    }
+  ]
+}
+```
+
+**第 2 步：把它绑到一个环节上。** 两种写法,选一种即可(都写也行,会合并):
+
+```jsonc
+// 写法 A：在角色那侧点名员工（推荐，因为角色的产出/作用也在这儿写）
+{
+  "efftaskRoles": [
+    {
+      "name": "架构师",
+      "step": "质疑讨论",
+      "output": "通过/阻断裁决 + 每条阻断指向具体的边界问题",
+      "purpose": "质疑这份拆分：有没有漏项、子任务间有没有隐藏依赖",
+      "staff": ["gpt5-架构"]
+    }
+  ]
+}
+```
+
+```jsonc
+// 写法 B：在员工那侧声明「我能当哪些角色」（双向配置）
+{
+  "roles": [
+    { "name": "gpt5-架构", "...": "同上", "efftaskRoles": ["架构师"] }
+  ]
+}
+```
+
+**第 3 步：确认它真的生效了。** 跑一次 `/et <任意目标>`，启动关口上会列出名册：
+
+```
+名册:
+  架构师←gpt5-架构 (gpt-5.1)
+```
+
+括号里是**后端模型**（`gpt-5.1`），不是会话的 Claude 模型——看到这个就说明协议和模型都接上了。
+如果这一行写着「架构师←主模型」，说明员工没被载入或者没绑上；关口上「你的请求中有以下部分不会生效」那一块会写明原因。看完按 Esc 取消即可，不会真的跑起来。
 
 ### 工具确认与权限流
 
@@ -650,6 +720,32 @@ main()
 3. 检查角色名是否与内置 Agent 类型冲突（原因会显示在 `/et` 启动关口的「你的请求中有以下部分不会生效」那一块里（非交互 `--print` 模式下才走终端））
 4. 对于 API 角色，确认 `apiProtocol`、`apiUrl`、`apiToken`、`model` 都已配置
 5. 对于 CLI 角色，确认 `command` 字段已配置且可执行
+
+### 思考级别配了没生效
+
+**症状**：配了 `thinkingDepth`，但感觉模型没在深想；或者启动关口上出现一句「本次不会发送思考级别」。
+
+这**不是**静默失败——关口一定会说原因。对着下面这张表看它说的是哪一种：
+
+| 关口上写的 | 意思 | 怎么办 |
+|---|---|---|
+| `思考级别 xhigh：Anthropic 协议没有这一档，已按 high 发送` | `xhigh` 是 OpenAI 的档 | 想要 xhigh 就换 `apiProtocol: "openai-responses"` |
+| `思考级别 max：OpenAI 系协议没有这一档，已按 xhigh 发送` | `max` 是 Anthropic 的档 | 直接写 `xhigh` 更准确 |
+| `思考级别 max：模型 X 不支持 effort 参数，本次不会发送思考级别` | 这个 Claude 模型不在 effort 支持名单里 | 换成支持的模型（如 `claude-opus-4-6`） |
+| `思考级别 120：OpenAI 系协议只收档位名…数字无效` | 数字档只有 Anthropic 收 | 写档位名 |
+| `thinkingDepth "deep" 无法识别，已忽略` | 拼错了 | 五个合法值：`low` / `medium` / `high` / `xhigh` / `max` |
+
+模型名写**别名**（`opus`）也可以，判定前会先解析成全名。
+
+### Responses 协议报错
+
+**症状**：`apiProtocol: "openai-responses"` 的员工调用失败。
+
+**检查清单：**
+1. `apiUrl` 是不是多写了路由。要填到 `/v1` 为止，**不要**写成 `.../v1/responses`——那会拼成 `/v1/responses/responses`
+2. `model` 是不是这个账号有权限的推理模型。Responses API 对模型的可用性和 chat/completions 不完全一样
+3. 上游报 `function_call was provided without its required reasoning item`：这条桥已经在处理推理片段往返（`store: false` + `include: ['reasoning.encrypted_content']`，密文搭 thinking 块的签名回传），不需要你配置。真出现这个错说明中间有网关改写了请求体，或者对话历史被外部截断过
+4. 协议名少写一个字母（`openai-response`）会让**整条员工不被载入**——不是「这个字段不生效」。原因会显示在 `/et` 启动关口上，并列出三个合法值
 
 ### API 模式连接失败
 

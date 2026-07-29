@@ -120,3 +120,22 @@ describe('没配就什么都不发', () => {
     }
   })
 })
+
+describe('模型别名', () => {
+  it('别名先解析成全名再判能力 —— 否则 `opus` 会被判成不支持 effort', () => {
+    /**
+     * 这一层跑在**解析期**拿用户写的原始串,而 configureEffortParams 跑在**请求期**
+     * 拿 getAgentModel 解析过别名的全名。实测 modelSupportsEffort('opus') 是 false、
+     * ('claude-opus-4-6') 是 true —— 不解析的话关口会印一句假话,同时把档位静默丢掉。
+     */
+    const r = resolveRoleThinking({ level: 'high', protocol: 'anthropic', model: 'opus' })
+    expect(r.value).toBe('high')
+    expect(r.note).toBeUndefined()
+  })
+
+  it('模型名为空时不印一个空洞的「模型 ␣ 不支持」', () => {
+    // cli 角色可以不写 model。
+    const r = resolveRoleThinking({ level: 'high', protocol: 'anthropic', model: '' })
+    expect(r.note ?? '').not.toContain('模型  ')
+  })
+})

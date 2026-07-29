@@ -248,6 +248,17 @@ bun --env-file=.env ./src/localRecoveryCli.ts
       "model": "deepseek-chat",
       // 员工侧也能声明「我能当哪些角色」（双向配置）
       "efftaskRoles": ["测试官"]
+    },
+    {
+      // OpenAI 官方的推理模型：走 Responses 协议才看得到思考过程
+      "name": "gpt5-方案",
+      "whenToUse": "复杂方案设计",
+      "execMode": "api",
+      "apiProtocol": "openai-responses",   // → {apiUrl}/responses
+      "apiUrl": "https://api.openai.com/v1",
+      "apiToken": "sk-proj-xxx",
+      "model": "gpt-5.1",
+      "thinkingDepth": "xhigh"             // xhigh 只有 OpenAI 系协议收得下
     }
   ],
 

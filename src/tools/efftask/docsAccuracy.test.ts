@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
 import { redoOptions, redoUnavailableReason } from './redo'
-import { ROLE_API_PROTOCOLS } from '../../services/api/openaiCompat/protocols'
+import { ROLE_API_PROTOCOLS, TRANSLATING_PROTOCOLS } from '../../services/api/openaiCompat/protocols'
 import { toResponsesRequest } from '../../services/api/openaiCompat/toResponsesRequest'
 import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from '../AgentTool/roles/roleThinking'
 import { modelSupportsEffort } from '../../utils/effort'
@@ -373,6 +373,50 @@ describe('员工协议与思考级别', () => {
     for (const s of ['store: false', 'reasoning.encrypted_content', "summary: 'auto'"]) {
       expect(`README 或 roles-setup 提到 ${s}: ${README.includes(norm(s)) || ROLES_DOC.includes(norm(s))}`)
         .toBe(`README 或 roles-setup 提到 ${s}: true`)
+    }
+  })
+})
+
+/**
+ * 排查表里引用的那几句关口提示,必须**逐字**是代码会说的话。
+ *
+ * 这一节守的是一种很具体的假文档:排查指引让用户「对着关口上写的那句话查表」,
+ * 而表里的句子和代码里的字符串对不上 —— 于是他在表里找不到自己看到的那句,
+ * 而这张表存在的全部理由就是让他查得到。
+ */
+describe('思考级别排查表和代码说同一句话', () => {
+  it('xhigh 在 anthropic 上被降级那句', () => {
+    const note = resolveRoleThinking({ level: 'xhigh', protocol: 'anthropic', model: 'claude-opus-4-6' }).note!
+    expect(ROLES_DOC).toContain(norm(note))
+  })
+
+  it('max 在 OpenAI 系上被译成 xhigh 那句', () => {
+    const note = resolveRoleThinking({ level: 'max', protocol: 'openai-responses', model: 'gpt-5.1' }).note!
+    expect(ROLES_DOC).toContain(norm(note))
+  })
+
+  it('数字档那句(表里夹了省略号,所以对头一截)', () => {
+    const note = resolveRoleThinking({ level: 120, protocol: 'openai', model: 'gpt-5.1' }).note!
+    expect(ROLES_DOC).toContain(norm(note.slice(0, note.indexOf('('))))
+  })
+
+  it('模型不支持 effort 那句(模型名是变量,所以对稳定的那一截)', () => {
+    const note = resolveRoleThinking({ level: 'max', protocol: 'anthropic', model: 'claude-3-5-sonnet-20241022' }).note!
+    expect(note).toContain('不支持 effort 参数')
+    expect(ROLES_DOC).toContain(norm('不支持 effort 参数，本次不会发送思考级别'))
+  })
+
+  it('别名会先解析成全名再判能力 —— 文档承诺了这件事', () => {
+    // 不解析的话 `model: "opus"` 会得到一句「模型 opus 不支持 effort 参数」的假话,
+    // 同时把用户配的档位静默丢掉。
+    expect(resolveRoleThinking({ level: 'high', protocol: 'anthropic', model: 'opus' }).value).toBe('high')
+    expect(ROLES_DOC).toContain(norm('模型名写**别名**（`opus`）也可以，判定前会先解析成全名'))
+  })
+
+  it('三条协议的路由,文档写的和注册表一致', () => {
+    for (const [name, proto] of Object.entries(TRANSLATING_PROTOCOLS)) {
+      expect(`${name} 的路由 ${proto.route} 在文档里: ${ROLES_DOC.includes(norm(`{apiUrl}/${proto.route}`))}`)
+        .toBe(`${name} 的路由 ${proto.route} 在文档里: true`)
     }
   })
 })
