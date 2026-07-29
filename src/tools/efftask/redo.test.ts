@@ -34,6 +34,61 @@ const ok = (r: RedoPlan | { error: string }): RedoPlan => {
   return r
 }
 
+describe('任务重做要认被删子树的账', () => {
+  /**
+   * 用户按 `r` 的那一刻,正是他最想知道「我为这个错误付了多少」的时刻。而任务重做把整棵
+   * 子树从内存和盘上一起删掉,`runUsage` 逐个累加还活着的节点 —— 验收实测一次重做让表头
+   * 的总数当场掉了 83%,当着他的面倒退,而 README 写的是「重做不清零,钱花掉了就是花掉了」。
+   *
+   * 少报的**正好是被丢弃的那部分工作**,也就是他最该看见的那个数。
+   */
+  const u = (calls: number, input: number) => ({ calls, input, output: 0, cacheRead: 0, cacheWrite: 0 })
+  /** 每个节点都花过钱的那棵树。 */
+  function paid(): TaskNode[] {
+    const t = tree()
+    const byId = new Map(t.map(n => [n.id, n]))
+    byId.get('root')!.usage = u(4, 1000)
+    byId.get('a')!.usage = u(6, 2000)
+    byId.get('a1')!.usage = u(10, 5000)
+    byId.get('b')!.usage = u(3, 500)
+    return t
+  }
+  const runTotal = (nodes: TaskNode[]): number =>
+    nodes.reduce((n, x) => n + (x.usage?.calls ?? 0) + (x.discardedUsage?.calls ?? 0), 0)
+
+  it('删掉的子树记进重做目标的 discardedUsage,整趟合计不倒退', () => {
+    const before = paid()
+    expect(runTotal(before)).toBe(23)
+    const r = ok(planRedo(before, 'a', 'plan', 'T1'))
+    expect(r.deleted).toEqual(['a1'])
+    const after = r.nodes
+    const target = after.find(n => n.id === 'a')!
+    // a1 那 10 次调用记到了 a 头上,而不是凭空消失。
+    expect(target.discardedUsage?.calls).toBe(10)
+    expect(target.discardedUsage?.input).toBe(5000)
+    // 节点自己那一份**不清零** —— 钱是真花过的。
+    expect(target.usage?.calls).toBe(6)
+    expect(runTotal(after)).toBe(23)
+  })
+
+  it('阶段重做什么都不删,自然也不记 —— 两者代价差着数量级', () => {
+    const r = ok(planRedo(paid(), 'a1', 'execute', 'T1'))
+    expect(r.deleted).toEqual([])
+    expect(r.nodes.find(n => n.id === 'a1')!.discardedUsage).toBeUndefined()
+  })
+
+  it('重做两次,第二次把第一次的欠账一起往上带', () => {
+    // 不带的话,一棵被重做过的子树再被上层重做时,前一轮的账会在这一步丢掉。
+    const t = paid()
+    const byId = new Map(t.map(n => [n.id, n]))
+    byId.get('a')!.discardedUsage = u(7, 300)
+    const r = ok(planRedo(t, 'root', 'plan', 'T1'))
+    const target = r.nodes.find(n => n.id === 'root')!
+    // a 自己的 6 + a 已欠的 7 + a1 的 10 + b 的 3 = 26
+    expect(target.discardedUsage?.calls).toBe(26)
+  })
+})
+
 describe('redoOptions', () => {
   it('七个环节永远都在,不可用的带原因 —— 菜单不能忽隐忽现', () => {
     const t = tree()

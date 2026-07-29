@@ -1075,3 +1075,48 @@ describe('--resume 之后收敛方式不能变', () => {
     expect(config.caps.planConverge).toBeUndefined()
   })
 })
+
+describe('用量:盘上的垃圾值不许上屏', () => {
+  /**
+   * 变异测试发现:把 `sanitizeUsage(n.usage)` 整条删掉,全量 2400+ 条一条不红 ——
+   * `hostileDisk` 那份生成式扫描只保证「不抛」,而这一档的错法是**渲染出一个假数字**
+   * (`NaN 次调用 · NaNk tokens`、`-5 次调用`),不是抛异常。node.md 是可手工编辑的。
+   */
+  const load = (usage: unknown, discarded?: unknown): TaskNode =>
+    validateLoadedNodes([mk({ usage: usage as never, discardedUsage: discarded as never })], OPTS).nodes[0]!
+
+  it('NaN / 负数 / 字符串 / 数组 一律被清成 undefined', () => {
+    for (const bad of [
+      { calls: NaN, input: NaN },
+      { calls: -5, input: -1, output: -1, cacheRead: -1, cacheWrite: -1 },
+      { calls: 'many', input: '100' },
+      [1, 2, 3],
+      'nope',
+      42,
+    ]) {
+      expect(`${JSON.stringify(bad)} → ${JSON.stringify(load(bad).usage)}`)
+        .toBe(`${JSON.stringify(bad)} → undefined`)
+    }
+  })
+
+  it('部分合法的保留合法那部分,非法字段归零', () => {
+    expect(load({ calls: 3, input: NaN, output: 7 }).usage)
+      .toEqual({ calls: 3, input: 0, output: 7, cacheRead: 0, cacheWrite: 0 })
+  })
+
+  it('Infinity 不许穿过去 —— 四项相加会溢出,总量反而显示成 0', () => {
+    // `1e308` 通过了「有限且非负」,四项一加就是 Infinity,而 formatTokens(Infinity) 是 '0'
+    // —— 屏幕上于是印出「1e+308 次调用 · 0 tokens」,两个数互相打脸。
+    // Infinity 本身被 num() 当非法读成 0(而不是穿过去当一个天文数字)。
+    expect(load({ calls: Infinity, input: 1 }).usage?.calls).toBe(0)
+    const huge = load({ calls: 1e308, input: 1e308, output: 1e308, cacheRead: 1e308, cacheWrite: 1e308 }).usage!
+    expect(Number.isFinite(huge.calls + huge.input + huge.output + huge.cacheRead + huge.cacheWrite)).toBe(true)
+  })
+
+  it('discardedUsage 走同一道校验', () => {
+    expect(load(undefined, { calls: NaN }).discardedUsage).toBeUndefined()
+    expect(load(undefined, { calls: 9, input: 5 }).discardedUsage)
+      .toEqual({ calls: 9, input: 5, output: 0, cacheRead: 0, cacheWrite: 0 })
+  })
+})
+

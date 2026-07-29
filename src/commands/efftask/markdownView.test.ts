@@ -40,6 +40,64 @@ describe('markdownToAnsi', () => {
     expect(table[2]).toContain('bbbb')
   })
 
+  it('表格排得下才对齐,排不下退回原文 —— 而不是撑爆窗口', () => {
+    /**
+     * `formatToken` 的表格分支把每列补齐到自然宽度,**完全不看窗口**。验收实测:源文
+     * 46 列的表被撑到 115 列,100 列终端上 5 行变 8 行,续行行首没有 `|`,列全乱 ——
+     * 比不上 markdown 的时候更难看。
+     */
+    // 四行,而且列宽不齐 —— 对齐版一定比源文宽,这正是它排不下时的问题所在。
+    const tbl = '| 环节 | 谁 | 何时 |\n| --- | --- | --- |\n| 分析 | 架构评审员 | 一开始 |\n| 执行 | 执行者 | 方案过了之后 |'
+    const rawWidest = Math.max(...tbl.split('\n').map(l => stringWidth(l)))
+    const wide = markdownToAnsi(tbl, THEME, 200).map(plain)
+    const alignedWidest = Math.max(...wide.map(stringWidth))
+    // 宽松时用对齐版(它比源文宽,这正是它排不下时的问题所在)。
+    expect(alignedWidest).toBeGreaterThan(rawWidest)
+    // 紧张时退回源文 —— 逐字节等于原文,而且一定不比对齐版宽。
+    const narrow = markdownToAnsi(tbl, THEME, alignedWidest - 1).map(plain)
+    expect(narrow).toEqual(tbl.split('\n'))
+    expect(Math.max(...narrow.map(stringWidth))).toBeLessThan(alignedWidest)
+  })
+
+  it('任务清单的勾选标记不许被剥掉', () => {
+    // formatToken 不看 `list_item.task` / `.checked`:「已完成」和「未完成」渲染出来
+    // 一模一样,而且那一档一个转义都没发 —— 纯损失。而勾没勾上恰恰是读的人最想知道的。
+    const out = markdownToAnsi('- [x] 建表\n- [ ] 写接口', THEME, 100).map(plain)
+    expect(out).toEqual(['- [x] 建表', '- [ ] 写接口'])
+    // 普通列表不受影响,照常上色。
+    expect(markdownToAnsi('- 建表', THEME, 100).map(plain)).toEqual(['- 建表'])
+  })
+
+  it('`<...>` 里的内容一个字都不许被删掉 —— 这是个 TSX 仓库', () => {
+    /**
+     * `formatToken` 对 html token 是 `case 'html': return ''`。而 marked 把 `<Text …>`、
+     * `<Box … />`、`Array<Uint8Array>` 一律认成 HTML —— 评审用真渲染量到的原样是:
+     *
+     *     写的:把 ScrollPane 的 <Text> 换成 <Ansi dimColor>,保留 Map<string, TaskNode>。
+     *     屏幕:把 ScrollPane 的 换成 ,保留 Map。
+     *
+     * 这不是记号被吃掉,是**正文被删掉**,而且屏幕上看不出来。方案里写 `<Box>`、评审员
+     * 写「缺 `<Suspense>` 边界」是这个仓库的常态。
+     */
+    const cases = [
+      '把 ScrollPane 的 <Text> 换成 <Ansi dimColor>',
+      '参数 Array<Uint8Array> 要显式写出来',
+      '新增 <Box flexGrow={1} /> 占位',
+      '<div class="warn">块级的也一样</div>',
+    ]
+    for (const src of cases) {
+      expect(`${src} → ${markdownToAnsi(src, THEME, 200).map(plain).join('')}`).toBe(`${src} → ${src}`)
+    }
+    // 单行那条路径(子 agent 输出)同样。
+    expect(inlineMarkdown('把 <Text> 换成 <Ansi>', THEME)).toBe('把 <Text> 换成 <Ansi>')
+  })
+
+  it('关掉 HTML 之后,其余记号照常上色 —— 不是把 markdown 整个关了', () => {
+    const out = markdownToAnsi('## 标题\n\n**粗** 和 `码` 和 <Box>', THEME, 200)
+    expect(out.map(plain)).toEqual(['标题', '', '粗 和 码 和 <Box>'])
+    for (const l of out.filter(l => l.trim().length > 0)) expect(styled(l)).toBe(true)
+  })
+
   it('终端不支持颜色时**原样返回** —— 剥掉记号又不上色是纯粹的信息损失', () => {
     chalk.level = 0
     try {
@@ -47,6 +105,65 @@ describe('markdownToAnsi', () => {
     } finally {
       chalk.level = 3
     }
+  })
+
+  it('模型写的东西一行都不许凭空消失', () => {
+    /**
+     * `formatToken` 对 `def` / `del` / `html` 和一切未知 token **返回空串**
+     * (源码原话:「These token types are not rendered」)。在主对话流里无所谓,
+     * 在详情页不行 —— 实测这两行会整行没了,而模型确实会写 HTML 和注释。
+     * 一个残缺的视图看起来完完整整,正是这个仓库反复付学费的形状。
+     */
+    const body = '前面一句\n\n<div class="warn">这段话在 div 里</div>\n\n<!-- 这是注释 -->\n\n后面一句'
+    const out = markdownToAnsi(body, THEME).map(plain)
+    expect(out).toContain('<div class="warn">这段话在 div 里</div>')
+    expect(out).toContain('<!-- 这是注释 -->')
+    expect(out[0]).toBe('前面一句')
+    expect(out[out.length - 1]).toBe('后面一句')
+  })
+
+  it('代码块保住围栏,而且围栏是暗的 —— 不然代码和散文长得一模一样', () => {
+    // formatToken 的 code 分支在没有 highlight 实例时返回**裸的** token.text:
+    // 围栏没了、也没有任何样式。而这个功能的名字叫「更加好看美观」。
+    const out = markdownToAnsi('```ts\nconst a = 1\n```\n\n后面', THEME)
+    expect(out.map(plain)).toEqual(['```ts', 'const a = 1', '```', '', '后面'])
+    expect(styled(out[0]!)).toBe(true) // 围栏压暗
+    expect(styled(out[2]!)).toBe(true)
+    expect(styled(out[1]!)).toBe(false) // 代码正文原样 —— 压暗它会真的变难读
+  })
+
+  it('原文没有收尾围栏时**不补一个** —— 补了就是替模型宣称代码到此为止', () => {
+    const out = markdownToAnsi('未闭合:\n```ts\nconst a = 1', THEME).map(plain)
+    expect(out).toEqual(['未闭合:', '```ts', 'const a = 1'])
+  })
+
+  it('缩进式代码块(四个空格)没有围栏可保,原样交给 formatToken', () => {
+    const out = markdownToAnsi('    const a = 1', THEME).map(plain)
+    expect(out).toEqual(['const a = 1'])
+  })
+
+  it('同一段正文只解析一次 —— 详情页每一次按键都会重画', () => {
+    /**
+     * 实测:8 个 markdown 段落、每段 3000 字,一帧 39.7ms,不上 markdown 是 5.9ms。
+     * 而详情页不只每秒重画一次,**每一次按键也重画一次**(滚动、展开、换页卡)——
+     * 按住 j 滚动时那 40ms 是看得见的迟滞。加缓存之后是 5.0ms。
+     *
+     * 断言的是**同一个数组引用**:内容相等的断言在「每次都重新解析」的世界里照样绿。
+     */
+    const body = '## 标题\n\n正文 **粗**'
+    const a = markdownToAnsi(body, THEME)
+    expect(markdownToAnsi(body, THEME)).toBe(a)
+    // 主题进 key —— 两套主题不该互相看见对方的结果。
+    expect(markdownToAnsi(body, 'light')).not.toBe(a)
+    clearMarkdownCache()
+    expect(markdownToAnsi(body, THEME)).not.toBe(a)
+  })
+
+  it('超长正文不进缓存 —— execStatus 是逐轮追加的,每追加一轮 key 就变了', () => {
+    // 缓存它等于把同一份内容在内存里多留一整份,而它恰恰最不可能被反复命中。
+    const huge = '正文。'.repeat(20_000)
+    expect(huge.length).toBeGreaterThan(40_000)
+    expect(markdownToAnsi(huge, THEME)).not.toBe(markdownToAnsi(huge, THEME))
   })
 
   it('marked 抛了也不许把整屏带走 —— 它只负责好看', () => {
@@ -108,6 +225,19 @@ describe('inlineMarkdown(单行)', () => {
     expect(inlineMarkdown('`c`', 'dark')).not.toBe(inlineMarkdown('`c`', 'light'))
   })
 
+  it('渲染成 0 行或多行时都退回原文 —— 一行进必须一行出', () => {
+    /**
+     * 两类都真的存在,不是假想的防御:
+     *  - `<div>x</div>` / `<!-- c -->` 这类被 formatToken 渲染成空串(现在由 renderToken
+     *    的 raw 兜底接住,所以走的是「1 行」那条);
+     *  - **一个孤零零的围栏行**(模型的输出被按行拆开时天天出现)会被 marked 解析成一个
+     *    未闭合的代码块,展开成 3 行。不退回的话,日志窗里一行变三行,而上游按行算高度。
+     */
+    for (const src of ['```', '~~~', '<div>x</div>', '<!-- c -->', '[^1]: 脚注']) {
+      expect(`${src} → ${inlineMarkdown(src, THEME)}`).toBe(`${src} → ${src}`)
+    }
+  })
+
   it('空行不动', () => {
     expect(inlineMarkdown('', THEME)).toBe('')
   })
@@ -153,6 +283,37 @@ describe('详情页段落', () => {
     const body = lines.find(l => l.text.includes('先做'))!
     expect(body.ansi).toBeUndefined()
     expect(body.text).toContain('**A**')
+  })
+
+  it('整段的亮度**一致** —— 不许「这一行碰巧有转义就亮、没有就暗」', () => {
+    /**
+     * 逐行判是上一版的写法,验收在真帧里抓到了后果:同一个三项列表,带行内代码的那一行
+     * 正常亮度,不带的两行是暗的 —— 一段花斑。改之前整段统一暗,难看但**一致**;
+     * 逐行判之后变成花的,那比原来更糟。
+     */
+    const body = '先做 A\n带 `代码` 的一行\n再做 B'
+    const { lines } = render([{ title: '完整方案', body, md: true }])
+    const bodyLines = lines.filter(l => l.bold !== true)
+    expect(bodyLines.length).toBeGreaterThan(2)
+    // 全部同一档:要么整段 ansi、要么整段走旧渲染,不能一半一半。
+    expect(new Set(bodyLines.map(l => l.ansi === true)).size).toBe(1)
+    expect(new Set(bodyLines.map(l => l.dim === true)).size).toBe(1)
+  })
+
+  it('折叠预览里不留空行 —— 那几行是预览的一半篇幅', () => {
+    /**
+     * 验收实测:40 行终端上 6 行预览里 2 行是空的、1 行是「中间省略 N 行」,真有内容的
+     * 只剩 3 行 —— 一段「更加好看美观」的排版把预览的信息量砍掉了一半。
+     */
+    const body = '## 标题\n\n第一段\n\n第二段\n\n第三段\n\n第四段'
+    const collapsed = render([{ title: '完整方案', body, md: true }]).lines.filter(l => l.bold !== true)
+    for (const l of collapsed) expect(l.text.trim().length).toBeGreaterThan(0)
+    // 展开之后空行照留 —— 那时候有地方,而段落之间那一行正是「好看」的来源。
+    const opened = sectionLines({
+      sections: [{ title: '完整方案', body, md: true }],
+      cursor: -1, expanded: new Set(['完整方案']), width: 60, collapsedLines: 6, theme: THEME,
+    }).lines.filter(l => l.bold !== true)
+    expect(opened.some(l => l.text.trim().length === 0)).toBe(true)
   })
 
   it('上色之后每一行仍然只占一个终端行', () => {

@@ -180,8 +180,11 @@ describe('buildRoleFetch openai translate', () => {
     expect(msg).toContain('502')
     // 空体要明说是空的,不能留一段空白让人以为上游说了什么而我们没转达。
     expect(msg).toContain('(空)')
-    // 一条能动手的建议,而且指向具体的配置键。
-    expect(msg).toContain('apiProtocol')
+    // 一条能动手的建议,而且指向具体的配置键。空体 5xx 这一档给的是「先重试确认不是
+    // 瞬时的」+「查 apiUrl 的路径前缀」—— 不再断言「这个网关没有这条路由」(那种情况
+    // 通常回 404,评审用真 socket 戳穿了这条)。
+    expect(msg).toContain('重试')
+    expect(msg).toContain('apiUrl')
     // **一行**。这段字符串是塞进 JSON 字符串字段里被原样打印的,换行在那里是 `\n` 两个字符。
     expect(msg).not.toContain('\n')
   })

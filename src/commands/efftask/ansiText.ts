@@ -1,4 +1,24 @@
 import { stringWidth } from '../../ink/stringWidth.js'
+import { getGraphemeSegmenter } from '../../utils/intl.js'
+
+/**
+ * 按**字素簇**切,不是按码点。
+ *
+ * `stringWidth`(ink 布局用的同一个)量的是字素簇:`⚠️` 是「符号 + 变体选择符」两个码点、
+ * 宽度 1;`👨‍👩‍👧` 是五个码点、宽度 2。按码点走的循环会把它们**拆开**逐个量宽,于是
+ *  - 宽度算错 → 行按 N 列排版、实际渲染成 N+k 列 → ink 把它回流成两个终端行 →
+ *    「一条 ViewLine = 一个终端行」当场破:切片少画一行、滚动条指错位置,而**帧的总行数
+ *    一点没变**。评审用真渲染量到过:整整一段被挤出屏幕、「↓ 下面还有 13 行」那句话
+ *    被静默剪掉,而画面看起来完完整整 —— 正是 `detailLayout` 注释里记着的那次学费。
+ *  - 还会把 ZWJ 家族 emoji 从中间劈成两半。
+ *
+ * 用的是仓库自己那个 segmenter —— `stringWidth` 内部用的就是它。同源才不会再分叉。
+ */
+export function graphemes(s: string): string[] {
+  const out: string[] = []
+  for (const { segment } of getGraphemeSegmenter().segment(s)) out.push(segment)
+  return out
+}
 
 /**
  * 带 ANSI 转义的文本的**按显示宽度**折行 / 截断。
@@ -23,9 +43,62 @@ import { stringWidth } from '../../ink/stringWidth.js'
  * `\x1b[0m`、下一行行首把它们原样重放一遍。重放全序列而不是「解析出有哪些属性」是
  * 因为前者天然正确 —— 从干净状态按原顺序重放同一串 SGR,得到的就是同一个状态。
  *
- * 列表只在**一个源行内**增长(调用方按 `\n` 拆过了,而 chalk 对多行字符串本来就会
- * 逐行重开样式),所以不存在无限增长。
+ * 列表装的是**此刻还开着的**属性 —— 收尾码会把对应的开启码摘掉(见 applySgr),
+ * 所以它的长度只跟「同时开着几个属性」有关,和行有多长无关。
+ *
+ * 上一版是只进不出的,注释里写着「所以不存在无限增长」—— 那句话技术上成立(有界),
+ * 但界是 O(源行样式段数),总量 O(n²):评审实测 6720 字符的行折完之后是源文的 46 倍。
  */
+
+/**
+ * SGR 收尾码 → 它关掉的那些开启码。
+ *
+ * 重放列表原来是**只进不出**的:`\x1b[39m`(关前景色)、`\x1b[22m`(关粗体)这些
+ * chalk 的收尾码不是全量重置,于是被一路 push 进去、永不出栈。评审量到的后果:
+ * 一个 6720 字符的多样式长行折成 58 行,总字节 313KB(源文的 46 倍),第 13 行开头就
+ * 挂着 1221 字节的重放串 —— 而那一行可见内容只有 40 列。总量是 O(n²)。
+ *
+ * 做法:收尾码把它对应的开启码从列表里**摘掉**,然后连自己也不入列 —— 从行首的干净
+ * 状态重放时,一个没被开启的属性本来就是关着的,再补一句「关掉它」纯属冗余。
+ *
+ * 只认标准的那几组。认不出来的参数(比如某些终端的私有扩展)照旧入列,宁可长一点
+ * 也不要把样式弄丢。
+ */
+const SGR_CLOSERS: Record<number, (code: number) => boolean> = {
+  22: c => c === 1 || c === 2,
+  23: c => c === 3,
+  24: c => c === 4,
+  25: c => c === 5 || c === 6,
+  27: c => c === 7,
+  28: c => c === 8,
+  29: c => c === 9,
+  // 前景色:30-37 / 90-97 / 38(扩展色)。
+  39: c => (c >= 30 && c <= 38) || (c >= 90 && c <= 97),
+  // 背景色:40-47 / 100-107 / 48。
+  49: c => (c >= 40 && c <= 48) || (c >= 100 && c <= 107),
+}
+
+/** 一段 SGR 的首个数字参数。`\x1b[m` 省略参数,等价于 0。 */
+function sgrCode(seq: string): number {
+  const m = /^\x1b\[([0-9;]*)m$/.exec(seq)
+  if (!m) return Number.NaN
+  const first = (m[1] ?? '').split(';')[0] ?? ''
+  return first.length === 0 ? 0 : Number(first)
+}
+
+/**
+ * 把一段 SGR 并进重放列表。
+ *
+ * 返回新列表 —— 纯函数,好让它自己被单独测。
+ */
+export function applySgr(open: readonly { code: number; raw: string }[], seq: string): { code: number; raw: string }[] {
+  const code = sgrCode(seq)
+  if (!Number.isFinite(code)) return [...open, { code, raw: seq }]
+  if (code === 0) return []
+  const closes = SGR_CLOSERS[code]
+  if (closes) return open.filter(o => !closes(o.code))
+  return [...open, { code, raw: seq }]
+}
 
 /** 全量重置。断行时补在行尾,免得样式漏给右边的滚动条那一列。 */
 const RESET = '\x1b[0m'
@@ -62,7 +135,7 @@ export interface AnsiAtom {
  */
 export function ansiAtoms(s: string): AnsiAtom[] {
   const out: AnsiAtom[] = []
-  const chars = Array.from(s)
+  const chars = graphemes(s)
   for (let i = 0; i < chars.length; i++) {
     if (chars[i] !== '\x1b') {
       out.push({ text: chars[i]!, esc: false })
@@ -111,24 +184,26 @@ export function wrapAnsi(s: string, width: number): string[] {
   if (width <= 0) return [s]
   const atoms = ansiAtoms(s)
   const out: string[] = []
-  /** 本行内出现过的 SGR,按顺序。断行时原样重放到下一行开头。 */
-  let sgr: string[] = []
+  /**
+   * 此刻**还开着**的 SGR,按开启顺序。断行时原样重放到下一行开头。
+   *
+   * 是「还开着的」,不是「出现过的」—— 见 applySgr:收尾码会把对应的开启码摘掉,
+   * 否则列表只进不出,长行上的重放串会涨到源文的几十倍(实测 6720 字符 → 313KB)。
+   */
+  let sgr: { code: number; raw: string }[] = []
   let cur = ''
   let curW = 0
   let visible = false
   const flush = (): void => {
     // 行尾补重置:不补的话样式会漏给右边的滚动条那一列(它是同一个 Box 里的兄弟节点)。
     out.push(sgr.length > 0 ? cur + RESET : cur)
-    cur = sgr.join('')
+    cur = sgr.map(x => x.raw).join('')
     curW = 0
     visible = false
   }
   for (const a of atoms) {
     if (a.esc) {
-      if (a.sgr === true) {
-        if (a.reset === true) sgr = []
-        else sgr.push(a.text)
-      }
+      if (a.sgr === true) sgr = applySgr(sgr, a.text)
       cur += a.text
       continue
     }

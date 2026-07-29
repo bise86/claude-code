@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import {
   addUsage, createUsageMeter, EMPTY_USAGE, formatTokens, isEmptyUsage,
-  sanitizeUsage, subtreeUsage, totalTokens, usageBrief, type UsageNode,
+  sanitizeUsage, subtreeUsage, totalTokens, type UsageNode,
 } from './usage.js'
 import { createAssistantAPIErrorMessage, createAssistantMessage } from '../../utils/messages.js'
 import { makeRunAgentFn } from './runAgentAdapter.js'
@@ -167,13 +167,23 @@ describe('格式化', () => {
      */
     const u = { calls: 3, input: 1_000, output: 500, cacheRead: 120_000, cacheWrite: 8_000 }
     expect(totalTokens(u)).toBe(129_500)
-    expect(usageBrief(u)).toBe('3 次 · 129.5k')
+    expect(formatTokens(totalTokens(u))).toBe('129.5k')
   })
 
-  it('usageBrief 空用量返回空串 —— 由调用方决定画不画,而不是画一个 `0 次 · 0`', () => {
-    expect(usageBrief(undefined)).toBe('')
-    expect(usageBrief(EMPTY_USAGE)).toBe('')
-    expect(usageBrief({ calls: 12, input: 30_000, output: 4_500, cacheRead: 0, cacheWrite: 0 })).toBe('12 次 · 34.5k')
+  it('SYNTHETIC_MODEL 抄的那份字面量和源头一致', () => {
+    /**
+     * `usage.ts` **故意不 import** `utils/messages.js` —— 那个模块拖着大半个依赖图,而
+     * usage.ts 是 `types.ts` 和 `redo.ts` 的下游,引进来会给一批本来无关的模块造出一条
+     * 真实的运行期边(实测把整套测试跑成了顺序相关的)。
+     *
+     * 代价是抄了一份字面量,风险是「对面改了名字这里静默失效,每一条 provider 报错
+     * 开始被记成一次真实调用」。所以把依赖代价挪到**测试**里:运行期不引,测试期直接
+     * 拿真构造器造一条合成消息,看计量器认不认得出来。
+     */
+    const synthetic = createAssistantMessage({ content: '占位' })
+    const m = createUsageMeter()
+    m.observe(synthetic)
+    expect(m.totals().calls).toBe(0)
   })
 
   it('addUsage 对 undefined 两边都成立', () => {

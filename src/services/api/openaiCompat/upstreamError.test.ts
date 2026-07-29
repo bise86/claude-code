@@ -33,11 +33,49 @@ describe('upstreamAdvice', () => {
     }
   })
 
-  it('502 的建议要点名「这个网关可能没有这条路由」—— 那才是空体 502 的头号原因', () => {
-    const a = upstreamAdvice({ status: 502, protocol: 'openai-responses' })
-    expect(a).toContain('/responses')
-    // 而且要给出退路:多数第三方网关只实现了 chat/completions。
-    expect(a).toContain('openai')
+  it('空体 5xx 和带内容的 5xx 给的是**不同**的建议', () => {
+    /**
+     * 上一版这里断言的是「502 的建议要点名『这个网关没有这条路由』—— 那才是空体 502 的
+     * 头号原因」。**那句话是我编的**,评审用真 socket 戳穿了三处:
+     *  - 网关缺路由的标准返回是 **404**,而代码里就有 404 那一支 —— 两档讲同一个原因;
+     *  - 空体 502 在中转链路上真正常见的是「源站被 reset」和「首字节太慢被 CDN/LB 掐断」;
+     *  - 那句话还是**无条件印**的:上游明明回了一段 nginx 的 502 页面,我们还在讲空体。
+     */
+    const empty = upstreamAdvice({ status: 502, protocol: 'openai-responses', emptyBody: true })
+    const withBody = upstreamAdvice({ status: 502, protocol: 'openai-responses' })
+    expect(empty).not.toBe(withBody)
+    // 空体那一档:先说两个真常见的成因,并明说「没有这条路由通常回 404」而不是 502。
+    expect(empty).toContain('重试')
+    expect(empty).toContain('超时')
+    expect(empty).toContain('404')
+    // 有内容那一档:第一句就是「照上游自己的说法排查」——它比我们的猜测靠谱。
+    expect(withBody).toContain('它自己的说法')
+    // 两档都不许再断言「最常见的原因是没有这条路由」。
+    for (const a of [empty, withBody]) expect(a).not.toContain('最常见的原因是这个网关没有')
+  })
+
+  it('404 不再叫用户去做 joinRoute 已经自动做了的事', () => {
+    /**
+     * 老建议:「apiUrl 只写到 /v1 为止(别把 /responses 也写进去)」。而 `joinRoute` 现在
+     * 会自动剥 —— 用户照做改完再试,发出去的地址一个字符都不变、症状分毫不差,
+     * 然后他会认定这套建议不可信,后面几条也不再看。
+     */
+    const a = upstreamAdvice({ status: 404, protocol: 'openai-responses' })
+    expect(a).not.toContain('别把')
+    expect(a).toContain('自动归一')
+    // 404 真正的成因是**路径前缀**,而各家差得远。
+    expect(a).toContain('路径前缀')
+    expect(a).toContain('/openai/v1')
+  })
+
+  it('连不上是单独一档 —— 它以前压根走不到', () => {
+    // 异常直接穿过整个翻译层,用户拿到引擎的通用兜底「检查你的网络连接」,
+    // 而他的网络是好的。
+    const a = upstreamAdvice({ status: 0, protocol: 'openai', connectFailed: true })
+    expect(a).toContain('域名')
+    expect(a).toContain('代理')
+    // 不能退化成那条 `status >= 500` 的话 —— 请求根本没发出去,谈不上「上游出错了」。
+    expect(a).not.toContain('上游或它前面的网关自己出错')
   })
 
   it('两条协议各自建议**对方**,不是各自建议自己', () => {
@@ -45,6 +83,12 @@ describe('upstreamAdvice', () => {
     const chat = upstreamAdvice({ status: 404, protocol: 'openai' })
     expect(chat).toContain('/chat/completions')
     expect(chat).toContain('openai-responses')
+  })
+
+  it('每一档都给得出一句非空的话 —— 包括没列进表里的状态码', () => {
+    for (const status of [0, 200, 301, 418, 599]) {
+      expect(upstreamAdvice({ status, protocol: 'openai' }).length).toBeGreaterThan(10)
+    }
   })
 
   it('notStreamed 压过状态码 —— 200 却不是流,和 200 成功是两件完全不同的事', () => {

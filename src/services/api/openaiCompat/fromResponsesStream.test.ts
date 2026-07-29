@@ -35,7 +35,25 @@ describe('骨架', () => {
 
   it('usage 用的是 input_tokens/output_tokens,不是 chat 那套 prompt/completion', async () => {
     const es = await run([created, completed({ input_tokens: 11, output_tokens: 22 })])
-    expect(es.find(e => e.event === 'message_delta')!.data.usage).toEqual({ input_tokens: 11, output_tokens: 22 })
+    expect(es.find(e => e.event === 'message_delta')!.data.usage)
+      .toEqual({ input_tokens: 11, output_tokens: 22, cache_read_input_tokens: 0 })
+  })
+
+  it('命中缓存的那一段单列出来,并从 input 里减掉', async () => {
+    /**
+     * OpenAI 的 `input_tokens` **已经包含**缓存部分。不减的话总量没错,但详情页那句
+     * 「缓存 读 X」对 openai 系员工恒为 0 —— 而 README 明写着「缓存读写单列」,
+     * 一个高度复用上下文的运行里那便宜的一大截会被算成全价输入。
+     */
+    const es = await run([created, completed({ input_tokens: 1000, output_tokens: 20, input_tokens_details: { cached_tokens: 900 } })])
+    expect(es.find(e => e.event === 'message_delta')!.data.usage)
+      .toEqual({ input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 900 })
+  })
+
+  it('两个数不自洽时夹到 0,不出负数', async () => {
+    // 网关自己报的数不一定自洽,而负数会一路渲染成 `-800`。
+    const es = await run([created, completed({ input_tokens: 100, output_tokens: 5, input_tokens_details: { cached_tokens: 900 } })])
+    expect(es.find(e => e.event === 'message_delta')!.data.usage.input_tokens).toBe(0)
   })
 
   it('认不出来的事件一律忽略,不报错也不打断', async () => {

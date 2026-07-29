@@ -19,13 +19,33 @@
  * - **不算合成消息**:provider 报错、UI 占位那几条走的是 `SYNTHETIC_MODEL`,它们没有
  *   对应的上游请求。算进去的话「调用次数」会随着报错次数虚涨,而那正是用户想拿这个数
  *   去判断的东西。
- * - **只统计经过 `/et` 适配层的调用**。子 agent 自己再开的 Task、以及启动关口那次
- *   一次性的配置提取调用,都不经过这里 —— 这个数是下限,不是全账。
+ * - **只统计经过 `/et` 适配层的调用**,所以这个数是**下限**。漏在外面的:
+ *   - **子 agent 里的自动压缩**(`autoCompactIfNeeded`)。它对子 agent 不设防,而一次
+ *     压缩就是一次读满上下文窗口的完整调用;它的产出以 `UserMessage` 回到主循环,
+ *     **不是 assistant 消息**,这一层一条都看不见。执行档最容易把窗口撑满。
+ *   - 启动关口那次一次性的配置提取调用(1 次,量级可忽略)。
+ *   - 根方案起草失败时,那一趟的账随被丢弃的 root 对象一起没了。
+ *
+ *   **误差不是一个常数,而是随「有没有压缩过」阶跃的**:没压缩过的运行在 1% 以内;
+ *   压缩一次就多漏一个上下文窗口(200k 模型上约 150k~180k 输入),一趟总量 1~5M 的
+ *   运行里每压缩一次约多漏 3%~10%。
+ *
+ *   子 agent 自己再开 Task 也不走这条路,不过默认配置下 `ALL_AGENT_DISALLOWED_TOOLS`
+ *   把 Task 挡在子 agent 之外(只有 `USER_TYPE === 'ant'` 放行),所以它发生不了 ——
+ *   上一版把这一条列成主要漏算来源,那是错的。
  */
 
-// 合成消息的模型名从**源头**引,不在这里抄一份字面量:抄一份的话对面改了名字,
-// 这里不会报错,只会开始把每一条报错都记成一次真实调用。
-import { SYNTHETIC_MODEL } from '../../utils/messages.js'
+/**
+ * 合成消息的模型名。
+ *
+ * **本地常量,不 import `utils/messages.js`。** 那个模块拖着大半个仓库的依赖图,而这个
+ * 文件是 `types.ts`(几乎所有 efftask 模块都 import 它)和 `redo.ts` 的下游 —— 引进来
+ * 会给一批本来无关的模块造出一条真实的运行期边,实测把测试跑成了顺序相关的。
+ *
+ * 抄一份字面量的风险(对面改名后这里静默失效)由 `usage.test.ts` 里一条**直接比对源头**
+ * 的断言接住 —— 那条断言只在测试里付出依赖代价,不在运行期。
+ */
+const SYNTHETIC_MODEL = '<synthetic>'
 
 export interface UsageTotals {
   /** 模型调用次数(不同的 message.id 数)。 */
@@ -63,8 +83,13 @@ export function isEmptyUsage(u: UsageTotals | undefined): boolean {
 }
 
 /** 一个非负整数,拿不准就当 0。盘上的值是可以手工编辑的,NaN 会一路渲染成 `NaNk`。 */
+const MAX_TOKENS = 1e15
 function num(v: unknown): number {
-  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.trunc(v) : 0
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return 0
+  // 上界不是洁癖:`1e308` 通过了「有限且非负」,四项一相加就溢出成 Infinity,
+  // 而 `formatTokens(Infinity)` 返回 '0' —— 详情页于是印出「1e+308 次调用 · 0 tokens」,
+  // 两个数互相打脸。手工编辑 node.md 就能到这儿,而 sanitizeUsage 存在的理由正是这个。
+  return Math.min(MAX_TOKENS, Math.trunc(v))
 }
 
 /** 读回校验:盘上/上游来的任意值 → 一个合法的 UsageTotals;拿不准就 undefined。 */
@@ -169,6 +194,7 @@ export interface UsageNode {
   id: string
   childIds: readonly string[]
   usage?: UsageTotals
+  discardedUsage?: UsageTotals
 }
 
 /**
@@ -192,7 +218,9 @@ export function subtreeUsage(
   const walk = (n: UsageNode | undefined): UsageTotals => {
     if (!n || seen.has(n.id)) return EMPTY_USAGE
     seen.add(n.id)
-    let out = n.usage ?? EMPTY_USAGE
+    // 被重做删掉的那棵子树的账也算进来 —— 那些节点已经不在树上了,不认的话
+    // 合计会随着一次重做当场倒退。
+    let out = addUsage(n.usage, n.discardedUsage)
     for (const id of n.childIds ?? []) out = addUsage(out, walk(resolve(id)))
     return out
   }
@@ -209,12 +237,9 @@ export function formatTokens(n: number): string {
   if (!Number.isFinite(n) || n < 0) return '0'
   const v = Math.trunc(n)
   if (v < 1000) return String(v)
-  if (v < 1_000_000) return `${(v / 1000).toFixed(1)}k`
+  // 判据是**四舍五入之后**的分档:`999_999 / 1000 = 999.999`,toFixed(1) 进位成
+  // `1000.0k` —— 比 `1.0M` 还长一位,而这个函数存在的全部理由就是把串压短。
+  if (v < 999_950) return `${(v / 1000).toFixed(1)}k`
   return `${(v / 1_000_000).toFixed(1)}M`
 }
 
-/** 树上/表头那一行的极简形态:`12 次 · 34.5k`。空用量返回空串,由调用方决定画不画。 */
-export function usageBrief(u: UsageTotals | undefined): string {
-  if (isEmptyUsage(u)) return ''
-  return `${u!.calls} 次 · ${formatTokens(totalTokens(u))}`
-}

@@ -111,6 +111,8 @@ function richNode(): TaskNode {
   // 模型用量。和 phaseMs 同一类:一张从盘上读回来的纯数字表,而它会被渲染成
   // `NaN 次 · NaNk`,还会顺着 childIds 被子树合计一路传染到根节点那一行。
   n.usage = { calls: 12, input: 34_000, output: 5_600, cacheRead: 120_000, cacheWrite: 800 }
+  // 被任务重做删掉的那棵子树的账。和 usage 同一类的敌意输入面。
+  n.discardedUsage = { calls: 20, input: 60_000, output: 9_000, cacheRead: 0, cacheWrite: 0 }
   n.confirmedDraft = { children: [{ title: '甲', deps: [] }] }
   // 手工重做的一次性重入点。和 confirmedDraft 同类:一个持久化的标志选 step **内部**的
   // 入口,而 node.md 是可手工编辑的 —— 一个垃圾值决定节点从哪个环节重入。

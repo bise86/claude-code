@@ -26,7 +26,7 @@ export async function* responsesEventsToAnthropicEvents(
 ): AsyncGenerator<Evt> {
   const w = createBlockWriter(ctx)
   const calls = new Map<string, PendingCall>()
-  let usage = { input_tokens: 0, output_tokens: 0 }
+  let usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number } = { input_tokens: 0, output_tokens: 0 }
   /**
    * responses **没有 finish_reason**,所以 stop_reason 只能自己推:本轮发过 function_call
    * 就是 tool_use。漏了这条推导的后果是工具循环根本不跑 —— 模型请求了工具,而引擎
@@ -40,7 +40,21 @@ export async function* responsesEventsToAnthropicEvents(
   const readUsage = (u: any): void => {
     if (!u) return
     // responses 用 input_tokens/output_tokens,chat 用 prompt_tokens/completion_tokens。
-    usage = { input_tokens: u.input_tokens ?? 0, output_tokens: u.output_tokens ?? 0 }
+    /**
+     * 命中缓存的那一段要**单列出来**。
+     *
+     * OpenAI 的 `prompt_tokens` / `input_tokens` 本身**已经包含**缓存部分,所以不减掉的话
+     * 总量没错、但详情页那句「缓存 读 X」对 openai 系员工恒为 0 —— 而 README 明写着
+     * 「缓存读写单列」。一个高度复用上下文的运行,便宜的那一大截会被算成全价输入。
+     *
+     * 减完可能为负(网关自己报的两个数不自洽),夹到 0。
+     */
+    const cached = Math.max(0, u.input_tokens_details?.cached_tokens ?? 0)
+    usage = {
+      input_tokens: Math.max(0, (u.input_tokens ?? 0) - cached),
+      output_tokens: u.output_tokens ?? 0,
+      cache_read_input_tokens: cached,
+    }
   }
 
   for await (const f of frames) {

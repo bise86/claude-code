@@ -370,6 +370,7 @@ export function validateLoadedNodes(
      * 可以手工编辑,所以每个字段都当敌意输入过一遍。
      */
     if (n.usage !== undefined) n.usage = sanitizeUsage(n.usage)
+    if (n.discardedUsage !== undefined) n.discardedUsage = sanitizeUsage(n.discardedUsage)
     const pr = (n.phaseRoles ?? {}) as Record<string, unknown>
     n.phaseRoles = Object.fromEntries(PHASE_NAMES.map(p => [p, roleArray(pr[p])])) as Record<PhaseName, RoleBinding[]>
     if (typeof n.title !== 'string' || n.title.length === 0) n.title = n.id

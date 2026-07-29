@@ -25,10 +25,33 @@ function scrubAnthropicHeaders(headers: Headers): void {
   }
 }
 
-/** 上游失败 → 一条 anthropic 形状的错误响应。**状态码原样透传**,好让上层的重试策略照旧。 */
+/**
+ * 上游失败 → 一条 anthropic 形状的错误响应。**状态码原样透传**,好让上层的重试策略照旧。
+ *
+ * ## 为什么多一个**顶层** `message`
+ *
+ * 这一条是验收从真链路上量出来的,而它把整个「让报错说人话」的改动几乎清零。
+ *
+ * SDK 的 `APIError.makeMessage` 是这么写的(`@anthropic-ai/sdk/core/error.js`):
+ *
+ *     const msg = error?.message ? … : error ? JSON.stringify(error) : message
+ *
+ * 它读的是**顶层**的 `message`。anthropic 的线上形状里没有这个字段,于是它退到
+ * `JSON.stringify(整个 body)` —— 我们精心写的那一句被塞进一个 JSON 壳里:
+ *
+ *     API Error: 502 {"type":"error","error":{"type":"api_error","message":"员工「…
+ *
+ * 而详情页「阻断原因」默认只给 3 行预览(掐头留尾),用户看到的第一行是
+ * `API Error: 502 {"type":"error","error":{"type":"api_error","message":"员工「` ——
+ * **和他最初报障时贴的那一串前 66 个字符逐字相同**。
+ *
+ * 加上顶层 `message` 之后,同一条路径上出来的是 `API Error: 502 员工「…」…`,3 行预览
+ * 里就能读到真正的诊断。这一层不是 anthropic 的线上 API,而是我们自己的适配器,
+ * body 的唯一消费者就是 SDK —— 多一个字段是安全的。
+ */
 function failureResponse(status: number, message: string): Response {
   return new Response(
-    JSON.stringify({ type: 'error', error: { type: 'api_error', message } }),
+    JSON.stringify({ type: 'error', message, error: { type: 'api_error', message } }),
     { status, headers: { 'content-type': 'application/json' } },
   )
 }
@@ -85,9 +108,41 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
     headers.set('content-type', 'application/json')
     const anthropicBody = JSON.parse(init.body as string)
     const outBody = proto.buildBody(anthropicBody, cfg)
+    /**
+     * 流式请求就明说要 SSE。
+     *
+     * 原来原样透传 SDK 设的 `Accept: application/json` —— 做内容协商的严格网关看到它
+     * 完全有理由回一个非流式 JSON,而那正好会撞进下面「200 但不是 SSE」那条硬失败。
+     * 我们自己要什么,自己说清楚。
+     */
+    if ((outBody as { stream?: unknown } | null)?.stream === true) headers.set('accept', 'text/event-stream')
     // 拼好的地址要**留在手上**:它是诊断 502 的第一手材料,而此前它只存在于这一行表达式里。
     const dest = joinRoute(target.toString(), proto.route, PROTOCOL_ROUTES)
-    const res = await inner(dest, { ...init, method: 'POST', headers, body: JSON.stringify(outBody) })
+    const said = (status: number, statusText: string) =>
+      (returnStatus: number, body: string, extra?: { notStreamed?: true; connectFailed?: true; emptyStream?: true }): Response =>
+        failureResponse(returnStatus, upstreamFailureMessage({
+          roleName: cfg.roleName, protocol: cfg.apiProtocol, url: dest,
+          status, statusText, body, ...extra,
+        }))
+    let res: Response
+    try {
+      res = await inner(dest, { ...init, method: 'POST', headers, body: JSON.stringify(outBody) })
+    } catch (e) {
+      /**
+       * **连不上**:DNS 打错一个字母、网关宕了、TLS 证书不对、公司代理拦了出网。
+       *
+       * 这一支以前没有 catch,异常直接穿过整个翻译层 —— `upstreamFailureMessage` 一次
+       * 都不会被调用,用户拿到的是引擎的通用兜底「Unable to connect to API. Check your
+       * internet connection」:没有员工名、没有协议、没有 URL。而这几种恰恰是 502 之外
+       * 最可能的真因,他的网络是好的,于是他会去查网络。
+       *
+       * **中断要原样抛回去。** 用户按 Esc、或者阶段超时闸门开火,走的都是 abort;
+       * 把它翻译成一个 502 会让上层以为是 provider 挂了,而那是用户自己的决定。
+       */
+      const name = (e as { name?: unknown } | null)?.name
+      if (name === 'AbortError' || (init.signal as AbortSignal | undefined)?.aborted === true) throw e
+      return said(0, '')(502, e instanceof Error ? `${e.name}: ${e.message}` : String(e), { connectFailed: true })
+    }
     /**
      * **返回给上层的状态码**和**上游自己说的状态码**是两回事,不能共用一个数。
      *
@@ -95,15 +150,11 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      * 之后返回 502,正文写「502 但不是 SSE」就是在编,用户会拿着 502 去找网关日志,
      * 而网关那边记的是一次成功的 200。
      */
-    const fail = (returnStatus: number, body: string, notStreamed?: true): Response =>
-      failureResponse(returnStatus, upstreamFailureMessage({
-        roleName: cfg.roleName, protocol: cfg.apiProtocol, url: dest,
-        status: res.status, statusText: res.statusText, body, notStreamed,
-      }))
+    const fail = said(res.status, res.statusText)
     // 上游报错:状态码原样透传,好让上层的重试策略照旧。
     if (!res.ok) return fail(res.status, await res.text().catch(() => ''))
-    // 2xx 但根本没有 body —— 和「不是 SSE」是同一件事的极端形态,走同一条解释。
-    if (!res.body) return fail(502, '', true)
+    // 进程内的假 fetch 会给 `null` body;真 socket 永远不会(见下面 bytes === 0 那一条)。
+    if (!res.body) return fail(502, '', { notStreamed: true })
     /**
      * 200 但不是 SSE —— 单独一条路径,见 sniffSSE 的注释。
      *
@@ -111,7 +162,15 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      * 回答,而流水线把这个空回答当成这一席的真实产出继续往下走。
      */
     const sniff = await sniffSSE(res.body)
-    if (!sniff.isSSE) return fail(502, await drainText(sniff.stream), true)
+    /**
+     * **`bytes === 0` 要单独判**,不能指望 `!res.body`。
+     *
+     * 评审用真 socket 量过:空体 200、甚至 204,`res.body` 都**不是 null** —— 拿到的是
+     * 一个立刻 done 的流。也就是说上面那条 `!res.body` 在真实网络上是死代码,而
+     * 「上游 200 却一个字节都没给」正是它本来要挡的东西。
+     */
+    if (sniff.bytes === 0) return fail(502, '', { emptyStream: true })
+    if (!sniff.isSSE) return fail(502, await drainText(sniff.stream), { notStreamed: true })
     const events = proto.toAnthropicEvents(parseSSE(new Response(sniff.stream)), { anthropicModel: anthropicBody.model })
     return new Response(anthropicEventsToSSE(events), { status: 200, headers: { 'content-type': 'text/event-stream' } })
   }) as typeof fetch

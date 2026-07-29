@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'bun:test'
+import { createBlockWriter } from './blocks.js'
 import { openaiChunksToAnthropicEvents, reasoningTextOf, REASONING_FIELDS } from './fromOpenAIStream.js'
 
 async function collect(chunks: any[]) {
@@ -323,4 +324,49 @@ describe('openaiChunksToAnthropicEvents', () => {
     expect(Math.max(...textIdx)).toBeLessThan(toolIdx)
     expect(stops[stops.length - 1]).toBe(toolIdx)
   })
+})
+
+describe('兜底消息 id', () => {
+  it('兜底消息 id 每次都不同 —— 常量会把几十次调用记成一次', () => {
+    /**
+     * 这一条是提交里点名修掉的两条真 bug 之一,而评审的变异测试发现它**零测试守着**:
+     * 把 id 退回常量 `'msg_openai'`,全量 2457 条一条不红。
+     *
+     * 消息 id 是「这是第几次模型调用」的唯一凭据(见 `usage.ts` 的口径),常量的后果是
+     * 任何按 id 去重的统计都把一个节点里的几十次调用记成一次。
+     */
+    const ids = [0, 1, 2].map(() => {
+      const w = createBlockWriter({ anthropicModel: 'm' })
+      return [...w.startIfNeeded()][0]!.data.message.id as string
+    })
+    expect(new Set(ids).size).toBe(3)
+    // 上游给了 id 就用上游的,不去编。
+    const w = createBlockWriter({ anthropicModel: 'm' })
+    expect([...w.startIfNeeded('chatcmpl-abc')][0]!.data.message.id).toBe('chatcmpl-abc')
+  })
+
+})
+
+describe('usage 里的缓存段', () => {
+  it('chat 侧也把缓存那一段单列出来', async () => {
+    // 和 responses 侧同一条理由:`prompt_tokens` 已经包含缓存部分,不减就永远显示 0。
+    const out = await collect([
+      { id: 'x', choices: [{ delta: { role: 'assistant', content: 'hi' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+      { choices: [], usage: { prompt_tokens: 1000, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 900 } } },
+    ])
+    const d = out.find(e => e.event === 'message_delta')!.data.usage
+    expect(d).toEqual({ input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 900 })
+  })
+
+  it('上游不给 cached_tokens 时是 0,不是 undefined —— 下游要相加', async () => {
+    const out = await collect([
+      { id: 'x', choices: [{ delta: { role: 'assistant', content: 'hi' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+      { choices: [], usage: { prompt_tokens: 50, completion_tokens: 5 } },
+    ])
+    expect(out.find(e => e.event === 'message_delta')!.data.usage)
+      .toEqual({ input_tokens: 50, output_tokens: 5, cache_read_input_tokens: 0 })
+  })
+
 })

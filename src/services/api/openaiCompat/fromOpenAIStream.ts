@@ -94,7 +94,7 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
   /** 见过的 tool_call id → 它的键。用来认出「同一个 id 又来了」这一种方言。 */
   const byId = new Map<string, string>()
   let stopReason = 'end_turn'
-  let usage = { input_tokens: 0, output_tokens: 0 }
+  let usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number } = { input_tokens: 0, output_tokens: 0 }
   for await (const c of chunks) {
     if (c.error) {
       logError(new Error(`OpenAI-compat upstream error: ${c.error?.message ?? JSON.stringify(c.error)}`))
@@ -103,7 +103,23 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
       yield* w.error(c.error?.message ?? 'upstream error', c.id)
       return
     }
-    if (c.usage) usage = { input_tokens: c.usage.prompt_tokens ?? 0, output_tokens: c.usage.completion_tokens ?? 0 }
+    if (c.usage) {
+      /**
+       * 命中缓存的那一段要**单列出来**。
+       *
+       * OpenAI 的 `prompt_tokens` / `input_tokens` 本身**已经包含**缓存部分,所以不减掉的话
+       * 总量没错、但详情页那句「缓存 读 X」对 openai 系员工恒为 0 —— 而 README 明写着
+       * 「缓存读写单列」。一个高度复用上下文的运行,便宜的那一大截会被算成全价输入。
+       *
+       * 减完可能为负(网关自己报的两个数不自洽),夹到 0。
+       */
+      const cached = Math.max(0, c.usage.prompt_tokens_details?.cached_tokens ?? 0)
+      usage = {
+        input_tokens: Math.max(0, (c.usage.prompt_tokens ?? 0) - cached),
+        output_tokens: c.usage.completion_tokens ?? 0,
+        cache_read_input_tokens: cached,
+      }
+    }
     const choice = c.choices?.[0]; if (!choice && !c.usage) continue
     const delta = choice?.delta ?? {}
     // 显式带上 chunk 的 id —— message_start 的 id 取的是**第一条 chunk** 的 id,

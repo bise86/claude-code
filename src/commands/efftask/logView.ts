@@ -12,7 +12,7 @@ import { stringWidth } from '../../ink/stringWidth.js'
 import type { AgentEvent } from '../../tools/efftask/agentEvents.js'
 import { ofBriefOf, type StreamState } from '../../tools/efftask/agentStream.js'
 import { BLACK_CIRCLE, TEARDROP_ASTERISK } from '../../constants/figures.js'
-import { clipAnsi, hasAnsi, wrapAnsi } from './ansiText.js'
+import { clipAnsi, graphemes, hasAnsi, wrapAnsi } from './ansiText.js'
 import { inlineMarkdown, markdownLines } from './markdownView.js'
 import type { ThemeName } from '../../utils/theme.js'
 
@@ -88,8 +88,10 @@ export function wrapDisplayWidth(s: string, width: number): string[] {
   const out: string[] = []
   let cur = ''
   let curW = 0
-  // 按码点走,宽度按 stringWidth 累加。一个宽字符放不下就先断行,绝不把它劈成半个。
-  for (const ch of s) {
+  // 按**字素簇**走(不是码点),宽度按 stringWidth 累加 —— 两边同源。
+  // 按码点走会把 emoji 的变体选择符、ZWJ 家族拆开各算一次,行就排宽了,而 ink 会把它
+  // 回流成两个终端行:切片少画一行、滚动条指错位置,而帧的总行数一点没变。
+  for (const ch of graphemes(s)) {
     const w = stringWidth(ch)
     if (curW + w > width) {
       out.push(cur)
@@ -117,7 +119,8 @@ export function clipToWidth(s: string, width: number): string {
   if (stringWidth(s) <= width) return s
   let out = ''
   let w = 0
-  for (const ch of s) {
+  // 同上:字素簇,不是码点。
+  for (const ch of graphemes(s)) {
     const cw = stringWidth(ch)
     if (w + cw > width - 1) break
     out += ch
@@ -320,6 +323,29 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
       inverse: i === args.selected,
     })
 
+    /**
+     * 这一场是怎么失败的 —— **全文,不是一个红叉。**
+     *
+     * `s.error` 一直存着完整的失败原文(runAgentAdapter 的 `stream.end(failure)` 传下来的),
+     * 而全仓库唯一读它的地方是上面的 `statusOf`,那里只把它当一个**布尔量**用,
+     * 画成 `✗ 调用失败 · 12s`。于是「员工「甲」(openai-responses 协议)调用失败 · POST …」
+     * 这一整句在日志窗里一个字都不上屏 —— 验收实测,配置报错时 TUI 里没有任何一个地方
+     * 看得到它。
+     *
+     * 折叠态也画:跑完的流默认就是折叠的,而一条**失败**的流恰恰是人回头来查的那一条。
+     */
+    if (s.error) {
+      const prefix = `${GUTTER}${figures.cross} `
+      const cont = GUTTER + ' '.repeat(Math.max(0, stringWidth(prefix) - stringWidth(GUTTER)))
+      // 折叠时只留一行(窗口里可能有几十条流);展开时铺完整句。
+      const chunks = wrapDisplayWidth(s.error, Math.max(4, w - stringWidth(prefix)))
+      for (const [k, chunk] of (isFolded ? chunks.slice(0, 1) : chunks).entries()) {
+        out.push({ text: (k === 0 ? prefix : cont) + chunk, color: 'error', streamIndex: i })
+      }
+      if (isFolded && chunks.length > 1) {
+        out.push({ text: `${cont}…(空格展开看全)`, color: 'error', dim: true, streamIndex: i })
+      }
+    }
     if (isFolded) {
       const last = lastActivity(s)
       if (last) {
@@ -503,14 +529,22 @@ function bodyLines(
   width: number,
   maxLines: number,
   /** 给了就按 markdown 排版这一段。见 `SectionSpec.md`。 */
-  md?: { theme: ThemeName },
+  md?: { theme: ThemeName; collapsed: boolean },
 ): { lines: string[]; total: number } {
   // **按显示宽度折行,不是按码点。** 老的 block() 写死 `width = 100` 并按码点判断,
   // 于是 100 个汉字(=200 列)被判成「不用折」,交给 Text 默认的 wrap 回流成两三个终端行。
   // 实测同一份内容,中文比 ASCII 多出 24 行 —— 行预算是假的,而且 80 列和 100 列的终端
   // 算出来一模一样(列宽根本没参与)。
-  const wrapped = md
-    ? markdownLines(body, width, md.theme)
+  /**
+   * **折叠预览里把空行全部丢掉。**
+   *
+   * markdown 靠段落之间那一行空白好看,而折叠态一共只给 3~6 行:验收实测 40 行终端上
+   * 6 行预览里 2 行是空的、1 行是「中间省略 N 行」,真有内容的只剩 3 行 —— 一段「更加
+   * 好看美观」的排版把预览的信息量砍掉了一半。展开之后空行照留。
+   */
+  const rendered = md ? markdownLines(body, width, md.theme) : undefined
+  const wrapped = rendered
+    ? (md!.collapsed ? rendered.filter(l => l.trim().length > 0) : rendered)
     : body.split('\n').flatMap(l => wrapDisplayWidth(l, width))
   const total = wrapped.length
   const cap = Math.max(1, Math.floor(maxLines))
@@ -576,8 +610,19 @@ export function sectionLines(args: {
       sec.body.trim(),
       bodyWidth,
       isExpanded ? EXPANDED_MAX_LINES : (sec.maxLines ?? args.collapsedLines),
-      md ? { theme: args.theme! } : undefined,
+      md ? { theme: args.theme!, collapsed: !isExpanded } : undefined,
     )
+    /**
+     * 上不上 ANSI 是**整段一起定**的,不是逐行看「这一行碰巧有没有转义」。
+     *
+     * 逐行判是上一版的写法,验收在真帧里抓到了后果:同一个三项列表,带行内代码的那一行
+     * 正常亮度,不带的两行是暗的 —— 一段花斑。改之前整段统一暗,难看但**一致**;
+     * 逐行判之后变成花的,那比原来更糟。
+     *
+     * 判据是「这一段**产出过**转义」:`chalk.level === 0` 时 markdown 整条短路、一个转义
+     * 都不发,那时候整段退回旧渲染(带 dim),和这个功能不存在时逐字一样。
+     */
+    const styledSection = md && body.some(hasAnsi)
     const clipped = body.length < total
     const hint = isExpanded ? '(空格收起)' : clipped ? `(空格展开,共 ${total} 行)` : ''
     headers.push(lines.length)
@@ -588,16 +633,9 @@ export function sectionLines(args: {
       inverse: selected,
     })
     for (const l of body) {
-      /**
-       * 判据是**这一行真的有 ANSI**,不是「这一段声明了 md」。
-       *
-       * 两件事:
-       *  - markdown 行自己带颜色,不能再叠 dim —— 叠上去之后加粗的标题和正文一样暗,
-       *    这个改动就白做了;
-       *  - 而终端不支持颜色时(chalk.level === 0)`formatToken` 一个转义都不发,那一行
-       *    就该原样退回旧渲染(带 dim),而不是变成一个既没颜色、又丢了 dim 的怪东西。
-       */
-      lines.push(md && hasAnsi(l)
+      // markdown 行自己带颜色,不能再叠 dim —— 叠上去之后加粗的标题和正文一样暗,
+      // 这个改动就白做了。
+      lines.push(styledSection
         ? { text: `    ${l}`, ansi: true }
         : { text: `    ${l}`, color: sec.color, dim: sec.color === undefined })
     }

@@ -466,12 +466,12 @@ describe('README 的 markdown 与用量两节说的和代码干的是同一件�
   it('用量那两行的标签,文档抄的就是代码产的', () => {
     const kid = { ...rich(), id: 'root/01-a', childIds: [] as string[] }
     const body = usageBody(rich(), (id: string) => (id === kid.id ? kid as TaskNode : undefined))
-    for (const label of ['本节点', '含 1 个子任务合计']) {
+    for (const label of ['本节点', '含 1 个子任务(整棵子树)合计']) {
       expect(body).toContain(label)
     }
     // README 用的是「含 3 个子任务合计」的示例,数字是变量,所以对稳定的两截。
     expect(README).toContain(norm('本节点：'))
-    expect(README).toContain(norm('个子任务合计：'))
+    expect(README).toContain(norm('个子任务（整棵子树）合计：'))
   })
 
   it('上游报错的排查表,每一行都对得上 upstreamAdvice 真正会说的话', () => {
@@ -482,7 +482,8 @@ describe('README 的 markdown 与用量两节说的和代码干的是同一件�
       [404, 'apiUrl'], [405, 'apiUrl'],
       [400, 'model'], [422, 'model'],
       [429, 'caps.maxSeatsPerPhase'],
-      [502, '/responses'],
+      // 502 不再指向路由 —— 网关缺路由回的是 404,那句断言是编的(评审用真 socket 戳穿)。
+      [502, '重试'],
     ]
     for (const [status, key] of cases) {
       const advice = upstreamAdvice({ status, protocol: 'openai-responses' })
@@ -492,5 +493,17 @@ describe('README 的 markdown 与用量两节说的和代码干的是同一件�
     // 「200 但不是 SSE」那一档:文档写的和代码里的措辞是同一个。
     expect(ROLES_DOC).toContain(norm('200 但不是 SSE'))
     expect(upstreamAdvice({ status: 200, protocol: 'openai', notStreamed: true })).toContain('流式')
+    // 空体 5xx 和带内容的 5xx 在文档里是**两行**,因为代码给的是两句话。
+    expect(upstreamAdvice({ status: 502, protocol: 'openai', emptyBody: true }))
+      .not.toBe(upstreamAdvice({ status: 502, protocol: 'openai' }))
+    expect(ROLES_DOC).toContain(norm('`5xx` **带内容**'))
+    expect(ROLES_DOC).toContain(norm('`5xx` **空体**'))
+    // 连不上是单独一档,而且以前压根走不到。
+    expect(upstreamAdvice({ status: 0, protocol: 'openai', connectFailed: true })).toContain('代理')
+    expect(ROLES_DOC).toContain(norm('| **连不上** |'))
+    // 「一个字节都没返回」和「不是 SSE」给的是两句不同的话。
+    expect(upstreamAdvice({ status: 200, protocol: 'openai', emptyStream: true }))
+      .not.toBe(upstreamAdvice({ status: 200, protocol: 'openai', notStreamed: true }))
+    expect(ROLES_DOC).toContain(norm('200 但一个字节都没返回'))
   })
 })

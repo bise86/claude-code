@@ -68,43 +68,80 @@ export function joinRoute(base: string, route: string, knownRoutes: readonly str
 }
 
 /**
- * 这条 200 响应到底是不是 SSE —— **看第一口数据,不看 content-type**。
+ * SSE 帧的合法行首。协议规定一帧只能以这五种之一开头(`:` 是注释行,网关的 keepalive
+ * 保活最常用的就是它)。
+ */
+const SSE_TOKENS = ['data:', 'event:', 'id:', 'retry:', ':'] as const
+
+/**
+ * 最多为了下结论读多少字节 / 多少口。
+ *
+ * 上限的作用只有一个:一个不断发**零长度块**的上游会让下面这个循环永远转下去。
+ * 正常情况下最迟第 6 个字节就能下结论(最长的 token 是 `retry:`)。
+ */
+const SNIFF_MAX_BYTES = 64
+const SNIFF_MAX_READS = 32
+
+/**
+ * 这条 200 响应到底是不是 SSE —— **看开头那几个字节,不看 content-type**。
  *
  * 为什么不看头:第三方网关的 content-type 五花八门(`application/octet-stream`、
- * 漏设、带 charset),按头判会把正常的流误杀。而**第一帧长什么样**是 SSE 协议本身规定的:
- * 只能以 `data:` / `event:` / `id:` / `retry:` / `:`(注释)开头。
+ * 漏设、带 charset),按头判会把正常的流误杀。而**第一帧长什么样**是 SSE 协议本身规定的。
  *
  * 为什么非判不可:有一类网关在不支持 `stream` 时会**用 HTTP 200 返回一个 JSON 错误体**。
  * 那条路径上 parseSSE 一帧都解不出来 → 零事件 → 用户拿到的是一次「成功但完全空白」的
  * 回答,而流水线会把这个空回答当成这一席的真实产出往下走。报错反而是最轻的后果。
  *
- * 读走的第一口数据由本函数**原样接回**返回的流里,所以调用方拿到的仍是完整响应体。
+ * ## 为什么是「读到能下结论为止」,不是「读第一口就下结论」
+ *
+ * 这里的第一版是 `read()` 一次就判,**那是个真 bug,评审用真 socket 抓到的**:
+ * HTTP 分块的边界由上游和中间层决定,首块只有 1~4 个字节完全正常(逐字节 flush、
+ * TLS record 切分、代理重新分块)。而 `data:` 有 5 个字节 —— 于是
+ *
+ *     首块 1~4 字节 → 判成「不是 SSE」→ 一条完全正常的流被硬转成 502,
+ *     报错正文还会把它刚拒掉的那段 SSE 原样印出来,再让用户去换协议。
+ *
+ * 同一个 bug 的反面:首块正好是一个多字节字符的头一个字节时,`decode(…,{stream:true})`
+ * 返回空串,于是一段**不是** SSE 的正文被判成 SSE。
+ *
+ * 所以判据改成三分:**完整匹配 → 是**;**还是某个 token 的严格前缀(或仍为空)→ 继续读**;
+ * **两者都不是 → 不是**。
+ *
+ * 读走的数据由本函数**原样接回**返回的流里,所以调用方拿到的仍是完整响应体。
+ *
+ * @returns bytes 为止一共读到多少字节。**0 = 上游一个字节都没给** —— 调用方要把这一档
+ *          单独报出来:`res.body` 在真 socket 上**永远不是 null**(空体 200 也给一个
+ *          立刻 done 的流),所以「200 但完全空白」只能从这个数里看出来。
  */
 export async function sniffSSE(
   body: ReadableStream<Uint8Array>,
-): Promise<{ isSSE: boolean; head: string; stream: ReadableStream<Uint8Array> }> {
+): Promise<{ isSSE: boolean; head: string; bytes: number; stream: ReadableStream<Uint8Array> }> {
   const reader = body.getReader()
   const dec = new TextDecoder()
+  const buffered: Uint8Array[] = []
   let head = ''
-  let first: Uint8Array | undefined
-  // 空口(有些实现会先发一个 0 长度块)不算数据,继续读到真的有字节为止。
+  let bytes = 0
+  let isSSE = false
+  let reads = 0
   for (;;) {
+    if (reads++ >= SNIFF_MAX_READS || bytes >= SNIFF_MAX_BYTES) break
     const { done, value } = await reader.read()
     if (done) break
-    if (value && value.byteLength > 0) {
-      first = value
-      head = dec.decode(value, { stream: true })
-      break
-    }
+    if (!value || value.byteLength === 0) continue
+    buffered.push(value)
+    bytes += value.byteLength
+    head += dec.decode(value, { stream: true })
+    // 前导空白和 BOM 不参与判定 —— 有网关会先发一个 `\n` 或者带 BOM。
+    const probe = head.replace(/^[﻿\s]+/, '')
+    if (probe.length === 0) continue
+    if (SSE_TOKENS.some(t => probe.startsWith(t))) { isSSE = true; break }
+    // 还是某个 token 的严格前缀 → 证据不够,再读一口。
+    if (SSE_TOKENS.some(t => t.startsWith(probe))) continue
+    break
   }
-  const probe = head.replace(/^[﻿\s]+/, '')
-  const isSSE = probe.length === 0
-    // 一口数据都没有 = 空流。**判成 SSE**(交给 parseSSE 得到零事件),而不是判成
-    // 「非流式错误」—— 后者会把一个空 body 当成上游的错误原文报出去,那是编的。
-    || /^(data:|event:|id:|retry:|:)/.test(probe)
   const stream = new ReadableStream<Uint8Array>({
     start(c) {
-      if (first) c.enqueue(first)
+      for (const chunk of buffered) c.enqueue(chunk)
     },
     async pull(c) {
       const { done, value } = await reader.read()
@@ -115,7 +152,7 @@ export async function sniffSSE(
       void reader.cancel(reason)
     },
   })
-  return { isSSE, head, stream }
+  return { isSSE, head, bytes, stream }
 }
 
 /**

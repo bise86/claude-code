@@ -354,6 +354,17 @@ export interface TaskNode {
    * 整节点倾倒)。**重做不清零** —— 钱是真花掉了的。
    */
   usage?: UsageTotals
+  /**
+   * 被**任务重做**删掉的那棵子树一共花了多少 —— 记在重做目标身上。
+   *
+   * 不记的话表头那个总数会当着用户的面倒退(验收实测一次重做掉了 83%),而少报的正好是
+   * 被丢弃的那部分工作 —— 也正是他按下 `r` 的那一刻最想知道的数。节点跟着 commit()
+   * 落盘,`--resume` 白拿。
+   *
+   * 和 `usage` 分开而不是并进去:「这个节点自己花了多少」和「我为一次推倒重来付了多少」
+   * 是两个问题,合成一个数之后哪个都答不了。
+   */
+  discardedUsage?: UsageTotals
   // Separate budgets. `acceptance` belongs to an executable node's accept loop and
   // `integration` to a decompose node's integrate loop; sharing one counter means a
   // resumed node could arrive at integration with its budget already spent elsewhere.

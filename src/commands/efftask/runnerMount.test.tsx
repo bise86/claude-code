@@ -295,7 +295,14 @@ describe('重做关口:从 done 屏按 r 真的能画出来', () => {
     expect(`到了 done 屏: ${squash(tty.frames()).includes('r重做选中的任务')}`).toBe('到了 done 屏: true')
 
     tty.stdin.press('r')
-    await tick(20)
+    /**
+     * **轮询等它画出来,不要按一个固定的 20ms。**
+     *
+     * 固定等待在这个仓库里是顺序相关的:单跑这个文件永远够,和另外几十个测试文件同进程
+     * 跑时(定时器排队更长)就会在菜单渲染之前抓帧 —— 实测帧里确实有「任务重做」,只是
+     * 抓早了。上面那一句等 done 屏用的就是轮询,这里跟着来。
+     */
+    for (let i = 0; i < 80 && !squash(tty.frames()).includes('任务重做'); i++) await tick(10)
     const f = squash(tty.frames())
     app.unmount()
     expect(`按 r 之后渲染出错: ${crash.current?.message ?? 'no'}`).toBe('按 r 之后渲染出错: no')

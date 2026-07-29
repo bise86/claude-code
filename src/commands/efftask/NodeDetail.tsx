@@ -119,12 +119,23 @@ export function usageBody(n: TaskNode, resolveNode?: (id: string) => TaskNode | 
   }
   const rows: string[] = []
   if (!isEmptyUsage(own)) rows.push(line('本节点', own!))
-  if (n.childIds.length > 0) {
+  /**
+   * 被任务重做删掉的那棵子树花了多少 —— **单独一行**。
+   *
+   * 并进「本节点」会答不了任何一个问题:「这个节点自己花了多少」和「我为一次推倒重来
+   * 付了多少」是两件事。而不画的话,表头的总数里有一截无处解释。
+   */
+  if (!isEmptyUsage(n.discardedUsage)) rows.push(line('已废弃(重做删掉的子任务)', n.discardedUsage!))
+  // `?? []`:`subtreeUsage` 早就这么写了(作者显然想过),这里漏了 —— node.md 是可
+  // 手工编辑的,而一个渲染函数抛出去会把整屏带走。
+  if ((n.childIds ?? []).length > 0) {
     // resolveNode 缺席时**不画这一行**,而不是画一个等于自己的合计 —— 后者是一句假话:
     // 这个节点明明有子任务,数字却把它们全漏了,而屏幕上看不出漏了。
     if (resolveNode) {
       const all = subtreeUsage(n, resolveNode)
-      if (!isEmptyUsage(all)) rows.push(line(`含 ${n.childIds.length} 个子任务合计`, all))
+      // N 是**直接**子节点数,而合计覆盖**整棵子树**(含孙节点)。不写清楚的话
+      // 「含 3 个子任务合计 26 次」会被读成「这 3 个加起来 26 次」。
+      if (!isEmptyUsage(all)) rows.push(line(`含 ${(n.childIds ?? []).length} 个子任务(整棵子树)合计`, all))
     } else if (rows.length > 0) {
       rows.push(`(子任务用量本屏取不到)`)
     }

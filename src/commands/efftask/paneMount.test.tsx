@@ -179,10 +179,30 @@ describe('模型用量', () => {
       mk({ id: 'root/01-a', parentId: 'root', usage: use(9, 90) }),
     ]
     const byId = new Map(nodes.map(n => [n.id, n]))
-    // 折叠着的拆分节点,人想知道的正是「这一整块花了多少」。
-    expect(usageTag(nodes[0]!, byId)).toContain('10')
+    /**
+     * **逐字相等,不是 toContain。** 上一版写的是 `toContain('10')`,而算错时的输出
+     * 是 `⇅1/10` —— 它也含 '10',于是「算自己那一份」这个变异活了下来。
+     * 折叠着的拆分节点上,人想知道的正是「这一整块花了多少」。
+     */
+    expect(usageTag(nodes[0]!, byId)).toBe(' ⇅10/100')
+    expect(usageTag(nodes[1]!, byId)).toBe(' ⇅9/90')
     expect(usageTag(mk({ id: 'x' }), byId)).toBe('')
   })
+
+  it('被重做删掉的那部分,合计里**认账**', () => {
+    /**
+     * 任务重做把整棵子树从内存和盘上一起删掉,而 `runUsage` 逐个累加还活着的节点 ——
+     * 验收实测一次重做让表头的总数当场掉了 83%,而 README 写的是「重做不清零,钱花掉了
+     * 就是花掉了」。少报的正好是被丢弃的那部分工作,也正是他按下 `r` 那一刻最想知道的数。
+     */
+    const target = mk({ id: 'root', usage: use(4, 100), discardedUsage: use(20, 900) })
+    expect(runUsage([target]).calls).toBe(24)
+    expect(runUsage([target]).input).toBe(1000)
+    // 子树合计同样算 —— 树行上那个标记读的是它。
+    const byId = new Map([[target.id, target]])
+    expect(usageTag(target, byId)).toBe(' ⇅24/1.0k')
+  })
+
 })
 
 describe('窄终端上用量要给标题让路', () => {
@@ -195,8 +215,32 @@ describe('窄终端上用量要给标题让路', () => {
     // 窄的时候把这几列还给标题 —— 树行回答的第一个问题永远是「这是哪个任务」。
     expect(narrow).not.toContain('⇅12/')
     expect(narrow).toContain('一个相当长')
-    // 而表头那份整趟合计仍然在(它不和标题抢地方)。
-    expect(narrow).toContain('tokens')
+    /**
+     * **表头那一截同样让路。**
+     *
+     * 验收实测 46 列时带用量的表头是 2 行、不带是 1 行;而这个面板的高度预算把
+     * 「表头 1 行」当成前提 —— 多一行就把底部的图例和按键提示顶出屏幕。
+     */
+    expect(narrow).not.toContain('tokens')
+    // 宽的时候在。
+    expect(wide).toContain('tokens')
+  })
+
+  it('行末的用量标记不许被从右边啃掉 —— 那会显示一个**错的数字**', async () => {
+    /**
+     * `columns` 是终端宽度,而面板整个包在 `<Box borderStyle="round" paddingX={1}>` 里:
+     * 边框 2 + 内边距 2 = 少 4 列。拿裸 `columns` 去算,评审用真渲染量到 70 列时
+     * 屏幕上是 `⇅12/3…` —— 30.0k 被截成 3,而截断和「显示一个错数」是两回事。
+     */
+    const n = mk({ id: 'root', title: '一个相当长的中文任务标题需要占掉很多列', usage: use(12, 30_000) })
+    for (const columns of [70, 80, 100, 120]) {
+      const f = await mountTree({ nodes: [n] }, columns)
+      // 要么整段不画(让位给标题),要么**画全** —— 不许画半截。
+      const shown = f.includes('⇅12/30.0k')
+      const truncated = /⇅12\/3(?!0\.0k)/.test(f) || f.includes('⇅12/…')
+      expect(`${columns} 列被截了半截: ${truncated}`).toBe(`${columns} 列被截了半截: false`)
+      if (columns >= 80) expect(`${columns} 列画全了: ${shown}`).toBe(`${columns} 列画全了: true`)
+    }
   })
 
   it('让路的阈值比 clipToWidth 那个 6 列的兜底宽得多', () => {

@@ -1,4 +1,5 @@
 import { PHASE_LABEL, PHASE_NAMES, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
+import { addUsage } from './usage.js'
 
 /**
  * 重做 —— 把某个节点退回到某个环节重新跑一遍。
@@ -573,6 +574,19 @@ export function planRedo(
     for (const id of deleted) {
       const d = byId.get(id)
       if (d?.worktree) worktreesToRelease.push({ nodeId: id, branch: d.worktree.branch, path: d.worktree.path })
+      /**
+       * **被删子树的账要认。**
+       *
+       * 节点从内存和磁盘上一起消失,而 `runUsage` 是逐个累加还活着的节点 —— 验收实测
+       * 一次任务重做让表头那个总数当场掉了 83%,而 README 承诺的是「重做不清零,
+       * 钱花掉了就是花掉了」。数字当着用户的面倒退,而少报的**正好是被丢弃的那部分工作**
+       * —— 也正是他按下 `r` 的那一刻最想知道的数。
+       *
+       * 记在**重做目标**身上,而不是 run 级别的某个桶:节点跟着 `commit()` 一起落盘,
+       * `--resume` 白拿;而 run.md 那边要新开一个字段、一条读回校验、一条迁移。
+       */
+      if (d?.usage) target.discardedUsage = addUsage(target.discardedUsage, d.usage)
+      if (d?.discardedUsage) target.discardedUsage = addUsage(target.discardedUsage, d.discardedUsage)
       byId.delete(id)
     }
     if (mergedAway.length > 0) {

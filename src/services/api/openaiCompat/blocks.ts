@@ -1,7 +1,12 @@
 /** anthropic 流式协议里的一条事件。 */
 export type Evt = { event: string; data: any }
 
-export interface BlockUsage { input_tokens: number; output_tokens: number }
+export interface BlockUsage {
+  input_tokens: number
+  output_tokens: number
+  /** 命中缓存的输入。**不含在 input_tokens 里** —— 见两个翻译层的 readUsage。 */
+  cache_read_input_tokens?: number
+}
 
 /**
  * anthropic **内容块的开合记账**。

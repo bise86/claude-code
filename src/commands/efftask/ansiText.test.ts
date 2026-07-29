@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { ansiAtoms, clipAnsi, hasAnsi, stripAnsiAtoms, wrapAnsi } from './ansiText.js'
+import { ansiAtoms, applySgr, clipAnsi, hasAnsi, stripAnsiAtoms, wrapAnsi } from './ansiText.js'
 import { clipToWidth, wrapDisplayWidth } from './logView.js'
 import { stringWidth } from '../../ink/stringWidth.js'
 
@@ -97,6 +97,50 @@ describe('wrapAnsi', () => {
   it('单个宽字符比整行还宽时不死循环', () => {
     // width=1 而汉字宽 2:每行放一个字,而不是无限断空行。
     expect(wrapAnsi('一二', 1).map(stripAnsiAtoms)).toEqual(['一', '二'])
+  })
+})
+
+describe('SGR 重放列表只装**还开着的**', () => {
+  it('收尾码把对应的开启码摘掉,自己也不入列', () => {
+    // 从行首的干净状态重放时,一个没被开启的属性本来就是关着的,再补一句「关掉它」是冗余。
+    expect(applySgr([], `${ESC}[1m`).map(x => x.raw)).toEqual([`${ESC}[1m`])
+    expect(applySgr([{ code: 1, raw: `${ESC}[1m` }], `${ESC}[22m`)).toEqual([])
+    expect(applySgr([{ code: 31, raw: `${ESC}[31m` }], `${ESC}[39m`)).toEqual([])
+    expect(applySgr([{ code: 41, raw: `${ESC}[41m` }], `${ESC}[49m`)).toEqual([])
+    // 全量重置清空。
+    expect(applySgr([{ code: 1, raw: `${ESC}[1m` }], `${ESC}[0m`)).toEqual([])
+    // 认不出来的照旧入列 —— 宁可长一点也不要把样式弄丢。
+    expect(applySgr([], `${ESC}[73m`)).toHaveLength(1)
+  })
+
+  it('长多样式行的重放串是 O(n),不是 O(n²)', () => {
+    /**
+     * 原来是**只进不出**:chalk 的 `\x1b[22m` / `\x1b[39m` 不是全量重置,于是一路 push、
+     * 永不出栈。评审量到 6720 字符的行折成 58 行之后总字节 313KB(源文的 46 倍),
+     * 第 13 行开头就挂着 1221 字节的重放串,而那一行可见内容只有 40 列。
+     */
+    let src = ''
+    for (let i = 0; i < 240; i++) src += `${ESC}[1m重点${i}${ESC}[22m普通 ${ESC}[36mcode${i}${ESC}[39m `
+    const out = wrapAnsi(src, 40)
+    const total = out.reduce((n, l) => n + l.length, 0)
+    // 1.04x 实测;给一点余量,但离 46x 差着一个数量级。
+    expect(total / src.length).toBeLessThan(1.5)
+    /**
+     * **每一行开头的重放串都短。** 断在一段样式中间时它非空是对的(那一段确实还开着),
+     * 但它只该带着「此刻真开着的那几个」—— 而原来带的是「本行至今出现过的全部」,
+     * 于是越往后越长(实测第 13 行就 1221 字节)。
+     */
+    const heads = out.map(l => /^(?:\u001b\[[0-9;]*m)*/.exec(l)?.[0].length ?? 0)
+    expect(Math.max(...heads)).toBeLessThan(30)
+    // 而且可见内容一个字都没丢。
+    expect(out.map(stripAnsiAtoms).join('')).toBe(stripAnsiAtoms(src))
+  })
+
+  it('样式跨行仍然接得上 —— 省字节不能省掉正确性', () => {
+    // 一段**没有**闭合的粗体折成多行:每一段续行都得带着它。
+    const out = wrapAnsi(`${ESC}[1m` + 'a'.repeat(10), 3)
+    expect(out).toHaveLength(4)
+    for (const l of out.slice(1)) expect(l.startsWith(`${ESC}[1m`)).toBe(true)
   })
 })
 

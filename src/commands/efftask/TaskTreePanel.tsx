@@ -49,12 +49,23 @@ export function usageTag(n: TaskNode, byId: Map<string, TaskNode>): string {
  */
 export const MIN_TITLE_ROOM = 16
 
+/**
+ * 表头那份整趟合计至少要这么宽才画。
+ *
+ * 实测 46 列时带它的表头是 **2 行**、不带是 1 行;30 列时 3 行 vs 2 行。而这个文件自己的
+ * 注释把「表头 1 行」当成高度预算的前提。60 是「run id + 四个计数 + 并行占用」之后还
+ * 剩得下那一小截合计的宽度。
+ */
+export const HEADER_USAGE_MIN_COLUMNS = 60
+
 /** 整棵树的用量合计 —— 表头那一句「这一趟花了多少」。 */
 export function runUsage(nodes: readonly TaskNode[]): UsageTotals {
-  // 逐个节点把**自己那一份**加起来,而不是从根做子树合计:孤儿节点(父节点被重做删掉、
-  // 或者盘上结构半损)一样是真花过钱的,从根走会把它们整个漏掉。
+  // 逐个节点把**自己那一份**加起来,而不是从根做子树合计:盘上结构半损时会出现够不到
+  // 的孤儿节点,而它们一样是真花过钱的,从根走会把它们整个漏掉。
+  //
+  // (任务重做**不**留孤儿 —— 它连节点一起删,那部分的账记在重做目标的 discardedUsage 上。)
   let out = EMPTY_USAGE
-  for (const n of nodes) out = addUsage(out, n.usage)
+  for (const n of nodes) out = addUsage(addUsage(out, n.usage), n.discardedUsage)
   return out
 }
 
@@ -423,6 +434,18 @@ export function TaskTreePanel(props: {
   for (const n of props.nodes) counts[uiStatus(n.status)]++
   const mouse = currentMouseAvailability()
   const total = runUsage(props.nodes)
+  /**
+   * 树行**真正**能用多少列。
+   *
+   * `columns` 是终端宽度,而这个面板整个包在 `<Box borderStyle="round" paddingX={1}>`
+   * 里:左右边框各 1 列、左右内边距各 1 列,一共少 4 列。拿裸 `columns` 去算的后果
+   * 评审用真渲染量到了 —— 70 列时行末的用量标记被 truncate-end 从右边啃掉一半,
+   * 屏幕上显示的是 `⇅12/3…`:**一个错的数字**,而不是一个被截断的数字。
+   *
+   * (这 4 列的差在加用量标记之前就在,一直在啃 `elapsed`;新标记只是把它顶成了
+   * 「显示一个错数」这种更糟的形态。)
+   */
+  const rowWidth = Math.max(10, columns - 4)
   // 子树合计要按 id 找孩子。建一次给整屏用 —— 每行各建一个是 O(行 × 节点)。
   const byId = new Map(props.nodes.map(n => [n.id, n]))
 
@@ -441,7 +464,10 @@ export function TaskTreePanel(props: {
         {/* 这一趟一共花了多少。表头是唯一一个「不用挑节点就看得到全局」的位置,而
             「这次跑掉了多少钱」正是一个人在树上第一眼想确认的事。空的时候整段不画 ——
             还没有任何调用时印一个 `0 次 · 0` 只是噪音。 */}
-        {isEmptyUsage(total) ? null : (
+        {/* 窄终端上**整段不画**:表头是 wrap 的,多这一截会把它挤成两行,而
+            「面板高度 = 边框 2 + 表头 1 + height + 提示」是下面行预算的前提 ——
+            多一行就把底部的图例和按键提示顶出屏幕。行末那个标记已经有同样的让路规矩。 */}
+        {isEmptyUsage(total) || columns < HEADER_USAGE_MIN_COLUMNS ? null : (
           <Text dimColor>{'  '}⇅{total.calls} 次 · {formatTokens(totalTokens(total))} tokens</Text>
         )}
         {rows.length > view.slice.length ? <Text dimColor>{'  '}{idx + 1}/{rows.length}</Text> : null}
@@ -464,13 +490,13 @@ export function TaskTreePanel(props: {
          * 紧张时不给,和这个文件里鼠标提示的两级降级是同一条规矩。
          */
         const tag = usageTag(n, byId)
-        const roomWith = columns - (8 + depth * 2) - stringWidth(base + tag)
+        const roomWith = rowWidth - (8 + depth * 2) - stringWidth(base + tag)
         const usage = tag && roomWith >= MIN_TITLE_ROOM ? tag : ''
         const suffix = base + usage
         // stringWidth 而不是 .length:后缀里有中文(「待人工解冲突」7 个 UTF-16 单元、
         // 13 列),按 .length 算会少扣一半宽度,行照样溢出 —— truncate-end 就得替它兜,
         // 而从右边吃掉的正是状态和耗时。
-        const room = columns - (8 + depth * 2) - stringWidth(suffix)
+        const room = rowWidth - (8 + depth * 2) - stringWidth(suffix)
         const title = clipToWidth(n.title, Math.max(6, room))
         return (
           <Box
