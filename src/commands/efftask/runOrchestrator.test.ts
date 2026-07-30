@@ -4,6 +4,7 @@ import type { FsLike } from '../../tools/efftask/persistence.js'
 import { DEFAULT_CAPS, emptyPhaseRoles, type EffTaskConfig } from '../../tools/efftask/types.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import type { AppState } from '../../state/AppState.js'
+import { createRunControl } from '../../tools/efftask/control.js'
 import type { EffTaskTaskState } from '../../tasks/EffTaskTask/EffTaskTask.js'
 
 function memFs(): FsLike & { files: Map<string, string> } {
@@ -626,5 +627,52 @@ describe('异常路径上待收口状态同样要落盘', () => {
     )
     expect(config.pendingHandoff?.branch).toBe('b')
     expect(fs.files.get('/run/run.md') ?? '').toContain('pendingHandoff')
+  })
+})
+
+describe('运行中调过的并发度要落进 run.md', () => {
+  it('写出去的是**现在这个数**,不是关口批准的那个', async () => {
+    /**
+     * `--resume` 的并发上限是从 run.md 读回来的(readRunManifest → config.parallelism),
+     * 所以不同步的话「我把它从 5 调到 10」在下一次恢复时静默变回 5,而屏幕上从没说过这件事。
+     * run.md 同时也是事后唯一能回答「这一趟到底是按几并发跑的」的地方。
+     */
+    const fs = memFs()
+    const ac = new AbortController()
+    ac.abort() // 最短路径就够:这条接缝在 queueManifest 里,和跑不跑节点无关
+    const control = createRunControl()
+    control.setParallelism(11)
+    const config = cfg()
+    expect(config.parallelism).toBe(5)
+
+    await runOrchestrator(
+      {
+        config, runDir: '/run/007', fs, control,
+        runAgent: (async () => { throw new Error('模型不应被调用') }) as RunAgentFn,
+        signal: ac.signal,
+      },
+      () => {}, () => {}, () => {},
+    )
+
+    expect(fs.files.get('/run/007/run.md') ?? '').toContain('parallelism: 11')
+    // config 也被同步了 —— 关口之后这份快照就是「这一趟实际怎么跑的」。
+    expect(config.parallelism).toBe(11)
+  })
+
+  it('没调过时一个字都不改 —— 关口批准的那个数原样落盘', async () => {
+    const fs = memFs()
+    const ac = new AbortController()
+    ac.abort()
+    const config = cfg()
+    await runOrchestrator(
+      {
+        config, runDir: '/run/008', fs, control: createRunControl(),
+        runAgent: (async () => { throw new Error('模型不应被调用') }) as RunAgentFn,
+        signal: ac.signal,
+      },
+      () => {}, () => {}, () => {},
+    )
+    expect(fs.files.get('/run/008/run.md') ?? '').toContain('parallelism: 5')
+    expect(config.parallelism).toBe(5)
   })
 })

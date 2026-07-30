@@ -2,10 +2,11 @@ import * as React from 'react'
 
 import { Box, Text, useInput } from '../../ink.js'
 import {
-  planRedo, redoOptions, redoSummary,
+  guidanceScopeFor, planRedo, redoOptions, redoSummary,
   type RedoContext, type RedoEntry, type RedoScope,
 } from '../../tools/efftask/redo.js'
-import type { TaskNode } from '../../tools/efftask/types.js'
+import { MAX_GUIDANCE_CHARS, PHASE_LABEL, type PhaseName, type TaskNode } from '../../tools/efftask/types.js'
+import { LineInput } from './LineInput.js'
 import { useModalOrTerminalSize } from '../../context/modalContext.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { clipToWidth, wrapDisplayWidth } from './logView.js'
@@ -56,6 +57,14 @@ export type RedoGateState = {
   scope: RedoScope | null
   cursor: number
   picked: RedoEntry | null
+  /**
+   * 补提示词那一屏开着吗。
+   *
+   * 它是**确认屏的一个岔路**,不是第四级:`e` 进去写、写完回到确认屏(能看到自己写了什么)、
+   * 再按回车确认。做成一级的话,用户写完那句话会直接开跑 —— 而这一屏的全部意义是
+   * 「按下确认之前先看清后果」。
+   */
+  noting?: boolean
 }
 export type RedoGateAction =
   | { kind: 'cancel' }
@@ -72,6 +81,14 @@ export function redoGateAction(
 ): RedoGateAction {
   const k = input.toLowerCase()
   const phaseOpts = options.filter(o => o.scope === 'phase')
+  /**
+   * 补提示词那一屏的键盘**整个归 LineInput** —— 它自己有 Esc / 回车 / 退格 / 正文。
+   *
+   * 必须排在最前面。少了这一句,用户写「q 要改成小写」时那个 `q` 会被下面
+   * 「`q` = 取消」吃掉:整个关口关闭,他刚打的字全没了,而屏幕上没有任何解释。
+   * `y` 更糟 —— 确认屏那一支会把它当「确认」,当场开跑。
+   */
+  if (state.noting === true) return { kind: 'none' }
   // Esc 在三屏上**不是同一件事**,页脚也是这么写的。三屏走同一分支时「q 取消」是句假话:
   // 按下去只是退一级,想彻底退出得连按三次而屏幕没说。
   if (key.escape && state.picked !== null) {
@@ -83,6 +100,9 @@ export function redoGateAction(
   }
   if (key.escape || k === 'q') return { kind: 'cancel' }
   if (state.picked !== null) {
+    // `e` 进补提示词那一屏(用户原话:「重做失败的阶段,可以塞新的提示词给这个阶段」/
+    // 「重做整个子任务时,可以塞新的提示词给这个子任务」)。
+    if (k === 'e') return { kind: 'state', next: { ...state, noting: true } }
     return key.return || k === 'y' ? { kind: 'confirm', entry: state.picked } : { kind: 'none' }
   }
   const rows = state.scope === null ? SCOPE_ROWS.length : phaseOpts.length
@@ -280,7 +300,21 @@ export function ConfirmRedo(props: {
    * 默认配置下那句话就是假的。同一份 ctx 也会传给 planRedo,免得「屏幕禁用、planRedo 放行」。
    */
   phases?: RedoContext
-  onConfirm: (entry: RedoEntry) => void
+  /**
+   * 直接停在这个环节的**确认屏**上(跳过前两屏)。
+   *
+   * 「快速重做失败的那个环节」走它:失败点已经决定了要重做哪一条,两屏菜单是白走。
+   * 但**仍然要过确认屏** —— 失败在分析环节的拆分型节点,它的入口就是「任务重做」,
+   * 而那一条会删掉整棵子树。一个按下去就删的快捷键不该存在。
+   */
+  initialEntry?: RedoEntry
+  /**
+   * 确认之后回调,带上用户补的那句提示词(没写就是 undefined)。
+   *
+   * `scope` 由粒度决定:任务重做给整个节点(`'all'`),阶段重做只给那个环节 ——
+   * 用户的两句原话分别对应这两个去处。
+   */
+  onConfirm: (entry: RedoEntry, guidance?: { scope: PhaseName | 'all'; text: string }) => void
   onCancel: () => void
 }): React.ReactElement {
   const byId = React.useMemo(() => new Map(props.nodes.map(n => [n.id, n])), [props.nodes])
@@ -293,9 +327,17 @@ export function ConfirmRedo(props: {
   const taskOpt = React.useMemo(() => options.find(o => o.entry === 'plan'), [options])
   const term = useTerminalSize()
   const { rows, columns } = useModalOrTerminalSize(term)
-  const [scope, setScope, scopeRef] = useLiveState<RedoScope | null>(null)
+  // `initialEntry` 决定初始屏:给了就直接停在确认屏上(见它的注释)。粒度跟着它算 ——
+  // 摘要和补充指引的去处都按粒度分流,写死 'phase' 会让快速重做的任务重做把那句提示词
+  // 送错地方。
+  const [scope, setScope, scopeRef] = useLiveState<RedoScope | null>(
+    props.initialEntry === undefined ? null : props.initialEntry === 'plan' ? 'task' : 'phase',
+  )
   const [cursor, setCursor, cursorRef] = useLiveState(0)
-  const [picked, setPicked, pickedRef] = useLiveState<RedoEntry | null>(null)
+  const [picked, setPicked, pickedRef] = useLiveState<RedoEntry | null>(props.initialEntry ?? null)
+  const [noting, setNoting, notingRef] = useLiveState(false)
+  /** 用户补的那句提示词。空串 = 没补。 */
+  const [note, setNote, noteRef] = useLiveState('')
 
   // 预演。选中哪一条就算哪一条,所以第三屏的数字和前面的选择永远对得上。
   const preview = React.useMemo(() => {
@@ -305,19 +347,28 @@ export function ConfirmRedo(props: {
     return 'error' in r ? { error: r.error } : { plan: r }
   }, [picked, target, props.nodes, props.targetId, props.now, props.phases])
 
+  /** 这次补的提示词给谁 —— 任务重做给整个节点,阶段重做只给那个环节。 */
+  const guidanceScope = (entry: RedoEntry): PhaseName | 'all' =>
+    guidanceScopeFor(entry, scopeRef.current ?? 'phase')
+
   useInput((input, key) => {
     // 全部判定归 redoGateAction —— 这里只负责把结果落到 state / 回调上。
     const act = redoGateAction(
       key, input,
-      { scope: scopeRef.current, cursor: cursorRef.current, picked: pickedRef.current },
+      { scope: scopeRef.current, cursor: cursorRef.current, picked: pickedRef.current, noting: notingRef.current },
       options,
     )
     if (act.kind === 'cancel') { props.onCancel(); return }
-    if (act.kind === 'confirm') { props.onConfirm(act.entry); return }
+    if (act.kind === 'confirm') {
+      const t = noteRef.current.trim()
+      props.onConfirm(act.entry, t.length > 0 ? { scope: guidanceScope(act.entry), text: t } : undefined)
+      return
+    }
     if (act.kind === 'state') {
       if (act.next.scope !== scopeRef.current) setScope(act.next.scope)
       if (act.next.cursor !== cursorRef.current) setCursor(act.next.cursor)
       if (act.next.picked !== pickedRef.current) setPicked(act.next.picked)
+      if ((act.next.noting === true) !== notingRef.current) setNoting(act.next.noting === true)
     }
   })
 
@@ -337,6 +388,32 @@ export function ConfirmRedo(props: {
    * 留着是因为它挡的是「第三屏白屏」——一旦 preview 的依赖数组以后多一个来源,
    * 这半个条件就是唯一的防线。
    */
+  /**
+   * 补一句提示词那一屏。
+   *
+   * 用户的两句原话:「重做失败的阶段,可以塞新的提示词给这个阶段」、「重做整个子任务时,
+   * 可以塞新的提示词给这个子任务」。去处按粒度分,标题把它说出来 —— 同一个输入框写下的
+   * 一句话,进「这个环节的提示词」和进「这个节点每个环节的提示词」是两件事,
+   * 而用户是照着标题决定要不要写具体到某一步的。
+   */
+  if (picked !== null && noting) {
+    const scopeText = guidanceScopeFor(picked, scope ?? 'phase') === 'all'
+      ? `「${target.title}」的每一个环节`
+      : `「${target.title}」的「${PHASE_LABEL[picked]}」这一步`
+    return (
+      <LineInput
+        title={`补一句提示词给${scopeText}`}
+        hint={'它会被拼进该环节的提示词(裁决类环节也看得到,并被告知按补充后的意图判)。同一处再写一次是替换。'}
+        maxChars={MAX_GUIDANCE_CHARS}
+        footerNote="留空 = 不补充"
+        onSubmit={t => { setNote(t); setNoting(false) }}
+        // 取消**只关这一屏**,不取消整次重做 —— 用户可能只是改主意不补了。
+        // 已经写过的那句话保留:他按 e 再进来还能看到。
+        onCancel={() => setNoting(false)}
+      />
+    )
+  }
+
   if (picked !== null && preview) {
     return (
       <Box borderStyle="round" paddingX={1} flexDirection="column">
@@ -349,10 +426,19 @@ export function ConfirmRedo(props: {
                 ...(preview.plan.deleted.length > 0
                   ? [`被删的子任务: ${preview.plan.deleted.slice(0, 6).join(', ')}${preview.plan.deleted.length > 6 ? ` 等 ${preview.plan.deleted.length} 个` : ''}`]
                   : []),
+                /**
+                 * 补过的那句话要**印在这一屏上**。
+                 *
+                 * 它会真的进提示词,而这是用户按下确认之前最后一次核对自己写了什么的机会。
+                 * 只在页脚写一句「已补充」是半句话:他不知道自己有没有打错、打漏。
+                 */
+                ...(note.trim().length > 0
+                  ? [`补充指引(给${guidanceScopeFor(picked, scope ?? 'phase') === 'all' ? '整个任务' : `「${PHASE_LABEL[picked]}」`}): ${note.trim()}`]
+                  : []),
               ]}
               rows={rows} columns={columns}
             />}
-        <Text dimColor>回车 / y 确认 · Esc 返回重选 · q 取消</Text>
+        <Text dimColor>回车 / y 确认 · e {note.trim().length > 0 ? '改写补充指引' : '补一句提示词'} · Esc 返回重选 · q 取消</Text>
       </Box>
     )
   }

@@ -162,6 +162,79 @@ describe('三个干预键', () => {
     expect(f2).toContain('p 恢复')
   })
 
+  it('+ / - 调并发,一次一步,四种写法都认', async () => {
+    // `+` 要按 shift,而不按的那一下终端送来的是 `=`;`_` 是 shift+`-`。只收 `+`/`-` 的话
+    // 一半的按法是死键,而「按了没反应」在这个仓库是反复付过学费的那一类。
+    const s = spy()
+    const steps: number[] = []
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        runControl={{ ...s.ctl, onAdjustParallelism: d => steps.push(d) }}
+        onExitKey={() => {}}
+      />,
+    )
+    for (const k of ['+', '=', '-', '_']) { t.stdin.press(k); await tick() }
+    app.unmount()
+    expect(steps).toEqual([1, 1, -1, -1])
+    // 别的干预键一个都没被顺手触发。
+    expect(s.log).toEqual([])
+  })
+
+  it('按住 + 被合批成 `+++` 时**只走一步**', async () => {
+    /**
+     * 和 j/k 那条「按住多久滚多远」的规矩不同,是故意的:这个数字的每一步都会真的多派一个
+     * 带写工具的执行者出去,而终端把按住 300ms 合批成一个 `+++++++` 是常事 —— 那会把并发
+     * 从 1 直接推到 8,而用户以为自己只点了一下。
+     */
+    const s = spy()
+    const steps: number[] = []
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        runControl={{ ...s.ctl, onAdjustParallelism: d => steps.push(d) }}
+        onExitKey={() => {}}
+      />,
+    )
+    t.stdin.press('+++++'); await tick()
+    app.unmount()
+    expect(steps).toEqual([1])
+  })
+
+  it('没接 onAdjustParallelism 时 + / - 是死键,表头也不写 `+/-`', async () => {
+    // 一个按了没反应的 affordance 比没有更糟。这一屏(比如结束视图)根本没有并发度可调。
+    const s = spy()
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive runControl={s.ctl}
+        pool={() => ({ inUse: 1, limit: 5 })} onExitKey={() => {}}
+      />,
+    )
+    for (const k of ['+', '-']) { t.stdin.press(k); await tick() }
+    const f = t.lastFrame()
+    app.unmount()
+    expect(s.log).toEqual([])
+    expect(f).toContain('并行 1/5')
+    expect(f).not.toContain('+/-')
+  })
+
+  it('表头在并行占用旁边写 `+/-` —— 那是这个数字唯一露面的地方', async () => {
+    const s = spy()
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        runControl={{ ...s.ctl, onAdjustParallelism: () => {} }}
+        pool={() => ({ inUse: 2, limit: 7 })} onExitKey={() => {}}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    // 页脚那一行在 80 列上早就被截掉右半截了(带 runControl 时整行 123 列),把这个键塞进去
+    // 等于让它在最常见的宽度上看不见。
+    expect(f).toContain('并行 2/7')
+    expect(f).toContain('+/-')
+  })
+
   it('这三个键不影响原有的导航', async () => {
     const s = spy()
     const { t, app } = await mount(

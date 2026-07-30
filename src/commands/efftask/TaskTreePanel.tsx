@@ -58,6 +58,19 @@ export const MIN_TITLE_ROOM = 16
  */
 export const HEADER_USAGE_MIN_COLUMNS = 60
 
+/**
+ * 「`+/-` 可以调这个数」这句提示至少要这么宽才画。
+ *
+ * 它跟着 `并行 n/N` 走 —— 那是这个数字**唯一**露面的地方,而键位提示离它越近越好。
+ * 代价是表头会长 4 列,而表头一旦折成两行,`budgetedViewport` 那句「面板高度 = 边框 2 +
+ * 表头 1 + height + 提示」就不成立了,被顶出屏幕的正是底部的图例和按键提示。
+ *
+ * 比 `HEADER_USAGE_MIN_COLUMNS` 高 12,不是随手取的:60 那个数是「四个计数 + 并行占用
+ * 之后还塞得下用量合计」量出来的,已经贴着一行的边;这 4 列必须自己带余量,否则在 60~63
+ * 之间就会把表头挤成两行。`headerFitsOneLine` 那条测试按真渲染钉住了这个数。
+ */
+export const HEADER_HINT_MIN_COLUMNS = 72
+
 /** 整棵树的用量合计 —— 表头那一句「这一趟花了多少」。 */
 export function runUsage(nodes: readonly TaskNode[]): UsageTotals {
   // 逐个节点把**自己那一份**加起来,而不是从根做子树合计:盘上结构半损时会出现够不到
@@ -236,6 +249,16 @@ export function TaskTreePanel(props: {
    */
   onRedo?: (node: TaskNode) => void
   /**
+   * **快速**重做失败的那个环节(`R`)。给了才有这个键。
+   *
+   * 和 `onRedo` 分开而不是加一个参数:两者的粒度不同 —— `r` 是「我自己选」,`R` 是
+   * 「就那个失败的环节」。而它做不到时(节点没失败、失败点看不出来、失败在一个不能单独
+   * 重入的环节)必须**说出原因**,所以调用方拿到的是节点,由它去算并决定显示什么。
+   */
+  onRedoFailed?: (node: TaskNode) => void
+  /** 跳过失败的那个环节继续往下走(`s`)。给了才有这个键。 */
+  onSkipFailed?: (node: TaskNode) => void
+  /**
    * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
    * 活存储而不是 React state:事件流对每个在飞的节点每条消息都要触发一次,镜像进 state
@@ -264,6 +287,14 @@ export function TaskTreePanel(props: {
     onAddDirective: () => void
     /** 取消**光标选中**的那个节点。已经终结的节点不会走到这里(面板自己挡)。 */
     onCancelNode: (node: TaskNode) => void
+    /**
+     * 调并发上限,`d` 是步长(±1)。给了才有 `+` / `-` 两个键。
+     *
+     * 面板**不持有那个数**:唯一真相在 RunControl 里,而屏幕上显示的是编排器现读出来的
+     * `pool().limit`。面板自己记一份的话,夹取(1..64)和真实上限会在边界上分叉,
+     * 而表头和页脚会各说一个数。
+     */
+    onAdjustParallelism?: (d: number) => void
   }
 }): React.ReactElement {
   // Tick once a second so elapsed times keep moving even when no node transitions —
@@ -335,7 +366,13 @@ export function TaskTreePanel(props: {
     // "leave the panel" again.
     if (detail) {
       // 详情页是判断「这个节点到底哪儿错了」的地方 —— 看完就想重做,最不该逼用户先退回
-      // 树上再按一次 r。
+      // 树上再按一次 r。快速重做和跳过同理,而且更是:详情页正是他刚看完阻断原因的地方。
+      //
+      // **`R` 要排在 `r` 之前**,而且判的是 `input` 原文不是 `k`:下面那一句用的是
+      // `k === 'r'`(已经 toLowerCase 过),所以 Shift+R 会先被它吃掉 —— 用户按 R
+      // 拿到的是「自己选环节」那个三屏菜单,而快速重做这个键彻底消失。
+      if (input === 'R' && props.onRedoFailed) { setDetailId(null); props.onRedoFailed(detail); return }
+      if (k === 's' && props.onSkipFailed) { setDetailId(null); props.onSkipFailed(detail); return }
       if (k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
       // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
       // Esc / q 任何时候都是返回 —— 返回这条路不许有死角。
@@ -347,6 +384,9 @@ export function TaskTreePanel(props: {
     if (rows.length === 0) return
     // 重做。放在方向键**之前**,因为它不依赖 rows 之外的任何东西,而且放后面会被
     // 下面那些 `return` 挡掉一半路径。
+    // `R`(快速重做失败环节)排在 `r` 前面,理由见详情页那一支:`k` 已经小写过了。
+    if (input === 'R' && props.onRedoFailed && current) { props.onRedoFailed(current); return }
+    if (k === 's' && props.onSkipFailed && current) { props.onSkipFailed(current); return }
     if (k === 'r' && props.onRedo && current) { props.onRedo(current); return }
     // 运行中的人工干预。同样放在方向键之前,同样的理由。
     if (props.runControl) {
@@ -356,6 +396,16 @@ export function TaskTreePanel(props: {
       if (act === 'cancelNode') {
         // 终态节点没什么可取消的。不挡的话会给一个「已取消」的错觉,而它早就跑完了。
         if (current && !isTerminal(current.status)) props.runControl.onCancelNode(current)
+        return
+      }
+      // 没接这两个键时**不吞掉它们** —— 落下去也没有别的处理者,但吞掉等于把
+      // 「这个键在这一屏没有意义」变成「这个键坏了」,而两者在排查时差别很大。
+      if (act === 'raiseParallelism' && props.runControl.onAdjustParallelism) {
+        props.runControl.onAdjustParallelism(1)
+        return
+      }
+      if (act === 'lowerParallelism' && props.runControl.onAdjustParallelism) {
+        props.runControl.onAdjustParallelism(-1)
         return
       }
     }
@@ -392,6 +442,9 @@ export function TaskTreePanel(props: {
     return (
       <NodeDetail
         canRedo={props.onRedo !== undefined}
+        // 同一条规矩:只在这个节点真的失败了时才写这两个键(见页脚那一行的注释)。
+        canRedoFailed={props.onRedoFailed !== undefined && detail.status === 'BLOCKED'}
+        canSkipFailed={props.onSkipFailed !== undefined && detail.status === 'BLOCKED'}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
         maxRows={detailRows}
@@ -446,6 +499,11 @@ export function TaskTreePanel(props: {
    * 「显示一个错数」这种更糟的形态。)
    */
   const rowWidth = Math.max(10, columns - 4)
+  /** 光标停在失败节点上时才写这两个键 —— 理由在页脚那一行的注释里。 */
+  const onFailedNode = current?.status === 'BLOCKED'
+  const failedKeysHint =
+    (onFailedNode && props.onRedoFailed ? ' · R 重做失败环节' : '') +
+    (onFailedNode && props.onSkipFailed ? ' · s 跳过它' : '')
   // 子树合计要按 id 找孩子。建一次给整屏用 —— 每行各建一个是 O(行 × 节点)。
   const byId = new Map(props.nodes.map(n => [n.id, n]))
 
@@ -458,6 +516,12 @@ export function TaskTreePanel(props: {
         {/* 并行占用 n/N (spec §10.1). The POOL's occupancy, which includes the reviewers a
             roundtable is running — that is the number the confirmation gate capped. */}
         {props.pool ? <Text dimColor>{'  '}并行 {props.pool().inUse}/{props.pool().limit}</Text> : null}
+        {/* 「这个数能调」写在这个数**旁边**。页脚那一行在 80 列上早就被截掉右半截了
+            (实测带 runControl 时整行 123 列),把一个新键塞进去等于让它在最常见的宽度上
+            看不见;而这里紧挨着它要改的那个数字,4 列就够。 */}
+        {props.pool && props.runControl?.onAdjustParallelism && columns >= HEADER_HINT_MIN_COLUMNS
+          ? <Text dimColor>{' '}+/-</Text>
+          : null}
         {props.serialExecute === true
           ? <Text color="warning">{'  '}执行串行(无隔离工作区)</Text>
           : null}
@@ -553,7 +617,17 @@ export function TaskTreePanel(props: {
              *     换掉「怎么退出去」。
              * 「为什么点不了」由详情页页签条右侧那个专门的位置来说,那里有地方。
              */
-            : `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定    ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · ${detailEntryHint(mouse)}${props.onRedo ? ' · r 重做' : ''} · Esc/q 退出`}
+            /**
+             * `R` / `s` **只在光标停在一个失败节点上时才写**。
+             *
+             * 两条理由,方向一致:
+             *  1. 它们对一个没失败的节点本来就不可用(按下去只会得到一句「这个任务没有失败」),
+             *     而一个按了只会被拒绝的键写在页脚上,和一个按了没反应的键一样糟;
+             *  2. 这一行是 `wrap="truncate-end"`,实测已经贴着 80 列 —— 无条件多写 20 列
+             *     会把右边的 `Esc/q 退出` 吃掉,也就是用「两个只在特定行有用的键」换掉
+             *     「怎么退出去」。
+             */
+            : `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定    ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · ${detailEntryHint(mouse)}${props.onRedo ? ' · r 重做' : ''}${failedKeysHint} · Esc/q 退出`}
         </Text>
       ) : null}
     </Box>

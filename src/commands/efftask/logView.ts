@@ -685,8 +685,64 @@ export type PaneAction =
   | { t: 'top' }
   | { t: 'bottom' }
   | { t: 'nextStream' }
+  /**
+   * 上下**换一条流**(往前也能走),而不是滚内容。
+   *
+   * 和 `nextStream`(`n`,只能往后、循环)分开:那是「下一条」,这是一个**列表光标**。
+   * 合成一个的话,`↑` 在第一条上要么什么都不做要么绕到最后一条,而列表光标撞到头就停,
+   * 是每个树/列表控件的行为。
+   */
+  | { t: 'selectStream'; d: number }
   | { t: 'toggleFold' }
   | { t: 'toggleThinking' }
+
+/**
+ * 输出页卡此刻在**选阶段**还是在**读内容**。
+ *
+ * 用户的原话:「各阶段选择中了可以通过上下键来选择,按空格展开后,上下键就是该阶段输出
+ * 内容的上下滚动了」。所以这不是一个额外的模式开关,而是**折叠状态本身**:
+ *
+ *  - 选中的那条流是折叠的 → `select`:↑↓ 在流之间走(它折着,本来也没有内容可滚)
+ *  - 选中的那条流是展开的 → `read`:↑↓ 滚它的内容
+ *
+ * 派生而不是另存一个 state,是因为「模式」和「折叠」两个真相源一定会分叉:一条流跑完会
+ * 自动折起来(见 AgentLogPane 的 folded),那时候一个独立的模式变量还停在 read,而屏幕上
+ * 已经没有内容可滚了 —— ↑↓ 于是变成死键,而没有任何东西解释为什么。
+ */
+export type LogPaneMode = 'select' | 'read'
+
+/**
+ * 哪几条流此刻是折叠的。
+ *
+ * 默认按流自己的状态走(**运行中展开、已收口折叠**),用户**显式**改过的按他改的走。
+ * 不能只存一个 `Set<number>`:流是一条条长出来的,一个纯集合分不清「用户展开了它」和
+ * 「它还没被折过」—— 于是一条刚跑完的流会在用户眼皮底下自己收起来,或者反过来,
+ * 一屏几千行全铺开。
+ *
+ * 抽出来是因为它现在有**两个**消费者:窗口自己(渲染 + 决定 ↑↓ 归谁)和详情页的页脚
+ * (它要在挂载那一刻就说对「↑↓ 现在是选阶段还是滚动」)。各写一份的话,页脚会在第一帧
+ * 说错,而说错的正是这次改动的全部内容。
+ */
+export function foldedStreams(
+  streams: readonly { closed: boolean }[], override: ReadonlyMap<number, boolean>,
+): Set<number> {
+  const set = new Set<number>()
+  streams.forEach((st, i) => {
+    const ov = override.get(i)
+    if (ov === undefined ? st.closed : ov) set.add(i)
+  })
+  return set
+}
+
+/**
+ * ↑↓ 归谁 —— 折叠状态说了算。见 `LogPaneMode`。
+ *
+ * 越界的 `selected`(流列表变短)算 `select`:没有内容可滚时,把键交给列表导航是唯一
+ * 有用的选择。
+ */
+export function logPaneMode(folded: ReadonlySet<number>, selected: number, count: number): LogPaneMode {
+  return folded.has(selected) || selected < 0 || selected >= count ? 'select' : 'read'
+}
 
 /**
  * 按键 → 动作。
@@ -701,14 +757,25 @@ export type PaneAction =
  * **刻意不认 Esc / q / 回车** —— 那三个键归详情视图(返回任务树)。两个 useInput 会同时收到
  * 每一个键,不冲突全靠键位不重叠。
  */
-export function logPaneAction(input: string, key: Key): PaneAction | null {
+/**
+ * @param mode 选阶段还是读内容。见 `LogPaneMode`。
+ *
+ * **只有 ↑↓ 和 j/k 分模式**,其余键两种模式下逐字相同:
+ *  - 滚轮 / PgUp / PgDn / `^u` / `^d` / `g` / `G` 一律是滚动。滚轮尤其不能当选择用 ——
+ *    一格滚轮是 3 行,当成「往下跳 3 条流」的话轻轻一拨就飞过整个列表;而 `g`/`G` 说的是
+ *    「到顶 / 到底并恢复跟随」,那是视口的事,和选中哪条流无关。
+ *  - `n`(下一条流)、空格(折叠)、`t`(思考原文)本来就作用在选中的那条流上。
+ *
+ * 默认 `'read'`:那是这个函数原来唯一的行为,而**新加的参数不该改变任何既有调用点的语义**。
+ */
+export function logPaneAction(input: string, key: Key, mode: LogPaneMode = 'read'): PaneAction | null {
   if (key.escape || key.return) return null
   // Tab 让给**区切换**(段落区 ⇄ 输出区)——详情页原来整个键盘归这里,
   // 用户因此没有任何办法把焦点移到上面的段落上。切流改用 n。
   if (key.tab) return null
   if (input === 'n' || input === 'N') return { t: 'nextStream' }
-  if (key.upArrow) return { t: 'line', d: -1 }
-  if (key.downArrow) return { t: 'line', d: 1 }
+  if (key.upArrow) return mode === 'select' ? { t: 'selectStream', d: -1 } : { t: 'line', d: -1 }
+  if (key.downArrow) return mode === 'select' ? { t: 'selectStream', d: 1 } : { t: 'line', d: 1 }
   // 鼠标滚轮。**能不能收到取决于终端有没有开鼠标追踪**(这个 fork 默认非全屏,不开)——
   // 接上它零成本,开了的场景就能用;没开的场景键盘照旧。不接的话,开了也白开。
   if (key.wheelUp) return { t: 'line', d: -3 }
@@ -730,8 +797,9 @@ export function logPaneAction(input: string, key: Key): PaneAction | null {
   // j/k 是**非幂等**的,按住多久就滚多远;g/G 幂等,重复多少次都一样。
   // 't' 展开/折叠选中流的思考原文。幂等,所以连击只走一次。
   if (c === 't') return { t: 'toggleThinking' }
-  if (c === 'j') return { t: 'line', d: input.length }
-  if (c === 'k') return { t: 'line', d: -input.length }
+  // j/k 跟着 ↑↓ 分模式 —— 页脚只写一句「↑↓/jk」,两者行为不一样的话那句话就是假的。
+  if (c === 'j') return mode === 'select' ? { t: 'selectStream', d: input.length } : { t: 'line', d: input.length }
+  if (c === 'k') return mode === 'select' ? { t: 'selectStream', d: -input.length } : { t: 'line', d: -input.length }
   return null
 }
 
@@ -809,10 +877,15 @@ export function anchoredFrom(
  *  - p/P:暂停 / 恢复调度(在飞的调用不打断)
  *  - i/I:追加一句指令(作用于之后派发的提示词)
  *  - x/X:取消**光标选中**的那一个节点
+ *  - +/=、-/_:调高 / 调低并发上限(在飞的不受影响,只影响还没起跑的)
  *
  * 大小写都收:用户按住 shift 打字是常事,而一个「按了没反应」的键比没有这个键更糟。
+ * `=` 和 `_` 同理:`+` 要按 shift,而不按的那一下终端送来的是 `=`;`_` 是 shift+`-`。
+ * 只收 `+`/`-` 的话,一半的按法是死键。
  */
-export type RunControlKey = 'togglePause' | 'addDirective' | 'cancelNode'
+export type RunControlKey =
+  | 'togglePause' | 'addDirective' | 'cancelNode'
+  | 'raiseParallelism' | 'lowerParallelism'
 
 export function runControlAction(input: string, key: { ctrl?: boolean; meta?: boolean }): RunControlKey | null {
   // 组合键归终端和 REPL,别抢。
@@ -825,6 +898,11 @@ export function runControlAction(input: string, key: { ctrl?: boolean; meta?: bo
   if (k === 'p') return 'togglePause'
   if (k === 'i') return 'addDirective'
   if (k === 'x') return 'cancelNode'
+  // 一次一步,**不按重复次数走**。和 j/k 那条「按住多久滚多远」的规矩不同,是故意的:
+  // 这个数字的每一步都会真的多派一个带写工具的执行者出去,而终端把按住 300ms 合批成
+  // 一个 `+++++++` 是常事 —— 那会把并发从 1 直接推到 8。
+  if (k === '+' || k === '=') return 'raiseParallelism'
+  if (k === '-' || k === '_') return 'lowerParallelism'
   return null
 }
 

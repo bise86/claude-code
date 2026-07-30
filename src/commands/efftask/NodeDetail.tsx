@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Box, Text, useInput, useTheme } from '../../ink.js'
-import type { TaskNode } from '../../tools/efftask/types.js'
+import { PHASE_LABEL, PHASE_NAMES, type TaskNode } from '../../tools/efftask/types.js'
 import { uiStatus } from '../../tools/efftask/stateMachine.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
 import { AgentLogPane } from './AgentLogPane.js'
@@ -8,6 +8,8 @@ import { ScrollPane } from './ScrollPane.js'
 import {
   anchoredFrom,
   clipToWidth,
+  foldedStreams,
+  logPaneMode,
   scrollWindow,
   sectionLines,
   sectionPaneAction,
@@ -18,6 +20,7 @@ import {
   tabFocused,
   mouseHint,
   type LogAnchor,
+  type LogPaneMode,
   type SectionSpec,
 } from './logView.js'
 import { formatTokens, isEmptyUsage, subtreeUsage, totalTokens, type UsageTotals } from '../../tools/efftask/usage.js'
@@ -143,6 +146,27 @@ export function usageBody(n: TaskNode, resolveNode?: (id: string) => TaskNode | 
   return rows.join('\n')
 }
 
+/**
+ * 用户补给这个节点的指引(重做 / 跳过时写的那句话)。
+ *
+ * **必须有地方看得见。** 它会被原样拼进提示词,而「同一处再写一次是替换」——
+ * 不显示的话,用户没有任何办法知道这个节点上此刻挂着哪几句话、上一次写的那句还在不在。
+ * 按环节列,`all` 那条写成「整个任务」。
+ */
+export function guidanceBody(n: TaskNode): string {
+  const g = n.guidance
+  if (!g) return ''
+  const rows: string[] = []
+  // 「整个任务」排最前:它作用于每一个环节,是这几条里覆盖面最大的那一条。
+  if (g.all && g.all.trim().length > 0) rows.push(`整个任务: ${g.all.trim()}`)
+  // 按 PHASE_NAMES 的顺序,和详情页里环节耗时、名册那几处保持一致。
+  for (const p of PHASE_NAMES) {
+    const t = g[p]
+    if (t && t.trim().length > 0) rows.push(`${PHASE_LABEL[p]}: ${t.trim()}`)
+  }
+  return rows.join('\n')
+}
+
 /** 评审 / 验收记录:每轮一行。 */
 function roundsBody(log: TaskNode['reviewLog']): string {
   return log
@@ -193,6 +217,9 @@ export function detailSections(
     { title: '风险点', body: n.plan.risks, md: true },
     { title: '验收点', body: n.plan.acceptance, md: true },
     { title: '执行状态', body: n.execStatus, md: true },
+    // 用户亲手写的话,md 上色 —— 和「目标」「完整方案」同一档待遇。排在执行状态之后、
+    // 阻断原因之前:它通常是**因为**上一次失败才写的,读的顺序就是这个。
+    { title: '补充指引(你写的)', body: guidanceBody(n), md: true },
     // 红色是**语义**(这是把节点挡下来的那条),不能被 markdown 的行内颜色顶掉。
     { title: '阻断原因', body: n.blockedReason, color: 'error' },
     { title: '评分', body: scoreBody(n) },
@@ -249,7 +276,7 @@ export function NodeDetail(props: {
   /** 本屏是否接管键盘。 */
   logActive?: boolean
   /** 日志窗自己的状态 —— 用来断言「页卡焦点真的管住了它的键盘」。 */
-  onLogState?: (s: { selected: number }) => void
+  onLogState?: (s: { selected: number; mode: LogPaneMode }) => void
   /**
    * 焦点状态的观测口。
    *
@@ -287,6 +314,10 @@ export function NodeDetail(props: {
   }) => void
   /** 这一屏能不能按 r 重做。键是父面板处理的,这里只负责**说出来**。 */
   canRedo?: boolean
+  /** 能不能按 R 快速重做失败的那个环节(只有失败节点才给)。同上,只负责说出来。 */
+  canRedoFailed?: boolean
+  /** 能不能按 s 跳过失败的那个环节。 */
+  canSkipFailed?: boolean
   /** 可用列宽。省略则跟着终端/模态槽走。 */
   columns?: number
   /** Resolves a dependency id to its node, so 依赖 renders as titles and statuses. */
@@ -320,6 +351,19 @@ export function NodeDetail(props: {
   const [cursor, setCursor, cursorRef] = useLiveState(0)
   const [expanded, setExpanded, expandedRef] = useLiveState<ReadonlySet<string>>(new Set())
   const [, setAnchor, anchorRef] = useLiveState<LogAnchor>({ stream: 0, delta: 0 })
+  /**
+   * 输出页卡此刻 ↑↓ 归谁 —— 只用来写页脚。
+   *
+   * 真相在 `AgentLogPane` 里(它由那条流的折叠状态派生),这里是镜像。镜像方向必须是
+   * **子 → 父**:折叠状态住在窗口自己的 useLiveState 里,父组件算不出来。写回时判一次
+   * 相等,否则子组件的 effect 会和父组件的重渲染互相触发。
+   */
+  const [logMode, setLogMode, logModeRef] = useLiveState<LogPaneMode>(
+    // 种子必须和窗口挂载那一刻算出来的**逐字相同**:不同的话第一帧的页脚是错的,而且
+    // 那次纠正会多写一帧 —— 详情页的行数断言(按累积写入数行)会因此超预算 1 行。
+    // 窗口挂载时 override 是空的、selected 是 0,所以这里就是那一刻的状态。
+    logPaneMode(foldedStreams(props.streams ?? [], new Map()), 0, (props.streams ?? []).length),
+  )
 
   const sections = detailSections(n, props.resolveNode)
   /**
@@ -444,13 +488,26 @@ export function NodeDetail(props: {
    * 「Esc/q 返回任务树」正好是被吃掉的那一截。把出口放在末尾,等于用「还有哪些花活」
    * 换掉了「怎么退出去」。截断只许吃掉最不重要的那一头。
    */
-  const redoHint = props.canRedo ? ' · r 重做本任务' : ''
+  const redoHint = (props.canRedo ? ' · r 重做本任务' : '')
+    // 这两个键只在这个节点真的失败了时才写 —— 一个按了只会被拒绝的键和一个按了没反应的键
+    // 一样糟,而这一行本来就在和宽度打架(见下面 footer 的注释)。
+    + (props.canRedoFailed ? ' · R 重做失败环节' : '')
+    + (props.canSkipFailed ? ' · s 跳过它' : '')
   const footer = ((): string => {
     if (zone === 'tabs') return `Esc/q 返回任务树${redoHint} · ←→ 选页卡 · 回车/空格 进入 · Tab 回内容`
     if (tab === 'log') {
-      return logPaneMounted
-        ? `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ↑↓/jk 滚动 · g/G 顶部/底部 · n 换流 · 空格 折叠 · t 思考 · 耗时含等你批权限的时间`
-        : `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签`
+      if (!logPaneMounted) return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签`
+      /**
+       * ↑↓ 在这一屏有**两个**含义,所以这一行必须跟着模式变。
+       *
+       * 写死一句「↑↓/jk 滚动」的后果不是少一条说明:选中一条折叠的流时按 ↑↓ 换的是流,
+       * 而页脚说它在滚动 —— 用户会以为滚动坏了。这个仓库为「页脚上写着的键按了没反应」
+       * 已经付过两次学费(Tab 切换环节、页签条上的回车),这次是同一类。
+       */
+      const nav = logMode === 'select'
+        ? '↑↓/jk 选阶段 · 空格 展开(之后 ↑↓ 滚它的内容)'
+        : '↑↓/jk 滚动 · 空格 收起(回到选阶段)'
+      return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ${nav} · n 下一条 · g/G 顶部/底部 · t 思考 · 耗时含等你批权限的时间`
     }
     return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ↑↓/jk 选段落 · 空格 展开/收起 · ^u/^d 翻页`
   })()
@@ -523,7 +580,10 @@ export function NodeDetail(props: {
               height={contentRows}
               width={contentWidth}
               isActive={props.logActive === true && zone === 'content' && tab === 'log'}
-              onState={s => props.onLogState?.({ selected: s.selected })}
+              onState={s => {
+                props.onLogState?.({ selected: s.selected, mode: s.mode })
+                if (s.mode !== logModeRef.current) setLogMode(s.mode)
+              }}
             />
           )}
         </Box>

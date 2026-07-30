@@ -5,12 +5,15 @@ import { ScrollPane } from './ScrollPane.js'
 import {
   anchoredFrom,
   budgetRows,
+  foldedStreams,
   logPaneAction,
+  logPaneMode,
   renderStreamLines,
   scrollWindow,
   droppedNotice,
   type LogLine,
   type LogAnchor,
+  type LogPaneMode,
 } from './logView.js'
 import { useLiveState } from './useLiveState.js'
 
@@ -91,7 +94,16 @@ export interface AgentLogPaneProps {
   isActive?: boolean
   emptyHint?: string
   /** 仅供测试观测内部状态 —— 滚动位置在这个仓库的 TTY 夹具里根本看不见。 */
-  onState?: (s: { from: number; total: number; follow: boolean; selected: number; folded: number[]; thinking: number[] }) => void
+  onState?: (s: {
+    from: number; total: number; follow: boolean; selected: number; folded: number[]; thinking: number[]
+    /**
+     * 此刻 ↑↓ 是在选阶段还是在滚内容。
+     *
+     * 交出来是因为它在帧里**看不见**:两种模式的画面可以逐像素相同(选中的表头一直是
+     * 反显的),差别只体现在下一次按键做了什么。而「上下键到底归谁」正是这次改动的全部内容。
+     */
+    mode: LogPaneMode
+  }) => void
 }
 
 /**
@@ -158,14 +170,23 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
    * 重算的代价是每帧遍历 ≤40 条流(MAX_STREAMS_PER_NODE),而这一帧本来就要
    * renderStreamLines 整个列表 —— memo 省下的那点远小于它掩盖的错。
    */
-  const folded = ((): Set<number> => {
-    const set = new Set<number>()
-    props.streams.forEach((st, i) => {
-      const ov = overrideRef.current.get(i)
-      if (ov === undefined ? st.closed : ov) set.add(i)
-    })
-    return set
-  })()
+  const folded = foldedStreams(props.streams, overrideRef.current)
+
+  /**
+   * ↑↓ 此刻归谁 —— **由选中那条流的折叠状态决定**,不是另存一个模式开关。
+   *
+   * 用户的原话:「各阶段选择中了可以通过上下键来选择,按空格展开后,上下键就是该阶段输出
+   * 内容的上下滚动了」。折叠 = 选阶段,展开 = 滚内容,一条规则,而空格正好是切换它的键。
+   *
+   * 派生的第二个好处是**自愈**:一条跑完的流会自动折起来(见上面的 folded),此时 ↑↓
+   * 自动变回选阶段 —— 而一个独立的模式变量会停在「滚内容」,对着一条只有表头的流,
+   * ↑↓ 成了死键。反过来,用户**显式**展开过的流不会被自动折叠(override 记着),
+   * 所以他刚刚亲手进入的阅读态不会被背后的状态变化抽走。
+   *
+   * 判据本身在 `logView.logPaneMode` 里,和详情页页脚共用一份 —— 页脚要在**挂载那一帧**
+   * 就说对「↑↓ 现在是选阶段还是滚动」,各算一份的话第一帧就会说错。
+   */
+  const mode: LogPaneMode = logPaneMode(folded, selectedRef.current, props.streams.length)
 
   const lines: LogLine[] = renderStreamLines({
     streams: props.streams,
@@ -191,7 +212,7 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
 
   useInput(
     (input, key) => {
-      const act = logPaneAction(input, key)
+      const act = logPaneAction(input, key, mode)
       if (!act) return
       const headerIdx = headerIdxOf
       /** 把「我想让视口停在第 n 行」翻译成锚(相对当前选中流的表头)。 */
@@ -218,6 +239,22 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
           setAnchor(anchorAt(maxFrom))
           setFollow(true)
           return
+        case 'selectStream': {
+          if (props.streams.length === 0) return
+          /**
+           * **夹住,不循环。** `n` 是「下一条」(循环),这是一个列表光标:撞到头就停,
+           * 和任务树、段落列表的行为一致。循环的话用户在第一条上按 ↑ 会跳到最后一条 ——
+           * 而那条通常正是还在跑、一直在动的那条,也就是他抱怨过的现象。
+           */
+          const next = Math.max(0, Math.min(props.streams.length - 1, selectedRef.current + act.d))
+          if (next === selectedRef.current) return
+          setSelected(next)
+          // 切到哪,展示哪:锚钉到那条流的表头,并无条件关掉跟随 —— 否则视口继续粘在
+          // 底部那条正在跑的流上(和 nextStream 逐字同因)。
+          setAnchor({ stream: next, delta: 0 })
+          setFollow(false)
+          return
+        }
         case 'nextStream': {
           if (props.streams.length === 0) return
           const next = (selectedRef.current + 1) % props.streams.length
@@ -260,6 +297,7 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
       selected: selectedRef.current,
       folded: [...folded].sort((a, b) => a - b),
       thinking: [...thinkingRef.current].sort((a, b) => a - b),
+      mode,
     })
   })
 

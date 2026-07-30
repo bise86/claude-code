@@ -299,6 +299,58 @@ export interface TaskNode {
    * node.md 按设计可以手工编辑,而这个字段决定节点从哪个环节重入。见 resumeCore。
    */
   redoFrom?: PhaseName
+  /**
+   * 被阻断的那一刻,节点**正处在哪个状态** —— 也就是「是哪个环节失败的」。
+   *
+   * 用户的原话:「对于失败的任务,有键可以快速重做失败的阶段或跳过失败的阶段」。这两个键
+   * 都必须先回答「哪个阶段失败了」,而 `status` 那一刻已经被改写成 `BLOCKED`,那个信息就
+   * 没了。
+   *
+   * **记下来,不反推。** 和 `capCategory` 逐字同因(见它的注释:反推被卡片自己的建议打败了)。
+   * 从 `iteration` 和日志反推同样站不住:验收和测试验证共用 `iteration.acceptance`、
+   * 共用 `acceptLog`,而「评审三轮没过」和「评审员一直打不通」在计数上一模一样。
+   *
+   * **只在节点自己失败时记**,`propagateBlocked` 那条路(子节点阻断 / 上级任务阻断 /
+   * 依赖阻断)一个字都不写:那不是这个节点的失败,而记上去的后果是快捷键在一个「其实是
+   * 它孩子挂了」的父节点上提供「重做集成验收」。留空时界面会照实说「这个节点不是自己
+   * 失败的」并指向真正失败的那个。
+   *
+   * 由 `commit()` 维护 —— 每一次 BLOCKED 都必经它,而它是唯一还看得见上一个状态的地方;
+   * 同时**任何非阻断的推进都会把它清掉**,所以一个被重做过的节点不会带着旧失败点。
+   */
+  failedAt?: NodeStatus
+  /**
+   * 手工**跳过**的那一个环节。一次性,由用到它的那个 step 消费后立刻清掉。
+   *
+   * 用户的原话是「跳过失败的阶段,继续往下走」。和 `config.skipSteps`(整个 run 都跳)
+   * 的区别是它只作用于这一个节点、这一次:一个反复被验收挡下的节点,用户自己看过产出之后
+   * 说「就这样吧」,不该因此让**后面每一个**节点都不再验收。
+   *
+   * 只可能是 review / verify / accept / integrate 四个之一 —— 那是「活干完了、判的人不放行」
+   * 的四个环节。跳过分析或执行的语义是「这个节点什么都没做」,那不是跳过,是放弃,
+   * 而放弃有它自己的入口(见 redo.ts 的 skipFailedPhaseReason)。
+   *
+   * 落盘是白拿的(serializeNode 整节点倾倒),所以真正要补的是**读回**校验 —— 见 resumeCore。
+   */
+  skipPhase?: PhaseName
+  /**
+   * 重做 / 跳过时,用户**补给这个节点**的提示词。
+   *
+   * 用户的原话有两句:「重做失败的阶段,可以塞新的提示词给这个阶段」和「重做整个子任务时,
+   * 可以塞新的提示词给这个子任务」。所以键是**环节**,`'all'` 那一条是「给整个节点」——
+   * 任务重做走的就是它。
+   *
+   * **同一个键再写一次是替换,不是追加。** 用户的说法是「塞新的提示词」:第二次重做执行
+   * 环节时补的那句话就是现在的指令,把上一次的也一起发过去会让两条互相打架,而模型看不出
+   * 哪句更新。代价是旧那句话没了 —— 所以它同时会显示在详情页的「补充指引」段落里,
+   * 用户按下确认之前和之后都看得到自己写的是什么。
+   *
+   * **裁决类环节看得到全部**(不只是给它自己那一条),这一条是拿实测换来的:用户补
+   * 「别动 src/legacy」→ 执行者照做 → 验收员拿着补话之前定下的验收点对照产出 → 判不通过
+   * → 返工 → 撞满迭代上限阻断。用户自己那句纠正成了这个节点失败的直接原因。
+   * 见 pipeline.ts 的 JUDGE_NOTE,那是同一个坑的第一次。
+   */
+  guidance?: Partial<Record<PhaseName | 'all', string>>
   reviewLog: RoundtableRecord[]
   acceptLog: RoundtableRecord[]
   score: { plan?: ScoreRecord; exec?: ScoreRecord }
@@ -453,10 +505,50 @@ export const DEFAULT_CAPS: Caps = {
   // 7 天。人不在键盘前是常态。
   humanTimeoutMs: 7 * 24 * 60 * 60 * 1000,
 }
+/**
+ * **可以手工跳过**的环节 —— 「活干完了、判的人不放行」的那四个。
+ *
+ * 三个消费者共用一份:`redo.ts` 决定屏幕上给不给这个动作、`pipeline.ts` 决定跑的时候认不认、
+ * `resumeCore.ts` 决定盘上读回来的值合不合法。各写一份的话,最松的那一份就是实际生效的那一份。
+ *
+ * **plan 和 execute 不在其中,而这是一条语义界线,不是保守。** 跳过分析 = 带着空方案进评审;
+ * 跳过执行 = 一行代码都不写就去验收。这两件事的名字叫「放弃这个节点」,不叫「跳过一个环节」,
+ * 而放弃有它自己的入口(整个 run 的 `skipSteps`,在启动关口上摆明后果让用户批准)。
+ * observer(观察评分)也不在其中:它不会挡住任何节点 —— 低分只触发一轮返工,而返工额度
+ * 用尽本来就会往下走。给它一个「跳过」按钮是在解决一个不存在的阻塞。
+ */
+export const SKIPPABLE_PHASES: ReadonlySet<string> = new Set<PhaseName>(['review', 'verify', 'accept', 'integrate'])
+
+/**
+ * 一条补充指引的长度上限(按码点)。
+ *
+ * 和 `MAX_DIRECTIVE_CHARS` 同一个数、同一个理由:整段提示词是要付钱的,而用户可能粘一整个
+ * 文件进来。两处都是「用户在运行中/重做时补的一句话」,给不同的上限只会让人困惑。
+ */
+export const MAX_GUIDANCE_CHARS = 2000
+
 /** 一个阶段的席位上限默认值。 */
 export const DEFAULT_MAX_SEATS_PER_PHASE = 5
 
 export const DEFAULT_PARALLELISM = 5
+/**
+ * 并发上限的**合法区间**。
+ *
+ * 一份真相,三个消费者:`parseDirectives` 的夹取、运行中调整并发度的夹取、以及关口上
+ * 那句「最多能调到多少」。原来 64 这个数只写在 parseDirectives 的一句 `clampInt(…, 1, 64, …)`
+ * 里 —— 而运行中调整并发度是**第二条**写入路径,两边各写一个字面量的话,它们迟早会不一致,
+ * 而不一致的那一次用户会发现自己在关口上被拒绝的数字,在运行中调得进去。
+ *
+ * 下限是 1 而不是 0:0 的语义是「一个都不许跑」,而调度器对 `<=0` 的预算返回空批次 ——
+ * 树会当场被判成「走不动」并以 blocked 收尾。想暂停请按 p,那条路是可逆的。
+ */
+export const MIN_PARALLELISM = 1
+export const MAX_PARALLELISM = 64
+/** 把任意输入夹进合法区间。非有限值(NaN/Infinity/手改的 run.md)回落到 fallback。 */
+export function clampParallelism(v: unknown, fallback = DEFAULT_PARALLELISM): number {
+  const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback
+  return Math.min(MAX_PARALLELISM, Math.max(MIN_PARALLELISM, n))
+}
 export interface EffTaskConfig {
   goalPrompt: string
   parallelism: number
@@ -517,6 +609,31 @@ export interface EffTaskConfig {
    * 所以恢复路径必须**独立于 status 和节点状态**检查这个字段。
    */
   pendingHandoff?: PendingHandoff
+  /**
+   * 提示词里**点名给某个环节**的那几句话(§定向注入)。
+   *
+   * 用户的原话:「/et 写提示词时,有些内容是关注某些阶段或者角色的,会将其提示词内容扩展
+   * 给注入到对应阶段或角色」。在这之前整段提示词只有一个去处 —— `goalPrompt`,它进的是
+   * **根节点的目标**。于是「评审时重点看并发安全」这句话的实际去处是:根方案作者读到它,
+   * 然后它被 plan 的产出覆盖掉,评审员一个字都看不到(评审提示词只吃 `node.plan`)。
+   *
+   * 键是内部 phase 名(中文别名在解析时就归一了,和 skipSteps 同一条规矩)。
+   *
+   * 必须被 `readRunManifest` 读回 —— `writeRunManifest` 整文件重写 run.md,一个只写不读的
+   * 字段会在第一次 `--resume` 时清零:恢复后的名册一模一样,而模型收到的东西变了。
+   * `resumes` 和 `roleDefs` 都踩过这个坑。
+   */
+  phaseGuidance?: Partial<Record<PhaseName, string>>
+  /**
+   * 提示词里**点名给某个角色/员工**的那几句话(§定向注入)。
+   *
+   * `name` 可以是任务角色名(「架构师」)也可以是员工名(「opus-架构」)—— 用户两种说法都用,
+   * 而席位上同时有 `roleTag`(角色)和 `roleName`(员工),两边都比一次。
+   *
+   * 数组而不是 map:同一个名字被点两次是用户的自由(「架构师注意 A」「架构师还要注意 B」),
+   * 而 map 会静默丢掉第一条。
+   */
+  roleGuidance?: { name: string; text: string }[]
   /**
    * 被整个跳过的环节。
    *

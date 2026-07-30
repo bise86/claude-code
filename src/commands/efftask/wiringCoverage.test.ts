@@ -451,7 +451,44 @@ describe('改回去要变红的四处', () => {
     // EffTaskRunner 的 JSX 里有没有这个分支,而这个组件挂不起来。剪断它的形状是
     // 「按 r → 界面纹丝不动」,而全套测试照绿。
     expect(SRC).toContain("phase === 'confirmRedo' && redoTarget")
-    expect(element('ConfirmRedo')).toContain('onConfirm={entry => applyRedo(redoTarget, entry)}')
+    expect(element('ConfirmRedo')).toContain('onConfirm={(entry, guidance) => applyRedo(redoTarget, entry, guidance)}')
+    /**
+     * 补充指引这一路必须**一路接到底**。
+     *
+     * 关口收下那句话、算出它给谁,然后 applyRedo 要把它交给 runRedo —— 而 runRedo 才是把它
+     * 写到节点上的那一步。中间任何一跳丢了它,用户会看到确认屏上印着自己写的那句话
+     * (关口自己就能印),而模型一个字都收不到。这是「配得进去、永远到不了」的形状。
+     */
+    expect(element('ConfirmRedo')).toContain('initialEntry={redoEntry ?? undefined}')
+  })
+
+  it('跳过关口也挂在渲染树上,而且和重做走同一套落盘', () => {
+    // 和上面那条逐字同因:setPhase 到 confirmSkip 之后能不能渲染出关口,取决于 JSX 里
+    // 有没有这个分支,而这个组件挂不起来。剪断它 = 按 s 之后界面纹丝不动,全套照绿。
+    expect(SRC).toContain("phase === 'confirmSkip' && skipTarget")
+    expect(element('ConfirmSkip')).toContain('onConfirm={guidance => applySkip(skipTarget, guidance)}')
+    // 两个关口必须用**同一份**环节实况:各算一份的话,屏幕上算出来的后果和实际发生的
+    // 可以不一样,而用户是照着屏幕按的确认。
+    expect(element('ConfirmRedo')).toContain('phases={phaseCtxOf(redoTarget, config)}')
+    expect(element('ConfirmSkip')).toContain('phases={phaseCtxOf(skipTarget, config)}')
+    // 隔离与否只有这一层看得见,而「跳过验收」能不能安全放行全靠它(见 RedoContext.isolated)。
+    // 写死 false 的话,一个丢了工作区引用的节点会被允许跳过验收 —— 把一个空工作区合进
+    // 集成分支并判「已验收」。
+    expect(SRC).toContain('{ isolated: poolRef.current !== undefined }')
+  })
+
+  it('R 与 s 两个键真的接到了失败判据上,而且拿不到时**说原因**', () => {
+    /**
+     * 这两个键的价值全在「拿不到的时候告诉你为什么」:一个节点不是自己失败的(是它孩子挂了)、
+     * 失败在一个不能单独重入的环节、或者这次 run 被中断过 —— 三种情况要做的事完全不同。
+     * 剪断任何一条 setRedoProblems,用户按下去得到的是**一屏什么都没有**。
+     */
+    const done = SRC.slice(SRC.indexOf('<DoneView'))
+    expect(done).toContain('failedRedoTarget(node, byId,')
+    expect(done).toContain('skipFailedPhaseReason(node,')
+    // 中断标记那道闸门在**三个**入口上都要有(r / R / s):少了它,按下去会立刻再次阻断,
+    // 而屏幕上只会闪一下(redoUnavailableReason 的注释记着这条实测)。
+    expect(done.split('redoUnavailableReason({ aborted: props.signal.aborted').length - 1).toBe(3)
   })
 
   it('重做的四条出口全都接上了 —— 行为归 redoRun.test.ts,这里只守接线', () => {
@@ -463,13 +500,21 @@ describe('改回去要变红的四处', () => {
      * 之所以曾经需要一整组源码文本断言:同样的逻辑长在这个文件里时,验收把每一个被
      * 断言的字符串原样留着,造出 14 条变异全部存活。搬走之后这里只需要守四条线。
      */
-    const body = SRC.slice(SRC.indexOf('const applyRedo = React.useCallback'))
+    // 四条出口现在住在 redoDeps 里 —— 重做和跳过共用一份(见 redoRun.ts 的注释:
+    // 两份实现意味着第二次踩同一组坑)。
+    const body = SRC.slice(SRC.indexOf('const redoDeps = React.useCallback'))
     const head = body.slice(0, 1200)
     // 落盘:少了它,树只在内存里改过,下次 --resume 全丢。
-    expect(head).toMatch(/commit:\s*\(plan, before\) => commitRedo\(/)
+    expect(head).toMatch(/commit:\s*\(plan: RedoPlan, before: readonly TaskNode\[\]\) => commitRedo\(/)
     // 重启:startRun 是这个文件里 runOrchestrator 的**唯一**调用点。少了它,用户按完
     // 确认会看到树变了、节点退回排队中,然后永远停在那儿。
-    expect(head).toMatch(/start:\s*n => startRun\(cfg, n\)/)
+    expect(head).toMatch(/start:\s*\(n: TaskNode\[\]\) => startRun\(cfg, n\)/)
+    // 两个入口都真的用了这份 deps。少了任何一个,那条路的六件事一件都不会发生。
+    expect(SRC).toMatch(/runRedo\([\s\S]{0,220}redoDeps\(cfg, runDir\)/)
+    expect(SRC).toMatch(/runSkip\([\s\S]{0,220}redoDeps\(cfg, runDir\)/)
+    // 补充指引一路交到底 —— 见上面那条注释。
+    expect(SRC).toMatch(/runRedo\([\s\S]{0,260}guidance,/)
+    expect(SRC).toMatch(/runSkip\([\s\S]{0,260}guidance,/)
     // 没做成的事上屏:一个删不掉的 node.md 会在下次 --resume 时自己长回来。
     expect(head).toContain('onProblems: setRedoProblems')
     // 新树进 state:少了它界面显示的还是重做前那棵。
@@ -480,7 +525,7 @@ describe('改回去要变红的四处', () => {
     // 组件手上的 `nodes` 和 runRedo 传出来的 `before` 在正常路径上相同,但把参数
     // 换成前者就等于**假装**这条线接对了 —— 而 redoRun.test.ts 断言的正是 before 的
     // 内容。两边指向同一个东西,这条线才是活的。
-    const body = SRC.slice(SRC.indexOf('const applyRedo = React.useCallback'), SRC.indexOf('const applyRedo = React.useCallback') + 1200)
+    const body = SRC.slice(SRC.indexOf('const redoDeps = React.useCallback'), SRC.indexOf('const redoDeps = React.useCallback') + 1200)
     expect(body).toMatch(/before,\s*onError:/)
   })
 
@@ -502,6 +547,25 @@ describe('改回去要变红的四处', () => {
     // 而顶上那个「并行 1/5」会一直误导用户。
     expect(element('RunningView')).toContain('serialExecute={poolRef.current === undefined}')
   })
+  it('调并发度接的是 control,而且基准取它现在的值', () => {
+    /**
+     * 两条线,都只在这个挂不起来的文件里:
+     *
+     *  1. 面板的 `+`/`-` 要接到 `control.setParallelism` 上。接到别处(或者只改 config)的话,
+     *     编排器读的是 `control.parallelism() ?? cfg.parallelism` —— 数字在屏幕上动了,
+     *     而调度器一无所知。
+     *  2. **基准必须取 control 现在的值**,没调过才回落到关口批准的那个。一直拿 config 当
+     *     基准的话,连按两次 `+` 会得到 6、6 而不是 6、7 —— 用户会以为这个键坏了。
+     */
+    expect(element('RunningView')).toContain('runControl={{')
+    expect(SRC).toContain('onAdjustParallelism: d => {')
+    expect(SRC).toContain('const cur = control.parallelism() ?? config.parallelism')
+    expect(SRC).toContain('control.setParallelism(cur + d)')
+    // 夹取只有一份(control 里),这里不许再算一遍 —— 两份夹取会在边界上分叉,
+    // 而表头和页脚会各说一个数。
+    expect(SRC).not.toContain('Math.min(MAX_PARALLELISM')
+  })
+
   it('人工干预面是**同一个实例**,三跳都接上了', () => {
     // 取消要靠面板、适配器、编排器共用同一个 RunControl 才生效:在组件里再 new 一个的话,
     // 已经登记的在飞调用永远取消不掉,而按 x 之后屏幕上什么都不会变。

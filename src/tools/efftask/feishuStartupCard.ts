@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig, PendingHandoff } from './types.js'
-import { capsLine, costLine, skipConflictLines, skipConsequenceLines, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { capsLine, costLine, guidanceLines, skipConflictLines, skipConsequenceLines, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -50,6 +50,11 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
       : '') +
     (skipConsequenceLines(config).length > 0
       ? `\n\n**跳过带来的连带后果**:\n${skipConsequenceLines(config).map(l => `- ${l}`).join('\n')}`
+      : '') +
+    // 定向注入(§定向注入)。两端必须说同一件事 —— 终端关口显示了这几段话会进哪个环节,
+    // 卡片上不显示的话,从飞书批准的人批的是一份他没看全的配置。
+    (guidanceLines(config).length > 0
+      ? `\n\n**以下几段会被定向送进对应环节/角色**:\n${guidanceLines(config).map(l => `- ${l}`).join("\n")}`
       : '') +
     (noticeLines(config).length > 0
       ? `\n\n**以下请求不会生效**:\n${noticeLines(config).map(l => `- ${l}`).join('\n')}`

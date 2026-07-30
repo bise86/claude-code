@@ -92,7 +92,21 @@ export class EffTaskOrchestrator {
    * slots too, and that is precisely the number the confirmation gate promised to cap.
    */
   slotUsage(): { inUse: number; limit: number } {
-    return { inUse: this.slots.inUse(), limit: Math.max(1, this.cfg.parallelism) }
+    return { inUse: this.slots.inUse(), limit: this.limit() }
+  }
+
+  /**
+   * 此刻的并发上限 —— **每次现读**,不缓存。
+   *
+   * 用户在运行中改过的那个数优先(`control.setParallelism`),没改过就用关口批准的那个。
+   * 现读是这个功能成立的全部条件:缓存一次的话,调整只会在下一次 run 生效。
+   *
+   * 三个消费者共用它 —— 池子的上限、调度循环的预算、表头那个 `并行 n/N`。分开算过一次
+   * 的代价这个文件已经付过(池子只数 step、圆桌的席位不计数,于是 3 席评审团把用户的
+   * 数字乘了三倍)。
+   */
+  private limit(): number {
+    return Math.max(1, this.deps.control?.parallelism() ?? this.cfg.parallelism)
   }
 
   // run() must always RESOLVE with an outcome. Its failure handlers do I/O of their own, so
@@ -137,7 +151,7 @@ export class EffTaskOrchestrator {
    * roundtables inside them draw from one budget — the second half of that clause was missing
    * and a 3-role panel multiplied the user's number by three.
    */
-  private slots = createSlotPool(() => Math.max(1, this.cfg.parallelism))
+  private slots = createSlotPool(() => this.limit())
 
   private ctx(): PipelineCtx {
     return {
@@ -219,6 +233,8 @@ export class EffTaskOrchestrator {
         // is a policy knob someone could plausibly relax to "allow two"; leaving a landmine
         // under a knob is worse than a one-line fingerprint. Do not read it as tested.
         if (stalls.note(n.id, `${n.status}:${n.childIds.length}`) >= 2) {
+          // 失败点。这一条不经过 commit(),所以得自己记 —— 见 TaskNode.failedAt。
+          if (n.status !== 'BLOCKED') n.failedAt = n.status
           n.status = 'BLOCKED'
           n.blockedReason = n.blockedReason || '节点未能推进(状态未变化),已阻断以避免空转'
           // Mark it interrupted when the run is aborting, or resume refuses to reopen it.
@@ -291,21 +307,47 @@ export class EffTaskOrchestrator {
         continue
       }
 
-      const budget = Math.max(1, this.cfg.parallelism) - running()
+      /**
+       * 并发上限的代数,**和这一轮扫描在同一个同步回合里读**。
+       *
+       * 要紧的是它读在上一次 `await` **之后**:代表的必须是「我这一轮扫描时看到的那个
+       * 上限」,这样睡下之后到来的每一次调整都会把我叫醒。把它提到循环外面就成了
+       * 「run 开始那一刻的代数」——第一次调整之后 `waitForParallelism` 会立刻兑现,
+       * 循环从此空转。
+       *
+       * 放在 `pickBatch` 之前还是之后**没有区别**,如实记下来而不是假装这里有个窗口:
+       * 从上一次 await 到下面那个 await 之间一个 await 都没有,而 JS 是单线程的 ——
+       * 一次按键根本挤不进来。变异测试把这两句对调,全套照绿,那是构造上等价。
+       */
+      const limitGen = this.deps.control?.parallelismGeneration() ?? 0
+      const budget = this.limit() - running()
       // NO await between pickBatch and the dispatch loop — that is what makes the dependency
       // check atomic (see pickBatch's contract).
       const batch = pickBatch(this.nodes(), this.byId, new Set(inFlight.keys()), budget)
       for (const { node, kind } of batch) inFlight.set(node.id, launch(node, kind))
 
       if (inFlight.size === 0) {
-        // Nothing running and nothing pickable → the tree cannot move. Surface WHY by
-        // propagating BLOCKED upward before returning.
+        /**
+         * 一个都没在跑、也一个都挑不出来。
+         *
+         * **调低并发度不会走到这里**:`pickBatch` 在 `limit <= 0` 时返回空批次,而
+         * `inFlight.size === 0` 蕴含 `running() === 0`,于是 `budget = limit() >= 1` ——
+         * 上限最低是 1(见 MIN_PARALLELISM 的注释:0 会让这里把「用户调小了」误判成
+         * 「树走不动了」,然后以 blocked 收尾)。
+         */
         await this.propagateBlocked(false)
         const reason = root.status === 'BLOCKED' ? (root.blockedReason || '根任务被阻断') : '存在无法推进的阻断节点'
         return { status: 'blocked', reason }
       }
       // Wake on the FIRST completion, then rescan and top the pool back up.
-      await Promise.race([...inFlight.values()]).catch(() => {})
+      //
+      // …**或者**在用户调整并发上限时立刻醒。少了后者,「把 5 调到 10」要等到某个节点跑完
+      // 才有第 6 个节点起跑 —— 一个二十分钟的执行环节就是二十分钟的「按了没反应」。
+      // 调低同样会唤醒,那一觉起来预算是负的、批次为空,于是再睡回去:多一次空转换来的是
+      // 一份**只有一条**的唤醒规则。
+      const wakeups: Promise<unknown>[] = [Promise.race([...inFlight.values()]).catch(() => {})]
+      if (this.deps.control) wakeups.push(this.deps.control.waitForParallelism(limitGen))
+      await Promise.race(wakeups)
     }
   }
 
@@ -337,6 +379,8 @@ export class EffTaskOrchestrator {
       // Only record a reason when we actually block; otherwise a recovered node would carry
       // a stale blockedReason into an ACCEPTED state.
       if (!subtreeAlive) {
+        // 失败点。这一条也不经过 commit() —— 见 TaskNode.failedAt。
+        if (next.status !== 'BLOCKED') next.failedAt = next.status
         next.status = 'BLOCKED'
         next.blockedReason = message
         next.interrupted = this.signal.aborted
@@ -351,6 +395,10 @@ export class EffTaskOrchestrator {
   // child, any BLOCKED dep, or any DANGLING dep becomes BLOCKED. Repeat until stable so
   // death propagates up the tree. `aborted` additionally sweeps every non-terminal node so
   // the final tree shows no phantom "running" rows after an interrupt.
+  //
+  // 这条路**刻意不记 failedAt**:这里的每一次阻断都不是该节点自己的失败(子节点阻断 /
+  // 上级任务阻断 / 依赖阻断 / 整轮被中止)。记上去的后果是「快速重做失败环节」在一个
+  // 其实是它孩子挂了的父节点上提供一个动作,而真正要动的节点在别处。见 TaskNode.failedAt。
   // INVARIANT: every in-flight step must be settled before calling this. It awaits inside
   // a LIVE `for (const n of this.byId.values())` iterator, so a concurrent createChildren
   // inserting mid-sweep would be visited — or not — unpredictably.

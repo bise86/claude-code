@@ -1,4 +1,4 @@
-import { PHASE_LABEL, PHASE_NAMES, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
+import { MAX_GUIDANCE_CHARS, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
 import { addUsage } from './usage.js'
 
 /**
@@ -141,6 +141,17 @@ export interface RedoContext {
   seatCount?: Partial<Record<PhaseName, number>>
   /** 用户明确要求跳过的环节。 */
   skipSteps?: readonly PhaseName[]
+  /**
+   * 这次运行是不是每个节点一个 git worktree。
+   *
+   * 「跳过验收」要靠它判断能不能安全放行:隔离运行里,节点的产出在**它自己那个工作区**里,
+   * 而跳过验收会直接走合并 → 已验收。工作区引用丢了(`--resume` 会清掉失效路径)的时候
+   * 那次合并合的是一个刚从集成分支切出来的空工作区 —— 节点被判「已验收」而它的产出
+   * 一行都没进去。`mergeAndRelease` 的 `!node.worktree → return true` 正是这条路。
+   *
+   * 非隔离运行不存在这个问题:执行者直接写在用户的检出里,产出已经在那儿了。
+   */
+  isolated?: boolean
 }
 
 /**
@@ -206,13 +217,153 @@ export function phaseChainText(entry: RedoEntry, ctx?: RedoContext, node?: TaskN
  * 仓库没有 typecheck,于是它一路过了打包,按下 r 就是一屏 ReferenceError。搬进来是为了
  * 让它有接缝可测,不只是为了修那一行。
  */
-export function redoContextOf(node: TaskNode, cfg?: { skipSteps?: readonly PhaseName[] }): RedoContext {
+export function redoContextOf(
+  node: TaskNode,
+  cfg?: { skipSteps?: readonly PhaseName[] },
+  opts?: { isolated?: boolean },
+): RedoContext {
   return {
     seatCount: Object.fromEntries(
       PHASE_NAMES.map(p => [p, (node.phaseRoles?.[p] ?? []).length]),
     ) as Record<PhaseName, number>,
     skipSteps: cfg?.skipSteps,
+    // 隔离与否只有命令层知道(它手里才有那个池子),所以由调用方传。缺省 false 是**保守**
+    // 的一侧:它只会让「跳过验收」在一个其实安全的场景下多问一句,而反过来会放行一次谎报。
+    ...(opts?.isolated === undefined ? {} : { isolated: opts.isolated }),
   }
+}
+
+/**
+ * 阻断那一刻它在跑哪个环节 —— `failedAt`(一个 NodeStatus)翻成环节名。
+ *
+ * 一张表,不是一串 if:七个环节、十五个状态,而这个映射是「哪个环节失败了」这件事的
+ * **唯一**判据(见 TaskNode.failedAt 为什么不反推)。
+ *
+ * `READY` / `WAITING_CHILDREN` 也算:节点坐在座位上却没能被派出去(依赖成环、拿不到隔离
+ * 工作区、调度器判它走不动),失败的就是那个座位后面的环节。
+ */
+const STATUS_PHASE: Partial<Record<NodeStatus, PhaseName>> = {
+  CREATED: 'plan', PLANNING: 'plan',
+  PLAN_REVIEW: 'review',
+  // stepExecute 是一个整体:READY 进,中途 EXECUTED/REWORK/MERGE 都在它里面。
+  READY: 'execute', EXECUTING: 'execute', EXECUTED: 'execute', REWORK: 'execute', MERGE: 'execute',
+  VERIFYING: 'verify',
+  ACCEPTANCE: 'accept',
+  WAITING_CHILDREN: 'integrate', INTEGRATION_ACCEPT: 'integrate',
+  SCORING: 'observer',
+}
+
+/** 失败的是哪个环节。`undefined` = 这个节点没有失败,或者看不出来(见 failedRedoTarget)。 */
+export function failedPhaseOf(node: TaskNode): PhaseName | undefined {
+  if (node.status !== 'BLOCKED') return undefined
+  return node.failedAt === undefined ? undefined : STATUS_PHASE[node.failedAt]
+}
+
+/**
+ * 这个失败环节要从哪个**可重入**的入口重来。
+ *
+ * 七个环节只有四个能单独重入(见文件头),所以这里是「失败在 X → 从 Y 进」的映射,
+ * 而不是恒等。测试验证 / 验收 / 观察都跑在 `stepExecute` 内部,唯一入口是执行;
+ * 拆分型节点没有执行环节,它的裁决是集成验收。
+ */
+function entryForPhase(phase: PhaseName, node: TaskNode): RedoEntry {
+  if (phase === 'plan') return 'plan'
+  if (phase === 'review') return 'review'
+  if (phase === 'integrate') return 'integrate'
+  return isDecomposed(node) ? 'integrate' : 'execute'
+}
+
+/** `propagateBlocked` 写在别人身上的三种理由,以及它们各自该去动谁。 */
+const PROPAGATED_ADVICE: Record<string, string> = {
+  子节点阻断: '这个节点是因为**它的子任务**失败才停的 —— 请到那个子任务上重做',
+  上级任务阻断: '这个节点是因为**上级任务**被阻断才停的 —— 请先处理上级那个',
+  依赖阻断: '这个节点是因为**它依赖的任务**失败才停的 —— 请到那个依赖上重做',
+  子节点缺失: '这棵树自己对不上(子节点缺失),不是某个环节失败 —— 见 README 的手工修复',
+  依赖节点缺失: '这棵树自己对不上(依赖节点缺失),不是某个环节失败 —— 见 README 的手工修复',
+  依赖成环: '这棵树自己对不上(依赖成环),不是某个环节失败 —— 见 README 的手工修复',
+}
+
+/**
+ * 「快速重做失败的那个环节」要重做的是哪一条。
+ *
+ * 用户的原话:「对于失败的任务,有键可以快速重做失败的阶段」。所谓「快速」是**省掉两屏
+ * 菜单**,不是省掉确认屏 —— 失败在分析环节的拆分型节点,它的入口就是「任务重做」,
+ * 而那一条会删掉整棵子树。一个按下去就删的快捷键不该存在。
+ *
+ * 拿不到时返回**原因**,而且原因分得很细:一个「这个节点不是自己失败的」和一个
+ * 「看不出是哪个环节」需要用户做的事完全不同。
+ */
+export function failedRedoTarget(
+  node: TaskNode, byId: ReadonlyMap<string, TaskNode>, ctx?: RedoContext,
+): { entry: RedoEntry; phase: PhaseName } | { error: string } {
+  if (node.status !== 'BLOCKED') {
+    return { error: `「${node.title}」没有失败(当前 ${node.status})—— 快速重做只对失败的任务有意义,要重做它请按 r 自己选环节` }
+  }
+  const phase = failedPhaseOf(node)
+  if (phase === undefined) {
+    const advice = PROPAGATED_ADVICE[node.blockedReason.trim()]
+    if (advice) return { error: advice }
+    return { error: `看不出「${node.title}」是哪个环节失败的(这条记录来自更早的版本,或者被手工改过)—— 请按 r 自己选环节` }
+  }
+  const entry = entryForPhase(phase, node)
+  const opt = redoOptions(node, byId, ctx).find(o => o.entry === entry)
+  // 授权判据仍然是菜单那一份 —— 快捷键不许从旁门进去。
+  if (!opt) return { error: `未知的重做入口: ${entry}` }
+  if (opt.disabled) return { error: `失败在「${PHASE_LABEL[phase]}」,而${opt.label}此刻不可用:${opt.disabled}` }
+  return { entry, phase }
+}
+
+/**
+ * 「跳过失败的那个环节,继续往下走」能不能做 —— 不能时返回**原因**。
+ *
+ * 用户的原话:「或跳过失败的阶段,继续往下走」。能跳的只有四个环节(见 SKIPPABLE_PHASES):
+ * 那是「活已经干完了、判的人不放行」的四个。
+ */
+export function skipFailedPhaseReason(
+  node: TaskNode, ctx?: RedoContext,
+): string | undefined {
+  if (node.status !== 'BLOCKED') return `「${node.title}」没有失败(当前 ${node.status}),没有环节可跳`
+  const phase = failedPhaseOf(node)
+  if (phase === undefined) {
+    const advice = PROPAGATED_ADVICE[node.blockedReason.trim()]
+    return advice ?? `看不出「${node.title}」是哪个环节失败的,无法跳过它 —— 请按 r 重做`
+  }
+  if (!SKIPPABLE_PHASES.has(phase)) {
+    /**
+     * 分析 / 执行不能「跳过」。
+     *
+     * 跳过分析 = 带着空方案进评审;跳过执行 = 一行代码都不写就去验收。这两件事的名字叫
+     * **放弃这个节点**,而不是「跳过一个环节」—— 说清区别,并给出能照做的下一步。
+     */
+    return phase === 'plan'
+      ? '失败在「分析」:跳过它等于让这个节点带着空方案往下走,评审员会对着空白发表意见 —— 请用 r 重做分析,或在启动关口用 skipSteps 整个跳过分析'
+      : phase === 'execute'
+        ? '失败在「执行」:跳过它等于承认这个节点什么都没做,而验收员会照常开会核对这个空产出 —— 请用 r 从执行重做'
+        : `失败在「${PHASE_LABEL[phase]}」,这个环节不能单独跳过 —— 请用 r 重做`
+  }
+  /**
+   * 隔离运行 + 工作区引用已丢 → **不许跳过验收/测试验证**。
+   *
+   * 这两条跳过之后都会走到合并:`mergeAndRelease` 在 `!node.worktree` 时直接
+   * `return true`,于是节点被判「已验收」,而它的产出一行都没进集成分支。
+   * 而重新 acquire 更糟 —— 它 `checkout -B` 回集成分支,把节点自己那些还没合并的提交
+   * 挪到一条 salvage 分支上,工作区当场变空。
+   */
+  if ((phase === 'accept' || phase === 'verify') && ctx?.isolated === true && !node.worktree) {
+    return `这次运行是隔离的,而本节点的工作区引用已经不在了(--resume 会清掉失效路径)—— ` +
+      `此时跳过${PHASE_LABEL[phase]}会把一个空工作区合进集成分支并判「已验收」。请用 r 选「从执行重做」`
+  }
+  if (phase === 'accept' || phase === 'verify') {
+    // 这两条要坐 READY,而 advanceableKind 对 READY + unknown 返回 null —— 节点会既不可推进
+    // 也不是终态,run 以「存在无法推进的阻断节点」结束,而节点上没有任何理由。
+    if (node.kind !== 'executable') {
+      return `本节点还不是执行型(kind=${node.kind}),坐不回执行环节的座位 —— 请用 r 重做`
+    }
+  }
+  if (phase === 'integrate' && node.childIds.length === 0) {
+    return '没有子任务,不存在集成验收'
+  }
+  return undefined
 }
 
 export interface RedoOption {
@@ -519,6 +670,63 @@ function reopenIfPropagated(n: TaskNode, now: string): void {
 }
 
 /**
+ * 把目标节点放回座位上,并把它**上面那条链**和在等它的兄弟一起解开。
+ *
+ * 重做和跳过共用 —— 两者在这一段上逐字相同,而漏掉其中任何一行的后果都是「操作完了
+ * 一次模型调用都不会发生」:
+ *  - 不清 `blockedReason` / `capBlocked`:`--retry-blocked` 之后的语义全错;
+ *  - 不清 `startedAt`:面板照着它算出「172800 秒」(跨过了终端关闭的那整段时间);
+ *  - 不解开祖先:调度器拒绝挑选任何祖先被阻断/已终结的节点(reseat.ts 实测过),
+ *    而一个跑成功的 run 里 root 必然是 ACCEPTED —— `orchestrator.run()` 的第一句就返回。
+ *
+ * @returns 被一并放回可推进状态的祖先 id
+ */
+function reseatForRerun(
+  target: TaskNode,
+  byId: ReadonlyMap<string, TaskNode>,
+  opts: {
+    seatedAt: NodeStatus
+    now: string
+    warnings: string[]
+    redoFrom: PhaseName | undefined
+    skipPhase: PhaseName | undefined
+  },
+): string[] {
+  target.redoFrom = opts.redoFrom
+  target.skipPhase = opts.skipPhase
+  target.status = opts.seatedAt
+  target.blockedReason = ''
+  target.interrupted = false
+  target.capBlocked = false
+  target.capCategory = undefined
+  target.mergeConflict = false
+  // 失败点跟着清:它说的是「上一次是在哪一步倒下的」,而这个节点此刻正要重新起跑。
+  // 留着的话,一个重跑后因为**别的**原因(比如子节点阻断)停下的节点会带着旧失败点,
+  // 而快捷键会照它提供一个错的动作。commit() 也会清,这里是让纯函数的返回值就已经是对的。
+  target.failedAt = undefined
+  target.startedAt = undefined
+  target.updatedAt = opts.now
+  const reopened: string[] = []
+  let p = target.parentId === null ? undefined : byId.get(target.parentId)
+  const guard = new Set<string>([target.id])
+  while (p && !guard.has(p.id)) {
+    guard.add(p.id)
+    if (reopenAncestor(p, opts.now)) reopened.push(p.id)
+    p = p.parentId === null ? undefined : byId.get(p.parentId)
+  }
+  if (reopened.length > 0) {
+    opts.warnings.push(
+      `上级的 ${reopened.length} 个任务会重新做一次集成验收 —— ` +
+      `它们原来那句「子任务合起来达成了父目标」判的是旧产出`,
+    )
+  }
+  for (const n of byId.values()) {
+    if (n.id !== target.id && n.deps.includes(target.id)) reopenIfPropagated(n, opts.now)
+  }
+  return reopened
+}
+
+/**
  * 计算一次重做。**纯函数**:不碰盘、不碰 git、不改传进来的数组。
  *
  * 返回的 `nodes` 是一份新数组,里面的节点对象也是新的 —— 调用方拿到的是「重做之后的树
@@ -696,44 +904,22 @@ export function planRedo(
   }
 
   // ---- 各入口共通的清理 ----
-  /**
-   * 一次性的重入点标记,由 stepStart 在**第一轮**消费后立刻清掉。
-   *
-   * 只有质疑讨论用得上它 —— 其余入口靠 `status` 就能被 `advanceableKind` 分派到正确的
-   * step,而 CREATED 有两个可能的起点(分析 / 质疑讨论),必须多一个字才分得开。
-   *
-   * **每条入口都要写**,包括写成 undefined 的那几条:上一次质疑讨论重做留下的标记
-   * 不清掉的话,这次「任务重做」会跳过分析 —— 那正是它唯一要做的事。
-   */
-  target.redoFrom = entry === 'review' ? 'review' : undefined
-  target.status = seatedAt
-  target.blockedReason = ''
-  target.interrupted = false
-  target.capBlocked = false
-  target.capCategory = undefined
-  target.mergeConflict = false
-  // 和 reseat 同因:startedAt 会跨越终端关闭的整段时间,面板照着它算出「172800 秒」。
-  // 重做就是重新开始,下一个活动阶段由 commit() 重新盖章。
-  target.startedAt = undefined
-  target.updatedAt = now
-
-  // 上面那条链,和任何在等它的兄弟。不做这一步,重做出来的座位是**够不到**的。
-  let p = target.parentId === null ? undefined : byId.get(target.parentId)
-  const guard = new Set<string>([target.id])
-  while (p && !guard.has(p.id)) {
-    guard.add(p.id)
-    if (reopenAncestor(p, now)) reopenedAncestors.push(p.id)
-    p = p.parentId === null ? undefined : byId.get(p.parentId)
-  }
-  if (reopenedAncestors.length > 0) {
-    warnings.push(
-      `上级的 ${reopenedAncestors.length} 个任务会重新做一次集成验收 —— ` +
-      `它们原来那句「子任务合起来达成了父目标」判的是旧产出`,
-    )
-  }
-  for (const n of byId.values()) {
-    if (n.id !== target.id && n.deps.includes(target.id)) reopenIfPropagated(n, now)
-  }
+  reopenedAncestors.push(...reseatForRerun(target, byId, {
+    seatedAt, now, warnings,
+    /**
+     * 一次性的重入点标记,由 stepStart 在**第一轮**消费后立刻清掉。
+     *
+     * 只有质疑讨论用得上它 —— 其余入口靠 `status` 就能被 `advanceableKind` 分派到正确的
+     * step,而 CREATED 有两个可能的起点(分析 / 质疑讨论),必须多一个字才分得开。
+     *
+     * **每条入口都要写**,包括写成 undefined 的那几条:上一次质疑讨论重做留下的标记
+     * 不清掉的话,这次「任务重做」会跳过分析 —— 那正是它唯一要做的事。
+     */
+    redoFrom: entry === 'review' ? 'review' : undefined,
+    // 手工跳过是一次性的,而这次重做是用户重新做的选择:上一次「跳过验收」的标记留着的话,
+    // 他按 r 重跑执行环节,产出会**再一次**不经验收就合进集成分支,而屏幕上什么都没说。
+    skipPhase: undefined,
+  }))
 
   return {
     nodes: [...byId.values()],
@@ -744,6 +930,150 @@ export function planRedo(
     reopenedAncestors,
     warnings,
   }
+}
+
+/**
+ * 计算一次「跳过失败的环节,继续往下走」。**纯函数**,返回值形状和 `planRedo` 一样,
+ * 所以落盘那一侧(redoRun / commitRedo)一行都不用改。
+ *
+ * ## 跳过之后到底会跑什么
+ *
+ * | 失败环节 | 座位 | 跳过之后 | 模型调用 |
+ * |---|---|---|---|
+ * | 质疑讨论 | CREATED + redoFrom=review | 方案照用,直接往下走(执行型接执行,拆分型接集成验收) | 0 次评审 |
+ * | 测试验证 | READY(从执行循环**尾部**进) | 不再实跑测试,直接进验收 | 只有验收那一桌 |
+ * | 验收 | READY(同上) | 不再核对验收点,直接评分 → 合并 → 已验收 | 只有评分(配了才有) |
+ * | 集成验收 | WAITING_CHILDREN | 不再裁决「合起来达没达成父目标」,直接已验收 | 0 次 |
+ *
+ * 「从执行循环尾部进」是这里唯一一处需要 pipeline 配合的地方(`node.skipPhase` 为
+ * verify/accept 时跳过循环前半段)。少了它,跳过验收会**先重跑一次执行者** —— 而用户想跳过的
+ * 是判决,不是重做工作;那一轮还会改动代码,把他刚刚亲自看过的产出换成另一份。
+ */
+export function planSkip(
+  input: readonly TaskNode[],
+  targetId: string,
+  now: string,
+  ctx?: RedoContext,
+): RedoPlan | { error: string } {
+  const nodes = input.map(n => structuredClone(n) as TaskNode)
+  const byId = new Map(nodes.map(n => [n.id, n]))
+  const target = byId.get(targetId)
+  if (!target) return { error: `节点不存在: ${targetId}` }
+  // 授权判据只有这一份 —— 屏幕上按不动的东西不可能从别的门进去。
+  const why = skipFailedPhaseReason(target, ctx)
+  if (why) return { error: why }
+  const phase = failedPhaseOf(target)!
+
+  const warnings: string[] = []
+  const worktreesToRelease: { nodeId: string; branch: string; path: string }[] = []
+  let seatedAt: NodeStatus
+  if (phase === 'review') {
+    // 方案一个字不动 —— 跳过的是「有没有人质疑它」。
+    target.confirmedDraft = undefined
+    /**
+     * 执行型节点要连带做执行重做的那套重置,和 `planRedo` 的 review 入口逐字同因:
+     * 跳过评审之后走的是普通路由(`commit(READY)` → stepExecute),工作区会被重新 acquire、
+     * 执行者重跑。不做的话 execStatus 里还写着「我实现了 feature.ts」而没有任何重做注记。
+     */
+    if (!isDecomposed(target)) resetForExecute(target, worktreesToRelease)
+    seatedAt = 'CREATED'
+  } else if (phase === 'verify' || phase === 'accept') {
+    /**
+     * 返工计数清零。
+     *
+     * 测试验证失败是**记在 `iteration.acceptance` 上**的(它和验收共用一份预算),所以一个
+     * 「测试验证迭代超限」的节点带着已经用尽的验收预算 —— 跳过测试验证之后那一桌验收
+     * 只要不通过就当场再次阻断,一次返工机会都没有。清零并在摘要里说出来。
+     */
+    target.iteration = { ...target.iteration, acceptance: 0, scoring: 0, mergeResolve: 0 }
+    if (phase === 'accept') {
+      warnings.push('本节点的产出**不会有任何人核对**就合进集成分支 —— 这正是你按下这个键要的效果,但它没有回头路')
+    }
+    seatedAt = 'READY'
+  } else {
+    // integrate:子任务一个不动,直接判这个父节点通过。
+    target.iteration = { ...target.iteration, integration: 0, scoring: 0 }
+    const unfinished = target.childIds.filter(id => byId.get(id)?.status !== 'ACCEPTED')
+    if (unfinished.length > 0) {
+      // 不是错误:退回 WAITING_CHILDREN 之后调度器会先把这些子任务推完,再走到集成验收
+      // 那一步 —— 而那一步这次会被跳过。
+      warnings.push(`还有 ${unfinished.length} 个子任务没有验收通过,本节点会先等它们完成`)
+    }
+    warnings.push('「这些子任务合起来达成父目标了吗」这一问**这次不会有人回答** —— 当初拆漏了也不会在这里被发现')
+    seatedAt = 'WAITING_CHILDREN'
+  }
+
+  const reopenedAncestors = reseatForRerun(target, byId, {
+    seatedAt, now, warnings,
+    redoFrom: phase === 'review' ? 'review' : undefined,
+    skipPhase: phase,
+  })
+
+  return {
+    nodes: [...byId.values()],
+    deleted: [],
+    dependencyRewrites: [],
+    worktreesToRelease,
+    seatedAt,
+    reopenedAncestors,
+    warnings,
+  }
+}
+
+/** 跳过关口上那段摘要 —— 按下确认之前,把「这一跳换掉了什么」摊开。 */
+export function skipSummary(
+  plan: RedoPlan, target: TaskNode, phase: PhaseName, ctx?: RedoContext,
+): string[] {
+  const lines: string[] = []
+  lines.push(`跳过「${PHASE_LABEL[phase]}」—— 这个环节这次**不会发生**,也不会在记录里留一条通过`)
+  /**
+   * 跳过之后还会跑什么,**照实算**。
+   *
+   * 复用 `phaseChainText` 那份口径(它已经按本次配置过滤过:没配角色的测试验证/观察本来
+   * 就不存在),再把被跳掉的这一个从里面拿掉 —— 印一条包含它的链就是当场自相矛盾。
+   */
+  const entry: RedoEntry = phase === 'review' ? 'review' : phase === 'integrate' ? 'integrate' : 'execute'
+  const rest = phasesOf(entry, ctx, target).filter(p => p !== phase)
+  lines.push(rest.length > 0
+    ? `之后会跑: ${rest.map(p => PHASE_LABEL[p]).join(' → ')}`
+    : '之后没有别的环节了,本节点会直接判为已验收')
+  if (phase === 'verify' || phase === 'accept') {
+    // 这一条是这次跳过最容易被误解的地方:它**不重跑执行者**。
+    lines.push('执行环节不重跑 —— 你刚看过的那份产出原样往下走(执行者不会再改一遍代码)')
+  }
+  if (phase === 'review') {
+    lines.push('现有方案原样保留,没有任何人质疑它就进入下一步')
+  }
+  if (target.status === 'BLOCKED') lines.push('本节点从「已阻断」回到可推进状态')
+  lines.push('相关环节的返工计数清零 —— 后面的环节会重新占满一轮返工额度')
+  for (const w of plan.warnings) lines.push(`⚠ ${w}`)
+  return lines
+}
+
+/**
+ * 把用户补的那句提示词写到节点上。**纯函数式**:改的是传进来的那个节点对象(调用方给的
+ * 已经是 `planRedo` / `planSkip` 克隆出来的那份)。
+ *
+ * `scope` 是环节名,或者 `'all'`(给整个节点 —— 任务重做走的就是它)。空串 = 清掉这一条。
+ *
+ * **同一个键再写一次是替换。** 见 TaskNode.guidance:用户的说法是「塞新的提示词」,
+ * 追加会让两条互相打架,而模型看不出哪句更新。
+ */
+export function attachGuidance(
+  node: TaskNode, scope: PhaseName | 'all', text: string,
+): void {
+  // 按**码点**截,不是按 UTF-16 单元:`.slice` 会把一个 emoji 劈成两半,尾部留下一个孤立的
+  // 高代理,而它会原样进提示词(control.addDirective 踩过同一个坑)。
+  const t = Array.from(text.trim()).slice(0, MAX_GUIDANCE_CHARS).join('')
+  const next = { ...(node.guidance ?? {}) }
+  if (t.length === 0) delete next[scope]
+  else next[scope] = t
+  node.guidance = Object.keys(next).length > 0 ? next : undefined
+}
+
+/** 一次重做/跳过要把补充指引写到哪个键上。任务重做是整节点,阶段重做/跳过是那个环节。 */
+export function guidanceScopeFor(entry: RedoEntry, scope: RedoScope): PhaseName | 'all' {
+  return scope === 'task' ? 'all' : entry
 }
 
 /** 关口上那段摘要 —— 按下确认之前,把这次重做**做了什么、做不到什么**摊开。 */

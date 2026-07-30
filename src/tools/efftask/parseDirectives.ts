@@ -1,5 +1,5 @@
 // src/tools/efftask/parseDirectives.ts
-import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
+import { clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 import { applyRoleDefsToPhases, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
@@ -11,7 +11,9 @@ const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令
 { "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
   "skipSteps": ["要整个跳过的环节名"],
   "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化" },
-  "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }] }
+  "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }],
+  "phaseGuidance": { "环节名": "指令里点名给这个环节的那几句话" },
+  "roleGuidance": [{ "name": "角色名或员工名", "text": "指令里点名给这个人的那几句话" }] }
 phaseRoles 的值是**员工名**数组(可派发的身份)。
 圆桌通过门槛有两个字段,按用户的说法二选一:
 - 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
@@ -21,6 +23,11 @@ skipSteps:用户说「跳过X」「不做X」「X就不用了」时,把那个环
 caps.planConverge:分析环节多员工时怎么收敛 ——「各自出稿再融合」=圆桌,「一稿传下去改」=精化(默认)。
 roles 是**任务角色**定义 —— 指令里凡是描述了「某个角色在哪个阶段、产出什么、起什么作用、由谁担当」的,抽到这里。
 角色名可以任意(架构师、安全、前端);step 必须是那几个之一 —— 用户说的中文环节名对应关系:${PHASE_NAMES.map(x => `${PHASE_LABEL[x]}=${x}`).join('、')};staff 填员工名,没说由谁担当就省略。
+phaseGuidance / roleGuidance 是**定向注入**:指令里凡是「某个环节该怎么做」「某个人要注意什么」的话,原文抄进去,它会被拼进那个环节/那一席的提示词。
+- 判据是这句话**冲着谁说的**,不是它讲什么。「评审时重点看并发安全」→ phaseGuidance.review;「架构师要给出回滚方案」→ roleGuidance(name=架构师)。
+- 只抽**点了名**的。整体目标(「把登录改成 JWT」)不属于任何环节,留在目标里,不要抄进来 —— 抄进来等于让同一句话在每个环节的提示词里再出现一遍,白付钱。
+- 一句话同时点了环节和人(「让架构师在评审时看并发」)→ 放 roleGuidance,更具体的那个赢;不要两边都放。
+- 原文照抄,不要改写、不要补充、不要翻译。
 只抽指令里真的写了的,不要替用户补 output/purpose —— 缺项的角色会被明确地判为不生效。未提及的字段省略。指令:\n`
 
 function clampInt(v: unknown, min: number, max: number, fallback: number): number {
@@ -71,7 +78,7 @@ export async function parseDirectives(
   }
   if (!obj) return applyDefs(base, opts.baseRoleDefs ?? [])
 
-  if (obj.parallelism !== undefined) base.parallelism = clampInt(obj.parallelism, 1, 64, DEFAULT_PARALLELISM)
+  if (obj.parallelism !== undefined) base.parallelism = clampParallelism(obj.parallelism)
 
   const known = new Set(opts.knownRoles)
   const unsupported = new Set(opts.unsupportedRoles ?? [])
@@ -140,6 +147,71 @@ export async function parseDirectives(
     if (kept.length > 0) base.skipSteps = kept
   }
 
+  /**
+   * 定向注入(§定向注入)—— 提示词里点名给某个环节 / 某个人的那几句话。
+   *
+   * 归一到内部 phase 名,和 skipSteps 同一条规矩(落盘永远是内部名,中文只是输入别名)。
+   * 认不出来的环节名**说出来并猜一个**:静默丢弃的话,用户明明写了「评审时重点看并发安全」,
+   * 而评审员一个字都收不到,而且界面上没有任何地方能让他发现这件事。
+   */
+  const guide = (obj.phaseGuidance ?? {}) as Record<string, unknown>
+  if (guide && typeof guide === 'object' && !Array.isArray(guide)) {
+    const kept: Partial<Record<PhaseName, string>> = {}
+    for (const [rawKey, rawVal] of Object.entries(guide)) {
+      const text = typeof rawVal === 'string' ? rawVal.trim() : ''
+      if (text.length === 0) continue
+      const key = rawKey.trim()
+      const v = STEP_ALIASES[key] ?? key
+      if (!(PHASE_NAMES as string[]).includes(v)) {
+        const guess = guessStep(key)
+        base.notices.push(
+          `你对「${key}」提的那段要求没有对应的环节(合法值:${PHASE_NAMES.map(x => PHASE_LABEL[x]).join('/')}),` +
+          `这段话不会进任何提示词` + (guess ? `。是不是想写「${guess}」?` : ''),
+        )
+        continue
+      }
+      const phase = v as PhaseName
+      // 同一个环节被点两次就接起来 —— 覆盖会静默丢掉前一条,而两条都是用户亲手写的。
+      const prev = kept[phase]
+      kept[phase] = prev ? `${prev}\n${text}` : text
+    }
+    /**
+     * 点给一个**这次不会跑**的环节:说出来。
+     *
+     * 「测试验证时要跑 bun test」+ 没配 verify 角色 = 这段话永远不会被任何人读到,
+     * 而用户以为自己已经安排好了。判据和 phaseRuns 一致(只有 verify/observer 是
+     * 「没配角色就整个不存在」),skipSteps 那一侧也一起判。
+     */
+    for (const phase of Object.keys(kept) as PhaseName[]) {
+      if ((base.skipSteps ?? []).includes(phase)) {
+        base.notices.push(`你对「${PHASE_LABEL[phase]}」提的那段要求不会生效:这次运行整个跳过了这个环节`)
+      } else if ((phase === 'verify' || phase === 'observer') && base.phaseRoles[phase].length === 0) {
+        base.notices.push(`你对「${PHASE_LABEL[phase]}」提的那段要求不会生效:没给这个环节配角色,它这次不会发生`)
+      }
+    }
+    if (Object.keys(kept).length > 0) base.phaseGuidance = kept
+  }
+  if (Array.isArray(obj.roleGuidance)) {
+    const kept: { name: string; text: string }[] = []
+    /**
+     * 名字对不上任何一个席位时**说出来并列出真名**。
+     *
+     * 席位来源是本次真实名册(`base.phaseRoles`)+ 角色定义 —— 也就是 `seatMatchesName`
+     * 那侧真正会比的两个字段。对不上就是这段话谁也读不到,而这正是「配得进去、永远不生效」
+     * 那一类。角色定义还没合并进来(在下面),所以这里只拿名册比,合并后的角色名在
+     * `applyDefs` 之后已经落到席位的 roleTag 上 —— 见下面那一段。
+     */
+    for (const raw of obj.roleGuidance) {
+      if (!raw || typeof raw !== 'object') continue
+      const r = raw as Record<string, unknown>
+      const name = typeof r.name === 'string' ? r.name.trim() : ''
+      const text = typeof r.text === 'string' ? r.text.trim() : ''
+      if (name.length === 0 || text.length === 0) continue
+      kept.push({ name, text })
+    }
+    if (kept.length > 0) base.roleGuidance = kept
+  }
+
   const caps = (obj.caps ?? {}) as Record<string, unknown>
   const c: Caps = { ...base.caps }
   if (caps.maxDepth !== undefined) c.maxDepth = clampInt(caps.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth)
@@ -172,5 +244,31 @@ export async function parseDirectives(
   // true:提示词是覆盖配置文件的那一层,「改由 X 担任」必须真的是「改」。
   const merged = mergeRoleDefs(opts.baseRoleDefs ?? [], fromPrompt.defs, true)
   base.notices.push(...merged.notices)
-  return applyDefs(base, merged.defs)
+  const cfg = applyDefs(base, merged.defs)
+  /**
+   * 点名给某个角色/员工的那段话,**名字对不上任何一席就说出来**。
+   *
+   * 判在 applyDefs **之后**:角色名是在那一步落到席位的 `roleTag` 上的,提前判会把每一个
+   * 按角色名点的人都误报成「找不到」。比的两个字段和 `pipeline.seatMatchesName` 逐字一致
+   * (roleTag / roleName),否则屏幕说找得到而提示词里没有,或者反过来。
+   *
+   * 不静默丢弃的理由和别处一样,但这一条尤其容易发生:用户写的是「架构师注意回滚」,
+   * 而他的名册里那个角色叫「架构评审」—— 没有这条 notice,那段话谁也读不到,
+   * 而关口上一切正常。
+   */
+  const seatNames = new Set<string>()
+  for (const seats of Object.values(cfg.phaseRoles)) {
+    for (const s of seats) {
+      if (s.roleTag) seatNames.add(s.roleTag.trim().toLowerCase())
+      if (s.roleName) seatNames.add(s.roleName.trim().toLowerCase())
+    }
+  }
+  const unmatched = (cfg.roleGuidance ?? []).filter(g => !seatNames.has(g.name.trim().toLowerCase()))
+  for (const g of unmatched) {
+    cfg.notices.push(
+      `你点名给「${g.name}」的那段要求不会生效:本次名册里没有这个角色或员工` +
+      (seatNames.size > 0 ? `(名册上是:${[...seatNames].join('、')})` : '(本次名册为空,所有环节都由主模型兼任)'),
+    )
+  }
+  return cfg
 }

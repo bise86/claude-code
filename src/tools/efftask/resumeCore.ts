@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES } from './types.js'
+import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
@@ -395,6 +395,43 @@ export function validateLoadedNodes(
       repairs.push(`节点 ${n.id}:重做入口 ${String(n.redoFrom)} 不是合法环节名,已清除`)
       n.redoFrom = undefined
     }
+    // 失败点。和 capCategory / redoFrom 同因:node.md 可手工编辑,而这个字段决定
+    // 「快速重做失败环节」和「跳过失败环节」这两个键**做什么**。垃圾值清掉之后退化成
+    // 「看不出是哪一步失败的」,那时界面会照实说,而不是按一个不存在的状态去派发。
+    if (n.failedAt !== undefined && !LEGAL_STATUS.has(n.failedAt as string)) {
+      repairs.push(`节点 ${n.id}:失败点 ${String(n.failedAt)} 不是合法状态名,已清除`)
+      n.failedAt = undefined
+    }
+    /**
+     * 手工跳过的那一个环节。**白名单比 PHASE_NAMES 更窄**,而这不是洁癖:
+     * `skipPhase: 'execute'` 会让这个节点一行代码都不写就走到验收,
+     * `skipPhase: 'plan'` 会让它带着空方案进评审 —— 两者都是「跳过 ≠ 放弃」那条界线的另一侧,
+     * 而这个字段只有一条来路(用户在跳过关口上按的那一下),那条来路只产出这四个值。
+     */
+    if (n.skipPhase !== undefined && !SKIPPABLE_PHASES.has(n.skipPhase as string)) {
+      repairs.push(`节点 ${n.id}:要跳过的环节 ${String(n.skipPhase)} 不在可跳过之列,已清除`)
+      n.skipPhase = undefined
+    }
+    /**
+     * 补充指引。它**会被原样拼进提示词**,所以这里逐条过:键必须是合法环节名或 `all`,
+     * 值必须是非空字符串,并按码点夹到上限。
+     *
+     * 不校验的后果不是崩,是更糟的那种:`guidance: {execute: {a: 1}}` 会被
+     * `String(obj)` 变成「[object Object]」发给执行者,而屏幕上那一段看起来像一句正常的
+     * 补充指引。按 UTF-16 截同样不行 —— 会把 emoji 劈成半个代理对原样进提示词。
+     */
+    if (n.guidance !== undefined) {
+      const raw = (n.guidance && typeof n.guidance === 'object' ? n.guidance : {}) as Record<string, unknown>
+      const clean: Record<string, string> = {}
+      let dropped = 0
+      for (const [k, v] of Object.entries(raw)) {
+        const legal = k === 'all' || (PHASE_NAMES as string[]).includes(k)
+        if (!legal || typeof v !== 'string' || v.trim().length === 0) { dropped++; continue }
+        clean[k] = Array.from(v.trim()).slice(0, MAX_GUIDANCE_CHARS).join('')
+      }
+      if (dropped > 0) repairs.push(`节点 ${n.id}:${dropped} 条补充指引的环节名或内容不合法,已清除`)
+      n.guidance = Object.keys(clean).length > 0 ? (clean as TaskNode['guidance']) : undefined
+    }
     // 根方案关口 (spec §2 第三关) 的确认结果。Reachable on disk when the run was aborted
     // before the root's first commit consumed it, so it must survive — but it is also the one
     // field that SKIPS the plan phase, and a malformed one would send an empty plan straight
@@ -617,7 +654,7 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
 
   if (typeof fm.goalPrompt === 'string' && fm.goalPrompt.length > 0) base.goalPrompt = fm.goalPrompt
   else degraded.push('run.md 缺少 goalPrompt(原始目标),整体验收将无法判定')
-  base.parallelism = clampInt(fm.parallelism, 1, 64, DEFAULT_PARALLELISM)
+  base.parallelism = clampParallelism(fm.parallelism)
 
   const caps = (fm.caps ?? {}) as Record<string, unknown>
   const rebuilt: Caps = {
@@ -727,6 +764,43 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
       else degraded.push(`run.md 里的跳过环节「${String(raw)}」不是合法环节名,已忽略(该环节会照常运行)`)
     }
     if (kept.length > 0) base.skipSteps = kept
+  }
+
+  /**
+   * 定向注入(§定向注入)。**必须读回** —— writeRunManifest 整文件重写 run.md,一个只写不读的
+   * 字段会在第一次 `--resume` 时清零:恢复后的名册一模一样,而模型收到的东西变了,
+   * 而界面上没有任何地方能让用户发现。`roleDefs` 和 `resumes` 都为这条注释付过学费。
+   *
+   * 手改 run.md 是一条绕开 parseDirectives 全部校验的路,所以归一 + 白名单 + 夹取都要
+   * 在这里重做一遍。这两个字段会被**原样拼进提示词**,所以类型也要逐个过:
+   * `phaseGuidance: {review: 12}` 会以「12」的形状发给评审员,而屏幕上看不出来。
+   */
+  if (fm.phaseGuidance && typeof fm.phaseGuidance === 'object' && !Array.isArray(fm.phaseGuidance)) {
+    const kept: Partial<Record<PhaseName, string>> = {}
+    for (const [rawKey, rawVal] of Object.entries(fm.phaseGuidance as Record<string, unknown>)) {
+      const v = STEP_ALIASES[rawKey] ?? rawKey
+      const text = typeof rawVal === 'string' ? rawVal.trim() : ''
+      if (!(PHASE_NAMES as string[]).includes(v) || text.length === 0) {
+        degraded.push(`run.md 里给「${String(rawKey)}」的那段定向要求不合法,已忽略(它不会进任何提示词)`)
+        continue
+      }
+      kept[v as PhaseName] = Array.from(text).slice(0, MAX_GUIDANCE_CHARS).join('')
+    }
+    if (Object.keys(kept).length > 0) base.phaseGuidance = kept
+  }
+  if (Array.isArray(fm.roleGuidance)) {
+    const kept: { name: string; text: string }[] = []
+    for (const raw of fm.roleGuidance) {
+      const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+      const name = typeof r.name === 'string' ? r.name.trim() : ''
+      const text = typeof r.text === 'string' ? r.text.trim() : ''
+      if (name.length === 0 || text.length === 0) {
+        degraded.push('run.md 里有一条定向要求缺角色名或内容,已忽略')
+        continue
+      }
+      kept.push({ name, text: Array.from(text).slice(0, MAX_GUIDANCE_CHARS).join('') })
+    }
+    if (kept.length > 0) base.roleGuidance = kept
   }
 
   base.notices = Array.isArray(fm.notices) ? fm.notices.filter((n): n is string => typeof n === 'string') : []

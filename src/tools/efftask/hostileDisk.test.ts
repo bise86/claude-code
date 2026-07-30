@@ -117,6 +117,17 @@ function richNode(): TaskNode {
   // 手工重做的一次性重入点。和 confirmedDraft 同类:一个持久化的标志选 step **内部**的
   // 入口,而 node.md 是可手工编辑的 —— 一个垃圾值决定节点从哪个环节重入。
   n.redoFrom = 'review'
+  /**
+   * 失败点、手工跳过的环节、补充指引 —— 这三个都是**决定接下来跑什么**的字段,而且都是
+   * 新的敌意输入面:
+   *  - `failedAt` 决定「快速重做失败环节」和「跳过失败环节」这两个键做什么;
+   *  - `skipPhase` 能让一个节点跳过验收直接合进集成分支;
+   *  - `guidance` 会被**原样拼进提示词**,一个非字符串值会以「[object Object]」的形状
+   *    发给执行者,而屏幕上那一段看起来像一句正常的补充指引。
+   */
+  n.failedAt = 'ACCEPTANCE'
+  n.skipPhase = 'accept'
+  n.guidance = { all: '别动 src/legacy', execute: '先跑一遍 bun test' }
   n.worktree = { branch: 'b', path: '/wt/root' }
   n.startedAt = NOW
   n.score = {

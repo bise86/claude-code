@@ -932,3 +932,70 @@ describe('--resume 带进来的节点:输出页卡要说清为什么是空的', 
     expect(f).toContain('Esc/q 返回任务树')
   })
 })
+
+describe('输出页卡的页脚要跟着 ↑↓ 的含义变', () => {
+  /**
+   * ↑↓ 在这一屏有两个含义(折叠时选阶段、展开时滚内容),而页脚原来无条件写着
+   * 「↑↓/jk 滚动」。这个仓库为「页脚上写着的键按了没反应」已经付过两次学费
+   * (日志窗写「Tab 切换环节」而 Tab 早让给了区切换;页签条写着回车进入而代码里没有分支
+   * 接住)。这一条守的是同一件事的第三次。
+   */
+  const closedLog = () => {
+    const store = createStreamStore()
+    const h = store.open({ nodeId: 'root', phaseLabel: '执行', label: '甲员工' })
+    for (let i = 0; i < 40; i++) h.push({ kind: 'text', text: `输出第${i}行` })
+    h.end()
+    return store.streams('root')
+  }
+
+  const mountLog = async (streams: unknown) => {
+    const t = fakeTty(30, 100)
+    const app = await render(
+      React.createElement(NodeDetail as never, {
+        node: fatNode(), elapsed: '1m', columns: 100, maxRows: 26,
+        logActive: true, initialTab: 'log', streams,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    return { t, app }
+  }
+
+  it('选中的是折叠的流 → 写「选阶段」,而且说清空格之后会变成滚动', async () => {
+    const { t, app } = await mountLog(closedLog())
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('↑↓/jk 选阶段')
+    expect(f).toContain('空格 展开')
+    expect(f).not.toContain('↑↓/jk 滚动')
+  })
+
+  it('空格展开之后 → 改写「滚动」,并说清怎么回到选阶段', async () => {
+    const { t, app } = await mountLog(closedLog())
+    t.reset()
+    t.stdin.press(' ')
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    /**
+     * 断言落在**两条文案第一处不同的地方之后**。
+     *
+     * 这个渲染器只写增量,而两条页脚的公共前缀(`… Tab 到页签 · ↑↓/jk `)一个字节都不会
+     * 被重写 —— 拿 `↑↓/jk 滚动` 做断言会恒假。实测重画出来的正是
+     * 「滚动 · 空格 收起(回到选阶段) · n 下一条 · g/G」这一截。
+     */
+    expect(f).toContain('滚动 · 空格 收起')
+    expect(f).toContain('回到选阶段')
+  })
+
+  it('正在跑的流(默认展开)第一帧就写「滚动」—— 不许先说错再改口', async () => {
+    // 页脚的种子和窗口挂载那一刻的判据是同一份(logPaneMode + foldedStreams)。
+    // 各算一份的话第一帧写的是「选阶段」,下一帧才纠正 —— 而那次纠正还会多写一帧,
+    // 把详情页那条「不超预算」的行数断言顶掉 1 行(实测)。
+    const { t, app } = await mountLog(withLog(40))
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('↑↓/jk 滚动')
+    expect(f).not.toContain('↑↓/jk 选阶段')
+  })
+})

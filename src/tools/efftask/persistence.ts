@@ -370,6 +370,11 @@ export async function writeRunManifest(
     // 读的是一个不存在的键:恢复之后所有跳过失效,评审/验收席位复活(0 席 = 主模型顶上),
     // 用户毫不知情地为一次恢复付了说好不付的钱。
     ...(cfg.skipSteps && cfg.skipSteps.length > 0 ? { skipSteps: cfg.skipSteps } : {}),
+    // 定向注入(§定向注入)。同一条白名单规矩:不加进来就永远写不出去,而 --resume 之后
+    // 「评审时重点看并发安全」这句话会**静默消失** —— 名册一模一样,评审员收到的东西变了,
+    // 而界面上没有任何地方能让用户发现。roleDefs 和 skipSteps 都是为这条注释付过学费的。
+    ...(cfg.phaseGuidance && Object.keys(cfg.phaseGuidance).length > 0 ? { phaseGuidance: cfg.phaseGuidance } : {}),
+    ...(cfg.roleGuidance && cfg.roleGuidance.length > 0 ? { roleGuidance: cfg.roleGuidance } : {}),
     // 独立于 status 落盘 —— 见 EffTaskConfig.pendingHandoff:status 先写下 completed 而
     // 集成分支还没处置,用户直接关终端就再也没人管那条分支了。
     ...(cfg.pendingHandoff ? { pendingHandoff: cfg.pendingHandoff } : {}),

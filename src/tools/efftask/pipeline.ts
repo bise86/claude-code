@@ -182,6 +182,21 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
       node.phaseMs = { ...(node.phaseMs ?? {}), [prev]: (node.phaseMs?.[prev] ?? 0) + (now - since) }
     }
   }
+  /**
+   * 失败点(`TaskNode.failedAt`)—— 「是哪个环节失败的」。
+   *
+   * 收在 commit 里,因为每一次 BLOCKED 都必经它,而它是**唯一还看得见上一个状态**的地方:
+   * 到了 blockWithReason 的调用点,`node.status` 已经要被改写成 BLOCKED,那个信息就没了。
+   *
+   * 两个方向都写:任何非阻断的推进都把它清掉,所以一个被重做过、又因为**别的**原因
+   * (比如子节点阻断)停下的节点不会带着上一次的失败点 —— 那会让快捷键提供一个错的动作。
+   *
+   * `prev !== 'BLOCKED'` 这一条挡的是「已经阻断的节点又被 block 一次」:那时候 prev 就是
+   * BLOCKED,记上去等于把失败点抹成一个没有环节含义的值。
+   */
+  if (status === 'BLOCKED') {
+    if (prev !== 'BLOCKED') node.failedAt = prev
+  } else node.failedAt = undefined
   node.status = status
   // Stamped ONCE, on the first active phase. Re-stamping would restart the clock on every
   // rework round and under-report exactly the nodes a user is looking for.
@@ -192,6 +207,10 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
   } catch (e) {
     node.status = 'BLOCKED'
     node.blockedReason = `状态持久化失败: ${e instanceof Error ? e.message : String(e)}`
+    // 这条路上失败点刚被上面那个 else 清掉了(它当时以为这是一次正常推进)。要补回来 ——
+    // 记的是**它正要进入的那个环节**:落盘失败发生在进入 status 的路上,而重做要重跑的
+    // 正是那一步。
+    if (status !== 'BLOCKED') node.failedAt = status
     safeUpdate(ctx)
     return false
   }
@@ -880,8 +899,22 @@ function integrateBriefPhase(node: TaskNode): PhaseName {
  * 是显式早退,而席位**保持原样**(清空还会让关口说「未配置」而不是「已跳过」,并误触发
  * integrateSeats 的回落)。
  */
-function isSkipped(ctx: PipelineCtx, phase: PhaseName): boolean {
-  return (ctx.config.skipSteps ?? []).includes(phase)
+function isSkipped(ctx: PipelineCtx, phase: PhaseName, node?: TaskNode): boolean {
+  return (ctx.config.skipSteps ?? []).includes(phase) || node?.skipPhase === phase
+}
+
+/**
+ * 消费掉一次性的手工跳过标记。
+ *
+ * 由下一次 `commit()` 顺手落盘(serializeNode 整节点倾倒)。**在跳过分支的里面**清,不是
+ * 在 step 的开头:开头清掉的话,同一个 step 里后面那句 `isSkipped(…, node)` 就变成 false,
+ * 环节照跑 —— 而用户以为自己跳过了它。
+ *
+ * `node` 只传给那四个可跳过的环节(见 SKIPPABLE_PHASES)。分析和执行那两处**故意不传**:
+ * 结构上就不可能被一个手改的 node.md 骗到。
+ */
+function consumeSkip(node: TaskNode, phase: PhaseName): void {
+  if (node.skipPhase === phase) node.skipPhase = undefined
 }
 
 function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
@@ -935,7 +968,7 @@ async function runPlanRoundtable(
     seats,
     seat => runPhase(ctx, {
       phase: 'plan', node, role: seat, system: 'plan',
-      prompt: planPrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, 'plan')),
+      prompt: planPrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'plan', node)),
       signal: ctx.signal,
     }, { phaseLabel: PHASE_LABEL.plan, round: node.iteration.planReview + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model }),
     ctx.slots,
@@ -961,7 +994,7 @@ async function runPlanRoundtable(
   const fuseTag = answerTag(ANSWER_TAGS.plan)
   const fused = await runPhase(ctx, {
     phase: 'plan', node, role: fuseSeat, system: 'plan',
-    prompt: fusePrompt(node, ctx, fuseTag, feedback, seatBrief(ctx, fuseSeat, 'plan'), drafts.map(d => d.parsed)),
+    prompt: fusePrompt(node, ctx, fuseTag, feedback, seatPreamble(ctx, fuseSeat, 'plan', node), drafts.map(d => d.parsed)),
     signal: ctx.signal,
   }, { phaseLabel: '方案融合', round: node.iteration.planReview + 1, label: (fuseSeat?.roleName || fuseSeat?.roleTag) || '主模型', model: fuseSeat?.model })
   if (!fused.ok) {
@@ -1030,7 +1063,7 @@ async function runPlanRefinement(
     )
     const res = await runPhase(ctx, {
       phase: 'plan', node, role: seat, system: 'plan',
-      prompt: planPrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, 'plan') + priorDraft),
+      prompt: planPrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'plan', node) + priorDraft),
       signal: ctx.signal,
     }, { phaseLabel: i === 0 ? PHASE_LABEL.plan : '方案精化', round: node.iteration.planReview + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model })
     if (!res.ok) {
@@ -1059,6 +1092,107 @@ async function runPlanRefinement(
 function seatBrief(ctx: { config: EffTaskConfig }, seat: RoleBinding | null, phase: PhaseName): string {
   const b = roleBriefFor(ctx.config.roleDefs ?? [], seat, phase)
   return b ? b + '\n\n' : ''
+}
+
+/**
+ * 裁决类环节 —— 它们判的是**别人干的活**。
+ *
+ * 定向注入要按这条线分流:一句「别动 src/legacy」给了执行者却没给验收员,后果是实测过的
+ * 那条死循环(见 JUDGE_NOTE)。所以裁决席位看得到**全部**指引,而不只是点名给它自己的那条。
+ */
+const JUDGING_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['review', 'verify', 'accept', 'integrate', 'observer'])
+
+/** 一段指引,带标题。空内容返回空串 —— 空槽会让模型努力去理解一个不存在的要求。 */
+function guidanceBlock(title: string, text: string | undefined): string {
+  const t = (text ?? '').trim()
+  return t.length === 0 ? '' : `${title}\n${quote(t)}\n`
+}
+
+/**
+ * **定向注入** —— 这一席这次该额外读到什么。
+ *
+ * 三个来源,同一个出口:
+ *  1. `config.phaseGuidance[phase]` —— 用户在 `/et` 提示词里点名给这个环节的话(§定向注入);
+ *  2. `config.roleGuidance[]` 里名字对得上这一席的(角色名或员工名);
+ *  3. `node.guidance` —— 重做/跳过时用户补给**这个节点**的话(`all` 是给整个节点的)。
+ *
+ * ## 为什么裁决席位看得到全部
+ *
+ * 一句只给执行者的补充会让验收员拿着**补话之前**定下的验收点对照产出:该改的没改 → 判不通过
+ * → 返工 → 执行者下一轮同时拿到用户那句话和「方案要求改 legacy,未见改动」,两条直接打架 →
+ * 撞满 maxIterations 阻断。**用户自己那句纠正成了这个节点失败的直接原因**,而屏幕上没有任何
+ * 东西会让他把这两件事联系起来。`JUDGE_NOTE` 是同一个坑的第一次(运行中追加指令),
+ * 这里是第二次,用的是同一份解法。
+ *
+ * ## 为什么这一切挂在 seatPreamble 上
+ *
+ * 七个环节的提示词构造函数**每一个**都已经收一个 `brief` 参数并把它放在最前面。挂在这里,
+ * 十二个调用点是机械替换、一个都跑不掉;另开一条通道的话,漏掉的那个环节就是一个
+ * 「配得进去、永远到不了」的功能 —— 这个仓库为这一类漏接线付过三次学费(onEscalate、
+ * onBlocked、openStream 各一次)。
+ */
+export function seatPreamble(
+  ctx: { config: EffTaskConfig }, seat: RoleBinding | null, phase: PhaseName, node?: TaskNode,
+  /**
+   * 到哪个环节下面去找**这一席的角色简报** —— 默认就是 `phase`。
+   *
+   * 只有集成验收需要分开,而它必须分开:没配「集成提交」席位时那一场由**验收席位**承担
+   * (见 integrateSeats),所以简报要去 accept 底下找,否则会去翻一份不存在的角色定义。
+   * 但定向注入跟着的是**这一轮是哪一关**,不是席位从哪儿借来的:用户写「集成验收时要
+   * 逐条核对验收点」,而借用了验收席位就收不到,那句话谁也读不到 —— 实测过。
+   */
+  briefPhase: PhaseName = phase,
+): string {
+  const out: string[] = []
+  const brief = seatBrief(ctx, seat, briefPhase)
+  const judging = JUDGING_PHASES.has(phase)
+  // 环节定向:裁决席位额外读到给**执行侧**(分析/执行)的那几条 —— 见上面的说明。
+  const phasesToShow: PhaseName[] = judging ? [phase, 'plan', 'execute'] : [phase]
+  const seen = new Set<string>()
+  for (const p of phasesToShow) {
+    if (seen.has(p)) continue
+    seen.add(p)
+    const label = p === phase ? `针对「${PHASE_LABEL[p]}」的额外要求(来自本次任务提示词):`
+      : `用户对「${PHASE_LABEL[p]}」环节提的额外要求(执行侧已收到,你按补充后的意图判):`
+    out.push(guidanceBlock(label, ctx.config.phaseGuidance?.[p]))
+  }
+  // 角色定向:名字对得上这一席的(角色名或员工名 —— 用户两种说法都用)。
+  for (const g of ctx.config.roleGuidance ?? []) {
+    if (!seatMatchesName(seat, g.name)) continue
+    out.push(guidanceBlock(`点名给你(${g.name})的额外要求(来自本次任务提示词):`, g.text))
+  }
+  // 节点定向:重做/跳过时用户补给这个节点的话。
+  if (node?.guidance) {
+    out.push(guidanceBlock('用户对本任务补充的指引(优先级高于原方案的枝节):', node.guidance.all))
+    const nodePhases: PhaseName[] = judging ? [phase, 'plan', 'execute'] : [phase]
+    const seenNode = new Set<string>()
+    for (const p of nodePhases) {
+      if (seenNode.has(p)) continue
+      seenNode.add(p)
+      const label = p === phase
+        ? `用户对本任务的「${PHASE_LABEL[p]}」这一步补充的指引:`
+        : `用户对本任务的「${PHASE_LABEL[p]}」这一步补充的指引(执行侧已收到,你按补充后的意图判):`
+      out.push(guidanceBlock(label, node.guidance[p]))
+    }
+  }
+  const targeted = out.filter(x => x.length > 0)
+  if (targeted.length === 0) return brief
+  // 裁决席位多一句「以补充后的意图为准」。少了它,上面那段实测的死循环照旧发生 ——
+  // 看得到不等于知道该拿它当什么。
+  return brief + targeted.join('') + (judging ? JUDGE_NOTE : '') + '\n'
+}
+
+/**
+ * 这一席是不是被这个名字点到了。
+ *
+ * 角色名和员工名都比:用户会说「架构师要注意 X」(角色)也会说「让 opus-架构 注意 X」(员工)。
+ * ASCII 名不分大小写(员工名常是 `gpt5-方案` 这种手打的标识),中文没有大小写、不受影响。
+ */
+function seatMatchesName(seat: RoleBinding | null, name: string): boolean {
+  const want = name.trim().toLowerCase()
+  if (want.length === 0 || !seat) return false
+  return (seat.roleTag ?? '').trim().toLowerCase() === want
+    || (seat.roleName ?? '').trim().toLowerCase() === want
 }
 
 // Re-entering a finished node would append a second verdict log and could flip a BLOCKED
@@ -1094,7 +1228,10 @@ function judgeGuidance(ctx: Pick<PipelineCtx, 'config' | 'control'>): string {
 }
 
 const JUDGE_NOTE =
-  '(用户在运行中补充的约束**优先于原方案的枝节**:执行者按它做了而原方案里没有、' +
+  // **不写「在运行中」。** 这一句现在有三个来源:恢复时补的续跑指引、运行中追加的指令、
+  // 以及提示词/重做时的定向注入。写死「运行中」会让后两种场景下的这句话本身就是假的,
+  // 而它正是要求裁决席位改变判据的那句话 —— 一条自称说错了来源的指令最容易被无视。
+  '(用户补充的约束**优先于原方案的枝节**:执行者按它做了而原方案里没有、' +
   '或原方案里有而按它跳过了,都不算未完成 —— 请按补充后的意图判。)\n'
 
 function guidanceSection(ctx: Pick<PipelineCtx, 'config' | 'control'>): string {
@@ -1252,10 +1389,13 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       lastChildren = parsed.children
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     }
-    if (isSkipped(ctx, 'review')) {
+    if (isSkipped(ctx, 'review', node)) {
       // 名册上还挂着评审员,记录却一片空白 —— 不写一行的话,这在 node.md 上读起来像
       // 「跑了但记录丢了」。写「已跳过」是为了让这两件事在事后追责时分得开。
-      noteOnNode(node, '质疑讨论环节已跳过:本节点的方案没有经过任何评审')
+      noteOnNode(node, node.skipPhase === 'review'
+        ? '质疑讨论环节被手工跳过(用户在阻断后按了跳过):本节点的方案没有经过任何评审'
+        : '质疑讨论环节已跳过:本节点的方案没有经过任何评审')
+      consumeSkip(node, 'review')
     } else {
     const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog), node.iteration.planReview + 1)
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
@@ -1263,7 +1403,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       system: 'review',
       // 一轮算一次,不是一席算一次:reviewLog 在这一轮之内不变。
       buildPrompt: (tag, seat) =>
-        reviewPrompt(node, ctx, tag, seatBrief(ctx, seat, 'review'), reviewNotice, node.iteration.planReview + 1, caps.maxIterations),
+        reviewPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'review', node), reviewNotice, node.iteration.planReview + 1, caps.maxIterations),
       ctx,
     })
     node.reviewLog.push(rec)
@@ -1490,7 +1630,7 @@ async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
     seats,
     seat => runPhase(ctx, {
       phase: 'observer', node, role: seat, system: 'observer',
-      prompt: scorePrompt(node, tag, seatBrief(ctx, seat, 'observer')), signal: ctx.signal,
+      prompt: scorePrompt(node, tag, seatPreamble(ctx, seat, 'observer', node)), signal: ctx.signal,
       cwd: node.worktree?.path,
     }, { phaseLabel: PHASE_LABEL.observer, round: node.iteration.scoring + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model }),
     ctx.slots,
@@ -1725,7 +1865,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           // node that had used its normal rounds became un-resumable the moment it hit a
           // conflict — measured "恢复时该阶段预算已耗尽(3/3)" on a node whose card had just
           // told the user to resume it. The rework budget must mean rework.
-          if (isSkipped(ctx, 'accept')) {
+          if (isSkipped(ctx, 'accept', node)) {
             // 跳过验收的第三个调用点(自动解冲突后的复验)。
             //
             // **必须和通过分支走同一个出口** `return mergeAndRelease(node, ctx, true)`,
@@ -1739,11 +1879,12 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
             // triedThisRun=true 也不能漏:漏了的话重入时 attempted 停在 false,升级卡会说
             // 「自动解决机会已在此前用完,本次未再尝试」,而本次实实在在跑了一次解冲突。
             noteOnNode(node, '自动解决冲突后的复验已跳过')
+            consumeSkip(node, 'accept')
             return mergeAndRelease(node, ctx, true)
           }
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
             phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
-            system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
+            system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatPreamble(ctx, seat, 'accept', node)), ctx, cwd: node.worktree.path,
           })
           node.acceptLog.push(rec)
           if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
@@ -1823,6 +1964,27 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
 export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
+  /**
+   * 手工跳过测试验证 / 验收时,**从执行循环的尾部进来** —— 不重跑执行者。
+   *
+   * 用户要跳过的是**判决**,不是重做工作。少了这一支,「跳过验收」会先派一次执行者:
+   * 多花一次最贵的调用,而且它会改动代码 —— 把用户刚刚亲自看过、决定放行的那份产出,
+   * 换成另一份没人看过的。
+   *
+   * **必须算在 acquire 之前。** 下面那句 `if (ctx.worktrees && !node.worktree)` 会给一个
+   * 没有工作区引用的节点**新建**一个(基于集成分支 tip,里面一个字节的产出都没有),
+   * 之后 `node.worktree` 就非空了 —— 判据当场失真,而后果是把一个空工作区合进集成分支
+   * 并判「已验收」。
+   *
+   * 拿不到工作区时**退化成正常跑一轮**(而不是硬着头皮跳),并且说出来:关口那侧
+   * (skipFailedPhaseReason)已经用同一条判据挡在前面了,这里是纵深防御。
+   */
+  const skipsJudge = node.skipPhase === 'verify' || node.skipPhase === 'accept'
+  let enterAtJudge = skipsJudge && (ctx.worktrees === undefined || node.worktree !== undefined)
+  if (skipsJudge && !enterAtJudge) {
+    noteOnNode(node, `要跳过${PHASE_LABEL[node.skipPhase!]},但本节点的隔离工作区引用已经不在了 —— ` +
+      `跳过它会把一个空工作区合进集成分支,所以这一轮仍然重跑执行环节`)
+  }
   // Isolation is a HARD gate, not a preference. Without a worktree this node would execute
   // with write tools in the user's real checkout — concurrently with others once the execute
   // mutex is lifted. Refusing is the only safe answer; the run degrades node by node, and
@@ -1854,10 +2016,11 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   // survives — so it is judged before it merges, exactly as an auto-resolution is.
   if (node.mergeConflict && node.worktree) {
     node.mergeConflict = false
-    if (isSkipped(ctx, 'accept')) {
+    if (isSkipped(ctx, 'accept', node)) {
       // 跳过验收的第二个调用点。人手改过的冲突解决代码因此**零评审直接合入** ——
       // 这是用户选择跳过验收的代价,关口文案里写明了。
       noteOnNode(node, '人工解决冲突后的验收已跳过')
+      consumeSkip(node, 'accept')
       if (!(await mergeAndRelease(node, ctx))) return
       await commit(node, 'ACCEPTED', ctx)
       return
@@ -1869,7 +2032,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // 验收记录 rendered 第 2 轮 twice, once before and once after 第 3 轮 — and the card sends
       // the user to exactly that record.
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
-      system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree.path,
+      system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatPreamble(ctx, seat, 'accept', node)), ctx, cwd: node.worktree.path,
     })
     node.acceptLog.push(rec)
     if (!infraExhausted && rec.synthesized.pass) {
@@ -1903,6 +2066,19 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   let syncNote = ''
   for (;;) {
     round++
+    /**
+     * 跳过判决那一路:**这一轮不跑前半段**(同步集成分支 → EXECUTING → 执行者 → 空产出闸门
+     * → 动态生长),直接落到下面的测试验证/验收。
+     *
+     * 写成一个包住前半段的 `if`,而且**故意不给里面的代码多缩进一层** —— 这个文件里
+     * `if (!isSkipped(ctx, 'execute')) {` 和 `if (isSkipped(ctx,'review')) … else {` 两处
+     * 已经是这个写法。目的是让 diff 只有这两行,评审看得见改了什么;重排 120 行缩进换来的
+     * 「好看」会把真正的改动埋掉。
+     *
+     * 只作用于**第一轮**:下面每一条 `continue` 回到循环顶部时它已经是 false,所以返工轮
+     * 照常从执行者开始 —— 那时候确实需要有人去改代码。
+     */
+    if (!enterAtJudge) {
     // 跨分支依赖调度. `acquire` based this worktree on the integration tip, and then froze it.
     // Rounds 2+ can be minutes or hours later, with sibling branches merged in between — so
     // refresh before reworking rather than editing a tree that no longer matches what the
@@ -1934,7 +2110,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // which is exactly what executePrompt renders on rework.
     const execTag = answerTag(ANSWER_TAGS.exec)
     const execSeat = firstRole(node, 'execute')
-    const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatBrief(ctx, execSeat, 'execute')), cwd: node.worktree?.path, signal: ctx.signal },
+    const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatPreamble(ctx, execSeat, 'execute', node)), cwd: node.worktree?.path, signal: ctx.signal },
       // round 用的是 stepExecute 的局部轮次:返工每一轮都是一次独立的执行,合成一条流
       // 会让「第三轮才修好」读起来像「一直在改同一件事」。
       { phaseLabel: PHASE_LABEL.execute, round, label: (execSeat?.roleName || execSeat?.roleTag) || '主模型', model: execSeat?.model })
@@ -2011,6 +2187,11 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
 
     }
 
+    }
+    // 前半段的一次性豁免用掉了。往后每一轮返工都要真的从执行者开始 —— 见上面
+    // `if (!enterAtJudge)` 的注释。
+    enterAtJudge = false
+
     // 测试验证(spec §7.1)。**只在配了这个环节的角色时存在** —— 没配就整个不发生,
     // 行为与引入它之前逐字节相同。
     //
@@ -2019,10 +2200,28 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // 没有这一步,验收员只能给执行者的散文盖章。
     // 配了席位却被跳过时要留痕 —— 名册上挂着 tester、验证记录空白、没有解释,
     // 和跳过质疑讨论时是同一种歧义。没配席位就不写:那本来就是 opt-in,不算「跳过了」。
-    if ((node.phaseRoles.verify ?? []).length > 0 && isSkipped(ctx, 'verify')) {
-      noteOnNode(node, '测试验证环节已跳过:没有实跑过任何测试')
+    /**
+     * 跳过判据**只求值一次**,而且在消费之前。
+     *
+     * 两个 `if` 读同一个判据,而中间那次 `consumeSkip` 会把手工标记清掉 —— 分别求值的话
+     * 第二个 `if` 当场变成「没跳过」,测试验证照跑,而用户以为自己跳过了它。实测过
+     * (phases 里多出一个 verify),而 `consumeSkip` 自己的注释正是在说这件事。
+     */
+    const skipVerify = isSkipped(ctx, 'verify', node)
+    if ((node.phaseRoles.verify ?? []).length > 0 && skipVerify) {
+      noteOnNode(node, node.skipPhase === 'verify'
+        ? '测试验证环节被手工跳过(用户在阻断后按了跳过):没有实跑过任何测试'
+        : '测试验证环节已跳过:没有实跑过任何测试')
     }
-    if ((node.phaseRoles.verify ?? []).length > 0 && !isSkipped(ctx, 'verify')) {
+    /**
+     * 手工跳过在这里**无条件消费**,不管席位数。
+     *
+     * 上面那条留痕的判据带着 `verify 席位 > 0`(没配席位本来就不算「跳过了」),而消费
+     * 不能跟着它:一个 0 席的节点带着 `skipPhase: 'verify'` 时,标记会一直留着,
+     * 而它的第二个作用是让下一次 stepExecute 也从判决那一段进来 —— 于是**永远不再执行**。
+     */
+    consumeSkip(node, 'verify')
+    if ((node.phaseRoles.verify ?? []).length > 0 && !skipVerify) {
       if (!(await commit(node, 'VERIFYING', ctx))) return
       // 验证者**不该改代码**,而工具清单挡不住这件事:Bash 本身就能写(echo >、sed -i、
       // git apply)。所以真正的探针是前后比对工作区 —— 断言它的工具集里没有 Edit/Write
@@ -2031,7 +2230,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       const v = await roundtableWithInfraRetry({
         phase: 'verify', node, roles: node.phaseRoles.verify, round: node.iteration.acceptance + 1,
         system: 'verify',
-        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatBrief(ctx, seat, 'verify')),
+        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node)),
         ctx, cwd: node.worktree?.path,
       })
       node.acceptLog.push({ ...v.rec, step: 'verify' })
@@ -2083,13 +2282,16 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // roundtableWithInfraRetry) — redoing the executor's real work over a flaky connection
     // would be wrong, and charging those retries to the rework budget would consume every
     // attempt the executor was owed.
-    if (isSkipped(ctx, 'accept')) {
+    if (isSkipped(ctx, 'accept', node)) {
       // **三个调用点全部跳过**(主循环 + 人工解冲突后 + 自动解冲突后)。只跳主循环的话,
       // 验收会在「最该有人看」的冲突解决场景悄悄复活 —— 那是更坏的惊喜。
       //
       // 不写 acceptLog:跳过 ≠ 通过。但要在 execStatus 上留一行,否则 node.md 是
       // 「名册挂着 qa、验收记录空白、状态 ACCEPTED」—— 读起来像记录丢了,不像没跑过。
-      noteOnNode(node, '验收环节已跳过:本节点的产出未经任何人核对就合进集成分支')
+      noteOnNode(node, node.skipPhase === 'accept'
+        ? '验收环节被手工跳过(用户在阻断后按了跳过):本节点的产出未经任何人核对就合进集成分支'
+        : '验收环节已跳过:本节点的产出未经任何人核对就合进集成分支')
+      consumeSkip(node, 'accept')
       if (firstRole(node, 'observer') && !isSkipped(ctx, 'observer') && !(await commit(node, 'SCORING', ctx))) return
       if (await scoreNode(node, ctx)) {
         if (!(await commit(node, 'REWORK', ctx))) return
@@ -2103,7 +2305,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
-      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, ctx, tag, seatBrief(ctx, seat, 'accept')), ctx, cwd: node.worktree?.path,
+      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'accept', node)), ctx, cwd: node.worktree?.path,
     })
     node.acceptLog.push(rec)
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
@@ -2189,14 +2391,17 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     if (!(await commit(node, 'INTEGRATION_ACCEPT', ctx))) return
     // Hold the integration worktree for the whole review: it is what the reviewers read, and
     // concurrent merges rewrite it underneath them.
-    if (isSkipped(ctx, 'integrate')) {
+    if (isSkipped(ctx, 'integrate', node)) {
       // 跳过集成验收。连带后果(关口要说):补救子任务的唯一入口没了,而且 scoreNode 也
       // 一起没了 —— 所有拆分型节点包括根再也不会被评分,整个 run 的最终分消失。
       //
       // mergeConflict 不用在这里再挡一次 —— stepIntegrate 前面已有一道守卫会先触发
       // (实测阻断信息来自那一道)。在这里重复一份是死代码,而死代码会让人以为
       // 保护来自这里,下次改前面那道时就没人知道它是唯一的那道。
-      noteOnNode(node, '集成验收已跳过:子任务各自通过即视为本节点达成')
+      noteOnNode(node, node.skipPhase === 'integrate'
+        ? '集成验收被手工跳过(用户在阻断后按了跳过):子任务各自通过即视为本节点达成'
+        : '集成验收已跳过:子任务各自通过即视为本节点达成')
+      consumeSkip(node, 'integrate')
       if (ctx.worktrees && node.worktree && !(await commit(node, 'MERGE', ctx))) return
       if (!(await mergeAndRelease(node, ctx))) return
       await commit(node, 'ACCEPTED', ctx)
@@ -2212,7 +2417,7 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       round: node.iteration.integration + 1, system: 'integrate',
       // 见 phaseLabel 的注释:不显式给的话,整个 run 的最终裁决会被标成「验收」。
       phaseLabel: PHASE_LABEL.integrate,
-      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatBrief(ctx, seat, integrateBriefPhase(node))), // child evidence, NOT acceptPrompt
+      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'integrate', node, integrateBriefPhase(node))), // child evidence, NOT acceptPrompt
       ctx,
       // The INTEGRATION worktree, not the user's tree. This roundtable accepts every
       // decompose node — including root, i.e. the run's final verdict — and under isolation

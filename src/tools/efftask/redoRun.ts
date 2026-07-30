@@ -1,5 +1,5 @@
-import { planRedo, type RedoContext, type RedoEntry, type RedoPlan } from './redo.js'
-import type { TaskNode } from './types.js'
+import { attachGuidance, planRedo, planSkip, type RedoContext, type RedoEntry, type RedoPlan } from './redo.js'
+import type { PhaseName, TaskNode } from './types.js'
 
 /**
  * 一次重做从「用户按下确认」到「编排器重新跑起来」之间的全部动作。
@@ -43,6 +43,14 @@ export async function runRedo(
   // 关口预演用的是同一份 ctx。不传下来的话「屏幕上算给你看的」和「真的执行的」会是
   // 两次不同的计算 —— 而用户是照着屏幕做的决定。
   ctx?: RedoContext,
+  /**
+   * 用户在关口上补的那句提示词,以及它给谁(`'all'` = 给整个节点)。
+   *
+   * 写在 `planRedo` **之后**、落盘**之前**:planRedo 会克隆整棵树,补充指引写在克隆出来的
+   * 那个目标节点上,于是它和这次重做在同一次 `commit` 里一起落盘。写在 planRedo 之前
+   * (改传进来的 nodes)就是改调用方手里那份 state —— 而它是 React state。
+   */
+  guidance?: { scope: PhaseName | 'all'; text: string },
 ): Promise<void> {
   const computed = planRedo(nodes, targetId, entry, now, ctx)
   if ('error' in computed) {
@@ -52,6 +60,13 @@ export async function runRedo(
     deps.onDone()
     return
   }
+  if (guidance && guidance.text.trim().length > 0) {
+    const target = computed.nodes.find(n => n.id === targetId)
+    // 找不到目标节点在这条路上不可达(planRedo 成功就意味着它在),但静默丢掉用户亲手写的
+    // 那句话是这个仓库反复付过代价的那一类,所以宁可说出来。
+    if (target) attachGuidance(target, guidance.scope, guidance.text)
+    else deps.onProblems([`补充指引没能写上:重做后的树里找不到节点 ${targetId}`])
+  }
   // `before` 必须是**重做前**的节点:commitRedo 要拿它们算隔离工作区的路径和分支,
   // 而 computed.nodes 里被删的那些已经不在了 —— 传错的话工作区一个都放不掉,而且
   // 不会有任何报错。
@@ -60,5 +75,43 @@ export async function runRedo(
   deps.onNodes(computed.nodes)
   // 落盘在前、重启在后。反过来的话编排器会在一棵还没写下去的树上开跑,
   // 中途崩溃就什么都恢复不了。
+  deps.start(computed.nodes)
+}
+
+/**
+ * 一次「跳过失败的环节」从确认到重新跑起来之间的全部动作。
+ *
+ * 和 `runRedo` 共用同一套 deps,而且**刻意**共用:两者在这一段上做的事逐字相同
+ * (落盘 → 上屏 → 进 state → 重启编排),而那六步里漏掉任何一步的后果都是
+ * 「按下确认之后界面纹丝不动」—— 那正是 runRedo 的注释里记着的、验收造出 14 条存活变异的
+ * 那一组。第二份实现意味着第二次踩同一组坑。
+ *
+ * 唯一的区别是怎么算出新树:`planSkip` 而不是 `planRedo`。
+ */
+export async function runSkip(
+  nodes: readonly TaskNode[],
+  targetId: string,
+  now: string,
+  deps: RedoRunDeps,
+  ctx?: RedoContext,
+  guidance?: { scope: PhaseName | 'all'; text: string },
+): Promise<void> {
+  const computed = planSkip(nodes, targetId, now, ctx)
+  if ('error' in computed) {
+    deps.onProblems([`跳过未执行: ${computed.error}`])
+    deps.onDone()
+    return
+  }
+  if (guidance && guidance.text.trim().length > 0) {
+    const target = computed.nodes.find(n => n.id === targetId)
+    if (target) attachGuidance(target, guidance.scope, guidance.text)
+    else deps.onProblems([`补充指引没能写上:跳过后的树里找不到节点 ${targetId}`])
+  }
+  // `before` 同样是**跳过前**的节点 —— commitRedo 拿它算隔离工作区的路径和分支。
+  // 跳过通常一个工作区都不放(deleted 恒为空),但「从质疑讨论跳过」那一条在执行型节点上
+  // 会走 resetForExecute,那时是有工作区要放的。
+  const { problems } = await deps.commit(computed, nodes)
+  deps.onProblems(problems)
+  deps.onNodes(computed.nodes)
   deps.start(computed.nodes)
 }

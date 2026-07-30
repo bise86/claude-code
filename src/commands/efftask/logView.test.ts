@@ -4,6 +4,8 @@ import { stringWidth } from '../../ink/stringWidth.js'
 import type { AgentEvent } from '../../tools/efftask/agentEvents.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
 import { runControlAction,
+  foldedStreams,
+  logPaneMode,
   budgetRows,
   lastActivity,
   logPaneAction,
@@ -318,7 +320,57 @@ describe('scrollbarColumn', () => {
   })
 })
 
+describe('折叠状态决定 ↑↓ 归谁', () => {
+  const s = (closed: boolean) => ({ closed })
+
+  it('默认按流自己的状态走:运行中展开、已收口折叠', () => {
+    expect([...foldedStreams([s(false), s(true), s(false)], new Map())]).toEqual([1])
+  })
+
+  it('用户显式改过的按他改的走 —— 包括「把一条跑完的重新展开」', () => {
+    // 只存一个 Set<number> 分不清「用户展开了它」和「它还没被折过」,于是一条刚跑完的流
+    // 会在用户眼皮底下自己收起来。这里的 false 就是「我要它展开着」。
+    expect([...foldedStreams([s(true), s(false)], new Map([[0, false], [1, true]]))]).toEqual([1])
+  })
+
+  it('选中的折着 → 选阶段;展开着 → 滚内容', () => {
+    expect(logPaneMode(new Set([0, 1]), 0, 2)).toBe('select')
+    expect(logPaneMode(new Set([1]), 0, 2)).toBe('read')
+  })
+
+  it('越界的 selected 算选阶段 —— 没有内容可滚时把键交给列表导航', () => {
+    // 流列表会变短(环形缓冲淘汰),而 selected 是一个独立的 state。
+    expect(logPaneMode(new Set(), 5, 2)).toBe('select')
+    expect(logPaneMode(new Set(), -1, 2)).toBe('select')
+    expect(logPaneMode(new Set(), 0, 0)).toBe('select')
+  })
+})
+
 describe('logPaneAction —— 按键必须是纯函数', () => {
+  it('选阶段模式下,只有 ↑↓ 和 j/k 换含义', () => {
+    // 其余键两种模式下逐字相同:滚轮一格是 3 行(当选择用会飞过整个列表),
+    // 而 g/G 说的是「到顶 / 到底并恢复跟随」,那是视口的事。
+    expect(logPaneAction('', key({ upArrow: true }), 'select')).toEqual({ t: 'selectStream', d: -1 })
+    expect(logPaneAction('', key({ downArrow: true }), 'select')).toEqual({ t: 'selectStream', d: 1 })
+    expect(logPaneAction('jj', key(), 'select')).toEqual({ t: 'selectStream', d: 2 })
+    expect(logPaneAction('k', key(), 'select')).toEqual({ t: 'selectStream', d: -1 })
+    expect(logPaneAction('', key({ wheelDown: true }), 'select')).toEqual({ t: 'line', d: 3 })
+    expect(logPaneAction('', key({ pageDown: true }), 'select')).toEqual({ t: 'halfPage', d: 1 })
+    expect(logPaneAction('d', key({ ctrl: true }), 'select')).toEqual({ t: 'halfPage', d: 1 })
+    expect(logPaneAction('G', key(), 'select')).toEqual({ t: 'bottom' })
+    expect(logPaneAction('g', key(), 'select')).toEqual({ t: 'top' })
+    expect(logPaneAction(' ', key(), 'select')).toEqual({ t: 'toggleFold' })
+    expect(logPaneAction('n', key(), 'select')).toEqual({ t: 'nextStream' })
+    expect(logPaneAction('t', key(), 'select')).toEqual({ t: 'toggleThinking' })
+  })
+
+  it('不传模式时行为和加这个参数之前逐字相同', () => {
+    // 新参数不该改变任何既有调用点的语义 —— 默认 read 就是这个函数原来唯一的行为。
+    expect(logPaneAction('', key({ upArrow: true }))).toEqual({ t: 'line', d: -1 })
+    expect(logPaneAction('', key({ upArrow: true }), 'read')).toEqual({ t: 'line', d: -1 })
+    expect(logPaneAction('jjj', key())).toEqual({ t: 'line', d: 3 })
+  })
+
   it('方向键与翻页键', () => {
     expect(logPaneAction('', key({ upArrow: true }))).toEqual({ t: 'line', d: -1 })
     expect(logPaneAction('', key({ downArrow: true }))).toEqual({ t: 'line', d: 1 })

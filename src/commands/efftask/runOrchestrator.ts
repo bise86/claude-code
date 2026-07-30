@@ -28,6 +28,9 @@ export type Phase =
   // (startRun 带着改过的树当 seed)。不是一个新的运行阶段,是 done 的一个岔路。
   | 'confirm' | 'drafting' | 'confirmRoot' | 'confirmResume' | 'handoff' | 'running' | 'done' | 'fatal'
   | 'confirmRedo'
+  // 'confirmSkip' 是重做的兄弟岔路:跳过失败的那个环节继续往下走。同样不是一个新的运行
+  // 阶段,而是 done 的一条分支 —— 确认之后 startRun 带着改过的树重新起跑。
+  | 'confirmSkip'
 
 /**
  * Drive one run to completion and report it.
@@ -84,6 +87,18 @@ export async function runOrchestrator(
   // manifest. One promise queue ⇒ strictly ordered, last-write-wins.
   let manifestQueue: Promise<void> = Promise.resolve()
   const queueManifest = (nodes: TaskNode[], result?: Outcome): Promise<void> => {
+    /**
+     * 运行中调过的并发度要落进 run.md。
+     *
+     * `--resume` 的并发上限是从 run.md 读回来的(readRunManifest → config.parallelism),
+     * 所以不同步的话「我把它从 5 调到 10」在下一次恢复时静默变回 5,而屏幕上从没说过这件事。
+     * run.md 同时也是事后唯一能回答「这一趟到底是按几并发跑的」的地方。
+     *
+     * 写在这里而不是在按键处理里:这是**落盘**这一侧的事,而这个函数是 run.md 的唯一
+     * 写入点。按键那侧只改 control(唯一真相),两处各写一份的话它们迟早不一致。
+     */
+    const liveParallelism = args.control?.parallelism()
+    if (liveParallelism !== undefined) args.config.parallelism = liveParallelism
     manifestQueue = manifestQueue
       .then(() => writeRunManifest(args.fs, args.runDir, args.config, nodes, result))
       .catch(logError)

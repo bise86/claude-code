@@ -1,13 +1,15 @@
+import { clampParallelism, DEFAULT_PARALLELISM } from './types.js'
+
 /**
- * 运行中的人工干预面:**暂停**、**追加指令**、**取消单个节点**。
+ * 运行中的人工干预面:**暂停**、**追加指令**、**取消单个节点**、**调并发度**。
  *
  * 在这之前,运行中唯一能做的事是 Esc —— 而它的粒度是整个 run。用户的原话是
  * 「任务正在运行怎么取消,可以用提示词修正这个任务怎么做不」:两件事都要,而且都不该
  * 是「把整轮炸掉重来」。
  *
- * 三件事放在一个对象里,因为它们共享同一个生命周期(一次 run),而且 UI 那侧是同一批
+ * 四件事放在一个对象里,因为它们共享同一个生命周期(一次 run),而且 UI 那侧是同一批
  * 按键。但**内部互不耦合**:暂停不影响在飞的调用,取消不影响别的节点,追加指令只作用于
- * 之后派发的提示词。
+ * 之后派发的提示词,并发度只影响**还没起跑**的那些。
  */
 
 /** 一次 run 的人工干预面。 */
@@ -54,6 +56,42 @@ export interface RunControl {
    * —— 阻断信息本身在推荐一条已经死掉的路。评审实测复现过。
    */
   clearAllCancels(): void
+
+  // ---- 并发度 ----
+  /**
+   * 用户在运行中调过的并发上限;`undefined` = 没调过,按 `config.parallelism` 走。
+   *
+   * 为什么不直接改 `config.parallelism`:那个对象同时是 React state、是关口批准过的那份
+   * 快照、也是 `writeRunManifest` 每一帧要写的东西。原地改它既不会触发重绘,也让「用户
+   * 批准的是 5」和「现在跑的是 10」这两件事再也分不开。这里存**改动**,由编排器每一轮
+   * 现读(`control.parallelism() ?? cfg.parallelism`),而落盘那一侧在写 run.md 之前
+   * 同步一次 —— `--resume` 的并发上限是从 run.md 读回来的。
+   */
+  parallelism(): number | undefined
+  /**
+   * 调整并发上限。夹进 [MIN_PARALLELISM, MAX_PARALLELISM]。
+   *
+   * **在飞的调用一律不受影响** —— 池子是 try-lease,已经拿到手的槽位不会被收回;调低只是
+   * 让接下来的 `tryTake` 拿不到。所以调低之后表头会短暂显示 `并行 5/2`(5 个在跑、上限 2),
+   * 那是**实话**:它们真的还在跑。
+   */
+  setParallelism(n: number): void
+  /**
+   * 并发上限改过几次。调度器用它判断「我睡这一觉期间它有没有变过」。
+   *
+   * 必须是**代数**而不是一个裸的 promise:调度器的循环是「扫一遍 → 派完 → 睡到有节点
+   * 结束」,而用户按下 `+` 完全可能正好落在扫描之后、睡下之前。那一下没有代数的话,
+   * 新的并发额度要等到**下一个节点跑完**才生效 —— 而「所有节点都在跑一个 20 分钟的执行
+   * 环节」正是他去调它的时刻。
+   */
+  parallelismGeneration(): number
+  /**
+   * 等到并发上限**再**变一次。`seen` 已经落后于当前代数时**立刻**兑现。
+   *
+   * 立刻兑现这一条和 `waitForResume` 是同一个坑:通知在注册之前就发完了的话,等待方会
+   * 睡到下一次变更 —— 而下一次可能永远不来。
+   */
+  waitForParallelism(seen: number): Promise<void>
 }
 
 /** 一条追加指令的长度上限。整段提示词是要付钱的,而用户可能粘一整个文件进来。 */
@@ -65,6 +103,11 @@ export function createRunControl(): RunControl {
   let paused = false
   /** 等着被恢复的那些人。恢复时一次性全部放行。 */
   let waiters: (() => void)[] = []
+  /** 用户调过的并发上限,以及它改过几次。 */
+  let parallelism: number | undefined
+  let parallelismGen = 0
+  /** 等着并发上限变化的那些人(就是调度循环)。 */
+  let limitWaiters: (() => void)[] = []
   const directives: string[] = []
   let dropped = 0
   /** nodeId → 此刻在飞的 controller。一个节点可能同时有多个(圆桌的多席位)。 */
@@ -140,5 +183,26 @@ export function createRunControl(): RunControl {
     wasCancelled: nodeId => cancelled.has(nodeId),
     clearCancel(nodeId) { cancelled.delete(nodeId) },
     clearAllCancels() { cancelled.clear() },
+
+    parallelism: () => parallelism,
+    setParallelism(n) {
+      const next = clampParallelism(n, parallelism ?? DEFAULT_PARALLELISM)
+      // 没变就别动代数:否则一次「已经到上限了还按 +」会白白唤醒调度循环一次。
+      if (next === parallelism) return
+      parallelism = next
+      parallelismGen++
+      // 换出来再清空,和 resume() 同因:不清的话等待者随调整次数无界增长。
+      const w = limitWaiters
+      limitWaiters = []
+      // 一个抛异常的等待者不能把别的等待者一起卡住。
+      for (const fn of w) { try { fn() } catch { /* 调用方自己的问题 */ } }
+    },
+    parallelismGeneration: () => parallelismGen,
+    waitForParallelism(seen) {
+      // 已经变过了就立刻返回 —— 少了这一句,发生在「扫描之后、睡下之前」的那一次调整
+      // 会被睡过去,而那正是用户最想它立刻生效的时刻。
+      if (seen !== parallelismGen) return Promise.resolve()
+      return new Promise<void>(res => { limitWaiters.push(res) })
+    },
   }
 }

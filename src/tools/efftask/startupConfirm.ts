@@ -376,6 +376,29 @@ export function rosterLines(config: EffTaskConfig): string[] {
 }
 
 /**
+ * 定向注入(§定向注入)—— 哪几句话会被送进哪个环节 / 哪一席。
+ *
+ * **必须上关口。** 这一步是一次抽取模型的判断:它决定「评审时重点看并发安全」这句话到底
+ * 进了评审的提示词,还是被当成整体目标留在了根节点上。抽错了的话运行会照常跑完,而用户
+ * 唯一能发现的方式是事后翻 node.md —— 而关口存在的全部意义正是「批准之前看见自己批准了
+ * 什么」。抽对了同样要显示:那是他确认自己那句话被听懂了的唯一机会。
+ *
+ * 每条夹到 80 码点(和名册、目标同一份预算),原文在 run.md 里。
+ */
+export function guidanceLines(config: EffTaskConfig): string[] {
+  const out: string[] = []
+  for (const p of PHASE_NAMES) {
+    const t = config.phaseGuidance?.[p]
+    if (t && t.trim().length > 0) out.push(`→「${PHASE_LABEL[p]}」环节: ${clip(t.replace(/\s+/g, ' '), ROSTER_BUDGET)}`)
+  }
+  for (const g of config.roleGuidance ?? []) {
+    if (g.text.trim().length === 0) continue
+    out.push(`→ 角色/员工「${g.name}」: ${clip(g.text.replace(/\s+/g, ' '), ROSTER_BUDGET)}`)
+  }
+  return out
+}
+
+/**
  * What the user asked for that will NOT happen. Rendered next to the roster on BOTH
  * surfaces: the roster says who runs, this says whose request was dropped and why.
  */
@@ -537,11 +560,16 @@ export function resumeSummarySections(s: ResumeSummary): SummarySection[] {
   return out
 }
 
-/** Hard bounds for the confirmation gate's parallelism editor; mirrors parseDirectives' clamp. */
-export const MIN_PARALLELISM = 1
-export const MAX_PARALLELISM = 64
-export const clampParallelism = (n: number): number =>
-  Math.min(MAX_PARALLELISM, Math.max(MIN_PARALLELISM, Math.trunc(n) || MIN_PARALLELISM))
+/**
+ * 关口那个并行数编辑器的合法区间 —— **从 types.ts 转出来的,不是自己一份**。
+ *
+ * 原来这里是三行独立实现,注释写着「mirrors parseDirectives' clamp」——「镜像」两个字
+ * 就是漂移的自白:那边写的是 `clampInt(v, 1, 64, DEFAULT_PARALLELISM)`,这边是
+ * `Math.trunc(n) || 1`,NaN 时一个给 5 一个给 1。运行中调并发度是**第三条**写入路径,
+ * 再抄一遍就有三份。两个消费者(ConfirmStartup / ConfirmResume)的导入路径不动,
+ * 所以这里保留转出。
+ */
+export { MIN_PARALLELISM, MAX_PARALLELISM, clampParallelism } from './types.js'
 
 /**
  * The one place that describes what `parallelism` currently BUYS.

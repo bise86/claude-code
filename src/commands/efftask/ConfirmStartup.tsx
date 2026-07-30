@@ -4,7 +4,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, costLine, mcpNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, costLine, guidanceLines, mcpNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -155,6 +155,15 @@ export function ConfirmStartup(props: {
         <Box flexDirection="column">
           <Text color="warning">跳过带来的连带后果:</Text>
           {skipConsequenceLines(shown).map(l => <Text key={l} color="warning">  · {l}</Text>)}
+        </Box>
+      )}
+      {/* 定向注入(§定向注入)。**自己一块,而且不是警告色** —— 这是用户要的东西生效了,
+          不是「有一部分不会生效」。它必须上关口:哪句话进哪个环节是一次抽取模型的判断,
+          抽错了运行会照常跑完,而用户唯一能发现的方式是事后翻 node.md。 */}
+      {guidanceLines(shown).length > 0 && (
+        <Box flexDirection="column">
+          <Text bold>提示词里这几段会被定向送进对应环节/角色:</Text>
+          {guidanceLines(shown).map(l => <Text key={l} dimColor>  {l}</Text>)}
         </Box>
       )}
       {mcpNoticeLines(props.mcpToolNames ?? []).length > 0 && (

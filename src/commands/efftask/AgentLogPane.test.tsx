@@ -48,7 +48,7 @@ const stream = (over: Partial<StreamState> = {}): StreamState => ({
 })
 const lines = (...t: string[]): AgentEvent[] => t.map(x => ({ kind: 'text', text: x }))
 
-type State = { from: number; total: number; follow: boolean; selected: number; folded: number[] }
+type State = { from: number; total: number; follow: boolean; selected: number; folded: number[]; mode: 'select' | 'read' }
 
 async function mount(props: Record<string, unknown>) {
   const t = fakeTty()
@@ -308,6 +308,119 @@ describe('useStreamTick:首个事件要立刻上屏', () => {
     // 只等几个宏任务,远小于 250ms 的合批窗口
     await tick()
     expect(`立刻重绘了: ${repaints > before}`).toBe('立刻重绘了: true')
+    app.unmount()
+  })
+})
+
+describe('折叠的阶段:↑↓ 选阶段,展开后 ↑↓ 滚内容', () => {
+  /**
+   * 用户的原话:「任务详情页中子agent里,各阶段选择中了可以通过上下键来选择,按空格展开后,
+   * 上下键就是该阶段输出内容的上下滚动了」。
+   *
+   * 在这之前 ↑↓ **永远**是滚整个列表:一屏几十条流全折着的时候,按 ↑↓ 滚的是一堆表头,
+   * 而「换一条流」只有 `n` 一个键、还只能单向循环。
+   */
+  /** 三条跑完的流(跑完默认折叠),各自有内容 —— 展开之后才有东西可滚。 */
+  const three = () => [
+    stream({ closed: true, events: lines(...[...Array(20)].map((_, i) => `甲${i}`)) }),
+    stream({ closed: true, events: lines(...[...Array(20)].map((_, i) => `乙${i}`)) }),
+    stream({ closed: true, events: lines(...[...Array(20)].map((_, i) => `丙${i}`)) }),
+  ]
+
+  it('全折着时 ↓ 换的是**选中的流**,不是滚动', async () => {
+    const { t, app, last } = await mount({ streams: three() })
+    expect(last().mode).toBe('select')
+    expect(last().selected).toBe(0)
+    t.stdin.press(DOWN); await tick()
+    expect(last().selected).toBe(1)
+    t.stdin.press(DOWN); await tick()
+    expect(last().selected).toBe(2)
+    app.unmount()
+  })
+
+  it('列表光标**撞到头就停**,不循环', async () => {
+    // `n` 是「下一条」(循环),这是列表光标。循环的话在第一条上按 ↑ 会跳到最后一条 ——
+    // 而那条通常正是还在跑、一直在动的那条,也就是用户抱怨过的现象。
+    const { t, app, last } = await mount({ streams: three() })
+    t.stdin.press(UP); await tick()
+    expect(last().selected).toBe(0)
+    for (let i = 0; i < 5; i++) { t.stdin.press(DOWN); await tick() }
+    expect(last().selected).toBe(2)
+    app.unmount()
+  })
+
+  it('空格展开选中那条之后,↑↓ 变成滚它的内容', async () => {
+    const { t, app, last } = await mount({ streams: three() })
+    t.stdin.press(DOWN); await tick()            // 选中第二条
+    expect(last().selected).toBe(1)
+    t.stdin.press(' '); await tick()             // 展开
+    expect(last().folded).toEqual([0, 2])
+    expect(last().mode).toBe('read')
+    const before = last().from
+    t.stdin.press(DOWN); await tick()
+    // 选中的那条一动不动 —— 这一下是滚动。
+    expect(last().selected).toBe(1)
+    expect(last().from).toBeGreaterThan(before)
+    app.unmount()
+  })
+
+  it('再按一次空格收起来,↑↓ 又回到选阶段', async () => {
+    const { t, app, last } = await mount({ streams: three() })
+    t.stdin.press(' '); await tick()
+    expect(last().mode).toBe('read')
+    t.stdin.press(' '); await tick()
+    expect(last().mode).toBe('select')
+    t.stdin.press(DOWN); await tick()
+    expect(last().selected).toBe(1)
+    app.unmount()
+  })
+
+  it('正在跑的那条默认是展开的,所以 ↑↓ 一进来就是滚动', async () => {
+    // 「实时终端」的手感不能被这次改动拿走:一个节点正在跑的时候,人是来看输出的,
+    // 而那条流本来就是展开的。要换阶段就按空格折起来,或者直接按 n。
+    const { t, app, last } = await mount({
+      streams: [stream({ events: lines(...[...Array(30)].map((_, i) => `行${i}`)) })],
+    })
+    expect(last().mode).toBe('read')
+    const before = last().from
+    t.stdin.press(UP); await tick()
+    expect(last().from).toBeLessThan(before)
+    app.unmount()
+  })
+
+  it('j/k 跟着 ↑↓ 走 —— 页脚只写一句「↑↓/jk」,两者不一样那句话就是假的', async () => {
+    const { t, app, last } = await mount({ streams: three() })
+    t.stdin.press('j'); await tick()
+    expect(last().selected).toBe(1)
+    t.stdin.press('k'); await tick()
+    expect(last().selected).toBe(0)
+    app.unmount()
+  })
+
+  it('选阶段模式下,滚轮和 g/G 仍然是滚动', async () => {
+    /**
+     * 一格滚轮是 3 行。当成「往下跳 3 条流」的话,轻轻一拨就飞过整个列表;而 g/G 说的是
+     * 「到顶 / 到底并恢复跟随」,那是视口的事,和选中哪条流无关。
+     */
+    const { t, app, last } = await mount({ streams: three() })
+    t.stdin.press('G'); await tick()
+    expect(last().selected).toBe(0)
+    expect(last().follow).toBe(true)
+    t.stdin.press('g'); await tick()
+    expect(last().selected).toBe(0)
+    expect(last().from).toBe(0)
+    app.unmount()
+  })
+
+  it('切到别的流之后,那条流的折叠状态决定 ↑↓ 归谁', async () => {
+    // 「模式」不是一个独立的开关,而是**选中那条流的折叠状态**。展开甲、再选到乙,
+    // ↑↓ 必须变回选阶段 —— 乙还是折着的。
+    const { t, app, last } = await mount({ streams: three() })
+    t.stdin.press(' '); await tick()
+    expect(last().mode).toBe('read')
+    t.stdin.press('n'); await tick()
+    expect(last().selected).toBe(1)
+    expect(last().mode).toBe('select')
     app.unmount()
   })
 })

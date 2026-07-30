@@ -18,9 +18,9 @@ import { createWorktreePool, type GitRunner, type WorktreePool } from '../../too
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
-import { redoContextOf, redoUnavailableReason, type RedoEntry } from '../../tools/efftask/redo.js'
+import { failedRedoTarget, redoContextOf, redoUnavailableReason, skipFailedPhaseReason, type RedoEntry, type RedoPlan } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
-import { runRedo } from '../../tools/efftask/redoRun.js'
+import { runRedo, runSkip } from '../../tools/efftask/redoRun.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
 import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
@@ -31,6 +31,7 @@ import { acquireRunLock, listRuns, releaseRunLock, reserveRun, type RunSummary }
 import { createRunControl, type RunControl } from '../../tools/efftask/control.js'
 import { AddDirective } from './AddDirective.js'
 import { ConfirmRedo } from './ConfirmRedo.js'
+import { ConfirmSkip } from './ConfirmSkip.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
@@ -735,6 +736,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [handoffResult, setHandoffResult] = React.useState<HandoffResult | null>(null)
   /** 正在被重做的节点(done 视图按 r 选中的那个)。null = 没有重做在进行。 */
   const [redoTarget, setRedoTarget] = React.useState<TaskNode | null>(null)
+  /**
+   * 「快速重做失败环节」预选的那个入口。
+   *
+   * 和 `redoTarget` 分开而不是塞进同一个 state:关口是同一个组件,而这个字段决定它**从哪一屏
+   * 开始**。合在一起的话,普通 `r` 也会带着上一次快速重做留下的入口,直接跳到确认屏 ——
+   * 用户按 r 是要自己选的。
+   */
+  const [redoEntry, setRedoEntry] = React.useState<RedoEntry | null>(null)
+  /** 正在被「跳过失败环节」的节点。 */
+  const [skipTarget, setSkipTarget] = React.useState<TaskNode | null>(null)
   /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
   const [redoProblems, setRedoProblems] = React.useState<string[]>([])
   /**
@@ -752,6 +763,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [paused, setPaused] = React.useState(false)
   /** 追加指令输入框开着吗。 */
   const [directiveOpen, setDirectiveOpen] = React.useState(false)
+  /**
+   * 并发上限改过之后逼一次重绘。**镜像,不是真相** —— 和 `paused` 同一条规矩。
+   *
+   * 表头那个数是编排器现读出来的(`pool().limit`),所以这里存的值没人读;存它只是因为
+   * 按下 `+` 之后必须**当场**看到数字动一下。树本来有 1s tick,但「按了一下要等最多一秒
+   * 才有反应」在一个只能靠这个数字确认自己按对了的界面上不合格。
+   */
+  const [, setParallelismTick] = React.useState(0)
   // 把通知口交给 call() 作用域里早就构造好的 runAgent —— 那时组件还不存在。
   // 卸载时收回:指向一个已卸载组件的 setState 会静默丢事件,而丢的正是「拿回键盘」。
   React.useEffect(() => {
@@ -1199,27 +1218,68 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 里几条源码文本断言,而验收把每一个被断言的字符串**原样留着**,造出 14 条变异
    * 全部存活 —— 每一条的后果都是「按下确认之后界面纹丝不动」,而全套测试绿。
    */
-  const applyRedo = React.useCallback((target: TaskNode, entry: RedoEntry): void => {
+  /**
+   * 重做和跳过共用的那一套落盘接线 —— 两者从这里往后逐字相同(见 redoRun.ts 的注释)。
+   *
+   * 抽出来是因为「按下确认之后要做的六件事」漏掉任何一件的后果都是「界面纹丝不动」,
+   * 而那正是验收在这个文件里造出 14 条存活变异的地方。一份实现,两个入口。
+   */
+  const redoDeps = React.useCallback((cfg: EffTaskConfig, dir: string) => ({
+    commit: (plan: RedoPlan, before: readonly TaskNode[]) => commitRedo(
+      {
+        fs: props.fs, runDir: dir, config: cfg, pool: poolRef.current ?? undefined,
+        before, onError: (e: unknown) => logError(e instanceof Error ? e : new Error(String(e))),
+      },
+      plan,
+    ),
+    onProblems: setRedoProblems,
+    onNodes: setNodes,
+    start: (n: TaskNode[]) => startRun(cfg, n),
+    onDone: () => setPhase('done'),
+    // biome-ignore lint/correctness/useExhaustiveDependencies: props are stable for a mount
+  }), [props.fs, startRun])
+
+  /** 这次重做/跳过要按哪份环节实况算 —— 关口预演和真正执行必须是同一份。 */
+  const phaseCtxOf = React.useCallback(
+    (target: TaskNode, cfg: EffTaskConfig) =>
+      // isolated:跳过验收能不能安全放行要靠它(见 RedoContext.isolated)。只有这一层
+      // 看得见那个池子。
+      redoContextOf(target, cfg, { isolated: poolRef.current !== undefined }),
+    [],
+  )
+
+  const applyRedo = React.useCallback((
+    target: TaskNode, entry: RedoEntry, guidance?: { scope: PhaseName | 'all'; text: string },
+  ): void => {
     const cfg = config
     if (!cfg || !runDir) return
     setRedoTarget(null)
-    void runRedo(nodes, target.id, entry, new Date().toISOString(), {
-      commit: (plan, before) => commitRedo(
-        {
-          fs: props.fs, runDir, config: cfg, pool: poolRef.current ?? undefined,
-          before, onError: e => logError(e),
-        },
-        plan,
-      ),
-      onProblems: setRedoProblems,
-      onNodes: setNodes,
-      start: n => startRun(cfg, n),
-      onDone: () => setPhase('done'),
+    setRedoEntry(null)
     // 关口预演和真正执行用**同一份**环节实况,否则屏幕上算出来的后果和实际发生的
     // 可以不一样,而用户是照着屏幕按的确认。
-    }, redoContextOf(target, cfg))
-    // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
-  }, [config, runDir, nodes, props.fs, startRun])
+    void runRedo(
+      nodes, target.id, entry, new Date().toISOString(),
+      redoDeps(cfg, runDir), phaseCtxOf(target, cfg), guidance,
+    )
+  }, [config, runDir, nodes, redoDeps, phaseCtxOf])
+
+  /**
+   * 执行一次「跳过失败的环节」。
+   *
+   * 和 applyRedo 走同一套 deps(落盘 → 上屏 → 进 state → 重启编排),只是新树由
+   * `planSkip` 算 —— 见 redoRun.ts 的 runSkip。
+   */
+  const applySkip = React.useCallback((
+    target: TaskNode, guidance?: { scope: PhaseName | 'all'; text: string },
+  ): void => {
+    const cfg = config
+    if (!cfg || !runDir) return
+    setSkipTarget(null)
+    void runSkip(
+      nodes, target.id, new Date().toISOString(),
+      redoDeps(cfg, runDir), phaseCtxOf(target, cfg), guidance,
+    )
+  }, [config, runDir, nodes, redoDeps, phaseCtxOf])
 
   /**
    * 执行收口选择,然后把待收口记录从 run.md 里划掉。
@@ -1594,9 +1654,26 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // **没有被导入**(第 35 行的值导入里没它,第 36 行是 import type,编译期就擦掉了)。
         // 仓库没有 typecheck,于是它一路过了打包 —— 按下 r 就是一屏 ReferenceError,
         // 而重做这个功能从任何路径都到不了。搬进 redo.ts 是为了让它有接缝可测。
-        phases={redoContextOf(redoTarget, config)}
-        onConfirm={entry => applyRedo(redoTarget, entry)}
-        onCancel={() => { setRedoTarget(null); setPhase('done') }}
+        phases={phaseCtxOf(redoTarget, config)}
+        // 「快速重做失败环节」预选的那一条 —— 给了就直接停在确认屏上。仍然要过确认屏:
+        // 失败在分析环节的拆分型节点,它的入口是「任务重做」,而那一条会删掉整棵子树。
+        initialEntry={redoEntry ?? undefined}
+        onConfirm={(entry, guidance) => applyRedo(redoTarget, entry, guidance)}
+        onCancel={() => { setRedoTarget(null); setRedoEntry(null); setPhase('done') }}
+      />
+    )
+  }
+  if (phase === 'confirmSkip' && skipTarget) {
+    return (
+      <ConfirmSkip
+        nodes={nodes}
+        targetId={skipTarget.id}
+        now={new Date().toISOString()}
+        // 和重做关口同一份环节实况(也就是 applySkip 真正会用的那一份)—— 两边各算一次的话,
+        // 屏幕上算出来的后果和实际发生的可以不一样。
+        phases={phaseCtxOf(skipTarget, config)}
+        onConfirm={guidance => applySkip(skipTarget, guidance)}
+        onCancel={() => { setSkipTarget(null); setPhase('done') }}
       />
     )
   }
@@ -1625,6 +1702,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         },
         onAddDirective: () => setDirectiveOpen(true),
         onCancelNode: n => control.cancelNode(n.id),
+        /**
+         * 调并发上限。**基准取 control 现在的值,没调过才回落到关口批准的那个** ——
+         * 一直拿 config 当基准的话,连按两次 `+` 会得到 6、6 而不是 6、7。
+         *
+         * 夹取交给 `control.setParallelism`(一份真相),这里不重复算一遍。
+         */
+        onAdjustParallelism: d => {
+          const cur = control.parallelism() ?? config.parallelism
+          control.setParallelism(cur + d)
+          setParallelismTick(t => t + 1)
+        },
       }}
     />
   }
@@ -1640,7 +1728,31 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 挡在**按键这一刻**,而不是让他选完环节、看完后果、确认完再看一遍失败。
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
         if (why) { setRedoProblems([why]); return }
-        setRedoTarget(node); setPhase('confirmRedo')
+        setRedoTarget(node); setRedoEntry(null); setPhase('confirmRedo')
+      }}
+      /**
+       * 快速重做失败的那个环节(`R`)。
+       *
+       * 两道闸门,顺序有讲究:先判「这一次能不能重做」(中断过的 run 一律不行),再判
+       * 「这个节点的失败环节能不能重入」。反过来的话,一个中断过的 run 上的失败节点会先
+       * 得到一句关于环节的解释,而真正的障碍是那个进程级的中断标记。
+       */
+      onRedoFailed={viewOnly ? undefined : node => {
+        const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
+        if (why) { setRedoProblems([why]); return }
+        const byId = new Map(nodes.map(n => [n.id, n]))
+        const found = failedRedoTarget(node, byId, config ? phaseCtxOf(node, config) : undefined)
+        // 拿不到就**说原因**,而不是把用户送进一屏什么都按不动的关口。
+        if ('error' in found) { setRedoProblems([found.error]); return }
+        setRedoTarget(node); setRedoEntry(found.entry); setPhase('confirmRedo')
+      }}
+      /** 跳过失败的那个环节继续往下走(`s`)。同样两道闸门,同样的顺序。 */
+      onSkipFailed={viewOnly ? undefined : node => {
+        const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
+        if (why) { setRedoProblems([why]); return }
+        const blocked = skipFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
+        if (blocked) { setRedoProblems([blocked]); return }
+        setSkipTarget(node); setPhase('confirmSkip')
       }}
     />
   )
@@ -1731,6 +1843,10 @@ export function DoneView(props: {
   redoProblems?: string[]
   /** 给了才有 r 键。 */
   onRedo?: (node: TaskNode) => void
+  /** 给了才有 R 键(快速重做失败的那个环节)。 */
+  onRedoFailed?: (node: TaskNode) => void
+  /** 给了才有 s 键(跳过失败的那个环节继续往下走)。 */
+  onSkipFailed?: (node: TaskNode) => void
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -1755,6 +1871,8 @@ export function DoneView(props: {
         // "完成后保留最终输出" — the buffer outlives the run, so the done view keeps it.
         streams={props.streams}
         onRedo={props.onRedo}
+        onRedoFailed={props.onRedoFailed}
+        onSkipFailed={props.onSkipFailed}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">
@@ -1774,6 +1892,9 @@ export function DoneView(props: {
         {handoff.map(l => <Text key={l} dimColor>{l}</Text>)}
         {props.redoProblems?.map(l => <Text key={l} color="warning">⚠ {l}</Text>) ?? null}
         <Text dimColor>
+          {/* 失败节点专属的那两个键**不在这里写** —— 它们只对 BLOCKED 节点有意义,
+              而这一行不知道光标停在哪。树自己的页脚按光标所在的行写它们(见
+              TaskTreePanel 的 failedKeysHint),那是唯一知道该不该写的地方。 */}
           q / Esc 退出 · 回车看节点详情{props.onRedo ? ' · r 重做选中的任务' : ''}
         </Text>
       </Box>

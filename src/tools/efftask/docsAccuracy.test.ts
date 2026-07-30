@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
-import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_LABEL, PHASE_NAMES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
+import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_PARALLELISM, MIN_PARALLELISM, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
 import { redoOptions, redoUnavailableReason } from './redo'
 import { ROLE_API_PROTOCOLS, TRANSLATING_PROTOCOLS } from '../../services/api/openaiCompat/protocols'
 import { toResponsesRequest } from '../../services/api/openaiCompat/toResponsesRequest'
 import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from '../AgentTool/roles/roleThinking'
 import { modelSupportsEffort } from '../../utils/effort'
 import { REASONING_FIELDS } from '../../services/api/openaiCompat/fromOpenAIStream'
-import { logPaneAction, sectionPaneAction, detailEntryHint, collapsedLinesFor } from '../../commands/efftask/logView'
+import { logPaneAction, logPaneMode, runControlAction, sectionPaneAction, detailEntryHint, collapsedLinesFor } from '../../commands/efftask/logView'
 import { detailSections, usageBody } from '../../commands/efftask/NodeDetail'
 import { upstreamAdvice } from '../../services/api/openaiCompat/upstreamError'
 import type { Key } from '../../ink/events/input-event'
@@ -270,6 +270,104 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     // Esc 归任务树面板(它负责关掉详情页)。这两个都必须放手。
     expect(logPaneAction('', key({ escape: true }))).toBeNull()
     expect(sectionPaneAction('', key({ escape: true }))).toBeNull()
+  })
+
+  it('说 ↑↓ 在输出页卡分两种含义,那 logPaneAction 就得真的分模式', () => {
+    /**
+     * 这一条守的是同一类谎的第三次(前两次:日志窗页脚写「Tab 切换环节」而 Tab 早就让给了
+     * 区切换;页签条写着回车进入而代码里没有分支接住)。README 现在写着「折叠着的那条流
+     * 选阶段,展开着的滚内容」,那两种模式就必须真的存在。
+     */
+    expect(README).toContain(norm('输出页卡：**折叠着的那条流选阶段，展开着的滚内容**'))
+    expect(logPaneAction('', key({ downArrow: true }), 'select')?.t).toBe('selectStream')
+    expect(logPaneAction('', key({ downArrow: true }), 'read')?.t).toBe('line')
+    expect(logPaneAction('j', key(), 'select')?.t).toBe('selectStream')
+  })
+
+  it('说滚轮和 g/G 两种模式下一样,那它们就不能跟着模式变', () => {
+    // 一格滚轮是 3 行,当成「往下跳 3 条流」的话轻轻一拨就飞过整个列表。
+    expect(README).toContain(norm('一格滚轮是 3 行，当成「往下跳 3 条流」的话轻轻一拨就飞过整个列表'))
+    expect(logPaneAction('', key({ wheelDown: true }), 'select')).toEqual({ t: 'line', d: 3 })
+    expect(logPaneAction('G', key(), 'select')?.t).toBe('bottom')
+    expect(logPaneAction('u', key({ ctrl: true }), 'select')?.t).toBe('halfPage')
+  })
+
+  it('说折叠状态决定 ↑↓ 归谁,那判据就得是折叠状态本身', () => {
+    // 另存一个模式变量的话,一条跑完自动折起来的流会让 ↑↓ 变成死键(它停在「滚内容」,
+    // 而屏幕上只剩一行表头)。
+    expect(logPaneMode(new Set([0]), 0, 2)).toBe('select')
+    expect(logPaneMode(new Set([1]), 0, 2)).toBe('read')
+  })
+
+  it('说 +/- 调并发、一次一步、= 和 _ 也认,那按键处理就得照办', () => {
+    expect(README).toContain(norm('| **调并发上限**'))
+    expect(README).toContain(norm('也认，因为'))
+    for (const k of ['+', '=']) expect(runControlAction(k, {})).toBe('raiseParallelism')
+    for (const k of ['-', '_']) expect(runControlAction(k, {})).toBe('lowerParallelism')
+    // 一次一步:终端把按住 300ms 合批成一个五连加是常事,而每一步都会真的多派一个
+    // 带写工具的执行者出去。
+    expect(README).toContain(norm('时**只走一步**'))
+    expect(runControlAction('+++++', {})).toBe('raiseParallelism')
+  })
+
+  it('说并发范围 1–64,那夹取就得是同一个区间', () => {
+    // 这个数在 README、parseDirectives、启动关口编辑器、运行中调整四处出现过,而
+    // 「1–64」这句话是用户唯一读得到的那一份。
+    expect(README).toContain(norm('一次一步，范围 1–64'))
+    expect(MIN_PARALLELISM).toBe(1)
+    expect(MAX_PARALLELISM).toBe(64)
+    expect(clampParallelism(0)).toBe(MIN_PARALLELISM)
+    expect(clampParallelism(999)).toBe(MAX_PARALLELISM)
+  })
+
+  it('说「下限是 1,不是 0」,那 0 就得被夹成 1', () => {
+    expect(README).toContain(norm('**下限是 1**，不是 0'))
+    expect(clampParallelism(0)).toBe(1)
+  })
+
+  it('说 R/s 只对失败节点,而且四个环节能跳,那判据就得是同一份', () => {
+    expect(README).toContain(norm('直接重做**失败的那个环节**'))
+    expect(README).toContain(norm('**跳过**失败的那个环节，继续往下走'))
+    // 能跳的只有那四个 —— README 的表格里,分析/执行/观察三行都写着「不可用」。
+    expect([...SKIPPABLE_PHASES].sort()).toEqual(['accept', 'integrate', 'review', 'verify'])
+    for (const p of ['plan', 'execute', 'observer']) {
+      expect(SKIPPABLE_PHASES.has(p)).toBe(false)
+    }
+  })
+
+  it('说失败点是「记下来,不反推」,那 TaskNode 上就得真有这个字段', () => {
+    expect(README).toContain(norm('它正处在哪个状态就记在'))
+    const types = readFileSync(new URL('src/tools/efftask/types.ts', ROOT), 'utf8')
+    expect(types).toContain('failedAt?: NodeStatus')
+    // 而且它只在**节点自己失败**时记 —— propagateBlocked 那条路一个字都不写,否则
+    // 「这个节点不是自己失败的」那句话就成了假的。
+    const orch = readFileSync(new URL('src/tools/efftask/orchestrator.ts', ROOT), 'utf8')
+    expect(orch).toContain('这条路**刻意不记 failedAt**')
+  })
+
+  it('说跳过验收/测试验证时执行不重跑,那 pipeline 里就得有那条豁免', () => {
+    expect(README).toContain(norm('**跳过测试验证 / 验收时执行环节不重跑**'))
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    expect(src).toContain('if (!enterAtJudge) {')
+    // 只作用于第一轮:返工轮必须真的从执行者开始。
+    expect(src).toContain('enterAtJudge = false')
+  })
+
+  it('说定向注入的两个字段会写进 run.md 并读回,那两侧就都得有它们', () => {
+    expect(README).toContain(norm('会写进'))
+    expect(README).toContain(norm('时读回来'))
+    const write = readFileSync(new URL('src/tools/efftask/persistence.ts', ROOT), 'utf8')
+    const read = readFileSync(new URL('src/tools/efftask/resumeCore.ts', ROOT), 'utf8')
+    for (const f of ['phaseGuidance', 'roleGuidance']) {
+      expect(write).toContain(f)
+      expect(read).toContain(f)
+    }
+  })
+
+  it('说裁决类环节看得到全部指引,那那一组环节就得逐字对得上', () => {
+    expect(README).toContain(norm('**裁决类环节（质疑讨论 / 测试验证 / 验收 / 集成验收 / 观察）看得到全部指引**'))
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    expect(src).toContain("new Set<PhaseName>(['review', 'verify', 'accept', 'integrate', 'observer'])")
   })
 
   it('说「只在真的能点时才写回车/点击」,那文案就得跟着可用性变', () => {

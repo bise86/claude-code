@@ -8,7 +8,7 @@ import { describe, expect, it } from 'bun:test'
 import * as React from 'react'
 import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
-import { TaskTreePanel, visibleRows, viewport, elapsed, budgetedViewport, kindGlyph, KIND_GLYPH } from './TaskTreePanel.js'
+import { TaskTreePanel, visibleRows, viewport, elapsed, budgetedViewport, kindGlyph, KIND_GLYPH, HEADER_HINT_MIN_COLUMNS } from './TaskTreePanel.js'
 import { NodeDetail, phaseTimeBody } from './NodeDetail.js'
 import { PHASE_LABEL, PHASE_NAMES } from '../../tools/efftask/types.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
@@ -22,7 +22,7 @@ const RIGHT = ESC + '[C'
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, 12))
 const tickEsc = (): Promise<void> => new Promise(r => setTimeout(r, 250))
 
-function fakeTty() {
+function fakeTty(cols = 120) {
   let pending: string | null = null
   const stdin = Object.assign(new EventEmitter(), {
     isTTY: true,
@@ -32,7 +32,7 @@ function fakeTty() {
   })
   let frame = ''
   const stdout = Object.assign(new EventEmitter(), {
-    isTTY: true, columns: 120, rows: 40,
+    isTTY: true, columns: cols, rows: 40,
     write: (s: string) => { frame += s; return true },
   })
   // Cursor-move sequences ARE the spacing, so they become a space; the bare ESC byte that
@@ -70,6 +70,54 @@ const mount = async (over: Record<string, unknown> = {}) => {
   await tick()
   return { ...t, app }
 }
+
+describe('表头一行装得下 —— 那是行预算的前提', () => {
+  /**
+   * 「面板高度 = 边框 2 + 表头 1 + height + 提示 1」是 `budgetedViewport` 全部预算的前提,
+   * 而表头是**会回流的**(它是 `<Text>`,不是 truncate)。表头一旦折成两行,被顶出屏幕的
+   * 正是底部的图例和按键提示。
+   *
+   * 这条不变量此前**一条测试都没有**,而 `HEADER_USAGE_MIN_COLUMNS` 的注释里那句
+   * 「实测 46 列时是 2 行」只活在注释里。加 `+/-` 那 4 列时才发现没人守着它。
+   */
+  const usageTree = (): TaskNode[] => tree().map((n, i) => (
+    i === 0 ? { ...n, usage: { calls: 6, input: 900, output: 300, cacheRead: 0, cacheWrite: 0 } } : n
+  ))
+  const mountAt = async (cols: number, over: Record<string, unknown> = {}) => {
+    const t = fakeTty(cols)
+    const app = await render(
+      React.createElement(TaskTreePanel, {
+        nodes: usageTree(), runId: '003', interactive: true,
+        pool: () => ({ inUse: 2, limit: 7 }),
+        runControl: {
+          paused: false, onTogglePause: () => {}, onAddDirective: () => {},
+          onCancelNode: () => {}, onAdjustParallelism: () => {},
+        },
+        ...over,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    return { ...t, app }
+  }
+
+  it(`${HEADER_HINT_MIN_COLUMNS} 列时 并行占用 + \`+/-\` + 用量合计 仍在同一行`, async () => {
+    const m = await mountAt(HEADER_HINT_MIN_COLUMNS)
+    const f = m.lastFrame()
+    m.app.unmount()
+    // 一行的证据:三者之间没有换行。中间那些空格数不能断言 —— `plain()` 把每段 ANSI
+    // 换成一个空格,而分段是渲染细节。
+    expect(f).toMatch(/并行 2\/7[^\n]*\+\/-[^\n]*⇅/)
+  })
+
+  it(`窄于 ${HEADER_HINT_MIN_COLUMNS} 列时整段不画 —— 4 列换两行表头不值`, async () => {
+    const m = await mountAt(HEADER_HINT_MIN_COLUMNS - 1)
+    const f = m.lastFrame()
+    m.app.unmount()
+    expect(f).toContain('并行 2/7')
+    expect(f).not.toContain('+/-')
+  })
+})
 
 describe('visibleRows folds subtrees, parent before child', () => {
   it('hides a collapsed node\'s whole subtree', () => {
