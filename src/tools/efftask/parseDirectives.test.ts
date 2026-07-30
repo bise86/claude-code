@@ -345,6 +345,29 @@ describe('caps 里两个新旋钮要有正常入口', () => {
     expect(cfg.caps.quorum).toBe(100)
     expect(cfg.caps.maxSeatsPerPhase).toBe(20)
   })
+  it('静默超时可以用一句话调 —— 此前只能手改 run.md', async () => {
+    /**
+     * 它是阻断卡唯一会点名让用户去调的旋钮(「提高 run.md 里 caps.nodeTimeoutMs」),
+     * 而正常路径上到不了它 —— 和 maxSeatsPerPhase / quorum 当初的处境逐字相同。
+     *
+     * 用户报的场景:一个思考很久的模型配成员工老是「超时」,而同一个模型当主模型正常。
+     * 那条时钟本身已经修好(流式增量算进展),但真的需要更长静默预算时,他得有个入口。
+     */
+    const cfg = await parseDirectives('这个模型慢,阶段超时给 20 分钟', {
+      knownRoles: [], modelJson: json({ caps: { nodeTimeoutMs: 1_200_000 } }),
+    })
+    expect(cfg.caps.nodeTimeoutMs).toBe(1_200_000)
+  })
+
+  it('静默超时的夹取范围和 resumeCore 读回时那一份相同(1s–2h)', async () => {
+    // 两处不一致的话,同一个数在启动时被接受、在恢复时被改写,而屏幕上没有任何东西
+    // 解释它为什么变了。
+    const tiny = await parseDirectives('x', { knownRoles: [], modelJson: json({ caps: { nodeTimeoutMs: 5 } }) })
+    expect(tiny.caps.nodeTimeoutMs).toBe(1000)
+    const huge = await parseDirectives('x', { knownRoles: [], modelJson: json({ caps: { nodeTimeoutMs: 99_999_999 } }) })
+    expect(huge.caps.nodeTimeoutMs).toBe(7_200_000)
+  })
+
   it('maxSeatsPerPhase 真的作用到席位上,不只是存进 caps', async () => {
     // 只断言 caps 里的数值,等于只验证「配置被记下来了」;剪断传给 applyRoleDefsToPhases
     // 的那一跳,数值还在、席位照旧超编。

@@ -105,6 +105,9 @@ describe('段落区', () => {
     expect(at()).toEqual({
       zone: 'content', tab: 'task', cursor: 0, expanded: [], from: 0,
       cursorShown: 0, tabsInverse: [],
+      // 刚打开时没有任何段落是展开的 → ↑↓ 是「选段落」。这个字段是「此刻 ↑↓ 归谁」
+      // 唯一的观测口(屏幕上看不见模式),见 NodeDetail.onState 的注释。
+      secMode: 'select',
     })
   })
 
@@ -172,6 +175,302 @@ describe('段落区', () => {
     t.stdin.press(' '); await tick()
     app.unmount()
     expect(at().expanded).toEqual(['验收点'])
+  })
+})
+
+/**
+ * ↑↓ 的两个含义 —— 用户原话:「任务页卡上,和子 agent 上一样,选择项就是上下键看内容,
+ * 空格缩起来后,上下键移动选择项目。」
+ *
+ * 断言一律落在 `onState`(cursor / from / secMode)上,不看帧文本:模式在屏幕上根本
+ * 观测不到(渲染器只写增量),而页脚那半句只能证明「写对了」,证明不了「按下去是这个行为」。
+ */
+describe('段落区 ↑↓ 双语义', () => {
+  it('折叠着 ↑↓ 选段落,展开后 ↑↓ 滚它的内容,收起又回到选段落', async () => {
+    const { t, app, at } = await mount()
+    expect(at().secMode).toBe('select')
+    t.stdin.press(DOWN); await tick() // → 完整方案
+    expect(at().cursor).toBe(1)
+    const beforeExpand = at().from
+
+    t.stdin.press(' '); await tick()
+    expect(at().expanded).toEqual(['完整方案'])
+    // 展开状态本身就是模式,不另存 state。
+    expect(at().secMode).toBe('read')
+
+    t.stdin.press(DOWN); await tick()
+    // 光标**不动**(这一下不是「换段落」),视口往下走一行。
+    expect(at().cursor).toBe(1)
+    expect(at().from).toBe(beforeExpand + 1)
+    t.stdin.press(UP); await tick()
+    expect(at().from).toBe(beforeExpand)
+
+    t.stdin.press(' '); await tick() // 收起
+    expect(at().secMode).toBe('select')
+    t.stdin.press(DOWN); await tick()
+    app.unmount()
+    // 收起之后 ↑↓ 又是「移动选择项目」。
+    expect(at().cursor).toBe(2)
+  })
+
+  it('一个 chunk 里连按 ↓ 要滚多行 —— 而不是只滚一行', async () => {
+    /**
+     * 一个 stdin chunk 会被拆成多个按键事件**同步**派发,而 `useInput` 的 handler 只在
+     * commit 之后才换。所以「滚到哪」必须在 handler 里从 ref 现算 —— 读 render 作用域的
+     * `from` 时,一个 chunk 里后面几下全都基于同一个陈旧值、互相覆盖。
+     * AgentLogPane 今天就有这个病(一个 chunk 4 个 ↑ 只动 1 行),而「按住 ↓ 一路读下去」
+     * 正是这个功能的主要用法。
+     */
+    const { t, app, at } = await mount()
+    t.stdin.press(' '); await tick() // 展开「目标」→ read
+    expect(at().secMode).toBe('read')
+    const from0 = at().from
+    t.stdin.press(`${DOWN}${DOWN}${DOWN}`); await tick()
+    app.unmount()
+    expect(at().from).toBe(from0 + 3)
+  })
+
+  it('jjj / kkk 在 read 模式下也是逐行滚,而且合批计数', async () => {
+    const { t, app, at } = await mount()
+    t.stdin.press(' '); await tick()
+    const from0 = at().from
+    t.stdin.press('jjj'); await tick()
+    expect(at().from).toBe(from0 + 3)
+    t.stdin.press('kk'); await tick()
+    app.unmount()
+    expect(at().from).toBe(from0 + 1)
+  })
+
+  it('read 模式下 n 换下一段 —— 不必先收起', async () => {
+    /** 这是从输出页卡搬过来的那半个逃生口:`n` 在两种模式下都认。 */
+    const { t, app, at } = await mount()
+    t.stdin.press(' '); await tick() // 展开「目标」
+    expect(at().secMode).toBe('read')
+    t.stdin.press('n'); await tick()
+    expect(at().cursor).toBe(1)
+    // 「目标」还是展开着的(n 只换选中项,不动展开状态),而选中的「完整方案」是折叠的
+    // → 模式跟着选中项回到 select。
+    expect(at().expanded).toEqual(['目标'])
+    expect(at().secMode).toBe('select')
+    // 循环:从最后一段按 n 回到第 0 段。
+    for (let i = 0; i < 5; i++) { t.stdin.press('n'); await tick() }
+    app.unmount()
+    expect(at().cursor).toBe(0)
+  })
+
+  it('内容短到滚不动时,展开也**不**进 read —— 否则 ↑↓ 是死键', async () => {
+    /**
+     * 段落区和输出区的第一处结构差异:一条流动辄几百行,而一个刚起跑的节点只有一段
+     * 一行的目标。展开之后总行数仍然 ≤ 视口高度时,`maxFrom` 是 0 —— 判成「滚动」的
+     * 后果就是按下去屏幕一个字不动,而页脚正好写着「↑↓ 滚内容」。
+     */
+    const n = node()
+    n.goal = '就一行目标'
+    n.plan = { solution: '', keyPoints: '', risks: '', acceptance: '' }
+    n.execStatus = ''
+    const { t, app, at } = await mount({ node: n })
+    t.stdin.press(' '); await tick()
+    expect(at().expanded).toEqual(['目标'])
+    expect(at().secMode).toBe('select')
+    // 而它仍然是「选段落」:唯一的一段,↑↓ 夹在原地,但语义是真的。
+    t.stdin.press(DOWN); await tick()
+    app.unmount()
+    expect(at().cursor).toBe(0)
+  })
+
+  it('段落列表在跑动中增长,模式**不**跟着翻面 —— 光标按标题走,不按下标', async () => {
+    /**
+     * 实测过的病:光标停在下标 2(「模型用量」)、空格展开 → 方案跑出来了、
+     * 列表从 3 段变成 7 段 → 下标 2 现在指着「重点」→ 展开状态还挂在「模型用量」上 →
+     * ↑↓ 的语义在用户手底下自己从「滚内容」翻回「选段落」,而他一个键都没按。
+     */
+    const before = node()
+    before.plan = { solution: '', keyPoints: '', risks: '', acceptance: '' }
+    before.execStatus = ''
+    // 段落 = [目标, 阻断原因]
+    before.blockedReason = long('阻断')
+    // 方案跑出来了:四段插进「目标」和「阻断原因」之间。
+    const after = { ...before, plan: node().plan }
+    const t = fakeTty()
+    const seen: { cursor: number; secMode: string; expanded: string[]; from: number }[] = []
+    /**
+     * 换节点必须由**父组件的 state** 换,不能用 `app.rerender(<NodeDetail .../>)`:
+     * 这个夹具里 rerender 会让 NodeDetail 重新挂载(实测:展开状态和光标一起清零),
+     * 于是这条测试测的就变成「重挂之后是不是干净的」——恒绿,而要钉的那件事没被碰到。
+     * 真实运行里换的是 props(树每秒 tick 一次),组件实例是同一个。
+     */
+    const grow: { current?: () => void } = {}
+    const Grower = (): React.ReactElement => {
+      const [n, setN] = React.useState<TaskNode>(before)
+      grow.current = () => setN(after)
+      return (
+        <NodeDetail
+          node={n} elapsed="12s" logActive columns={110}
+          onState={x => seen.push(x as never)}
+        />
+      )
+    }
+    const app = await render(
+      <Grower />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const at = () => seen[seen.length - 1]!
+    t.stdin.press(DOWN); await tick() // → 阻断原因(下标 1)
+    t.stdin.press(' '); await tick()
+    expect(at().expanded).toEqual(['阻断原因'])
+    expect(at().secMode).toBe('read')
+    // 往这一段里读几行 —— 视口此刻停在「阻断原因」的第 6 行附近。
+    t.stdin.press(DOWN.repeat(6)); await tick()
+    const beforeGrow = at().from
+
+    // **没有按任何键**,只是节点长出了新段落。
+    grow.current!()
+    await tick()
+    // 下标跟着那一段走(0 目标 / 1..4 方案四段 / 5 阻断原因)。
+    expect(at().cursor).toBe(5)
+    // 而模式一动不动 —— 用户还在读他刚展开的那一段。
+    expect(at().secMode).toBe('read')
+    /**
+     * **视口也必须跟着那一段走。**
+     *
+     * 验收实测过只改光标不改锚的后果:光标跟着「阻断原因」走到了下标 5,而锚里那个
+     * `stream: 1` 被 `headerAt(1)` 解成了**「完整方案」**的标题行 —— 用户正在读的那一行
+     * 已经在屏幕外,而空格/`n`/模式派生作用在第 5 段。比不修更糟:改动前光标和锚都按
+     * 下标、**互相一致**(一起指错段),两者分叉之后屏幕和键盘说的是两段不同的内容。
+     *
+     * 判据是「`from` 落在那一段的标题行上」——展开时锚的 delta 是 0(select() 钉的),
+     * 而那一段现在在第 headerAt(5) 行。
+     */
+    expect(at().from).toBeGreaterThan(beforeGrow)
+    // 而且它仍然归「读内容」:按 ↑ 视口退一行,光标一动不动。
+    const afterGrow = at().from
+    t.stdin.press(UP); await tick()
+    expect(at().from).toBe(afterGrow - 1)
+    expect(at().cursor).toBe(5)
+    t.stdin.press(' '); await tick()
+    app.unmount()
+    // 收起的仍然是他展开的那一段,不是「现在下标 1 指着的那一段」。
+    expect(at().expanded).toEqual([])
+  })
+
+  it('**同一个回合**里「空格 + ↓」:那一下 ↓ 必须按展开之后的语义走', async () => {
+    /**
+     * 这是 `measure()` 从几个常量改成一个函数、以及 handler 里现算模式的**全部理由**,
+     * 而它此前一条测试都没有:别的用例在空格和箭头之间 `await tick()`,已经提交过一帧了。
+     *
+     * 真实场景是用户按住键或者快速连按两下 —— 两个 stdin chunk 落在同一个同步回合里,
+     * 而 `useInput` 的 handler 只在 commit 之后才换。读上一帧的模式,那一下 ↓ 会被当成
+     * 「换段落」(展开之前的语义),视口一动不动。
+     */
+    const { t, app, at } = await mount()
+    // 两次 press 之间**不 await** —— 这才是同一个回合。
+    t.stdin.press(' ')
+    t.stdin.press(DOWN.repeat(3))
+    await tick()
+    app.unmount()
+    expect(at().expanded).toEqual(['目标'])
+    expect(at().secMode).toBe('read')
+    // 光标没动、视口滚了 3 行:那三下走的是**展开之后**的语义。
+    expect(at().cursor).toBe(0)
+    expect(at().from).toBe(3)
+  })
+
+  it('同一回合里展开**把「滚得动」这件事本身翻过来**时,那一下 ↓ 也要按新版面走', async () => {
+    /**
+     * 变异测试实测出来的缺口:把 `measure(expandedRef.current, …)` 换成 render 作用域的
+     * `measure(expanded, …)` 之后,上面那条「空格↓↓↓」照样绿 —— 因为模式本身读的是
+     * `expandedRef.current`,陈旧的 `expanded` 只经由 `canScroll` 和 `from` 显形,而那条
+     * 用例里两者恰好同值。
+     *
+     * 这一条专门造出**差异**:折叠时整份列表放得下(canScroll 假 → select),展开之后
+     * 放不下(canScroll 真 → read)。同一个同步回合里「空格 + ↓」,陈旧的版面会算出
+     * 「还是滚不动」→ 那一下 ↓ 变成移光标,视口一动不动。
+     */
+    const n = node()
+    n.goal = Array.from({ length: 40 }, (_, i) => `目标第${i}行`).join('\n')
+    n.plan = { solution: '', keyPoints: '', risks: '', acceptance: '' }
+    n.execStatus = ''
+    const { t, app, at } = await mount({ node: n, maxRows: 14 })
+    // 前提:折叠着的时候是「选段落」(整份列表放得下)。
+    expect(at().secMode).toBe('select')
+    t.stdin.press(' ')
+    t.stdin.press(DOWN)
+    await tick()
+    app.unmount()
+    expect(at().expanded).toEqual(['目标'])
+    expect(at().secMode).toBe('read')
+    // 那一下 ↓ 走的是**展开之后**的版面:视口动了,光标没动。
+    expect(at().from).toBe(1)
+    expect(at().cursor).toBe(0)
+  })
+
+  it('滚不动的边界:总行数正好等于视口高度时仍然是 select', async () => {
+    /**
+     * `canScroll` 差一个等号(`>` 写成 `>=`)就会造出一个死键:`maxFrom` 是 0,而页脚
+     * 写着「↑↓ 滚内容」。边界值必须有探针 —— 这正是 `sectionPaneMode` 第 1 条注释存在的理由。
+     *
+     * 造法:把可用高度压到刚好容纳展开后的全部行。段落只有「目标」一段(12 行正文),
+     * maxRows 给到「标题 1 + 正文 12」正好等于 paneRows 的那个值。
+     */
+    const n = node()
+    n.goal = Array.from({ length: 12 }, (_, i) => `目标第${i}行`).join('\n')
+    n.plan = { solution: '', keyPoints: '', risks: '', acceptance: '' }
+    n.execStatus = ''
+    // 逐个高度试,找到「展开后 total === paneRows」那一档:此时 canScroll 必须为假。
+    let hit = false
+    for (let rows = 10; rows <= 26 && !hit; rows++) {
+      const { t, app, at } = await mount({ node: n, maxRows: rows })
+      t.stdin.press(' '); await tick()
+      const expanded = at().expanded.length === 1
+      const from = at().from
+      t.stdin.press(DOWN); await tick()
+      const moved = at().from !== from
+      app.unmount()
+      // 找的是「展开了、但一行都滚不动」那一档 —— 那一档的模式必须是 select。
+      if (expanded && !moved) { expect(at().secMode).toBe('select'); hit = true }
+    }
+    expect(hit).toBe(true)
+  })
+
+  it('段落光标那个 ❯ 真的画在屏幕上 —— 不是只在 onState 里', async () => {
+    /**
+     * `onState.cursorShown` 是**独立重算**的(effect 里再调一次 `sectionCursor`),
+     * 不是从渲染结果读的 —— 也就是说它是一个 look-alike:把渲染时那个 `cursor:` 改成 -1,
+     * 屏幕上一个光标都没有,而所有 cursorShown 断言照旧全绿(验收实测存活)。
+     */
+    const { t, app } = await mount()
+    app.unmount()
+    expect(t.lastFrame()).toContain('❯')
+  })
+
+  it('「下面还有 N 行」那句提示也要跟着模式变', async () => {
+    // select 模式下 ↑↓ 换的是段落,写「↑↓ 继续」就是那句「页脚上写着的键按了不是这个
+    // 意思」的翻版 —— 而这一行比页脚更贴着内容,用户更容易当真。
+    const { t, app, at } = await mount()
+    expect(t.lastFrame()).toContain('^d 翻页')
+    expect(t.lastFrame()).not.toContain('↑↓ 继续')
+    t.stdin.press(' '); await tick()
+    expect(at().secMode).toBe('read')
+    app.unmount()
+    expect(t.lastFrame()).toContain('↑↓ 继续')
+  })
+
+  it('页脚跟着模式变 —— 两句都不许写成假话', async () => {
+    const { t, app, at } = await mount()
+    // 首帧是整屏写,所以整句可靠。
+    expect(t.lastFrame()).toContain('↑↓/jk 选段落')
+    expect(t.lastFrame()).toContain('^u/^d 翻页')
+    t.stdin.press(' '); await tick()
+    expect(at().secMode).toBe('read')
+    app.unmount()
+    /**
+     * 换页脚那一跳是**增量**重画,整句在缓冲里从来没出现过(实测:只剩
+     * `滚内容 收起 选段落 n 下一段 …` 这些被改动的片段)。所以挑的是两个**只在
+     * read 模式的页脚里出现**的片段 —— 写死一句「↑↓/jk 滚动」的话它们一个都不会有。
+     */
+    expect(t.lastFrame()).toContain('滚内容')
+    expect(t.lastFrame()).toContain('n 下一段')
   })
 })
 

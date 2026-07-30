@@ -173,6 +173,25 @@ function verdictArray(v: unknown, onDrop?: () => void): RoundtableRecord['verdic
         comments: typeof x.comments === 'string' ? capText(x.comments, MAX_BLOCKING_CHARS) : '',
         ...(x.infra === true ? { infra: true as const } : {}),
         ...(x.timeout === true ? { timeout: true as const } : {}),
+        /**
+         * 下面这四个字段此前**读不回来**,而每一个丢掉都有具体后果:
+         *
+         *  - `manual`:一条**人工强制通过**读回来之后会渲染成和一位真评审员点头
+         *    **逐字相同**的「通过」(persistence.roundtableBody 和详情页都按它分叉)——
+         *    而那个区别正是强制通过这一整套存在的理由;
+         *  - `roleTag`:「这几条裁决属于同一个角色的几个员工」无从恢复,而按角色分组
+         *    正是「一个角色多员工收敛成一个结论」的前提(这条理由写在 Verdict.roleTag 上);
+         *  - `rateLimited`:圆桌耗尽时的补救建议靠它分叉,丢了就退回「去查角色模型和网络」;
+         *  - `timeoutKind`:两种超时的处理方式**相反**(见 Verdict.timeoutKind)。
+         *
+         * 都走保守校验:只认严格相等的字面量,手改成别的值一律当没有。
+         */
+        ...(x.manual === true ? { manual: true as const } : {}),
+        ...(typeof x.roleTag === 'string' && x.roleTag !== '' ? { roleTag: capText(x.roleTag, 200) } : {}),
+        ...(x.rateLimited === true ? { rateLimited: true as const } : {}),
+        ...(x.timeoutKind === 'human' || x.timeoutKind === 'stall' || x.timeoutKind === 'total'
+          ? { timeoutKind: x.timeoutKind }
+          : {}),
       }
     })
 }

@@ -51,7 +51,7 @@ describe('保留 = 什么都不做', () => {
 
 describe('合并回当前分支', () => {
   it('成功时说合并了几个提交', async () => {
-    const { git, calls } = gitOf({ 'status --porcelain': { code: 0, stdout: '' } })
+    const { git, calls } = gitOf({ 'diff --quiet': { code: 0 } })
     const r = await runHandoffChoice('merge', H, git, '/repo')
     expect(r.ok).toBe(true)
     expect(r.message).toContain('3 个提交')
@@ -62,7 +62,7 @@ describe('合并回当前分支', () => {
     // 显示「已合并」是这个功能最不能出的错:用户会据此去做下一步,而代码根本不在
     // 他的分支上。
     const { git } = gitOf({
-      'status --porcelain': { code: 0, stdout: '' },
+      'diff --quiet': { code: 0 },
       merge: { code: 1, stderr: 'CONFLICT (content): Merge conflict in a.ts' },
     })
     const r = await runHandoffChoice('merge', H, git, '/repo')
@@ -74,11 +74,76 @@ describe('合并回当前分支', () => {
   })
 
   it('工作区脏时先挡住,并且不跑 merge', async () => {
-    const { git, calls } = gitOf({ 'status --porcelain': { code: 0, stdout: ' M src/a.ts\n' } })
+    // `git diff --quiet` 的约定:1 = 有差异。
+    const { git, calls } = gitOf({
+      'diff --quiet': { code: 1 },
+      'status --porcelain': { code: 0, stdout: ' M src/a.ts\n' },
+    })
     const r = await runHandoffChoice('merge', H, git, '/repo')
     expect(r.ok).toBe(false)
     expect(r.message).toContain('未提交的改动')
+    expect(r.followUps!.join('\n')).toContain('src/a.ts')
     expect(calls.some(c => c[0] === 'merge')).toBe(false)
+  })
+
+  it('**未跟踪文件不算脏** —— 否则这个功能在正常仓库里一次也不会发生', async () => {
+    /**
+     * 判据原来是 `git status --porcelain` 非空,而它把未跟踪文件也算进去。`/et` 自己就在
+     * 用户的检出里写 `.claude/efftask/<runId>/`,于是每一趟运行结束时 status 里都躺着
+     * 一条 `?? .claude/` —— 自动合并永远被自己挡住,而给出的补救照做也没用
+     * (`git stash` 对未跟踪目录回答「No local changes to save」)。
+     *
+     * 真的会被覆盖时 **git 自己会拒绝并且不动工作树**,那条路比我们猜更准。
+     */
+    const { git, calls } = gitOf({
+      'diff --quiet': { code: 0 },
+      // 只有未跟踪文件时 `git diff` 全都干净,而 porcelain 会吐 `?? …`。
+      'status --porcelain': { code: 0, stdout: '?? .claude/\n?? scratch.txt\n' },
+    })
+    const r = await runHandoffChoice('merge', H, git, '/repo')
+    expect(r.ok).toBe(true)
+    expect(calls.some(c => c[0] === 'merge')).toBe(true)
+  })
+
+  it('**只暂存、没提交**也算脏 —— 那份改动同样会被一次合并卷进去', async () => {
+    /**
+     * 变异测试实测存活:把 `git diff --cached --quiet` 那一问删掉(只看工作区)之后,
+     * 全套照绿 —— 因为别的用例的夹具让**工作区**那一问就已经报脏了。
+     *
+     * 而 `git add` 过、还没 commit 的改动正是最容易被吞掉的一种:工作区干净
+     * (`git diff --quiet` 返回 0),而 merge 会把它和合并结果搅在一起。
+     */
+    const { git, calls } = gitOf({
+      'diff --quiet': { code: 0 },   // 工作区干净
+      'diff --cached': { code: 1 },  // 但暂存区有改动
+      'status --porcelain': { code: 0, stdout: 'A  new.ts\n' },
+    })
+    const r = await runHandoffChoice('merge', H, git, '/repo')
+    expect(r.ok).toBe(false)
+    expect(calls.some(c => c[0] === 'merge')).toBe(false)
+    expect(r.followUps!.join('\n')).toContain('new.ts')
+  })
+
+  it('冲突把工作区留在半合并状态时,要说出来并给出 --abort', async () => {
+    /**
+     * git 在内容冲突时**不回滚**:冲突标记留在文件里、`MERGE_HEAD` 还在。而自动收口
+     * 这一路是用户没按任何键就发生的,所以「分支原样保留,没有任何东西丢失」这一句
+     * 漏掉了工作区;而原来给的「冲突需要你手工解决: git merge <branch>」照做会得到
+     * `error: Merging is not possible because you have unmerged files.`。
+     */
+    const { git } = gitOf({
+      'diff --quiet': { code: 0 },
+      merge: { code: 1, stderr: 'CONFLICT (content): Merge conflict in a.ts' },
+      'status --porcelain': { code: 0, stdout: 'UU a.ts\n M b.ts\n' },
+    })
+    const r = await runHandoffChoice('merge', H, git, '/repo')
+    expect(r.ok).toBe(false)
+    const ups = r.followUps!.join('\n')
+    expect(ups).toContain('未完成的合并')
+    expect(ups).toContain('a.ts')
+    expect(ups).toContain('git merge --abort')
+    // 「没有任何东西丢失」这句话在这里是假的 —— 工作区被动过了。
+    expect(ups).not.toContain('没有任何东西丢失')
   })
 })
 

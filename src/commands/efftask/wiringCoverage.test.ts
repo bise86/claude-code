@@ -202,14 +202,68 @@ describe('收口关口的接线(spec §8)', () => {
     // 不划掉:下次 --resume 会为一条已经合并/推送/删掉的分支再弹一次四选一,
     // 而「丢弃」会对着一条不存在的分支报错。
     // 失败还划掉:用户就再也回不到这个关口了,而他刚被告知失败了什么。
+    // **`keep` 也算处置完了**,尽管它什么都没做:恢复路径在任何节点检查之前就判
+    // pendingHandoff 并 return,而关口每个出口都走 done —— 不划掉的话一个「被安全阀挡住
+    // + 有待收口」的 run 会永久卡在收口关口,--retry-blocked 永远到不了 reseat。
     expect(SRC).toContain('if (result.ok) {')
     expect(SRC).toContain('pendingHandoff: undefined')
+  })
+
+  it('静默超时真的换到了那口时钟上(新建和恢复两条路都要)', () => {
+    /**
+     * 剪断它的后果:抽出来的数**显示**对了(关口那一行)、**落盘**对了(run.md),而真正
+     * 会中止调用的 `timeoutMs: () => capsRef.nodeTimeoutMs` 还读着旧值 —— 用户说「阶段
+     * 超时 20 分钟」,关口回答「静默超时 20 分钟」,而 10 分钟到了照样被杀。
+     *
+     * 必须计数:新建和恢复两条路径的这行字是逐字相同的,`toContain` 会被另一处满足。
+     */
+    expect(occurrences('capsRef.nodeTimeoutMs = ')).toBe(2)
+    expect(occurrences('timeoutMs: () => capsRef.nodeTimeoutMs')).toBe(2)
+  })
+
+  it('自动收口真的接上了 git,而且结果回到了 done 视图', () => {
+    /**
+     * 剪断这两根线的后果各自完整:
+     *  - 不传 `git`:`finishHandoff` 走「没注入」那条路,一次 merge 都不跑 —— 产出永远
+     *    只在集成分支上,而这正是用户报的那件事(「要在当前目录下有对应的存在」);
+     *  - 不接 `onHandoffResult`:合并成功/失败在屏幕上一个字都没有,done 视图照旧印
+     *    「你的工作区未被改动」,而它已经被改动了。
+     * 判据是**顺序 + 落点**那一层由 runOrchestrator.test.ts 真跑一遍;这里只钉「线接着」。
+     */
+    /**
+     * **带上下文**,不能只查 `git: gitRunner` 这七个字:`createWorktreePool({… git: gitRunner …})`
+     * 在同一个文件里也有一处,于是把传给 runOrchestrator 的那根线整条剪掉,断言照样绿
+     * —— 验收预言过、变异测试实测存活。锚在它自己那一段(收口回调紧跟其后)。
+     */
+    expect(SRC).toContain('        git: gitRunner,\n        onHandoffResult: out => {')
+    expect(SRC).toContain('onHandoffResult: out => {')
+    expect(SRC).toContain('setHandoffState(st)')
+    expect(element('DoneView')).toContain('handoffState={handoffState}')
   })
 
   it('收口结果显示在 done 视图上', () => {
     // 合并冲突之后安静地回到 done,用户会以为成功了 —— 而代码根本不在他的分支上。
     expect(element('DoneView')).toContain('handoffResult={handoffResult}')
     expect(SRC).toContain('props.handoffResult')
+  })
+})
+
+describe('上游限流闸门的接线', () => {
+  it('**两个** makeRunAgentFn 实例都拿到了同一个闸门', () => {
+    /**
+     * 剪断任意一处的后果都完整:
+     *  - 主 runAgent 少了它 → 整个退避功能在生产里彻底不接线(七个环节、圆桌每一席),
+     *    而全套测试一条都不红(验收实测:2481 pass 0 fail);
+     *  - extractAgent(一次性配置抽取)少了它 → 那一次调用绕过冷却,而它恰好是用户敲完
+     *    /et 之后的第一次调用。
+     *
+     * **必须计数**:这行字在这个文件里有两处,`toContain` 会被另一处满足 —— 这个文件
+     * 顶部记的就是这类假绿(occurrences 这个辅助函数正是为它写的)。
+     */
+    expect(occurrences('rateGate,')).toBe(2)
+    // 闸门本身建在 call() 作用域,和 control 同处 —— 建在组件里的话同一次会话按 r 重做
+    // 会把退避级数清零,而两个实例也不再共享「上游在限流」这条状态。
+    expect(SRC).toContain('const rateGate = createRateLimitGate()')
   })
 })
 

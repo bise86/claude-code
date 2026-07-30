@@ -6,6 +6,7 @@ import type { StreamState } from '../../tools/efftask/agentStream.js'
 import { AgentLogPane } from './AgentLogPane.js'
 import { ScrollPane } from './ScrollPane.js'
 import {
+  alignSectionCursor,
   anchoredFrom,
   clipToWidth,
   foldedStreams,
@@ -14,13 +15,13 @@ import {
   scrollWindow,
   sectionLines,
   sectionPaneAction,
+  sectionPaneMode,
   detailLayout,
   collapsedLinesFor,
   MIN_DETAIL_WIDTH,
   sectionCursor,
   tabFocused,
   mouseHint,
-  type LogAnchor,
   type LogPaneMode,
   type SectionSpec,
 } from './logView.js'
@@ -322,6 +323,15 @@ export function NodeDetail(props: {
     /** 此刻反显的是哪几个页签(焦点真的落在页签条上时才有)。 */
     tabsInverse: string[]
     /**
+     * 「任务」页卡此刻 ↑↓ 归谁 —— 选段落还是滚内容。
+     *
+     * 和 `AgentLogPane` 的 `onState.mode` 同一个理由,而且是同一个坑:模式在屏幕上
+     * **根本观测不到**(渲染器只写增量,`lastFrame()` 又把转义换成空格),而这次改动的
+     * 全部内容就是「同一个键在两种状态下做两件事」。按帧文本断言只能钉住页脚那半句,
+     * 钉不住行为。
+     */
+    secMode: LogPaneMode
+    /**
      * 「任务」页卡此刻从第几行开始画。
      *
      * 和 AgentLogPane 的 onState 交出 from 是同一个理由,而且是同一个坑:滚动位置在这个
@@ -366,9 +376,32 @@ export function NodeDetail(props: {
 
   const [zone, setZone, zoneRef] = useLiveState<DetailZone>('content')
   const [tab, setTab, tabRef] = useLiveState<DetailTabId>(props.initialTab ?? 'task')
-  const [cursor, setCursor, cursorRef] = useLiveState(0)
+  const [, setCursor, cursorRef] = useLiveState(0)
+  /**
+   * 选中的是**哪一段**(按标题),不是「第几段」。
+   *
+   * 下标不是身份:`detailSections` 过滤掉空 body,而节点跑起来会在**中间**插入
+   * 「完整方案 / 重点 / 风险点 / 验收点 / 执行状态」。实测过的后果:光标停在下标 2
+   * (「模型用量」)、按空格展开 → 方案跑出来了、列表从 3 段变成 7 段 → 下标 2 现在指着
+   * 「重点」→ 展开状态还挂在「模型用量」上 → ↑↓ 的语义**在用户手底下自己从「滚动」翻回
+   * 「选段落」**,页脚跟着变,而他一个键都没按。
+   *
+   * 所以身份是标题(和 `expanded` 同一个口径),下标只当回落(见 `alignSectionCursor`)。
+   */
+  const [, setSelTitle, selTitleRef] = useLiveState<string | undefined>(undefined)
   const [expanded, setExpanded, expandedRef] = useLiveState<ReadonlySet<string>>(new Set())
-  const [, setAnchor, anchorRef] = useLiveState<LogAnchor>({ stream: 0, delta: 0 })
+  /**
+   * 视口锚。**按标题记**,和光标、展开状态同一个口径。
+   *
+   * 只把光标换成标题寻址是不够的 —— 验收实测过:段落列表在中间插入之后,光标跟着
+   * 「阻断原因」走到了下标 6,而锚里那个 `stream: 1` 被 `headerAt(1)` 解成了
+   * **「完整方案」**的标题行 → 用户正在读的那一行(46)已经在屏幕外,而 `from` 停在 16。
+   * 比改动前更糟:改动前光标和锚都按下标、**互相一致**(一起指错段);两者分叉之后,
+   * 空格/`n`/模式派生作用在第 6 段,视口显示的却是第 1 段附近,而页脚写着「↑↓ 滚内容」。
+   *
+   * `delta` 仍然是「相对那一段标题行的偏移」——它跟着内容走,不受插入影响。
+   */
+  const [, setAnchor, anchorRef] = useLiveState<{ title?: string; delta: number }>({ delta: 0 })
   /**
    * 输出页卡此刻 ↑↓ 归谁 —— 只用来写页脚。
    *
@@ -402,21 +435,63 @@ export function NodeDetail(props: {
    * 零信息量,而那正是用户第一次打开详情页看到的东西。
    */
   const collapsedLines = collapsedLinesFor(contentRows)
-  // 滚动条占一列。
-  const { lines: secLines, headerAt } = sectionLines({
-    sections,
-    cursor: sectionCursor(zone, tab === 'task', cursor),
-    expanded,
-    width: contentWidth - 1,
-    collapsedLines,
-    theme,
-  })
-  const secTotal = secLines.length
-  const secFrom = scrollWindow(
-    secTotal,
-    paneRows,
-    anchoredFrom(secTotal, paneRows, anchorRef.current, headerAt),
-  ).from
+  /**
+   * 版面的一次测量:总行数、每段标题在第几行、视口从第几行开始、最多能滚到哪。
+   *
+   * **是一个函数,不是几个 render 作用域的常量。** 一个 stdin chunk 会被拆成多个按键事件
+   * **同步**派发(见 useLiveState 的文件头:按住 ↑ 拿到的是一个 chunk 多个事件),而
+   * `useInput` 的 handler 只在 commit 之后才换。于是 handler 里读 render 作用域的
+   * `secFrom` 时,一个 chunk 里第二下之后的每一下都基于**同一个陈旧值**、互相覆盖 ——
+   * 实测 `AgentLogPane` 就有这个病:一个 chunk 里送 4 个 ↑,视口只动 1 行。
+   * 而这次改动的卖点正是「一行一行读一段 60 行的方案」,按住 ↓ 只动 1 行等于没做。
+   *
+   * 展开状态和光标要从**外面传进来**:同一个 chunk 里「空格 + ↓」的第二下必须看见
+   * 第一下的结果(ref),而 `expanded` 一变 `total` 就变。
+   */
+  const measure = (expandedNow: ReadonlySet<string>, cursorNow: number) => {
+    // 滚动条占一列。
+    const { lines, headerAt: hAt } = sectionLines({
+      sections,
+      cursor: sectionCursor(zoneRef.current, tabRef.current === 'task', cursorNow),
+      expanded: expandedNow,
+      width: contentWidth - 1,
+      collapsedLines,
+      theme,
+    })
+    const total = lines.length
+    /**
+     * 锚里的标题在**此刻**是第几段。
+     *
+     * 这一句就是「锚也按标题走」的落点:`anchoredFrom` 收的是下标(它和日志窗共用),
+     * 而插入/删除之后同一个下标指的是**另一段**。解析放在这里,是因为这个函数是
+     * 「从状态算出画面」的唯一入口 —— render 和 handler 都走它。
+     */
+    const anchorIdx = sections.findIndex(s => s.title === anchorRef.current.title)
+    return {
+      lines,
+      headerAt: hAt,
+      total,
+      from: scrollWindow(total, paneRows, anchoredFrom(
+        total, paneRows,
+        // 那一段不在了(被清空/被过滤掉)→ 退回「按行号定位」,和这个功能之前一样。
+        { stream: anchorIdx, delta: anchorRef.current.delta },
+        hAt,
+      )).from,
+      maxFrom: Math.max(0, total - paneRows),
+      canScroll: total > paneRows,
+    }
+  }
+  const cursor = alignSectionCursor(sections, selTitleRef.current, cursorRef.current)
+  const lay = measure(expanded, cursor)
+  const secLines = lay.lines
+  const secTotal = lay.total
+  const secFrom = lay.from
+  /**
+   * 「任务」页卡此刻 ↑↓ 归谁。**派生的,不另存 state** —— 理由与输出页卡逐字相同
+   * (见 `sectionPaneMode` 与 `LogPaneMode` 的注释)。这里只用来写页脚和交给测试;
+   * 真正决定按键归属的那一份在 handler 里**现算**(合批)。
+   */
+  const secMode = sectionPaneMode(expanded, sections, cursor, lay.canScroll)
 
   React.useEffect(() => {
     props.onState?.({
@@ -424,17 +499,39 @@ export function NodeDetail(props: {
       // 交的是**画出来的样子**,不是 state 里的意图 —— 见上面 cursorShown 的注释。
       cursorShown: sectionCursor(zone, tab === 'task', cursor),
       tabsInverse: DETAIL_TABS.filter(t => tabFocused(zone, t.id === tab)).map(t => t.id),
+      secMode,
     })
   })
 
   useInput((input, key) => {
-    const act = sectionPaneAction(input, key)
+    /**
+     * 模式**在这里现算**,不用 render 作用域的 `secMode`。
+     *
+     * 同一个 chunk 里的「空格 ↓」是同步派发的:用上一帧的模式去解释那一下 ↓,拿到的是
+     * 展开**之前**的语义(移光标而不是滚动)。而这两下正是这个功能最常见的用法。
+     */
+    const onTask = tabRef.current === 'task'
+    const cursorNow = onTask ? alignSectionCursor(sections, selTitleRef.current, cursorRef.current) : 0
+    const layNow = onTask ? measure(expandedRef.current, cursorNow) : undefined
+    const mode = layNow
+      ? sectionPaneMode(expandedRef.current, sections, cursorNow, layNow.canScroll)
+      : 'select'
+    const act = sectionPaneAction(input, key, mode)
     if (!act) return
-    /** 把「我想让视口停在第 n 行」翻译成锚(相对当前选中段落的标题行)。 */
-    const anchorAt = (line: number): LogAnchor => {
-      const i = cursorRef.current
-      const at = headerAt(i)
-      return { stream: i, delta: at >= 0 ? line - at : line }
+    /**
+     * 把「我想让视口停在第 n 行」翻译成锚 —— 相对**当前选中那一段的标题行**,
+     * 而身份记的是它的**标题**(见 anchorRef 的注释)。
+     */
+    const anchorAt = (line: number): { title?: string; delta: number } => {
+      const at = layNow ? layNow.headerAt(cursorNow) : -1
+      return { title: sections[cursorNow]?.title, delta: at >= 0 ? line - at : line }
+    }
+    /** 选中第 i 段:光标、身份(标题)、锚三者必须一起动,否则视口会留在别处。 */
+    const select = (i: number): void => {
+      setCursor(i)
+      setSelTitle(sections[i]?.title)
+      // **切到哪,展示哪**:锚直接钉到那一段的标题行上。
+      setAnchor({ title: sections[i]?.title, delta: 0 })
     }
     if (act.t === 'tab') {
       const i = DETAIL_TABS.findIndex(t => t.id === tabRef.current)
@@ -464,28 +561,39 @@ export function NodeDetail(props: {
     // AgentLogPane 自己的 useInput 在管。两个 handler 会同时收到每一个键,
     // 不冲突全靠这一句 + 键位不重叠(logPaneAction 里 Tab 和左右箭头都是不认的)。
     if (tabRef.current !== 'task') return
-    if (act.t === 'scroll') {
-      const step = act.d * Math.max(1, Math.floor(paneRows / 2))
-      const maxFrom = Math.max(0, secTotal - paneRows)
-      setAnchor(anchorAt(Math.max(0, Math.min(maxFrom, secFrom + step))))
+    if (!layNow) return
+    // 半页(^u/^d、PgUp/PgDn)和逐行(read 模式的 ↑↓/jk)是**同一件事的两个步长**,
+    // 所以共用一份夹取。起点用现算的 `layNow.from`,不是 render 作用域的 secFrom ——
+    // 见 measure 的注释(合批的一个 chunk 里后面几下会互相覆盖)。
+    if (act.t === 'scroll' || act.t === 'line') {
+      const step = act.t === 'line' ? act.d : act.d * Math.max(1, Math.floor(paneRows / 2))
+      setAnchor(anchorAt(Math.max(0, Math.min(layNow.maxFrom, layNow.from + step))))
       return
     }
     if (act.t === 'move') {
       if (sections.length === 0) return
-      const next = Math.max(0, Math.min(sections.length - 1, cursorRef.current + act.d))
-      setCursor(next)
-      // **切到哪,展示哪**:锚直接钉到那一段的标题行上。
-      setAnchor({ stream: next, delta: 0 })
+      select(Math.max(0, Math.min(sections.length - 1, cursorNow + act.d)))
       return
     }
-    const title = sections[cursorRef.current]?.title
+    /**
+     * `n`:下一段,**循环**,两种模式下都认。
+     *
+     * 循环而不是撞到头就停:它和列表光标(↑↓)是两个不同的东西,和输出页卡的 `n`
+     * (下一条流,循环)保持一致 —— 那边的注释把这条区别写清楚了。
+     */
+    if (act.t === 'nextSection') {
+      if (sections.length === 0) return
+      select((cursorNow + 1) % sections.length)
+      return
+    }
+    const title = sections[cursorNow]?.title
     if (title === undefined) return
     const set = new Set(expandedRef.current)
     if (set.has(title)) set.delete(title)
     else set.add(title)
     setExpanded(set)
     // 展开/收起会让下面所有行整体位移,锚重新钉回这一段的标题 —— 否则视口当场跳走。
-    setAnchor({ stream: cursorRef.current, delta: 0 })
+    setAnchor({ title, delta: 0 })
   }, { isActive: props.logActive === true })
 
   const hasLog = (props.streams?.length ?? 0) > 0
@@ -539,7 +647,22 @@ export function NodeDetail(props: {
         : '↑↓/jk 滚动 · 空格 收起(回到选阶段)'
       return `Esc/q 返回任务树 · ${nav} · ←→ 换页卡 · Tab 到页签 · n 下一条 · g/G 顶部/底部 · t 思考${redoHint} · 耗时含等你批权限的时间`
     }
-    return `Esc/q 返回任务树 · ↑↓/jk 选段落 · 空格 展开/收起 · ←→ 换页卡 · Tab 到页签 · ^u/^d 翻页${redoHint}`
+    /**
+     * ↑↓ 在段落区也有**两个**含义了(用户原话:「和子 agent 上一样」),所以这一行
+     * 跟着模式变 —— 理由与上面输出页卡那一段逐字相同。
+     *
+     * 两句都**量过宽度**:100 列的终端上页脚实际能写 95 列(truncate-end 自己占一列),
+     * 而这两句分别是 94 和 92。上一版写成「空格 展开(之后 ↑↓ 滚它的内容)」是 101 列 ——
+     * 超出去的部分从尾部吃掉,被吃掉的正好是 `^u/^d 翻页`,而那是 select 模式下**唯一**
+     * 的翻页手段(read 模式里 ↑↓ 本来就能滚,它可有可无)。截断只许吃掉最不重要的那一头。
+     *
+     * `n 下一段` 只写在 read 模式里:select 模式下 ↑↓ 就是换段落,列一个同义键只会挤掉
+     * 别的说明;而 read 模式下它是**唯一**不用先收起就能换段落的键(和输出页卡的 `n` 同位)。
+     */
+    const nav = secMode === 'select'
+      ? '↑↓/jk 选段落 · 空格 展开(→ ↑↓ 滚内容) · ←→ 换页卡 · Tab 到页签 · ^u/^d 翻页'
+      : '↑↓/jk 滚内容 · 空格 收起(→ ↑↓ 选段落) · n 下一段 · ←→ 换页卡 · Tab 到页签'
+    return `Esc/q 返回任务树 · ${nav}${redoHint}`
   })()
 
   return (
@@ -581,7 +704,9 @@ export function NodeDetail(props: {
                 from={secFrom}
                 height={paneRows}
                 behind={Math.max(0, secTotal - paneRows - secFrom)}
-                behindHint="↑↓ 继续,^d 翻页"
+                /* 提示要说**此刻**按 ↑↓ 会发生什么。select 模式下 ↑↓ 换的是段落、不是视口,
+                   写「↑↓ 继续」就是那句「页脚上写着的键按了不是这个意思」的翻版。 */
+                behindHint={secMode === 'read' ? '↑↓ 继续,^d 翻页' : '^d 翻页'}
               />
             )
           : null}

@@ -1,17 +1,17 @@
 // src/tools/efftask/pipeline.ts
-import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode } from './types.js'
+import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
 import { ALT_SOLUTION_CHARS, createNode, MANUAL_PASS_ROLE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
-import { runRoundtable, type RunAgentFn } from './roundtable.js'
+import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
-import { blockReasonWithRemedy, humanTimeoutRemedy, type BlockCategory } from './escalation.js'
-import { NodeCancelledError, PhaseTimeoutError, type TimeoutKind } from './runAgentAdapter.js'
+import { blockReasonWithRemedy, humanTimeoutRemedy, totalTimeoutRemedy, type BlockCategory } from './escalation.js'
+import { NodeCancelledError, PhaseTimeoutError, ProviderApiError, type TimeoutKind } from './runAgentAdapter.js'
 import type { RunControl } from './control.js'
 
 /** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
@@ -280,7 +280,14 @@ type PhaseResult =
   | { ok: true; text: string }
   // timeoutKind 要跟着走:静默超时和等人超时的处理方式**相反**,合并成一个 boolean
   // 就只能给一句通用的话。
-  | { ok: false; reason: string; text?: string; timeout?: boolean; timeoutKind?: TimeoutKind; cancelled?: boolean }
+  // rateLimited:上游说「慢一点」(429/529)。和别的失败**必须分开** —— 它不是一次判决,
+  // 也不是一次故障,重试是对的;而且阻断卡要给的是「上游限流」那一版建议。
+  | {
+      ok: false; reason: string; text?: string; timeout?: boolean; timeoutKind?: TimeoutKind
+      cancelled?: boolean; rateLimited?: boolean
+      // 额度/权限用尽:**不重试**(等没有用),但要带分类和它自己那一句建议。
+      quotaExhausted?: boolean
+    }
 
 /**
  * 方案环节的返回值。
@@ -292,7 +299,13 @@ type PhaseResult =
  */
 type PlanPhaseResult =
   | { ok: true; parsed: ReturnType<typeof parsePlanOutput> }
-  | { ok: false; reason: string; timeout?: boolean; timeoutKind?: TimeoutKind; cancelled?: boolean }
+  // rateLimited 必须跟着走 —— 和 timeoutKind 逐字同因(见上面那段注释):调用方
+  // (stepStart)读它来决定阻断分类,漏掉它的后果是一条永远取不到值的死分支,
+  // 而限流阻断会以「无分类」落地:阻断卡给不出建议,--retry-blocked 也捞不回节点。
+  | {
+      ok: false; reason: string; timeout?: boolean; timeoutKind?: TimeoutKind; cancelled?: boolean
+      rateLimited?: boolean; quotaExhausted?: boolean
+    }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
 // which records it into node.blockedReason and BLOCKs the node.
@@ -303,7 +316,93 @@ type PlanPhaseResult =
  * (N 席并行)全都走这里,而不是走 runRoundtable。少给一个署名,这些席位就会退回
  * chunkBuffer 时代那种「几个人的话并成一坨、看不出谁说的」——正是本次要治的病。
  */
+/**
+ * 上游限流时**同一次调用**最多重试几次。
+ *
+ * 只有 3 是因为退避本身在闸门里(2s → 4s → …),这里要的只是「别把一次限流变成一个
+ * 节点的死刑」。圆桌那三条路有 `roundtableWithInfraRetry`,而**单次调用那六个调用点
+ * 一条重试都没有**:分析和执行拿到 429 就直接 `blockWithReason`,`blockedReason` 是一句
+ * 英文的 `API Error: Request rejected (429)`,`capCategory` 是 undefined —— 阻断卡连一条
+ * 对症的建议都给不出。而在订阅账号上 SDK 那一层对 429 一次都不重试
+ * (`withRetry.shouldRetry`),所以这就是全部的重试。
+ */
+const RATE_LIMIT_ATTEMPTS = 3
+
+/**
+ * 一次单点调用失败该按哪个阀报。
+ *
+ * 三个调用点(分析、执行、以及将来会长出来的)共用一份 —— 各写一遍的下一个漏掉的一定是
+ * 新加的那一类。上一次这样的漏是 `timeoutKind`:三个函数各写一遍内联字面量,而调用方要读
+ * 的那个字段**一个都没写**,于是「没人来点确认」拿到的是「去调 nodeTimeoutMs」。
+ *
+ * 限流报 `'infra'` 而不是新增一类:它已经带着「阻断卡 + capBlocked + --retry-blocked 认它」
+ * 这一整套,而分类名对用户是不可见的 —— 可见的是标题和补救建议,后者由 remedyOf 换掉。
+ */
+function blockCategoryOf(res: {
+  timeout?: boolean; rateLimited?: boolean; quotaExhausted?: boolean
+}): BlockCategory | undefined {
+  if (res.timeout === true) return 'timeout'
+  // 限流和额度用尽都**必须**带分类:不带的话 `capBlocked` 是 false、`capCategory` 是
+  // undefined —— 阻断卡给不出任何对症建议,而 `--retry-blocked` 也捞不回这个节点。
+  if (res.rateLimited === true || res.quotaExhausted === true) return 'infra'
+  return undefined
+}
+
+/** 对症的那一句。省略 = 用 category 的默认那版。 */
+function remedyOf(res: {
+  timeoutKind?: TimeoutKind; rateLimited?: boolean; quotaExhausted?: boolean
+}): string | undefined {
+  if (res.timeoutKind === 'human') return humanTimeoutRemedy()
+  if (res.timeoutKind === 'total') return totalTimeoutRemedy()
+  /**
+   * 额度用尽和限流**必须给两句不同的话**。上游自己说的是「resets 3pm」,而限流那一版
+   * 写着「等几分钟再 /et --resume 继续」—— 照它做的人会在几分钟后再撞一次,而每个调用点
+   * 还会先白花几次重试。
+   */
+  if (res.quotaExhausted === true) {
+    return '上游额度/权限用尽(不是临时限流,等几分钟没有用):按上面那条消息里给的恢复时间之后再 /et --resume 继续,'
+      + '或者换一个配额更宽的 apiToken / 员工模型。'
+  }
+  // 默认那版是「先确认角色模型/网络可用」—— 而这次上游是**通的**,只是在限流。
+  // 照那句去查网络会查不出任何东西。和圆桌耗尽共用同一句(rateLimitRemedy)。
+  if (res.rateLimited === true) return rateLimitRemedy()
+  return undefined
+}
+
 async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: Omit<StreamMeta, 'nodeId'>): Promise<PhaseResult> {
+  /**
+   * 限流可以重试**几次**。
+   *
+   * **执行环节除外,而且这条界线是刻意的:** 执行者带写工具,一次 429 可能发生在它已经
+   * 改过几个文件之后(provider 的错误消息是在工具循环中间到达的)。再跑一遍等于让第二个
+   * 执行者对着一个半改过的工作区从头开始 —— 那是返工循环该做的决定(它会先让验收员看过),
+   * 不该由一条网络错误在这里替它做。执行环节改成**带上分类**地阻断,于是阻断卡会说
+   * 「上游限流」并给出可操作的下一步,`--retry-blocked` 也认它。
+   */
+  /**
+   * **执行和观察都不重试。**
+   *
+   *  - 执行:执行者带写工具,一次 429 可能发生在它已经改过几个文件之后(provider 的
+   *    错误消息是在工具循环中间到达的)。再跑一遍等于让第二个执行者对着一个半改过的
+   *    工作区从头开始 —— 那是返工循环该做的决定(它会先让验收员看过),不该由一条网络
+   *    错误在这里替它做。
+   *  - 观察评分:它是**咨询性**的。调用失败只会记一行「评分调用失败」,而默认
+   *    (`caps.scoreThreshold` 未设)连一轮返工都不触发。为一个不影响任何判决的数字
+   *    付 3 次调用 + 两次冷却,是纯粹的浪费。
+   */
+  const attempts = req.phase === 'execute' || req.phase === 'observer' ? 1 : RATE_LIMIT_ATTEMPTS
+  for (let attempt = 1; ; attempt++) {
+    const res = await runPhaseOnce(ctx, req, meta)
+    if (res.ok || !res.rateLimited || attempt >= attempts) return res
+    // 中止 / 单节点取消时不再试 —— 那两个是决定,不是故障。
+    if (ctx.signal.aborted || ctx.control?.wasCancelled(req.node.id) === true) return res
+    // **这里不 sleep。** 退避住在 `makeRunAgentFn` 顶部的闸门里(它是所有调用的必经点,
+    // 而且冷却是 run 级的:另外四个槽位也会一起等)。在这里再等一次就是双重惩罚 ——
+    // 一桌全 infra 的圆桌会付 4 次冷却而不是 3 次。
+  }
+}
+
+async function runPhaseOnce(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: Omit<StreamMeta, 'nodeId'>): Promise<PhaseResult> {
   try {
     const text = await ctx.runAgent({
       ...req,
@@ -320,6 +419,10 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: 
       timeout: e instanceof PhaseTimeoutError,
       timeoutKind: e instanceof PhaseTimeoutError ? e.kind : undefined,
       cancelled: e instanceof NodeCancelledError,
+      // 上游限流(429/529)。**是一个标志,不是去 grep 那句文案** —— 那句是英文原文,
+      // provider 想怎么改就怎么改。判据在适配层(结构化字段 + 529 的文案兜底)。
+      rateLimited: e instanceof ProviderApiError && e.kind === 'rate_limit',
+      quotaExhausted: e instanceof ProviderApiError && e.kind === 'quota',
       // 取消带回来的那部分产出。别的失败路径没有它(runPhase 的 text 只在
       // 「成功之后才发现 abort」那条路上才有),所以这里是取消**独有**的一份。
       text: e instanceof NodeCancelledError ? e.partialText : undefined,
@@ -434,6 +537,16 @@ function exhaustionCategory(rec: RoundtableRecord): BlockCategory {
 }
 
 /**
+ * 这一桌是**被上游限流**耗尽的吗。
+ *
+ * 「有任何一席是限流」就算 —— 和 `exhaustionRemedyFor` 里等人超时那一条同一条规矩:
+ * 只要有一席在被限流,叫用户去查角色模型和网络就是白费。
+ */
+function exhaustedByRateLimit(rec: RoundtableRecord): boolean {
+  return rec.verdicts.some(v => v.rateLimited === true)
+}
+
+/**
  * 圆桌耗尽时该给哪一版补救建议。
  *
  * 「有任何一席是等人超时」就给等人那版:等人超时是所有席位一起等**同一个**权限确认,
@@ -445,7 +558,28 @@ function exhaustionCategory(rec: RoundtableRecord): BlockCategory {
  * 自相矛盾,而用户是照着后半句去做的。
  */
 function exhaustionRemedyFor(rec: RoundtableRecord): string | undefined {
-  return rec.verdicts.some(v => v.timeoutKind === 'human') ? humanTimeoutRemedy() : undefined
+  if (rec.verdicts.some(v => v.timeoutKind === 'human')) return humanTimeoutRemedy()
+  // 总时长那一种排在限流之前:它是这一席自己太慢,和上游限不限流是两件事。
+  if (rec.verdicts.some(v => v.timeoutKind === 'total')) return totalTimeoutRemedy()
+  /**
+   * 限流那一版排在超时之后、默认之前。
+   *
+   * 不给它专门一版的后果实测过(而且这正是用户报 429 的那个场景):3 席评审里一席持续
+   * 429 → 圆桌耗尽 → 阻断理由末尾贴的是「先确认角色模型/网络可用(角色配置在
+   * .claude/settings.json 的 roles 里),再重试」。而上游是**通的**,照那句去查什么都
+   * 查不出来,而真正该做的两件事(等一会儿、把并行数或席位数调小)一个字都没说。
+   */
+  if (exhaustedByRateLimit(rec)) return rateLimitRemedy()
+  return undefined
+}
+
+/**
+ * 上游限流时该给的那一句。**一份实现,两个消费者**(单点调用的 `remedyOf` 和圆桌耗尽的
+ * `exhaustionRemedyFor`)—— 各写一份的话两条路会给出两种建议,而它们说的是同一件事。
+ */
+function rateLimitRemedy(): string {
+  return '上游在限流(429/529),不是网络不通。等几分钟再 /et --resume 继续;'
+    + '要更稳的话把并行数调小(运行中可以按 ←/→ 调),或把每个环节的席位数调小(caps.maxSeatsPerPhase)。'
 }
 
 /**
@@ -530,11 +664,24 @@ async function roundtableWithInfraRetry(args: {
   // leave `rec` undefined and every caller dereferences it.
   const max = Math.max(1, args.ctx.config.caps.maxIterations)
   let rec!: RoundtableRecord
+  /**
+   * 上一桌合并后的全量裁决。**只重派 infra 失败的那几席**,其余席位的裁决原样留着。
+   *
+   * 为什么:重开整桌意味着已经出过裁决的席位再付一次调用。3 席里 1 席打不通时,第二桌
+   * 付 3 次而只有 1 次必要;`maxIterations=3` + 席位上限 5 下最坏 15 次调用换 ≤5 次有效
+   * 裁决 —— 而这一切正发生在上游限流的时候(infra 失败最常见的原因就是 429/529)。
+   *
+   * 顺带修掉一个旧毛病:原来只返回**最后一桌**的 rec,前几桌真实的裁决在 reviewLog 里
+   * 整个消失(那一段注释记着实测:3 席 quorum=60、c 永久失败 → reviewLog 只剩 1 条)。
+   */
+  let merged: Verdict[] | undefined
   for (let attempt = 1; attempt <= max; attempt++) {
     // A fresh tag per attempt: an agent cannot pre-plant a verdict under a tag it has
     // never seen, and a stale tag from an earlier attempt no longer counts as tagged.
     const tag = answerTag(ANSWER_TAGS.verdict)
-    rec = await runRoundtable({
+    /** 这一桌派哪几席:首桌全派,之后只派上一桌 infra 失败的。 */
+    const only = merged?.flatMap((v, i) => (v.infra === true ? [i] : []))
+    const fresh = await runRoundtable({
       phase: args.phase, node: args.node, roles: args.roles, round: args.round,
       system: args.system, prompt: (seat: RoleBinding | null) => args.buildPrompt(tag, seat),
       runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
@@ -544,7 +691,34 @@ async function roundtableWithInfraRetry(args: {
       // 最终裁决标成「验收」,和 node.md 的验收记录、和关口对用户讲的两个不同环节全对不上。
       phaseLabel: args.phaseLabel ?? PHASE_LABEL[args.phase],
       slots: args.ctx.slots,
+      ...(only ? { only } : {}),
     })
+    /**
+     * **中止和取消排在合并之前判。**
+     *
+     * `runRoundtable` 的中止早退恒返回 1 条 `role:'main'` 的裁决,与 roster 长度无关 ——
+     * 而「3 席里 1 席打不通」是最常见的形态,此时 `only.length === 1`,长度校验**恰好
+     * 相等**,那条无 roleTag、无 infra 的中断记录会被原样盖到那一席身上。先判早退,
+     * 下面那道长度校验就只需要管长度(席位数在两桌之间理论上可变:重做会重排名册)。
+     */
+    if (args.ctx.signal.aborted || args.ctx.control?.wasCancelled(args.node.id) === true) {
+      return { rec: fresh, infraExhausted: false }
+    }
+    if (merged && only && fresh.verdicts.length === only.length) {
+      const next = [...merged]
+      only.forEach((seat, k) => { next[seat] = fresh.verdicts[k]! })
+      merged = next
+      rec = {
+        round: fresh.round,
+        verdicts: next,
+        // 重新合成:法定人数是对**全量**席位算的,只拿这一桌重派的几席去算会得出
+        // 完全不同的答案(极端情形:1 席重派通过 → 100% 赞成 → 整桌通过)。
+        synthesized: synthesizeVerdicts(next, args.ctx.config.caps.quorum, args.ctx.config.caps.quorumSeats),
+      }
+    } else {
+      merged = fresh.verdicts
+      rec = fresh
+    }
     if (args.ctx.signal.aborted) return { rec, infraExhausted: false }
     /**
      * 用户取消了这个节点就**立刻停**,不要再试。
@@ -1086,7 +1260,17 @@ async function runPlanRoundtable(
     drafts.push({ staff: who, parsed: parsePlanOutput(r.value.text, tag) })
   })
   // 一份都没成 → 照旧阻断,和精化第一位失败时一致。
-  if (drafts.length === 0) return { ok: false, reason: `全部方案席位调用失败: ${failures.join('; ')}` }
+  if (drafts.length === 0) {
+    return {
+      ok: false,
+      reason: `全部方案席位调用失败: ${failures.join('; ')}`,
+      // 全席位都因为限流倒下时,阻断要按限流报 —— 而不是「先确认角色模型/网络可用」。
+      // 判据是「每一席都是限流」:混着别的故障时那才是真正需要查的东西。
+      rateLimited: settled.length > 0 && settled.every(
+        r => r.status === 'fulfilled' && !r.value.ok && r.value.rateLimited === true,
+      ),
+    }
+  }
   // 只剩一份 → 没什么可融合的,直接用它(还省下融合那一次调用)。
   if (drafts.length === 1) {
     if (failures.length > 0) noteOnNode(node, `方案圆桌只有 1 份稿可用,未做融合: ${failures.join('; ')}`)
@@ -1175,7 +1359,12 @@ async function runPlanRefinement(
       // timeoutKind 必须跟着走。少了它,1046 行那句 `res.timeoutKind === 'human'` 就是
       // 一条**永远为 undefined 的死分支**(返回类型里根本没这个字段,而本仓库没有
       // typecheck 会说)—— 于是分析环节的等人超时拿到的是静默超时那一版建议。
-      if (i === 0) return { ok: false, reason: res.reason, timeout: res.timeout, timeoutKind: res.timeoutKind, cancelled: res.cancelled }
+      if (i === 0) {
+        return {
+          ok: false, reason: res.reason, timeout: res.timeout, timeoutKind: res.timeoutKind,
+          cancelled: res.cancelled, rateLimited: res.rateLimited, quotaExhausted: res.quotaExhausted,
+        }
+      }
       node.execStatus = (node.execStatus ? node.execStatus + '\n' : '') +
         ORCHESTRATOR_NOTE + '方案精化第 ' + (i + 1) + ' 位(' + (seat?.roleName || '主模型') +
         ')调用失败,采用前一稿: ' + res.reason + ')'
@@ -1535,8 +1724,8 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
         // 并保持 interrupted 好让 --resume 重新排队。
         if (res.cancelled === true) { await blockAsCancelled(node, ctx); return }
         await blockWithReason(
-          node, res.reason, ctx, res.timeout ? 'timeout' : undefined,
-          res.timeoutKind === 'human' ? humanTimeoutRemedy() : undefined,
+          node, res.reason, ctx, blockCategoryOf(res),
+          remedyOf(res),
         )
         return
       }
@@ -2343,8 +2532,8 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // 上面那句「以上为中断时已报告的产出」正是给用户看的,不该被一句「调用失败」盖过去。
       if (res.cancelled === true) { await blockAsCancelled(node, ctx); return }
       await blockWithReason(
-        node, res.reason, ctx, res.timeout ? 'timeout' : undefined,
-        res.timeoutKind === 'human' ? humanTimeoutRemedy() : undefined,
+        node, res.reason, ctx, blockCategoryOf(res),
+        remedyOf(res),
       )
       return
     }

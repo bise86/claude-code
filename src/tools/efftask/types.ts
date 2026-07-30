@@ -183,7 +183,19 @@ export interface Verdict {
    * 诊断对了,建议却给成了「提高 nodeTimeoutMs 后再重试,或把该节点拆小」—— 一句话的
    * 前后两半自相矛盾,而用户是照着后半句去做的。
    */
-  timeoutKind?: 'stall' | 'human'
+  timeoutKind?: 'stall' | 'human' | 'total'
+  /**
+   * 这一席是被**上游限流**挡回来的(429/529),不是打不通。
+   *
+   * 和 `timeout` 逐字同因:两者都是 `infra`(没人对工作做出判断,重试是对的),但
+   * **补救建议不同** —— 限流要等一会儿、或者把并行数/席位数调小,而默认那版
+   * 「先确认角色模型/网络可用」在上游明明是通的时候会让用户去查一个不存在的问题。
+   *
+   * 少了这个字段的后果实测过:`runRoundtable` 把 rejection 合成 infra 裁决时只带
+   * `timeout`,于是圆桌耗尽走的 `exhaustionCategory`/`exhaustionRemedyFor` 拿不到任何
+   * 能分辨限流的信息 —— 而**多角色圆桌正是用户报 429 的那个场景**。
+   */
+  rateLimited?: boolean
   /**
    * 集成验收不通过时,这位角色提出的**补救子任务** —— spec §4.1 的
    * `INTEGRATION_ACCEPT ──fail──▶ (回到 decompose 修订)`。

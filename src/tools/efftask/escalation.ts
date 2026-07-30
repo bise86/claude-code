@@ -68,7 +68,9 @@ const TITLE: Record<BlockCategory, string> = {
   'cap-iteration': '安全阀 · 方案评审迭代超限',
   'cap-nodes': '安全阀 · 任务树节点数超上限',
   rework: '连续返工超限',
-  timeout: '安全阀 · 单节点执行超时',
+  // 「执行超时」教的是「跑太久了 → 把节点拆小」,而这条阀量的是**静默**:一直在吐字就
+  // 永远不算。标题是用户最先读的一行,它必须和正文、和运行期抛出的那句话说同一件事。
+  timeout: '安全阀 · 静默超时(久到一个字都没有)',
   infra: '角色调用连续失败',
   'cap-depth': '安全阀 · 已达最大拆分深度',
   // NOT an 安全阀 heading: nothing tripped and nothing stopped. The node just recovered.
@@ -83,7 +85,20 @@ const REMEDY: Record<BlockCategory, string> = {
   'cap-iteration': '若方案本身没问题,可提高 run.md 里 caps.maxIterations 后再重试;否则先按评审意见改需求或补充信息。',
   'cap-nodes': '提高 run.md 里 caps.maxNodes 后再重试,或缩小需求范围。',
   rework: '先看该节点的验收记录,按阻断意见改代码或改验收点;必要时提高 caps.maxIterations。',
-  timeout: '提高 run.md 里 caps.nodeTimeoutMs 后再重试,或把该节点拆小。',
+  /**
+   * 静默超时。**两个旋钮都要说**,而且第二个此前一个字都没有。
+   *
+   * 这条时钟量的是「多久没有任何输出」(流式增量也算 —— 见 runAgentAdapter 的
+   * onQueryProgress)。真的开火时有两种可能,各自对应不同的旋钮:
+   *  - 模型/工具确实卡住了 → `caps.nodeTimeoutMs`(现在可以直接说「阶段超时 20 分钟」);
+   *  - 员工走的是自己的端点(`roles[]` + `execMode: 'api'`),而那个端点**迟迟不发第一个
+   *    字节**:翻译层要先嗅一口才知道是不是 SSE(否则一次「成功但完全空白」的回答会被
+   *    当成真产出),所以这段等待落在 **SDK 自己的请求超时**里,而它的默认值是 10 分钟、
+   *    只认环境变量 `API_TIMEOUT_MS`。`caps.nodeTimeoutMs` 调多大都动不了它。
+   */
+  timeout: '改 run.md 里的 caps.nodeTimeoutMs 再 --resume(下次新建运行时可以直接说「阶段超时 20 分钟」),或把该节点拆小;'
+    + '如果这一席是**翻译协议**的员工(roles[] 里 apiProtocol: openai / openai-responses),'
+    + '「上游迟迟不发第一个字节」这段等待落在 SDK 请求超时里,那个只认环境变量 API_TIMEOUT_MS(默认 600000)。',
   // 注:等人工确认超时走的是同一个 category,但**处理方式相反** —— 见
   // humanTimeoutRemedy,由 pipeline 以 remedy 覆盖传进来。
   infra: '先确认角色模型/网络可用(角色配置在 .claude/settings.json 的 roles 里),再重试。',
@@ -100,6 +115,19 @@ const REMEDY: Record<BlockCategory, string> = {
  * 毫无关系 —— 是那条工具权限确认没人点。给通用的一句话,一半的用户会被指去调一个
  * 和原因无关的旋钮。
  */
+/**
+ * 总时长超限的处理方式 —— 和静默**正好相反**:它一直在吐字。
+ *
+ * 叫用户去调静默预算或者查网络都不对症(上游是通的、也没卡),该看的是这一席为什么这么
+ * 慢:是节点太大(一次让它做太多),还是这个端点本身吞吐很低。
+ */
+export function totalTimeoutRemedy(): string {
+  return '这一席一直有输出,只是久到不像话(上限 = caps.nodeTimeoutMs × 6)。'
+    + '先看这个节点是不是一次要做太多 —— 拆小它;确认是端点本身慢的话,改 run.md 里的 '
+    + 'caps.nodeTimeoutMs 再 --resume(它同时抬高静默和总时长两个上限)。'
+    + '这条和「网络不通」「没人批权限」都无关。'
+}
+
 export function humanTimeoutRemedy(): string {
   return '没有人回答工具权限确认。去终端(或飞书卡片)上把那个确认点掉再重试;' +
     '如果你不打算守着它,可以把要用的工具加进 allowlist,或者用 bypassPermissions 模式。' +

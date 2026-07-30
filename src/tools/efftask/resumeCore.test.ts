@@ -484,6 +484,49 @@ describe('半截的 reviewLog 不能把整个 Run 打死', () => {
     expect(() => serializeNode(nodes[0])).not.toThrow()
   })
 
+  it('人工强制通过、角色标签、限流标记必须读得回来', async () => {
+    /**
+     * 这四个字段此前**读不回来**,而每一个丢掉都有具体后果:
+     *
+     *  - `manual`:一条人工强制通过读回来之后会渲染成和一位真评审员点头**逐字相同**的
+     *    「通过」(persistence.roundtableBody 和详情页都按它分叉)—— 而那个区别正是
+     *    强制通过这一整套存在的理由;
+     *  - `roleTag`:「这几条裁决属于同一个角色的几个员工」无从恢复,而按角色分组正是
+     *    「一个角色多员工收敛成一个结论」的前提;
+     *  - `rateLimited`:圆桌耗尽时的补救建议靠它分叉,丢了就退回「去查角色模型和网络」;
+     *  - `timeoutKind`:两种超时的处理方式**相反**。
+     */
+    const n = mkn({
+      reviewLog: [{
+        round: 1,
+        verdicts: [
+          { role: '人工强制通过', pass: true, blocking: [], comments: '我批的', manual: true },
+          { role: 'b', pass: false, blocking: ['x'], comments: '', infra: true, rateLimited: true, roleTag: '架构师' },
+          { role: 'c', pass: false, blocking: ['y'], comments: '', infra: true, timeout: true, timeoutKind: 'human' },
+        ],
+        synthesized: { pass: true, blockingSummary: '' },
+      }],
+    })
+    const { nodes } = validateLoadedNodes([n], o)
+    const back = nodes[0].reviewLog[0].verdicts
+    expect(back[0].manual).toBe(true)
+    expect(back[1].rateLimited).toBe(true)
+    expect(back[1].roleTag).toBe('架构师')
+    expect(back[2].timeoutKind).toBe('human')
+    // 手改成别的值一律当没有 —— 这几个字段都参与判定或渲染。
+    const bad = mkn({
+      reviewLog: [{
+        round: 1,
+        verdicts: [{ role: 'a', pass: true, blocking: [], comments: '', manual: 'yes', roleTag: 7, timeoutKind: '随便' }],
+        synthesized: { pass: true, blockingSummary: '' },
+      }],
+    })
+    const b2 = validateLoadedNodes([bad], o).nodes[0].reviewLog[0].verdicts[0]
+    expect(b2.manual).toBeUndefined()
+    expect(b2.roleTag).toBeUndefined()
+    expect(b2.timeoutKind).toBeUndefined()
+  })
+
   it('缺 blocking 的裁决也被补齐', async () => {
     const { serializeNode } = await import('./persistence.js')
     const n = mkn({ reviewLog: [{ round: 1, verdicts: [{ role: 'a', pass: false }], synthesized: { pass: false, blockingSummary: '' } }] })

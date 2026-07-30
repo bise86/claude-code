@@ -1067,4 +1067,101 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
       expect((e as { kind?: string }).kind).toBe('stall')
     }
   })
+
+  it('**思考中的流式增量也算有进展** —— 否则「静默时钟」量的是两条完整消息的间隔', async () => {
+    /**
+     * 用户报的原话:「用 API 调用一个模型老是报错,是不是超时时间太短了。这个模型用做
+     * 主模型是正常的。」
+     *
+     * 病根不是那个数太小,是这条时钟**量错了东西**。`runAgent` 只 yield 完整消息
+     * (assistant / user / attachment),`stream_event` 增量它自己就丢掉了 —— 它的
+     * `onQueryProgress` 注释写明了存在理由:「long single-block streams (e.g. thinking)
+     * where no assistant message is yielded for >60s」,而这个钩子此前全仓库零消费者。
+     *
+     * 于是一个思考很久、或者端点很慢的模型在一次调用里流了十分钟 token、一条完整消息
+     * 还没攒够,就被判成「静默超过 600000 ms 没有任何输出」—— 它一秒都没停。而这条时钟
+     * **只存在于 /et 的子 agent 调用上**,主模型那条路没有,所以同一个模型当主模型正常。
+     *
+     * 实测(改之前):这条用例抛 `PhaseTimeoutError: 阶段调用超时(120 ms)`。
+     */
+    let ticks = 0
+    async function* thinking(args: { onQueryProgress?: () => void }): AsyncGenerator<never> {
+      // 300ms 里一条完整消息都没有,但每 10ms 有一个 delta —— 模型一直在吐字。
+      for (let i = 0; i < 30; i++) {
+        args.onQueryProgress?.()
+        ticks++
+        await new Promise(r => setTimeout(r, 10))
+      }
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '想完了' }] } } as never
+    }
+    // 预算 120ms << 300ms 的思考时长:只有「delta 也重置时钟」才过得去。
+    const text = await call(makeRunAgentFn(deps(thinking, { timeoutMs: 120 })))
+    expect(text).toBe('想完了')
+    expect(ticks).toBe(30)
+  })
+
+  it('**滴水式上游**要被总时长上限兜住 —— 一直吐字不等于可以永远跑', async () => {
+    /**
+     * 「流式增量算进展」把静默时钟修对了,同时把**总时长**这一维变成完全无界的:一个每
+     * 分钟吐一个 token 的上游从此可以永远跑下去。而这个文件里 `deps.timeoutMs` 的存在
+     * 理由写的就是「a provider that hangs without ever rejecting has no bound at all」——
+     * 滴水和挂死是同一类故障,只是一个装得像在干活。
+     *
+     * 上限 = 静默预算 × TOTAL_LIMIT_FACTOR,用同一个旋钮。这里 timeoutMs=50 → 总上限 300ms。
+     */
+    let ticks = 0
+    async function* drip(args: { onQueryProgress?: () => void }): AsyncGenerator<never> {
+      // 每 20ms 一个 delta:静默时钟永远不会开火(20 < 50),但总时长会。
+      for (let i = 0; i < 200; i++) {
+        args.onQueryProgress?.()
+        ticks++
+        await new Promise(r => setTimeout(r, 20))
+      }
+      yield null as never
+    }
+    try {
+      await call(makeRunAgentFn(deps(drip, { timeoutMs: 50 })))
+      throw new Error('should have thrown')
+    } catch (e) {
+      expect((e as Error).name).toBe('PhaseTimeoutError')
+      // **是总时长那一种**,不是静默 —— 两者的补救建议相反(一个「一直没反应」,
+      // 一个「一直有反应但太慢」),报错种类错了用户就会去调错旋钮。
+      expect((e as { kind?: string }).kind).toBe('total')
+      expect((e as Error).message).toContain('总时长超限')
+      // 上限报的是**开火的那一个**(50 × 6 = 300),不是静默预算 50。
+      expect((e as Error).message).toContain('300 ms')
+    }
+    // 真的滴过水:不然这条用例和「一条 delta 都没有」那条没有区别。
+    expect(ticks).toBeGreaterThan(5)
+  })
+
+  it('总时长上限跟着 timeoutMs=0(禁用)一起关掉 —— 「关掉超时」要真的关掉', async () => {
+    // 留一个用户没听说过的上限,比没有上限更糟。
+    let ticks = 0
+    async function* drip(args: { onQueryProgress?: () => void }): AsyncGenerator<never> {
+      for (let i = 0; i < 15; i++) {
+        args.onQueryProgress?.()
+        ticks++
+        await new Promise(r => setTimeout(r, 20))
+      }
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: '慢但跑完了' }] } } as never
+    }
+    expect(await call(makeRunAgentFn(deps(drip, { timeoutMs: 0 })))).toBe('慢但跑完了')
+    expect(ticks).toBe(15)
+  })
+
+  it('真的一条 delta 都没有时,静默时钟照旧开火 —— 这个阀不能被上面那条废掉', async () => {
+    // 上一条的反面。少了它,把 `timeoutMs` 整个删掉也照样绿,而那道阀挡的是
+    // 「provider 挂死了但不 reject」这一整类(唯一无界的那一维)。
+    async function* silentNoTicks(): AsyncGenerator<never> {
+      await new Promise(r => setTimeout(r, 800))
+      yield null as never
+    }
+    try {
+      await call(makeRunAgentFn(deps(silentNoTicks, { timeoutMs: 100 })))
+      throw new Error('should have thrown')
+    } catch (e) {
+      expect((e as Error).name).toBe('PhaseTimeoutError')
+    }
+  })
 })

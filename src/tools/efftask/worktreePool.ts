@@ -122,13 +122,30 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       // Keep our scratch out of the user's `git status`. .git/info/exclude is the right
       // place: it is per-clone and NOT a tracked file, so we are not editing something the
       // user committed. Without it, .efftask-worktrees/ shows as untracked forever.
+      /**
+       * `.claude/efftask/` 也要排除,**而它不是「顺手」**。
+       *
+       * 那是 run 目录(任务树的 md 镜像),`/et` 在**用户的检出里**从第一帧就开始写它。
+       * 只排除 `.efftask-worktrees/` 的后果是每一趟运行结束时 `git status` 里都躺着一条
+       * `?? .claude/` —— 而收口那条判据(工作区干净才自动合并)会被它挡住,于是
+       * 「跑完把产出送回当前目录」在一个没有 gitignore 掉 `.claude/` 的普通仓库里
+       * 一次也不会发生。判据那一侧已经改成只看被跟踪的改动(见 handoffActions.trackedChanges),
+       * 这里是第二道:让用户的 `git status` 也干净。
+       *
+       * **两条一起写**,不是二选一:判据那一侧治的是「合不合」,这一侧治的是
+       * 「用户看到的 status 里有没有我们留下的垃圾」。
+       *
+       * linked worktree 里 `.git` 是**文件**,`mkdir(.git/info)` 会 ENOTDIR —— 整段被
+       * catch 吞掉,那种检出上两条都写不进去。所以判据那一侧不能依赖这里。
+       */
       try {
         const info = `${gitRoot}/.git/info`
         await mkdir(info, { recursive: true })
         const excl = `${info}/exclude`
         const cur = await readFile(excl, 'utf-8').catch(() => '')
-        if (!cur.includes('.efftask-worktrees/')) {
-          await writeFile(excl, `${cur}${cur.endsWith('\n') || cur === '' ? '' : '\n'}.efftask-worktrees/\n`)
+        const want = ['.efftask-worktrees/', '.claude/efftask/'].filter(p => !cur.includes(p))
+        if (want.length > 0) {
+          await writeFile(excl, `${cur}${cur.endsWith('\n') || cur === '' ? '' : '\n'}${want.join('\n')}\n`)
         }
       } catch { /* cosmetic only — never fail a run over it */ }
       const registered = await git(['rev-parse', '--git-dir'], intPath)

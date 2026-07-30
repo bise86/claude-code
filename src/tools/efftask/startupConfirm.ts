@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES, PHASE_LABEL } from './types.js'
+import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES, PHASE_LABEL } from './types.js'
 import { stripControl } from './persistence.js'
 import { allowsMultipleSeats } from './roleDefs.js'
 import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
@@ -602,8 +602,16 @@ export function parallelismLine(
   // mistranslation of "read-only phases" — and it also claimed 验收 was parallel, which is
   // false for every executable leaf, whose acceptance lives inside stepExecute's
   // execute→accept→rework loop.
+  /**
+   * 隔离运行还要**先说合并**。
+   *
+   * 用户批准的是他看到的东西,而这一趟结束时我们会在他的检出里跑一次 `git merge`
+   * (工作区干净且正常跑完时)。这句话此前一个字都没有 —— 而在这之前的行为恰恰相反
+   * (产出只留在集成分支上,合并要他自己敲),所以不说就是让一次真实的、改动他工作区的
+   * 操作凭空出现。
+   */
   const scope = opts.isolation === 'worktree'
-    ? '各阶段并行,执行任务在各自的 git worktree 中隔离'
+    ? '各阶段并行,执行任务在各自的 git worktree 中隔离;跑完自动合并回当前分支(工作区不干净或未跑完时改为提示手工合并)'
     : '方案/评审阶段并行;执行与叶子验收串行(未启用隔离)'
   const hint = opts.editable ? ' · ←/→ 调整' : ''
   return `并行数: ${config.parallelism}（${scope}）${hint}`
@@ -638,7 +646,30 @@ export function capsLine(config: EffTaskConfig): string {
   const converge = c.planConverge === '圆桌' && planSeats > 1
     ? ` · 分析用圆桌(${planSeats} 人各自起草,末席融合,多 1 次调用)`
     : ''
-  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}${converge}`
+  /**
+   * 静默超时要**上关口**。
+   *
+   * 它是这一组阀里唯一会让一次**正在正常干活**的调用被中止的那个(其余几个都是
+   * 「不再往下走」),也是阻断卡唯一点名让用户去调的那个。此前这一行一个字都没提它 ——
+   * 于是「一次调用最多可以多久没动静」这件事,用户只能在被它咬了之后从阻断理由里知道。
+   *
+   * 只在**不是默认值**时印:默认 10 分钟印出来只是噪声,而这一行已经在跟宽度打架。
+   */
+  /**
+   * **不足一分钟要印秒。**
+   *
+   * 夹取下限是 1000ms(parseDirectives / resumeCore 两处都是),也就是 1s–59s 是合法可达
+   * 区间 —— 而抽取最可能犯的错正是刻度:「阶段超时 20 分钟」被写成 20 而不是 1200000,
+   * 夹取**静默**把它抬成 1000。按分钟取整的话关口印的是「静默超时 0 分钟」,而「0 分钟」
+   * 读起来是「没有超时」,真相是每次调用一秒内必死。为拦这件事新加的这一行,不能用一个
+   * 把它藏起来的数字来汇报它。
+   */
+  const silence = c.nodeTimeoutMs === DEFAULT_CAPS.nodeTimeoutMs
+    ? ''
+    : c.nodeTimeoutMs < 60_000
+      ? ` · 静默超时 ${Math.round(c.nodeTimeoutMs / 1000)} 秒`
+      : ` · 静默超时 ${Math.round(c.nodeTimeoutMs / 60000)} 分钟`
+  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}${converge}${silence}`
 }
 
 /**
@@ -651,6 +682,15 @@ export function capsLine(config: EffTaskConfig): string {
  * **刻意不叫「并发」。** 并发上限是 parallelism,和这个数无关 —— 把排队总量说成在飞数
  * 会让用户以为自己要同时开 30 个连接,从而去调一个不解决问题的旋钮。
  */
+/**
+ * 单次调用被上游限流时最多重试几次 —— 和 `pipeline.RATE_LIMIT_ATTEMPTS` **必须是同一个数**。
+ *
+ * 没有从 pipeline 导:那个模块 import 这个模块(startupConfirm)会成环。所以这里放一份
+ * 常量,并由 docsAccuracy 里一条断言把两处钉在一起 —— 一份数字两个地方,漂移就是关口
+ * 在对用户撒谎。
+ */
+export const COST_RATE_LIMIT_ATTEMPTS = 3
+
 export function costLine(config: EffTaskConfig): string {
   const c = config.caps
   const seats = (p: PhaseName) => (config.phaseRoles[p] ?? []).length
@@ -669,7 +709,16 @@ export function costLine(config: EffTaskConfig): string {
   // 圆桌**自己**还有一层 infra 重试循环(roundtableWithInfraRetry 最多跑 maxIterations 桌),
   // 所以是 It 的平方,不是一次方。漏掉它会低估约 2.5 倍 —— 实测 1 评审席 + 2 验收席、
   // It=3 时真实 23 次而关口承诺 15 次。低估比高估糟:用户按一个偏小的数批准。
-  const planPhase = It * (P + It * R)
+  /**
+   * 单点调用(分析席位 + 融合席)自己还有一层**限流重试**:`runPhase` 对 429/529 最多
+   * 试 `RATE_LIMIT_ATTEMPTS` 次。圆桌那几席不吃这个乘子(它们直接调 runAgent,由
+   * roundtableWithInfraRetry 管),执行和观察也不吃(那两个明确 attempts=1)。
+   *
+   * 漏掉它的后果和上面那条 It² 逐字同类:实测 3 分析席圆桌 + 3 评审席、每次调用头两遍
+   * 429 第三遍成功 → 真实 45 次,而不带这个乘子的式子给出 39。**低估比高估糟**:
+   * 用户按一个偏小的数批准。
+   */
+  const planPhase = It * (P * COST_RATE_LIMIT_ATTEMPTS + It * R)
   // 测试验证是 **opt-in**:没配这个环节的角色,这一步整个不发生。所以用 seats() 原值
   // 而不是 Math.max(1, …) —— 照抄 accept 的写法会让默认配置的关口数字凭空涨一截,
   // 而实际一次调用都不会有。关口高估同样是撒谎,只是方向相反(用户会去调一个根本不
@@ -858,24 +907,64 @@ export function exitReportLine(args: {
   /** False only when the run directory was an unused reservation we just removed. */
   withPath: boolean
   handoff: HandoffSummary | null
+  /**
+   * 收口的结局。**必须传** —— 这行字进的是对话记录,比 done 视图活得久:面板关掉之后
+   * 用户能回看的只剩它。不传的话自动合并成功之后这里仍然写着「你的工作区未被改动」
+   * 和「稍后收口: /et --resume … 会重新弹出四选一」,而两句都已经不成立。
+   */
+  handoffState?: HandoffState
 }): string {
   const verb = args.resumed ? '续跑' : ''
   const path = args.withPath ? ` · .claude/efftask/${args.runId}/run.md` : ''
-  const where = args.handoff ? '\n' + handoffLines(args.handoff, args.runId).join('\n') : ''
+  const where = args.handoff
+    ? '\n' + handoffLines(args.handoff, args.runId, args.handoffState).join('\n')
+    : ''
   return `高效任务 ${args.runId} ${verb}${args.how}${path}${where}`
 }
 
-export function handoffLines(h: HandoffSummary, runId?: string): string[] {
+/**
+ * 自动收口这一趟的结局 —— done 视图和退出报告都按它写那句话。
+ *
+ *  - `'merged'`:产出已经在当前目录里;
+ *  - `'conflicted'`:自动合并撞了冲突,**用户的工作区被留在半合并状态**(git 不回滚);
+ *  - 省略:没合(脏树 / 没跑完 / 没启用隔离),工作区确实没被动过。
+ */
+export type HandoffState = 'merged' | 'conflicted'
+
+export function handoffLines(
+  h: HandoffSummary,
+  runId?: string,
+  /**
+   * 这一趟收口的结局。
+   *
+   * 必须影响这一屏的**两句话**,否则它们双双变成可照做的假话:
+   *  - 「你的工作区未被改动」—— 合成功时它刚刚被改动了(这正是用户要的那件事);
+   *    而**撞冲突时更糟**:工作区里留着冲突标记和 `MERGE_HEAD`,而这一路是自动发生的,
+   *    用户没按任何键就被丢进了冲突态;
+   *  - 「稍后收口: /et --resume … 会重新弹出四选一」—— 合并成功后 `pendingHandoff` 已经
+   *    从 run.md 上清掉了,那条命令进来什么都不会弹。
+   */
+  state?: HandoffState,
+): string[] {
+  const merged = state === 'merged'
   const out = [
     h.commits > 0
-      ? `本次改动已合并到分支 ${h.branch}(${h.commits} 个提交),你的工作区未被改动`
+      ? merged
+        ? `本次改动(${h.commits} 个提交)已合并回你当前的分支 —— 产出就在当前目录里;分支 ${h.branch} 保留着`
+        : state === 'conflicted'
+          ? `自动合并 ${h.branch}(${h.commits} 个提交)撞了冲突,**你的工作区里留着一次未完成的合并**(见上面)`
+          : `本次改动已合并到分支 ${h.branch}(${h.commits} 个提交),你的工作区未被改动`
       : `本次没有产生任何改动;分支 ${h.branch} 与起点相同`,
   ]
   if (h.commits > 0) {
     // 现在收口是一个**关口**,不是一串要用户自己敲的命令 —— 但那几行命令仍然保留:
     // 用户可能按 Esc 跳过关口,也可能想手工来。关口是新增的路,不是把旧路拆了。
-    if (runId) out.push(`稍后收口: /et --resume ${runId} 会重新弹出「合并/推送/保留/丢弃」`)
-    out.push(`查看: git log ${h.branch}   合并: git merge ${h.branch}`)
+    if (runId && !merged) out.push(`稍后收口: /et --resume ${runId} 会重新弹出「合并/推送/保留/丢弃」`)
+    // 已经合过之后不再印「合并:」—— 再跑一次会得到 `Already up to date.`,而一条什么都
+    // 不做的命令摆在这里会让人以为合并还没发生。
+    out.push(merged
+      ? `查看这一趟的提交: git log ${h.branch}`
+      : `查看: git log ${h.branch}   合并: git merge ${h.branch}`)
     // 丢弃 gets its own line because it needs TWO commands. The branch is checked out in the
     // integration worktree, and git refuses to delete a checked-out branch — so the old
     // one-liner `git branch -D <branch>` printed here always failed. Verified against real

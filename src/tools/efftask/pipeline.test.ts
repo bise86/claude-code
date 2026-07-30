@@ -2979,13 +2979,58 @@ describe('达成结论的圆桌不该因为有席位没打通而被重试', () =
     expect(n.reviewLog[0].synthesized.pass).toBe(true)
   })
 
-  it('全票档下同样的局面照旧重试并阻断 —— 默认行为不变', async () => {
+  it('部分重派之后,法定人数是对**全量席位**重算的', async () => {
+    /**
+     * 变异测试实测存活:合并之后写 `synthesized: fresh.synthesized`(只对这一桌重派的
+     * 那几席算)照样绿。用 `quorumSeats` 才造得出差异 —— 它是一个**绝对席位数**门槛:
+     *
+     * 「至少 3 席赞成」+ 三席:首桌 a 通过、b/c 打不通 → 重派 b、c,两席都通过。
+     *  - 对全量三席算:赞成 3 席 ≥ 3 → **通过**;
+     *  - 只对重派的两席算:赞成 2 席 < 3 → 不通过 → 一个其实全票赞成的节点被打回返工。
+     */
+    const seats: string[] = []
+    const failedOnce = new Set<string>()
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      const who = req.role?.roleName ?? 'main'
+      seats.push(who)
+      // b、c 第一次打不通(infra),重派时正常出一份赞成裁决。
+      if ((who === 'b' || who === 'c') && !failedOnce.has(who)) {
+        failedOnce.add(who)
+        throw new Error('provider unreachable')
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.phaseRoles = roster
+    await stepStart(n, ctxFor([n], agent, {
+      ...cfg, phaseRoles: roster, caps: { ...DEFAULT_CAPS, quorumSeats: 3 },
+    }))
+    // 首桌 3 席 + 重派 2 席 = 5 次(不是整桌重开的 6 次)。
+    expect(seats).toEqual(['a', 'b', 'c', 'b', 'c'])
+    expect(n.status).toBe('READY')
+    const last = n.reviewLog[n.reviewLog.length - 1]!
+    // 合并后的裁决是**全量**三席,而且署名跟着**原席位**走(不是按重派子集的下标)。
+    expect(last.verdicts.map(v => v.role)).toEqual(['a', 'b', 'c'])
+    expect(last.verdicts.every(v => v.pass)).toBe(true)
+    expect(last.synthesized.pass).toBe(true)
+  })
+
+  it('全票档下同样的局面照旧重试并阻断,但**只重派打不通的那一席**', async () => {
     const { agent, count } = cCallsFail()
     const n = root()
     n.phaseRoles = roster
     await stepStart(n, ctxFor([n], agent, { ...cfg, phaseRoles: roster }))
+    // 判决不变:全票档下 c 永久打不通 → 三桌用尽 → 阻断。
     expect(n.status).toBe('BLOCKED')
-    expect(count()).toBe(9)
+    /**
+     * 调用数**从 9 降到 5**:首桌 3 席,之后两桌只重派 c(a、b 的裁决原样留着)。
+     *
+     * 这个数字就是这次改动的全部内容。原来重开整桌意味着已经出过裁决的席位再付一次调用,
+     * 而 infra 失败最常见的原因正是上游限流(429/529)—— 也就是说我们在上游说「慢一点」
+     * 的那一刻,把同一批请求又打了两遍。默认 caps + 席位上限 5 下最坏 15 次换 ≤5 次有效裁决。
+     */
+    expect(count()).toBe(5)
   })
 })
 

@@ -6,6 +6,7 @@ import type { Message } from '../../types/message.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { runWithCwdOverride } from '../../utils/cwd.js'
 import type { RunControl } from './control.js'
+import type { RateLimitGate } from './rateLimitGate.js'
 import { eventsFromMessage, type BriefResolver } from './agentEvents.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { RoleBinding } from './types.js'
@@ -18,7 +19,23 @@ import { addUsage, createUsageMeter, isEmptyUsage } from './usage.js'
  * phase failure (提高 nodeTimeoutMs / 拆小节点, rather than "read the reviewer's blockers"),
  * and this reason's text is user-facing Chinese prose that will be reworded.
  */
-export type TimeoutKind = 'stall' | 'human'
+export type TimeoutKind =
+  /** 静默:一个字都没有(流式增量也算「有字」)。 */
+  | 'stall'
+  /** 等人回答工具权限确认。 */
+  | 'human'
+  /**
+   * 总时长:一直在吐字,但这一次调用久到不像话。
+   *
+   * **是 stall 修好之后新开的洞。** 在「流式增量算进展」之前,`nodeTimeoutMs` 顺带给了
+   * 每一次调用一个总时长上限(错的判据、对的边界);之后一个每分钟吐一个 token 的上游
+   * 可以永远跑下去,而 `deps.timeoutMs` 的存在理由写的就是「a provider that hangs
+   * without ever rejecting has no bound at all」—— 滴水和挂死是同一类故障。
+   *
+   * 上限取 `nodeTimeoutMs × TOTAL_LIMIT_FACTOR`(默认 10 分钟 × 6 = 1 小时),
+   * 用同一个旋钮,不再多一个要解释的数。补救建议也不同:它不是「没反应」,是「太慢」。
+   */
+  | 'total'
 
 /**
  * 用户点名取消了这一个节点。
@@ -64,6 +81,15 @@ export function pollIntervalMs(limitMs: number | undefined): number {
   return Math.min(1000, Math.max(50, Math.floor((limitMs && limitMs > 0 ? limitMs : 1000) / 20)))
 }
 
+/**
+ * 总时长上限 = 静默预算的几倍。
+ *
+ * 6 不是随便取的:静默预算的语义是「多久没动静算挂死」,而一次**正常**的长调用
+ * (读二十个文件、跑一遍测试、改几处代码)可以是它的好几倍。取 6 让默认配置下的绝对
+ * 上限落在 1 小时 —— 比任何一次健康的阶段调用都长,又不至于让一个滴水的上游挂一整天。
+ */
+export const TOTAL_LIMIT_FACTOR = 6
+
 export class PhaseTimeoutError extends Error {
   constructor(
     public readonly limitMs: number,
@@ -80,7 +106,11 @@ export class PhaseTimeoutError extends Error {
     super(
       kind === 'human'
         ? `等待人工确认超时(${limitMs} ms):没有人回答工具权限确认,已中止`
-        : `阶段调用超时(${limitMs} ms):静默超过该时长没有任何输出,已中止`,
+        : kind === 'total'
+          // 这一句**必须**和静默那句分得开:它一直在吐字,叫用户去调静默预算或者
+          // 「检查网络」都不对症 —— 该看的是这一席为什么这么慢(或者这个节点太大了)。
+          ? `阶段调用总时长超限(${limitMs} ms):一直有输出但迟迟不结束,已中止`
+          : `阶段调用超时(${limitMs} ms):静默超过该时长没有任何输出,已中止`,
     )
     this.name = 'PhaseTimeoutError'
   }
@@ -107,17 +137,82 @@ export class PhaseTimeoutError extends Error {
  * model 相等,而我们要拦的是**所有** provider 错误,不只是合成的那一类。
  */
 export function providerErrorOf(messages: readonly unknown[]): string | undefined {
-  for (const m of messages as { type?: string; isApiErrorMessage?: boolean }[]) {
+  return providerErrorInfoOf(messages)?.text
+}
+
+/**
+ * provider 报错**属于哪一类**。今天只区分一类:限流(429 / 529 / overloaded)。
+ *
+ * 为什么要分:限流不是「这一席判了不通过」,也不是「模型不存在」——它是「慢一点」。
+ * 认出来之后,`/et` 可以让整趟 run 一起退避(见 rateLimitGate)而不是**在上游拒绝的
+ * 那一秒把同一批请求再打两遍**,而后者是这个功能上线以来一直在做的事。
+ */
+export type ProviderErrorKind =
+  /** 容量限流(429/529/overloaded):**等一会儿就好**,该退避、该重试。 */
+  | 'rate_limit'
+  /**
+   * 额度/权限用尽:**等没有用**。
+   *
+   * 和 `rate_limit` 必须分开,这是验收实测出来的净负面:`errors.ts` 把
+   * `error: 'rate_limit'` 这个字段**同时**用在四种情况上,其中三种等待毫无意义 ——
+   * 订阅额度用尽(`You've hit your session limit · resets 3pm`,最长要等到几小时后)、
+   * 1M 上下文要 `/extra-usage`、以及 Opus→Sonnet 回落时那条哑消息。
+   *
+   * 只按字段判的后果:上游自己说 **resets 3pm**,而我们在同一行后面贴上「等几分钟再
+   * /et --resume 继续」,并且每个调用点先白花 3 次调用 + 6 秒退避。改动前是 1 次调用
+   * 后立刻阻断 —— 也就是说不分开的话,这次改动在这一类上把事情做得更糟了。
+   */
+  | 'quota'
+
+/**
+ * 429 走**结构化**字段,529/overloaded 只能认文案 —— 这条不对称是实测的,不是偷懒:
+ *
+ *  - 429:`errors.ts` 造那条 assistant 消息时写了 `error: 'rate_limit'`,而
+ *    `baseCreateAssistantMessage` 把它原样挂在消息上。判字段,文案怎么改都不影响。
+ *  - 529 / overloaded_error:`getAssistantMessageFromError` 里**没有** 529 分支,它落到
+ *    最后那个 `error: 'unknown'` 兜底(写 `'rate_limit'` 的 `categorizeRetryableAPIError`
+ *    只服务 SDK 输出通道,不在 `/et` 这条路上)。所以 529 只剩文案可认。
+ *
+ * 认它是值得的:529 恰恰是 `withRetry` 会连着重试、最容易把节点拖长的那一类,而 429 在
+ * 订阅账号上 SDK **一次都不重试**(`withRetry.shouldRetry`),我们这一层是唯一的重试。
+ */
+const RATE_LIMIT_TEXT = /\(429\)|\b429\b|rate.?limit|overloaded_error|\b529\b|Overloaded/i
+
+/**
+ * 「等没有用」的那几种,**判在容量限流之前**。
+ *
+ * 三条都对着 `errors.ts` 的原文:
+ *  - `hit your … limit` / `resets …`:订阅额度用尽那条卡片文案(errors.ts 的配额分支);
+ *  - `Extra usage is required`:1M 上下文没开 extra usage;
+ *  - `No response requested`:Opus→Sonnet 静默回落时那条哑消息(它连正文都不是给人看的)。
+ *
+ * 判文案是**没得选**:这三种和真限流共用同一个结构化字段 `error: 'rate_limit'`。
+ * 所以顺序是判据的一部分 —— 先排除「等没有用」的,剩下的才当容量限流退避。
+ */
+const QUOTA_TEXT = /hit your .*limit|resets\s|Extra usage is required|No response requested/i
+
+export function providerErrorInfoOf(
+  messages: readonly unknown[],
+): { text: string; kind?: ProviderErrorKind } | undefined {
+  for (const m of messages as { type?: string; isApiErrorMessage?: boolean; error?: string }[]) {
     if (m?.type !== 'assistant' || m.isApiErrorMessage !== true) continue
-    const text = collectText([m] as never)
-    return text.trim() === '' ? '模型服务返回了一条空的错误消息' : text
+    const raw = collectText([m] as never)
+    const text = raw.trim() === '' ? '模型服务返回了一条空的错误消息' : raw
+    const kind: ProviderErrorKind | undefined = QUOTA_TEXT.test(text)
+      ? 'quota'
+      : m.error === 'rate_limit' || RATE_LIMIT_TEXT.test(text) ? 'rate_limit' : undefined
+    return kind ? { text, kind } : { text }
   }
   return undefined
 }
 
 /** provider 报错被当成回答收下的那一刻抛出来 —— 见 providerErrorOf。 */
 export class ProviderApiError extends Error {
-  constructor(public readonly providerMessage: string) {
+  constructor(
+    public readonly providerMessage: string,
+    /** 限流时是 `'rate_limit'`。调用方靠它决定「退避后重试」还是「当成失败」。 */
+    public readonly kind?: ProviderErrorKind,
+  ) {
     super(providerMessage)
     this.name = 'ProviderApiError'
   }
@@ -244,10 +339,55 @@ export function makeRunAgentFn(deps: {
    * agentEvents 里那张静态表。
    */
   briefResolver?: BriefResolver
+  /**
+   * 上游限流闸门(run 级)。给了才有退避。
+   *
+   * 接在这一层是因为这里是**所有** `/et` 模型调用的唯一必经点(七个环节、圆桌的每一席、
+   * 根方案、自动重拟、冲突自动解决)。少了它,「429 之后立刻把同一批请求再打两遍」这条
+   * 就只能在每个调用点各修一遍,而调用点还会继续长。
+   */
+  rateGate?: RateLimitGate
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
   return async req => {
+    /**
+     * 上游还在限流就先等 —— **排在下面那条 abort 早退之前**。
+     *
+     * 顺序是有讲究的,反过来会打开一个实测存在的窗口:那条早退和
+     * `req.signal.addEventListener('abort', relay)` 之间原本**一个 await 都没有**,
+     * 这正是它成立的全部条件。在它之后插一个等待的话,一个在冷却期间 abort 的 signal
+     * **不会再派发 abort 事件**(已经 aborted 了),`relay` 永不执行、`inner` 永不 abort ——
+     * 于是 60 秒之后我们照样派出一个真的、带写工具的子 agent。
+     *
+     * 放在前面则两种情形都对:等之前就 abort 了 → `wait` 立刻返回 → 早退;等的过程中
+     * abort → `wait` 被 signal 打断 → 早退。
+     *
+     * 计时器也必须在这之后才起跑(`lastProgressAt` 在下面),否则冷却会被算进「静默时长」,
+     * 一个正常的限流退避会被 `caps.nodeTimeoutMs` 判成挂死。
+     */
+    if (deps.rateGate) {
+      await deps.rateGate.wait({
+        signal: req.signal,
+        // 单节点取消要能穿透冷却:`registerCall` 在下面几十行才发生,而 `cancelNode`
+        // 只 abort 已登记的 controller —— 不给它这条早退,用户按下 x 之后屏幕上那个节点
+        // 会继续显示「运行中」直到冷却结束(最坏 60 秒)。
+        stop: () => deps.control?.wasCancelled(req.node.id) === true,
+        onWait: ms => {
+          // 屏幕上必须有话说:否则那一屏就是一个一动不动的「运行中」。
+          try {
+            req.stream?.push({
+              kind: 'text',
+              text: `\n[上游限流,等 ${Math.round(ms / 1000)}s 后再发这次请求]\n`,
+            })
+          } catch { /* 提示而已 */ }
+        },
+      })
+      if (deps.control?.wasCancelled(req.node.id) === true) {
+        req.stream?.end('已被用户取消')
+        throw new NodeCancelledError(req.node.id)
+      }
+    }
     // Already cancelled → don't start a sub-agent at all. Without this an abort racing the
     // next phase call still launches a real, tool-bearing agent (write-capable in the
     // execute phase). runRoundtable guards the same way for the same reason.
@@ -298,6 +438,9 @@ export function makeRunAgentFn(deps: {
       try {
         return await deps.canUseTool(...args)
       } finally {
+        // 等人这段时间从**总时长**里扣掉 —— 静默时钟本来就不走它(轮询器里那条早退),
+        // 而总时长如果算上它,用户去倒杯水回来会看到一次「总时长超限」。
+        if (humanWaitFrom !== undefined) humanSpentMs += Date.now() - humanWaitFrom
         humanWaitFrom = undefined
         markProgress()
         // finally 里发,所以用户拒绝、超时中止、provider 抛错,面板都会拿回键盘。
@@ -345,10 +488,31 @@ export function makeRunAgentFn(deps: {
     const limitMs = typeof deps.timeoutMs === 'function' ? deps.timeoutMs() : deps.timeoutMs
     const humanLimitMs = typeof deps.humanTimeoutMs === 'function' ? deps.humanTimeoutMs() : deps.humanTimeoutMs
     let lastProgressAt = Date.now()
+    /**
+     * 这次调用起跑的时刻 —— 总时长上限的起点。
+     *
+     * **不含等人的那段时间**(见下面 `humanSpentMs`):否则用户去倒杯水回来,一次正常的
+     * 调用会以「总时长超限」阻断,而那正是两个时钟当初被拆开的全部理由。
+     */
+    const startedAt = Date.now()
+    /** 累计等人回答花掉的毫秒 —— 从总时长里扣掉。 */
+    let humanSpentMs = 0
     /** 正在等人回答的那一刻;不在等人时是 undefined。 */
     let humanWaitFrom: number | undefined
     const markProgress = (): void => { lastProgressAt = Date.now() }
     const fire = (kind: TimeoutKind): void => { timedOut = true; timeoutKind = kind; inner.abort() }
+    /**
+     * 总时长的绝对上限。
+     *
+     * 「流式增量算进展」把静默时钟修对了,同时把**总时长**这一维变成了完全无界的 ——
+     * 一个每分钟吐一个 token 的上游从此可以永远跑下去,而这个文件里 `deps.timeoutMs`
+     * 的存在理由写的就是「a provider that hangs without ever rejecting has no bound at all」。
+     * 滴水和挂死是同一类故障,只是一个装得像在干活。
+     *
+     * 用同一个旋钮 × 一个倍数,不再多一个要向用户解释的数;`limitMs` 为 0(禁用)时它也
+     * 一起禁用 —— 「关掉超时」应该真的关掉,而不是留一个用户没听说过的上限。
+     */
+    const totalLimitMs = limitMs && limitMs > 0 ? limitMs * TOTAL_LIMIT_FACTOR : 0
     // 轮询而不是 setTimeout:deadline 会被「有进展」和「在等人」两件事不断推后,
     // 用 setTimeout 就得每次重排,而重排的边界条件比一个便宜的轮询更容易写错。
     const tickMs = pollIntervalMs(limitMs)
@@ -356,11 +520,14 @@ export function makeRunAgentFn(deps: {
       ? setInterval(() => {
           const now = Date.now()
           if (humanWaitFrom !== undefined) {
-            // 在等人:只查人工预算,stall 时钟这段时间不走。
+            // 在等人:只查人工预算,stall 和总时长两个时钟这段时间都不走。
             if (humanLimitMs && humanLimitMs > 0 && now - humanWaitFrom >= humanLimitMs) fire('human')
             return
           }
-          if (limitMs && limitMs > 0 && now - lastProgressAt >= limitMs) fire('stall')
+          if (limitMs && limitMs > 0 && now - lastProgressAt >= limitMs) { fire('stall'); return }
+          // 总时长排在静默**之后**判:两个同时到点时,「一个字都没有」比「太慢」更能解释
+          // 这次失败,而它们的补救建议不同。
+          if (totalLimitMs > 0 && now - startedAt - humanSpentMs >= totalLimitMs) fire('total')
         }, tickMs)
       : undefined
 
@@ -399,6 +566,25 @@ export function makeRunAgentFn(deps: {
         canUseTool,
         isAsync: false,
         querySource: 'agent:custom',
+        /**
+         * **流式增量也算「有进展」。** 这一行是「静默时钟」名副其实的全部前提。
+         *
+         * `runAgent` 只把**完整消息**(assistant / user / attachment)yield 出来,
+         * `stream_event` 增量它自己就丢掉了 —— 它的 `onQueryProgress` 注释写得很清楚,
+         * 存在的理由正是「long single-block streams (e.g. thinking) where no assistant
+         * message is yielded for >60s」。而这个钩子此前**全仓库零消费者**。
+         *
+         * 于是 `caps.nodeTimeoutMs` 实际量的不是静默,是「两条完整消息之间的间隔」。
+         * 一个思考很久、或者端点很慢的模型在一次调用里流了十分钟 token、一条完整消息还没
+         * 攒够,就会被判成「静默超过 600000 ms 没有任何输出,已中止」—— 而它一秒都没停。
+         * 实测复现:一个持续吐 delta、300ms 后才给出完整消息的假 runAgent,配 120ms 预算,
+         * 抛 `PhaseTimeoutError('stall')`。
+         *
+         * 而这条时钟**只存在于 /et 的子 agent 调用上**:主模型那条路没有它(claude.ts 的
+         * 流式看门狗要 `CLAUDE_ENABLE_STREAM_WATCHDOG` 才开)。所以症状正是用户报的那句
+         * ——「同一个模型当主模型正常,配成员工用 API 调就老是报错」。
+         */
+        onQueryProgress: markProgress,
         // model 是**故意不传**的 —— 传了会盖掉 runAgent 按协议分好的那套解析,
         // 而且 getAgentModel 让外部值优先于专门拦它的保护。上面那段长注释是全部原委。
         // 员工的模型和端点跟着 agentDefinition 走(pickAgentDefinition 已经选好了)。
@@ -508,7 +694,9 @@ export function makeRunAgentFn(deps: {
         deps.control?.wasCancelled(req.node.id) === true
           ? '已被用户取消'
           : timedOut
-            ? (timeoutKind === 'human' ? '等待人工确认超时' : '静默超时(没有任何输出)')
+            ? (timeoutKind === 'human'
+              ? '等待人工确认超时'
+              : timeoutKind === 'total' ? '总时长超限(一直有输出但不结束)' : '静默超时(没有任何输出)')
             : failure,
       )
     }
@@ -521,14 +709,23 @@ export function makeRunAgentFn(deps: {
     }
     if (timedOut) {
       throw new PhaseTimeoutError(
-        (timeoutKind === 'human' ? humanLimitMs : limitMs) ?? 0,
+        // 报**开火的那一个**上限,不是静默预算 —— 印一个和判据不符的数,用户会去调错旋钮。
+        (timeoutKind === 'human' ? humanLimitMs : timeoutKind === 'total' ? totalLimitMs : limitMs) ?? 0,
         timeoutKind,
       )
     }
     // provider 的报错**不是**这一席的回答。排在取消和超时之后:那两个是用户和闸门的
     // 决定,比 provider 的抱怨更能解释这次失败。
-    const providerError = providerErrorOf(collected)
-    if (providerError !== undefined) throw new ProviderApiError(providerError)
+    const providerError = providerErrorInfoOf(collected)
+    if (providerError !== undefined) {
+      // 限流要**记在闸门上**:下一个请求(不管是哪个节点、哪一席)会先等冷却。
+      // 这是唯一一处所有 `/et` 调用必经的地方,所以也是唯一一处能把「上游在限流」
+      // 变成 run 级状态的地方。
+      if (providerError.kind === 'rate_limit') deps.rateGate?.noteRateLimit()
+      throw new ProviderApiError(providerError.text, providerError.kind)
+    }
+    // 真的答上来了 → 冷却级数清零(见 noteSuccess 为什么不清窗口)。
+    deps.rateGate?.noteSuccess()
     return collectText(collected)
   }
 }

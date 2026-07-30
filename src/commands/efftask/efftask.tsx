@@ -11,6 +11,7 @@ import { collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/e
 import { collectRoleLoadIssues } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
+import { createRateLimitGate } from '../../tools/efftask/rateLimitGate.js'
 import { searchUnavailableReason } from '../../utils/ripgrep.js'
 import { SKILL_TOOL_NAME } from '../../tools/SkillTool/constants.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
@@ -53,6 +54,7 @@ import {
   rosterEquals,
   dispatchableRoles,
   type HandoffSummary,
+  type HandoffState,
 } from '../../tools/efftask/startupConfirm.js'
 import { buildStartupCard, sendFeishuStartupCard } from '../../tools/efftask/feishuStartupCard.js'
 import { buildConflictCard } from '../../tools/efftask/conflictEscalation.js'
@@ -324,6 +326,12 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
    * 靠它们共用同一个实例才生效。组件重挂时换一个新的,已经登记的在飞调用就永远取消不掉。
    */
   const control = createRunControl()
+  /**
+   * 上游限流闸门。**和 control 同处建、同一个理由**:两个 makeRunAgentFn 实例
+   * (runAgent 和一次性的 extractAgent)必须共用同一个,否则「上游在限流」这条状态在
+   * 它们之间不共享;而建在组件里的话,同一次会话按 r 重做会把退避级数清零。
+   */
+  const rateGate = createRateLimitGate()
   const canUseTool = context.canUseTool ?? hasPermissionsToUseTool
   const mainModelDefault = pickMainAgentDefinition(allAgents)
   // 非执行环节的池子:会话里的一切,减去会改盘的(含 MCP —— 见 WRITE_CAPABLE_TOOL_NAMES)。
@@ -352,6 +360,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     // 工具摘要用工具自己的 userFacingName —— 主 REPL 每一行工具调用就是这么渲染的。
     // 接上它,以后新增的工具自动有好摘要,不用回来改那张静态表。
     briefResolver: briefResolverFor(context.options.tools),
+    rateGate,
   })
   // Separate NO-TOOLS seam for the one-shot config extraction: it only rewrites text into
   // JSON, so it needs neither read nor write tools. This is the ONLY place that passes [].
@@ -364,6 +373,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     mainModelDefault,
     timeoutMs: () => capsRef.nodeTimeoutMs,
     humanTimeoutMs: () => capsRef.humanTimeoutMs,
+    rateGate,
   })
 
   /**
@@ -408,6 +418,14 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // ReferenceError from inside a .then(), onDone was never called, and processSlashCommand's
   // promise stayed pending forever.
   const handoffOut: { current: HandoffSummary | null } = { current: null }
+  /**
+   * 收口结局,给**退出报告**用(它进对话记录,比 done 视图活得久)。
+   *
+   * 和 handoffOut 同一套理由:onExit 跑在 call() 的作用域里,读不到组件的 state。
+   * 不带上它的话,自动合并成功之后留在对话记录里的仍然是「你的工作区未被改动」
+   * 和「稍后收口: /et --resume … 会重新弹出四选一」—— 而两句都已经不成立。
+   */
+  const handoffStateOut: { current: HandoffState | undefined } = { current: undefined }
   // Same shape, same reason: onExit runs in THIS scope and must be able to report how many
   // escalation cards were dropped.
   const cardLimitOut: { current: number } = { current: 0 }
@@ -460,6 +478,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       // claim they cancelled. It points at the run dir, which is exactly what resume reads.
       onTornDown={() => { tornDown = true }}
       handoffOut={handoffOut}
+      handoffStateOut={handoffStateOut}
       cardLimitOut={cardLimitOut}
       humanWaitOut={humanWaitOut}
       control={control}
@@ -487,7 +506,10 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
             ? `\n(另有 ${dropped} 条升级通知因数量上限未发送;被阻断的节点见 run.md 的任务树,未阻断的见对应节点的 node.md)`
             : ''
           onDone(
-            exitReportLine({ runId, how, resumed, withPath, handoff: handoffOut.current }) + suppressed,
+            exitReportLine({
+              runId, how, resumed, withPath,
+              handoff: handoffOut.current, handoffState: handoffStateOut.current,
+            }) + suppressed,
             { display: 'system' },
           )
         }
@@ -690,6 +712,7 @@ type RunnerProps = {
   onTornDown: () => void
   /** call()-scoped holder for the handoff, read by onExit. See exitReportLine. */
   handoffOut: { current: HandoffSummary | null }
+  handoffStateOut: { current: HandoffState | undefined }
   /** call()-scoped count of escalation cards the limiter dropped, read by onExit. */
   cardLimitOut: { current: number }
   humanWaitOut: { current: ((waiting: boolean) => void) | null }
@@ -735,6 +758,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [pendingHandoff, setPendingHandoff] = React.useState<PendingHandoff | null>(null)
   // 收口动作的结果。必须显示出来:合并冲突/推送失败时,用户看到的不能是一个安静的 done。
   const [handoffResult, setHandoffResult] = React.useState<HandoffResult | null>(null)
+  /**
+   * 集成分支已经合回当前分支了吗。
+   *
+   * done 视图那句话按它写:不区分的话屏幕上会写「你的工作区未被改动」+「稍后收口:
+   * /et --resume … 会重新弹出四选一」,而两句在自动合并之后都是**可照做的假话**
+   * (第二条尤其:pendingHandoff 已经从 run.md 上清掉了,那条命令进来什么都不会弹)。
+   */
+  const [handoffState, setHandoffState] = React.useState<HandoffState | undefined>(undefined)
   /** 正在被重做的节点(done 视图按 r 选中的那个)。null = 没有重做在进行。 */
   const [redoTarget, setRedoTarget] = React.useState<TaskNode | null>(null)
   /**
@@ -1180,6 +1211,21 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         cwd: getCwd(),
         // 并行占用 (spec §10.1). One call, storing a live reader for the status bar.
         onPool: read => { poolRead.current = read },
+        /**
+         * 收口(spec §8 的自动那一半):跑完就把集成分支合回**当前目录**。
+         *
+         * 用户原话:「任务完后,在隔离环境产出的代码和目录,并且提交成功了,要在当前目录下
+         * 有对应的存在。」判据和真正的合并都在 `finishHandoff` 里(可单测),这里只接线 ——
+         * 这个文件里长逻辑的代价这一轮已经量过:验收在同一个位置造出过 14 条存活变异。
+         */
+        git: gitRunner,
+        onHandoffResult: out => {
+          const st: HandoffState | undefined = out.merged ? 'merged' : out.conflicted ? 'conflicted' : undefined
+          setHandoffState(st)
+          // 退出报告读的是 call() 作用域里的这个盒子(onExit 读不到 state)。
+          props.handoffStateOut.current = st
+          if (out.result) setHandoffResult(out.result)
+        },
         // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
         // read at escalation time, not at gate time, because the bridge may connect
         // after the run starts. Absent bridge => no card; the node still blocks with
@@ -1338,8 +1384,19 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     } catch (e) {
       result = { ok: false, message: `收口失败: ${e instanceof Error ? e.message : String(e)}` }
     }
-    // 只有真的成功了才划掉。失败(冲突、脏树、推不上去)必须让它留着,用户下次还能回来 ——
-    // 而且关口刚刚已经如实告诉他失败了什么。
+    /**
+     * 只有真的成功了才划掉。失败(冲突、脏树、推不上去)必须让它留着,用户下次还能回来 ——
+     * 而且关口刚刚已经如实告诉他失败了什么。
+     *
+     * **`keep` 也算处置完了,尽管它什么都没做。** 这一条反直觉,验收实测过反过来的后果:
+     * 恢复路径在**任何节点检查之前**就判 `pendingHandoff` 并 return(只渲染关口),而关口的
+     * 每一个出口都走 `setPhase('done')` —— 没有一条通往续跑。所以 `keep` 不划掉的话,
+     * 一个「被安全阀挡住 + 有待收口」的 run 会**永久卡在收口关口**:第二次 `--resume`
+     * 还是那一屏,`--retry-blocked` 永远到不了 reseat,而 README 承诺它能重开那些节点。
+     *
+     * 代价是 ConfirmHandoff 上「Esc 稍后再说(等同「保留」)」那句话不完全准 —— 记录会被
+     * 划掉,以后只能 `git merge <branch>` 自己来。文案已经按这个改口(见 ConfirmHandoff)。
+     */
     if (result.ok) {
       // props.effRoot,不是裸 effRoot —— 那个绑定只存在于 call() 的作用域。这三行躲在
       // try/catch 后面,所以裸写它是**静默失败**:收口明明成功了,pendingHandoff 却永远
@@ -1354,6 +1411,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
     }
     setHandoffResult(result)
+    // 关口里那次合并同样要让 done 视图改口 —— 判据和自动收口共用一个 state,
+    // 否则同一件事在两条路上被描述成两个样子。
+    if (choice === 'merge' && result.ok) { setHandoffState('merged'); props.handoffStateOut.current = 'merged' }
     setPhase('done')
     // props.effRoot,不是裸 effRoot:那个绑定只存在于 call() 的作用域,组件里没有。
   // 依赖数组**每次 render 都求值**,所以裸写它 = EffTaskRunner 第一次渲染就抛
@@ -1792,7 +1852,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   return (
     <DoneView
       nodes={nodes} runId={runId ?? ''} streams={streams.current} outcome={outcome}
-      handoff={handoff} handoffResult={handoffResult} viewOnly={viewOnly} onExit={props.onExit}
+      handoff={handoff} handoffResult={handoffResult} handoffState={handoffState}
+      viewOnly={viewOnly} onExit={props.onExit}
       redoProblems={redoProblems}
       // 只查看模式下不给重做:那个 run 的编排器根本没起来过,重做等于**替用户决定**
       // 把它跑起来 —— 而他刚刚明确选了不跑。
@@ -1924,6 +1985,8 @@ export function DoneView(props: {
    * 成功了 —— 而代码根本不在他的分支上。这是这个功能最不能出的错。
    */
   handoffResult?: HandoffResult | null
+  /** 收口结局(已合并 / 撞冲突留下半合并)—— 决定这一屏那两句话怎么写(见 handoffLines)。 */
+  handoffState?: HandoffState
   /**
    * 仅查看后退出 (spec §17.3): this view is doubling as a read-only browser for a run the user
    * chose NOT to continue. Nothing ran, so the summary must not say 被阻断 — that would report
@@ -1945,7 +2008,7 @@ export function DoneView(props: {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
   // node's detail — the run is over, so reading the tree matters more than leaving it fast.
   const ok = props.outcome?.status === 'completed'
-  const handoff = props.handoff ? handoffLines(props.handoff, props.runId) : []
+  const handoff = props.handoff ? handoffLines(props.handoff, props.runId, props.handoffState) : []
   const summaryRows = doneSummaryRows({
     viewOnly: props.viewOnly === true,
     hasReason: Boolean(props.outcome?.reason),

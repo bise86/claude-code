@@ -17,7 +17,7 @@ export function ConfirmHandoff(props: {
   handoff: PendingHandoff
   runId: string
   onDecision: (choice: HandoffChoice) => void
-  /** 用户放弃选择(Esc)。退化成「保留」,不丢任何东西。 */
+  /** 用户放弃选择(Esc)。退化成「保留」:分支和工作区都留着,但待收口记录会被划掉。 */
   onSkip: () => void
 }): React.ReactNode {
   const choices = choiceLabels(props.handoff)
@@ -72,7 +72,10 @@ export function ConfirmHandoff(props: {
               {i === idx ? '▶ ' : '  '}{c.label} — {c.hint}
             </Text>
           ))}
-          <Text dimColor>↑/↓ 选择 · 回车 确认 · Esc 稍后再说(等同「保留」)</Text>
+          {/* 「稍后再说」曾经写成一句做不到的话:keep 之后待收口记录**会被划掉**,
+              /et --resume 不会再弹这一屏。不划掉又会让被阻断的 run 永久卡在这里
+              (恢复路径在节点检查之前就 return 到关口)—— 所以留着划掉,把话说准。 */}
+          <Text dimColor>↑/↓ 选择 · 回车 确认 · Esc 等同「保留」(分支留着,但这一屏不会再弹;之后用 git merge 自己来)</Text>
         </Box>
       )}
     </Box>

@@ -220,3 +220,57 @@ describe('完成视图必须把下面那个总结框的行数交给面板', () =
     expect(`空框画 ${bare} 行,厚框画 ${fat} 行`).toBe(`空框画 ${bare} 行,厚框画 ${bare - 4} 行`)
   })
 })
+
+/**
+ * 收口那几行**说的是不是真话** —— 三种结局三套文案。
+ *
+ * 验收实测过两条存活变异:把 `handoffLines(..., props.handoffState)` 的第三参写死成
+ * 「没合」、以及不接 `setHandoffResult` —— 前者让自动合并成功之后屏幕上照旧写着
+ * 「你的工作区未被改动」,后者让合并失败在屏幕上一个字都没有。两条全套测试都不红,
+ * 因为**没有任何一条断言看过这一屏渲染出来的文字**。
+ */
+describe('done 视图上的收口文案', () => {
+  const summary = { branch: 'efftask/007/integration', commits: 3, kept: [], salvage: [] }
+  const frameOf = async (extra: Record<string, unknown>): Promise<string> => {
+    const t = fakeTty(40)
+    const app = await render(
+      React.createElement(DoneView as never, {
+        nodes: [node({ id: 'root', title: '根任务' })] as never,
+        runId: '007', outcome: { status: 'completed' }, handoff: summary, onExit: () => {}, ...extra,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    return f
+  }
+
+  it('合成功 → 说产出就在当前目录里,而且不再教用户去 --resume 收口', async () => {
+    const f = await frameOf({ handoffState: 'merged', handoffResult: { ok: true, message: '已合并 3 个提交' } })
+    expect(f).toContain('已合并回你当前的分支')
+    expect(f).not.toContain('你的工作区未被改动')
+    // pendingHandoff 已经被清掉了,那条命令进去什么都不会弹。
+    expect(f).not.toContain('会重新弹出')
+  })
+
+  it('没合 → 照旧说工作区未被改动,并给出收口入口', async () => {
+    const f = await frameOf({ handoffResult: { ok: false, message: '你的工作区有未提交的改动' } })
+    expect(f).toContain('你的工作区未被改动')
+    expect(f).toContain('/et --resume 007')
+    // 失败原因必须显示出来 —— 安静地回到 done,用户会以为成功了。
+    expect(f).toContain('未提交的改动')
+  })
+
+  it('撞冲突 → 说清工作区里留着一次未完成的合并', async () => {
+    // 这一路是**自动**发生的:用户没按任何键就被丢进冲突态。屏幕上写「工作区未被改动」
+    // 是这一屏最不能出的错。
+    const f = await frameOf({
+      handoffState: 'conflicted',
+      handoffResult: { ok: false, message: '合并失败:CONFLICT (content)', followUps: ['git merge --abort 回到合并前'] },
+    })
+    expect(f).toContain('未完成的合并')
+    expect(f).not.toContain('你的工作区未被改动')
+    expect(f).toContain('--abort')
+  })
+})

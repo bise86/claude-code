@@ -10,7 +10,7 @@ export type ModelJsonFn = (prompt: string) => Promise<string>
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
   "skipSteps": ["要整个跳过的环节名"],
-  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化" },
+  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化", "nodeTimeoutMs"?: number },
   "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }],
   "phaseGuidance": { "环节名": "指令里点名给这个环节的那几句话" },
   "roleGuidance": [{ "name": "角色名或员工名", "text": "指令里点名给这个人的那几句话" }] }
@@ -19,6 +19,7 @@ phaseRoles 的值是**员工名**数组(可派发的身份)。
 - 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
 - 用户说**人数**(「至少 2 个人通过」「要 3 票」)→ caps.quorumSeats,就是那个人数。**不要**把人数写进 quorum:「至少 2 人」写成 quorum=2 的含义是 2%,等于 1 票就放行,和用户的意思正好相反。
 caps.maxSeatsPerPhase 是每个阶段最多几席。
+caps.nodeTimeoutMs 是**一次调用最多可以多久没有任何输出**(毫秒)。用户说「阶段超时 20 分钟」「每步最多等半小时」「模型慢,超时给久一点」→ 换算成毫秒填这里(20 分钟 = 1200000)。他说的是「多久没动静算卡死」,不是「一个节点最多跑多久」—— 一直在吐字就永远不算超时。
 skipSteps:用户说「跳过X」「不做X」「X就不用了」时,把那个环节名放进来。没说就省略。
 caps.planConverge:分析环节多员工时怎么收敛 ——「各自出稿再融合」=圆桌,「一稿传下去改」=精化(默认)。
 roles 是**任务角色**定义 —— 指令里凡是描述了「某个角色在哪个阶段、产出什么、起什么作用、由谁担当」的,抽到这里。
@@ -259,6 +260,19 @@ export async function parseDirectives(
   // 这两条同样需要入口:只有 readRunManifest 读回而没人写进去的话,它们只能靠手改
   // run.md 再 --resume 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
   if (caps.maxSeatsPerPhase !== undefined) c.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
+  /**
+   * 静默超时:此前**只能手改 run.md**。
+   *
+   * 而它恰恰是阻断卡唯一会点名让用户去调的那个旋钮 ——「提高 run.md 里 caps.nodeTimeoutMs」。
+   * 一个只能靠编辑 md 文件再 --resume 才转得动的旋钮,和上面 maxSeatsPerPhase / quorum
+   * 当初的处境逐字相同(「配置得进去、正常路径上到不了」)。
+   *
+   * 夹取范围与 `resumeCore` 读回时那一份**必须相同**(1s–2h):两处不一致的话,同一个数
+   * 在启动时被接受、在恢复时被改写,而屏幕上没有任何东西解释它为什么变了。
+   */
+  if (caps.nodeTimeoutMs !== undefined) {
+    c.nodeTimeoutMs = clampInt(caps.nodeTimeoutMs, 1000, 7_200_000, DEFAULT_CAPS.nodeTimeoutMs)
+  }
   if (caps.quorum !== undefined) c.quorum = clampInt(caps.quorum, 1, 100, 100)
   if (caps.quorumSeats !== undefined) c.quorumSeats = clampInt(caps.quorumSeats, 1, 20, 1)
   // 只收这两个值,别的写法(roundtable/refine/乱写)一律回落默认的精化 —— 但**必须说出来**。

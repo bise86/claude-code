@@ -61,8 +61,52 @@ describe('重开一个节点,却把它的上级留在阻断状态,等于什么�
     })
     const dependent = mk({ id: 'root/02', parentId: 'root', depth: 1, kind: 'executable', deps: ['root/01'], status: 'BLOCKED', blockedReason: '依赖阻断' })
     reseatTransientNodes([root, conflict, dependent], NOW, DEFAULT_CAPS)
-    expect(dependent.status).toBe('READY')
+    /**
+     * **CREATED,不是 READY** —— 这个节点身上没有任何「方案被放行过」的痕迹
+     * (reviewLog 空、execStatus 空),而 `stepStart` 在评审圆桌**之前**就把 kind 写成
+     * executable。放到 READY 等于让带写工具的执行者去跑一份没有任何评审员看过的方案
+     * (`advanceableKind` 直接判 'execute')。这条判据和重做那边共用一份
+     * (redo.seatForPropagated),而 reseat 这一侧原来没有它。
+     */
+    expect(dependent.status).toBe('CREATED')
     expect(dependent.blockedReason).toBe('')
+  })
+
+  it('干过活的下游回 READY(不用重新分析),而且多级依赖一起放开', () => {
+    /**
+     * 这一条守的是「不动点」那一半:阻断是 propagateBlocked 的不动点扫出来的
+     * (父→子 / 子→父 / 依赖→依赖方),而 reseat 这里原来只有一句
+     * `other.deps.includes(n.id)` 的**一级**循环。实测后果:A←B←C 的链上人工解完
+     * 合并冲突再 --resume,B 被放开而 **C 和 B 的子树留在 BLOCKED** —— 而 B 的子树红着
+     * 会让 propagateBlocked 立刻把刚放开的 B 再阻断一次,也就是「resume 之后一次模型
+     * 调用都不会发生」的那个老失败,只是从另一扇门进。
+     */
+    const root = mk({ id: 'root', childIds: ['root/01', 'root/02', 'root/03'], kind: 'decompose', status: 'BLOCKED', blockedReason: '子节点阻断' })
+    const conflict = mk({
+      id: 'root/01', parentId: 'root', depth: 1, kind: 'executable', status: 'BLOCKED',
+      blockedReason: '合并冲突', mergeConflict: true, worktree: { branch: 'b', path: '/wt/1' },
+    })
+    const b = mk({
+      id: 'root/02', parentId: 'root', depth: 1, kind: 'decompose', childIds: ['root/02/01'],
+      deps: ['root/01'], status: 'BLOCKED', blockedReason: '依赖阻断',
+    })
+    const b1 = mk({
+      id: 'root/02/01', parentId: 'root/02', depth: 2, kind: 'executable',
+      status: 'BLOCKED', blockedReason: '上级任务阻断', execStatus: '改过 src/a.ts',
+      // 两天前跑过 —— startedAt 留着的话树上会显示 172800s 并每秒往上跳。
+      startedAt: '2026-07-28T00:00:00.000Z', failedAt: 'EXECUTING',
+    })
+    const c = mk({
+      id: 'root/03', parentId: 'root', depth: 1, kind: 'executable', deps: ['root/02'],
+      status: 'BLOCKED', blockedReason: '依赖阻断', execStatus: '干过一轮',
+    })
+    reseatTransientNodes([root, conflict, b, b1, c], NOW, DEFAULT_CAPS)
+    expect(b.status).toBe('WAITING_CHILDREN')
+    expect(b1.status).toBe('READY') // 干过活 → 不用重新分析
+    expect(c.status).toBe('READY')
+    // 过期的痕迹一起清掉(这两条各自实测过后果)。
+    expect(b1.startedAt).toBeUndefined()
+    expect(b1.failedAt).toBeUndefined()
   })
 
   it('leaves a dependent alone when it failed on its own account', () => {

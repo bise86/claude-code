@@ -651,6 +651,25 @@ describe('不把自己的痕迹留在用户的 git status 里', () => {
     expect((await git(['status', '--porcelain'], gitRoot)).stdout).not.toContain('.efftask-worktrees')
   })
 
+  it('run 目录(.claude/efftask/)也要排除 —— 否则自动收口永远被自己挡住', async () => {
+    /**
+     * 这一条不是「顺手」:`/et` 从第一帧就在**用户的检出里**写 `.claude/efftask/<runId>/`,
+     * 而收口那条判据(工作区干净才自动合并)原来看 `git status --porcelain` —— 它把未跟踪
+     * 文件也算进去,于是每一趟运行结束时都躺着一条 `?? .claude/`,「跑完把产出送回当前
+     * 目录」在一个没 gitignore 掉 `.claude/` 的普通仓库里**一次也不会发生**(真 git 实测)。
+     *
+     * 判据那一侧已经改成只看已跟踪改动(handoffActions.trackedChanges),这里是第二道:
+     * 让用户自己的 `git status` 也干净。两条一起写,不是二选一。
+     */
+    const p = pool()
+    await p.init()
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    await mkdir(join(gitRoot, '.claude', 'efftask', '001'), { recursive: true })
+    await writeFile(join(gitRoot, '.claude', 'efftask', '001', 'run.md'), '# run\n')
+    expect((await git(['check-ignore', '-v', '.claude/efftask/'], gitRoot)).code).toBe(0)
+    expect((await git(['status', '--porcelain'], gitRoot)).stdout).not.toContain('.claude')
+  })
+
   it('is idempotent — a second init does not duplicate the entry', async () => {
     const p = pool()
     await p.init()

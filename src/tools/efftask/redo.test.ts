@@ -730,10 +730,17 @@ describe('redoSummary', () => {
     const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
     const lines = redoSummary(r, t[2]!, 'execute', { seatCount: { verify: 1 } }).join('\n')
     expect(lines).toContain('执行 → 测试验证 → 验收')
-    // 执行重做不删任何东西、不动任何依赖 —— 摘要里就不该出现这两句。
+    // 执行重做不删任何东西、不改写任何依赖 —— 摘要里就不该出现这两句。
     expect(lines).not.toContain('删除')
-    expect(lines).not.toContain('依赖')
-    expect(lines).not.toContain('⚠')
+    expect(lines).not.toContain('依赖被改写')
+    expect(lines).not.toContain('依赖被移除')
+    /**
+     * 但**连带恢复**那一条要印:这棵夹具树里 `b` 正 BLOCKED 于「依赖阻断」(它依赖
+     * 重做目标 a1),而重做 a1 之后它会被放回队列 —— 那是一件真的会发生的事,
+     * 不印才是漏报。这条断言原来写的是「摘要里不该出现『依赖』」,而它当时之所以成立,
+     * 是因为**多级恢复根本没有发生**(只解开直接依赖那一句从来没被渲染过)。
+     */
+    expect(lines).toContain('⚠ 连带恢复了 1 个被牵连阻断的任务')
   })
 })
 

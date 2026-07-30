@@ -18,6 +18,8 @@ import { runControlAction,
   formatDur,
   sectionLines,
   sectionPaneAction,
+  sectionPaneMode,
+  alignSectionCursor,
   mouseAvailability,
   mouseHint,
   detailEntryHint,
@@ -718,6 +720,76 @@ describe('详情页的按键(段落区 / 页签条)', () => {
     expect(sectionPaneAction('x', key({ meta: true }))).toBeNull()
     // 合批带进来的别的输入不认(和 logPaneAction 同一条规矩)。
     expect(sectionPaneAction('jk', key())).toBeNull()
+  })
+
+  it('read 模式下 ↑↓/jk 变成逐行滚,**其余键逐字不变**', () => {
+    // 这条对照断言不是加分项:仓库里没有 typecheck(package.json 只有 bun test),
+    // 一个写错的模式串不会有任何东西红,只能靠它。
+    expect(sectionPaneAction('', key({ upArrow: true }), 'read')).toEqual({ t: 'line', d: -1 })
+    expect(sectionPaneAction('', key({ downArrow: true }), 'read')).toEqual({ t: 'line', d: 1 })
+    expect(sectionPaneAction('jjj', key(), 'read')).toEqual({ t: 'line', d: 3 })
+    expect(sectionPaneAction('kk', key(), 'read')).toEqual({ t: 'line', d: -2 })
+    for (const [input, k] of [
+      ['', key({ tab: true })], ['', key({ tab: true, shift: true })],
+      ['', key({ leftArrow: true })], ['', key({ rightArrow: true })],
+      ['', key({ pageUp: true })], ['', key({ pageDown: true })],
+      ['u', key({ ctrl: true })], ['d', key({ ctrl: true })],
+      [' ', key()], ['n', key()], ['x', key({ meta: true })], ['jk', key()],
+    ] as const) {
+      expect(sectionPaneAction(input, k, 'read')).toEqual(sectionPaneAction(input, k, 'select'))
+    }
+  })
+
+  it('默认参数是 select —— 新参数不许改变既有调用点的语义', () => {
+    expect(sectionPaneAction('', key({ upArrow: true }))).toEqual(
+      sectionPaneAction('', key({ upArrow: true }), 'select'),
+    )
+    expect(sectionPaneAction('jjj', key())).toEqual({ t: 'move', d: 3 })
+  })
+
+  it('n 是两种模式下都认的「下一段」—— read 模式里唯一不用先收起就能换段落的键', () => {
+    expect(sectionPaneAction('n', key())).toEqual({ t: 'nextSection' })
+    expect(sectionPaneAction('N', key())).toEqual({ t: 'nextSection' })
+    expect(sectionPaneAction('n', key(), 'read')).toEqual({ t: 'nextSection' })
+  })
+})
+
+describe('展开状态决定段落区的 ↑↓ 归谁', () => {
+  const secs = [{ title: '目标' }, { title: '完整方案' }]
+  it('选中的那一段展开着 → 读内容;折叠着 → 选段落', () => {
+    expect(sectionPaneMode(new Set(['完整方案']), secs, 1, true)).toBe('read')
+    expect(sectionPaneMode(new Set(['完整方案']), secs, 0, true)).toBe('select')
+    expect(sectionPaneMode(new Set(), secs, 1, true)).toBe('select')
+  })
+
+  it('滚不动就一律 select —— 否则 ↑↓ 是死键,而页脚写着「滚内容」', () => {
+    // 段落区和输出区的结构差异:一段可能只有一行(刚起跑的节点、字段稀疏的恢复节点)。
+    expect(sectionPaneMode(new Set(['完整方案']), secs, 1, false)).toBe('select')
+  })
+
+  it('空列表 / 越界一律 select', () => {
+    expect(sectionPaneMode(new Set(['目标']), [], 0, true)).toBe('select')
+    expect(sectionPaneMode(new Set(['目标']), secs, 7, true)).toBe('select')
+    expect(sectionPaneMode(new Set(['目标']), secs, -1, true)).toBe('select')
+  })
+})
+
+describe('段落光标按标题定位 —— 列表在中间插入时不许换段', () => {
+  it('插入新段落之后,光标跟着**那一段**走', () => {
+    const before = [{ title: '目标' }, { title: '阻断原因' }]
+    const after = [{ title: '目标' }, { title: '完整方案' }, { title: '重点' }, { title: '阻断原因' }]
+    expect(alignSectionCursor(before, '阻断原因', 1)).toBe(1)
+    // 同一个下标 1 在新列表里指着「完整方案」;按标题找会回到 3。
+    expect(alignSectionCursor(after, '阻断原因', 1)).toBe(3)
+  })
+
+  it('那一段消失了就退回下标,并**夹在合法范围内**', () => {
+    const secs = [{ title: '目标' }, { title: '完整方案' }]
+    expect(alignSectionCursor(secs, '阻断原因', 1)).toBe(1)
+    // 界外的下标会让 sectionLines 一个 ❯ 都画不出来、headerAt 返回 -1、视口跳回顶部。
+    expect(alignSectionCursor(secs, '阻断原因', 9)).toBe(1)
+    expect(alignSectionCursor(secs, undefined, -3)).toBe(0)
+    expect(alignSectionCursor([], '目标', 4)).toBe(0)
   })
 })
 

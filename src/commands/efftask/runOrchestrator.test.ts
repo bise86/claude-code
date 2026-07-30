@@ -211,6 +211,220 @@ describe('runOrchestrator reports the run it just drove', () => {
   })
 })
 
+/**
+ * 跑完之后把集成分支合回**当前目录**(spec §8 的自动那一半)。
+ *
+ * 这里必须在 runOrchestrator 这一层断言,而不是只测 finishHandoff:这个功能的全部风险
+ * 都在**接线的顺序**上 —— 合并要排在 `reclaim` 之后(那时 pendingHandoff 才存在)、
+ * 排在 `settle` 和最后一次 `queueManifest` 之前(否则 `/tasks` 那一行和盘上的 run.md
+ * 会一起去教用户敲一条已经没有关口的 `--resume`)。
+ */
+describe('收口:跑完就把产出送回当前目录', () => {
+  /** root 直接给成 ACCEPTED —— run() 第一句就返回 completed,收口那一段才是被测对象。 */
+  const doneSeed = () => [{
+    id: 'root', title: '根任务', goal: 'g', parentId: null, childIds: [], deps: [],
+    kind: 'executable' as const, status: 'ACCEPTED' as const,
+    phaseRoles: emptyPhaseRoles(),
+    plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+    execStatus: '做完了', blockedReason: '', reviewLog: [], acceptLog: [], score: {},
+    iteration: { planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+    depth: 0, createdAt: 'T0', updatedAt: 'T0',
+  }]
+  const poolWithCommits = (commits: number) => ({
+    init: async () => ({ ok: true }),
+    acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b', gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: true, merged: true }),
+    release: async () => ({ removed: true }),
+    dispose: async () => ({ kept: [] }),
+    handoff: async () => ({
+      branch: 'efftask/004/integration', commits, kept: [], salvage: [], integrationPath: '/wt/integration',
+    }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    integrationPath: '/wt/integration',
+    integrationBranchName: 'efftask/004/integration',
+  })
+  const git = (answers: Record<string, { code?: number; stdout?: string; stderr?: string }> = {}) => {
+    const calls: string[][] = []
+    /** 每条命令的 cwd —— 跑错目录时 merge 会回答 Already up to date. 而屏幕报「已合并」。 */
+    const cwds: (string | undefined)[] = []
+    return {
+      calls,
+      cwds,
+      ran: (p: string) => calls.some(c => c.join(' ').startsWith(p)),
+      fn: async (args: string[], cwd?: string) => {
+        calls.push(args)
+        cwds.push(cwd)
+        const hit = Object.entries(answers).find(([k]) => args.join(' ').startsWith(k))
+        return { code: hit?.[1].code ?? 0, stdout: hit?.[1].stdout ?? '', stderr: hit?.[1].stderr ?? '' }
+      },
+    }
+  }
+  const run = async (over: {
+    commits?: number
+    answers?: Record<string, { code?: number; stdout?: string; stderr?: string }>
+    withGit?: boolean
+  } = {}) => {
+    const fs = memFs()
+    const g = git(over.answers)
+    const results: { merged: boolean; result?: { ok: boolean; message: string } }[] = []
+    const config = cfg()
+    const phases: string[] = []
+    /**
+     * `settle` 那一刻 pendingHandoff 还在不在 —— 顺序的观测口。
+     *
+     * setOutcome 紧挨着 settle(中间只有一句 setNodes),所以在这个回调里读 config 就是
+     * settle 看到的那份。这比去桩一个 AppState store 轻,而它要钉的正是**顺序**。
+     */
+    const settledWithHandoff: boolean[] = []
+    await runOrchestrator(
+      {
+        config, runDir: '/run/004', fs, runAgent: (async () => '') as RunAgentFn,
+        signal: new AbortController().signal, worktrees: poolWithCommits(over.commits ?? 3) as never,
+        seed: doneSeed() as never, cwd: '/repo',
+        ...(over.withGit === false ? {} : { git: g.fn as never }),
+        onHandoffResult: r => results.push(r as never),
+      },
+      () => {},
+      () => { settledWithHandoff.push(config.pendingHandoff !== undefined) },
+      p => phases.push(p),
+    )
+    return { fs, g, results, config, phases, settledWithHandoff, manifest: fs.files.get('/run/004/run.md') ?? '' }
+  }
+
+  it('干净的检出 + 跑完 → 真的 git merge,而且 run.md 里不再留待收口', async () => {
+    const r = await run()
+    expect(r.g.ran('merge --no-edit efftask/004/integration')).toBe(true)
+    expect(r.results[0]?.merged).toBe(true)
+    // 清掉了,而且**落盘了** —— 只清内存的话下一次 --resume 会为一条已经合过的分支
+    // 再弹一次四选一,而「丢弃」会对着它跑 branch -D。
+    expect(r.config.pendingHandoff).toBeUndefined()
+    expect(r.manifest).not.toContain('pendingHandoff')
+    expect(r.phases).toEqual(['done'])
+  })
+
+  it('工作区脏 → 不合、不清,run.md 留着待收口', async () => {
+    // 判据是 `git diff --quiet`(1 = 有差异),**不看未跟踪文件** —— 见 trackedChanges:
+    // `/et` 自己写的 `.claude/efftask/` 会让 `status --porcelain` 永远非空。
+    const r = await run({ answers: { 'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M src/app.ts\n' } } })
+    expect(r.g.ran('merge')).toBe(false)
+    expect(r.results[0]?.merged).toBe(false)
+    expect(r.config.pendingHandoff?.branch).toBe('efftask/004/integration')
+    expect(r.manifest).toContain('pendingHandoff')
+  })
+
+  it('零提交 → 一条 git 都不跑,也不报告', async () => {
+    const r = await run({ commits: 0 })
+    expect(r.g.calls).toEqual([])
+    expect(r.results).toEqual([])
+  })
+
+  it('不注入 git → 行为与这个功能不存在时逐字相同', async () => {
+    // headless / 拿不到 git 的调用点走这条路:待收口原样留在盘上,交给 --resume 的关口。
+    const r = await run({ withGit: false })
+    expect(r.results).toEqual([])
+    expect(r.manifest).toContain('pendingHandoff')
+    expect(r.phases).toEqual(['done'])
+  })
+
+  it('每一条 git 都跑在**用户的** cwd 上,而不是集成工作区', async () => {
+    // 跑错目录时 `git merge` 会回答 `Already up to date.`(那里已经在集成分支上)→
+    // code 0 → 屏幕报「已合并」,而用户目录里一个文件都没有。
+    const r = await run()
+    expect(r.g.calls.length).toBeGreaterThan(0)
+    for (const c of r.g.cwds) expect(c).toBe('/repo')
+  })
+
+  it('收口排在 settle 之前 —— 否则 /tasks 那一行会教用户敲一条没有关口的命令', async () => {
+    /**
+     * `settle()` 把 `!!config.pendingHandoff` 交给面板,决定 `/tasks` 那一行是不是
+     * 「待收口(/et --resume …)」。排在合并之后,面板才不会去教用户敲一条已经没有关口
+     * 的命令(合并成功时 pendingHandoff 已经被清掉)。
+     */
+    const r = await run()
+    // 合并发生在 settle 之前:settle 看到的 pendingHandoff 已经是 undefined。
+    expect(r.settledWithHandoff).toEqual([false])
+  })
+
+  it('顺利跑完时收口**只发生一次** —— finally 里那次是兜底,不是第二次', async () => {
+    /**
+     * 变异测试实测存活:把 `handoffDone` 那道幂等闩删掉之后,原来那条用例照样绿 ——
+     * 它走的是**异常**路径(happy path 根本没跑到),所以两次调用里只有一次会发生。
+     *
+     * 而顺利跑完时两处都会跑:后果是对一个**已经合过**的分支再跑一次 `git merge`
+     * (第二次拿到 `Already up to date.` → code 0 → 又报一次「已合并」),而屏幕上会
+     * 出现两条收口结果。
+     */
+    const r = await run()
+    expect(r.results).toHaveLength(1)
+    expect(r.g.calls.filter(c => c[0] === 'merge')).toHaveLength(1)
+  })
+
+  it('**没合成功**时也只报告一次 —— 这才是那道闩真正承重的地方', async () => {
+    /**
+     * 复验实测:上面那条杀不掉「删掉 handoffDone」。原因是合成功之后 `pendingHandoff`
+     * 已经被清掉,finally 里那第二次调用于是走 `action: 'none'`(不报告、不跑 git)——
+     * 闩在这条路上是**冗余**的。
+     *
+     * 真正需要它的是**没清掉**的那些路:脏树 / 没跑完 / 合并失败。那时 `pendingHandoff`
+     * 还在,第二次调用会把同一份诊断再探一遍、再报一遍 —— 屏幕上出现两条收口结果,
+     * 而 `git status` 也白跑一次。
+     */
+    const r = await run({ answers: { 'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M a.ts\n' } } })
+    expect(r.results).toHaveLength(1)
+    expect(r.config.pendingHandoff).toBeDefined()
+    // 判据也只探一次(两次的话这里是 4:diff/diff --cached/status × 2)。
+    expect(r.g.calls.filter(c => c[0] === 'diff')).toHaveLength(2)
+  })
+
+  it('异常路径上收口照样跑一次(而且只跑一次)', async () => {
+    /**
+     * happy path 那一句在 run() 抛出时根本到不了。而 finally 里那次是兜底 ——
+     * 幂等靠 `handoffDone`:做两遍意味着对一个已经合过的分支再跑一次 merge。
+     */
+    const fs = memFs()
+    const g = git()
+    const results: unknown[] = []
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/006', fs, runAgent: (async () => '') as RunAgentFn,
+        signal: new AbortController().signal, worktrees: poolWithCommits(2) as never,
+        seed: doneSeed() as never, cwd: '/repo', git: g.fn as never,
+        onHandoffResult: x => results.push(x),
+      },
+      () => { throw new Error('渲染崩溃') }, // setNodes 抛 → 走 catch → finally
+      () => {}, () => {},
+    )
+    // 被阻断的结局 → 只报告不合并;而报告本身必须发生(否则屏幕上一个字都没有)。
+    expect(results).toHaveLength(1)
+    expect(g.ran('merge')).toBe(false)
+    // 只跑过一次收口:status 那一步都没跑(blocked 不探脏),更不会跑两遍 merge。
+    expect(g.calls.filter(c => c[0] === 'merge')).toHaveLength(0)
+  })
+
+  it('git 抛异常也照样到达 done 视图', async () => {
+    /**
+     * 收口跑在 finally 里,而那一段的每一句都是被保护的:一个逃出去的异常会让
+     * `setPhase('done')` 永不执行 —— 界面永久停在「运行中」,Esc 毫无反应,而外层
+     * catch 早就跑完了救不了。
+     */
+    const fs = memFs()
+    const phases: string[] = []
+    const results: { merged: boolean }[] = []
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/005', fs, runAgent: (async () => '') as RunAgentFn,
+        signal: new AbortController().signal, worktrees: poolWithCommits(2) as never,
+        seed: doneSeed() as never, cwd: '/repo',
+        git: (async () => { throw new Error('spawn EAGAIN') }) as never,
+        onHandoffResult: r => results.push(r as never),
+      },
+      () => {}, () => {}, p => phases.push(p),
+    )
+    expect(phases).toEqual(['done'])
+    expect(results[0]?.merged).toBe(false)
+  })
+})
+
 describe('后台任务条目 (spec §10) 真的被接上', () => {
   /** Minimal AppState double: registerTask/updateTaskState only touch `tasks`. */
   function store() {

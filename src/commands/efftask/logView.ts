@@ -944,6 +944,23 @@ export function runControlAction(input: string, key: { ctrl?: boolean; meta?: bo
 export type SectionPaneAction =
   | { t: 'move'; d: number }
   | { t: 'toggle' }
+  /**
+   * 逐行滚动选中那一段的内容(展开着的时候的 ↑↓/jk)。
+   *
+   * 和 `scroll`(半页)分开:半页是「快速掠过」,这一条是「一行一行读」,而用户原话
+   * 要的正是后者(「选择项就是上下键看内容」)。
+   */
+  | { t: 'line'; d: number }
+  /**
+   * `n`:跳到下一段,**两种模式下都认**。
+   *
+   * 这是从输出页卡整份搬过来的那半:那边 `n`(换流)在 select 和 read 两种模式下逐字
+   * 相同,所以「读到一半想换一段」不必先收起。段落区原来没有这个键 —— 展开着读一段
+   * 60 行的完整方案时,想去看验收点只能「空格收起(视口当场跳回标题、读到哪儿丢了)→
+   * ↓ → 空格展开」。段落区的 `n` 此前是死键(输出页卡的 handler 判了 tab==='log'),
+   * 零冲突。
+   */
+  | { t: 'nextSection' }
   /** Tab / Shift+Tab:在 页签条 ⇄ 内容区 之间轮转。 */
   | { t: 'switchZone'; d: number }
   /** ←/→:切页卡。**在详情页里这两个键原来是死键**,零冲突白捡。 */
@@ -977,12 +994,25 @@ export type SectionPaneAction =
  * TaskTreePanel 比 NodeDetail 先挂,所以它**永远先跑**,在 NodeDetail 里调
  * stopImmediatePropagation 已经来不及了。
  */
+/**
+ * @param mode 选段落还是读内容。见 `LogPaneMode` —— 和输出页卡**共用同一个类型和同一条规矩**。
+ *
+ * **只有 ↑↓ 和 j/k 分模式**,其余键两种模式下逐字相同(和 `logPaneAction` 的取舍一致):
+ * Tab / 回车 / ←→ / PgUp / PgDn / `^u^d` 说的都是「版面」或「视口」的事,和「此刻 ↑↓ 归谁」
+ * 无关;空格(展开/收起)和 `n`(下一段)本来就作用在选中的那一段上。
+ *
+ * 默认 `'select'`:那是这个函数原来唯一的行为,而**新加的参数不该改变任何既有调用点的语义**。
+ */
 export function sectionPaneAction(
   input: string,
   key: {
     tab?: boolean; upArrow?: boolean; downArrow?: boolean; leftArrow?: boolean; rightArrow?: boolean
     pageUp?: boolean; pageDown?: boolean; shift?: boolean; ctrl?: boolean; meta?: boolean
+    // `key.return` 一直在被读(下面第三行),而这个内联类型从来没声明过它 —— 仓库里
+    // 没有 typecheck 脚本(package.json 只有 `bun test`),所以没有任何东西会红。
+    return?: boolean
   },
+  mode: LogPaneMode = 'select',
 ): SectionPaneAction | null {
   if (key.tab) return { t: 'switchZone', d: key.shift === true ? -1 : 1 }
   // `logPaneAction` 第一行就把回车挡掉了,所以两个 handler 不会为它打架。
@@ -994,16 +1024,77 @@ export function sectionPaneAction(
   if (key.ctrl && input === 'u') return { t: 'scroll', d: -1 }
   if (key.ctrl && input === 'd') return { t: 'scroll', d: 1 }
   if (key.ctrl || key.meta) return null
-  if (key.upArrow) return { t: 'move', d: -1 }
-  if (key.downArrow) return { t: 'move', d: 1 }
+  if (key.upArrow) return mode === 'read' ? { t: 'line', d: -1 } : { t: 'move', d: -1 }
+  if (key.downArrow) return mode === 'read' ? { t: 'line', d: 1 } : { t: 'move', d: 1 }
   if (input === ' ') return { t: 'toggle' }
+  if (input === 'n' || input === 'N') return { t: 'nextSection' }
   if (input.length === 0) return null
   const c = input[0]!
   // 和 logPaneAction 同一条规矩:只认同一字符的连续重复,否则那是合批带进来的别的输入。
   if (input !== c.repeat(input.length)) return null
-  if (c === 'j') return { t: 'move', d: input.length }
-  if (c === 'k') return { t: 'move', d: -input.length }
+  if (c === 'j') return mode === 'read' ? { t: 'line', d: input.length } : { t: 'move', d: input.length }
+  if (c === 'k') return mode === 'read' ? { t: 'line', d: -input.length } : { t: 'move', d: -input.length }
   return null
+}
+
+/**
+ * 段落区此刻在**选段落**还是在**读内容** —— 和输出页卡逐字同构(见 `logPaneMode`)。
+ *
+ * 用户原话:「任务页卡上,和子 agent 上一样,选择项就是上下键看内容,空格缩起来后,
+ * 上下键移动选择项目。」所以这同样**不是**一个额外的模式开关,而是**展开状态本身**。
+ *
+ * 但段落区和输出区有两处结构差异,少判一处就会造出一个死键 —— 而「页脚上写着的键按了
+ * 没反应」是这个仓库反复付学费的那一条:
+ *
+ *  1. **`canScroll`**:整份段落列表可能一共只有两三行(刚起跑的节点、`--resume` 回来
+ *     字段稀疏的节点)。展开之后 `secTotal` 仍然 ≤ `paneRows` 时,`maxFrom` 是 0 ——
+ *     ↑↓ 判成「滚动」就是按下去屏幕一个字不动,而页脚正好写着「↑↓ 滚内容」。
+ *     输出页卡不需要这个判据(一条流动辄几百行),段落区需要。
+ *
+ *     **它量的是整份列表,不是选中那一段。** 所以它挡不住这一种:一个段落很多的节点上
+ *     展开一段只有一行的「阻断原因」——`total > paneRows` 成立,模式变成 read,而那一段
+ *     自己没有任何可滚的内容(视口滚的是整份列表)。那是**视口边界**的正常行为,不是死键
+ *     (往回滚仍然有效),所以这里不为它加第二道判据;写清楚是为了别让下一个人以为
+ *     这道闸门保证了「选中那一段一定滚得动」。
+ *  2. **按标题定位,不按下标**:`expanded` 是按标题索引的,而段落列表是**过滤后**动态
+ *     生成的(`detailSections` 末尾 filter 掉空 body),节点跑起来会在中间**插入**
+ *     「完整方案 / 重点 / 风险点 / 执行状态」。同一个下标一秒之前指着「模型用量」、
+ *     一秒之后指着「重点」—— 于是模式会在用户手底下自己翻面。所以调用方必须先把光标
+ *     对齐到标题(`alignSectionCursor`),这里收的是**对齐后**的下标。
+ */
+export function sectionPaneMode(
+  expanded: ReadonlySet<string>,
+  sections: readonly { title: string }[],
+  cursor: number,
+  canScroll: boolean,
+): LogPaneMode {
+  if (!canScroll) return 'select'
+  const title = sections[cursor]?.title
+  // 越界 / 空列表 → 没有「选中的那一段」可读,把键交给列表导航。
+  if (title === undefined) return 'select'
+  return expanded.has(title) ? 'read' : 'select'
+}
+
+/**
+ * 光标此刻落在第几段 —— **按标题找**,下标只是回落。
+ *
+ * 段落列表会在中间插入和删除(见 `sectionPaneMode` 第 2 条),而光标、展开状态、锚三者
+ * 必须指着**同一段**。用标题当身份、下标当回落,插入/删除时光标跟着那一段走。
+ *
+ * 回落夹取到合法范围:列表变短时一个界外下标会让 `sectionLines` 一个 ❯ 都画不出来、
+ * `headerAt` 返回 -1、视口当场跳回顶部,而 `onState` 仍然交出那个界外的数。
+ */
+export function alignSectionCursor(
+  sections: readonly { title: string }[],
+  selectedTitle: string | undefined,
+  fallback: number,
+): number {
+  if (sections.length === 0) return 0
+  if (selectedTitle !== undefined) {
+    const i = sections.findIndex(s => s.title === selectedTitle)
+    if (i >= 0) return i
+  }
+  return Math.max(0, Math.min(sections.length - 1, fallback))
 }
 
 /**

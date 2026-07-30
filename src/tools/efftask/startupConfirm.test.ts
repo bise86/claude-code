@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, skipConflictLines, skipConsequenceLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -303,6 +303,108 @@ describe('handoffLines 告诉用户工作在哪,以及怎么处置', () => {
     const text = handoffLines({ branch: 'b', commits: 3, kept: [], salvage: [] }).join('\n')
     expect(text).toContain('git branch -D b')
     expect(text).toContain('worktree')
+  })
+
+  it('已经自动合并回当前分支之后,那两句话必须改口', () => {
+    /**
+     * 跑完会自动把集成分支合回当前分支(见 finishHandoff)。这一屏原来的两句话在那之后
+     * 都是**可照做的假话**:
+     *  - 「你的工作区未被改动」—— 它刚刚被改动了,而那正是用户要的那件事;
+     *  - 「稍后收口: /et --resume … 会重新弹出四选一」—— 合并成功后 pendingHandoff 已经
+     *    从 run.md 上清掉了,那条命令进来什么都不会弹。
+     * 而「合并: git merge …」同样不该再印:再跑一次只会得到 Already up to date.,
+     * 一条什么都不做的命令摆在那里会让人以为合并还没发生。
+     */
+    const text = handoffLines(
+      { branch: 'efftask/001/integration', commits: 7, kept: [], salvage: [] }, '001', 'merged',
+    ).join('\n')
+    expect(text).toContain('已合并回你当前的分支')
+    expect(text).toContain('产出就在当前目录里')
+    expect(text).not.toContain('你的工作区未被改动')
+    expect(text).not.toContain('会重新弹出')
+    expect(text).not.toContain('合并: git merge')
+    // 分支保留这件事仍然要说 —— 它是回滚的唯一凭据,而「丢弃」的两条命令照旧给。
+    expect(text).toContain('git log efftask/001/integration')
+    expect(text).toContain('git branch -D efftask/001/integration')
+  })
+
+  it('没合并时(默认)那两句一个字都不变', () => {
+    const text = handoffLines(
+      { branch: 'efftask/001/integration', commits: 7, kept: [], salvage: [] }, '001',
+    ).join('\n')
+    expect(text).toContain('你的工作区未被改动')
+    expect(text).toContain('稍后收口: /et --resume 001')
+    expect(text).toContain('合并: git merge efftask/001/integration')
+  })
+})
+
+describe('退出报告里的收口那几行', () => {
+  /**
+   * 这行字进的是**对话记录**,比 done 视图活得久 —— 面板关掉之后用户能回看的只剩它。
+   * 变异测试实测存活:`exitReportLine` 不把 `handoffState` 往下传,全套照绿 ——
+   * 于是自动合并成功之后,记录里仍然写着「你的工作区未被改动」和
+   * 「稍后收口: /et --resume … 会重新弹出四选一」,而两句都已经不成立。
+   */
+  const h = { branch: 'efftask/009/integration', commits: 4, kept: [], salvage: [] }
+  const line = (state?: 'merged' | 'conflicted'): string =>
+    exitReportLine({ runId: '009', how: '完成', resumed: false, withPath: true, handoff: h, handoffState: state })
+
+  it('合成功 → 说产出在当前分支,不再说「工作区未被改动」', () => {
+    const t = line('merged')
+    expect(t).toContain('已合并回你当前的分支')
+    expect(t).not.toContain('你的工作区未被改动')
+    expect(t).not.toContain('会重新弹出')
+  })
+
+  it('没传结局(默认)→ 和这个功能不存在时逐字相同', () => {
+    const t = line()
+    expect(t).toContain('你的工作区未被改动')
+    expect(t).toContain('稍后收口: /et --resume 009')
+  })
+
+  it('撞冲突 → 记录里也要说清工作区里留着一次未完成的合并', () => {
+    expect(line('conflicted')).toContain('未完成的合并')
+  })
+})
+
+describe('静默超时要在关口上说出来', () => {
+  const mk = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], mainModel: 'm', ...over,
+  })
+
+  it('调过就印出来 —— 它是唯一会中止一次正在正常干活的调用的那个阀', () => {
+    // 此前这一行一个字都没提它:「一次调用最多可以多久没动静」只能在被咬之后从阻断
+    // 理由里知道,而阻断卡点名让用户去调的正是它。
+    const line = capsLine(mk({ caps: { ...DEFAULT_CAPS, nodeTimeoutMs: 1_200_000 } }))
+    expect(line).toContain('静默超时 20 分钟')
+  })
+
+  it('默认值不印 —— 这一行本来就在跟宽度打架', () => {
+    expect(capsLine(mk())).not.toContain('静默超时')
+  })
+
+  it('**调小**也要印 —— 判据是「不等于默认」,不是「大于默认」', () => {
+    /**
+     * 写成 `<= 默认` 就不印,而调小恰恰是最危险的方向:抽取最可能犯的错是刻度
+     * (「20 分钟」被写成 20 而不是 1200000),夹取**静默**把它抬成 1000ms —— 每次调用
+     * 一秒内必死,而关口一个字都不说。这一行的全部意义就是拦这件事。
+     */
+    const line = capsLine(mk({ caps: { ...DEFAULT_CAPS, nodeTimeoutMs: 60_000 } }))
+    expect(line).toContain('静默超时 1 分钟')
+  })
+
+  it('不足一分钟印秒 —— 「0 分钟」读起来是「没有超时」', () => {
+    // 1000 是两处夹取的**下限**(不是被拒的值),所以 1s–59s 是合法可达区间。
+    for (const [ms, want] of [[1000, '静默超时 1 秒'], [5000, '静默超时 5 秒'], [29_999, '静默超时 30 秒']] as const) {
+      expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, nodeTimeoutMs: ms } }))).toContain(want)
+    }
+    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, nodeTimeoutMs: 1000 } }))).not.toContain('0 分钟')
+  })
+
+  it('分钟按四舍五入,不是截断 —— 90 秒是「2 分钟」而不是「1 分钟」', () => {
+    // 截断会让 119 秒印成「1 分钟」,而用户配的是接近两分钟。
+    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, nodeTimeoutMs: 90_000 } }))).toContain('静默超时 2 分钟')
   })
 })
 
@@ -820,10 +922,10 @@ describe('成本预估必须对得上真实调用数', () => {
     // 承诺 15 次。低估比高估糟 —— 用户按一个偏小的数批准。
     // 精确值,不用比值:比值断言会被**另一个**阶段的平方项满足 —— 实测把方案阶段的
     // 平方拆掉,验收阶段的平方仍让比值达标,测试照旧全绿。
-    // 默认 It=3,方案/评审/验收各 1 席,观察 0 席:
-    //   方案阶段 = 3 × (1 + 3×1) = 12;执行阶段 = 3 × (1 + 3×1 + 0) = 12;合计 24。
-    // 任一处平方被拆成一次方都会掉到 18。
-    expect(n(costLine(mk()))).toBe(24)
+    // 默认 It=3,方案/评审/验收各 1 席,观察 0 席,单点调用的限流重试 T=3:
+    //   方案阶段 = 3 × (1×T + 3×1) = 18;执行阶段 = 3 × (1 + 3×1 + 0) = 12;合计 30。
+    // 任一处平方被拆成一次方都会掉下来;T 漏掉会掉到 24。
+    expect(n(costLine(mk()))).toBe(30)
     const it2 = n(costLine(mk({ caps: { ...DEFAULT_CAPS, maxIterations: 2 } })))
     const it4 = n(costLine(mk({ caps: { ...DEFAULT_CAPS, maxIterations: 4 } })))
     expect(it4 / it2).toBeGreaterThan(2.5)
@@ -879,30 +981,34 @@ describe('新环节的成本必须计入,而默认配置的数字不能动', () 
   })
   const n = (s: string) => Number(s.match(/每节点最多 (\d+) 次/)![1])
 
-  it('默认配置仍然是 24 —— 两个新环节都是 opt-in', () => {
+  it('默认配置是 30 —— 两个新环节都是 opt-in,而单点调用带限流重试', () => {
     // 照抄 accept 的 Math.max(1, seats) 写法会让这个数凭空涨一截,而实际一次调用都不会
     // 发生。关口高估同样是撒谎,只是方向相反:用户会去调一个根本不需要调的旋钮。
-    expect(n(costLine(mk()))).toBe(24)
+    //
+    // 24 → 30 是 `runPhase` 的限流重试(T=3,只作用在分析席位和融合席上)。它是**上限
+    // 口径**:不限流时一次都不会多跑。低估比高估糟 —— 用户按一个偏小的数批准,而这个
+    // 数字在关口上就是他批的那个。
+    expect(n(costLine(mk()))).toBe(30)
   })
 
   it('配了测试验证 → 数字涨,而且带 infra 重试层(平方项)', () => {
     const one = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }] } })))
     const two = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }, { roleName: 'w' }] } })))
-    expect(one).toBeGreaterThan(24)
+    expect(one).toBeGreaterThan(30)
     // It=3:一席 +9,两席 +18。一次方的话是 +3/+6。
-    expect(one - 24).toBe(9)
+    expect(one - 30).toBe(9)
     expect(two - one).toBe(9)
   })
 
   it('配了集成验收 → 数字涨', () => {
     const withInt = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), integrate: [{ roleName: 'i' }] } })))
-    expect(withInt - 24).toBe(9)
+    expect(withInt - 30).toBe(9)
   })
 
   it('两个都配 → 两份都算上', () => {
     const both = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(),
       verify: [{ roleName: 'v' }], integrate: [{ roleName: 'i' }] } })))
-    expect(both).toBe(24 + 9 + 9)
+    expect(both).toBe(30 + 9 + 9)
   })
 })
 
@@ -1031,9 +1137,9 @@ describe('关口:跳过要说出后果,组合要拦住', () => {
 
   it('成本:被跳过的环节归零', () => {
     const n = (c: EffTaskConfig) => Number(costLine(c).match(/每节点最多 (\d+) 次/)![1])
-    expect(n(mk())).toBe(24)
-    expect(n(mk({ skipSteps: ['review'] as never }))).toBeLessThan(24)
-    expect(n(mk({ skipSteps: ['execute'] as never }))).toBeLessThan(24)
+    expect(n(mk())).toBe(30)
+    expect(n(mk({ skipSteps: ['review'] as never }))).toBeLessThan(30)
+    expect(n(mk({ skipSteps: ['execute'] as never }))).toBeLessThan(30)
     // 七个全跳 = 一次调用都没有。
     const all = ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer']
     expect(n(mk({ skipSteps: all as never }))).toBe(0)
@@ -1044,9 +1150,10 @@ describe('关口:跳过要说出后果,组合要拦住', () => {
     const three = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
     const refine = n(mk({ phaseRoles: three }))
     const table = n(mk({ phaseRoles: three, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' } }))
-    expect(table - refine).toBe(DEFAULT_CAPS.maxIterations)
+    // 融合那一席也是单点调用,所以它也带限流重试的 T 倍(It × T = 3 × 3)。
+    expect(table - refine).toBe(DEFAULT_CAPS.maxIterations * COST_RATE_LIMIT_ATTEMPTS)
     // 单席位两种模式相同 —— 没有第二份稿可融合。
-    expect(n(mk({ caps: { ...DEFAULT_CAPS, planConverge: '圆桌' } }))).toBe(24)
+    expect(n(mk({ caps: { ...DEFAULT_CAPS, planConverge: '圆桌' } }))).toBe(30)
   })
 })
 

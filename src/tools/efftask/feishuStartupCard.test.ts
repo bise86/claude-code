@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import { buildStartupCard, buildHandoffCard } from './feishuStartupCard.js'
-import { costLine } from './startupConfirm.js'
+import { capsLine, costLine } from './startupConfirm.js'
 
 describe('启动卡不能邀请一件它自己会丢掉的事', () => {
   it('不再说"如需调整请在终端修改" —— 在此批准正是丢弃终端修改的那条路径', () => {
@@ -35,6 +35,20 @@ describe('两个界面必须说同一件事', () => {
     // 竞速器的前提是两端显示同一份配置 —— 谁先点谁算数。终端说了代价而卡片没说,
     // 从飞书批准的人批准的就是一份他没看全的配置。
     expect(text(cfg())).toContain(costLine(cfg() as never))
+    /**
+     * capsLine **整行**也要钉,而不是逐条钉它里面的字段。
+     *
+     * 验收造的变异:卡片侧把 capsLine 的输出正则剥掉「· 静默超时 …」那一段 —— 433 tests
+     * 全绿。逐条钉的写法对**下一个**新增字段同样无效,而这一行的字段还会长。
+     */
+    expect(text(cfg())).toContain(capsLine(cfg() as never))
+    /**
+     * capsLine **整行**也要钉,而不是逐条钉它里面的字段。
+     *
+     * 验收造的变异:卡片侧把 capsLine 的输出正则剥掉「· 静默超时 …」那一段 —— 433 tests
+     * 全绿。逐条钉的写法对**下一个**新增字段同样无效,而这一行的字段还会长。
+     */
+    expect(text(cfg())).toContain(capsLine(cfg() as never))
     expect(text(cfg())).toContain('次模型调用')
   })
 

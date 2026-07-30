@@ -1,7 +1,7 @@
 // src/tools/efftask/roundtable.ts
 import type { PhaseName, RoleBinding, RoundtableRecord, TaskNode, Verdict } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
-import { PhaseTimeoutError } from './runAgentAdapter.js'
+import { PhaseTimeoutError, ProviderApiError } from './runAgentAdapter.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { capText, MAX_SUMMARY_CHARS, parseVerdict } from './parseOutput.js'
 
@@ -132,6 +132,21 @@ export async function runRoundtable(args: {
    * measured a peak of 6 concurrent runAgent calls, and the default 5 with 3 roles is 15.
    */
   slots?: SlotPool
+  /**
+   * 只派**这几个**席位(roster 下标)。省略 = 全席位,与这个参数不存在时逐字相同。
+   *
+   * 为什么需要它:infra 重试原来重开的是**整桌**,包括已经出过裁决的席位。3 席里 1 席
+   * 打不通时,第二桌付 3 次调用而只有 1 次是必要的;`maxIterations=3` + 席位上限 5 下,
+   * 一个圆桌最坏 15 次调用换 ≤5 次有效裁决 —— 而这一切发生在上游正在限流的时候。
+   *
+   * 收**下标**而不是「一份子集 roster」:第 143 行是
+   * `args.roles.length > 0 ? args.roles : [null]`,传一个**空**子集会静默变成
+   * 「主模型单席评审」,而它的裁决会被合并回下标 0。下标形式让这道门根本不存在。
+   *
+   * 返回的 `verdicts` 只含这几席,顺序与 `only` 一致 —— 合并由调用方按同一份下标做
+   * (见 pipeline 的 roundtableWithInfraRetry)。
+   */
+  only?: number[]
 }): Promise<RoundtableRecord> {
   // Already aborted → don't burn a real model call; synthesize a failing record instead.
   if (args.signal.aborted) {
@@ -141,11 +156,25 @@ export async function runRoundtable(args: {
   }
   // Empty roster => a single main-model reviewer (role=null). Independent & parallel.
   const roster: (RoleBinding | null)[] = args.roles.length > 0 ? args.roles : [null]
+  /**
+   * 这一桌真的要派哪几席。
+   *
+   * `only` 里越界或重复的下标一律丢掉:它是调用方按上一桌的 verdicts 算出来的,而
+   * 席位数在两桌之间理论上可变(重做会重排名册)。全被丢掉时退回全席位 —— 派 0 席会让
+   * `verdicts` 为空,而 `synthesizeVerdicts` 对空数组判不通过,于是一个「其实没人反对」
+   * 的圆桌会以「未能取得任何裁决」阻断。
+   */
+  const picked = (() => {
+    if (!args.only) return roster.map((_, i) => i)
+    const seen = new Set<number>()
+    const out = args.only.filter(i => Number.isInteger(i) && i >= 0 && i < roster.length && !seen.has(i) && seen.add(i))
+    return out.length > 0 ? out : roster.map((_, i) => i)
+  })()
   // Promise.allSettled so a single reviewer's runAgent REJECTION does not throw out
   // of the whole roundtable. Fulfilled path is identical (parseVerdict); a rejected
   // reviewer is synthesized into a failing verdict instead.
   const settled = await mapWithinPool(
-    roster,
+    picked.map(i => roster[i]!),
     role =>
       // cwd goes to EVERY reviewer: the work under review lives in the node's worktree, and a
       // reviewer reading the main tree can only rubber-stamp the executor's own prose.
@@ -165,8 +194,9 @@ export async function runRoundtable(args: {
       }),
     args.slots,
   )
-  const verdicts: Verdict[] = settled.map((res, i) => {
-    const role = roster[i]
+  const verdicts: Verdict[] = settled.map((res, k) => {
+    // `picked[k]`,不是 `k` —— 部分重派时署名/roleTag 必须跟着**原来那一席**走。
+    const role = roster[picked[k]!]
     // 署名的取值顺序:员工名 → 角色名 → 'main'。
     //
     // `role ? role.roleName : 'main'` 曾经在「主模型兼任」的席位上产出**空串** —— 那个
@@ -185,9 +215,23 @@ export async function runRoundtable(args: {
     // A DEADLINE is still infra (nobody judged anything), but it is a different fact from
     // an unreachable provider and needs different advice on the escalation card.
     const timedOut = res.reason instanceof PhaseTimeoutError
+    /**
+     * **限流也要跟着走**,和 `timeoutKind` 逐字同因。
+     *
+     * 丢掉它的后果实测过:圆桌耗尽时 `exhaustionRemedyFor` 拿不到任何能分辨限流的信息,
+     * 于是 3 席评审里有一席持续 429 的节点被阻断时,建议是「先确认角色模型/网络可用
+     * (角色配置在 .claude/settings.json 的 roles 里)」—— 而上游是**通的**,照那句去查
+     * 什么都查不出来。而多角色圆桌正是用户报 429 的那个场景。
+     */
+    const rateLimited = res.reason instanceof ProviderApiError && res.reason.kind === 'rate_limit'
     // kind 必须跟着走。丢掉它 = 圆桌里所有超时都被当成静默超时,而「没人来点确认」
     // 这一种拿到的建议是「提高 nodeTimeoutMs 或把节点拆小」—— 和病因完全无关。
-    return { role: roleName || 'main', ...tag, pass: false, blocking: ['角色调用失败: ' + reason], comments: '', infra: true, ...(timedOut ? { timeout: true, timeoutKind: res.reason.kind } : {}) }
+    return {
+      role: roleName || 'main', ...tag, pass: false,
+      blocking: ['角色调用失败: ' + reason], comments: '', infra: true,
+      ...(timedOut ? { timeout: true, timeoutKind: res.reason.kind } : {}),
+      ...(rateLimited ? { rateLimited: true } : {}),
+    }
   })
   // 阻断项**照样全部汇总**,即使已经达到法定人数 —— 少数派的意见不因为没挡住就消失。
   return { round: args.round, verdicts, synthesized: synthesizeVerdicts(verdicts, args.quorum, args.quorumSeats) }

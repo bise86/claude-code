@@ -740,15 +740,147 @@ function reopenAncestor(n: TaskNode, now: string): boolean {
   return true
 }
 
-/** 兄弟/下游那一侧:只解开**被牵连**的阻断,不碰人家自己的判决,也不碰已验收的。 */
-function reopenIfPropagated(n: TaskNode, now: string): void {
-  if (n.status !== 'BLOCKED' || !PROPAGATED.has(n.blockedReason)) return
-  n.status = n.childIds.length > 0 ? 'WAITING_CHILDREN' : n.kind === 'executable' ? 'READY' : 'CREATED'
+/**
+ * 一个被牵连的节点该回到哪个状态。
+ *
+ * **`READY` 有一道额外的闸门:方案得真的被放行过。** `stepStart` 在评审圆桌**之前**就把
+ * `node.kind` 写成 `'executable'`(评审是为了打回它),所以一个「方案三次被否」或者
+ * 「跳过质疑讨论后坐回 CREATED」的节点身上,kind 已经是 executable 了。把它放到 READY,
+ * `advanceableKind` 直接判 `'execute'` —— 带写工具的执行者去跑一份**没有任何评审员看过**
+ * 的方案,`reviewLog` 为 0。这条是 `reseat.ts` 实测记下来的失败(它在那边有自己的写法),
+ * 而不动点把作用面从「直接依赖重做目标的节点」扩到了**全树每一个被牵连的 BLOCKED 节点**,
+ * 所以这里必须一起判。
+ *
+ * 判据是**结构性**的,而且要**三条一起看** —— 只看 `reviewLog` 会把一类正常节点也打回去:
+ *  - `reviewLog` 有一轮真的通过过(`pipeline` 里那是唯一写入点);
+ *  - 或者它已经**执行过**(`execStatus` 非空)—— 那说明它当时就是从这道门里出来的。
+ *    质疑讨论可以被整个 run 跳过(`skipSteps`)或被 `s` 跳过一次,那种节点的 `reviewLog`
+ *    是空的,而它确确实实干过一轮活;
+ *  - 或者验收开过会(`acceptLog` 非空),同理。
+ *
+ * 三条都不成立就回 `CREATED` 重新分析 —— 多花一次分析调用,换掉「一份没人看过的方案
+ * 被带写工具的执行者跑掉」。
+ */
+function seatForPropagated(n: TaskNode): NodeStatus {
+  if (n.childIds.length > 0) return 'WAITING_CHILDREN'
+  const pastPlanGate = n.reviewLog.some(r => r.synthesized?.pass === true)
+    || n.execStatus.trim() !== ''
+    || n.acceptLog.length > 0
+  return n.kind === 'executable' && pastPlanGate ? 'READY' : 'CREATED'
+}
+
+/**
+ * 把一个**被牵连**的节点放回可推进状态。不碰人家自己的判决,也不碰已验收的。
+ *
+ * 清哪几个字段和 `reopenAncestor` 逐字对齐,因为漏掉任何一个都实测过后果:
+ *  - `failedAt`:过期的失败点会让 `R`/`s` 在一个「其实是别人挂了」的节点上放行,
+ *    而落下的一次性标记很久以后才生效;
+ *  - `interrupted`:`propagateBlocked` 的非中止那条路**不清**它,所以一个上一轮被 Esc
+ *    扫过、这一轮被牵连的节点会带着它回来;
+ *  - `capBlocked`/`capCategory`:带着它们的节点会让阻断卡给出一条不对症的补救建议;
+ *  - `startedAt`:它只在首个活动阶段盖一次、之后永不重盖,而面板对非终态节点用**现在**
+ *    收尾。一个两天前被牵连阻断的节点重开之后,树上那一行会当场显示 `172800s` 并每秒往上跳
+ *    (这条 bug 仓库已经付过两次学费)。
+ *
+ * **不动 `iteration` 预算**,和 `reopenAncestor` 不同 —— 那一处退的是「目标自己那条链」,
+ * 用户按下重做就意味着要重判它们;而这里是全树被牵连的节点,预算真的花完的那个会带着
+ * 自己的 `cap-iteration` 理由再阻断一次,那是诚实的,而且 `--retry-blocked` 认它。
+ * `mergeConflict` 同理不动:那是一条还等着人去解的冲突,清掉它等于谎报冲突没了。
+ */
+function reopenPropagatedNode(n: TaskNode, now: string): void {
+  /**
+   * 一次性的手工标记**不许跨过一次阻断活下来**。
+   *
+   * 这条规矩不是新的:`blockWithReason` 对**节点自己的**每一次失败都清 `skipPhase`,
+   * 理由记在那里(评审实跑出来的 P0:按 s 跳过验收 → 打回 → 中断 → 恢复后
+   * `enterAtJudge` 再一次为真 → 执行环节一次都不跑,半成品被判「已验收」)。
+   * 而被牵连的阻断走的是 `propagateBlocked`,**不经过** blockWithReason —— 于是这三个
+   * 标记会原样活到下一次重开:一个带着 `redoFrom='review'` 被恢复到 CREATED 的节点会
+   * 跳过分析,而屏幕上什么都没说。
+   */
+  n.skipPhase = undefined
+  n.forcePass = undefined
+  n.redoFrom = undefined
+  n.status = seatForPropagated(n)
   n.blockedReason = ''
-  // 失败点跟着清 —— 理由见 reopenAncestor 里那一段(过期的失败点会让 R/s 在一个
-  // 「其实是别人挂了」的节点上放行,而落下的一次性标记很久以后才生效)。
   n.failedAt = undefined
+  n.interrupted = false
+  n.capBlocked = false
+  n.capCategory = undefined
+  n.startedAt = undefined
   n.updatedAt = now
+}
+
+/**
+ * 把**所有**被牵连的阻断一次解开 —— 多级依赖、被牵连节点的子树、以及在等它们的那些。
+ *
+ * 用户报的现象:「某个任务失败掉,其依赖任务变成失败,包括多级依赖。但是将这个任务恢复
+ * 重做,其多级依赖任务还是失败状态。」
+ *
+ * ## 为什么必须换算法,而不是把那个一级循环改成 while
+ *
+ * 阻断是**不动点**扫出来的(`orchestrator.propagateBlocked`:父阻断 / 子阻断 / 依赖阻断
+ * 三个方向反复扫到稳定),而恢复原来只有一句「谁的 deps 里有 target 就解开谁」——
+ * 于是 A←B←C 里的 C、以及 B 的子树和 B 的父节点全部留在 BLOCKED,而调度器拒绝挑选任何
+ * 祖先被阻断的节点。重做完之后一次模型调用都不会发生。
+ *
+ * 而**「把现有阻断集合往回侵蚀」是错的**,这条评审用脚本跑过:`parentBlocked` 和
+ * `childBlocked` 是互为逆命题的一对,只要链上出现任何一组父子,两者互相支撑 —— 第一轮
+ * 就没有任何节点满足释放条件,`reopened` 是空的。一棵「依赖任务被拆过子任务」的树
+ * (这个功能的常态)因此完全恢复不了。
+ *
+ * ## 正确的判据:从**真失败**的种子重算一遍死亡集合
+ *
+ *  1. 种子 = 还 BLOCKED 且理由**不是**被牵连的那三种(它自己的判决 / 结构性 / 已中断),
+ *     以及依赖或子节点已经不在盘上的(那种永远推不动);
+ *  2. 沿三条边扩散,**但只标记此刻仍然 BLOCKED 的节点**:父→子、依赖→依赖方、子→父。
+ *     「只标 BLOCKED」这一条是关键 —— 重做目标和它的祖先链在这之前已经被
+ *     `reseatForRerun`/`reopenAncestor` 放开了,扩散到那里就停住,不会顺着 root 淹掉全树;
+ *  3. 剩下的「BLOCKED + 被牵连 + 不在死亡集合里」全部放开。
+ *
+ * 于是:上游还真的挂着的那些**继续挡住**下游(评审最容易写错的另一半),而一个孩子真死了
+ * 的父节点、以及它下面被牵连的兄弟仍然留红 —— 它们此刻确实推不动,把它们放开只会白烧调用。
+ *
+ * @returns 被放开的节点 id(按 byId 的顺序)
+ */
+export function reopenPropagatedBlocks(byId: ReadonlyMap<string, TaskNode>, now: string): string[] {
+  const blocked = [...byId.values()].filter(n => n.status === 'BLOCKED')
+  /** 盘上引用不全的节点永远推不动 —— 当种子,不当候选。 */
+  const dangling = (n: TaskNode): boolean =>
+    n.deps.some(id => !byId.has(id)) || n.childIds.some(id => !byId.has(id))
+  const dead = new Set<string>()
+  const stack: TaskNode[] = []
+  const kill = (m: TaskNode | undefined): void => {
+    // **只吃 BLOCKED**。见上面第 2 条:这一句就是「不淹掉全树」的全部理由。
+    if (!m || m.status !== 'BLOCKED' || dead.has(m.id)) return
+    dead.add(m.id)
+    stack.push(m)
+  }
+  /** 谁在依赖它。只在 BLOCKED 里建索引 —— 别的节点不参与扩散。 */
+  const dependents = new Map<string, TaskNode[]>()
+  for (const n of blocked) {
+    for (const d of n.deps) {
+      const arr = dependents.get(d)
+      if (arr) arr.push(n)
+      else dependents.set(d, [n])
+    }
+  }
+  for (const n of blocked) {
+    if (!PROPAGATED.has(n.blockedReason) || dangling(n)) kill(n)
+  }
+  while (stack.length > 0) {
+    const cur = stack.pop()!
+    for (const id of cur.childIds) kill(byId.get(id))
+    for (const m of dependents.get(cur.id) ?? []) kill(m)
+    if (cur.parentId !== null) kill(byId.get(cur.parentId))
+  }
+  const reopened: string[] = []
+  for (const n of blocked) {
+    if (dead.has(n.id) || !PROPAGATED.has(n.blockedReason)) continue
+    reopenPropagatedNode(n, now)
+    reopened.push(n.id)
+  }
+  return reopened
 }
 
 /**
@@ -813,8 +945,16 @@ function reseatForRerun(
       `它们原来那句「子任务合起来达成了父目标」判的是旧产出`,
     )
   }
-  for (const n of byId.values()) {
-    if (n.id !== target.id && n.deps.includes(target.id)) reopenIfPropagated(n, opts.now)
+  /**
+   * **排在祖先之后**。不动点只扩散「此刻仍然 BLOCKED」的节点,而 target 和它的祖先链
+   * 刚刚在上面被放开 —— 顺序反过来的话,第一轮扫描时 target 还是 BLOCKED,依赖它的
+   * 那一批会被「上游还挂着」挡住,而这正是用户报的那个现象。
+   */
+  const cascaded = reopenPropagatedBlocks(byId, opts.now)
+  if (cascaded.length > 0) {
+    // 说出来:多级恢复是用户看不见的连带效果。一句话,而且**不带 id 清单** ——
+    // 这一屏本来就在跟高度打架(见 redoSummary 的注释),一行 12 个 id 会把别的警告挤掉。
+    opts.warnings.push(`连带恢复了 ${cascaded.length} 个被牵连阻断的任务(依赖链上的下游及其子树)`)
   }
   return reopened
 }

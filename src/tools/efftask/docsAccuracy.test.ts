@@ -1,15 +1,24 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
+import { parallelismLine, rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
 import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_PARALLELISM, MANUAL_PASS_ROLE, MAX_ROLE_GUIDANCE, MIN_PARALLELISM, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
 import { forcePassFailedPhaseReason, planForcePass, planSkip, redoOptions, redoUnavailableReason, skipFailedPhaseReason } from './redo'
+import { planFinish } from './finishHandoff'
+import { createRateLimitGate } from './rateLimitGate'
+import { TOTAL_LIMIT_FACTOR } from './runAgentAdapter'
+import type { PendingHandoff } from './types'
+
+/** 一条跑完了、有提交的待收口记录。 */
+const handoffFixture = (over: Partial<PendingHandoff> = {}): PendingHandoff => ({
+  branch: 'efftask/001/integration', commits: 3, kept: [], salvage: [], outcome: 'completed', ...over,
+})
 import { ROLE_API_PROTOCOLS, TRANSLATING_PROTOCOLS } from '../../services/api/openaiCompat/protocols'
 import { toResponsesRequest } from '../../services/api/openaiCompat/toResponsesRequest'
 import { toOpenAIRequest } from '../../services/api/openaiCompat/toOpenAIRequest'
 import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from '../AgentTool/roles/roleThinking'
 import { modelSupportsEffort } from '../../utils/effort'
 import { REASONING_FIELDS } from '../../services/api/openaiCompat/fromOpenAIStream'
-import { logPaneAction, logPaneMode, runControlAction, sectionPaneAction, detailEntryHint, collapsedLinesFor } from '../../commands/efftask/logView'
+import { logPaneAction, logPaneMode, runControlAction, sectionPaneAction, sectionPaneMode, detailEntryHint, collapsedLinesFor } from '../../commands/efftask/logView'
 import { detailSections, usageBody } from '../../commands/efftask/NodeDetail'
 import { createRunControl } from './control'
 import { serializeNode } from './persistence'
@@ -233,9 +242,34 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(logPaneAction('', key({ tab: true }))).toBeNull()
   })
 
-  it('说 n 换流,那 n 就得真的换流 —— 而且页脚以前从没提过它', () => {
-    expect(README).toContain(norm('| `n` | 输出页卡换一条流 |'))
+  it('说 n 换一项且两种模式下都认,那两个页卡都得真的认它', () => {
+    expect(README).toContain(norm('| `n` | 下一项：任务页卡换一段，输出页卡换一条流。**两种模式下都认**'))
     expect(logPaneAction('n', key())?.t).toBe('nextStream')
+    expect(logPaneAction('n', key(), 'select')?.t).toBe('nextStream')
+    // 段落区的 n 此前是死键。read 模式下它是唯一不用先收起就能换段落的键。
+    expect(sectionPaneAction('n', key())?.t).toBe('nextSection')
+    expect(sectionPaneAction('n', key(), 'read')?.t).toBe('nextSection')
+  })
+
+  it('说两个页卡的 ↑↓ 是同一条规矩,那段落区就得真的分模式', () => {
+    /**
+     * 这张表原来写的是「任务页卡:选段落」—— 而用户的要求正是把它改成和输出页卡一样。
+     * 少了这一条断言,把 `sectionPaneAction` 的 mode 分支删掉之后全套测试照样绿,而
+     * README 会继续描述一个不存在的行为(这个文件顶部记的就是这类谎)。
+     */
+    expect(README).toContain(norm('**两个页卡同一条规矩**：折叠着的那一项选段落 / 选阶段，展开着的滚它的内容'))
+    expect(sectionPaneAction('', key({ downArrow: true }), 'select')?.t).toBe('move')
+    expect(sectionPaneAction('', key({ downArrow: true }), 'read')?.t).toBe('line')
+    expect(sectionPaneAction('j', key(), 'read')?.t).toBe('line')
+    // 派生自展开状态,不是另一个开关 —— 和输出页卡同一个判据。
+    expect(sectionPaneMode(new Set(['目标']), [{ title: '目标' }], 0, true)).toBe('read')
+    expect(sectionPaneMode(new Set(), [{ title: '目标' }], 0, true)).toBe('select')
+  })
+
+  it('说空格展开之后 ↑↓ 归内容,那滚不动的那一段就不能进 read', () => {
+    expect(README).toContain(norm('展开之后 `↑↓` 就归内容'))
+    // 一段只有一行时 maxFrom 是 0:判成滚动 = 按下去屏幕一个字不动。
+    expect(sectionPaneMode(new Set(['目标']), [{ title: '目标' }], 0, false)).toBe('select')
   })
 
   it('说 ^u/^d 翻页,那它们就得归段落区,而不是被日志窗吃掉', () => {
@@ -282,7 +316,7 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
      * 区切换;页签条写着回车进入而代码里没有分支接住)。README 现在写着「折叠着的那条流
      * 选阶段,展开着的滚内容」,那两种模式就必须真的存在。
      */
-    expect(README).toContain(norm('输出页卡：**折叠着的那条流选阶段，展开着的滚内容**'))
+    expect(README).toContain(norm('折叠着的那一项选段落 / 选阶段，展开着的滚它的内容'))
     expect(logPaneAction('', key({ downArrow: true }), 'select')?.t).toBe('selectStream')
     expect(logPaneAction('', key({ downArrow: true }), 'read')?.t).toBe('line')
     expect(logPaneAction('j', key(), 'select')?.t).toBe('selectStream')
@@ -359,6 +393,132 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(src).toContain('if (!enterAtJudge) {')
     // 只作用于第一轮:返工轮必须真的从执行者开始。
     expect(src).toContain('enterAtJudge = false')
+  })
+
+  it('说「流式增量算有输出」,那 /et 就得真的把 delta 接进静默时钟', () => {
+    /**
+     * 用户报的原话:「用 API 调用一个模型老是报错,是不是超时时间太短了。这个模型用做
+     * 主模型是正常的。」根因不是那个数太小,是这条时钟量错了东西 —— `runAgent` 只 yield
+     * 完整消息,思考期间的 `stream_event` 增量它自己丢掉,而它的 `onQueryProgress` 钩子
+     * (存在理由就是这个)此前全仓库零消费者。
+     *
+     * 钉三样:README 说了这件事、适配层真的传了那个钩子、以及它接的是重置时钟的那个函数。
+     * 只钉前两样的话,把 `markProgress` 换成一个空函数照样绿。
+     */
+    expect(README).toContain(norm('**流式增量算「有输出」。**'))
+    const src = readFileSync(new URL('src/tools/efftask/runAgentAdapter.ts', ROOT), 'utf8')
+    expect(src).toContain('onQueryProgress: markProgress,')
+    expect(src).toContain('const markProgress = (): void => { lastProgressAt = Date.now() }')
+    /**
+     * 而 runAgent 那一侧必须真的转发 delta —— 这一跳属于别的模块,剪断它这里就该红。
+     *
+     * 钉的是**位置**,不只是「这行字还在」:验收造出的变异是
+     * `if (message.type !== 'stream_event') onQueryProgress?.()` —— 修复被精确地剪断,
+     * 而 `toContain('onQueryProgress?.()')` 被它逐字满足(实测 447 tests 全绿)。
+     * 它必须是消息循环的**第一句**,排在任何按类型过滤之前。
+     *
+     * 说清这条断言证明什么、不证明什么:它证明「那一句在正确的位置上」,不证明
+     * 「delta 真的到得了它」—— 后者要驱动真 `query()`,而它要一整个 toolUseContext。
+     * /et 那一侧的行为由 runAgentAdapter.test.ts 用替身钉住(替身自己调这个钩子),
+     * 两条合起来覆盖这一跳的两端。
+     */
+    const agent = readFileSync(new URL('src/tools/AgentTool/runAgent.ts', ROOT), 'utf8')
+    expect(agent).toContain('})) {\n      onQueryProgress?.()')
+  })
+
+  it('说有两条时钟(静默 + 总时长 ×6),那两条就都得真的在', () => {
+    /**
+     * 总时长那条是「增量算进展」之后**新开的洞**的补丁:滴水式上游(每分钟一个 token)
+     * 永远不触发静默阀,而它和挂死是同一类故障。文档承诺了倍数和「设 0 一起关掉」,
+     * 两条都要能在代码里对上 —— 一个只写在 README 里的阀等于没有阀。
+     */
+    expect(README).toContain(norm('| 总时长 | 这一次调用**总共**跑了多久（× 6） | 1 小时 |'))
+    expect(README).toContain(norm('把 `caps.nodeTimeoutMs` 设成 0 会把两条一起关掉'))
+    expect(TOTAL_LIMIT_FACTOR).toBe(6)
+    const src = readFileSync(new URL('src/tools/efftask/runAgentAdapter.ts', ROOT), 'utf8')
+    // 设 0 时总上限也是 0(禁用)—— 这一句就是「一起关掉」的全部实现。
+    expect(src).toContain('const totalLimitMs = limitMs && limitMs > 0 ? limitMs * TOTAL_LIMIT_FACTOR : 0')
+    // 而两条都不含等人的那段时间。
+    expect(src).toContain('humanSpentMs += Date.now() - humanWaitFrom')
+    expect(README).toContain(norm('两条都**不含等你批工具权限的时间**'))
+  })
+
+  it('说静默超时能用一句话调,那抽取和夹取两侧就都得有它', () => {
+    // 阻断卡点名让用户去调的就是这个旋钮;只能手改 run.md 的旋钮等于没有旋钮。
+    expect(README).toContain(norm('直接说「阶段超时 20 分钟」就能调'))
+    const src = readFileSync(new URL('src/tools/efftask/parseDirectives.ts', ROOT), 'utf8')
+    expect(src).toContain('"nodeTimeoutMs"?: number')
+    expect(src).toContain('c.nodeTimeoutMs = clampInt(caps.nodeTimeoutMs, 1000, 7_200_000, DEFAULT_CAPS.nodeTimeoutMs)')
+  })
+
+  it('说员工端点的首字节等待落在 API_TIMEOUT_MS 上,那阻断建议就得点名它', () => {
+    // 「caps.nodeTimeoutMs 调多大都动不了它」—— 这句话必须同时出现在文档和阻断建议里,
+    // 否则用户会一直去调那个不管用的旋钮(而阻断卡此前只提它)。
+    expect(README).toContain(norm('只认环境变量 `API_TIMEOUT_MS`'))
+    const esc = readFileSync(new URL('src/tools/efftask/escalation.ts', ROOT), 'utf8')
+    expect(esc).toContain('API_TIMEOUT_MS')
+    // 而 SDK 的那个超时确实是从这个环境变量读的(默认 600s)。
+    const client = readFileSync(new URL('src/services/api/client.ts', ROOT), 'utf8')
+    expect(client).toContain("parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10)")
+    /**
+     * **卡片告诉用户的那个默认值,必须和代码里的那个是同一个数。**
+     *
+     * 一条建议里印错默认值,用户会照着一个不存在的基线去判断「要不要调、调多少」。
+     * 和 `COST_RATE_LIMIT_ATTEMPTS` 那条断言同一个形状 —— 两份数字必须锚在一起。
+     */
+    const clientDefaultMs = 600 * 1000
+    expect(esc).toContain(`API_TIMEOUT_MS(默认 ${clientDefaultMs})`)
+    // 那个字面量本身也要还在 client.ts 里(上面那条 toContain 已经锁住表达式形状)。
+    expect(clientDefaultMs).toBe(600_000)
+    /**
+     * 而且这条建议**只对翻译协议成立**:`apiProtocol: 'anthropic'` 的员工那条路
+     * `return inner(...)` 直接返回,不嗅探 —— 首字节等待和主模型一样落在响应体上,
+     * `API_TIMEOUT_MS` 管不到。不限定协议就是给一半的员工指了一条无效的路。
+     */
+    expect(esc).toContain('apiProtocol: openai / openai-responses')
+    const rf = readFileSync(new URL('src/services/api/openaiCompat/roleFetch.ts', ROOT), 'utf8')
+    expect(rf).toContain("if (cfg.apiProtocol === 'anthropic') {")
+    expect(rf).toContain('const sniff = await sniffSSE(res.body)')
+  })
+
+  it('说限流会「整趟 run 一起退避」,那退避的数就得对得上', () => {
+    /**
+     * 这一段写的是用户唯一能读到的口径(2s → 4s → …上限 60s、成功归零、只重派打不通的
+     * 那几席、执行环节不重试)。四条里任何一条对不上,用户就会照着一份错的模型去调
+     * 并行数和席位数 —— 而那正是他手上唯一的两个旋钮。
+     */
+    expect(README).toContain(norm('2s → 4s → 8s …上限 60s，成功一次就归零'))
+    // 逐级验:每次都把时钟推过上一个窗口,否则窗口内的重复上报**刻意**不抬级。
+    let t = 0
+    const gate = createRateLimitGate({ now: () => t, random: () => 0, sleep: async () => {} })
+    const seq: number[] = []
+    for (let i = 0; i < 6; i++) { const ms = gate.noteRateLimit(); seq.push(ms); t += ms + 1 }
+    expect(seq).toEqual([2_000, 4_000, 8_000, 16_000, 32_000, 60_000])
+    // 「成功一次就归零」。
+    gate.noteSuccess()
+    expect(gate.noteRateLimit()).toBe(2_000)
+    // 执行环节不重试这一条在 rateLimitPipeline.test.ts 里真跑;这里只钉文档口径的存在。
+    expect(README).toContain(norm('执行环节**不重试**'))
+    expect(README).toContain(norm('重试只重发那 1 席'))
+  })
+
+  it('说跑完会自动合并回当前分支,那三件事就都得是真的', () => {
+    /**
+     * README 这一段原来写的是「跑完再弹一个**收口关口**」—— 而那句话**当时就是假的**:
+     * 关口只在 `--resume` 那条路上出现,同一次会话里跑完是直接进 done 视图,于是合并
+     * 永远不会发生。用户报的正是这个(「要在当前目录下有对应的存在」)。
+     * 所以这一条钉三样:判据在、脏树/未跑完不合、以及启动关口**事先说过**这件事。
+     */
+    expect(README).toContain(norm('跑完之后**自动把集成分支合并回你当前的分支**'))
+    expect(README).toContain(norm('工作区不干净、或者这一趟没正常跑完时不会自动合'))
+    expect(planFinish(handoffFixture(), { dirty: false })).toEqual({ action: 'merge' })
+    expect(planFinish(handoffFixture(), { dirty: true }).action).toBe('skip')
+    expect(planFinish(handoffFixture({ outcome: 'blocked' }), { dirty: false }).action).toBe('skip')
+    // 关口必须先说 —— 用户批准的是他看到的东西,而这一趟结束时我们会动他的工作区。
+    expect(parallelismLine(
+      { goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: DEFAULT_CAPS, notices: [] },
+      { editable: false, isolation: 'worktree' },
+    )).toContain('跑完自动合并回当前分支')
   })
 
   it('说定向注入的两个字段会写进 run.md 并读回,那两侧就都得有它们', () => {

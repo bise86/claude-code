@@ -7,6 +7,8 @@ import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import { logError } from '../../utils/log.js'
 import type { WorktreePool } from '../../tools/efftask/worktreePool.js'
 import type { HandoffSummary } from '../../tools/efftask/startupConfirm.js'
+import type { GitFn, HandoffResult } from '../../tools/efftask/handoffActions.js'
+import { finishHandoff } from '../../tools/efftask/finishHandoff.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { finishEffTaskRun, markEffTaskPendingHandoff, registerEffTaskRun, updateEffTaskRun } from '../../tasks/EffTaskTask/EffTaskTask.js'
 import type { SetAppState } from '../../Task.js'
@@ -80,6 +82,15 @@ export async function runOrchestrator(
       /** The RUN's controller. A private one would mark the task killed and stop nothing. */
       abortController: AbortController
     }
+    /**
+     * 收口用的 git 执行器。**给了才会自动把集成分支合回当前目录**(见 finishHandoff)。
+     *
+     * 可缺省,而缺省时行为与这个功能不存在时逐字相同 —— 既有测试和任何拿不到 git 的
+     * 调用点都走那条路。
+     */
+    git?: GitFn
+    /** 收口结果:合成了没有、没合是为什么。UI 拿它写 done 视图那句话。 */
+    onHandoffResult?: (r: { merged: boolean; result?: HandoffResult }) => void
   },
   setNodes: (n: TaskNode[]) => void,
   setOutcome: (o: Outcome) => void,
@@ -182,6 +193,40 @@ export async function runOrchestrator(
       logError(e instanceof Error ? e : new Error(String(e)))
     }
   }
+  /**
+   * 把集成分支合回**当前目录**(spec §8 的收口,自动那一半)。
+   *
+   * ## 为什么排在 `reclaim` 之后、`settle`/最后一次 `queueManifest` 之前
+   *
+   * 这个位置是**唯一**一个能让三样东西同时说真话的位置:
+   *  - `reclaim` 刚把 `config.pendingHandoff` 挂上(它是「还没人处置这条分支」的唯一真相);
+   *  - 合并成功后这里把它**清掉**,于是紧随其后的 `queueManifest(nodes, result)` 写出去的
+   *    run.md 里就没有它了 —— 下一次 `--resume` 不会再为一条已经合进当前分支的分支弹
+   *    四选一(而「丢弃」会对着它跑 `branch -D`)。清完之后自己**不**重写 run.md 是不行的:
+   *    happy path 那次 `queueManifest` 在这之后才跑,而 finally 里那次是 `if (pendingHandoff)`
+   *    —— 清掉之后它恰好不再触发,盘上那份原样留着。所以顺序必须是「清 → 让后面那次写」;
+   *  - `settle(result)` 把 `!!config.pendingHandoff` 交给面板,决定 `/tasks` 那一行是不是
+   *    「待收口(/et --resume …)」。排在合并之后,面板才不会去教用户敲一条已经没有关口的命令。
+   *
+   * 幂等:`handoffDone` 让异常路径上的第二次调用变成空转。永不抛(finishHandoff 自己包了
+   * try/catch)—— 这个 finally 里每一句都是被保护的,一个逃出去的异常会让
+   * `setPhase('done')` 永不执行,界面永久停在「运行中」而 Esc 毫无反应。
+   */
+  const onHandoffResult = args.onHandoffResult
+  let handoffDone = false
+  const handOff = async (): Promise<void> => {
+    if (handoffDone || !args.git) return
+    handoffDone = true
+    const out = await finishHandoff({
+      handoff: args.config.pendingHandoff,
+      git: args.git,
+      cwd: args.cwd ?? process.cwd(),
+    })
+    if (out.merged) args.config.pendingHandoff = undefined
+    if (out.result) {
+      try { onHandoffResult?.(out) } catch { /* UI only —— 合并已经发生了,不能被一个 UI 回调带走 */ }
+    }
+  }
   let liveNodes: TaskNode[] = []
   try {
     const persist = (n: TaskNode) => writeNode(args.fs, args.runDir, n)
@@ -220,6 +265,7 @@ export async function runOrchestrator(
     liveNodes = orch.nodes()
     pendingOutcome = result
     await reclaim(orch.nodes())
+    await handOff()
     setNodes([...orch.nodes()])
     setOutcome(result)
     settle(result)
@@ -236,6 +282,13 @@ export async function runOrchestrator(
   } finally {
     // The reclaim the happy path may not have reached. A no-op when it did.
     await reclaim(liveNodes)
+    /**
+     * 收口同理:异常路径上 happy path 那一句根本没跑到。空转当且仅当上面已经跑过。
+     *
+     * 这条路上 `pendingOutcome.status` 必然是 `blocked`,所以它只会**报告为什么不合**,
+     * 不会真去合一棵没跑完的树(判据在 planFinish 里,而不是靠这里排除)。
+     */
+    await handOff()
     // 待收口状态必须落盘,而异常路径上 happy path 的那次 queueManifest 根本没跑到 ——
     // 于是 pendingHandoff 被设进 config、一次也没写出去,集成分支再没人处置。
     // 幂等:happy path 已经写过时这只是再写一遍同样的内容。

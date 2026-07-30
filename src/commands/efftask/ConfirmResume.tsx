@@ -5,7 +5,7 @@ import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from '../../tool
 import { useLiveState } from './useLiveState.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import {
-  clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, rosterEditorLines, toggleRole, resumeSummarySections,
+  capsLine, clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, rosterEditorLines, toggleRole, resumeSummarySections,
   type ResumeSummary, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -124,6 +124,15 @@ export function ConfirmResume(props: {
       <Text bold>高效任务模式 · 恢复确认</Text>
       <Text>目标: {goalLine(props.config.goalPrompt)}</Text>
       <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: props.isolation })}</Text>
+      {/*
+        * 安全阀那一行**恢复路径上也要印**。
+        *
+        * 「改 run.md 里的 caps.nodeTimeoutMs 再 --resume」是这个旋钮唯一真正转得动的路径
+        * (parseDirectives 在恢复时整个不跑),而它此前恰好落在唯一不显示结果的那一屏上 ——
+        * 用户改完盘、进来看不到自己改的数生效没有。飞书的恢复卡一直是印的,两个界面
+        * 因此在恢复路径上说着不同的话。
+        */}
+      <Text dimColor>{capsLine(shown)}</Text>
       <Text bold>角色名册{editing ? '(编辑中)' : ''}:</Text>
       {editing
         ? rosterEditorLines(roster, available, phaseIdx, roleIdx, undefined, skipRef.current).map((line, i) => (

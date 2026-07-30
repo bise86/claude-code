@@ -345,3 +345,50 @@ describe('席位署名不能是空串', () => {
     })
   })
 })
+
+describe('只重派几席(only)', () => {
+  const seatsOf = async (only?: number[]): Promise<{ called: string[]; roles: string[] }> => {
+    const called: string[] = []
+    const rec = await runRoundtable({
+      phase: 'review',
+      node: { id: 'n', title: 't' } as never,
+      roles: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] as never,
+      round: 2,
+      system: 'review',
+      prompt: () => 'p',
+      runAgent: (async (req: { role?: { roleName: string } }) => {
+        called.push(req.role?.roleName ?? 'main')
+        return '```verdict\n{"pass":true,"blocking":[],"comments":""}\n```'
+      }) as never,
+      signal: new AbortController().signal,
+      answerTag: 'verdict',
+      ...(only ? { only } : {}),
+    })
+    return { called, roles: rec.verdicts.map(v => v.role) }
+  }
+
+  it('给了下标就只派那几席,而且署名跟着**原席位**走', async () => {
+    const { called, roles } = await seatsOf([2, 0])
+    expect(called).toEqual(['c', 'a'])
+    expect(roles).toEqual(['c', 'a'])
+  })
+
+  it('越界 / 重复的下标一律丢掉', async () => {
+    // `only` 是调用方按上一桌的 verdicts 算出来的,而席位数在两桌之间理论上可变
+    // (重做会重排名册)。不过滤的话 `roster[5]` 是 undefined,署名和裁决都会跟着错。
+    const { called, roles } = await seatsOf([1, 1, 7, -1])
+    expect(called).toEqual(['b'])
+    expect(roles).toEqual(['b'])
+  })
+
+  it('全被丢掉时退回**全席位** —— 派 0 席会让圆桌以「未能取得任何裁决」阻断', async () => {
+    // synthesizeVerdicts 对空数组判不通过,于是一个其实没人反对的圆桌会被判死。
+    const { called } = await seatsOf([9, 10])
+    expect(called).toEqual(['a', 'b', 'c'])
+  })
+
+  it('不给这个参数时行为与它不存在时逐字相同', async () => {
+    const { called } = await seatsOf()
+    expect(called).toEqual(['a', 'b', 'c'])
+  })
+})

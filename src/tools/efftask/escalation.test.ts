@@ -129,7 +129,11 @@ describe('触阀升级卡 (spec §9/§11)', () => {
   it('titles each category as itself', () => {
     expect(lines('rework')).toContain('连续返工超限')       // spec §9 uses exactly this name
     expect(lines('cap-nodes')).toContain('节点数超上限')
-    expect(lines('timeout')).toContain('单节点执行超时')
+    // 「执行超时」教的是「跑太久了 → 把节点拆小」,而这条阀量的是**静默**(一直在吐字
+    // 就永远不算,流式增量也算)。标题是用户最先读的一行,它必须和正文、和运行期抛出的
+    // 那句「静默超时(没有任何输出)」说同一件事。
+    expect(lines('timeout')).toContain('静默超时')
+    expect(lines('timeout')).not.toContain('执行超时')
     expect(lines('infra')).toContain('角色调用连续失败')
   })
 

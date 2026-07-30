@@ -1,4 +1,5 @@
 import type { Caps, NodeStatus, TaskNode } from './types.js'
+import { reopenPropagatedBlocks } from './redo.js'
 
 /**
  * Statuses that mean "a phase was in flight". A process kill leaves these on disk while
@@ -302,15 +303,22 @@ export function reseatTransientNodes(
     // timestamp is exactly what would let downtime be counted as work.
     // Reopen the chain above too, or this seat is unreachable.
     reopenAncestors(n)
-    // …and anything that was only waiting on this node. Same reason: the block was never
-    // about them.
-    for (const other of nodes) {
-      if (other.status === 'BLOCKED' && PROPAGATED.has(other.blockedReason) && other.deps.includes(n.id)) {
-        other.status = other.childIds.length > 0 ? 'WAITING_CHILDREN' : other.kind === 'executable' ? 'READY' : 'CREATED'
-        other.blockedReason = ''
-        other.updatedAt = now
-      }
-    }
+    /**
+     * …以及所有**被牵连**的节点,不只是「直接依赖它的那一层」。
+     *
+     * 这里原来是一句 `other.deps.includes(n.id)` 的一级循环,而阻断是不动点扫出来的
+     * (父→子 / 子→父 / 依赖→依赖方,反复扫到稳定)。验收实测:A←B←C 的链上人工解完
+     * 合并冲突再 `--resume`,B 被放开而 **C 和 B 的子树留在 BLOCKED** —— 而 B 的子树红着
+     * 会让 `propagateBlocked` 立刻把刚放开的 B 再阻断一次(childBlocked),也就是
+     * 「resume 之后一次模型调用都不会发生」的那个老失败,只是从另一扇门进。
+     *
+     * 用重做那边同一个不动点(`reopenPropagatedBlocks`),顺带把那一级循环漏掉的三件事
+     * 一起补上:清 `startedAt`(否则树上显示 `172800s` 并每秒往上跳)、清过期的 `failedAt`
+     * (否则 `R`/`s` 会在一个「其实是别人挂了」的节点上放行)、以及**方案没被放行过的
+     * executable 不许坐 READY**(否则带写工具的执行者会跑一份没人看过的方案)。
+     * 一份实现,两个入口 —— 各写一份的话最松的那一份就是实际生效的那一份。
+     */
+    reopenPropagatedBlocks(byId, now)
     // It is no longer blocked, so the reason must not linger — it would render in the tree
     // and be read as a live failure.
     n.blockedReason = ''
