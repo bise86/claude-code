@@ -5,6 +5,7 @@ import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_GUIDAN
 import { redoOptions, redoUnavailableReason } from './redo'
 import { ROLE_API_PROTOCOLS, TRANSLATING_PROTOCOLS } from '../../services/api/openaiCompat/protocols'
 import { toResponsesRequest } from '../../services/api/openaiCompat/toResponsesRequest'
+import { toOpenAIRequest } from '../../services/api/openaiCompat/toOpenAIRequest'
 import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from '../AgentTool/roles/roleThinking'
 import { modelSupportsEffort } from '../../utils/effort'
 import { REASONING_FIELDS } from '../../services/api/openaiCompat/fromOpenAIStream'
@@ -625,5 +626,223 @@ describe('README 的 markdown 与用量两节说的和代码干的是同一件�
     expect(upstreamAdvice({ status: 200, protocol: 'openai', emptyStream: true }))
       .not.toBe(upstreamAdvice({ status: 200, protocol: 'openai', notStreamed: true }))
     expect(ROLES_DOC).toContain(norm('200 但一个字节都没返回'))
+  })
+})
+
+/**
+ * README 的「子 agent 继承什么」一节必须说真话。
+ *
+ * 这一节和别处不一样:它给的是**用户会直接粘进 settings.json 的东西** —— 五个旗标名、
+ * 一个预批键名、一条「别写 env」的禁令、一句「-p 是必须的」。一个字错的代价不是读者
+ * 困惑,是他粘完之后员工整条不生效,而错在文档里。
+ *
+ * 所以这里尽量用**行为探针**而不是文本比对:`resolveAgentTools` / `toOpenAIRequest`
+ * 直接调,拿真的返回值对。只有那些够不到的(子进程怎么 spawn、schema 有没有某个键)
+ * 才退回读源码,而且都钉在**会随改动一起变**的那一句上。
+ */
+describe('README 的子 agent 继承一节说的和代码干的是同一件事', () => {
+  const src = (p: string) => readFileSync(new URL(p, ROOT), 'utf8')
+  const MCP_TOOL = 'mcp__gitlab__list_issues'
+
+  it('显式 tools 白名单是精确全名查表,而工具池本身对 MCP 免检', () => {
+    /**
+     * README 说「工具名是精确全名匹配,没有 `mcp__<服务器>__*` 前缀通配」。
+     *
+     * 本来想用行为探针(直接调 resolveAgentTools 走三种写法),但那个模块 import 进来会
+     * 触发 AgentTool.tsx 的循环初始化(`Cannot access 'agentToolResultSchema' before
+     * initialization`),测试根本起不来 —— 记在这里,免得下一个人再试一遍。
+     *
+     * 退回结构探针,但钉的是**会随改动一起变**的位置关系:白名单解析那一段里一个前缀
+     * 匹配都没有。哪天有人往里加前缀展开,这条就红,提醒的是「去改文档」。
+     */
+    const utils = src('src/tools/AgentTool/agentToolUtils.ts')
+    const poolFilter = utils.slice(0, utils.indexOf('export function resolveAgentTools'))
+    const whitelist = utils.slice(utils.indexOf('export function resolveAgentTools'))
+    expect(whitelist.length).toBeGreaterThan(500) // 切歪了就别往下断言了
+
+    // 白名单:逐个键去查表,没有任何前缀/通配匹配。
+    expect(whitelist).toContain('availableToolMap.get(toolName)')
+    expect(whitelist).not.toContain('startsWith(')
+    // 而「不写 tools 或写 ["*"] 才是全给」也在这一段里,是同一个判据。
+    expect(whitelist).toContain("agentTools.length === 1 && agentTools[0] === '*'")
+
+    // 池子那一半:MCP 对黑名单免检 —— 这就是内建 Explore/Plan 的 MCP 还在的原因,
+    // 也是「白名单吃掉 MCP」和「黑名单吃不掉」这两句话必须分开写的原因。
+    expect(poolFilter).toContain("if (tool.name.startsWith('mcp__')) {")
+
+    expect(README).toContain(norm('没有 `mcp__<服务器>__*` 前缀通配'))
+    expect(README).toContain(norm('| 普通子 agent，写了显式 `tools` 白名单 | **要逐个列全名** | 继承 |'))
+    expect(README).toContain(norm('不写 `tools` 或写 `["*"]` 才是全给'))
+  })
+
+  it('换协议丢不掉 CLAUDE.md,因为它走的是 user 消息而不是 system', () => {
+    /**
+     * README 敢说「协议那一轴整个不影响」,全部依据是两件事:
+     *   1. CLAUDE.md 被拼成一条 user 消息(prependUserContext),不在 system 里;
+     *   2. 三种协议都把 user 消息原样带过去。
+     * 任一条变了,那句话就是假的。第 2 条这里用真的转换函数验。
+     */
+    const api = src('src/utils/api.ts')
+    // 1. 它造的是 user 消息,而且带着 `# claudeMd` 这个小标题。
+    expect(api).toContain('createUserMessage({')
+    expect(api).toContain('`# ${key}\\n${value}`')
+    expect(src('src/query.ts')).toContain('prependUserContext(messagesForQuery, userContext)')
+    // CLAUDE.md 是 userContext 的一个键,而 userContext 整个走上面那条路。
+    expect(src('src/context.ts')).toContain('...(claudeMd && { claudeMd })')
+
+    // 2. chat/completions:user 消息原样过桥。
+    const chat = toOpenAIRequest({
+      system: [{ type: 'text', text: 'SYS' }],
+      messages: [{ role: 'user', content: '<system-reminder># claudeMd\n用 bun 不用 npm' }],
+    }, 'gpt-4o')
+    expect(chat.messages).toEqual([
+      { role: 'system', content: 'SYS' },
+      { role: 'user', content: '<system-reminder># claudeMd\n用 bun 不用 npm' },
+    ])
+    // 2. responses:system 走 instructions —— README 括号里那句话就是这个。
+    const resp = toResponsesRequest({
+      system: [{ type: 'text', text: 'SYS' }],
+      messages: [{ role: 'user', content: '# claudeMd' }],
+    }, 'gpt-5.1')
+    expect(resp.instructions).toBe('SYS')
+    expect(JSON.stringify(resp.input)).toContain('# claudeMd')
+
+    expect(README).toContain(norm('**一条领头的 user 消息**'))
+    expect(README).toContain(norm('`instructions` 只接 system，而它本来就不在那儿'))
+  })
+
+  it('MCP 工具过得了 openai 那条桥,没有 input_schema 的过不了', () => {
+    // README 的表里「execMode api + openai 协议 → MCP 继承」这一格靠的就是这条。
+    const out = toOpenAIRequest({
+      messages: [{ role: 'user', content: 'x' }],
+      tools: [
+        { name: MCP_TOOL, description: 'd', input_schema: { type: 'object', properties: {} } },
+        { name: 'web_search' }, // anthropic 服务端工具:没有 input_schema
+      ],
+    }, 'gpt-4o')
+    expect(out.tools.map((t: { function: { name: string } }) => t.function.name)).toEqual([MCP_TOOL])
+  })
+
+  it('cli 档只递提示词:prompt 进 stdin、stdout 整个当结果、spawn 不传 env', () => {
+    const runner = src('src/tools/AgentTool/cliAgentRunner.ts')
+    // README 表格第二行:「整段写进 stdin 然后关闭 stdin,stdout 整个当结果」。
+    expect(runner).toContain('proc.stdin.write(task.prompt)')
+    expect(runner).toContain('proc.stdin.end()')
+    expect(runner).toContain('readAll(proc.stdout)')
+    // README 表格第一行:环境变量是继承的 —— 因为 spawn 压根没传 env。
+    // 哪天传了(比如加了个 env 白名单),「继承环境变量」这句就得改。
+    const spawnBody = runner.slice(runner.indexOf('function defaultSpawn'), runner.indexOf('return {', runner.indexOf('function defaultSpawn')))
+    expect(spawnBody).toContain('cwd: opts?.cwd')
+    expect(spawnBody).not.toContain('env')
+    // cwd 不填就是父进程的 —— Bun.spawn 收到 undefined 就继承,所以传的是可选值本身。
+    expect(runner).toContain("spawn(agentDef.command, agentDef.args ?? [], { cwd: agentDef.roleCwd })")
+
+    expect(README).toContain(norm('整段写进 stdin 然后关闭 stdin，**stdout 整个当结果**'))
+    expect(README).toContain(norm('工作目录（`cwd` 不填就是父进程的）'))
+  })
+
+  it('cli 档收不到系统提示 —— 它的入参就只有四个字段', () => {
+    /**
+     * README 把这条标成「最容易踩」。它成立的原因是结构性的:runCliAgent 的 agentDef
+     * 入参只声明了 command/args/roleCwd/interactive,系统提示没有地方进去。哪天有人
+     * 把它加进这个类型,文档那一行就得跟着改。
+     */
+    expect(src('src/tools/AgentTool/cliAgentRunner.ts')).toContain(
+      'agentDef: { command: string; args?: string[]; roleCwd?: string; interactive?: boolean }',
+    )
+    // 而 api 档的系统提示是另一条路:算好之后只喂给 runAgent 的 override。
+    expect(src('src/tools/AgentTool/AgentTool.tsx')).toContain('systemPrompt: asSystemPrompt(enhancedSystemPrompt)')
+    expect(README).toContain(norm('**员工自己配的 `prompt`（系统提示）**'))
+  })
+
+  it('roles[] 是 strict 且没有 env 字段 —— 所以文档敢说「别写 env」', () => {
+    const schema = src('src/tools/AgentTool/roles/rolesFromSettings.ts')
+    const block = schema.slice(schema.indexOf('const RoleSchema = z.object({'), schema.indexOf('}).strict()'))
+    expect(block.length).toBeGreaterThan(100) // 切歪了就别往下断言了
+    // 没有 env 键。加了的话 README 那条禁令就成了假话(而且是「照着文档反而配不对」)。
+    expect(block).not.toMatch(/\benv\b/)
+    // strict:未声明的键让整条员工失败,而不是该字段失效。这是禁令的**后果**那一半。
+    expect(schema).toContain('}).strict()')
+    // cli 档要求 command,api 档要求那三个 —— 表格和示例都建立在这上面。
+    expect(schema).toContain("execMode 'cli' requires 'command'")
+    expect(README).toContain(norm('**而且没有 `env` 字段**'))
+    expect(README).toContain(norm('会让**整条员工被跳过**'))
+  })
+
+  it('interactive 那套报文名,README 抄的就是代码收发的', () => {
+    const runner = src('src/tools/AgentTool/cliAgentRunner.ts')
+    // 父 → 子
+    expect(runner).toContain("JSON.stringify({ type: 'task', prompt: task.prompt })")
+    expect(runner).toContain("type: 'permission_response'")
+    // 子 → 父
+    expect(runner).toContain("'permission_request'")
+    expect(runner).toContain("'result'")
+    for (const wire of ['"type"："task"', '"type"："permission_request"', '"type"："result"']) {
+      expect(`README 写了 ${wire}：${README.includes(wire)}`).toBe(`README 写了 ${wire}：true`)
+    }
+    expect(README).toContain(norm('普通 `claude -p` **不说这套协议**'))
+  })
+
+  it('项目级 MCP 默认不连,预批的两个键名文档没写错', () => {
+    const mcpUtils = src('src/services/mcp/utils.ts')
+    expect(mcpUtils).toContain('enabledMcpjsonServers')
+    expect(mcpUtils).toContain('enableAllProjectMcpServers')
+    // 默认档是 'pending' —— 「默认不通」这三个字就是它。
+    expect(mcpUtils).toContain("): 'approved' | 'rejected' | 'pending'")
+    expect(README).toContain(norm('{ "enabledMcpjsonServers"： ["gitlab"， "ctx7"] }'))
+    expect(README).toContain(norm('enableAllProjectMcpServers'))
+  })
+
+  it('README 那段 args 示例里的每个旗标,CLI 里都真的存在', () => {
+    /**
+     * 这条挡的是最贵的一种文档错误:用户把 args 数组整段粘走,旗标名错一个字,子进程
+     * 直接起不来,而他会以为是自己配错了。
+     *
+     * 必须在**示例那个代码块里面**找,不能在整份 README 里找 —— 后者是个破探针:
+     * 旗标名在正文里也提了一遍,所以把示例里的名字改错,「README 里有这个词」照样成立。
+     */
+    const at = README.indexOf(norm('"name"： "cli-评审"'))
+    expect(at).toBeGreaterThan(0)
+    const argsBlock = README.slice(at, README.indexOf('```', at))
+    expect(argsBlock.length).toBeGreaterThan(100)
+
+    const main = src('src/main.tsx')
+    // print 模式:示例里是数组第一个元素,CLI 里是 `-p, --print`。
+    expect(argsBlock).toContain('"-p"')
+    expect(main).toContain('-p, --print')
+    for (const flag of ['--add-dir', '--mcp-config', '--settings', '--append-system-prompt-file']) {
+      expect(`示例里用了 ${flag}：${argsBlock.includes(flag)}`).toBe(`示例里用了 ${flag}：true`)
+      expect(`CLI 里有 ${flag}：${main.includes(`'${flag}`)}`).toBe(`CLI 里有 ${flag}：true`)
+    }
+  })
+
+  it('只有 Explore 和 Plan 不给 CLAUDE.md', () => {
+    // README 的例外第一条点了名。多一个少一个都得改文档。
+    expect(src('src/tools/AgentTool/built-in/exploreAgent.ts')).toContain('omitClaudeMd: true')
+    expect(src('src/tools/AgentTool/built-in/planAgent.ts')).toContain('omitClaudeMd: true')
+    // 它们摘工具用的是**黑名单**(disallowedTools),所以 MCP 还在 —— 表里那一格写的是「继承」。
+    expect(src('src/tools/AgentTool/built-in/exploreAgent.ts')).toContain('disallowedTools: [')
+    expect(README).toContain(norm('| 内建 `Explore` / `Plan` | 继承 | **不给** |'))
+    expect(README).toContain(norm('只有这两个内建员工带 `omitClaudeMd`'))
+  })
+
+  it('改完 CLAUDE.md 要重启,以及子目录那份是每个子 agent 独立的', () => {
+    // 「只读一次并缓存」= memoize。
+    expect(src('src/context.ts')).toContain('export const getUserContext = memoize(')
+    // 「每个子 agent 有自己独立的去重表」= 建子上下文时发的是新 Set,不是父的引用。
+    expect(src('src/utils/forkedAgent.ts')).toContain('loadedNestedMemoryPaths: new Set<string>()')
+    expect(README).toContain(norm('它在进程里只读一次并缓存'))
+    expect(README).toContain(norm('每个子 agent 有自己独立的去重表'))
+  })
+
+  it('AGENTS.md 不在自动加载的清单里', () => {
+    // README 说它「只被 /init 读一次」。依据:装载器压根不认识这个名字。
+    const loader = src('src/utils/claudemd.ts')
+    expect(loader).not.toContain('AGENTS')
+    expect(src('src/context.ts')).not.toContain('AGENTS')
+    // 而装载器认的就是 README 列的那几个。
+    expect(loader).toContain("name === 'CLAUDE.md' || name === 'CLAUDE.local.md'")
+    expect(README).toContain(norm('**`AGENTS.md` 不是自动加载的指令文件**'))
+    expect(README).toContain(norm('它们只被 `/init` 读一次'))
   })
 })

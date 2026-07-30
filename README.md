@@ -449,7 +449,7 @@ bun --env-file=.env ./src/localRecoveryCli.ts
 - **`roles[]` 是严格校验的**：写入未声明的字段会让**整条员工被跳过**（表现为「这个员工不存在」），而不只是该字段失效。原因会显示在 `/et` 启动关口的「你的请求中有以下部分不会生效」那一块里（非交互 `--print` 模式下才走终端）——**交互式会话里终端上看不到它**：ink 的 `patchConsole` 把 `console.error` 改写成了只进 debug 日志。
 - **`step` 写错**会被拒绝并列出合法值，还会猜一个最接近的（写「测试」会提示「是不是想写『测试验证』」）。
 - **`staff` 里的员工名找不到** → 该角色改由主模型兼任，关口会说明。这和「没写 staff」是两回事。
-- **`execMode: 'cli'` 的员工** `/et` 目前派发不了，会被剔除并说明。
+- **`execMode: 'cli'` 的员工** `/et` 目前派发不了，会被剔除并说明。它也不继承 MCP 和 CLAUDE.md（是另一个进程）——要怎么配通见「子 agent 继承什么：MCP 与 CLAUDE.md」。
 - **想让某一步别跑，要用「跳过」而不是「不配角色」**：不配角色只是换主模型一个人干，那一步照跑。见上面的「跳过环节」。
 - **MCP 在所有环节都能用，但会写的 MCP 挡不住**：内建写工具（Edit/Write/Bash）只有执行环节有，而 `mcp__*` 无法从名字判断读写，给评审／验收席位配带写能力 MCP 的角色时它可以自己改完再放行。关口会提示。详见 `docs/roles-setup.md` 的「各环节能用什么工具」。
 
@@ -839,6 +839,99 @@ anthropic 收。Anthropic 协议下模型不支持 effort 参数时（比如 `cl
 以前的表现是「这个员工不存在」而屏幕上零提示（`console.error` 被 ink 的 `patchConsole`
 吞进 debug 日志了）。现在这些原因会出现在 `/et` 启动关口的「你的请求中有以下部分不会生效」
 那一块里。
+
+---
+
+## 子 agent 继承什么：MCP 与 CLAUDE.md
+
+项目里配了 `.mcp.json` 和 `CLAUDE.md`，主模型会加载。子 agent 呢？
+
+**一句话：同进程的子 agent 全继承；另起进程的（`execMode: "cli"` 的员工）一样都不继承。**
+
+| 子 agent 形态 | MCP 工具 | CLAUDE.md |
+|---|---|---|
+| 普通子 agent，没写 `tools` 或写 `["*"]` | 继承 | 继承 |
+| 普通子 agent，写了显式 `tools` 白名单 | **要逐个列全名** | 继承 |
+| 内建 `Explore` / `Plan` | 继承 | **不给** |
+| `/et` 的七个环节 | 继承 | 继承 |
+| `execMode: "api"` + anthropic 协议 | 继承 | 继承 |
+| `execMode: "api"` + openai / openai-responses 协议 | 继承 | 继承 |
+| `execMode: "cli"` | **不继承** | **不继承** |
+
+**协议那一轴整个不影响，原因值得单说**：CLAUDE.md 不走 system prompt，它被拼成**一条领头的 user 消息**（裹在 `<system-reminder>` 里）。user 消息在三种协议上都有对等物——`chat/completions` 映成 `{"role":"user"}`，Responses 走同一条消息列表（`instructions` 只接 system，而它本来就不在那儿）。所以换协议丢不掉它。
+
+顺带一条容易踩空的：**`AGENTS.md` 不是自动加载的指令文件**，`.cursorrules`、`.github/copilot-instructions.md`、`.clinerules` 也不是。它们只被 `/init` 读一次、把内容抄进 `CLAUDE.md`。真正会自动加载的只有 `CLAUDE.md`、`.claude/CLAUDE.md`、`CLAUDE.local.md`、`~/.claude/CLAUDE.md` 和 `.claude/rules/*.md`——项目规范要生效就写这几个，而且**主模型和子 agent 是同一份**，不存在「主模型读到了、子 agent 漏了」。
+
+### 四个例外
+
+- **`Explore` 和 `Plan` 拿不到 CLAUDE.md。** 只有这两个内建员工带 `omitClaudeMd`，理由是「只读 agent 不需要 commit/PR/lint 规则」。后果：CLAUDE.md 里「搜索时排除 vendor/」这类**指导探索行为**的规范，对这两个是白写的。
+- **显式 `tools` 白名单会静默吃掉 MCP。** 工具名是精确全名匹配，没有 `mcp__<服务器>__*` 前缀通配，想留就得写全 `mcp__gitlab__list_issues`。不写 `tools` 或写 `["*"]` 才是全给。（内建那两个用的是**黑名单**，所以它们的 MCP 还在。）
+- **改完 CLAUDE.md 要重启。** 它在进程里只读一次并缓存，会话中途改完，**后面新起的子 agent 拿到的仍是启动时那份快照**。
+- **子目录的 CLAUDE.md 走另一条路。** 它不在上面那条消息里，是读到该目录下的文件时才注入的，而且每个子 agent 有自己独立的去重表——父 agent 已经加载过，不会把子 agent 的那份顶掉。
+
+### `execMode: "cli"` 的员工怎么让它们生效
+
+cli 员工是**另一个进程**，父进程只递给它一样东西：提示词。所以没有「继承」开关，只有三条路。先看清它实际拿到什么：
+
+| | |
+|---|---|
+| 继承 | 环境变量；工作目录（`cwd` 不填就是父进程的） |
+| 只收到 | 提示词。默认档整段写进 stdin 然后关闭 stdin，**stdout 整个当结果** |
+| 收不到 | 工具表、MCP 连接、CLAUDE.md 那条消息 |
+| 也收不到 | **员工自己配的 `prompt`（系统提示）**——这条最容易踩，它算出来了，但只喂给 api 档 |
+
+#### 路一：让子 CLI 自己去发现（`command` 就是 `claude` 时最省事）
+
+**CLAUDE.md 默认就通。** `cwd` 不填就继承父进程的工作目录，通常正是项目根，子 claude 自己走目录发现就读到了。只有把 `cwd` 指到项目外才会断。
+
+**`.mcp.json` 默认不通，这条得动手。** 子进程是非交互的，弹不出审批框，项目级 MCP 服务器会停在「待审批」而不连接。预批一下：
+
+```jsonc
+{ "enabledMcpjsonServers": ["gitlab", "ctx7"] }   // 或 "enableAllProjectMcpServers": true
+```
+
+#### 路二：用 `args` 显式喂
+
+```jsonc
+{
+  "name": "cli-评审",
+  "whenToUse": "独立评审",
+  "execMode": "cli",
+  "command": "claude",
+  "args": [
+    "-p",
+    "--add-dir", "/abs/path/to/repo",
+    "--mcp-config", "/abs/path/to/repo/.mcp.json",
+    "--settings", "/abs/path/to/repo/.claude/settings.json",
+    "--append-system-prompt-file", "/abs/path/to/repo/CLAUDE.md"
+  ]
+}
+```
+
+三点：`-p` 是**必须的**（父进程的协议就是提示词进 stdin、stdout 整个当结果，不是 print 模式会挂在那儿等交互）；`--append-system-prompt-file` 是把上面那条「员工 `prompt` 被丢掉」补回来的唯一办法；`args` 是**原样数组、不过 shell**，所以 `"--add-dir /path"` 合成一个元素是错的，`~` 也不会展开，写绝对路径。
+
+#### 路三：包一层 wrapper —— 要设环境变量只有这条
+
+`roles[]` 是严格校验的，**而且没有 `env` 字段**。后果比「该字段不生效」严重：多一个未声明的键会让**整条员工被跳过**（表现成「这个员工不存在」）。所以别试着加 `"env"`，用脚本：
+
+```bash
+#!/usr/bin/env bash
+# scripts/role-reviewer.sh
+cd /abs/path/to/repo || exit 1
+export ANTHROPIC_BASE_URL=...
+export ANTHROPIC_API_KEY=...
+exec claude -p --add-dir . --mcp-config .mcp.json
+```
+
+然后 `"command": "scripts/role-reviewer.sh"`、`args` 留空。wrapper 顺手把工作目录和那串长旗标也解决了——配置文件里只留一个路径，调什么都在脚本里改。**推荐这条。**
+
+#### 子 CLI 不是 `claude` 时
+
+codex / gemini / 自研程序认不认 `CLAUDE.md` 完全是它自己的事（`AGENTS.md` 这套约定就是这么冒出来的）。这时别指望文件发现，把规范**拼进提示词**才可靠：wrapper 里 `cat CLAUDE.md` 前置，或者用它自己的 system-prompt 旗标。
+
+> **`interactive: true` 不是「要不要界面」。** 它是说「这个程序实现了那套双向 JSON-lines 协议」——父进程发 `{"type":"task","prompt":…}`，子进程回 `{"type":"permission_request",…}` / `{"type":"result","content":…}`，每行一个 JSON。普通 `claude -p` **不说这套协议**，给它配 `interactive: true` 会卡住。不确定就别写：默认的单次档适用于任何「吃 stdin、吐 stdout」的程序。
+
+> **`/et` 派发不了 cli 员工。** 它们会在启动关口被剔除并说明原因，而不是静默降级成主模型。所以如果目标是让 `/et` 的环节用上，正解不是把 cli 配通，是改成 `execMode: "api"`——那条路上 MCP 和 CLAUDE.md 都自动继承，两种协议都一样。
 
 ---
 
