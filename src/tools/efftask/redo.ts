@@ -227,8 +227,18 @@ export function redoContextOf(
       PHASE_NAMES.map(p => [p, (node.phaseRoles?.[p] ?? []).length]),
     ) as Record<PhaseName, number>,
     skipSteps: cfg?.skipSteps,
-    // 隔离与否只有命令层知道(它手里才有那个池子),所以由调用方传。缺省 false 是**保守**
-    // 的一侧:它只会让「跳过验收」在一个其实安全的场景下多问一句,而反过来会放行一次谎报。
+    /**
+     * 隔离与否只有命令层知道(它手里才有那个池子),所以由调用方传。
+     *
+     * **缺省(undefined/false)是宽松的那一侧,不是保守的那一侧** —— 第一版的注释把方向
+     * 说反了,评审点了出来:`skipFailedPhaseReason` 的闸门是
+     * `ctx?.isolated === true && !node.worktree`,所以缺省时它**不触发**,也就是放行。
+     *
+     * 真正兜住这条的是 `pipeline.stepExecute` 里的 `node.worktree !== undefined`:
+     * 拿不到工作区就退化成正常跑一轮,并在节点上留一行说明。命令层(efftask.tsx)确实
+     * 一直传值,所以今天不成灾;写清方向是为了下一个人不会以为「不传也安全」而删掉
+     * 那道纵深防御。
+     */
     ...(opts?.isolated === undefined ? {} : { isolated: opts.isolated }),
   }
 }
@@ -653,6 +663,16 @@ function reopenAncestor(n: TaskNode, now: string): boolean {
   n.interrupted = false
   n.capBlocked = false
   n.capCategory = undefined
+  /**
+   * 失败点跟着清 —— 和上面那三个开关**逐字同因**,而它原来漏了。
+   *
+   * 评审实跑出来的 P0:root 真在集成验收超限 → 用户在某个子任务上按 R(完全合理)→
+   * root 被重开而 `failedAt='INTEGRATION_ACCEPT'` 留着 → 那个子任务又挂 →
+   * `propagateBlocked` 写「子节点阻断」而失败点仍是旧的 → **`s` 在 root 上放行**
+   * (本该说「这个节点是因为它的子任务失败才停的」)→ 落下 `skipPhase='integrate'` →
+   * 用户后来修好子任务 → 整棵树的最终裁决**一次都没发生**,acceptLog 空,run 报 completed。
+   */
+  n.failedAt = undefined
   // 这一轮它要重判的是集成验收,所以给回集成和评分的预算;方案/验收预算不动 ——
   // 这次重做没打算让祖先重新分析。
   n.iteration = { ...n.iteration, integration: 0, scoring: 0 }
@@ -666,6 +686,9 @@ function reopenIfPropagated(n: TaskNode, now: string): void {
   if (n.status !== 'BLOCKED' || !PROPAGATED.has(n.blockedReason)) return
   n.status = n.childIds.length > 0 ? 'WAITING_CHILDREN' : n.kind === 'executable' ? 'READY' : 'CREATED'
   n.blockedReason = ''
+  // 失败点跟着清 —— 理由见 reopenAncestor 里那一段(过期的失败点会让 R/s 在一个
+  // 「其实是别人挂了」的节点上放行,而落下的一次性标记很久以后才生效)。
+  n.failedAt = undefined
   n.updatedAt = now
 }
 
@@ -1033,7 +1056,20 @@ export function skipSummary(
    * 就不存在),再把被跳掉的这一个从里面拿掉 —— 印一条包含它的链就是当场自相矛盾。
    */
   const entry: RedoEntry = phase === 'review' ? 'review' : phase === 'integrate' ? 'integrate' : 'execute'
-  const rest = phasesOf(entry, ctx, target).filter(p => p !== phase)
+  /**
+   * **这一轮真的不跑的那几个,一个都不许出现在这一行里。**
+   *
+   * 评审实测到两行同屏自相矛盾:「之后会跑: 执行」紧跟着「执行环节不重跑」——
+   * 而默认配置(测试验证/观察都 0 席)下 `rest` **只有** execute,所以那一行 100% 是假的。
+   * 除了被跳掉的那一个,还要滤掉:
+   *  - `execute`:verify/accept 这两跳从执行循环的**尾部**进来,执行者不会被派;
+   *  - `verify`:跳过验收时它在上一轮已经过了,这一轮也不重跑(见 stepExecute 的
+   *    `skipVerifyThisRound`)。
+   */
+  const notThisRound = new Set<PhaseName>([phase])
+  if (phase === 'verify' || phase === 'accept') notThisRound.add('execute')
+  if (phase === 'accept') notThisRound.add('verify')
+  const rest = phasesOf(entry, ctx, target).filter(p => !notThisRound.has(p))
   lines.push(rest.length > 0
     ? `之后会跑: ${rest.map(p => PHASE_LABEL[p]).join(' → ')}`
     : '之后没有别的环节了,本节点会直接判为已验收')
@@ -1041,11 +1077,21 @@ export function skipSummary(
     // 这一条是这次跳过最容易被误解的地方:它**不重跑执行者**。
     lines.push('执行环节不重跑 —— 你刚看过的那份产出原样往下走(执行者不会再改一遍代码)')
   }
+  if (phase === 'accept') {
+    lines.push('本轮测试验证也不重跑 —— 它在上一轮(节点走到验收之前)已经通过了')
+  }
   if (phase === 'review') {
     lines.push('现有方案原样保留,没有任何人质疑它就进入下一步')
   }
   if (target.status === 'BLOCKED') lines.push('本节点从「已阻断」回到可推进状态')
-  lines.push('相关环节的返工计数清零 —— 后面的环节会重新占满一轮返工额度')
+  /**
+   * 返工计数**只在真的清了的时候**才说。
+   *
+   * 评审实测:跳过质疑讨论时这句话照样印,而 `planSkip` 那一支一个计数都没重置
+   * (planReview 3→3, acceptance 3→3)。关口上一句无条件的承诺,就是一句一半的时候
+   * 为假的话。
+   */
+  if (phase !== 'review') lines.push('相关环节的返工计数清零 —— 后面的环节会重新占满一轮返工额度')
   for (const w of plan.warnings) lines.push(`⚠ ${w}`)
   return lines
 }

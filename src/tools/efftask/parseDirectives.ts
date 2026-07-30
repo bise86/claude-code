@@ -1,5 +1,5 @@
 // src/tools/efftask/parseDirectives.ts
-import { clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
+import { clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_ROLE_GUIDANCE, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 import { applyRoleDefsToPhases, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
@@ -173,7 +173,25 @@ export async function parseDirectives(
       const phase = v as PhaseName
       // 同一个环节被点两次就接起来 —— 覆盖会静默丢掉前一条,而两条都是用户亲手写的。
       const prev = kept[phase]
-      kept[phase] = prev ? `${prev}\n${text}` : text
+      const joined = prev ? `${prev}\n${text}` : text
+      /**
+       * **在这里夹取,不只在读回那一侧夹。**
+       *
+       * 评审量出来的:`resumeCore` 是夹的,而这条**主入口**一个上限都没有 —— 实测抽取模型
+       * 回一段 50000 码点的指引,它原样出口;40 条角色指引合计 80190 码点,评审那一席
+       * 单次前言 181446 码点(Haiku 4.5 的 200K 窗口占 91%)。而拼接那一步会让它翻倍。
+       *
+       * 按**码点**截(`.slice` 会把 emoji 劈成半个代理对),而且**说出来** —— 静默截断
+       * 用户亲手写的话是这个仓库反复付过代价的那一类。
+       */
+      const cp = Array.from(joined)
+      if (cp.length > MAX_GUIDANCE_CHARS) {
+        base.notices.push(
+          `你给「${PHASE_LABEL[phase]}」的那段要求有 ${cp.length} 字,超过 ${MAX_GUIDANCE_CHARS} 的上限,` +
+          `已截断到前 ${MAX_GUIDANCE_CHARS} 字(整段提示词是要按字数付钱的)`,
+        )
+      }
+      kept[phase] = cp.slice(0, MAX_GUIDANCE_CHARS).join('')
     }
     /**
      * 点给一个**这次不会跑**的环节:说出来。
@@ -201,13 +219,30 @@ export async function parseDirectives(
      * 那一类。角色定义还没合并进来(在下面),所以这里只拿名册比,合并后的角色名在
      * `applyDefs` 之后已经落到席位的 roleTag 上 —— 见下面那一段。
      */
+    let dropped = 0
     for (const raw of obj.roleGuidance) {
       if (!raw || typeof raw !== 'object') continue
       const r = raw as Record<string, unknown>
       const name = typeof r.name === 'string' ? r.name.trim() : ''
       const text = typeof r.text === 'string' ? r.text.trim() : ''
       if (name.length === 0 || text.length === 0) continue
-      kept.push({ name, text })
+      /**
+       * 条数和长度都有上限 —— 理由和 phaseGuidance 那一段逐字相同(评审实测 40 条合计
+       * 80190 码点),而且这里的乘子更大:每一条都要和**每一个**名字对得上的席位见面。
+       *
+       * 名字也夹:它会被拼进提示词的**标题**里,而一个 400 字的名字实测能把关口顶出屏幕。
+       */
+      if (kept.length >= MAX_ROLE_GUIDANCE) { dropped++; continue }
+      kept.push({
+        name: Array.from(name).slice(0, MAX_GUIDANCE_CHARS).join(''),
+        text: Array.from(text).slice(0, MAX_GUIDANCE_CHARS).join(''),
+      })
+    }
+    if (dropped > 0) {
+      base.notices.push(
+        `点名给某个角色/员工的额外要求最多 ${MAX_ROLE_GUIDANCE} 条,多出的 ${dropped} 条不会生效` +
+        `(每一条都要和名字对得上的每一席见面,条数是会乘起来的)`,
+      )
     }
     if (kept.length > 0) base.roleGuidance = kept
   }

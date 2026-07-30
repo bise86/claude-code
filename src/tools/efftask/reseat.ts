@@ -252,6 +252,14 @@ export function reseatTransientNodes(
       n.status = 'BLOCKED'
       n.blockedReason = `恢复时该阶段预算已耗尽(${spent}/${caps.maxIterations}),不再重试`
       n.interrupted = false // a later resume must not reopen it again
+      /**
+       * 失败点。`wasStatus` 早就在手上(上面 target 的判定和下面那条注记都在用它),
+       * 唯独这里没记 —— 而这恰恰是**最需要「跳过失败环节」的那一类节点**:活干完了,
+       * 判的人没预算了。评审实跑:`ACCEPTANCE` + acceptance=3 的节点在这里阻断之后,
+       * `R` 回「这条记录来自更早的版本,或者被手工改过」,`s` 回「看不出…无法跳过」——
+       * 两个新键在它身上全废。
+       */
+      n.failedAt = wasStatus
       n.updatedAt = now
       exhausted.push(n.id)
       continue
@@ -259,6 +267,10 @@ export function reseatTransientNodes(
 
     n.status = target
     n.interrupted = false
+    // 归位 = 重新起跑,上一次的失败点作废(和 redo 的 reseatForRerun 逐字同因:留着它,
+    // R/s 会照一个属于上辈子的失败点给出动作)。手工跳过的一次性标记同理。
+    n.failedAt = undefined
+    n.skipPhase = undefined
     /**
      * 耗时重新计时 (spec §10.1: 「自进入**活动态**起的累计耗时」).
      *

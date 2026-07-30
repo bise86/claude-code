@@ -99,6 +99,13 @@ export const MAX_DIRECTIVE_CHARS = 2000
 /** 最多累积多少条。再多就把最早的挤掉 —— 但**不静默**,见 directives 的注释。 */
 export const MAX_DIRECTIVES = 20
 
+/** 一个可以从外面兑现的 promise。见 `limitChanged` —— 一个共享事件,不是一张等待者表。 */
+function deferred(): { promise: Promise<void>; wake: () => void } {
+  let wake = (): void => {}
+  const promise = new Promise<void>(res => { wake = res })
+  return { promise, wake }
+}
+
 export function createRunControl(): RunControl {
   let paused = false
   /** 等着被恢复的那些人。恢复时一次性全部放行。 */
@@ -106,8 +113,18 @@ export function createRunControl(): RunControl {
   /** 用户调过的并发上限,以及它改过几次。 */
   let parallelism: number | undefined
   let parallelismGen = 0
-  /** 等着并发上限变化的那些人(就是调度循环)。 */
-  let limitWaiters: (() => void)[] = []
+  /**
+   * 「并发上限变了」这一个事件 —— **一个共享的 promise,不是一张等待者表**。
+   *
+   * 评审量出来的:调度循环每转一圈就注册一个等待者,而只有 `setParallelism` 会清表 ——
+   * 用户不碰并发度就永远不清。实跑一棵 11 节点的树跑完积压 22 个 resolver(随后一次
+   * `setParallelism` 一起兑现 22/22,证明全程被持有)。`control.ts` 自己给暂停那张表写过
+   * 同一条注释:「表只涨不落就是泄漏」。
+   *
+   * 换成一个共享 promise 之后,N 轮循环等的是**同一个**对象:表长恒为 1,而唤醒语义
+   * 一个字没变(任何一次变更放行所有等待者)。
+   */
+  let limitChanged: { promise: Promise<void>; wake: () => void } = deferred()
   const directives: string[] = []
   let dropped = 0
   /** nodeId → 此刻在飞的 controller。一个节点可能同时有多个(圆桌的多席位)。 */
@@ -191,18 +208,18 @@ export function createRunControl(): RunControl {
       if (next === parallelism) return
       parallelism = next
       parallelismGen++
-      // 换出来再清空,和 resume() 同因:不清的话等待者随调整次数无界增长。
-      const w = limitWaiters
-      limitWaiters = []
-      // 一个抛异常的等待者不能把别的等待者一起卡住。
-      for (const fn of w) { try { fn() } catch { /* 调用方自己的问题 */ } }
+      // 换出来再兑现:先把新的那一个装上,再唤醒旧的那些人 —— 反过来的话,一个被唤醒的
+      // 等待者在同一个微任务里重新来等,可能等到的还是这个已经兑现的 promise。
+      const prev = limitChanged
+      limitChanged = deferred()
+      prev.wake()
     },
     parallelismGeneration: () => parallelismGen,
     waitForParallelism(seen) {
       // 已经变过了就立刻返回 —— 少了这一句,发生在「扫描之后、睡下之前」的那一次调整
       // 会被睡过去,而那正是用户最想它立刻生效的时刻。
       if (seen !== parallelismGen) return Promise.resolve()
-      return new Promise<void>(res => { limitWaiters.push(res) })
+      return limitChanged.promise
     },
   }
 }

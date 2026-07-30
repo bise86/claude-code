@@ -352,3 +352,124 @@ describe('重做关口:补一句提示词', () => {
     expect(seen).toEqual([['execute', { scope: 'execute', text: 'y' }]])
   })
 })
+
+describe('评审实按查出来的那几条', () => {
+  it('kitty / modifyOtherKeys 终端上按 Shift+R 也要走快速重做', async () => {
+    /**
+     * 那些终端送的是 `ESC[82;2u`,而仓库自己的 parse-keypress 把它解成
+     * `input='r', shift=true` —— 只判 `input === 'R'` 的话它会掉到下一行的 `k === 'r'` 上,
+     * 用户按 R 拿到的是三屏菜单,而快速重做这个键彻底消失。`ink.tsx` 正是在 iTerm / kitty /
+     * WezTerm / ghostty / tmux / Windows Terminal 上开 ENABLE_KITTY_KEYBOARD。
+     *
+     * 同一个仓库已经为**同一件事**双写过两次(logPaneAction 的 `c === 'g' && key.shift`、
+     * ScrollKeybindingHandler 同款)。
+     */
+    const log: string[] = []
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        onRedo={() => log.push('redo')}
+        onRedoFailed={n => log.push(`redoFailed:${n.id}`)}
+        onExitKey={() => {}}
+      />,
+    )
+    t.stdin.press(DOWN); await tick()
+    // kitty 协议的 Shift+R。这个序列由仓库自己的 parse-keypress 解析,不是我手写的假事件。
+    t.stdin.press('\u001b[82;2u'); await tick()
+    app.unmount()
+    expect(log).toEqual(['redoFailed:root/00-a'])
+  })
+
+  it('出口键排在这一行最前面 —— 光标移到失败节点上不许把它挤掉', async () => {
+    /**
+     * 评审用真渲染量到:出口原来排在**末尾**,于是 100 列时光标从一个正常节点移到失败节点,
+     * `R`/`s` 两句话一进来 `Esc/q 退出` 当场消失 —— 移一下光标就把出口弄丢了。
+     * 运行中那一截(p/i/x)更糟:60~126 列上一律没有出口。
+     */
+    for (const cols of [60, 80, 100, 120]) {
+      const { t, app } = await mount(
+        <TaskTreePanel
+          nodes={TREE()} runId="003" interactive
+          onRedo={() => {}} onRedoFailed={() => {}} onSkipFailed={() => {}}
+          runControl={{
+            paused: false, onTogglePause: () => {}, onAddDirective: () => {},
+            onCancelNode: () => {}, onAdjustParallelism: () => {},
+          }}
+          onExitKey={() => {}}
+        />,
+        cols,
+      )
+      t.stdin.press(DOWN); await tick()   // 停在失败节点上(最挤的那一种情形)
+      const f = t.lastFrame()
+      app.unmount()
+      expect(`${cols} 列有出口: ${f.includes('Esc/q 退出')}`).toBe(`${cols} 列有出口: true`)
+    }
+  })
+
+  it('错误屏上回车**什么都不做** —— 页脚只写了「q / Esc 返回」', async () => {
+    /**
+     * 评审实按:屏上是「没有失败(当前 ACCEPTED),没有环节可跳」+「q / Esc 返回」,
+     * 而按回车真的触发了 onConfirm。`runSkip` 会二次校验所以不毁数据,但屏幕刚说这件事
+     * 做不到,回车就做了 —— 而回车是最容易误按的那个键。
+     */
+    let confirms = 0
+    let cancels = 0
+    const done = [mk('x', { status: 'ACCEPTED' })]
+    const { t, app } = await mount(
+      <ConfirmSkip
+        nodes={done} targetId="x" now={NOW}
+        onConfirm={() => { confirms++ }} onCancel={() => { cancels++ }}
+      />,
+    )
+    expect(t.lastFrame()).toContain('没有失败')
+    t.stdin.press('\r'); await tick()
+    t.stdin.press('y'); await tick()
+    t.stdin.press('e'); await tick()
+    expect([confirms, cancels]).toEqual([0, 0])
+    // 出口照旧管用。
+    t.stdin.press('q'); await tick()
+    app.unmount()
+    expect([confirms, cancels]).toEqual([0, 1])
+  })
+
+  it('重做关口的「节点不存在」屏同理:回车不许开跑', async () => {
+    // `initialEntry` 预置了 picked,于是 redoGateAction 在那一支会把回车当确认 ——
+    // 屏幕说「节点不存在: nope」,回车却把 onConfirm('execute') 发了出去。
+    const seen: unknown[] = []
+    let cancels = 0
+    const { t, app } = await mount(
+      <ConfirmRedo
+        nodes={TREE()} targetId="nope" now={NOW} initialEntry="execute"
+        onConfirm={(e, g) => seen.push([e, g])} onCancel={() => { cancels++ }}
+      />,
+    )
+    expect(t.lastFrame()).toContain('节点不存在')
+    t.stdin.press('\r'); await tick()
+    t.stdin.press('y'); await tick()
+    expect(seen).toEqual([])
+    t.stdin.press('q'); await tick()
+    app.unmount()
+    expect(cancels).toBe(1)
+  })
+
+  it('再按一次 e 是**接着改**,不是从空开始', async () => {
+    // 页脚在写过一次之后写的是「e 改写补充指引」,而输入框原来每次挂载都从空开始:
+    // 想改一个错字的人只补了半句,原句就被替换掉了。
+    const seen: unknown[] = []
+    const { t, app } = await mount(
+      <ConfirmSkip nodes={TREE()} targetId="root/00-a" now={NOW} onConfirm={g => seen.push(g)} onCancel={() => {}} />,
+    )
+    t.stdin.press('e'); await tick()
+    for (const ch of ['甲', '乙']) { t.stdin.press(ch); await tick() }
+    t.stdin.press('\r'); await tick()
+    expect(t.lastFrame()).toContain('改写补充指引')
+    t.stdin.press('e'); await tick()
+    // 原文还在屏幕上 —— 而不是一个空输入框。
+    expect(t.lastFrame()).toContain('甲乙')
+    t.stdin.press('丙'); await tick()
+    t.stdin.press('\r'); await tick()
+    t.stdin.press('\r'); await tick()
+    app.unmount()
+    expect(seen).toEqual([{ scope: 'all', text: '甲乙丙' }])
+  })
+})

@@ -236,6 +236,10 @@ export function validateLoadedNodes(
     // NEVER interrupted: reseat reopens interrupted nodes, and a node blocked because its
     // own disk state is unusable must stay blocked.
     n.interrupted = false
+    // 手工跳过的一次性标记也要清。这条路阻断的理由是「这棵树自己对不上」(子节点缺失、
+    // 依赖成环……),而一个带着 `skipPhase` 的节点一旦被别的路复活,会跳过一关**它自己
+    // 都还没走到**的判决。同一个函数里 capBlocked 正是为这一类硬清的。
+    n.skipPhase = undefined
     // Same door, and it was left open: a node that had legitimately tripped a valve keeps
     // capBlocked === true, so a later --retry-blocked reopened it even though this pass has
     // since blocked it for an UNRECOVERABLE reason (a missing child/dep, a cycle). The resume
@@ -411,6 +415,34 @@ export function validateLoadedNodes(
     if (n.skipPhase !== undefined && !SKIPPABLE_PHASES.has(n.skipPhase as string)) {
       repairs.push(`节点 ${n.id}:要跳过的环节 ${String(n.skipPhase)} 不在可跳过之列,已清除`)
       n.skipPhase = undefined
+    }
+    /**
+     * 光校验**值**不够 —— 还要校验这个节点**有没有活可跳**。
+     *
+     * 评审实跑出来的那一条:手写一个 `status: READY, kind: executable, skipPhase: accept`
+     * 的 node.md(空 plan、空 execStatus)→ 校验一句 repair 都不出 → stepExecute 从判决段
+     * 进来 → **ACCEPTED,零次模型调用**,唯一留痕是 execStatus 上一句**假话**
+     * 「用户在阻断后按了跳过」。这正是「不谎报完成」那条底线。
+     *
+     * 判据是**证据**,不是 `failedAt`:合法的跳过(planSkip)恰好会把 failedAt 清掉,
+     * 拿它当判据会把用户真按过的那一次跳过在恢复时静默撤销。而证据是查得到的 ——
+     * 跳过验收/测试验证意味着「执行者已经交过东西」,跳过质疑讨论意味着「有一份方案」,
+     * 跳过集成验收意味着「有子任务」。同一个函数里 `confirmedDraft` 正是为这一类硬挡的。
+     */
+    if (n.skipPhase !== undefined) {
+      const hasWork =
+        n.skipPhase === 'accept' || n.skipPhase === 'verify'
+          ? typeof n.execStatus === 'string' && n.execStatus.trim().length > 0
+          : n.skipPhase === 'review'
+            ? `${n.plan?.solution ?? ''}${n.plan?.keyPoints ?? ''}${n.plan?.acceptance ?? ''}`.trim().length > 0
+            : (n.childIds ?? []).length > 0
+      if (!hasWork) {
+        repairs.push(
+          `节点 ${n.id}:盘上写着要跳过${String(n.skipPhase)},但这个节点还没有可被跳过的产出` +
+          `(执行自述/方案/子任务都是空的),已清除 —— 否则它会零调用地判为已验收`,
+        )
+        n.skipPhase = undefined
+      }
     }
     /**
      * 补充指引。它**会被原样拼进提示词**,所以这里逐条过:键必须是合法环节名或 `all`,

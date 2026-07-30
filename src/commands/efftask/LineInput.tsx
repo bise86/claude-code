@@ -27,14 +27,30 @@ export function LineInput(props: {
   hint: string
   /** 长度上限(按码点)。 */
   maxChars: number
-  /** 键盘归不归这一屏。见上面第 1 条。 */
+  /**
+   * 初始文本 —— 再进来一次时接着改,而不是从空开始。
+   *
+   * 重做/跳过关口的页脚在写过一次之后写的是「e **改写**补充指引」,而不给这个 prop 的话
+   * 进来是空的:想改一个错字的人只补了半句,原句就被替换掉了(评审实测)。
+   */
+  initialText?: string
+  /**
+   * 键盘归不归这一屏。见上面第 1 条。
+   *
+   * **今天只有 `AddDirective` 真的传它**,而那是唯一在**运行中**弹出来的输入框 ——
+   * 重做/跳过关口只挂在 done 视图上,那时 run 已经结束,不会有在飞的调用弹权限框。
+   * 如实记下来,而不是让上面那条「必须有」读起来像每个调用点都在遵守它。
+   */
   isActive?: boolean
   /** 页脚右边的补充说明(可选),比如「留空 = 不补充」。 */
   footerNote?: string
   onSubmit: (text: string) => void
   onCancel: () => void
 }): React.ReactElement {
-  const [text, setText, textRef] = useLiveState('')
+  // 按码点夹到上限:传进来的初值也可能超(它上一次就是这么被夹的,但调用方不该依赖那个)。
+  const [text, setText, textRef] = useLiveState(
+    Array.from(props.initialText ?? '').slice(0, props.maxChars).join(''),
+  )
 
   useInput((input, key) => {
     if (key.escape) { props.onCancel(); return }

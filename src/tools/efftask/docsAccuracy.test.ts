@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
-import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_PARALLELISM, MIN_PARALLELISM, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
+import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_PARALLELISM, MAX_ROLE_GUIDANCE, MIN_PARALLELISM, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
 import { redoOptions, redoUnavailableReason } from './redo'
 import { ROLE_API_PROTOCOLS, TRANSLATING_PROTOCOLS } from '../../services/api/openaiCompat/protocols'
 import { toResponsesRequest } from '../../services/api/openaiCompat/toResponsesRequest'
@@ -364,10 +364,28 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     }
   })
 
-  it('说裁决类环节看得到全部指引,那那一组环节就得逐字对得上', () => {
-    expect(README).toContain(norm('**裁决类环节（质疑讨论 / 测试验证 / 验收 / 集成验收 / 观察）看得到全部指引**'))
+  it('说裁决席位额外读哪一条,那分流表就得逐字对得上', () => {
+    /**
+     * README 那张表说的是「质疑讨论读分析那条,验收/测试验证/集成验收/观察读执行那条」。
+     * 原来两边写的都是「看得到**全部**」,而成本评审量出来那是 18× 放大 —— 一半用不上
+     * (评审判方案时一行代码都还没写)。所以文档和代码都收窄了,这条闸门跟着改。
+     */
+    expect(README).toContain(norm('**裁决类环节会额外读到「它判的那件事」对应的那条指引**'))
+    expect(README).toContain(norm('| 质疑讨论 | **方案**（那时一行代码都还没写） | 给「分析」的那条 |'))
+    expect(README).toContain(norm('| 测试验证 / 验收 / 集成验收 / 观察 | **产出** | 给「执行」的那条 |'))
     const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    // 哪些环节算「裁决」(决定要不要加那句「按补充后的意图判」)。
     expect(src).toContain("new Set<PhaseName>(['review', 'verify', 'accept', 'integrate', 'observer'])")
+    // 而**读哪一条**是另一张表 —— 两张表分开,因为「是不是裁决」和「判的是什么」是两件事。
+    expect(src).toContain("    review: 'plan',")
+    expect(src).toContain("    verify: 'execute', accept: 'execute', integrate: 'execute', observer: 'execute',")
+  })
+
+  it('说每条指引 2000 字上限、角色指引最多 20 条,那代码里就得是这两个数', () => {
+    // 这两个数是用户唯一读得到的那一份,而它们在 parseDirectives、resumeCore 两处夹取。
+    expect(README).toContain(norm('每条指引上限 2000 字、点名给角色的最多 20 条'))
+    expect(MAX_GUIDANCE_CHARS).toBe(2000)
+    expect(MAX_ROLE_GUIDANCE).toBe(20)
   })
 
   it('说「只在真的能点时才写回车/点击」,那文案就得跟着可用性变', () => {

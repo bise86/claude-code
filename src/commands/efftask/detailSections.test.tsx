@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { createStreamStore } from '../../tools/efftask/agentStream.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
-import { NodeDetail } from './NodeDetail.js'
+import { NodeDetail, detailSections } from './NodeDetail.js'
 
 const NOW = new Date().toISOString()
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, 30))
@@ -290,5 +290,46 @@ describe('两个页卡', () => {
     t.stdin.press(DOWN); await tick()
     app.unmount()
     expect(at().cursor).toBe(0)
+  })
+})
+
+describe('补充指引(你写的)必须有地方看得见', () => {
+  /**
+   * 它会被**原样拼进提示词**,而「同一处再写一次是替换」—— 不显示的话,用户没有任何办法
+   * 知道这个节点上此刻挂着哪几句话、上一次写的那句还在不在。
+   *
+   * 断言落在 `detailSections`(纯函数)上而不是帧上:段落列表是数据,而屏幕上任何时刻只有
+   * 其中一屏 —— 「这一段在不在」和「它有没有恰好滚到可视区」是两件事。
+   */
+  const mk = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id: 'root', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+
+  it('按环节列,「整个任务」那条排最前', () => {
+    const secs = detailSections(mk({
+      guidance: { execute: '先跑 bun test', all: '别动 src/legacy', review: '重点看并发' },
+    }))
+    const g = secs.find(s => s.title === '补充指引(你写的)')
+    expect(g).toBeDefined()
+    // 「整个任务」覆盖面最大,排最前;其余按 PHASE_NAMES 的次序(和环节耗时、名册一致)。
+    expect(g!.body.split('\n')).toEqual([
+      '整个任务: 别动 src/legacy',
+      '质疑讨论: 重点看并发',
+      '执行: 先跑 bun test',
+    ])
+  })
+
+  it('没写过就整段不出现 —— 空段落是死格', () => {
+    expect(detailSections(mk()).some(s => s.title === '补充指引(你写的)')).toBe(false)
+    // 全是空白也一样。**两个分支都要验**:`all` 和某个环节键各走一条判断,只验前者时
+    // 「环节键的空白也画出来」这条变异是活的(实测存活)—— 而那会画出一行「执行: 」,
+    // 一个看起来像内容丢了的空槽。
+    expect(detailSections(mk({ guidance: { all: '   ' } })).some(s => s.title === '补充指引(你写的)')).toBe(false)
+    expect(detailSections(mk({ guidance: { execute: '  \t ' } })).some(s => s.title === '补充指引(你写的)')).toBe(false)
+    // 一个有内容 + 一个空白:只画有内容的那一行。
+    const mixed = detailSections(mk({ guidance: { execute: '  ', review: '看并发' } }))
+      .find(s => s.title === '补充指引(你写的)')!
+    expect(mixed.body).toBe('质疑讨论: 看并发')
   })
 })

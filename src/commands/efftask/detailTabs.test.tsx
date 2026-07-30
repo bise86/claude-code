@@ -440,15 +440,18 @@ describe('页卡切换不重挂日志窗 —— 滚动位置不许被清掉', ()
       { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
     )
     await tick()
-    t.stdin.press('n'); await tick()   // 切到第 2 条流
-    t.stdin.press('n'); await tick()   // 切到第 3 条流
+    // 初值是最后一条(见 logView.initialSelectedStream),两下 n 从 2 绕到 1。
+    t.stdin.press('n'); await tick()   // 2 → 0(绕回头)
+    t.stdin.press('n'); await tick()   // 0 → 1
     const before = seen[seen.length - 1]
-    expect(before).toBe(2)
+    expect(before).toBe(1)
     t.stdin.press(RIGHT); await tick() // → 任务页卡
     t.stdin.press(RIGHT); await tick() // → 转回输出页卡
     app.unmount()
-    // 重挂的话这几个 useLiveState 会被清空,选中的流回到 0 —— 用户会以为自己按错了。
-    expect(seen[seen.length - 1]).toBe(2)
+    // 重挂的话这几个 useLiveState 会被清空,选中的流回到**初值**(最后一条,这里是 2)
+    // —— 用户会以为自己按错了。所以断言的是「和切走之前一样」,而不是某个固定下标:
+    // 前者才是这条用例要守的性质。
+    expect(seen[seen.length - 1]).toBe(before)
   })
 })
 

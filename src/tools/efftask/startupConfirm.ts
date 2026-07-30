@@ -1,4 +1,5 @@
 import { DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES, PHASE_LABEL } from './types.js'
+import { stripControl } from './persistence.js'
 import { allowsMultipleSeats } from './roleDefs.js'
 import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
 
@@ -393,7 +394,16 @@ export function guidanceLines(config: EffTaskConfig): string[] {
   }
   for (const g of config.roleGuidance ?? []) {
     if (g.text.trim().length === 0) continue
-    out.push(`→ 角色/员工「${g.name}」: ${clip(g.text.replace(/\s+/g, ' '), ROSTER_BUDGET)}`)
+    /**
+     * **名字也要夹、也要剥控制符。**
+     *
+     * 原来只夹了正文,名字原样插进去 —— 评审用真渲染量到:400 个汉字的名字**全部进帧**,
+     * 在 80 列的关口框里折成 9 行,把后面的段落和页脚顶出屏幕;`ESC[41m` 之类也活着进了帧
+     * (`\s+ → ' '` 那一步不匹配 U+001B)。
+     *
+     * `stripControl` 是仓库里现成的那一份 —— `serializeNode` 为一模一样的理由用它。
+     */
+    out.push(`→ 角色/员工「${clip(stripControl(g.name), ROSTER_BUDGET)}」: ${clip(stripControl(g.text).replace(/\s+/g, ' '), ROSTER_BUDGET)}`)
   }
   return out
 }

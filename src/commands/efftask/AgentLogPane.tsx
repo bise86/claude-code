@@ -6,6 +6,7 @@ import {
   anchoredFrom,
   budgetRows,
   foldedStreams,
+  initialSelectedStream,
   logPaneAction,
   logPaneMode,
   renderStreamLines,
@@ -143,7 +144,12 @@ export function AgentLogPane(props: AgentLogPaneProps): React.ReactElement {
    */
   const [, setAnchor, anchorRef] = useLiveState<LogAnchor>({ stream: 0, delta: 0 })
   const [, setFollow, followRef] = useLiveState(true)
-  const [, setSelected, selectedRef] = useLiveState(0)
+  /**
+   * 选中哪一条流。初值是**最后一条** —— 见 logView 的 initialSelectedStream:
+   * 一个正在跑的节点手上必然已经有收口的分析/评审流,选第 0 条会让 ↑↓ 变成「选阶段」,
+   * 而用户进来是为了滚那条正在跑的输出。
+   */
+  const [, setSelected, selectedRef] = useLiveState(initialSelectedStream(props.streams.length))
   /**
    * 用户**显式**改过的折叠状态。没记录的流按默认走:运行中展开,已收口折叠。
    *

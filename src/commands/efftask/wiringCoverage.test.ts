@@ -561,6 +561,15 @@ describe('改回去要变红的四处', () => {
     expect(SRC).toContain('onAdjustParallelism: d => {')
     expect(SRC).toContain('const cur = control.parallelism() ?? config.parallelism')
     expect(SRC).toContain('control.setParallelism(cur + d)')
+    /**
+     * 按下之后**当场重绘**那一句。
+     *
+     * 验收量过删掉它的真实后果:树还活着时靠 TaskTreePanel 那个 1s tick 兜底(≤1s 延迟),
+     * 而那个 tick 的条件是「还有非终态节点」—— **全终态时它 clearInterval,表头就永久不动**,
+     * 按了完全没反应。而删掉这一行全套 2600+ 条测试照绿(验收造的变异存活了),
+     * 所以这一跳只能在这里钉。
+     */
+    expect(SRC).toContain('setParallelismTick(t => t + 1)')
     // 夹取只有一份(control 里),这里不许再算一遍 —— 两份夹取会在边界上分叉,
     // 而表头和页脚会各说一个数。
     expect(SRC).not.toContain('Math.min(MAX_PARALLELISM')

@@ -362,16 +362,30 @@ export function TaskTreePanel(props: {
 
   useInput((input, key) => {
     const k = input.toLowerCase()
+    /**
+     * Shift+R —— **两种写法都要认**。
+     *
+     * kitty 键盘协议 / modifyOtherKeys 的终端送的是 `ESC[82;2u`,而仓库自己的 parse-keypress
+     * 把它解成 `input='r', shift=true`;传统终端送的是裸 `R`。只判 `input === 'R'` 的话,
+     * 在 iTerm / kitty / WezTerm / ghostty / tmux / Windows Terminal 上(`ink.tsx` 正是在这些
+     * 终端里写 ENABLE_KITTY_KEYBOARD)这个键会掉到下一行的 `k === 'r'` 上 —— 用户按 R
+     * 拿到的是「自己选环节」那个三屏菜单,而快速重做这个键彻底消失。评审用真的
+     * parse-keypress 送序列复现过。
+     *
+     * 同一个仓库已经为**同一件事**双写过两次(`logView.logPaneAction` 的 `c === 'g' &&
+     * key.shift`、`ScrollKeybindingHandler` 同款),这里跟着来。
+     */
+    const shiftR = input === 'R' || (k === 'r' && key.shift === true)
     // Detail view owns Esc/q/Enter while it is open; only after it closes do those keys mean
     // "leave the panel" again.
     if (detail) {
       // 详情页是判断「这个节点到底哪儿错了」的地方 —— 看完就想重做,最不该逼用户先退回
       // 树上再按一次 r。快速重做和跳过同理,而且更是:详情页正是他刚看完阻断原因的地方。
       //
-      // **`R` 要排在 `r` 之前**,而且判的是 `input` 原文不是 `k`:下面那一句用的是
+      // **`R` 要排在 `r` 之前**,而且判据要收两种终端写法(见 shiftR):下面那一句用的是
       // `k === 'r'`(已经 toLowerCase 过),所以 Shift+R 会先被它吃掉 —— 用户按 R
       // 拿到的是「自己选环节」那个三屏菜单,而快速重做这个键彻底消失。
-      if (input === 'R' && props.onRedoFailed) { setDetailId(null); props.onRedoFailed(detail); return }
+      if (shiftR && props.onRedoFailed) { setDetailId(null); props.onRedoFailed(detail); return }
       if (k === 's' && props.onSkipFailed) { setDetailId(null); props.onSkipFailed(detail); return }
       if (k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
       // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
@@ -385,7 +399,7 @@ export function TaskTreePanel(props: {
     // 重做。放在方向键**之前**,因为它不依赖 rows 之外的任何东西,而且放后面会被
     // 下面那些 `return` 挡掉一半路径。
     // `R`(快速重做失败环节)排在 `r` 前面,理由见详情页那一支:`k` 已经小写过了。
-    if (input === 'R' && props.onRedoFailed && current) { props.onRedoFailed(current); return }
+    if (shiftR && props.onRedoFailed && current) { props.onRedoFailed(current); return }
     if (k === 's' && props.onSkipFailed && current) { props.onSkipFailed(current); return }
     if (k === 'r' && props.onRedo && current) { props.onRedo(current); return }
     // 运行中的人工干预。同样放在方向键之前,同样的理由。
@@ -601,9 +615,6 @@ export function TaskTreePanel(props: {
         // 多一行就是 25 行,而 24 行是极常见的默认 —— 底部的计数和提示会被顶出去。
         // 分隔符不用 '·':「待定」那个字形本身就是 '·',读起来会变成三项。
         <Text dimColor wrap="truncate-end">
-          {props.runControl
-            ? `${props.runControl.paused ? '⏸ 已暂停(p 恢复)' : 'p 暂停'} · i 追加指令 · x 取消选中任务    `
-            : ''}
           {props.suspended === true
             // 不说的话,用户会按着方向键发现树不动,以为界面卡死了。
             ? '⏸ 等你回答上面那个权限确认 —— 这期间按键归它'
@@ -618,16 +629,28 @@ export function TaskTreePanel(props: {
              * 「为什么点不了」由详情页页签条右侧那个专门的位置来说,那里有地方。
              */
             /**
-             * `R` / `s` **只在光标停在一个失败节点上时才写**。
-             *
-             * 两条理由,方向一致:
-             *  1. 它们对一个没失败的节点本来就不可用(按下去只会得到一句「这个任务没有失败」),
-             *     而一个按了只会被拒绝的键写在页脚上,和一个按了没反应的键一样糟;
-             *  2. 这一行是 `wrap="truncate-end"`,实测已经贴着 80 列 —— 无条件多写 20 列
-             *     会把右边的 `Esc/q 退出` 吃掉,也就是用「两个只在特定行有用的键」换掉
-             *     「怎么退出去」。
+             * `R` / `s` **只在光标停在一个失败节点上时才写**:它们对一个没失败的节点本来就
+             * 不可用(按下去只会得到一句「这个任务没有失败」),而一个按了只会被拒绝的键
+             * 和一个按了没反应的键一样糟。
              */
-            : `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定    ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · ${detailEntryHint(mouse)}${props.onRedo ? ' · r 重做' : ''}${failedKeysHint} · Esc/q 退出`}
+            /**
+             * **「怎么出去」排在最前面。**
+             *
+             * 这一行是 `wrap="truncate-end"`,而它在真实宽度上一定会被截。评审用真渲染量到
+             * 出口原来排在**末尾**的两个后果:
+             *  - 运行中(带 p/i/x 那一截)整行 123 列,**60~126 列上一律没有 `Esc/q 退出`**;
+             *  - 光标从一个正常节点移到一个失败节点,`R`/`s` 两句话一进来,100 列上
+             *    `Esc/q 退出` 当场消失 —— 移一下光标就把出口弄丢了。
+             *
+             * 所以次序按「被截掉的先后」定,不按「读起来顺」:
+             * 出口 → 干预/动作键 → 导航 → 图例。图例最先被吃掉是对的 —— 它是三个字形的
+             * 说明,不是一件能做的事。
+             */
+            : `Esc/q 退出${props.runControl
+              ? ` · ${props.runControl.paused ? '⏸ 已暂停(p 恢复)' : 'p 暂停'} · i 追加指令 · x 取消选中任务`
+              : ''}${props.onRedo ? ' · r 重做' : ''}${failedKeysHint}`
+              + ` · ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · ${detailEntryHint(mouse)}`
+              + `    ${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定`}
         </Text>
       ) : null}
     </Box>

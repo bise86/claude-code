@@ -409,6 +409,10 @@ export class EffTaskOrchestrator {
       // INTEGRATION_ACCEPT, REWORK… (and any status added later).
       for (const n of this.byId.values()) {
         if (isTerminal(n.status)) continue
+        // 失败点:这条路**清掉**它,而不只是「不记」。留着一个上一辈子的失败点,
+        // 会让「快速重做失败环节」和「跳过失败环节」在一个其实是被牵连的节点上放行 ——
+        // 评审实跑出来的 P0(见 redo.ts reopenAncestor 那一段)。
+        n.failedAt = undefined
         n.status = 'BLOCKED'
         // Mark WHY it is blocked, structurally. Resume must reopen the nodes this sweep
         // killed while leaving genuinely failed ones dead, and it cannot tell them apart
@@ -441,6 +445,9 @@ export class EffTaskOrchestrator {
         const depDangling = n.deps.some(id => !this.byId.has(id))
         const depBlocked = n.deps.some(id => this.byId.get(id)?.status === 'BLOCKED')
         if (parentBlocked || childBlocked || childMissing || depBlocked || depDangling) {
+          // 同上:被牵连的阻断要**清掉**过期的失败点,否则 R/s 会在这个节点上给出一个
+          // 属于它上一次失败的动作,而真正该动的节点在别处。
+          n.failedAt = undefined
           n.status = 'BLOCKED'
           if (!n.blockedReason) {
             n.blockedReason = childBlocked ? '子节点阻断'

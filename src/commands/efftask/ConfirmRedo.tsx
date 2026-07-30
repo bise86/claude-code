@@ -352,6 +352,18 @@ export function ConfirmRedo(props: {
     guidanceScopeFor(entry, scopeRef.current ?? 'phase')
 
   useInput((input, key) => {
+    /**
+     * 「节点不存在」那一屏上**只有出口**。
+     *
+     * 评审实按出来的:那一屏的页脚只写「q / Esc 返回」,而 `initialEntry` 预置了 `picked`
+     * 之后,`redoGateAction` 在 `picked !== null` 那一支会把回车当**确认**——于是屏幕说
+     * 「节点不存在: nope」,回车却把 `onConfirm('execute')` 发出去了。`runRedo` 会二次校验
+     * 所以不毁数据,但回车是最容易误按的那个键,而屏幕刚说这件事做不到。
+     */
+    if (!target) {
+      if (key.escape || input.toLowerCase() === 'q') props.onCancel()
+      return
+    }
     // 全部判定归 redoGateAction —— 这里只负责把结果落到 state / 回调上。
     const act = redoGateAction(
       key, input,
@@ -405,6 +417,8 @@ export function ConfirmRedo(props: {
         title={`补一句提示词给${scopeText}`}
         hint={'它会被拼进该环节的提示词(裁决类环节也看得到,并被告知按补充后的意图判)。同一处再写一次是替换。'}
         maxChars={MAX_GUIDANCE_CHARS}
+        // 再进来一次是**接着改**,不是从空开始 —— 页脚在写过之后写的就是「改写」。
+        initialText={note}
         footerNote="留空 = 不补充"
         onSubmit={t => { setNote(t); setNoting(false) }}
         // 取消**只关这一屏**,不取消整次重做 —— 用户可能只是改主意不补了。

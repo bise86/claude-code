@@ -5,6 +5,7 @@ import type { AgentEvent } from '../../tools/efftask/agentEvents.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
 import { runControlAction,
   foldedStreams,
+  initialSelectedStream,
   logPaneMode,
   budgetRows,
   lastActivity,
@@ -947,5 +948,37 @@ describe('⎿ 的归属:provider 没给 id 时也不能瞎认主人', () => {
     const line = ls.find(l => l.includes('读到了'))!
     expect(line).toContain('100ms · 读到了')
     expect(line.includes('Read(a.ts)')).toBe(false)
+  })
+})
+
+describe('打开时选中哪一条流', () => {
+  it('最后一条 —— 那是最新那次调用,在跑的节点上就是正在跑的那条', () => {
+    /**
+     * 选第 0 条的后果评审用真渲染量到:一个正在跑的节点手上必然已经有收口的分析/评审流,
+     * `streams = [已完成, 已完成, 运行中]` 时 selected=0 落在一条**折叠**的流上 →
+     * ↑↓ 变成「选阶段」,而用户进来是为了看那条正在跑的输出。README 写着
+     * 「节点还在跑时进去 ↑↓ 就是滚它的实时输出,和以前一样」——那一版把「以前一样」拿走了。
+     *
+     * 最后一条同时是**视口本来就停在的那一条**(follow 粘底),所以「选中的」和「看得见的」
+     * 对上了。
+     */
+    expect(initialSelectedStream(3)).toBe(2)
+    expect(initialSelectedStream(1)).toBe(0)
+    // 一条流都没有时不许是 -1:那会让 logPaneMode 走越界分支,而 0 是它自然的空态。
+    expect(initialSelectedStream(0)).toBe(0)
+  })
+
+  it('配上折叠状态之后:在跑的节点开出来是滚动,跑完的是选阶段', () => {
+    const s = (closed: boolean) => ({ closed })
+    // [已完成, 已完成, 运行中] —— 最后一条展开着 → read。
+    const running = [s(true), s(true), s(false)]
+    expect(logPaneMode(
+      foldedStreams(running, new Map()), initialSelectedStream(running.length), running.length,
+    )).toBe('read')
+    // 全跑完 —— 最后一条折着 → select。
+    const done = [s(true), s(true), s(true)]
+    expect(logPaneMode(
+      foldedStreams(done, new Map()), initialSelectedStream(done.length), done.length,
+    )).toBe('select')
   })
 })

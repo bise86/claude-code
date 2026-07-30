@@ -94,20 +94,22 @@ describe('n 切到哪条流,视口就停在哪条', () => {
     const { store } = twoStreams()
     const m = await mountPane(store)
     expect(m.last().follow).toBe(true) // 初始粘底
+    // 初值是最后一条(第 1 条),所以这一下 n 绕回第 0 条。
+    expect(m.last().selected).toBe(1)
     m.t.stdin.press(NEXT_STREAM)
     await tick()
     m.app.unmount()
     // 关掉跟随是这条修复的一半:原来只在「找得到表头」时才关,于是切到一条还没渲染出
     // 表头的流时,视口继续粘在底部那条正在跑的流上 —— 正是用户抱怨的现象。
     expect(m.last().follow).toBe(false)
-    expect(m.last().selected).toBe(1)
+    expect(m.last().selected).toBe(0)
   })
 
   it('切过去之后,正在跑的那条流再吐输出也**抢不走**视口', async () => {
     const { store, exec } = twoStreams()
     const m = await mountPane(store)
-    // n 两下回到第 0 条(分析)。
-    m.t.stdin.press(NEXT_STREAM); await tick()
+    // n 一下从初值(最后一条)绕回第 0 条(分析)—— 关键是选中的**不是**那条会继续
+    // 吐输出的执行流,否则「视口不被抢走」这条断言测的是空气。
     m.t.stdin.press(NEXT_STREAM); await tick()
     expect(m.last().selected).toBe(0)
     const parked = m.last().from
@@ -127,8 +129,14 @@ describe('n 切到哪条流,视口就停在哪条', () => {
   it('一条流跑完折叠、上方塌掉时,视口跟着选中的流走', async () => {
     const { store, plan } = twoStreams()
     const m = await mountPane(store)
-    m.t.stdin.press(NEXT_STREAM); await tick() // 选中第 1 条(执行)
+    // 初值就是第 1 条(执行)—— 上方那条塌掉时锚必须跟着它走。
     expect(m.last().selected).toBe(1)
+    // 先离开粘底:跟随时 from 恒等于 maxFrom,塌掉之后它自然也变小,那样这条断言测的
+    // 是粘底而不是锚。按 n 两下回到第 1 条并把 follow 关掉。
+    m.t.stdin.press(NEXT_STREAM); await tick()
+    m.t.stdin.press(NEXT_STREAM); await tick()
+    expect(m.last().selected).toBe(1)
+    expect(m.last().follow).toBe(false)
     const before = m.last().from
 
     // 第 0 条(分析)收口 → 默认折叠 → 它那十几行当场塌掉。

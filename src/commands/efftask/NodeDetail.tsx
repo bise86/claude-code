@@ -9,6 +9,7 @@ import {
   anchoredFrom,
   clipToWidth,
   foldedStreams,
+  initialSelectedStream,
   logPaneMode,
   scrollWindow,
   sectionLines,
@@ -361,8 +362,12 @@ export function NodeDetail(props: {
   const [logMode, setLogMode, logModeRef] = useLiveState<LogPaneMode>(
     // 种子必须和窗口挂载那一刻算出来的**逐字相同**:不同的话第一帧的页脚是错的,而且
     // 那次纠正会多写一帧 —— 详情页的行数断言(按累积写入数行)会因此超预算 1 行。
-    // 窗口挂载时 override 是空的、selected 是 0,所以这里就是那一刻的状态。
-    logPaneMode(foldedStreams(props.streams ?? [], new Map()), 0, (props.streams ?? []).length),
+    // 窗口挂载时 override 是空的、selected 是最后一条(initialSelectedStream),所以这里就是那一刻的状态。
+    logPaneMode(
+      foldedStreams(props.streams ?? [], new Map()),
+      initialSelectedStream((props.streams ?? []).length),
+      (props.streams ?? []).length,
+    ),
   )
 
   const sections = detailSections(n, props.resolveNode)
@@ -488,15 +493,23 @@ export function NodeDetail(props: {
    * 「Esc/q 返回任务树」正好是被吃掉的那一截。把出口放在末尾,等于用「还有哪些花活」
    * 换掉了「怎么退出去」。截断只许吃掉最不重要的那一头。
    */
+  /**
+   * 重做/跳过那几个键。
+   *
+   * **排在导航说明之后**(见下面 footer 的拼接次序)。原来紧跟在出口后面,而评审用真渲染
+   * 量到:100 列 + 一个失败节点时,`r · R · s` 三句话把这次新加的「↑↓ 两种含义」整段挤出
+   * 屏幕 —— 而那一段正是用户此刻最需要的说明。次序按被截掉的先后定:出口 → 导航 → 动作键。
+   *
+   * 后两个只在这个节点真的失败了时才写 —— 一个按了只会被拒绝的键和一个按了没反应的键
+   * 一样糟。
+   */
   const redoHint = (props.canRedo ? ' · r 重做本任务' : '')
-    // 这两个键只在这个节点真的失败了时才写 —— 一个按了只会被拒绝的键和一个按了没反应的键
-    // 一样糟,而这一行本来就在和宽度打架(见下面 footer 的注释)。
     + (props.canRedoFailed ? ' · R 重做失败环节' : '')
     + (props.canSkipFailed ? ' · s 跳过它' : '')
   const footer = ((): string => {
-    if (zone === 'tabs') return `Esc/q 返回任务树${redoHint} · ←→ 选页卡 · 回车/空格 进入 · Tab 回内容`
+    if (zone === 'tabs') return `Esc/q 返回任务树 · ←→ 选页卡 · 回车/空格 进入 · Tab 回内容${redoHint}`
     if (tab === 'log') {
-      if (!logPaneMounted) return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签`
+      if (!logPaneMounted) return `Esc/q 返回任务树 · ←→ 换页卡 · Tab 到页签${redoHint}`
       /**
        * ↑↓ 在这一屏有**两个**含义,所以这一行必须跟着模式变。
        *
@@ -507,9 +520,9 @@ export function NodeDetail(props: {
       const nav = logMode === 'select'
         ? '↑↓/jk 选阶段 · 空格 展开(之后 ↑↓ 滚它的内容)'
         : '↑↓/jk 滚动 · 空格 收起(回到选阶段)'
-      return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ${nav} · n 下一条 · g/G 顶部/底部 · t 思考 · 耗时含等你批权限的时间`
+      return `Esc/q 返回任务树 · ${nav} · ←→ 换页卡 · Tab 到页签 · n 下一条 · g/G 顶部/底部 · t 思考${redoHint} · 耗时含等你批权限的时间`
     }
-    return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签 · ↑↓/jk 选段落 · 空格 展开/收起 · ^u/^d 翻页`
+    return `Esc/q 返回任务树 · ↑↓/jk 选段落 · 空格 展开/收起 · ←→ 换页卡 · Tab 到页签 · ^u/^d 翻页${redoHint}`
   })()
 
   return (

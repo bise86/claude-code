@@ -527,6 +527,15 @@ export const SKIPPABLE_PHASES: ReadonlySet<string> = new Set<PhaseName>(['review
  */
 export const MAX_GUIDANCE_CHARS = 2000
 
+/**
+ * 点名给角色/员工的额外要求最多几条。
+ *
+ * 和 `MAX_DIRECTIVES` 同一个数、同一个理由,而这里的乘子更大:每一条都要和**每一个**
+ * 名字对得上的席位见面,而席位本身已经是 (角色 × 员工) 展平的。评审实测 40 条合计
+ * 80190 码点,让评审那一席单次前言到 181446 码点。
+ */
+export const MAX_ROLE_GUIDANCE = 20
+
 /** 一个阶段的席位上限默认值。 */
 export const DEFAULT_MAX_SEATS_PER_PHASE = 5
 

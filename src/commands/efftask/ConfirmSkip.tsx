@@ -48,12 +48,29 @@ export function ConfirmSkip(props: {
     return 'error' in r ? { error: r.error } : { plan: r }
   }, [target, props.nodes, props.targetId, props.now, props.phases])
 
+  const phase = target ? failedPhaseOf(target) : undefined
+  // 关口打开之前调用方已经用同一份判据挡过一次了(见 TaskTreePanel 的 s 键),所以这一屏
+  // 通常不会渲染错误态。留着它是因为树在关口开着的时候还会变(重做会重启编排),
+  // 而一屏白屏比一句原因糟得多。
+  const why = target ? skipFailedPhaseReason(target, props.phases) : `节点不存在: ${props.targetId}`
+  /**
+   * 这一屏此刻是不是**错误屏**。
+   *
+   * 算在 `useInput` **之前**,因为它要管键盘:评审实按出来的问题是错误屏的页脚只写
+   * 「q / Esc 返回」,而按**回车**真的触发了 `onConfirm` —— 屏幕刚说这件事做不到,
+   * 回车就做了,而回车是最容易误按的那个键。`runSkip` 会二次校验所以不毁数据,
+   * 但「屏幕上写着的键和按下去发生的事不一样」本身就是这个仓库反复付学费的那一类。
+   */
+  const errored = !target || why !== undefined || phase === undefined || !preview
+
   useInput((input, key) => {
     // 补提示词那一屏的键盘整个归 LineInput —— 和重做关口逐字同因:不让路的话,
     // 用户写「q 要改成小写」的那个 q 会把整个关口关掉,他刚打的字全没了。
     if (notingRef.current) return
     const k = input.toLowerCase()
     if (key.escape || k === 'q' || k === 'n') { props.onCancel(); return }
+    // 错误屏上**只有出口**。页脚写的就是这一句,不许多做一件事。
+    if (errored) return
     if (k === 'e') { setNoting(true); return }
     if (key.return || k === 'y') {
       const t = noteRef.current.trim()
@@ -72,12 +89,7 @@ export function ConfirmSkip(props: {
     )
   }
 
-  const phase = failedPhaseOf(target)
-  // 关口打开之前调用方已经用同一份判据挡过一次了(见 TaskTreePanel 的 s 键),所以这一屏
-  // 通常不会渲染错误态。留着它是因为树在关口开着的时候还会变(重做会重启编排),
-  // 而一屏白屏比一句原因糟得多。
-  const why = skipFailedPhaseReason(target, props.phases)
-  if (why || phase === undefined || !preview) {
+  if (errored) {
     return (
       <Box borderStyle="round" paddingX={1} flexDirection="column">
         <Text bold color="warning">跳过失败环节</Text>
@@ -93,6 +105,8 @@ export function ConfirmSkip(props: {
         title={`补一句提示词给「${target.title}」的每一个环节`}
         hint="它会被拼进本节点之后每个环节的提示词(裁决类环节也看得到,并被告知按补充后的意图判)。"
         maxChars={MAX_GUIDANCE_CHARS}
+        // 同 ConfirmRedo:再进来一次接着改。
+        initialText={note}
         footerNote="留空 = 不补充"
         onSubmit={t => { setNote(t); setNoting(false) }}
         onCancel={() => setNoting(false)}

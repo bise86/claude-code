@@ -144,8 +144,11 @@ describe('AgentLogPane 的折叠', () => {
       streams: [stream({ closed: false, events: lines('一', '二') }), stream({ closed: true, endedAt: Date.now(), events: lines('三') })],
     })
     expect(last().folded).toEqual([1])
+    // 初值选中**最后一条**(见 logView.initialSelectedStream):第 1 条已收口、默认折着,
+    // 所以第一下空格是把它**展开**。
+    expect(last().selected).toBe(1)
     t.stdin.press(' '); await tick()
-    expect(last().folded).toEqual([0, 1]) // 选中的是第 0 条,把它折起来
+    expect(last().folded).toEqual([])
     t.stdin.press(' '); await tick()
     expect(last().folded).toEqual([1])
     app.unmount()
@@ -155,12 +158,14 @@ describe('AgentLogPane 的折叠', () => {
     const { t, app, last } = await mount({
       streams: [stream({ events: lines('甲') }), stream({ events: lines('乙') }), stream({ events: lines('丙') })],
     })
-    expect(last().selected).toBe(0)
+    // 初值是最后一条(见 logView.initialSelectedStream),n 从那里往后绕。
+    expect(last().selected).toBe(2)
+    t.stdin.press(TAB); await tick()
+    expect(last().selected).toBe(0) // 绕回头
     t.stdin.press(TAB); await tick()
     expect(last().selected).toBe(1)
     t.stdin.press(TAB); await tick()
-    t.stdin.press(TAB); await tick()
-    expect(last().selected).toBe(0) // 绕回来
+    expect(last().selected).toBe(2) // 回到初值
     app.unmount()
   })
 
@@ -170,15 +175,18 @@ describe('AgentLogPane 的折叠', () => {
     // 的当前值」和「读选中那条的当前值」算出来一样,探针是空的。
     const { t, app, last } = await mount({
       streams: [
-        stream({ closed: true, endedAt: Date.now(), events: lines('甲') }),
+        stream({ closed: false, events: lines('甲') }),
         stream({ closed: false, events: lines('乙') }),
-        stream({ closed: false, events: lines('丙') }),
+        stream({ closed: true, endedAt: Date.now(), events: lines('丙') }),
       ],
     })
-    expect(last().folded).toEqual([0])   // 默认:收口的折起来
-    t.stdin.press(TAB); await tick()     // 选中第 1 条(还在跑,默认展开)
+    expect(last().folded).toEqual([2])   // 默认:收口的折起来
+    // 初值选中最后一条(第 2 条,已折);按 n 走到第 0 条(还在跑,默认展开)——
+    // 两者的默认折叠状态不同,所以「读第 0 条」和「读选中那条」算出来不一样,探针不是空的。
+    t.stdin.press(TAB); await tick()
+    expect(last().selected).toBe(0)
     t.stdin.press(' '); await tick()
-    expect(last().folded).toEqual([0, 1])
+    expect(last().folded).toEqual([0, 2])
     app.unmount()
   })
 })
@@ -327,14 +335,18 @@ describe('折叠的阶段:↑↓ 选阶段,展开后 ↑↓ 滚内容', () => {
     stream({ closed: true, events: lines(...[...Array(20)].map((_, i) => `丙${i}`)) }),
   ]
 
-  it('全折着时 ↓ 换的是**选中的流**,不是滚动', async () => {
+  it('全折着时 ↑↓ 换的是**选中的流**,不是滚动', async () => {
     const { t, app, last } = await mount({ streams: three() })
     expect(last().mode).toBe('select')
+    // 初值是**最后一条**(见 logView.initialSelectedStream:一个在跑的节点手上必然已经有
+    // 收口的分析/评审流,选第 0 条会让 ↑↓ 在他最想看的那条输出上变成「选阶段」)。
+    expect(last().selected).toBe(2)
+    t.stdin.press(UP); await tick()
+    expect(last().selected).toBe(1)
+    t.stdin.press(UP); await tick()
     expect(last().selected).toBe(0)
     t.stdin.press(DOWN); await tick()
     expect(last().selected).toBe(1)
-    t.stdin.press(DOWN); await tick()
-    expect(last().selected).toBe(2)
     app.unmount()
   })
 
@@ -342,16 +354,16 @@ describe('折叠的阶段:↑↓ 选阶段,展开后 ↑↓ 滚内容', () => {
     // `n` 是「下一条」(循环),这是列表光标。循环的话在第一条上按 ↑ 会跳到最后一条 ——
     // 而那条通常正是还在跑、一直在动的那条,也就是用户抱怨过的现象。
     const { t, app, last } = await mount({ streams: three() })
-    t.stdin.press(UP); await tick()
-    expect(last().selected).toBe(0)
     for (let i = 0; i < 5; i++) { t.stdin.press(DOWN); await tick() }
-    expect(last().selected).toBe(2)
+    expect(last().selected).toBe(2) // 已经在末尾,再按也不绕
+    for (let i = 0; i < 5; i++) { t.stdin.press(UP); await tick() }
+    expect(last().selected).toBe(0) // 撞到头就停
     app.unmount()
   })
 
   it('空格展开选中那条之后,↑↓ 变成滚它的内容', async () => {
     const { t, app, last } = await mount({ streams: three() })
-    t.stdin.press(DOWN); await tick()            // 选中第二条
+    t.stdin.press(UP); await tick()              // 从末尾往上,选中第二条
     expect(last().selected).toBe(1)
     t.stdin.press(' '); await tick()             // 展开
     expect(last().folded).toEqual([0, 2])
@@ -370,7 +382,7 @@ describe('折叠的阶段:↑↓ 选阶段,展开后 ↑↓ 滚内容', () => {
     expect(last().mode).toBe('read')
     t.stdin.press(' '); await tick()
     expect(last().mode).toBe('select')
-    t.stdin.press(DOWN); await tick()
+    t.stdin.press(UP); await tick()
     expect(last().selected).toBe(1)
     app.unmount()
   })
@@ -390,10 +402,10 @@ describe('折叠的阶段:↑↓ 选阶段,展开后 ↑↓ 滚内容', () => {
 
   it('j/k 跟着 ↑↓ 走 —— 页脚只写一句「↑↓/jk」,两者不一样那句话就是假的', async () => {
     const { t, app, last } = await mount({ streams: three() })
-    t.stdin.press('j'); await tick()
-    expect(last().selected).toBe(1)
     t.stdin.press('k'); await tick()
-    expect(last().selected).toBe(0)
+    expect(last().selected).toBe(1)
+    t.stdin.press('j'); await tick()
+    expect(last().selected).toBe(2)
     app.unmount()
   })
 
@@ -404,10 +416,10 @@ describe('折叠的阶段:↑↓ 选阶段,展开后 ↑↓ 滚内容', () => {
      */
     const { t, app, last } = await mount({ streams: three() })
     t.stdin.press('G'); await tick()
-    expect(last().selected).toBe(0)
+    expect(last().selected).toBe(2)   // 选中的一动不动 —— 这是视口的键
     expect(last().follow).toBe(true)
     t.stdin.press('g'); await tick()
-    expect(last().selected).toBe(0)
+    expect(last().selected).toBe(2)
     expect(last().from).toBe(0)
     app.unmount()
   })
@@ -416,10 +428,10 @@ describe('折叠的阶段:↑↓ 选阶段,展开后 ↑↓ 滚内容', () => {
     // 「模式」不是一个独立的开关,而是**选中那条流的折叠状态**。展开甲、再选到乙,
     // ↑↓ 必须变回选阶段 —— 乙还是折着的。
     const { t, app, last } = await mount({ streams: three() })
-    t.stdin.press(' '); await tick()
+    t.stdin.press(' '); await tick()   // 展开最后一条
     expect(last().mode).toBe('read')
-    t.stdin.press('n'); await tick()
-    expect(last().selected).toBe(1)
+    t.stdin.press('n'); await tick()   // n 从末尾绕回第 0 条(它还折着)
+    expect(last().selected).toBe(0)
     expect(last().mode).toBe('select')
     app.unmount()
   })

@@ -351,3 +351,43 @@ describe('编排器每一轮现读上限', () => {
     expect(orch.slotUsage().limit).toBe(2)
   })
 })
+
+describe('等待者不许随调度循环无界增长', () => {
+  it('N 轮循环等的是**同一个** promise —— 表长恒为 1', async () => {
+    /**
+     * 评审量出来的:调度循环每转一圈注册一个等待者,而只有 setParallelism 会清表 ——
+     * 用户不碰并发度就永远不清。实跑一棵 11 节点的树跑完积压 22 个 resolver
+     * (随后一次 setParallelism 一起兑现 22/22,证明全程被持有)。
+     *
+     * 探针:同一代数下反复要 promise,拿到的必须是同一个对象。这条断言直接说出「共享」
+     * 这件事,而数「积压了几个」要伸手进私有状态。
+     */
+    const c = createRunControl()
+    const seen = c.parallelismGeneration()
+    const first = c.waitForParallelism(seen)
+    for (let i = 0; i < 50; i++) {
+      expect(c.waitForParallelism(seen)).toBe(first)
+    }
+    // 变更之后是**新的**那一个(旧的已经兑现,再等它会立刻返回 → 循环空转)。
+    c.setParallelism(3)
+    await first
+    const after = c.waitForParallelism(c.parallelismGeneration())
+    expect(after).not.toBe(first)
+  })
+
+  it('一次变更把之前所有在等的人一起放行', async () => {
+    const c = createRunControl()
+    const seen = c.parallelismGeneration()
+    let woke = 0
+    for (let i = 0; i < 5; i++) void c.waitForParallelism(seen).then(() => { woke++ })
+    await tick(2)
+    expect(woke).toBe(0)
+    c.setParallelism(4)
+    await tick(2)
+    expect(woke).toBe(5)
+    // 再变一次不许把已经兑现的那批再唤醒一遍(那是「表只涨不落」的另一面)。
+    c.setParallelism(5)
+    await tick(2)
+    expect(woke).toBe(5)
+  })
+})
