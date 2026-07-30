@@ -999,6 +999,15 @@ export function planSkip(
      * 执行者重跑。不做的话 execStatus 里还写着「我实现了 feature.ts」而没有任何重做注记。
      */
     if (!isDecomposed(target)) resetForExecute(target, worktreesToRelease)
+    /**
+     * ⚠ **这四跳都要有**,而这一跳原来是空的。
+     *
+     * 关口用 `⚠` 标「这一跳换掉了什么质量保证」,而那些 ⚠ 全部来自 `plan.warnings` ——
+     * 只有 accept / integrate 往里 push 过。验收实测:跳过质疑讨论和跳过测试验证的 ⚠ 条数
+     * **都是 0**,而这两个恰恰是「换掉了质量保证」最明显的两个(方案没人质疑就往下走、
+     * 一个测试都不实跑)。README 承诺这一屏会用 ⚠ 标出来,那就得真的标。
+     */
+    warnings.push('这份方案**没有任何人质疑过**就进入下一步 —— 漏项和隐藏依赖不会在这里被拦下')
     seatedAt = 'CREATED'
   } else if (phase === 'verify' || phase === 'accept') {
     /**
@@ -1011,6 +1020,9 @@ export function planSkip(
     target.iteration = { ...target.iteration, acceptance: 0, scoring: 0, mergeResolve: 0 }
     if (phase === 'accept') {
       warnings.push('本节点的产出**不会有任何人核对**就合进集成分支 —— 这正是你按下这个键要的效果,但它没有回头路')
+    } else {
+      // 同上:这一跳的 ⚠ 原来也是空的。
+      warnings.push('**一个测试都不会被实跑** —— 之后的验收只能读执行者的自述')
     }
     seatedAt = 'READY'
   } else {

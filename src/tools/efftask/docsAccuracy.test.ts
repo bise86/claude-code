@@ -339,10 +339,14 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(README).toContain(norm('它正处在哪个状态就记在'))
     const types = readFileSync(new URL('src/tools/efftask/types.ts', ROOT), 'utf8')
     expect(types).toContain('failedAt?: NodeStatus')
-    // 而且它只在**节点自己失败**时记 —— propagateBlocked 那条路一个字都不写,否则
-    // 「这个节点不是自己失败的」那句话就成了假的。
-    const orch = readFileSync(new URL('src/tools/efftask/orchestrator.ts', ROOT), 'utf8')
-    expect(orch).toContain('这条路**刻意不记 failedAt**')
+    /**
+     * 「它只在节点自己失败时记」这半句**不在这里测**。
+     *
+     * 原来这里 grep 的是 orchestrator.ts 里的一句注释,而验收一针见血:grep 注释证明不了
+     * 接线 —— 把那一行清理代码删掉、注释留着,这条断言照样绿(实测存活)。行为归
+     * failedPhase.test.ts 里那几条「被牵连的阻断要清掉过期的失败点」,它们真的跑
+     * propagateBlocked / planRedo / reseat。这里只留字段声明这一条源码断言。
+     */
   })
 
   it('说跳过验收/测试验证时执行不重跑,那 pipeline 里就得有那条豁免', () => {

@@ -12,7 +12,7 @@
 // the confirmation gates exist to prevent.
 import { ANSWER_TAGS, answerTag, parsePlanOutput } from './parseOutput.js'
 import type { StreamHandle } from './agentStream.js'
-import { planPrompt, type PlanPromptCtx } from './pipeline.js'
+import { planPrompt, seatPreamble, type PlanPromptCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import { createNode } from './types.js'
 import type { EffTaskConfig, NodeKind, NodePlan, TaskNode } from './types.js'
@@ -101,6 +101,8 @@ export async function draftRootPlan(args: {
   // byId holds only the root: it has no deps and no children yet, so depsSection renders
   // empty — the same string the run's first plan call would produce.
   const ctx = { config, byId: new Map([[root.id, root]]), worktrees: args.worktrees, cwd: args.cwd }
+  // 两次调用同一席 —— 取一次,免得重拟那次悄悄换了人。
+  const seat = config.phaseRoles.plan[0] ?? null
   let text: string
   try {
     text = await runAgent({
@@ -108,7 +110,18 @@ export async function draftRootPlan(args: {
       node: root,
       role: config.phaseRoles.plan[0] ?? null,
       system: 'plan',
-      prompt: planPrompt(root, ctx, tag, args.feedback ?? ''),
+      /**
+       * **第五个参数(前言)不许省。**
+       *
+       * 它是 `seatBrief`(这一席的角色简报)+ 定向注入(用户在 /et 提示词里点名给分析环节
+       * 或给这一席的话)的唯一通道,而这里是根节点分析调用的**正常路径** ——
+       * 用户在第三关批准之后,`stepStart` 会消费 `confirmedDraft` 并**跳过它自己那次
+       * plan 调用**。所以省掉它的后果不是「少一段」,是「整棵树的第一份方案什么都收不到」:
+       * 角色简报从来没到过根方案作者手上(这一条比定向注入更早就断着),而
+       * 「分析时先按文件边界拆」这类话被写在提示词里、抽取对了、关口也显示了,
+       * 却一个字都不会进那次调用。
+       */
+      prompt: planPrompt(root, ctx, tag, args.feedback ?? '', seatPreamble(ctx, seat, 'plan', root)),
       signal,
       stream: args.stream,
     })
@@ -148,6 +161,8 @@ export async function draftRootPlan(args: {
           { ...root, plan: parsed.plan }, ctx, retryTag,
           [args.feedback, `上一版方案不合格:${gaps.join(';')}。请补齐这几处,其余部分保留。`]
             .filter(Boolean).join('\n'),
+          // 重拟同样要带前言 —— 少了它,这一次调用比第一次知道得**更少**,而它的任务是补齐。
+          seatPreamble(ctx, seat, 'plan', root),
         ),
         signal, stream: args.retryStream?.(),
       })

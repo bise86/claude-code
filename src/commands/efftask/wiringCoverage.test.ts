@@ -570,6 +570,27 @@ describe('改回去要变红的四处', () => {
      * 所以这一跳只能在这里钉。
      */
     expect(SRC).toContain('setParallelismTick(t => t + 1)')
+  })
+
+  it('运行中的树上**没有** r / R / s 三个键 —— 编排器正握着这些节点', () => {
+    /**
+     * README 明写着这一条,而它此前**没有任何东西守着**:给 `RunningView` 接上
+     * `onRedo` / `onRedoFailed` / `onSkipFailed` 三个回调,全套测试 0 fail(验收实测)。
+     * 接上去的后果是重做会在编排器正在改这些节点的时候动它们 —— 而 `redoUnavailableReason`
+     * 那道闸门只挡「被 Esc 中断过的 run」,挡不住「run 还在跑」。
+     *
+     * 断言落在**渲染 RunningView 的那一处 JSX** 上:它是这个挂不起来的文件里唯一的接线点。
+     */
+    const running = element('RunningView')
+    expect(running).toContain('runControl={{')
+    for (const wire of ['onRedo=', 'onRedoFailed=', 'onSkipFailed=']) {
+      expect(`RunningView 上有 ${wire}: ${running.includes(wire)}`).toBe(`RunningView 上有 ${wire}: false`)
+    }
+    // 而 DoneView 上三个都在 —— 否则这条断言用「两边都没有」也能满足。
+    const done = SRC.slice(SRC.indexOf('<DoneView'))
+    for (const wire of ['onRedo=', 'onRedoFailed=', 'onSkipFailed=']) {
+      expect(`DoneView 上有 ${wire}: ${done.includes(wire)}`).toBe(`DoneView 上有 ${wire}: true`)
+    }
     // 夹取只有一份(control 里),这里不许再算一遍 —— 两份夹取会在边界上分叉,
     // 而表头和页脚会各说一个数。
     expect(SRC).not.toContain('Math.min(MAX_PARALLELISM')

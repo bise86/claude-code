@@ -101,8 +101,16 @@ describe('表头一行装得下 —— 那是行预算的前提', () => {
     return { ...t, app }
   }
 
-  it(`${HEADER_HINT_MIN_COLUMNS} 列时 并行占用 + \`+/-\` + 用量合计 仍在同一行`, async () => {
-    const m = await mountAt(HEADER_HINT_MIN_COLUMNS)
+  it('72 列时 并行占用 + `+/-` + 用量合计 仍在同一行', async () => {
+    /**
+     * 宽度写**字面量 72**,不是 `HEADER_HINT_MIN_COLUMNS`。
+     *
+     * 从常量自己推导的话,这两条用例永远钉不住那个值 —— 验收实测把它改成
+     * 73/80/100 全套照绿,而改成 100 之后 80 列终端不再画 `+/-`,README 的
+     * 「窄于 72 列」当场变假。常量和字面量必须分开断言,这才是「值本身」被守住。
+     */
+    expect(HEADER_HINT_MIN_COLUMNS).toBe(72)
+    const m = await mountAt(72)
     const f = m.lastFrame()
     m.app.unmount()
     // 一行的证据:三者之间没有换行。中间那些空格数不能断言 —— `plain()` 把每段 ANSI
@@ -110,8 +118,8 @@ describe('表头一行装得下 —— 那是行预算的前提', () => {
     expect(f).toMatch(/并行 2\/7[^\n]*\+\/-[^\n]*⇅/)
   })
 
-  it(`窄于 ${HEADER_HINT_MIN_COLUMNS} 列时整段不画 —— 4 列换两行表头不值`, async () => {
-    const m = await mountAt(HEADER_HINT_MIN_COLUMNS - 1)
+  it('窄于 72 列时整段不画 —— 4 列换两行表头不值', async () => {
+    const m = await mountAt(71)
     const f = m.lastFrame()
     m.app.unmount()
     expect(f).toContain('并行 2/7')

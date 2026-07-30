@@ -21,8 +21,10 @@ import {
 import { commitForTest, stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipeline.js'
 import { byIdMap } from './stateMachine.js'
 import { reseatTransientNodes } from './reseat.js'
+import { createRunControl } from './control.js'
+import { EffTaskOrchestrator } from './orchestrator.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM, MAX_GUIDANCE_CHARS } from './types.js'
-import type { EffTaskConfig, NodeStatus, TaskNode } from './types.js'
+import type { EffTaskConfig, NodeStatus, PhaseName, TaskNode } from './types.js'
 import type { RunAgentFn } from './roundtable.js'
 
 const NOW = '2026-07-30T00:00:00Z'
@@ -784,5 +786,88 @@ describe('下游兄弟被解开时,过期的失败点也要清', () => {
     expect(b.failedAt).toBeUndefined()
     // 于是 s 在它上面不再放行(它此刻根本不是一个失败节点)。
     expect(skipFailedPhaseReason(b)).toContain('没有失败')
+  })
+})
+
+describe('验收员 C 查出来的那几条', () => {
+  it('propagateBlocked 真的清掉过期的失败点 —— 不是靠注释', async () => {
+    /**
+     * 原来唯一的护栏是对 orchestrator.ts 里一句**注释**的 grep,而验收指出:把清理那一行
+     * 删掉、注释留着,断言照样绿。所以这条改成真跑编排器:让子节点失败,父节点被
+     * propagateBlocked 扫成 BLOCKED,然后看它身上那个**上一辈子**的失败点在不在。
+     */
+    const nodes = [
+      mk({ id: 'root', kind: 'decompose', childIds: ['root/01-a'], status: 'WAITING_CHILDREN', failedAt: 'INTEGRATION_ACCEPT' }),
+      mk({ id: 'root/01-a', parentId: 'root', depth: 1, kind: 'executable', status: 'BLOCKED', blockedReason: '执行失败' }),
+    ]
+    const orch = new EffTaskOrchestrator(
+      cfg(),
+      {
+        runAgent: (async () => { throw new Error('不该被调用') }) as unknown as RunAgentFn,
+        persist: async () => {}, now: () => NOW, onUpdate: () => {},
+      },
+      new AbortController().signal,
+      nodes,
+    )
+    const out = await orch.run()
+    expect(out.status).toBe('blocked')
+    const root = orch.nodes().find(n => n.id === 'root')!
+    expect(root.status).toBe('BLOCKED')
+    expect(root.blockedReason).toBe('子节点阻断')
+    // 过期的失败点被清掉了 —— 于是 R/s 在它上面照实说「这个节点不是自己失败的」。
+    expect(root.failedAt).toBeUndefined()
+    expect(skipFailedPhaseReason(root)).toContain('子任务')
+  })
+
+  it('调并发度**不碰**已登记的在飞调用 —— 一个都不 abort', () => {
+    /**
+     * 「在跑的任务不受影响」这条,编排器那一档的测试注入的是假 runAgent,而
+     * `registerCall` 只接在 `runAgentAdapter` 里 —— 于是「让 setParallelism abort 掉所有在飞
+     * 控制器」这条变异**存活**(验收实测)。这里直接在 RunControl 这一层验:登记几个真的
+     * AbortController,反复调整上限,一个都不许被 abort。
+     */
+    const c = createRunControl()
+    const controllers = [new AbortController(), new AbortController(), new AbortController()]
+    const offs = controllers.map((ac, i) => c.registerCall(`n${i}`, ac))
+    for (const n of [1, 8, 2, 64, 1, 5]) c.setParallelism(n)
+    expect(controllers.map(ac => ac.signal.aborted)).toEqual([false, false, false])
+    // 对照:cancelNode 才是那个会 abort 的动作 —— 探针因此不是空的。
+    c.cancelNode('n1')
+    expect(controllers.map(ac => ac.signal.aborted)).toEqual([false, true, false])
+    for (const off of offs) off()
+  })
+})
+
+describe('四跳的 ⚠ 一个都不许空', () => {
+  it('每一种跳过都至少有一条 ⚠ 说清换掉了什么质量保证', () => {
+    /**
+     * 关口用 ⚠ 标「这一跳换掉了什么」,而那些 ⚠ 全部来自 `plan.warnings` —— 验收实测:
+     * 跳过质疑讨论和跳过测试验证的 ⚠ 条数**都是 0**,而这两个恰恰是最明显的两个
+     * (方案没人质疑就往下走、一个测试都不实跑)。README 承诺这一屏会用 ⚠ 标出来。
+     */
+    const cases: { phase: PhaseName; nodes: TaskNode[] }[] = [
+      {
+        phase: 'review',
+        nodes: [mk({
+          status: 'BLOCKED', failedAt: 'PLAN_REVIEW', kind: 'executable',
+          plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+        })],
+      },
+      { phase: 'verify', nodes: [mk({ status: 'BLOCKED', failedAt: 'VERIFYING', kind: 'executable', execStatus: '干完了' })] },
+      { phase: 'accept', nodes: [mk({ status: 'BLOCKED', failedAt: 'ACCEPTANCE', kind: 'executable', execStatus: '干完了' })] },
+      {
+        phase: 'integrate',
+        nodes: [
+          mk({ id: 'root', kind: 'decompose', childIds: ['root/01-a'], status: 'BLOCKED', failedAt: 'INTEGRATION_ACCEPT' }),
+          mk({ id: 'root/01-a', parentId: 'root', depth: 1, kind: 'executable', status: 'ACCEPTED' }),
+        ],
+      },
+    ]
+    for (const { phase, nodes } of cases) {
+      const r = planSkip(nodes, 'root', NOW)
+      if ('error' in r) throw new Error(`${phase}: ${r.error}`)
+      const warned = skipSummary(r, nodes[0]!, phase, {}).filter(l => l.startsWith('⚠'))
+      expect(`${phase} 的 ⚠ 条数: ${warned.length}`).not.toBe(`${phase} 的 ⚠ 条数: 0`)
+    }
   })
 })

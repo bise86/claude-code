@@ -1214,6 +1214,28 @@ export function seatPreamble(
     if (!seatMatchesName(seat, g.name)) continue
     out.push(guidanceBlock(`点名给你(${g.name})的额外要求(来自本次任务提示词):`, g.text))
   }
+  /**
+   * 裁决席位还要读到**点名给它所判那件事的执行者**的话。
+   *
+   * 和环节定向那一条(上面的 `cross`)是同一个坑,只是换了一扇门:用户写
+   * 「让 opus-执行 别动 src/legacy」→ 那位执行者照做 → 验收员拿着补话之前定下的验收点
+   * 对照产出 → 判不通过 → 返工 → 撞满迭代上限。按角色/员工点名的话在这条通道上原来
+   * 完全不扩散,而它和按环节点名的话在语义上没有任何区别。
+   *
+   * 判据是「这个名字在 cross 那个环节上有席位吗」—— 用本次真实名册算,不是猜。
+   */
+  if (cross) {
+    const crossSeats = ctx.config.phaseRoles?.[cross] ?? []
+    for (const g of ctx.config.roleGuidance ?? []) {
+      // 已经因为「点名给这一席」印过的,不再印第二遍。
+      if (seatMatchesName(seat, g.name)) continue
+      if (!crossSeats.some(s => seatMatchesName(s, g.name))) continue
+      out.push(guidanceBlock(
+        `用户点名给「${g.name}」(负责${PHASE_LABEL[cross]})的额外要求(它已收到,你按补充后的意图判):`,
+        g.text,
+      ))
+    }
+  }
   // 节点定向:重做/跳过时用户补给这个节点的话。
   if (node?.guidance) {
     out.push(guidanceBlock('用户对本任务补充的指引(优先级高于原方案的枝节):', node.guidance.all))
@@ -1880,6 +1902,13 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
         const resolve = await runPhase(ctx, {
           phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute',
           prompt:
+            /**
+             * **前言不许省。** 这是一次真正会写代码的调用(它在节点工作区里改冲突文件),
+             * 而它原来是全仓库唯一一个手搓提示词、既没有角色简报也没有定向注入的写调用。
+             * 后果:用户补了一句「别动 src/legacy」,执行环节照做了,而**解冲突这一次**
+             * 一个字都不知道 —— 偏偏它是最可能去改那些文件的一次。
+             */
+            seatPreamble(ctx, firstRole(node, 'execute'), 'execute', node) +
             `已把集成分支 ${quote(ctx.worktrees.integrationBranchName)} 合并进你的工作区,产生了冲突。` +
             `当前工作目录里就是冲突现场(带 <<<<<<< / >>>>>>> 标记)。\n` +
             `请解决冲突,保留双方的意图,不要简单丢弃任何一边;解决后 git add 冲突文件即可,不要提交。\n` +

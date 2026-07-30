@@ -396,9 +396,11 @@ export class EffTaskOrchestrator {
   // death propagates up the tree. `aborted` additionally sweeps every non-terminal node so
   // the final tree shows no phantom "running" rows after an interrupt.
   //
-  // 这条路**刻意不记 failedAt**:这里的每一次阻断都不是该节点自己的失败(子节点阻断 /
-  // 上级任务阻断 / 依赖阻断 / 整轮被中止)。记上去的后果是「快速重做失败环节」在一个
-  // 其实是它孩子挂了的父节点上提供一个动作,而真正要动的节点在别处。见 TaskNode.failedAt。
+  // 这条路**清掉 failedAt**,而不只是不记它:这里的每一次阻断都不是该节点自己的失败
+  // (子节点阻断 / 上级任务阻断 / 依赖阻断 / 整轮被中止),而节点上可能还留着**上一辈子**
+  // 那次真失败的记录。留着的后果是「快速重做失败环节」和「跳过失败环节」在一个其实是
+  // 它孩子挂了的父节点上放行 —— 评审实跑出来的 P0,而落下的一次性标记很久以后才生效。
+  // 见 TaskNode.failedAt。
   // INVARIANT: every in-flight step must be settled before calling this. It awaits inside
   // a LIVE `for (const n of this.byId.values())` iterator, so a concurrent createChildren
   // inserting mid-sweep would be visited — or not — unpredictably.

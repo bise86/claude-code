@@ -232,7 +232,15 @@ describe('跳过关口', () => {
     expect(t.lastFrame()).toContain('补一句提示词')
     for (const ch of ['补', '上', '测', '试']) { t.stdin.press(ch); await tick() }
     t.stdin.press('\r'); await tick()   // 提交那句话 → 回确认屏
-    expect(t.lastFrame()).toContain('补充指引')
+    /**
+     * 断言**后果清单那一行的形状**,不是裸的「补充指引」。
+     *
+     * 验收抓到的:页脚在 note 非空时写的是「e **改写补充指引**」,所以
+     * `toContain('补充指引')` 恒真 —— 把回显那一行整个删掉,用户打的字从屏幕上消失,
+     * 而这条用例 17 pass。这正是这个仓库反复付学费的 look-alike 断言。
+     */
+    expect(t.lastFrame()).toContain('补充指引(给整个任务)')
+    expect(t.lastFrame()).toContain('补上测试')
     t.stdin.press('\r'); await tick()   // 确认跳过
     app.unmount()
     expect(seen).toEqual([{ scope: 'all', text: '补上测试' }])

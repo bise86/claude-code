@@ -690,3 +690,60 @@ describe('重拟途中被中断', () => {
     expect(res.ok).toBe(false)
   })
 })
+
+describe('根方案这条通道也要收到前言(角色简报 + 定向注入)', () => {
+  /**
+   * 这是**正常路径下根节点唯一的一次分析调用**:用户在第三关批准之后,`stepStart` 会消费
+   * `confirmedDraft` 并跳过它自己那次 plan 调用。所以这里省掉前言的后果不是「少一段」,
+   * 是整棵树的第一份方案什么都收不到 —— 而角色简报这一条比定向注入更早就断着。
+   */
+  const guided = (over: Partial<EffTaskConfig> = {}) => cfg({
+    phaseGuidance: { plan: '先按文件边界切,别跨模块' },
+    roleGuidance: [{ name: '架构师', text: '每个子任务都要写清回滚步骤' }],
+    ...over,
+  })
+
+  /**
+   * **收全部提示词,断言第一个。**
+   *
+   * 第一版写的是 `seen = req.prompt`(后一次覆盖前一次),而 draftRootPlan 在方案有空字段时
+   * 会**自动重拟一次** —— 实测这个夹具下就是 2 次调用。于是断言打中的是重拟那一次,
+   * 而「第一次起草不带前言」这条变异**存活**了:探针在它要守的那一次调用上是瞎的。
+   */
+  const draftPrompts = async (c: EffTaskConfig): Promise<string[]> => {
+    const root = makeRootNode(c, NOW)
+    const prompts: string[] = []
+    await draftRootPlan({
+      root, config: c, signal: new AbortController().signal,
+      runAgent: async req => { prompts.push(req.prompt); return PLAN_REPLY },
+    })
+    expect(prompts.length).toBeGreaterThan(0)
+    return prompts
+  }
+
+  it('点名给分析环节的话进了根方案的**第一次**起草', async () => {
+    const prompts = await draftPrompts(guided())
+    expect(prompts[0]).toContain('先按文件边界切,别跨模块')
+  })
+
+  it('点名给这一席的话也进了 —— 按角色名和员工名都认', async () => {
+    const roles = emptyPhaseRoles()
+    roles.plan = [{ roleName: '甲', roleTag: '架构师' }]
+    const prompts = await draftPrompts(guided({ phaseRoles: roles }))
+    expect(prompts[0]).toContain('每个子任务都要写清回滚步骤')
+  })
+
+  it('空方案重拟那一次也带着前言 —— 它的任务是补齐,不该比第一次知道得更少', async () => {
+    const c = guided()
+    const root = makeRootNode(c, NOW)
+    const seen: string[] = []
+    const EMPTY = '```json\n{"kind":"executable","solution":"一句话","keyPoints":"","risks":"","acceptance":""}\n```'
+    await draftRootPlan({
+      root, config: c, signal: new AbortController().signal,
+      // 第一次回一份空方案(触发自动重拟),第二次回完整的。
+      runAgent: async req => { seen.push(req.prompt); return seen.length === 1 ? EMPTY : PLAN_REPLY },
+    })
+    expect(seen).toHaveLength(2)
+    expect(seen[1]).toContain('先按文件边界切,别跨模块')
+  })
+})

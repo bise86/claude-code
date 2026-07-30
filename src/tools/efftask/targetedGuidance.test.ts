@@ -34,11 +34,17 @@ const mk = (over: Partial<TaskNode> = {}): TaskNode => ({
   ...createNode({ id: 'root', title: '根任务', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
   ...over,
 })
-function ctxFor(nodes: TaskNode[], runAgent: RunAgentFn, config: EffTaskConfig): PipelineCtx {
+function ctxFor(
+  nodes: TaskNode[], runAgent: RunAgentFn, config: EffTaskConfig,
+  // 第四个参数原来没有,而我一度传了它 —— 于是隔离池被静默丢掉,解冲突那条路根本没走到
+  // (节点以「没有可用的隔离池」阻断,而断言看的是「有没有那次调用」)。
+  extra: Partial<PipelineCtx> = {},
+): PipelineCtx {
   return {
     config, byId: byIdMap(nodes), runAgent, persist: async () => {}, now: () => NOW,
     signal: new AbortController().signal, onUpdate: () => {},
     reserveNodes: () => ({ release: () => {} }),
+    ...extra,
   }
 }
 function memFs(): FsLike & { files: Map<string, string> } {
@@ -528,5 +534,106 @@ describe('成本评审查出来的那几条', () => {
     expect(accept).toContain('别动 legacy')
     // ……而分析那条已经体现在 node.plan 里,plan 本来就在它的提示词里,不必再抄一遍。
     expect(accept).not.toContain('按文件边界拆')
+  })
+})
+
+describe('解冲突那次写代码的调用也要收到前言', () => {
+  it('点名给执行环节/给这一席的话真的进了解冲突提示词', async () => {
+    /**
+     * 它是全仓库唯一一个手搓提示词、既没有角色简报也没有定向注入的**写调用**。后果:
+     * 用户补了一句「别动 src/legacy」,执行环节照做了,而解冲突这一次一个字都不知道 ——
+     * 偏偏它是最可能去改那些文件的一次(它在冲突现场逐处挑保留哪一边)。
+     */
+    const roles = emptyPhaseRoles()
+    roles.execute = [{ roleName: '甲' }]
+    const prompts: { phase: string; label?: string; prompt: string }[] = []
+    const n = mk({
+      status: 'READY', kind: 'executable', phaseRoles: roles,
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+      worktree: { branch: 'b', path: '/wt' },
+    })
+    let merges = 0
+    const ctx = ctxFor([n], (async (req: { phase: string; prompt: string }) => {
+      prompts.push({ phase: req.phase, prompt: req.prompt })
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改好了"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as unknown as RunAgentFn, cfg({
+      phaseRoles: roles,
+      phaseGuidance: { execute: '别动 src/legacy' },
+      roleGuidance: [{ name: '甲', text: '冲突处保留双方意图' }],
+    }), {
+      // biome-ignore lint/suspicious/noExplicitAny: 只需要合并那几个方法
+      worktrees: {
+        acquire: async () => ({ branch: 'b', path: '/wt', gitRoot: '/g' }),
+        // 第一次合并报冲突,逼出解冲突那次调用;第二次成功。
+        commitAndMerge: async () => (++merges === 1 ? { ok: false, kind: 'conflict', files: ['src/a.ts'] } : { ok: true, merged: true }),
+        mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
+        conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/a.ts'] }),
+        release: async () => ({ removed: true }),
+        integrationBranchName: 'int',
+        statusFingerprint: async () => 'fp',
+      } as any,
+    })
+    await stepExecute(n, ctx)
+    // 解冲突那一次的提示词认得出来:它是唯一带「冲突现场」的那一条。
+    const resolve = prompts.find(p => p.prompt.includes('冲突现场'))
+    expect(resolve).toBeDefined()
+    expect(resolve!.prompt).toContain('别动 src/legacy')
+    expect(resolve!.prompt).toContain('冲突处保留双方意图')
+  })
+})
+
+describe('角色定向也要向裁决席位扩散', () => {
+  it('点名给执行那一席的话,验收席位也读得到(并被告知按补充后的意图判)', async () => {
+    /**
+     * 和环节定向那条(CROSS)是同一个坑的另一扇门:用户写「让 甲 别动 src/legacy」→
+     * 那位执行者照做 → 验收员拿着补话之前定下的验收点判不通过 → 返工 → 撞满迭代上限。
+     * 按角色/员工点名的话原来在这条通道上完全不扩散,而它和按环节点名在语义上没有区别。
+     */
+    const roles = emptyPhaseRoles()
+    roles.execute = [{ roleName: '甲' }]
+    roles.accept = [{ roleName: '乙' }]
+    const prompts: { phase: string; prompt: string }[] = []
+    const n = mk({
+      status: 'READY', kind: 'executable', phaseRoles: roles,
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+    })
+    await stepExecute(n, ctxFor([n], (async (req: { phase: string; prompt: string }) => {
+      prompts.push({ phase: req.phase, prompt: req.prompt })
+      if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as unknown as RunAgentFn, cfg({
+      phaseRoles: roles,
+      roleGuidance: [{ name: '甲', text: '别动 src/legacy' }],
+    })))
+    const exec = prompts.find(p => p.phase === 'execute')!.prompt
+    const accept = prompts.find(p => p.phase === 'accept')!.prompt
+    expect(exec).toContain('别动 src/legacy')
+    // 验收席位读得到,而且被告知它是给执行者的、要按补充后的意图判。
+    expect(accept).toContain('别动 src/legacy')
+    expect(accept).toContain('负责执行')
+    expect(accept).toContain('都不算未完成')
+  })
+
+  it('点名给一个**和这一关无关**的角色,不许扩散过去', async () => {
+    // 「点名」两个字必须有意义:每一席多背一段不属于它的要求是要付钱的。
+    const roles = emptyPhaseRoles()
+    roles.review = [{ roleName: '丙' }]
+    roles.accept = [{ roleName: '乙' }]
+    const prompts: { phase: string; prompt: string }[] = []
+    const n = mk({
+      status: 'READY', kind: 'executable', phaseRoles: roles,
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+    })
+    await stepExecute(n, ctxFor([n], (async (req: { phase: string; prompt: string }) => {
+      prompts.push({ phase: req.phase, prompt: req.prompt })
+      if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as unknown as RunAgentFn, cfg({
+      phaseRoles: roles,
+      // 丙 只在质疑讨论那一关有席位,而验收判的是产出 —— 它不该读到给评审员的话。
+      roleGuidance: [{ name: '丙', text: '重点看并发' }],
+    })))
+    expect(prompts.find(p => p.phase === 'accept')!.prompt).not.toContain('重点看并发')
   })
 })
