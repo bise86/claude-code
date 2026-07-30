@@ -1,10 +1,10 @@
 // src/tools/efftask/pipeline.ts
 import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
-import { ALT_SOLUTION_CHARS, createNode, PHASE_LABEL } from './types.js'
+import { ALT_SOLUTION_CHARS, createNode, MANUAL_PASS_ROLE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
-import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
@@ -938,6 +938,87 @@ function consumeSkip(node: TaskNode, phase: PhaseName): void {
   if (node.skipPhase === phase) node.skipPhase = undefined
 }
 
+/**
+ * 这个环节被**强制通过**了吗 —— 两条来路,判据合成一个。
+ *
+ * 1. `node.forcePass`:用户在节点阻断之后按的那一次。落盘,`--resume` 之后还在。
+ * 2. `control.wasForcePassed`:用户在节点还在跑的时候预先批准的那一次。只活在内存里,
+ *    和 `cancelNode` 同寿 —— 进程没了就没了,而那是对的:它描述的是「这一趟我放行」,
+ *    不是节点自身的状态。
+ *
+ * **必须排在 `isSkipped` 之前判。** 两个标记同时挂在一个节点上时(用户先按跳过、
+ * 又按强制通过,或者反过来),留下记录的那一个赢:两者路由完全相同,而「有人放行过」
+ * 比「没人看过」信息更多,反过来则是把用户刚做出的判断丢掉。
+ *
+ * 注意 `skipSteps`(整个 run 跳过某环节)**不参与**:那是启动关口上批准的「这一档
+ * 质量保证整个不要了」,不是对某一份产出的放行,给它伪造裁决没有任何人做过判断。
+ */
+function isForcePassed(ctx: PipelineCtx, phase: PhaseName, node: TaskNode): boolean {
+  return node.forcePass === phase || ctx.control?.wasForcePassed(node.id, phase) === true
+}
+
+/**
+ * 消费掉一次强制通过 —— **两条来路都要清**。
+ *
+ * 只清节点上那个字段的话,一条预先批准会在返工循环里每一轮都再放行一次:用户按的是
+ * 「这一次放行」,拿到的是「这个节点的这个环节从此不再开会」。和 `consumeSkip` 一样
+ * 必须在分支**里面**清,不能在 step 开头 —— 开头清掉之后同一个 step 里后面那句
+ * `isForcePassed` 当场变假,环节照跑,而用户以为自己放行了。
+ */
+function consumeForcePass(ctx: PipelineCtx, node: TaskNode, phase: PhaseName): void {
+  if (node.forcePass === phase) node.forcePass = undefined
+  ctx.control?.clearForcePass(node.id, phase)
+}
+
+/**
+ * 人工强制通过那一条裁决记录。
+ *
+ * **`round` 由调用点给**,而且给的就是这一关本该用的那个表达式(评审用
+ * `iteration.planReview + 1`,验收用 `acceptLog.length + 1` …)。自己算一个的话,
+ * 这条记录会和它覆盖掉的那一轮撞号或跳号,而 node.md 的 `## 验收记录` 是按 round
+ * 读的 —— 升级卡片写的正是「先看该节点的验收记录」。
+ *
+ * **被覆盖的那一轮的阻断项抄进 comments。** 这是这条记录里最重要的一段:一条只写着
+ * 「通过」的人工裁决,和它推翻掉的那些意见分开存放时,事后读记录的人要自己去上下文里
+ * 找「他到底放行了什么」。抄一份进来,一行就答完。
+ */
+function manualPassRecord(
+  node: TaskNode, phase: PhaseName, round: number, overridden: string,
+): RoundtableRecord {
+  const what = overridden.trim()
+  return {
+    round,
+    verdicts: [{
+      role: MANUAL_PASS_ROLE,
+      pass: true,
+      blocking: [],
+      // 夹一次:overridden 来自 synthesized.blockingSummary,那个值本身已经按
+      // MAX_SUMMARY_CHARS 夹过,但它也可能来自一个手工编辑过的 node.md。
+      comments: what.length > 0
+        ? capText(`用户强制通过,覆盖了以下裁决意见: ${what}`, MAX_SUMMARY_CHARS)
+        : '用户强制通过(此前没有留下具体阻断项)',
+      manual: true,
+    }],
+    synthesized: { pass: true, blockingSummary: '' },
+    step: phase,
+  }
+}
+
+/**
+ * 走一次强制通过:留痕 + 记录 + 消费标记。四个环节共用,所以口径不会分叉。
+ *
+ * 顺序要紧 —— 先算 `overridden` 再消费:被覆盖的意见取自这个环节**已有的**最后一轮,
+ * 而 log 是就地 push 的。
+ */
+function applyForcePass(
+  ctx: PipelineCtx, node: TaskNode, phase: PhaseName,
+  log: RoundtableRecord[], round: number, note: string,
+): void {
+  noteOnNode(node, note)
+  log.push(manualPassRecord(node, phase, round, lastFailureFeedback(log)))
+  consumeForcePass(ctx, node, phase)
+}
+
 function firstRole(node: TaskNode, phase: 'plan' | 'execute' | 'observer') {
   return node.phaseRoles[phase][0] ?? null
 }
@@ -1465,7 +1546,22 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       lastChildren = parsed.children
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     }
-    if (isSkipped(ctx, 'review', node)) {
+    if (isForcePassed(ctx, 'review', node)) {
+      // 强制通过和跳过在这里**路由完全相同**,差的只是下面那条记录 —— 见 applyForcePass。
+      applyForcePass(
+        ctx, node, 'review', node.reviewLog, node.iteration.planReview + 1,
+        '质疑讨论环节被人工强制通过:圆桌没有放行这份方案,由用户拍板继续',
+      )
+      /**
+       * 手工跳过的标记**也一并消费掉**,即使这一支走的是强制通过。
+       *
+       * 一个手工编辑过的 node.md 可以把两个字段同时写上。强制通过赢(它留记录),而剩下
+       * 那个 skipPhase 不是死数据 —— 它会在下一次返工进入本环节时让评审整个不开会,
+       * 而屏幕上没有任何东西说过还会再跳一次。四个环节里另外三个的 consumeSkip 本来就在
+       * 分支外面无条件跑,只有这一支需要自己补;`resumeCore` 因此不必再判一次两者互斥。
+       */
+      consumeSkip(node, 'review')
+    } else if (isSkipped(ctx, 'review', node)) {
       // 名册上还挂着评审员,记录却一片空白 —— 不写一行的话,这在 node.md 上读起来像
       // 「跑了但记录丢了」。写「已跳过」是为了让这两件事在事后追责时分得开。
       noteOnNode(node, node.skipPhase === 'review'
@@ -1948,8 +2044,10 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           // node that had used its normal rounds became un-resumable the moment it hit a
           // conflict — measured "恢复时该阶段预算已耗尽(3/3)" on a node whose card had just
           // told the user to resume it. The rework budget must mean rework.
-          if (isSkipped(ctx, 'accept', node)) {
-            // 跳过验收的第三个调用点(自动解冲突后的复验)。
+          if (isForcePassed(ctx, 'accept', node) || isSkipped(ctx, 'accept', node)) {
+            // 跳过验收的第三个调用点(自动解冲突后的复验)。强制通过走**同一条**分支:
+            // 漏掉这里的话,一个已经被强制通过的验收会在解冲突之后原样复活开会,而那个
+            // 标记还留在节点上等着下一轮再放行一次 —— 用户按的那一下既没生效也没消失。
             //
             // **必须和通过分支走同一个出口** `return mergeAndRelease(node, ctx, true)`,
             // 不能自己拍板 ACCEPTED。这里是 mergeAndRelease 内部,函数签名是 Promise<boolean>:
@@ -1961,7 +2059,12 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
             //    子任务一次都没跑。
             // triedThisRun=true 也不能漏:漏了的话重入时 attempted 停在 false,升级卡会说
             // 「自动解决机会已在此前用完,本次未再尝试」,而本次实实在在跑了一次解冲突。
-            noteOnNode(node, '自动解决冲突后的复验已跳过')
+            if (isForcePassed(ctx, 'accept', node)) {
+              applyForcePass(
+                ctx, node, 'accept', node.acceptLog, node.acceptLog.length + 1,
+                '自动解决冲突后的复验被人工强制通过:解冲突改出来的代码未经任何人核对',
+              )
+            } else noteOnNode(node, '自动解决冲突后的复验已跳过')
             consumeSkip(node, 'accept')
             return mergeAndRelease(node, ctx, true)
           }
@@ -2062,7 +2165,23 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
    * 拿不到工作区时**退化成正常跑一轮**(而不是硬着头皮跳),并且说出来:关口那侧
    * (skipFailedPhaseReason)已经用同一条判据挡在前面了,这里是纵深防御。
    */
-  const skipsJudge = node.skipPhase === 'verify' || node.skipPhase === 'accept'
+  /**
+   * 从尾部进来的那个环节 —— 跳过和**阻断后**的强制通过共用这条入口。
+   *
+   * **只认节点上那个字段,不认 `control` 里的预先批准**,而这条区分是必须的:
+   * `node.forcePass` 只由 `planForcePass` 在一个**已经阻断**的节点上写下(那意味着
+   * 执行者早就交过东西了),而且 resumeCore 会拿证据再核一遍;预先批准则可以按在一个
+   * **还没开始执行**的节点上 —— 那时候「从判决段进来」等于让它一行代码不写就去验收,
+   * 正是 `SKIPPABLE_PHASES` 那条界线要挡的事。
+   *
+   * 预先批准不需要这条入口也能正常生效:节点照常执行,走到 verify/accept 时
+   * `isForcePassed` 在那一段里为真,圆桌照样不开。
+   */
+  const judgePhase: PhaseName | undefined =
+    node.skipPhase === 'verify' || node.skipPhase === 'accept' ? node.skipPhase
+      : node.forcePass === 'verify' || node.forcePass === 'accept' ? node.forcePass
+        : undefined
+  const skipsJudge = judgePhase !== undefined
   let enterAtJudge = skipsJudge && (ctx.worktrees === undefined || node.worktree !== undefined)
   /**
    * 跳过**验收**时,这一轮的测试验证也不再跑。
@@ -2075,10 +2194,11 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
    * 只作用于**这一轮**(和 enterAtJudge 同寿):之后如果走返工,测试验证照跑 —— 那时候
    * 工作区里是新产出,它确实需要被验一遍。
    */
-  let skipVerifyThisRound = enterAtJudge && node.skipPhase === 'accept'
+  let skipVerifyThisRound = enterAtJudge && judgePhase === 'accept'
   if (skipsJudge && !enterAtJudge) {
-    noteOnNode(node, `要跳过${PHASE_LABEL[node.skipPhase!]},但本节点的隔离工作区引用已经不在了 —— ` +
-      `跳过它会把一个空工作区合进集成分支,所以这一轮仍然重跑执行环节`)
+    const what = node.skipPhase === judgePhase ? '跳过' : '强制通过'
+    noteOnNode(node, `要${what}${PHASE_LABEL[judgePhase!]},但本节点的隔离工作区引用已经不在了 —— ` +
+      `${what}它会把一个空工作区合进集成分支,所以这一轮仍然重跑执行环节`)
   }
   // Isolation is a HARD gate, not a preference. Without a worktree this node would execute
   // with write tools in the user's real checkout — concurrently with others once the execute
@@ -2111,10 +2231,15 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   // survives — so it is judged before it merges, exactly as an auto-resolution is.
   if (node.mergeConflict && node.worktree) {
     node.mergeConflict = false
-    if (isSkipped(ctx, 'accept', node)) {
+    if (isForcePassed(ctx, 'accept', node) || isSkipped(ctx, 'accept', node)) {
       // 跳过验收的第二个调用点。人手改过的冲突解决代码因此**零评审直接合入** ——
-      // 这是用户选择跳过验收的代价,关口文案里写明了。
-      noteOnNode(node, '人工解决冲突后的验收已跳过')
+      // 这是用户选择跳过验收的代价,关口文案里写明了。强制通过同理,理由见第三个调用点。
+      if (isForcePassed(ctx, 'accept', node)) {
+        applyForcePass(
+          ctx, node, 'accept', node.acceptLog, node.acceptLog.length + 1,
+          '人工解决冲突后的验收被人工强制通过:手改的冲突解决代码零评审合入',
+        )
+      } else noteOnNode(node, '人工解决冲突后的验收已跳过')
       consumeSkip(node, 'accept')
       if (!(await mergeAndRelease(node, ctx))) return
       await commit(node, 'ACCEPTED', ctx)
@@ -2302,8 +2427,17 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
      * 第二个 `if` 当场变成「没跳过」,测试验证照跑,而用户以为自己跳过了它。实测过
      * (phases 里多出一个 verify),而 `consumeSkip` 自己的注释正是在说这件事。
      */
-    const skipVerify = isSkipped(ctx, 'verify', node) || skipVerifyThisRound
-    if ((node.phaseRoles.verify ?? []).length > 0 && skipVerify) {
+    // 强制通过同样**只求值一次、在消费之前**,理由和上面那段逐字相同。
+    const forceVerify = isForcePassed(ctx, 'verify', node)
+    // 强制通过赢:两者路由相同,而留下记录的那一个信息更多。少了这个 `!forceVerify`,
+    // 一个既被跳过又被强制通过的节点会把两条互相矛盾的注记同时写进 execStatus。
+    const skipVerify = !forceVerify && (isSkipped(ctx, 'verify', node) || skipVerifyThisRound)
+    if ((node.phaseRoles.verify ?? []).length > 0 && forceVerify) {
+      applyForcePass(
+        ctx, node, 'verify', node.acceptLog, node.iteration.acceptance + 1,
+        '测试验证环节被人工强制通过:没有实跑过任何测试,由用户拍板放行',
+      )
+    } else if ((node.phaseRoles.verify ?? []).length > 0 && skipVerify) {
       noteOnNode(node, node.skipPhase === 'verify'
         ? '测试验证环节被手工跳过(用户在阻断后按了跳过):没有实跑过任何测试'
         : skipVerifyThisRound
@@ -2314,6 +2448,14 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // 和 enterAtJudge 同寿:只豁免这一轮。
     skipVerifyThisRound = false
     /**
+     * 和 `consumeSkip` 同一处、同一个理由:**无条件**消费,不管席位数。
+     *
+     * 0 席的节点上 `applyForcePass` 不会被调到(上面那个分支带着席位数判据),标记就会
+     * 一直留着 —— 而一条留着的预先批准会在返工循环里每一轮都重新为真。重复调用无害:
+     * 这个函数是幂等的。
+     */
+    consumeForcePass(ctx, node, 'verify')
+    /**
      * 手工跳过在这里**无条件消费**,不管席位数。
      *
      * 上面那条留痕的判据带着 `verify 席位 > 0`(没配席位本来就不算「跳过了」),而消费
@@ -2321,7 +2463,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
      * 而它的第二个作用是让下一次 stepExecute 也从判决那一段进来 —— 于是**永远不再执行**。
      */
     consumeSkip(node, 'verify')
-    if ((node.phaseRoles.verify ?? []).length > 0 && !skipVerify) {
+    if ((node.phaseRoles.verify ?? []).length > 0 && !skipVerify && !forceVerify) {
       if (!(await commit(node, 'VERIFYING', ctx))) return
       // 验证者**不该改代码**,而工具清单挡不住这件事:Bash 本身就能写(echo >、sed -i、
       // git apply)。所以真正的探针是前后比对工作区 —— 断言它的工具集里没有 Edit/Write
@@ -2382,15 +2524,24 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // roundtableWithInfraRetry) — redoing the executor's real work over a flaky connection
     // would be wrong, and charging those retries to the rework budget would consume every
     // attempt the executor was owed.
-    if (isSkipped(ctx, 'accept', node)) {
+    if (isForcePassed(ctx, 'accept', node) || isSkipped(ctx, 'accept', node)) {
       // **三个调用点全部跳过**(主循环 + 人工解冲突后 + 自动解冲突后)。只跳主循环的话,
       // 验收会在「最该有人看」的冲突解决场景悄悄复活 —— 那是更坏的惊喜。
       //
-      // 不写 acceptLog:跳过 ≠ 通过。但要在 execStatus 上留一行,否则 node.md 是
-      // 「名册挂着 qa、验收记录空白、状态 ACCEPTED」—— 读起来像记录丢了,不像没跑过。
-      noteOnNode(node, node.skipPhase === 'accept'
-        ? '验收环节被手工跳过(用户在阻断后按了跳过):本节点的产出未经任何人核对就合进集成分支'
-        : '验收环节已跳过:本节点的产出未经任何人核对就合进集成分支')
+      // 跳过**不写** acceptLog:跳过 ≠ 通过。强制通过**要写**:那是一个人做出的判断,
+      // 不留痕的话事后读记录的人分不清「没人看过」和「有人看过并拍板」。两条路都要在
+      // execStatus 上留一行,否则 node.md 是「名册挂着 qa、验收记录空白、状态 ACCEPTED」
+      // —— 读起来像记录丢了,不像没跑过。
+      if (isForcePassed(ctx, 'accept', node)) {
+        applyForcePass(
+          ctx, node, 'accept', node.acceptLog, node.acceptLog.length + 1,
+          '验收环节被人工强制通过:圆桌没有放行这份产出,由用户拍板合进集成分支',
+        )
+      } else {
+        noteOnNode(node, node.skipPhase === 'accept'
+          ? '验收环节被手工跳过(用户在阻断后按了跳过):本节点的产出未经任何人核对就合进集成分支'
+          : '验收环节已跳过:本节点的产出未经任何人核对就合进集成分支')
+      }
       consumeSkip(node, 'accept')
       if (firstRole(node, 'observer') && !isSkipped(ctx, 'observer') && !(await commit(node, 'SCORING', ctx))) return
       if (await scoreNode(node, ctx)) {
@@ -2491,16 +2642,24 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     if (!(await commit(node, 'INTEGRATION_ACCEPT', ctx))) return
     // Hold the integration worktree for the whole review: it is what the reviewers read, and
     // concurrent merges rewrite it underneath them.
-    if (isSkipped(ctx, 'integrate', node)) {
+    if (isForcePassed(ctx, 'integrate', node) || isSkipped(ctx, 'integrate', node)) {
       // 跳过集成验收。连带后果(关口要说):补救子任务的唯一入口没了,而且 scoreNode 也
       // 一起没了 —— 所有拆分型节点包括根再也不会被评分,整个 run 的最终分消失。
+      // 强制通过在这条路上尤其要留痕:根节点走的就是这里,而那是**整个 run 的最终裁决**。
       //
       // mergeConflict 不用在这里再挡一次 —— stepIntegrate 前面已有一道守卫会先触发
       // (实测阻断信息来自那一道)。在这里重复一份是死代码,而死代码会让人以为
       // 保护来自这里,下次改前面那道时就没人知道它是唯一的那道。
-      noteOnNode(node, node.skipPhase === 'integrate'
-        ? '集成验收被手工跳过(用户在阻断后按了跳过):子任务各自通过即视为本节点达成'
-        : '集成验收已跳过:子任务各自通过即视为本节点达成')
+      if (isForcePassed(ctx, 'integrate', node)) {
+        applyForcePass(
+          ctx, node, 'integrate', node.acceptLog, node.iteration.integration + 1,
+          '集成验收被人工强制通过:「这些子任务合起来达成父目标了吗」这一问由用户自己回答了是',
+        )
+      } else {
+        noteOnNode(node, node.skipPhase === 'integrate'
+          ? '集成验收被手工跳过(用户在阻断后按了跳过):子任务各自通过即视为本节点达成'
+          : '集成验收已跳过:子任务各自通过即视为本节点达成')
+      }
       consumeSkip(node, 'integrate')
       if (ctx.worktrees && node.worktree && !(await commit(node, 'MERGE', ctx))) return
       if (!(await mergeAndRelease(node, ctx))) return

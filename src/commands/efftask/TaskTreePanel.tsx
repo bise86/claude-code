@@ -259,6 +259,14 @@ export function TaskTreePanel(props: {
   /** 跳过失败的那个环节继续往下走(`s`)。给了才有这个键。 */
   onSkipFailed?: (node: TaskNode) => void
   /**
+   * 强制通过一个环节(`f`)。给了才有这个键。
+   *
+   * 和 `onSkipFailed` 分开而不是加一个参数:两者的**去处**不同 —— 跳过只对已阻断的
+   * 节点有意义,而强制通过在运行中的节点上也要能按(预先批准)。所以这个键不像 `s`
+   * 那样只挂在失败节点上,判断哪条路走得通由关口自己做,并在做不到时说原因。
+   */
+  onForcePass?: (node: TaskNode) => void
+  /**
    * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
    * 活存储而不是 React state:事件流对每个在飞的节点每条消息都要触发一次,镜像进 state
@@ -387,6 +395,7 @@ export function TaskTreePanel(props: {
       // 拿到的是「自己选环节」那个三屏菜单,而快速重做这个键彻底消失。
       if (shiftR && props.onRedoFailed) { setDetailId(null); props.onRedoFailed(detail); return }
       if (k === 's' && props.onSkipFailed) { setDetailId(null); props.onSkipFailed(detail); return }
+      if (k === 'f' && props.onForcePass) { setDetailId(null); props.onForcePass(detail); return }
       if (k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
       // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
       // Esc / q 任何时候都是返回 —— 返回这条路不许有死角。
@@ -401,6 +410,7 @@ export function TaskTreePanel(props: {
     // `R`(快速重做失败环节)排在 `r` 前面,理由见详情页那一支:`k` 已经小写过了。
     if (shiftR && props.onRedoFailed && current) { props.onRedoFailed(current); return }
     if (k === 's' && props.onSkipFailed && current) { props.onSkipFailed(current); return }
+    if (k === 'f' && props.onForcePass && current) { props.onForcePass(current); return }
     if (k === 'r' && props.onRedo && current) { props.onRedo(current); return }
     // 运行中的人工干预。同样放在方向键之前,同样的理由。
     if (props.runControl) {
@@ -515,9 +525,18 @@ export function TaskTreePanel(props: {
   const rowWidth = Math.max(10, columns - 4)
   /** 光标停在失败节点上时才写这两个键 —— 理由在页脚那一行的注释里。 */
   const onFailedNode = current?.status === 'BLOCKED'
+  /**
+   * `f` 的措辞跟着**光标所在节点的状态**换,因为这个键在两种节点上做的是两件事:
+   * 失败节点上是「覆盖那次不通过」,运行中节点上是「预先批准接下来某一关」。
+   * 写死一句的话,总有一半的时候页脚在说另一件事 —— 而这一行是用户唯一的说明书。
+   */
+  const forcePassHint = props.onForcePass
+    ? (onFailedNode ? ' · f 强制通过它' : current && !isTerminal(current.status) ? ' · f 预先批准' : '')
+    : ''
   const failedKeysHint =
     (onFailedNode && props.onRedoFailed ? ' · R 重做失败环节' : '') +
-    (onFailedNode && props.onSkipFailed ? ' · s 跳过它' : '')
+    (onFailedNode && props.onSkipFailed ? ' · s 跳过它' : '') +
+    forcePassHint
   // 子树合计要按 id 找孩子。建一次给整屏用 —— 每行各建一个是 O(行 × 节点)。
   const byId = new Map(props.nodes.map(n => [n.id, n]))
 

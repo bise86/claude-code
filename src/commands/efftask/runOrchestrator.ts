@@ -31,6 +31,10 @@ export type Phase =
   // 'confirmSkip' 是重做的兄弟岔路:跳过失败的那个环节继续往下走。同样不是一个新的运行
   // 阶段,而是 done 的一条分支 —— 确认之后 startRun 带着改过的树重新起跑。
   | 'confirmSkip'
+  // 'confirmForcePass' 是跳过的兄弟岔路:同样让节点越过一个判决环节,但**留下一条署名
+  // 「人工强制通过」的裁决**。和上面两个不同的是它**也能从 running 进来** —— 运行中的
+  // 预先批准不重启编排,只往 RunControl 上记一笔,确认完直接回运行视图。
+  | 'confirmForcePass'
 
 /**
  * Drive one run to completion and report it.

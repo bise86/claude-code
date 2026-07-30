@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
-import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_PARALLELISM, MAX_ROLE_GUIDANCE, MIN_PARALLELISM, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
-import { redoOptions, redoUnavailableReason } from './redo'
+import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_PARALLELISM, MANUAL_PASS_ROLE, MAX_ROLE_GUIDANCE, MIN_PARALLELISM, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
+import { forcePassFailedPhaseReason, planForcePass, planSkip, redoOptions, redoUnavailableReason, skipFailedPhaseReason } from './redo'
 import { ROLE_API_PROTOCOLS, TRANSLATING_PROTOCOLS } from '../../services/api/openaiCompat/protocols'
 import { toResponsesRequest } from '../../services/api/openaiCompat/toResponsesRequest'
 import { toOpenAIRequest } from '../../services/api/openaiCompat/toOpenAIRequest'
@@ -11,6 +11,9 @@ import { modelSupportsEffort } from '../../utils/effort'
 import { REASONING_FIELDS } from '../../services/api/openaiCompat/fromOpenAIStream'
 import { logPaneAction, logPaneMode, runControlAction, sectionPaneAction, detailEntryHint, collapsedLinesFor } from '../../commands/efftask/logView'
 import { detailSections, usageBody } from '../../commands/efftask/NodeDetail'
+import { createRunControl } from './control'
+import { serializeNode } from './persistence'
+import { stepExecute } from './pipeline'
 import { upstreamAdvice } from '../../services/api/openaiCompat/upstreamError'
 import type { Key } from '../../ink/events/input-event'
 
@@ -844,5 +847,120 @@ describe('README 的子 agent 继承一节说的和代码干的是同一件事',
     expect(loader).toContain("name === 'CLAUDE.md' || name === 'CLAUDE.local.md'")
     expect(README).toContain(norm('**`AGENTS.md` 不是自动加载的指令文件**'))
     expect(README).toContain(norm('它们只被 `/init` 读一次'))
+  })
+})
+
+/**
+ * README 的「`f` 强制通过」一节必须说真话。
+ *
+ * 这一节的风险形状和别处不同:它讲的是**两个动作的区别**,而那两个动作在实现上共用了
+ * 大半代码。一句「和跳过的区别只有记录」如果哪天不成立了(比如有人给强制通过单开一条
+ * 路由),文档不会自己变红 —— 除非探针盯的是**行为的等价性**本身。
+ *
+ * 所以这里尽量跑真东西:planSkip / planForcePass 各算一次拿返回值对,pipeline 真跑一遍
+ * 数圆桌派了几次。文本比对只用在那些「用户会照着做」的具体承诺上。
+ */
+describe('README 的强制通过一节说的和代码干的是同一件事', () => {
+  const blocked = (): TaskNode => {
+    const n = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: '2026-07-30T00:00:00Z' })
+    n.kind = 'executable'; n.status = 'BLOCKED'; n.failedAt = 'ACCEPTANCE'; n.execStatus = '交过了'
+    return n
+  }
+
+  it('「路由上逐字相同」是真的 —— 两条路算出来的树只差那两个标记', () => {
+    const a = planSkip([blocked()], 'root', '2026-07-30T00:00:00Z') as { nodes: TaskNode[] }
+    const b = planForcePass([blocked()], 'root', '2026-07-30T00:00:00Z') as { nodes: TaskNode[] }
+    expect(a).not.toHaveProperty('error')
+    expect(b).not.toHaveProperty('error')
+    // 把两个互斥的标记抹掉之后,**整棵树必须一模一样**。这是那句话唯一诚实的探针:
+    // 逐字段列举会漏掉将来新增的字段,而漏掉的那个正好可能是分叉的地方。
+    const strip = (n: TaskNode) => ({ ...n, skipPhase: undefined, forcePass: undefined })
+    expect(a.nodes.map(strip)).toEqual(b.nodes.map(strip))
+    // 而那两个标记确实是反过来的。
+    expect(a.nodes[0].skipPhase).toBe('accept')
+    expect(a.nodes[0].forcePass).toBeUndefined()
+    expect(b.nodes[0].forcePass).toBe('accept')
+    expect(b.nodes[0].skipPhase).toBeUndefined()
+    expect(README).toContain(norm('在**路由上逐字相同**'))
+  })
+
+  it('「四个环节」这句话和 SKIPPABLE_PHASES 是同一份名单', () => {
+    // README 把能强制通过的和能跳过的说成同样那四个。它们共用一个常量 —— 但共用这件事
+    // 本身要被钉住,否则哪天分开了,文档那句「同样那四个」就是假的。
+    for (const p of ['review', 'verify', 'accept', 'integrate']) expect(SKIPPABLE_PHASES.has(p)).toBe(true)
+    expect(SKIPPABLE_PHASES.size).toBe(4)
+    expect(README).toContain(norm('能强制通过的和能跳过的是同样那四个环节'))
+  })
+
+  it('隔离运行 + 工作区丢失时**两条路都**被拒,而且各说各的动作', () => {
+    const n = blocked()
+    n.worktree = undefined
+    const s = skipFailedPhaseReason(n, { isolated: true })
+    const f = forcePassFailedPhaseReason(n, { isolated: true })
+    expect(s).toContain('跳过')
+    expect(f).toContain('强制通过')
+    // 同一道闸,同一句理由 —— 只有动作名不同。
+    expect(s!.replace(/跳过/g, 'X')).toBe(f!.replace(/强制通过/g, 'X'))
+    // 只钉不跨行的那一截:README 在这句中间折了行,把换行写进针里等于把排版也钉死了。
+    expect(README).toContain(norm('**隔离运行 + 工作区引用已丢时不许强制'))
+    expect(README).toContain(norm('强制通过在此之上还要记一条'))
+  })
+
+  it('那条记录的记号是 MANUAL-PASS 而不是 pass —— README 拿它当卖点', () => {
+    const n = createNode({ id: 'x', title: 'x', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: '2026-07-30T00:00:00Z' })
+    n.acceptLog = [{
+      round: 1,
+      verdicts: [{ role: MANUAL_PASS_ROLE, pass: true, blocking: [], comments: '覆盖了: [qa] 不行', manual: true }],
+      synthesized: { pass: true, blockingSummary: '' },
+    }]
+    const md = serializeNode(n)
+    expect(md).toContain('MANUAL-PASS')
+    expect(README).toContain(norm('`MANUAL-PASS`，**不是** `pass`'))
+    expect(README).toContain(norm('署名 `人工强制通过`'))
+  })
+
+  it('运行中预先批准:不打断在飞、一次性、不落盘 —— 三条都是代码里查得到的', () => {
+    const c = createRunControl()
+    // 「不打断在飞的调用」:这条门根本不碰 registerCall 登记的那些 controller ——
+    // 拿一个真的 AbortController 登记进去,批准之后它必须没被 abort。
+    const ac = new AbortController()
+    c.registerCall('n1', ac)
+    c.forcePass('n1', 'accept')
+    expect(ac.signal.aborted).toBe(false)
+    // 对照:取消是会 abort 的。两者的区别正是 README 那一条在讲的事。
+    c.cancelNode('n1')
+    expect(ac.signal.aborted).toBe(true)
+    // 「一次性」:清掉之后就不在了。
+    c.clearForcePass('n1', 'accept')
+    expect(c.wasForcePassed('n1', 'accept')).toBe(false)
+    // 「只活在这次进程里」:它不是 TaskNode 的字段,落盘那一侧根本没有它的位置。
+    // (节点上那个 forcePass 是**阻断后**那条路的,两回事。)
+    expect(Object.keys(createRunControl())).toContain('forcePass')
+    expect(README).toContain(norm('**不打断此刻在飞的调用。**'))
+    expect(README).toContain(norm('**只活在这次进程里。**'))
+  })
+
+  it('预先批准不让节点跳过执行 —— README 最后那段是真跑出来的', async () => {
+    const n = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: '2026-07-30T00:00:00Z' })
+    n.kind = 'executable'; n.status = 'READY'
+    const c = createRunControl()
+    c.forcePass('root', 'accept')
+    const phases: string[] = []
+    const ctx = {
+      config: { goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS } } as EffTaskConfig,
+      byId: new Map([['root', n]]), persist: async () => {}, now: () => '2026-07-30T00:00:00Z',
+      signal: new AbortController().signal, onUpdate: () => {}, reserveNodes: () => ({ release: () => {} }),
+      control: c,
+      runAgent: async (req: { phase: string; prompt: string }) => {
+        phases.push(req.phase)
+        return req.phase === 'execute'
+          ? '```json\n{"execStatus":"改了 foo.ts"}\n```'
+          : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+      },
+    }
+    await stepExecute(n, ctx as never)
+    expect(phases).toEqual(['execute'])   // 活照干,会不开
+    expect(n.status).toBe('ACCEPTED')
+    expect(README).toContain(norm('预先批准**不会**让节点跳过执行环节'))
   })
 })

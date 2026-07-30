@@ -1,7 +1,8 @@
-import { clampParallelism, DEFAULT_PARALLELISM } from './types.js'
+import { clampParallelism, DEFAULT_PARALLELISM, SKIPPABLE_PHASES } from './types.js'
+import type { PhaseName } from './types.js'
 
 /**
- * 运行中的人工干预面:**暂停**、**追加指令**、**取消单个节点**、**调并发度**。
+ * 运行中的人工干预面:**暂停**、**追加指令**、**取消单个节点**、**调并发度**、**预先批准**。
  *
  * 在这之前,运行中唯一能做的事是 Esc —— 而它的粒度是整个 run。用户的原话是
  * 「任务正在运行怎么取消,可以用提示词修正这个任务怎么做不」:两件事都要,而且都不该
@@ -56,6 +57,37 @@ export interface RunControl {
    * —— 阻断信息本身在推荐一条已经死掉的路。评审实测复现过。
    */
   clearAllCancels(): void
+
+  // ---- 运行中预先批准(强制通过) ----
+  /**
+   * 预先批准某个节点的某个环节 —— 它到达那一步时不派圆桌,直接记一条人工通过。
+   *
+   * **不打断在飞的调用**,和 `addDirective` 逐字同规矩,和 `cancelNode` 正相反。
+   * 理由:预先批准说的是「接下来那一关不用开了」,不是「把正在开的这一关砍掉」。
+   * 砍掉在飞的圆桌会让已经判完的席位的裁决变成 infra 失败(runRoundtable 把任何
+   * rejection 一律合成 infra),那些钱已经花了,而结果被丢掉。所以它在**下一次进入
+   * 该环节时**生效 —— 对返工循环里的节点就是下一轮,对还没走到那一步的就是走到时。
+   *
+   * 只收 SKIPPABLE_PHASES 那四个,别的一律忽略:分析和执行没有「通过」可言。
+   */
+  forcePass(nodeId: string, phase: PhaseName): void
+  /** 这个节点的这个环节被预先批准过吗。 */
+  wasForcePassed(nodeId: string, phase: PhaseName): boolean
+  /** 消费掉一次预先批准 —— 一次性,和 `TaskNode.forcePass` 同规矩。 */
+  clearForcePass(nodeId: string, phase: PhaseName): void
+  /** 这个节点此刻挂着哪些预先批准。给界面用(页脚要显示,否则用户不知道自己按过)。 */
+  forcePassesOf(nodeId: string): readonly PhaseName[]
+  /**
+   * 清掉**全部**预先批准,返回被清掉的条数 —— 一次新的编排开始时调。
+   *
+   * 和 `clearAllCancels` 同一个位置、同一个理由的反面:redo 是原地重置、id 不变,
+   * 一条留下来的预先批准会作用到**重做之后那份不一样的产出**上 —— 那正是
+   * `failedAt` 过期时踩过的坑(见 TaskNode.failedAt 的注释和 reopenAncestor 那几处清理)。
+   *
+   * **返回条数是要用的**:静默丢掉用户亲手按过的批准是这个仓库反复付代价的那一类,
+   * 调用方拿这个数去告诉他「你那 N 条预先批准因为重开编排已经失效」。
+   */
+  clearAllForcePasses(): number
 
   // ---- 并发度 ----
   /**
@@ -130,6 +162,8 @@ export function createRunControl(): RunControl {
   /** nodeId → 此刻在飞的 controller。一个节点可能同时有多个(圆桌的多席位)。 */
   const calls = new Map<string, Set<AbortController>>()
   const cancelled = new Set<string>()
+  /** nodeId → 已预先批准的环节。空集合随手删掉,免得表只涨不落。 */
+  const forcePassed = new Map<string, Set<PhaseName>>()
 
   return {
     isPaused: () => paused,
@@ -200,6 +234,31 @@ export function createRunControl(): RunControl {
     wasCancelled: nodeId => cancelled.has(nodeId),
     clearCancel(nodeId) { cancelled.delete(nodeId) },
     clearAllCancels() { cancelled.clear() },
+
+    forcePass(nodeId, phase) {
+      // 白名单挡在**入口**,不是在消费点:进不来的东西不需要在四个环节里各挡一遍,
+      // 而 UI 那侧的选项本来就只列这四个 —— 这一句挡的是接线错误,不是用户。
+      if (!SKIPPABLE_PHASES.has(phase)) return
+      const set = forcePassed.get(nodeId) ?? new Set<PhaseName>()
+      set.add(phase)
+      forcePassed.set(nodeId, set)
+    },
+    wasForcePassed: (nodeId, phase) => forcePassed.get(nodeId)?.has(phase) === true,
+    clearForcePass(nodeId, phase) {
+      const set = forcePassed.get(nodeId)
+      if (!set) return
+      set.delete(phase)
+      // 空了就删掉整条:留着一个空 Set 会让 forcePassed 随节点数只涨不落,而
+      // `control.ts` 已经为「表只涨不落就是泄漏」写过两次注释(waiters、limitChanged)。
+      if (set.size === 0) forcePassed.delete(nodeId)
+    },
+    forcePassesOf: nodeId => [...(forcePassed.get(nodeId) ?? [])],
+    clearAllForcePasses() {
+      let n = 0
+      for (const set of forcePassed.values()) n += set.size
+      forcePassed.clear()
+      return n
+    },
 
     parallelism: () => parallelism,
     setParallelism(n) {

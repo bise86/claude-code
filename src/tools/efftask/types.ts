@@ -132,8 +132,31 @@ export const ALT_SOLUTION_CHARS = 1500
  * failed (network, provider error). It is NOT a judgement about the work, so a caller
  * must retry the review rather than treat it as a rejection and redo the executor's work.
  */
+/**
+ * 人工强制通过那条裁决的 `role`。
+ *
+ * **不是角色名,而且刻意不像角色名。** 它会和真正的评审员并排渲染在 node.md 的
+ * `## 评审记录` 里(`- [人工强制通过] MANUAL: …`),而那一节是用户事后追责的依据 ——
+ * 唯一不能发生的事是它被读成「有一位叫这个名字的评审员通过了」。
+ *
+ * 用户配的角色名撞上它也无所谓:`manual` 那个布尔才是判据,这个字符串只管显示。
+ */
+export const MANUAL_PASS_ROLE = '人工强制通过'
+
 export interface Verdict {
   role: string; pass: boolean; blocking: string[]; comments: string; infra?: boolean
+  /**
+   * 这一条不是模型给的,是**人**按下强制通过按出来的。
+   *
+   * 判据只能是这个布尔,不能是 `role === MANUAL_PASS_ROLE`:role 是显示用的字符串,
+   * 而 node.md 可以手工编辑 —— 拿它当判据等于让「把角色名改成这四个字」成为一条伪造
+   * 人工放行的路。反过来这个字段被手改成 true 也只是让一条真实裁决**被标成人工**,
+   * 那个方向是保守的(读记录的人会去核对),而另一个方向是把人工放行伪装成评审通过。
+   *
+   * 消费者只有渲染层(persistence 的 roundtableBody、详情页):它不参与任何判定 ——
+   * `synthesized.pass` 已经是 true,路由早就走完了。
+   */
+  manual?: boolean
   /**
    * 这一席在演哪个任务角色(见 RoleBinding.roleTag)。
    *
@@ -333,6 +356,27 @@ export interface TaskNode {
    * 落盘是白拿的(serializeNode 整节点倾倒),所以真正要补的是**读回**校验 —— 见 resumeCore。
    */
   skipPhase?: PhaseName
+  /**
+   * 手工**强制通过**的那一个环节。一次性,和 `skipPhase` 同寿、同白名单、同消费方式。
+   *
+   * **和跳过的区别只有一个,但那一个是全部理由:留不留下一条裁决。**
+   * 跳过说的是「这个环节这次不发生」,`pipeline` 那四处刻意不写 log(见 review 分支上
+   * 「一条 PASS 记录 = 谎报有人评审过」那条注释);强制通过说的是「圆桌没通过,我看过了,
+   * 我放行」——那是一个**人做出的判断**,它必须在 node.md 上留痕,否则事后翻记录的人
+   * 看到的是一片空白,分不清「没人看过」和「有人看过并拍板」。
+   *
+   * 所以写进 log 的那条记录必须**一眼看出是人写的**:`role` 是 MANUAL_PASS_ROLE 而不是
+   * 任何角色名,`Verdict.manual` 为真,而被它覆盖掉的那一轮的阻断项原样留在 comments 里。
+   * 伪装成一席角色的 pass 是这个字段唯一不能犯的错 —— 那等于给事后追责的人下毒。
+   *
+   * 路由上和跳过**逐字相同**(planForcePass 直接复用 planSkip 的重入座位计算):环节照样
+   * 不发生,执行者照样不重跑。省下的钱、走过的路都一样,差的只是那条记录。
+   *
+   * 只可能是 SKIPPABLE_PHASES 那四个。落盘白拿,读回要校验 —— 而这一条比 skipPhase
+   * **更要紧**:一个手写的 forcePass 不只是零调用判 ACCEPTED,还会在 log 里留下一条
+   * 「有人放行过」的假记录。见 resumeCore。
+   */
+  forcePass?: PhaseName
   /**
    * 重做 / 跳过时,用户**补给这个节点**的提示词。
    *

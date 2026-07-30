@@ -1,4 +1,4 @@
-import { MAX_GUIDANCE_CHARS, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
+import { MANUAL_PASS_ROLE, MAX_GUIDANCE_CHARS, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
 import { addUsage } from './usage.js'
 
 /**
@@ -332,11 +332,35 @@ export function failedRedoTarget(
 export function skipFailedPhaseReason(
   node: TaskNode, ctx?: RedoContext,
 ): string | undefined {
-  if (node.status !== 'BLOCKED') return `「${node.title}」没有失败(当前 ${node.status}),没有环节可跳`
+  return failedPhaseActionReason(node, '跳过', ctx)
+}
+
+/**
+ * 「强制通过失败的那个环节」能不能做 —— 不能时返回**原因**。
+ *
+ * **闸门和跳过一字不差**,所以它们共用一个实现:两者路由完全相同(见
+ * `TaskNode.forcePass`),差别只在留不留记录,而一条记录改变不了任何一条闸门的理由。
+ * 各写一份的话,最松的那一份就是实际生效的那一份 —— `SKIPPABLE_PHASES` 的注释
+ * 已经为同一件事写过一次。
+ *
+ * 尤其是隔离运行 + 工作区引用丢失那一条:跳过它会把空工作区合进集成分支并判「已验收」,
+ * 而强制通过在此之上**还要**记一条「有人放行过」—— 严格更坏,更不能漏。
+ */
+export function forcePassFailedPhaseReason(
+  node: TaskNode, ctx?: RedoContext,
+): string | undefined {
+  return failedPhaseActionReason(node, '强制通过', ctx)
+}
+
+/** 跳过 / 强制通过共用的那套闸门。`what` 只进文案,不进任何判据。 */
+function failedPhaseActionReason(
+  node: TaskNode, what: '跳过' | '强制通过', ctx?: RedoContext,
+): string | undefined {
+  if (node.status !== 'BLOCKED') return `「${node.title}」没有失败(当前 ${node.status}),没有环节可${what}`
   const phase = failedPhaseOf(node)
   if (phase === undefined) {
     const advice = PROPAGATED_ADVICE[node.blockedReason.trim()]
-    return advice ?? `看不出「${node.title}」是哪个环节失败的,无法跳过它 —— 请按 r 重做`
+    return advice ?? `看不出「${node.title}」是哪个环节失败的,无法${what}它 —— 请按 r 重做`
   }
   if (!SKIPPABLE_PHASES.has(phase)) {
     /**
@@ -346,10 +370,10 @@ export function skipFailedPhaseReason(
      * **放弃这个节点**,而不是「跳过一个环节」—— 说清区别,并给出能照做的下一步。
      */
     return phase === 'plan'
-      ? '失败在「分析」:跳过它等于让这个节点带着空方案往下走,评审员会对着空白发表意见 —— 请用 r 重做分析,或在启动关口用 skipSteps 整个跳过分析'
+      ? `失败在「分析」:${what}它等于让这个节点带着空方案往下走,评审员会对着空白发表意见 —— 请用 r 重做分析,或在启动关口用 skipSteps 整个跳过分析`
       : phase === 'execute'
-        ? '失败在「执行」:跳过它等于承认这个节点什么都没做,而验收员会照常开会核对这个空产出 —— 请用 r 从执行重做'
-        : `失败在「${PHASE_LABEL[phase]}」,这个环节不能单独跳过 —— 请用 r 重做`
+        ? `失败在「执行」:${what}它等于承认这个节点什么都没做,而验收员会照常开会核对这个空产出 —— 请用 r 从执行重做`
+        : `失败在「${PHASE_LABEL[phase]}」,这个环节不能单独${what} —— 请用 r 重做`
   }
   /**
    * 隔离运行 + 工作区引用已丢 → **不许跳过验收/测试验证**。
@@ -361,7 +385,7 @@ export function skipFailedPhaseReason(
    */
   if ((phase === 'accept' || phase === 'verify') && ctx?.isolated === true && !node.worktree) {
     return `这次运行是隔离的,而本节点的工作区引用已经不在了(--resume 会清掉失效路径)—— ` +
-      `此时跳过${PHASE_LABEL[phase]}会把一个空工作区合进集成分支并判「已验收」。请用 r 选「从执行重做」`
+      `此时${what}${PHASE_LABEL[phase]}会把一个空工作区合进集成分支并判「已验收」。请用 r 选「从执行重做」`
   }
   if (phase === 'accept' || phase === 'verify') {
     // 这两条要坐 READY,而 advanceableKind 对 READY + unknown 返回 null —— 节点会既不可推进
@@ -374,6 +398,41 @@ export function skipFailedPhaseReason(
     return '没有子任务,不存在集成验收'
   }
   return undefined
+}
+
+/**
+ * 运行中**预先批准**能选哪几个环节 —— 不能选的也列出来,并说原因。
+ *
+ * 和阻断后那条路不同:那时候「哪个环节」由 `failedAt` 说了算,没得选;运行中节点还没
+ * 倒下,用户要自己指一个「等会儿走到那儿别开会了」。
+ *
+ * 两道过滤,都不是洁癖:
+ *  - `phaseRuns`:本次运行里根本不存在的环节(没配席位的测试验证)选了也不会发生,
+ *    而屏幕上摆着一个按下去什么都不变的选项,比没有这个选项糟。
+ *  - 结构:验收/测试验证只属于执行型叶子,集成验收只属于有子任务的节点。给一个拆分型
+ *    节点提供「强制通过验收」是在承诺一件它这辈子都不会走到的事。
+ *
+ * **不判「这个环节是不是已经过去了」**。那要从 status 反推节点在循环里的位置,而返工会
+ * 让它一轮轮回头 —— 反推出来的答案在最常见的那种节点上就是错的。屏幕上照实说「下一次
+ * 走到这个环节时生效」,让用户自己看着树决定,比一个猜出来的禁用状态诚实。
+ */
+export function forcePassOptions(
+  node: TaskNode, ctx?: RedoContext,
+): { phase: PhaseName; label: string; disabled?: string }[] {
+  const decomposed = isDecomposed(node)
+  return [...SKIPPABLE_PHASES].map(p => p as PhaseName).map(phase => {
+    const label = PHASE_LABEL[phase]
+    if (!phaseRuns(phase, ctx)) {
+      return { phase, label, disabled: ctx?.skipSteps?.includes(phase) ? '本次运行整个跳过了它' : '本次没有配置这个环节' }
+    }
+    if ((phase === 'accept' || phase === 'verify') && decomposed) {
+      return { phase, label, disabled: '本节点是拆分型,不走这个环节(它走集成验收)' }
+    }
+    if (phase === 'integrate' && !decomposed) {
+      return { phase, label, disabled: '本节点没有子任务,不存在集成验收' }
+    }
+    return { phase, label }
+  })
 }
 
 export interface RedoOption {
@@ -713,10 +772,21 @@ function reseatForRerun(
     warnings: string[]
     redoFrom: PhaseName | undefined
     skipPhase: PhaseName | undefined
+    /** 强制通过的那个环节。和 `skipPhase` 互斥 —— 见 planPastFailedPhase 的调用点。 */
+    forcePass?: PhaseName | undefined
   },
 ): string[] {
   target.redoFrom = opts.redoFrom
   target.skipPhase = opts.skipPhase
+  /**
+   * **无条件写**(包括写 undefined),不是 `if (opts.forcePass)`。
+   *
+   * 这个函数是所有重入路径的必经点,而它的职责之一就是把上一次的痕迹清干净 ——
+   * `failedAt` / `capBlocked` / `blockedReason` 都在下面几行被无条件清掉,同因。
+   * 条件写的话,一个被强制通过过、后来又走普通重做的节点会带着旧的 forcePass 回来,
+   * 于是「重做一遍看看」变成「重做一遍然后再放行一次」,而屏幕上什么都没说。
+   */
+  target.forcePass = opts.forcePass
   target.status = opts.seatedAt
   target.blockedReason = ''
   target.interrupted = false
@@ -978,12 +1048,43 @@ export function planSkip(
   now: string,
   ctx?: RedoContext,
 ): RedoPlan | { error: string } {
+  return planPastFailedPhase(input, targetId, now, 'skip', ctx)
+}
+
+/**
+ * 「强制通过失败的那个环节」算出来的新树。
+ *
+ * **和 `planSkip` 共用一个实现,而这是这个功能能小到值得做的全部原因**:两者的重入座位、
+ * 返工计数清零、祖先重开、工作区处置逐字相同 —— 强制通过唯一多做的事发生在 `pipeline`
+ * 那一侧(往 log 里写一条人工裁决),这里只负责把 `forcePass` 而不是 `skipPhase` 写到
+ * 节点上。
+ *
+ * 那些 ⚠ 警告文案是分开的:它们讲的是「这一下换掉了什么质量保证」,而
+ * 「没有任何人质疑过」和「圆桌否了、你放行了」不是同一件事,对着同一个用户也不该说同一句话。
+ */
+export function planForcePass(
+  input: readonly TaskNode[],
+  targetId: string,
+  now: string,
+  ctx?: RedoContext,
+): RedoPlan | { error: string } {
+  return planPastFailedPhase(input, targetId, now, 'forcePass', ctx)
+}
+
+function planPastFailedPhase(
+  input: readonly TaskNode[],
+  targetId: string,
+  now: string,
+  mode: 'skip' | 'forcePass',
+  ctx?: RedoContext,
+): RedoPlan | { error: string } {
+  const forced = mode === 'forcePass'
   const nodes = input.map(n => structuredClone(n) as TaskNode)
   const byId = new Map(nodes.map(n => [n.id, n]))
   const target = byId.get(targetId)
   if (!target) return { error: `节点不存在: ${targetId}` }
   // 授权判据只有这一份 —— 屏幕上按不动的东西不可能从别的门进去。
-  const why = skipFailedPhaseReason(target, ctx)
+  const why = forced ? forcePassFailedPhaseReason(target, ctx) : skipFailedPhaseReason(target, ctx)
   if (why) return { error: why }
   const phase = failedPhaseOf(target)!
 
@@ -1007,7 +1108,9 @@ export function planSkip(
      * **都是 0**,而这两个恰恰是「换掉了质量保证」最明显的两个(方案没人质疑就往下走、
      * 一个测试都不实跑)。README 承诺这一屏会用 ⚠ 标出来,那就得真的标。
      */
-    warnings.push('这份方案**没有任何人质疑过**就进入下一步 —— 漏项和隐藏依赖不会在这里被拦下')
+    warnings.push(forced
+      ? '评审员提出的意见**一条都没有被处理**,由你放行 —— 它们原样留在评审记录里,而方案一个字没改'
+      : '这份方案**没有任何人质疑过**就进入下一步 —— 漏项和隐藏依赖不会在这里被拦下')
     seatedAt = 'CREATED'
   } else if (phase === 'verify' || phase === 'accept') {
     /**
@@ -1019,10 +1122,14 @@ export function planSkip(
      */
     target.iteration = { ...target.iteration, acceptance: 0, scoring: 0, mergeResolve: 0 }
     if (phase === 'accept') {
-      warnings.push('本节点的产出**不会有任何人核对**就合进集成分支 —— 这正是你按下这个键要的效果,但它没有回头路')
+      warnings.push(forced
+        ? '验收员判**不通过**的那份产出会原样合进集成分支 —— 这正是你按下这个键要的效果,但它没有回头路'
+        : '本节点的产出**不会有任何人核对**就合进集成分支 —— 这正是你按下这个键要的效果,但它没有回头路')
     } else {
       // 同上:这一跳的 ⚠ 原来也是空的。
-      warnings.push('**一个测试都不会被实跑** —— 之后的验收只能读执行者的自述')
+      warnings.push(forced
+        ? '**一个测试都不会被实跑**,而此前那一轮是判过不通过的 —— 之后的验收只能读执行者的自述'
+        : '**一个测试都不会被实跑** —— 之后的验收只能读执行者的自述')
     }
     seatedAt = 'READY'
   } else {
@@ -1034,14 +1141,20 @@ export function planSkip(
       // 那一步 —— 而那一步这次会被跳过。
       warnings.push(`还有 ${unfinished.length} 个子任务没有验收通过,本节点会先等它们完成`)
     }
-    warnings.push('「这些子任务合起来达成父目标了吗」这一问**这次不会有人回答** —— 当初拆漏了也不会在这里被发现')
+    warnings.push(forced
+      ? '「这些子任务合起来达成父目标了吗」这一问**由你自己回答了是** —— 圆桌给的是否,当初拆漏了什么就随之定案'
+      : '「这些子任务合起来达成父目标了吗」这一问**这次不会有人回答** —— 当初拆漏了也不会在这里被发现')
     seatedAt = 'WAITING_CHILDREN'
   }
 
   const reopenedAncestors = reseatForRerun(target, byId, {
     seatedAt, now, warnings,
     redoFrom: phase === 'review' ? 'review' : undefined,
-    skipPhase: phase,
+    // 两个字段**互斥**地写:同时挂着的话 pipeline 里那个「强制通过赢」的判据会让跳过
+    // 那一支永远走不到,而节点上留着一个永远不被消费的 skipPhase —— 它的第二个作用
+    // (让 stepExecute 从判决段进来)会在**下一轮**再次生效,执行环节从此不再跑。
+    skipPhase: forced ? undefined : phase,
+    forcePass: forced ? phase : undefined,
   })
 
   return {
@@ -1059,8 +1172,30 @@ export function planSkip(
 export function skipSummary(
   plan: RedoPlan, target: TaskNode, phase: PhaseName, ctx?: RedoContext,
 ): string[] {
+  return pastPhaseSummary(plan, target, phase, 'skip', ctx)
+}
+
+/**
+ * 强制通过关口上那段摘要。
+ *
+ * 和跳过共用主体(之后跑什么、执行重不重跑、计数清不清零 —— 那些是路由的事实,两条路
+ * 逐字相同),只有**头一行和尾巴上那条**不同,而那正是这个功能的全部:一条会留在记录里的
+ * 人工裁决。
+ */
+export function forcePassSummary(
+  plan: RedoPlan, target: TaskNode, phase: PhaseName, ctx?: RedoContext,
+): string[] {
+  return pastPhaseSummary(plan, target, phase, 'forcePass', ctx)
+}
+
+function pastPhaseSummary(
+  plan: RedoPlan, target: TaskNode, phase: PhaseName, mode: 'skip' | 'forcePass', ctx?: RedoContext,
+): string[] {
+  const forced = mode === 'forcePass'
   const lines: string[] = []
-  lines.push(`跳过「${PHASE_LABEL[phase]}」—— 这个环节这次**不会发生**,也不会在记录里留一条通过`)
+  lines.push(forced
+    ? `强制通过「${PHASE_LABEL[phase]}」—— 这个环节这次**不会开会**,但会在记录里留下一条**署名「${MANUAL_PASS_ROLE}」的通过**`
+    : `跳过「${PHASE_LABEL[phase]}」—— 这个环节这次**不会发生**,也不会在记录里留一条通过`)
   /**
    * 跳过之后还会跑什么,**照实算**。
    *
@@ -1093,7 +1228,13 @@ export function skipSummary(
     lines.push('本轮测试验证也不重跑 —— 它在上一轮(节点走到验收之前)已经通过了')
   }
   if (phase === 'review') {
-    lines.push('现有方案原样保留,没有任何人质疑它就进入下一步')
+    lines.push(forced
+      // 「没有任何人质疑它」在强制通过这条路上是**假话** —— 有人质疑了,而且判了不通过。
+      ? '现有方案原样保留(一个字都不会改),评审员提的那些意见留在记录里但没人去处理'
+      : '现有方案原样保留,没有任何人质疑它就进入下一步')
+  }
+  if (forced) {
+    lines.push(`记录里会多一条 round 的 PASS,署名「${MANUAL_PASS_ROLE}」,并附上被你覆盖掉的那些阻断意见`)
   }
   if (target.status === 'BLOCKED') lines.push('本节点从「已阻断」回到可推进状态')
   /**

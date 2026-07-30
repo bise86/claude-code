@@ -171,7 +171,24 @@ export function guidanceBody(n: TaskNode): string {
 /** 评审 / 验收记录:每轮一行。 */
 function roundsBody(log: TaskNode['reviewLog']): string {
   return log
-    .map(r => `第 ${r.round} 轮 ${r.synthesized.pass ? '通过' : '未通过'}${r.synthesized.blockingSummary ? ': ' + r.synthesized.blockingSummary : ''}`)
+    .map(r => {
+      /**
+       * 人工强制通过要**在这一行上就看得出来**,不能只在展开的角色意见里。
+       *
+       * 详情页这一段是折叠的,用户扫的就是这些行。一条只写着「通过」的人工裁决和一桌
+       * 真的通过在这里逐字相同 —— 而 node.md 那侧已经为同一件事把 mark 分开了
+       * (见 persistence 的 roundtableBody),两边口径必须一致,否则同一条记录在
+       * 界面上和文件里读起来是两回事。
+       */
+      const manual = r.verdicts.some(v => v.manual === true)
+      const head = manual ? '人工强制通过' : r.synthesized.pass ? '通过' : '未通过'
+      // 人工那条的 blockingSummary 是空的(它就是通过),被覆盖的意见在 comments 里 ——
+      // 摊到这一行上,否则用户要展开才知道自己当初放行了什么。
+      const detail = manual
+        ? r.verdicts.find(v => v.manual === true)?.comments ?? ''
+        : r.synthesized.blockingSummary
+      return `第 ${r.round} 轮 ${head}${detail ? ': ' + detail : ''}`
+    })
     .join('\n')
 }
 

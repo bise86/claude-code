@@ -122,11 +122,16 @@ function richNode(): TaskNode {
    * 新的敌意输入面:
    *  - `failedAt` 决定「快速重做失败环节」和「跳过失败环节」这两个键做什么;
    *  - `skipPhase` 能让一个节点跳过验收直接合进集成分支;
+   *  - `forcePass` 同上,**而且还会往验收记录里塞一条署名「人工强制通过」的 PASS** ——
+   *    手写一个就等于伪造一份「有人放行过」的记录,而那一节是事后追责唯一的依据;
    *  - `guidance` 会被**原样拼进提示词**,一个非字符串值会以「[object Object]」的形状
    *    发给执行者,而屏幕上那一段看起来像一句正常的补充指引。
    */
   n.failedAt = 'ACCEPTANCE'
   n.skipPhase = 'accept'
+  // 和 skipPhase 分开的两个节点场景由用例自己造;这里给的是「盘上两个都写着」那一种,
+  // 而校验必须清掉其中一个 —— 留着两个的后果见 resumeCore 那一段注释。
+  n.forcePass = 'accept'
   n.guidance = { all: '别动 src/legacy', execute: '先跑一遍 bun test' }
   n.worktree = { branch: 'b', path: '/wt/root' }
   n.startedAt = NOW

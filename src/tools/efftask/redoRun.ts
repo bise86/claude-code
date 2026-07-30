@@ -1,4 +1,4 @@
-import { attachGuidance, planRedo, planSkip, type RedoContext, type RedoEntry, type RedoPlan } from './redo.js'
+import { attachGuidance, planForcePass, planRedo, planSkip, type RedoContext, type RedoEntry, type RedoPlan } from './redo.js'
 import type { PhaseName, TaskNode } from './types.js'
 
 /**
@@ -96,16 +96,49 @@ export async function runSkip(
   ctx?: RedoContext,
   guidance?: { scope: PhaseName | 'all'; text: string },
 ): Promise<void> {
-  const computed = planSkip(nodes, targetId, now, ctx)
+  return runPastFailedPhase(nodes, targetId, now, 'skip', deps, ctx, guidance)
+}
+
+/**
+ * 一次「强制通过失败的环节」从确认到重新跑起来之间的全部动作。
+ *
+ * 和 `runSkip` 共用实现,理由和它自己的注释逐字相同:那六步(落盘 → 上屏 → 进 state →
+ * 重启编排)漏掉任何一步的后果都是「按下确认之后界面纹丝不动」,而第二份实现意味着
+ * 第二次踩同一组坑。唯一的区别是算新树用 `planForcePass`,以及出错时那句话叫什么。
+ */
+export async function runForcePass(
+  nodes: readonly TaskNode[],
+  targetId: string,
+  now: string,
+  deps: RedoRunDeps,
+  ctx?: RedoContext,
+  guidance?: { scope: PhaseName | 'all'; text: string },
+): Promise<void> {
+  return runPastFailedPhase(nodes, targetId, now, 'forcePass', deps, ctx, guidance)
+}
+
+async function runPastFailedPhase(
+  nodes: readonly TaskNode[],
+  targetId: string,
+  now: string,
+  mode: 'skip' | 'forcePass',
+  deps: RedoRunDeps,
+  ctx?: RedoContext,
+  guidance?: { scope: PhaseName | 'all'; text: string },
+): Promise<void> {
+  const what = mode === 'forcePass' ? '强制通过' : '跳过'
+  const computed = mode === 'forcePass'
+    ? planForcePass(nodes, targetId, now, ctx)
+    : planSkip(nodes, targetId, now, ctx)
   if ('error' in computed) {
-    deps.onProblems([`跳过未执行: ${computed.error}`])
+    deps.onProblems([`${what}未执行: ${computed.error}`])
     deps.onDone()
     return
   }
   if (guidance && guidance.text.trim().length > 0) {
     const target = computed.nodes.find(n => n.id === targetId)
     if (target) attachGuidance(target, guidance.scope, guidance.text)
-    else deps.onProblems([`补充指引没能写上:跳过后的树里找不到节点 ${targetId}`])
+    else deps.onProblems([`补充指引没能写上:${what}后的树里找不到节点 ${targetId}`])
   }
   // `before` 同样是**跳过前**的节点 —— commitRedo 拿它算隔离工作区的路径和分支。
   // 跳过通常一个工作区都不放(deleted 恒为空),但「从质疑讨论跳过」那一条在执行型节点上

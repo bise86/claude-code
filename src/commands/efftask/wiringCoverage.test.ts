@@ -477,18 +477,42 @@ describe('改回去要变红的四处', () => {
     expect(SRC).toContain('{ isolated: poolRef.current !== undefined }')
   })
 
-  it('R 与 s 两个键真的接到了失败判据上,而且拿不到时**说原因**', () => {
+  it('R / s / f 三个键真的接到了失败判据上,而且拿不到时**说原因**', () => {
     /**
-     * 这两个键的价值全在「拿不到的时候告诉你为什么」:一个节点不是自己失败的(是它孩子挂了)、
+     * 这几个键的价值全在「拿不到的时候告诉你为什么」:一个节点不是自己失败的(是它孩子挂了)、
      * 失败在一个不能单独重入的环节、或者这次 run 被中断过 —— 三种情况要做的事完全不同。
      * 剪断任何一条 setRedoProblems,用户按下去得到的是**一屏什么都没有**。
      */
     const done = SRC.slice(SRC.indexOf('<DoneView'))
     expect(done).toContain('failedRedoTarget(node, byId,')
     expect(done).toContain('skipFailedPhaseReason(node,')
-    // 中断标记那道闸门在**三个**入口上都要有(r / R / s):少了它,按下去会立刻再次阻断,
+    // 强制通过用的是它自己那个判据函数,不是跳过那个。两者共用实现但**文案不同**
+    // (「跳过它」vs「强制通过它」),接错了屏幕上会对着一个强制通过的动作说「无法跳过」。
+    expect(done).toContain('forcePassFailedPhaseReason(node,')
+    // 中断标记那道闸门在**四个**入口上都要有(r / R / s / f):少了它,按下去会立刻再次阻断,
     // 而屏幕上只会闪一下(redoUnavailableReason 的注释记着这条实测)。
-    expect(done.split('redoUnavailableReason({ aborted: props.signal.aborted').length - 1).toBe(3)
+    expect(done.split('redoUnavailableReason({ aborted: props.signal.aborted').length - 1).toBe(4)
+  })
+
+  it('运行中的 f 走的是预先批准,不是重开编排', () => {
+    /**
+     * 这两条路**必须分开**,而接线是唯一能把它们接反的地方:
+     *  - 从 running 进来 → `control.forcePass` + 回 running。节点一个字不动,编排器继续跑。
+     *  - 从 done 进来 → `runForcePass` 重算树 + 重开编排。
+     *
+     * 接反的后果不对称:把 done 那条接成预先批准 = 按下去什么都不发生(节点已经停了,
+     * 没有人会再走到那个环节);把 running 那条接成 runForcePass = **在编排器正握着这些
+     * 节点的时候把树换掉**。
+     */
+    const gate = SRC.slice(SRC.indexOf("phase === 'confirmForcePass'"))
+    expect(gate).toContain("forcePassFrom === 'running'")
+    expect(gate).toContain('control.forcePass(forcePassTarget.id, p)')
+    // 取消要回到**来的那一屏**,不是无条件回 done —— 运行中按 f 又按 Esc 会让一个还在跑的
+    // run 变成结束屏:树不再更新,p / i / x 一起消失,而什么都没有出错。
+    expect(gate).toContain('setPhase(forcePassFrom)')
+    expect(gate).not.toContain("onCancel={() => { setForcePassTarget(null); setPhase('done') }}")
+    // 运行视图那一侧真的把键给出去了(给了才有 f)。
+    expect(SRC).toContain("onForcePass={node => { setForcePassTarget(node); setForcePassFrom('running')")
   })
 
   it('重做的四条出口全都接上了 —— 行为归 redoRun.test.ts,这里只守接线', () => {

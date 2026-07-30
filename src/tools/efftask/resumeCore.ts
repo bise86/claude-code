@@ -214,6 +214,27 @@ export interface ValidateResult { nodes: TaskNode[]; repairs: string[] }
  * needs the REAL objective and the REAL roster, because it is what the integration
  * roundtable judges the entire run against.
  */
+/**
+ * 这个节点**有没有可被跳过 / 可被放行的产出** —— 跳过和强制通过共用的那道证据校验。
+ *
+ * 判据是**证据**,不是 `failedAt`:合法的跳过/强制通过恰好会把 failedAt 清掉(见
+ * reseatForRerun),拿它当判据会把用户真按过的那一次在恢复时静默撤销。而证据是查得到的
+ * —— 放行验收/测试验证意味着「执行者已经交过东西」,放行质疑讨论意味着「有一份方案」,
+ * 放行集成验收意味着「有子任务」。
+ *
+ * 一份实现,两个消费者:各写一份的话最松的那一份就是实际生效的那一份,而这两条的后果
+ * (零调用判 ACCEPTED)一模一样。
+ */
+function hasWorkToSkip(n: Partial<TaskNode>, phase: string): boolean {
+  if (phase === 'accept' || phase === 'verify') {
+    return typeof n.execStatus === 'string' && n.execStatus.trim().length > 0
+  }
+  if (phase === 'review') {
+    return `${n.plan?.solution ?? ''}${n.plan?.keyPoints ?? ''}${n.plan?.acceptance ?? ''}`.trim().length > 0
+  }
+  return (n.childIds ?? []).length > 0
+}
+
 export function validateLoadedNodes(
   nodes: TaskNode[],
   opts: { goal: string; phaseRoles: Record<PhaseName, RoleBinding[]>; now: string },
@@ -429,21 +450,46 @@ export function validateLoadedNodes(
      * 跳过验收/测试验证意味着「执行者已经交过东西」,跳过质疑讨论意味着「有一份方案」,
      * 跳过集成验收意味着「有子任务」。同一个函数里 `confirmedDraft` 正是为这一类硬挡的。
      */
-    if (n.skipPhase !== undefined) {
-      const hasWork =
-        n.skipPhase === 'accept' || n.skipPhase === 'verify'
-          ? typeof n.execStatus === 'string' && n.execStatus.trim().length > 0
-          : n.skipPhase === 'review'
-            ? `${n.plan?.solution ?? ''}${n.plan?.keyPoints ?? ''}${n.plan?.acceptance ?? ''}`.trim().length > 0
-            : (n.childIds ?? []).length > 0
-      if (!hasWork) {
-        repairs.push(
-          `节点 ${n.id}:盘上写着要跳过${String(n.skipPhase)},但这个节点还没有可被跳过的产出` +
-          `(执行自述/方案/子任务都是空的),已清除 —— 否则它会零调用地判为已验收`,
-        )
-        n.skipPhase = undefined
-      }
+    if (n.skipPhase !== undefined && !hasWorkToSkip(n, n.skipPhase)) {
+      repairs.push(
+        `节点 ${n.id}:盘上写着要跳过${String(n.skipPhase)},但这个节点还没有可被跳过的产出` +
+        `(执行自述/方案/子任务都是空的),已清除 —— 否则它会零调用地判为已验收`,
+      )
+      n.skipPhase = undefined
     }
+    /**
+     * 强制通过的那一个环节。两道校验和 `skipPhase` **逐字相同**,而且更要紧。
+     *
+     * 同因:落盘白拿(serializeNode 整节点倾倒),所以缺口只在读回这一侧,而这个字段决定
+     * 一个节点会不会零调用地走完一个判决环节。
+     *
+     * 更要紧的地方在于**后果多一层**:一个手写的 `skipPhase` 只是让节点零调用判 ACCEPTED,
+     * 留痕是 execStatus 上一句假话;而一个手写的 `forcePass` 在此之上还会往
+     * reviewLog/acceptLog 里塞一条署名「人工强制通过」的 PASS —— 那是伪造一份**有人放行过**
+     * 的记录,而那一节正是事后追责唯一的依据。
+     */
+    if (n.forcePass !== undefined && !SKIPPABLE_PHASES.has(n.forcePass as string)) {
+      repairs.push(`节点 ${n.id}:要强制通过的环节 ${String(n.forcePass)} 不在可强制通过之列,已清除`)
+      n.forcePass = undefined
+    }
+    if (n.forcePass !== undefined && !hasWorkToSkip(n, n.forcePass)) {
+      repairs.push(
+        `节点 ${n.id}:盘上写着要强制通过${String(n.forcePass)},但这个节点还没有可被放行的产出` +
+        `(执行自述/方案/子任务都是空的),已清除 —— 否则它会零调用地判为已验收,并留下一条假的通过记录`,
+      )
+      n.forcePass = undefined
+    }
+    /**
+     * **两个都写着不算坏数据,所以这里一个字都不改。**
+     *
+     * 正常路径产生不了这种组合(reseatForRerun 把两个字段一起无条件写,一个必为 undefined),
+     * 所以它只可能来自手工编辑。而 `pipeline` 那四处已经把它处理干净了:强制通过的分支赢,
+     * 两个标记**都**被消费掉,没有一个会留到下一轮。
+     *
+     * 不在这里判的理由是**别造第二份判据**:一条「已清除跳过标记」的修复消息要和
+     * `isForcePassed` 的优先级永远同向,而那是两个文件里的两句话。让消费点自己兜住,
+     * 这里就不存在漂移的余地。
+     */
     /**
      * 补充指引。它**会被原样拼进提示词**,所以这里逐条过:键必须是合法环节名或 `all`,
      * 值必须是非空字符串,并按码点夹到上限。

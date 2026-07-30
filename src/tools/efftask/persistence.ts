@@ -119,7 +119,15 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
     const head = `- ${step}round ${stripControl(String(r?.round ?? '?'))}: ${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
     const roles = (r?.verdicts ?? []).map(v => {
       const detail = (v?.blocking ?? []).length > 0 ? (v.blocking ?? []).join('; ') : (v?.comments ?? '')
-      const mark = v?.infra ? 'CALL-FAILED' : v?.pass ? 'pass' : 'FAIL'
+      /**
+       * `MANUAL` 排在 `pass` **之前**,而且是自己的记号,不是 pass 的一种。
+       *
+       * 这一行是事后追责唯一读得到的东西。一条人工强制通过如果渲染成 `pass`,它和一位
+       * 真的评审员点头就**逐字相同** —— 而两者的区别正是这一节存在的全部理由。
+       * 判据是 `manual` 那个布尔,不是 role 里那四个字:role 是显示用的字符串,而
+       * node.md 可以手工编辑,拿它当判据等于让改个名字就能伪装成人工放行(反过来也一样)。
+       */
+      const mark = v?.infra ? 'CALL-FAILED' : v?.manual ? 'MANUAL-PASS' : v?.pass ? 'pass' : 'FAIL'
       return `  - [${stripControl(String(v?.role ?? 'unknown'))}] ${mark}${detail ? ': ' + clipBody(stripControl(detail)) : ''}`
     })
     return [head, ...roles].join('\n')

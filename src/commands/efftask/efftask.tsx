@@ -18,9 +18,9 @@ import { createWorktreePool, type GitRunner, type WorktreePool } from '../../too
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
 import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
-import { failedRedoTarget, redoContextOf, redoUnavailableReason, skipFailedPhaseReason, type RedoEntry, type RedoPlan } from '../../tools/efftask/redo.js'
+import { failedRedoTarget, forcePassFailedPhaseReason, redoContextOf, redoUnavailableReason, skipFailedPhaseReason, type RedoEntry, type RedoPlan } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
-import { runRedo, runSkip } from '../../tools/efftask/redoRun.js'
+import { runForcePass, runRedo, runSkip } from '../../tools/efftask/redoRun.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
 import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
@@ -32,6 +32,7 @@ import { createRunControl, type RunControl } from '../../tools/efftask/control.j
 import { AddDirective } from './AddDirective.js'
 import { ConfirmRedo } from './ConfirmRedo.js'
 import { ConfirmSkip } from './ConfirmSkip.js'
+import { ConfirmForcePass } from './ConfirmForcePass.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
@@ -746,6 +747,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [redoEntry, setRedoEntry] = React.useState<RedoEntry | null>(null)
   /** 正在被「跳过失败环节」的节点。 */
   const [skipTarget, setSkipTarget] = React.useState<TaskNode | null>(null)
+  const [forcePassTarget, setForcePassTarget] = React.useState<TaskNode | null>(null)
+  /**
+   * 强制通过关口开之前是哪一屏 —— 取消时要回到**它**,不是无条件回 done。
+   *
+   * 这个关口是唯一一个**也能从 running 进来**的:运行中按 f 是预先批准。写死 `setPhase('done')`
+   * 的话,用户在跑到一半时按 f 又按 Esc,run 还在跑而界面已经变成结束屏 —— 树不再更新,
+   * 那三个运行中的干预键(p / i / x)一起消失,而什么都没有出错。
+   */
+  const [forcePassFrom, setForcePassFrom] = React.useState<Phase>('done')
   /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
   const [redoProblems, setRedoProblems] = React.useState<string[]>([])
   /**
@@ -1132,6 +1142,19 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
      * 一下、节点又变回 BLOCKED,理由还是那句「可以按 r 重做」。
      */
     props.control.clearAllCancels()
+    /**
+     * 预先批准同样归零 —— 而且**要说出来**。
+     *
+     * 归零的理由和上面那句同源:redo 是原地重置、id 不变,一条留下来的预先批准会作用到
+     * 重做之后那份**不一样的产出**上,那正是 `failedAt` 过期时踩过的坑。
+     *
+     * 但静默丢掉用户亲手按过的批准是这个仓库反复付代价的另一类,所以拿返回值报出来 ——
+     * 他至少知道要重按一次,而不是等到那一关照常开了会才发现。
+     */
+    const droppedApprovals = props.control.clearAllForcePasses()
+    if (droppedApprovals > 0) {
+      setRedoProblems([`重开编排,此前那 ${droppedApprovals} 条运行中预先批准已失效 —— 它们判的是重做之前那份产出,需要的话请重按 f`])
+    }
     // Built at gate time, before the first step: init() creates the integration branch and
     // its worktree, which is real work the user has consented to. A failure is not fatal —
     // the run continues honestly un-isolated.
@@ -1276,6 +1299,25 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     if (!cfg || !runDir) return
     setSkipTarget(null)
     void runSkip(
+      nodes, target.id, new Date().toISOString(),
+      redoDeps(cfg, runDir), phaseCtxOf(target, cfg), guidance,
+    )
+  }, [config, runDir, nodes, redoDeps, phaseCtxOf])
+
+  /**
+   * 执行一次「强制通过失败的环节」—— 阻断后那条路。
+   *
+   * 和 applySkip 走同一套 deps(落盘 → 上屏 → 进 state → 重启编排),只是新树由
+   * `planForcePass` 算。运行中预先批准那条路**不走这里**:它一个节点都不动,见下面
+   * ConfirmForcePass 的 onPreApprove。
+   */
+  const applyForcePass = React.useCallback((
+    target: TaskNode, guidance?: { scope: PhaseName | 'all'; text: string },
+  ): void => {
+    const cfg = config
+    if (!cfg || !runDir) return
+    setForcePassTarget(null)
+    void runForcePass(
       nodes, target.id, new Date().toISOString(),
       redoDeps(cfg, runDir), phaseCtxOf(target, cfg), guidance,
     )
@@ -1677,6 +1719,32 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  if (phase === 'confirmForcePass' && forcePassTarget) {
+    return (
+      <ConfirmForcePass
+        nodes={nodes}
+        targetId={forcePassTarget.id}
+        now={new Date().toISOString()}
+        // 同一份环节实况(也就是 applyForcePass 真正会用的那一份)——
+        // 两边各算一次的话,屏幕上算出来的后果和实际发生的可以不一样。
+        phases={phaseCtxOf(forcePassTarget, config)}
+        /**
+         * 预先批准。**只在这个关口是从 running 进来的时候给** —— 结束之后没有编排器会
+         * 再走到那个环节,给了就是一个按下去什么都不会发生的选项。关口自己也会用节点
+         * 状态判一次(见它的 `blocked`),这里是把「有没有人在听」这一半交代清楚。
+         */
+        onPreApprove={forcePassFrom === 'running'
+          ? p => {
+            control.forcePass(forcePassTarget.id, p)
+            setForcePassTarget(null)
+            setPhase('running')
+          }
+          : undefined}
+        onConfirm={guidance => { setPhase(forcePassFrom); applyForcePass(forcePassTarget, guidance) }}
+        onCancel={() => { setForcePassTarget(null); setPhase(forcePassFrom) }}
+      />
+    )
+  }
   if (phase === 'running' && directiveOpen) {
     return (
       <AddDirective
@@ -1691,6 +1759,11 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   }
   if (phase === 'running') {
     return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} serialExecute={poolRef.current === undefined}
+      /**
+       * 运行中按 f = 预先批准。**不在这里判能不能** —— 关口自己会按节点状态和本次配置
+       * 算出可选的环节并逐条说明原因,而在这儿再判一次就是第二份判据。
+       */
+      onForcePass={node => { setForcePassTarget(node); setForcePassFrom('running'); setPhase('confirmForcePass') }}
       runControl={{
         paused,
         // 真相在 control 里,state 只是让提示行重绘 —— 两边分开的话它们迟早不一致,
@@ -1754,6 +1827,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         if (blocked) { setRedoProblems([blocked]); return }
         setSkipTarget(node); setPhase('confirmSkip')
       }}
+      /**
+       * 强制通过失败的那个环节(`f`)。闸门和 `s` 逐字相同(它们共用一份实现),
+       * 顺序也一样:先判这一次能不能重开编排,再判这个环节能不能被放行。
+       */
+      onForcePass={viewOnly ? undefined : node => {
+        const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
+        if (why) { setRedoProblems([why]); return }
+        const blocked = forcePassFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
+        if (blocked) { setRedoProblems([blocked]); return }
+        setForcePassTarget(node); setForcePassFrom('done'); setPhase('confirmForcePass')
+      }}
     />
   )
 }
@@ -1809,6 +1893,13 @@ export function RunningView(props: {
   onAbort: () => void; suspended?: boolean; serialExecute?: boolean
   /** 运行中的人工干预:暂停 / 追加指令 / 取消单个节点。 */
   runControl?: React.ComponentProps<typeof TaskTreePanel>['runControl']
+  /**
+   * 给了才有 `f` 键(运行中预先批准某个环节)。
+   *
+   * 和 runControl 分开传:那三个键当场就生效,而这一个要先弹一屏让用户选环节并看后果 ——
+   * 它的落点是 `setPhase('confirmForcePass')`,不是一个即时动作。
+   */
+  onForcePass?: (node: TaskNode) => void
 }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
@@ -1816,7 +1907,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
@@ -1847,6 +1938,8 @@ export function DoneView(props: {
   onRedoFailed?: (node: TaskNode) => void
   /** 给了才有 s 键(跳过失败的那个环节继续往下走)。 */
   onSkipFailed?: (node: TaskNode) => void
+  /** 给了才有 f 键(强制通过失败的那个环节,并留下一条人工裁决)。 */
+  onForcePass?: (node: TaskNode) => void
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -1873,6 +1966,7 @@ export function DoneView(props: {
         onRedo={props.onRedo}
         onRedoFailed={props.onRedoFailed}
         onSkipFailed={props.onSkipFailed}
+        onForcePass={props.onForcePass}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">
