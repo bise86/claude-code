@@ -1,4 +1,6 @@
 import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES, PHASE_LABEL } from './types.js'
+import { hostOf, isLanHost } from '../../utils/lanDirect.js'
+import { getProxyUrl } from '../../utils/proxy.js'
 import { stripControl } from './persistence.js'
 import { allowsMultipleSeats } from './roleDefs.js'
 import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
@@ -295,6 +297,42 @@ export function mcpNoticeLines(mcpToolNames: string[]): string[] {
     `本次所有环节(不只是执行)都能用 MCP:${shown}${more}`,
     '内建写工具(Edit/Write/NotebookEdit/Bash)仍然只有执行环节有;但**会写的 MCP 挡不住** —— 给评审/验收席位配带写能力 MCP 的角色时,它可以自己改完再判通过。',
   ]
+}
+
+/**
+ * 全局代理与内网直连 —— 这次运行的**出网路线**。
+ *
+ * 为什么值一块关口位置:用户报过一次「配了 roles 就连不上」,真凶是一条他早就忘了的
+ * `HTTPS_PROXY`,而同一台机器上 `curl` 那个地址是通的。现在内网端点会自动绕过代理
+ * (见 utils/lanDirect),但**自动发生的事更需要说出来** —— 它同时回答了两个问题:
+ * 「为什么这次能连上了」和「哪些员工仍然要走代理」。
+ *
+ * 没配代理就一个字都不说:那时候这一块是纯噪音。
+ *
+ * @param apiUrls 这次名册上所有 execMode:'api' 员工的端点(可含重复/空)
+ */
+export function proxyNoticeLines(
+  apiUrls: readonly (string | undefined)[],
+  env: Record<string, string | undefined> = process.env,
+): string[] {
+  const proxy = getProxyUrl(env)
+  if (!proxy) return []
+  const direct: string[] = []
+  const viaProxy: string[] = []
+  for (const u of apiUrls) {
+    const host = hostOf(u)
+    if (!host) continue
+    const bucket = isLanHost(host) ? direct : viaProxy
+    if (!bucket.includes(host)) bucket.push(host)
+  }
+  const out = [`检测到全局代理 ${clip(proxy, 40)}`]
+  if (direct.length > 0) {
+    out.push(`以下内网端点会**绕过代理直连**(代理到不了局域网):${direct.map(h => clip(h, 30)).join('、')}`)
+  }
+  if (viaProxy.length > 0) {
+    out.push(`以下端点仍走代理:${viaProxy.map(h => clip(h, 30)).join('、')}`)
+  }
+  return out
 }
 
 export function skipConsequenceLines(config: EffTaskConfig): string[] {
@@ -759,6 +797,57 @@ export function relativeTime(iso: string, nowMs: number): string {
   if (secs < 3600) return `${Math.floor(secs / 60)} 分钟前`
   if (secs < 86400) return `${Math.floor(secs / 3600)} 小时前`
   return `${Math.floor(secs / 86400)} 天前`
+}
+
+/**
+ * 整趟运行的**时间窗口** —— 结束屏上那一句「这是什么时候的事、跑了多久」。
+ *
+ * 用户原话:「任务运行和阶段运行,都要有具体的运行时间点,现在只有一个运行了多长时间。」
+ * 节点和阶段各自的时刻在详情页里(见 NodeDetail 的时间线),而 run 这一级此前**一个
+ * 时间都没有**:结束屏只说完成/阻断,一个隔天回来看的人无从判断这是刚跑完的还是昨天的。
+ *
+ * - 起点取所有节点里最早的 `createdAt`(通常是 root,但重做会新建节点,取最小更稳);
+ * - 终点取最晚的 `finishedAt`;**还有节点没结论时不写终点**,写「进行中」——
+ *   拿 `now` 当终点会让一个卡住的 run 看起来刚刚才结束。
+ *
+ * 解析不了的时间串一律跳过(node.md 可手工编辑),全都解析不了就返回空串:
+ * 少说一句永远比说错一句好。
+ */
+export function runSpanLine(
+  nodes: readonly { createdAt?: string; finishedAt?: string; updatedAt?: string; status?: string }[],
+  nowMs: number,
+): string {
+  const ms = (v: string | undefined): number => (typeof v === 'string' ? Date.parse(v) : NaN)
+  const starts = nodes.map(n => ms(n.createdAt)).filter(Number.isFinite)
+  if (starts.length === 0) return ''
+  const start = Math.min(...starts)
+  const unfinished = nodes.some(n => n.status !== 'ACCEPTED' && n.status !== 'BLOCKED')
+  /**
+   * 终点:优先 `finishedAt`,拿不到就退回**最后一次落盘时刻**。
+   *
+   * 评审实测出来的 P1:全树都是终态、却一个 `finishedAt` 都没有,是**两条常见路径**的
+   * 常态 —— (a) 整个 run 被 `propagateBlocked` 扫成 BLOCKED(那条路不经过 commit,
+   * 不写 finishedAt);(b) 任何一个**老 run** 的 `--resume` / 仅查看(老 node.md 里
+   * 没有这个字段)。退回之前的写法会在「✓ 高效任务完成」下面第一行印
+   * 「进行中(至今 744h0m)」—— 一句和它上面那行结论直接打架的话。
+   */
+  const stamps = nodes.map(n => ms(n.finishedAt)).filter(Number.isFinite)
+  const ends = stamps.length > 0 ? stamps : nodes.map(n => ms(n.updatedAt)).filter(Number.isFinite)
+  const end = unfinished || ends.length === 0 ? undefined : Math.max(...ends)
+  const stamp = (t: number): string => {
+    const d = new Date(t)
+    const p2 = (v: number): string => String(v).padStart(2, '0')
+    return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+  }
+  const dur = (a: number, b: number): string => {
+    const s = Math.max(0, Math.round((b - a) / 1000))
+    if (s < 60) return `${s}s`
+    const m = Math.floor(s / 60)
+    return m < 60 ? `${m}m${s % 60}s` : `${Math.floor(m / 60)}h${m % 60}m`
+  }
+  return end === undefined
+    ? `起 ${stamp(start)} · 进行中(至今 ${dur(start, nowMs)})`
+    : `起 ${stamp(start)} · 止 ${stamp(end)} · 共 ${dur(start, end)}`
 }
 
 /**

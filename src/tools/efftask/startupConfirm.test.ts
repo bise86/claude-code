@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -1204,5 +1204,102 @@ describe('分析的收敛方式必须在关口上看得见', () => {
   it('**只有一席时不说** —— 那时圆桌和精化完全等价,说了就是又一句不实承诺', () => {
     expect(capsLine(withPlan(1, '圆桌'))).not.toContain('分析用圆桌')
     expect(capsLine(withPlan(0, '圆桌'))).not.toContain('分析用圆桌')
+  })
+})
+
+describe('proxyNoticeLines —— 出网路线', () => {
+  it('没配代理时一个字都不说', () => {
+    expect(proxyNoticeLines(['http://192.168.1.7:8000/v1'], {})).toEqual([])
+  })
+
+  it('有代理时点名代理,并把内网端点和公网端点分开列', () => {
+    const lines = proxyNoticeLines(
+      ['http://192.168.1.7:8000/v1', 'https://api.openai.com/v1', undefined, 'http://192.168.1.7:9000/v1'],
+      { HTTPS_PROXY: 'http://corp-proxy:8080' },
+    )
+    expect(lines[0]).toContain('corp-proxy:8080')
+    // 内网那条要说清是「绕过代理」——「为什么这次能连上了」的答案
+    expect(lines.some(l => l.includes('192.168.1.7') && l.includes('绕过代理'))).toBe(true)
+    // 公网那条要说清仍走代理 —— 剩下那半个答案
+    expect(lines.some(l => l.includes('api.openai.com') && l.includes('仍走代理'))).toBe(true)
+    // 同一个主机的两个端口只列一次
+    expect(lines.filter(l => l.includes('192.168.1.7')).length).toBe(1)
+  })
+
+  it('没有任何 api 员工时只报代理本身 —— 主模型也可能被它挡住', () => {
+    expect(proxyNoticeLines([], { HTTP_PROXY: 'http://p:1' })).toEqual(['检测到全局代理 http://p:1'])
+  })
+})
+
+/**
+ * 整趟运行的时间窗口 —— 结束屏那一句。
+ *
+ * 用户原话:「任务运行和阶段运行,都要有具体的运行时间点,现在只有一个运行了多长时间。」
+ * 节点和阶段各自的时刻在详情页里,run 这一级此前一个时间都没有。
+ */
+describe('runSpanLine', () => {
+  const N = (over: Record<string, unknown>) => over as never
+  const NOW = Date.parse('2026-07-31T10:00:00.000Z')
+
+  it('都结束了就给起、止、总时长', () => {
+    const line = runSpanLine([
+      N({ createdAt: '2026-07-31T09:00:00.000Z', finishedAt: '2026-07-31T09:20:00.000Z', status: 'ACCEPTED' }),
+      N({ createdAt: '2026-07-31T09:05:00.000Z', finishedAt: '2026-07-31T09:30:00.000Z', status: 'ACCEPTED' }),
+    ], NOW)
+    expect(line).toContain('起 ')
+    expect(line).toContain('止 ')
+    expect(line).toContain('共 30m0s')
+  })
+
+  it('还有节点没结论时说「进行中」,不拿此刻冒充结束时刻', () => {
+    // 拿 now 当终点会让一个卡死的 run 看起来「刚刚才结束」。
+    const line = runSpanLine([
+      N({ createdAt: '2026-07-31T09:00:00.000Z', finishedAt: '2026-07-31T09:20:00.000Z', status: 'ACCEPTED' }),
+      N({ createdAt: '2026-07-31T09:05:00.000Z', status: 'EXECUTING' }),
+    ], NOW)
+    expect(line).toContain('进行中')
+    expect(line).not.toContain('止 ')
+  })
+
+  it('时间串全是垃圾时整行不画 —— node.md 可以手工编辑', () => {
+    expect(runSpanLine([N({ createdAt: '前天', status: 'ACCEPTED' })], NOW)).toBe('')
+    expect(runSpanLine([], NOW)).toBe('')
+  })
+
+  it('起点取最早的一个 —— 重做会新建节点,只看 root 会算错', () => {
+    const line = runSpanLine([
+      N({ createdAt: '2026-07-31T09:30:00.000Z', finishedAt: '2026-07-31T09:40:00.000Z', status: 'ACCEPTED' }),
+      N({ createdAt: '2026-07-31T09:00:00.000Z', finishedAt: '2026-07-31T09:10:00.000Z', status: 'ACCEPTED' }),
+    ], NOW)
+    expect(line).toContain('共 40m0s')
+  })
+})
+
+/**
+ * 老 node.md 一个 `finishedAt` 都没有 —— 复验点名这条路没有测试。
+ *
+ * 触发面是**任何一个老 run 的 --resume / 仅查看**,以及整个 run 被 propagateBlocked
+ * 扫成 BLOCKED 的那一路(那条不经过 commit,不写 finishedAt)。退回之前的写法会在
+ * 「✓ 高效任务完成」下面第一行印「进行中(至今 744h)」。
+ */
+describe('runSpanLine 的老数据回落', () => {
+  const NOW2 = Date.parse('2026-07-31T10:00:00.000Z')
+  const N = (over: Record<string, unknown>) => over as never
+
+  it('全树终态但都没有 finishedAt → 退回最后一次落盘时刻', () => {
+    const line = runSpanLine([
+      N({ createdAt: '2026-07-29T09:00:00.000Z', updatedAt: '2026-07-29T10:00:00.000Z', status: 'ACCEPTED' }),
+      N({ createdAt: '2026-07-29T09:10:00.000Z', updatedAt: '2026-07-29T11:00:00.000Z', status: 'BLOCKED' }),
+    ], NOW2)
+    expect(line).toContain('止 ')
+    expect(line).not.toContain('进行中')
+    expect(line).toContain('共 2h0m')
+  })
+
+  it('有 finishedAt 时优先用它 —— 落盘时刻只是兜底', () => {
+    const line = runSpanLine([
+      N({ createdAt: '2026-07-29T09:00:00.000Z', finishedAt: '2026-07-29T09:30:00.000Z', updatedAt: '2026-07-29T23:00:00.000Z', status: 'ACCEPTED' }),
+    ], NOW2)
+    expect(line).toContain('共 30m0s')
   })
 })

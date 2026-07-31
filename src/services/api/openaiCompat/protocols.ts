@@ -24,13 +24,36 @@ import { toResponsesRequest } from './toResponsesRequest.js'
  * 字面量联合(那个模块 import 本文件,从表派生会成环)。仓库没有 typecheck,所以漏掉它
  * 不会有任何东西报错 —— 而这段自述如果不提它,它自己就是它想防的那种假话。
  */
+/**
+ * 翻译一条流时,除了帧本身还需要知道的东西。
+ *
+ * `requestId` 和 `estimatedInput` 都只为**上游不报用量**那条路服务:那时候整趟运行的
+ * token 会全是 0(实测有网关直接忽略 `stream_options.include_usage`),而 0 是一句假话。
+ * 兜底估算需要输入侧的量级(`estimatedInput`,由发请求的那一层算,只有它看得见请求体),
+ * 而「这个数是估的」这件事要靠 `requestId` 传到用量表那一侧(见 tokenEstimate 的注释:
+ * 塞进 usage 里的自定义字段会被 claude.ts 的白名单静默丢掉)。
+ */
+export interface StreamCtx {
+  anthropicModel: string
+  /** 这次响应的 request-id(由翻译层自己签发)。缺席则「是估算」这件事无处可记。 */
+  requestId?: string
+  /**
+   * 请求体的估算 token 数,**惰性**。
+   *
+   * 写成函数而不是数:绝大多数请求上游会给真 usage,这个数直接扔掉;而算它要把整个
+   * 请求体再 `JSON.stringify` 一遍并逐码点扫 —— 评审实测 703KB 的请求体上 20.8ms 的
+   * **同步**阻塞(那期间整个界面不刷新,包括别的节点正在跑的日志窗)。
+   */
+  estimatedInput?: () => number
+}
+
 export interface TranslatingProtocol {
   /** 接在 apiUrl 后面的路由段。 */
   route: string
   /** anthropic 请求体 → 该协议请求体。纯函数。 */
   buildBody(anthropicBody: any, cfg: RoleClientConfig): unknown
   /** 该协议的帧流 → anthropic 事件流。纯函数(生成器)。 */
-  toAnthropicEvents(frames: AsyncIterable<any>, ctx: { anthropicModel: string }): AsyncGenerator<Evt>
+  toAnthropicEvents(frames: AsyncIterable<any>, ctx: StreamCtx): AsyncGenerator<Evt>
 }
 
 export const TRANSLATING_PROTOCOLS: Record<string, TranslatingProtocol> = {

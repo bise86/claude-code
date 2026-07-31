@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'bun:test'
-import { runCliAgent, makeResultMessage } from './cliAgentRunner.js'
+import { runCliAgent, makeResultMessage, parseCliUsage } from './cliAgentRunner.js'
+import { isEstimatedUsage } from '../../services/api/tokenEstimate.js'
 
 function fakeSpawn(stdoutText: string) {
   return (_c: string, _a: string[]) => {
@@ -30,8 +31,60 @@ describe('makeResultMessage', () => {
     expect(typeof msg.timestamp).toBe('string')
     expect(msg.message.role).toBe('assistant')
     expect(msg.message.content).toEqual([{ type: 'text', text: 'hello world' }])
+    // 输入侧没给提示词就没得估 —— 那时候 0 是实话。
     expect(msg.message.usage.input_tokens).toBe(0)
-    expect(msg.message.usage.output_tokens).toBe(0)
+    // 输出侧**不再是 0**:那是一句假话(用户报的正是「CLI 档的 token 统计没有」)。
+    expect(msg.message.usage.output_tokens).toBeGreaterThan(0)
+  })
+
+  /**
+   * 用户原话:「token 统计…不管 CLI 还是 API 都要准确」。
+   *
+   * CLI 档是另一个进程,外面只看得见文本 —— 除非它自己报。所以两档:它报就采信,
+   * 它不报就估、并且**标明是估的**(界面上带 ≈)。硬编码 0 让一个跑二十分钟、
+   * 烧几十万 token 的外部 CLI 在统计里恒等于免费。
+   */
+  it('CLI 自己报了用量就采信它,而且不标成估算', () => {
+    const msg = makeResultMessage('hi', { usage: { input: 1234, output: 56 }, promptForEstimate: '很长的提示词'.repeat(50) }) as any
+    expect(msg.message.usage.input_tokens).toBe(1234)
+    expect(msg.message.usage.output_tokens).toBe(56)
+    expect(isEstimatedUsage(msg.requestId)).toBe(false)
+  })
+
+  it('没报就按提示词和正文估,并登记成估算', () => {
+    const msg = makeResultMessage('输出的正文', { promptForEstimate: '一段中文提示词,大约这么长' }) as any
+    expect(msg.message.usage.input_tokens).toBeGreaterThan(0)
+    expect(msg.message.usage.output_tokens).toBeGreaterThan(0)
+    // 标记挂在 requestId 上 —— 它此前是 undefined,而那个字段是这次调用的身份。
+    expect(typeof msg.requestId).toBe('string')
+    expect(isEstimatedUsage(msg.requestId)).toBe(true)
+  })
+
+  it('两次调用不共用身份 —— 否则用量表会把它们去重成一次', () => {
+    const a = makeResultMessage('x', { promptForEstimate: 'p' }) as any
+    const b = makeResultMessage('y', { promptForEstimate: 'p' }) as any
+    expect(a.requestId).not.toBe(b.requestId)
+  })
+})
+
+describe('parseCliUsage', () => {
+  it('两套字段名都收 —— 外部 CLI 是别人写的', () => {
+    expect(parseCliUsage({ input_tokens: 10, output_tokens: 20 })).toEqual({ input: 10, output: 20 })
+    expect(parseCliUsage({ prompt_tokens: 10, completion_tokens: 20 })).toEqual({ input: 10, output: 20 })
+  })
+
+  it('第一个键是 0 时不许短路 —— 那种形状真实存在', () => {
+    // 某些 CLI 两套字段都写,只有一套是真的。0 在这里的含义是「这一档没报」,不是「零」。
+    expect(parseCliUsage({ input_tokens: 0, prompt_tokens: 500, output_tokens: 7 })).toEqual({ input: 500, output: 7 })
+    expect(parseCliUsage({ output_tokens: 0, completion_tokens: 42 })).toEqual({ input: 0, output: 42 })
+  })
+
+  it('没有可用数字时返回 undefined —— 那时候该走估算,而不是记成 0', () => {
+    expect(parseCliUsage(undefined)).toBeUndefined()
+    expect(parseCliUsage({})).toBeUndefined()
+    expect(parseCliUsage({ input_tokens: 0, output_tokens: 0 })).toBeUndefined()
+    expect(parseCliUsage({ input_tokens: -5 })).toBeUndefined()
+    expect(parseCliUsage('nope')).toBeUndefined()
   })
 })
 

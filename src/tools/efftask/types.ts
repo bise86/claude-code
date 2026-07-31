@@ -90,6 +90,20 @@ export const NODE_STATUSES: NodeStatus[] = [
   'ACCEPTED', 'BLOCKED',
 ]
 
+/**
+ * 节点**正在干活**的那几个状态(相对于「在排队」「在等子任务」「已终结」)。
+ *
+ * 三个消费者共用一份:`pipeline.commit` 拿它决定给哪些状态记耗时与时间点、
+ * `startedAt` 拿它认「首个活动阶段」、`resumeCore` 拿它校验盘上 `phaseMs`/`phaseAt`
+ * 的键。各写一份的后果是**最松的那一份说了算**:评审实测,一个手改的
+ * `phaseAt: { ACCEPTED: … }` 通过了只按 NODE_STATUSES 判的校验,详情页于是印出一行
+ * 没有中文标签的 `ACCEPTED 18:07:00 → 进行中` —— 内部枚举名直接摆到用户面前。
+ */
+export const ACTIVE_STATUSES: ReadonlySet<NodeStatus> = new Set<NodeStatus>([
+  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'VERIFYING', 'ACCEPTANCE', 'REWORK',
+  'INTEGRATION_ACCEPT', 'SCORING', 'MERGE',
+])
+
 export interface RoleBinding {
   /**
    * 员工名 —— 一个可派发的 agentType,**永远不是角色名**。
@@ -267,6 +281,24 @@ export interface TaskNode {
    * merely interrupted. Cleared the moment the node is reseated.
    */
   interrupted?: boolean
+  /**
+   * 这个节点是**被用户点名取消**的(面板上按 x),不是整个 run 被中断扫到的。
+   *
+   * 两者都会置 `interrupted`(取消不是判决,`--resume` 要能重新排队它),但**在重做那条
+   * 路上它们的语义相反**:
+   *  - 整个 run 被 Esc 扫成 BLOCKED 的那一批,是意外,重做时要连带放开
+   *    (见 `reopenPropagatedBlocks` 的 includeInterrupted);
+   *  - 而这一个是用户看着它、按下了 x —— 那是一个决定。别人重做一个不相干的节点时
+   *    把它悄悄复活,等于替他改主意。
+   *
+   * **必须是字段,不能拿理由文本判。** 两者的 `blockedReason` 都是我们自己写的中文串,
+   * 而 node.md 按设计可以手工编辑;一个共享的字面量不是接口(这条规矩在 `interrupted`
+   * 和 `capBlocked` 上各付过一次学费)。
+   *
+   * 两个方向都写:一个曾经被取消、后来重跑并因别的原因失败的节点,不能带着旧标记 ——
+   * 那会让它在下一次重做里被永久摁住。
+   */
+  cancelled?: boolean
   /**
    * BLOCKED because its worktree would not merge, and a human was asked to fix it.
    *
@@ -451,6 +483,36 @@ export interface TaskNode {
    * mean very different things to someone reading the number.
    */
   phaseMs?: Partial<Record<NodeStatus, number>>
+  /**
+   * 每个阶段的**时间点**:第一次进入、最后一次离开。
+   *
+   * 用户原话:「任务运行和阶段运行,都要有具体的运行时间点,现在只有一个运行了多长时间。」
+   * 一个「执行 749s」回答不了他真正在问的问题 —— **那是什么时候发生的**:一段 12 分钟的
+   * 执行是刚刚在跑,还是两小时前就跑完了、之后一直卡在等验收?两者在屏幕上一模一样,
+   * 而它们要做的事完全相反。
+   *
+   * `first` 只写一次,`last` 每次离开都覆盖 —— 一个返工三轮的节点在 EXECUTING 上的
+   * 「第一次开始」和「最后一次结束」正好圈出它的全部执行窗口,而中间那几轮的分段
+   * 由 `phaseMs`(累计)和输出页卡里那几条流(每轮一条)各自回答。
+   *
+   * `last` 缺席 = **进了但还没出来**(正在跑,或者进程被杀在这一步)。渲染时照实说,
+   * 不要拿 `now` 填 —— 那会让一个两天前被杀掉的节点显示成「刚刚还在跑」。
+   *
+   * 和 `phaseMs` 分开存而不是塞进同一个对象:那个字段是数字映射,读回校验按数字写的,
+   * 混进一个对象会让手工编辑过的 node.md 在渲染层炸开。
+   */
+  phaseAt?: Partial<Record<NodeStatus, { first: string; last?: string }>>
+  /**
+   * 进入**终态**(已验收 / 阻断)的时刻。
+   *
+   * 和 `startedAt` 成对:一个是「什么时候开始跑的」,一个是「什么时候有结论的」。少了它,
+   * 一个已经结束的节点在界面上只能显示「跑了多久」,而那个时长是从 `updatedAt` 反推的 ——
+   * 任何一次 `--resume` 的重新落盘都会把它改掉。
+   *
+   * 两个方向都写:重做/归位把节点放回队列时清掉,否则一个正在重跑的节点会顶着上一次的
+   * 结束时刻,而界面拿它当「已经结束」的证据。
+   */
+  finishedAt?: string
   /**
    * 这个节点**自己**花掉的模型调用次数与 token(不含子节点)。口径见 `usage.ts`。
    *

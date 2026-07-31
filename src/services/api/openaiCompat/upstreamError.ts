@@ -57,6 +57,13 @@ export interface UpstreamFailure {
    * 认认真真回了个东西、只是不流。两条排查路径不一样,合成一句话等于把它们并成一条。
    */
   emptyStream?: boolean
+  /**
+   * 这次请求**走的是代理还是直连**(见 utils/lanDirect 的 proxyRouteNote)。
+   *
+   * 只在连不上时才有意义,所以由调用方决定填不填。空串 = 不说 —— 没配代理时多一句
+   * 「未经代理」是噪音,而它要挤掉的是上游原文。
+   */
+  route?: string
 }
 
 /** 上游原文夹到 MAX_UPSTREAM_BODY,空的时候说「空」而不是留一段空白。 */
@@ -81,6 +88,9 @@ export function upstreamAdvice(
   if (f.connectFailed === true) {
     // 连不上和「上游回了个错」是两件事,而这一档以前根本走不到:异常直接穿过整个翻译层,
     // 用户拿到引擎的通用兜底「检查你的网络连接」—— 而他的网络是好的。
+    //
+    // 「这次走的是代理还是直连」由调用方量出来一并传进来(见 route)。少了它,最常见的
+    // 真因(全局代理到不了内网端点)恰好是最难想到的那一个:同一台机器上 curl 是通的。
     return `根本没连上这个地址。先确认 apiUrl 的域名和端口没写错、这台机器出得去网(公司代理/防火墙),再确认网关还活着`
   }
   if (f.emptyStream === true) {
@@ -145,7 +155,7 @@ export function upstreamFailureMessage(f: UpstreamFailure): string {
   return [
     `${who}(${f.protocol} 协议)调用失败`,
     `POST ${f.url} → ${status}`,
-    `${label}:${upstreamBodyText(f.body)}`,
+    `${label}:${upstreamBodyText(f.body)}${f.connectFailed === true && f.route ? ` ${f.route}` : ''}`,
     // 上游给没给内容会换一条建议 —— 空体 5xx 和带内容的 5xx 该查的东西不一样。
     `可能原因:${upstreamAdvice({ ...f, emptyBody: f.body.trim().length === 0 })}`,
   ].join(' · ')

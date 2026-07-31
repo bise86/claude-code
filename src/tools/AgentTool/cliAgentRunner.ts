@@ -9,6 +9,7 @@ import {
 import type { ToolUseContext } from '../../Tool.js'
 import type { AssistantMessage, Message } from '../../types/message.js'
 import { logError } from '../../utils/log.js'
+import { estimateTokens, markEstimatedUsage } from '../../services/api/tokenEstimate.js'
 
 /**
  * Minimal process handle abstraction so `runCliAgent` can be driven by a
@@ -48,6 +49,34 @@ export type CliAgentDeps = {
 }
 
 /**
+ * CLI 子 agent 报回来的用量(如果它肯报的话)。
+ *
+ * 协议里的 `result` 行可以带一个 `usage`,字段名同时收 anthropic 和 OpenAI 两套写法 ——
+ * 外部 CLI 是别人写的,强求一种写法只会让大多数实现落到估算那一档。
+ */
+export function parseCliUsage(raw: unknown): { input: number; output: number } | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const u = raw as Record<string, unknown>
+  /**
+   * 取**第一个正数**,不是第一个「存在且非负」。
+   *
+   * 评审实测:`{input_tokens: 0, prompt_tokens: 500}` 会在第一个键上就返回 0 ——
+   * 而那种形状真实存在(某些 CLI 两套字段都写,只有一套是真的)。0 在这里的含义是
+   * 「这一档没报」,不是「这一档是零」。
+   */
+  const num = (...keys: string[]): number => {
+    for (const k of keys) {
+      const v = u[k]
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0) return Math.trunc(v)
+    }
+    return 0
+  }
+  const input = num('input_tokens', 'prompt_tokens', 'input')
+  const output = num('output_tokens', 'completion_tokens', 'output')
+  return input === 0 && output === 0 ? undefined : { input, output }
+}
+
+/**
  * Builds a spec-compliant assistant `Message` (matching the shape actually
  * produced by the real query loop — see
  * src/services/api/claude.ts (`const m: AssistantMessage = { message: {
@@ -62,13 +91,37 @@ export type CliAgentDeps = {
  * elsewhere for non-API-driven assistant messages) marking this message as
  * having come from an external CLI process rather than a real model API
  * call.
+ *
+ * ## 用量:**不再硬编码 0**
+ *
+ * 这里原来给的是四个 0。用户报的是「token 统计不管 CLI 还是 API 都要准」,而 CLI 这一档
+ * 的数字**从来就没有过** —— 一个跑了二十分钟、烧掉几十万 token 的外部 CLI,在
+ * `finalizeAgentTool` 的统计里恒等于免费。0 不是「未知」,0 是一句假话。
+ *
+ * 两档:
+ *  1. CLI 自己在协议里报了 `usage` → 原样采信(它才知道真数);
+ *  2. 没报 → 按**输入提示词 + 输出正文**估算,并且把这次调用登记成「估算」
+ *     (`markEstimatedUsage`),界面上带 `≈`。
+ *
+ * 估算标记挂在 `requestId` 上,所以这条消息必须有一个 —— 它此前是 `undefined`。
+ * 那个字段本来就是「这次调用的身份」,给它一个 `cli-` 开头的合成 id 同时让用量表
+ * 按请求去重时不会把两次 CLI 调用并成一次。
  */
-export function makeResultMessage(text: string): Message {
+export function makeResultMessage(
+  text: string,
+  opts: { promptForEstimate?: string; usage?: { input: number; output: number } } = {},
+): Message {
+  const requestId = `cli-${randomUUID()}`
+  const usage = opts.usage ?? {
+    input: estimateTokens(opts.promptForEstimate ?? ''),
+    output: estimateTokens(text),
+  }
+  if (!opts.usage && (usage.input > 0 || usage.output > 0)) markEstimatedUsage(requestId)
   const message: AssistantMessage = {
     type: 'assistant',
     uuid: randomUUID(),
     timestamp: new Date().toISOString(),
-    requestId: undefined,
+    requestId,
     message: {
       id: `cli-${randomUUID()}`,
       type: 'message',
@@ -78,8 +131,8 @@ export function makeResultMessage(text: string): Message {
       stop_reason: 'end_turn',
       stop_sequence: null,
       usage: {
-        input_tokens: 0,
-        output_tokens: 0,
+        input_tokens: usage.input,
+        output_tokens: usage.output,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
       },
@@ -389,6 +442,8 @@ async function* runInteractiveInner(
 
     const buffer = { rest: '' }
     let result = ''
+    /** CLI 自己报的用量。它肯报就采信 —— 只有它知道真数(见 makeResultMessage)。 */
+    let reported: { input: number; output: number } | undefined
 
     for await (const chunk of proc.stdout) {
       const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
@@ -408,6 +463,9 @@ async function* runInteractiveInner(
                 : msg.content == null
                   ? ''
                   : JSON.stringify(msg.content)
+            // 用量是**可选**的:多数外部 CLI 不会报,那时候落到估算。收两套字段名,
+            // 强求一种写法只会让大多数实现都落进估算那一档。
+            reported = parseCliUsage(msg.usage) ?? reported
             break
           case 'error':
             logError(new Error(`cli agent error: ${msg.message ?? 'unknown error'}`))
@@ -419,7 +477,7 @@ async function* runInteractiveInner(
       }
     }
 
-    yield makeResultMessage(result)
+    yield makeResultMessage(result, { promptForEstimate: task.prompt, usage: reported })
     await proc.exited
   } finally {
     cleanupAbort()
@@ -493,7 +551,8 @@ async function* runNonInteractive(
       }),
     ])
 
-    yield makeResultMessage(out.trim())
+    // 非交互档没有协议可言(prompt 进 stdin,stdout 全文即结果),所以只有估算这一档。
+    yield makeResultMessage(out.trim(), { promptForEstimate: task.prompt })
     await proc.exited
   } finally {
     cleanupAbort()

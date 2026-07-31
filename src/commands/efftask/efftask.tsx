@@ -49,6 +49,7 @@ import {
   type ResumeSummary,
   handoffLines,
   exitReportLine,
+  runSpanLine,
   applyStartupDecision,
   applyRosterToNodes,
   rosterEquals,
@@ -138,9 +139,12 @@ export function doneSummaryRows(a: {
   followUps: number
   handoffLines: number
   redoProblems: number
+  /** 「起 … 止 … 共 …」那一行(runSpanLine)。空串时不画,也就不占行。 */
+  hasRunSpan?: boolean
 }): number {
   return (
     4 +
+    (a.hasRunSpan === true ? 1 : 0) +
     (a.viewOnly ? 1 : 0) +
     // 仅查看时不显示 reason —— 那会把用户自己按的一下退出报成一次失败。
     (!a.viewOnly && a.hasReason ? 1 : 0) +
@@ -1302,6 +1306,11 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       plan,
     ),
     onProblems: setRedoProblems,
+    /**
+     * 被删掉的子树的实时输出也一起扔掉 —— 否则重做之后新建的同名子节点会顶着
+     * 上一轮的运行记录(childId 由「父id + 序号 + 标题 slug」算出,重拆一次常常一模一样)。
+     */
+    onDropStreams: (ids: readonly string[]) => { streams.current.dropNodes(ids) },
     onNodes: setNodes,
     start: (n: TaskNode[]) => startRun(cfg, n),
     onDone: () => setPhase('done'),
@@ -1698,6 +1707,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 会话级 MCP 工具。放开之后所有环节都能用,而「挡不住会写的 MCP」这件事
         // 必须在用户按 y 之前说出来 —— 这是他要自己决定的取舍。
         mcpToolNames={props.mcpToolNames}
+        // 出网路线:有全局代理时,哪些员工的端点会绕过它直连、哪些仍走代理。
+        // 用户报过一次「配了 roles 就连不上」,真凶是一条早就忘了的 HTTPS_PROXY。
+        apiUrls={props.agentModels.map(a => a.roleClientConfig?.apiUrl)}
         // spec §2 第一关 "名册可编辑". Only roles this session can actually dispatch — the
         // roster must not offer a seat the run would then silently downgrade to the main model.
         availableRoles={dispatchableRoles(props.knownRoles, props.unsupportedRoles)}
@@ -2009,8 +2021,12 @@ export function DoneView(props: {
   // node's detail — the run is over, so reading the tree matters more than leaving it fast.
   const ok = props.outcome?.status === 'completed'
   const handoff = props.handoff ? handoffLines(props.handoff, props.runId, props.handoffState) : []
+  // 一次算好,两处用(占几行 / 画什么)—— 两处各算一次的话,它们迟早会不一致,
+  // 而不一致的后果是详情页最底下那条页签条被顶出屏幕。
+  const runSpan = runSpanLine(props.nodes, Date.now())
   const summaryRows = doneSummaryRows({
     viewOnly: props.viewOnly === true,
+    hasRunSpan: runSpan.length > 0,
     hasReason: Boolean(props.outcome?.reason),
     hasHandoffResult: Boolean(props.handoffResult),
     followUps: props.handoffResult?.followUps?.length ?? 0,
@@ -2036,6 +2052,10 @@ export function DoneView(props: {
         <Text bold color={props.viewOnly ? 'warning' : ok ? 'success' : 'error'}>
           {props.viewOnly ? '仅查看:本次没有继续执行' : ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
         </Text>
+        {/* 这一趟是什么时候的事、跑了多久。排在结论下面第一行:一个隔天回来看的人,
+            第一个要确认的就是屏幕上这棵树是不是刚才那一次。节点和阶段各自的时刻在
+            详情页里(时间线那一段)。 */}
+        {runSpan ? <Text dimColor>{runSpan}</Text> : null}
         {props.viewOnly
           ? <Text dimColor>这个 run 原样留在盘上,想继续跑: /et --resume {props.runId}</Text>
           : null}

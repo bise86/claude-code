@@ -1,7 +1,7 @@
 // src/tools/efftask/pipeline.ts
 import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
-import { ALT_SOLUTION_CHARS, createNode, MANUAL_PASS_ROLE, PHASE_LABEL } from './types.js'
+import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, MANUAL_PASS_ROLE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
@@ -135,10 +135,7 @@ export interface PipelineCtx {
  * `startedAt` reads this set too, and is unaffected: both statuses are only ever reached after
  * ACCEPTANCE or INTEGRATION_ACCEPT, so the first-active stamp has already happened.
  */
-const ACTIVE_STATUSES = new Set([
-  'PLANNING', 'PLAN_REVIEW', 'EXECUTING', 'VERIFYING', 'ACCEPTANCE', 'REWORK',
-  'INTEGRATION_ACCEPT', 'SCORING', 'MERGE',
-])
+// 清单住在 types.ts —— resumeCore 的读回校验读的是同一份(见 ACTIVE_STATUSES)。
 
 async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineCtx): Promise<boolean> {
   /**
@@ -155,6 +152,16 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
     await blockWithReason(node, '已被用户取消', ctx)
     return false
   }
+  /**
+   * **一次 commit 只取一次时间**,下面五处(阶段耗时的终点、阶段的进入/离开时刻、
+   * startedAt、finishedAt、updatedAt)全用它。
+   *
+   * 原来每处各调一次 `ctx.now()`。真实时钟下它们相差几十微秒 —— 无害但也毫无意义;
+   * 而注入时钟(测试、以及任何按调用次数排程的假时钟)下,同一次状态迁移会被记成
+   * **几个不同的时刻**:阶段的结束时刻和节点的 updatedAt 对不上,而这两个数会并排
+   * 显示在详情页上。一次迁移是一个时间点,这里就该只有一个数。
+   */
+  const stamp = ctx.now()
   /**
    * 各阶段耗时 (spec §10.2 lists it among what the node detail view must show).
    *
@@ -174,13 +181,23 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
   const prev = node.status
   if (prev !== status && ACTIVE_STATUSES.has(prev)) {
     const since = Date.parse(node.updatedAt)
-    const now = Date.parse(ctx.now())
+    const now = Date.parse(stamp)
     // Both come off disk on a resumed node and either can be garbage. A NaN would poison the
     // running total permanently; a negative delta (clock skew between machines that wrote the
     // same run) would render a phase that finished before it started.
     if (Number.isFinite(since) && Number.isFinite(now) && now > since) {
       node.phaseMs = { ...(node.phaseMs ?? {}), [prev]: (node.phaseMs?.[prev] ?? 0) + (now - since) }
     }
+    /**
+     * 离开这个阶段的**时刻**。和上面那个累计时长成对 —— 见 TaskNode.phaseAt:
+     * 「跑了 749 秒」和「那 749 秒发生在什么时候」是两个问题,而用户问的是后一个。
+     *
+     * 不带 `Number.isFinite` 那道闸:那道闸挡的是**算术**(NaN 会永久污染累计值),
+     * 而这里存的是 `ctx.now()` 原样的时间串 —— 它是这一刻真的发生了什么的记录,
+     * 上一次的 `updatedAt` 是不是垃圾跟它没关系。
+     */
+    const at = node.phaseAt?.[prev]
+    node.phaseAt = { ...(node.phaseAt ?? {}), [prev]: { first: at?.first ?? stamp, last: stamp } }
   }
   /**
    * 失败点(`TaskNode.failedAt`)—— 「是哪个环节失败的」。
@@ -200,8 +217,25 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
   node.status = status
   // Stamped ONCE, on the first active phase. Re-stamping would restart the clock on every
   // rework round and under-report exactly the nodes a user is looking for.
-  if (node.startedAt === undefined && ACTIVE_STATUSES.has(status)) node.startedAt = ctx.now()
-  node.updatedAt = ctx.now()
+  if (node.startedAt === undefined && ACTIVE_STATUSES.has(status)) node.startedAt = stamp
+  /**
+   * **进入**这个阶段的时刻。只写 `first`,而且只写一次(见 TaskNode.phaseAt)。
+   *
+   * 写在这里而不是和上面那段合并:上面那段记的是**离开 prev**,这一段记的是**进入
+   * status**,而一次 commit 两件事都发生。合并的话,一个只进过一次、还没出来的阶段
+   * (正在跑,或者进程被杀在这一步)就永远不会被记下来 —— 而「它是什么时候开始的」
+   * 恰恰是那种情况下唯一有用的信息。
+   */
+  if (ACTIVE_STATUSES.has(status)) {
+    const at = node.phaseAt?.[status]
+    if (!at) node.phaseAt = { ...(node.phaseAt ?? {}), [status]: { first: stamp } }
+  }
+  /**
+   * 有结论的时刻。两个方向都写 —— 一个被重做放回队列、这次跑到一半的节点顶着上一次的
+   * 结束时刻,会让详情页把它显示成「已经结束」,而它正在跑。
+   */
+  node.finishedAt = status === 'ACCEPTED' || status === 'BLOCKED' ? stamp : undefined
+  node.updatedAt = stamp
   try {
     await ctx.persist(node)
   } catch (e) {
@@ -487,9 +521,21 @@ async function blockWithReason(node: TaskNode, reason: string, ctx: PipelineCtx,
     node.capBlocked = false
     node.capCategory = undefined
     node.interrupted = true
+    /**
+     * **点名取消**,而不是「整个 run 被中断扫到的」。见 TaskNode.cancelled。
+     *
+     * 这一个字决定了别人重做另一个节点时它会不会被连带放开:整个 run 的中断是意外
+     * (重做要把那一批放回队列,否则依赖链上的下游永远推不动 —— 用户报过),而这一下
+     * 是用户看着这个节点按的 x,那是一个决定。判据只能是字段:两条路的理由文本都是我们
+     * 自己写的中文串,而 node.md 是可手工编辑的。
+     */
+    node.cancelled = true
     await commit(node, 'BLOCKED', ctx)
     return
   }
+  // 两个方向都写(和 interrupted / capBlocked 同规矩):一个曾被取消、后来重跑又因别的
+  // 原因失败的节点若带着旧标记,会在下一次重做里被永久摁住,而屏幕上什么都不会说。
+  node.cancelled = false
   node.blockedReason = category !== undefined ? blockReasonWithRemedy(reason, category, ctx.runId, remedy) : reason
   // Assigned in BOTH directions, like `interrupted`: a node that previously tripped a valve
   // and is now blocked for a structural reason must not keep a flag that offers a retry.
@@ -889,6 +935,8 @@ function ctxGoal(node: TaskNode): string { return node.goal }
  * 这个函数是 per-seat 的:5 席就调 5 次,而 `feedbackItems(node.reviewLog)` 在一轮之内
  * 结果完全相同。放在函数体里实测过 —— 5 席 × 3 轮 × 20 条时单次 752 ms,一轮 15 次 =
  * **11.3 秒的主线程同步阻塞**,期间整个界面(含别的节点正在跑的日志窗)不刷新。
+ * (那是 `prepare()` 预处理**之前**的数;复测同一份输入现在是 8~92 ms —— 常数被压掉了
+ * 一个量级,而 O(n²) 还在。所以这条规矩保留,只是它现在防的是浪费,不是卡死。)
  */
 function reviewPrompt(
   node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>,
@@ -917,7 +965,19 @@ function reviewPrompt(
     `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +
     answerRule(tag)
 }
-function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', syncNote = '', brief = ''): string {
+/**
+ * @param history 历次未通过的**累积**纪要(去重、按轮次标注),由调用方**一轮算一次**传进来。
+ *
+ * 用户原话:「执行、测试、验收,如果重复多轮,会将上一轮为什么没有通过的原因带到第二轮不。
+ * 在其失败的基础上进行修正。」——`feedback` 只带**最后一轮**,而它每轮被覆盖:
+ * 第 1 轮的意见在第 2 轮被改跑偏、第 3 轮又被提回来,执行者一直在打地鼠。方案那一侧
+ * 早就治过这个病(见 reviewConvergence 文件头),这是把同一份药给执行侧。
+ *
+ * 不在这里算的理由和 reviewPrompt 的 notice 逐字相同:这个函数是 per-seat 的,而
+ * feedbackItems 是 O(n²) 的相似度比较(复测:同样的最坏输入 8~92 ms;752 ms 是预处理
+ * 之前的数)。
+ */
+function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', syncNote = '', brief = '', history = ''): string {
   return (
     brief +
     `按以下方案执行任务并完成实际改动。方案:\n${quote(JSON.stringify(node.plan))}\n` +
@@ -932,6 +992,9 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
     (feedback
       ? `上一轮验收未通过,阻断意见:\n${quote(feedback)}\n上一轮执行状态:\n${quote(node.execStatus)}\n请针对性返工。\n`
       : '') +
+    // 更早那几轮的账。**排在「上一轮」后面**:最新的意见最要紧,而这一段回答的是
+    // 另一个问题 ——「哪几条我已经被提过不止一次」。
+    (history ? `${history}\n` : '') +
     graftTargets(node, ctx) +
     `完成后输出:{ "execStatus":"做了什么、结果如何", "newChildren"?:[{"parent"?:"上面清单里的节点 id,省略则挂到本节点下","title","deps":["同批兄弟标题"]}] }。` +
     `只有在执行中发现必须先完成的新子任务时才给 newChildren。` + answerRule(tag)
@@ -945,13 +1008,21 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
  * 和验收的关键差别:它要求**真的把命令跑起来并贴出原始输出**,而不是判断产出描述。
  * 没有这一步,验收员只能给执行者的散文盖章 —— 这是本 fork 自己反复付过代价的那件事。
  */
+/**
+ * @param notice 这一关**自己**前几轮提过什么(reviewRepeatNotice)。一轮算一次,不在这里算。
+ *
+ * 少了它,测试验证每一轮都是从零开一次会:执行者改完上一轮的问题,这一轮换一批新理由
+ * 挡回去,直到迭代耗尽 —— 而每一轮都要付一次带写工具的执行调用。方案圆桌那边同一个病
+ * 已经有解(见 reviewConvergence),这里用的是同一份。
+ */
 function verifyPrompt(
-  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '',
+  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '', notice = '',
 ): string {
   return (
     brief +
     judgeGuidance(ctx) +
     `请**实际运行**验证这次改动,不要只读执行者的自述。\n` +
+    (notice ? notice + '\n' : '') +
     `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
     `执行者的自述(仅供参考,不能作为通过依据):${quote(node.execStatus) || '(没有报告任何产出)'}\n` +
     `要求:跑测试/构建/复现步骤,把**实际执行的命令与原始输出**写进 comments;` +
@@ -961,13 +1032,15 @@ function verifyPrompt(
     answerRule(tag)
   )
 }
+/** @param notice 这一关自己前几轮提过什么。理由同 verifyPrompt 的 notice。 */
 function acceptPrompt(
-  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '',
+  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '', notice = '',
 ): string {
   return (
     brief +
     judgeGuidance(ctx) +
     `请验收执行结果是否达成验收点。\n` +
+    (notice ? notice + '\n' : '') +
     `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
     `执行状态:${quote(node.execStatus) || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
     `输出:{ "pass":boolean, "blocking":string[], "comments":string }。` +
@@ -976,7 +1049,8 @@ function acceptPrompt(
 }
 // Integration acceptance judges CHILD evidence against the parent goal. acceptPrompt would
 // show only the parent's own execStatus — which for a decompose node is empty.
-function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', brief = ''): string {
+/** @param notice 这一关自己前几轮提过什么。理由同 verifyPrompt 的 notice。 */
+function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback = '', brief = '', notice = ''): string {
   const judge = judgeGuidance(ctx)
   // A child missing from the map is REPORTED, not filtered away: silently shrinking the
   // evidence list would let a parent be accepted on the strength of the children that
@@ -1034,6 +1108,9 @@ function integratePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback
     ownWork +
     `子任务结果:\n${children || '(无子任务)'}\n\n` +
     (feedback ? `上一轮集成验收阻断意见,请复核是否已解决:\n${quote(feedback)}\n\n` : '') +
+    // 更早那几轮自己提过什么。「上一轮」回答「最新的账」,这一段回答「哪几条被我提过
+    // 不止一次」—— 后者才是这一关会不会自己转不出来的判据。
+    (notice ? notice + '\n\n' : '') +
     // 补救拆分 (spec §4.1). Asked for HERE, inside the verdict, rather than by a separate plan
     // call — see Verdict.remedy for why that placement is the design. Described as optional
     // and small on purpose: it is spent at most once per node, and these siblings all touch
@@ -1610,6 +1687,38 @@ function guidanceSection(ctx: Pick<PipelineCtx, 'config' | 'control'>): string {
  * work that was just rejected — with one fewer round of budget left. The data survives on
  * disk in the logs; read it back instead of losing it.
  */
+/**
+ * 一条圆桌记录属于**哪一关**。
+ *
+ * `acceptLog` 是三关共用的:测试验证(`step:'verify'`)、验收、集成验收。省略 `step`
+ * 的含义是「验收」—— 那是这个字段被引入之前所有记录的形状,老 node.md 里全是这样。
+ *
+ * 为什么必须分得开:历次未通过纪要要**按关分组**交回给对应的圆桌。混在一起的后果是
+ * 把「这些子任务合起来达成父目标了吗」那条意见,交给一个正在验单个产出的验收员去复核
+ * —— 它既回应不了,也会被它当成一条自己没提过的新要求。
+ *
+ * **认不出来的(老 node.md 里没有 step 的记录)返回 undefined,谁的历史都不算。**
+ * 上一版在这里退回 `'accept'`,理由是「省略的含义就是验收」—— 那句话只对**叶子**验收
+ * 成立:集成验收的记录在老 node.md 里同样没有 step,而它们的含义不是验收。评审实测:
+ * 一条老的集成意见出现在了叶子验收圆桌的「你前几轮提过」里。宁可对老数据少说一句。
+ */
+function stepOfRound(rec: RoundtableRecord): PhaseName | undefined {
+  return rec.step
+}
+
+/**
+ * 这一关**自己**前几轮提过的意见,压成一条给圆桌看的提示。
+ *
+ * 一轮算一次(调用点在圆桌之外),理由见 reviewPrompt 的 notice:席位是 per-seat 的,
+ * 而 `feedbackItems` 是 O(n²) 的相似度比较(复测最坏输入 8~92 ms)。
+ */
+function judgeNotice(node: TaskNode, step: PhaseName, round: number, label: string, subject: string): string {
+  return reviewRepeatNotice(
+    feedbackItems(node.acceptLog.filter(r => stepOfRound(r) === step)),
+    round, label, subject,
+  )
+}
+
 function lastFailureFeedback(log: { synthesized: { pass: boolean; blockingSummary: string } }[]): string {
   for (let i = log.length - 1; i >= 0; i--) {
     if (!log[i].synthesized.pass) return log[i].synthesized.blockingSummary
@@ -2467,9 +2576,19 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     return
   }
   const caps = ctx.config.caps
-  // previous round's acceptance blockingSummary; drives the REWORK prompt. Seeded from the
-  // persisted log so a resumed node does not repeat work that was already rejected.
-  let feedback = lastFailureFeedback(node.acceptLog)
+  /**
+   * previous round's acceptance blockingSummary; drives the REWORK prompt. Seeded from the
+   * persisted log so a resumed node does not repeat work that was already rejected.
+   *
+   * **要把集成验收的记录排除掉。** 评审实测:一个先长了子节点、后来又回到执行循环的
+   * 节点,acceptLog 的最后一条可能是集成验收的意见(「子任务合起来没达成父目标」),
+   * 而这一段的标题写的是「上一轮**验收**未通过」—— 同一份提示词里,旁边那段按关分组的
+   * 历次纪要过滤对了,这一段没有,两个口径当场打架。
+   *
+   * 没标 step 的老记录**留着**:在一个叶子节点上,它们只可能是验收或测试验证的
+   * (集成验收发生在 stepIntegrate,那条路不回这里)。
+   */
+  let feedback = lastFailureFeedback(node.acceptLog.filter(r => r.step !== 'integrate'))
   let emptyReports = 0
   let round = 0
   let syncNote = ''
@@ -2519,7 +2638,18 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // which is exactly what executePrompt renders on rework.
     const execTag = answerTag(ANSWER_TAGS.exec)
     const execSeat = firstRole(node, 'execute')
-    const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatPreamble(ctx, execSeat, 'execute', node)), cwd: node.worktree?.path, signal: ctx.signal },
+    /**
+     * 历次未通过的累积纪要 —— 测试验证和验收**两关一起**给执行者。
+     *
+     * 两关合看是对的:打回它的是这两关,而它要修的是同一份产出。分开给反而会让它以为
+     * 那是两批互不相干的要求。一轮算一次(执行只有一席,但 feedbackItems 是 O(n²),
+     * 而返工轮次越多这份日志越长)。
+     */
+    const execHistory = planFeedbackPrompt(
+      feedbackItems(node.acceptLog.filter(r => stepOfRound(r) === 'verify' || stepOfRound(r) === 'accept')),
+      '测试验证/验收',
+    )
+    const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatPreamble(ctx, execSeat, 'execute', node), execHistory), cwd: node.worktree?.path, signal: ctx.signal },
       // round 用的是 stepExecute 的局部轮次:返工每一轮都是一次独立的执行,合成一条流
       // 会让「第三轮才修好」读起来像「一直在改同一件事」。
       { phaseLabel: PHASE_LABEL.execute, round, label: (execSeat?.roleName || execSeat?.roleTag) || '主模型', model: execSeat?.model })
@@ -2658,10 +2788,12 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // git apply)。所以真正的探针是前后比对工作区 —— 断言它的工具集里没有 Edit/Write
       // 与「它会不会改代码」毫无关系。
       const before = await verifySnapshot(node, ctx)
+      // 这一关自己前几轮提过什么。**一轮算一次**(圆桌之外),见 judgeNotice。
+      const verifyNotice = judgeNotice(node, 'verify', node.iteration.acceptance + 1, '测试验证', '这一版产出')
       const v = await roundtableWithInfraRetry({
         phase: 'verify', node, roles: node.phaseRoles.verify, round: node.iteration.acceptance + 1,
         system: 'verify',
-        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node)),
+        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node), verifyNotice),
         ctx, cwd: node.worktree?.path,
       })
       node.acceptLog.push({ ...v.rec, step: 'verify' })
@@ -2743,11 +2875,15 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       return
     }
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
+    const acceptNotice = judgeNotice(node, 'accept', node.iteration.acceptance + 1, '验收', '这一版产出')
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
-      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'accept', node)), ctx, cwd: node.worktree?.path,
+      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'accept', node), acceptNotice), ctx, cwd: node.worktree?.path,
     })
-    node.acceptLog.push(rec)
+    // 显式标上「验收」。历次未通过纪要按关口分组,而**老 node.md 里没有这个字段的记录
+    // 谁的历史都不算**(见 stepOfRound:那种记录可能是叶子验收,也可能是集成验收,
+    // 分不出来就宁可少说)。所以从这一版起,每条记录都自报家门。
+    node.acceptLog.push({ ...rec, step: 'accept' })
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {
       // Nobody ever judged the work — say that, rather than blaming the work.
@@ -2823,7 +2959,17 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
    * would tell this roundtable — the one that decides the run's final verdict on root — to
    * re-check a complaint about something else entirely.
    */
-  let feedback = node.iteration.integration > 0 ? lastFailureFeedback(node.acceptLog) : ''
+  /**
+   * 同 stepExecute:**优先只看集成验收自己的记录**。
+   *
+   * 老 node.md 里那些记录没有 step,分不出是哪一关 —— 那时候回落到「整份日志的最后一条
+   * 未通过」,也就是这一行原来的行为。少一个回落的话,一个被 `--resume` 回来的老 run
+   * 会丢掉它上一轮的集成意见,而这一段的注释(下面那大段)整个是在讲那件事有多贵。
+   */
+  const integrateRounds = node.acceptLog.filter(r => r.step === 'integrate')
+  let feedback = node.iteration.integration > 0
+    ? lastFailureFeedback(integrateRounds.length > 0 ? integrateRounds : node.acceptLog)
+    : ''
   // Same bounded-retry shape as stepExecute: a single failed integration verdict must not
   // be terminal (the roundtable may simply have misread the evidence). Uses its OWN budget
   // so a node that spent `acceptance` elsewhere still gets a full integration allowance.
@@ -2855,6 +3001,7 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       await commit(node, 'ACCEPTED', ctx)
       return
     }
+    const integrateNotice = judgeNotice(node, 'integrate', node.iteration.integration + 1, '集成验收', '子任务的结果')
     const runIntegrate = async () => roundtableWithInfraRetry({
       // 集成提交(integrate)自己的席位。
       //
@@ -2865,7 +3012,7 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       round: node.iteration.integration + 1, system: 'integrate',
       // 见 phaseLabel 的注释:不显式给的话,整个 run 的最终裁决会被标成「验收」。
       phaseLabel: PHASE_LABEL.integrate,
-      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'integrate', node, integrateBriefPhase(node))), // child evidence, NOT acceptPrompt
+      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'integrate', node, integrateBriefPhase(node)), integrateNotice), // child evidence, NOT acceptPrompt
       ctx,
       // The INTEGRATION worktree, not the user's tree. This roundtable accepts every
       // decompose node — including root, i.e. the run's final verdict — and under isolation
@@ -2875,7 +3022,13 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     const { rec, infraExhausted } = ctx.worktrees
       ? await ctx.worktrees.withIntegrationRead(runIntegrate)
       : await runIntegrate()
-    node.acceptLog.push(rec)
+    /**
+     * **标上是哪一关**。集成验收和叶子验收共用 acceptLog,而省略 step 的含义是「验收」——
+     * 于是一条集成验收记录读回来会被当成叶子验收。两个消费者会因此说错话:node.md 的
+     * 「## 验收记录」把它标成验收,而**历次未通过纪要**会把它交给另一关的圆桌去复核
+     * (「这些子任务合起来达成父目标了吗」被拿去问一个正在验单个产出的验收员)。
+     */
+    node.acceptLog.push({ ...rec, step: 'integrate' })
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
     if (infraExhausted) {
       // A decompose node whose children ALL succeeded must not be thrown away because the

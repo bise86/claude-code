@@ -145,6 +145,16 @@ export interface StreamState {
   seq: number
   /** 被淘汰过:只剩表头和末尾几条。 */
   tombstone?: boolean
+  /**
+   * 这条流的节点**已经不存在了**(被一次重做删掉,见 dropNodes)。
+   *
+   * 存在的理由是**迟到的消息**:`runAgentAdapter` 的超时是 `Promise.race`,poll 赢了
+   * 之后并不停下 consume(),provider 缓冲里的消息会在 end() 之后继续到达。评审实测:
+   * drop 完之后一条迟到消息就能把 `droppedEvents` 的记账重新建出来 —— 而重做之后
+   * **新建的同 id 节点**会顶着那句「有 N 条输出没能留下来」,那 N 条属于另一次运行;
+   * `total` 也会被这些幽灵事件顶高,而虚高的 total 会让全局上限去压真正在被看的流。
+   */
+  orphan?: boolean
 }
 
 export interface StreamStore {
@@ -160,6 +170,24 @@ export interface StreamStore {
   /** resume 带进来的节点:没有流 ≠ 什么都没干。 */
   markHistorical(nodeIds: readonly string[]): void
   isHistorical(nodeId: string): boolean
+  /**
+   * 这些节点**已经不存在了** —— 把它们的历史运行记录一并扔掉。返回扔掉的流数。
+   *
+   * ## 为什么必须有这个口子
+   *
+   * 用户报的现象:「之前任务在运行,取消掉后,重做其父任务,但是其子任务的历史运行记录
+   * 还有,未完全删除掉。」
+   *
+   * 一次任务重做会把整棵子树从内存和磁盘上删干净(`planRedo.deleted` + `removeNodeDirs`),
+   * 唯独这里不知道 —— 流是按 nodeId 存的活存储,没有任何东西通知它。而 `childId` 是
+   * `父id + 序号 + 标题 slug` 算出来的:同一个父节点重新拆一次,标题往往一模一样,
+   * **新子节点的 id 和被删的那个逐字相同**。于是上一轮的输出会原样挂到新节点的详情页上,
+   * 表头写着「已完成」,内容是上一次跑的东西 —— 用户看到的正是这个。
+   *
+   * 顺带把 `droppedEvents` 和 `markHistorical` 的记账一起清掉:留着的话,新节点一开张
+   * 就顶着一句「有 N 条输出没能留下来」,而那 N 条属于另一次运行。
+   */
+  dropNodes(nodeIds: readonly string[]): number
   /** 仅供测试与断言:当前保存的事件总数。 */
   totalEvents(): number
 }
@@ -199,7 +227,9 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
    * 正好淘汰第 1 轮。墓碑保住表头和结论,代价约 3 行。
    */
   const tombstone = (s: StreamState): void => {
-    if (s.tombstone) return
+    // 被删掉的流不参与淘汰:它的事件在 dropNodes 里已经从 total 里减过一次,
+    // 再压一次会**重复减账**,total 一路飘负,全局上限从此形同虚设。
+    if (s.orphan === true || s.tombstone) return
     const keep = s.events.slice(-TOMBSTONE_KEEP)
     const removed = s.events.length - keep.length
     total -= removed
@@ -279,6 +309,9 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
       notify()
       return {
         push(e) {
+          // 节点已经被删掉了:这条流不再属于任何人,连「丢了几条」都不该记 —— 那个数
+          // 会挂到重做之后新建的同 id 节点头上(见 StreamState.orphan)。
+          if (state.orphan === true) return
           // 收口之后到达的事件直接丢弃并计数。这不是理论:runAgentAdapter 的超时是
           // `Promise.race`,poll 赢了之后**并不停下 consume()** —— 生成器要等下一次 yield
           // 才会看到 abort,provider 缓冲里的消息会在 end() 之后继续到达。不挡的话,一个
@@ -358,6 +391,9 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
           notify()
         },
         end(err) {
+          // 同 push:被删掉的流不进 closedQueue —— 进去的话下一次全局淘汰会去压一条
+          // 早就没人能打开的流,而真正该被压的还在队列后面,上限于是形同虚设。
+          if (state.orphan === true) return
           if (state.closed) return
           state.closed = true
           state.endedAt = now()
@@ -379,6 +415,40 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
       for (const id of nodeIds) historical.add(id)
     },
     isHistorical: nodeId => historical.has(nodeId),
+    dropNodes(nodeIds) {
+      let dropped = 0
+      for (const id of nodeIds) {
+        const list = byNode.get(id)
+        droppedByNode.delete(id)
+        historical.delete(id)
+        if (!list) continue
+        for (const s of list) {
+          // 标记在**减账之前**:标记之后到达的事件一律直接丢弃,不会再动 total,
+          // 也不会重新建出 droppedEvents 的记账(见 StreamState.orphan)。
+          s.orphan = true
+          /**
+           * **总量要减回去**,否则全局上限会被一批已经不存在的事件长期占着 ——
+           * 那个上限一旦被虚高的 total 顶满,`enforceGlobal` 会开始压真正在看的流的墓碑。
+           */
+          total -= s.events.length
+          // 已收口队列里的引用也要摘掉:留着的话,下一次超限会去压一条早就没人能打开的流,
+          // 而真正该被压的那条还在队列后面 —— 上限于是形同虚设。
+          const at = closedQueue.indexOf(s)
+          if (at >= 0) closedQueue.splice(at, 1)
+          /**
+           * 事件本体也放掉。两个作用:一棵被删的子树可能挂着几千条事件(纯垃圾,
+           * 没有任何界面能再打开它们);而且万一有别的路径拿到这条流去压墓碑,
+           * 空数组让那次减账为 0 —— 减两次账是 total 飘负的唯一来源。
+           */
+          s.events = []
+        }
+        dropped += list.length
+        byNode.delete(id)
+      }
+      // 有变化才通知:重做之后界面本来就要整个重画,而空通知会让每个订阅者白跑一次。
+      if (dropped > 0) notify()
+      return dropped
+    },
     totalEvents: () => total,
   }
 }

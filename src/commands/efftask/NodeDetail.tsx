@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Box, Text, useInput, useTheme } from '../../ink.js'
 import { PHASE_LABEL, PHASE_NAMES, type TaskNode } from '../../tools/efftask/types.js'
-import { uiStatus } from '../../tools/efftask/stateMachine.js'
+import { isTerminal, uiStatus } from '../../tools/efftask/stateMachine.js'
 import type { StreamState } from '../../tools/efftask/agentStream.js'
 import { AgentLogPane } from './AgentLogPane.js'
 import { ScrollPane } from './ScrollPane.js'
@@ -76,17 +76,104 @@ function iterationBody(n: TaskNode): string {
 }
 
 /**
- * 各阶段耗时 (spec §10.2), largest first.
+ * 一个时刻 → 屏幕上那个短串。
  *
- * The pane showed a single aggregate, which cannot answer the question someone opens it with:
- * a node that took 20 minutes because its executor is slow and one that took 20 minutes
- * because it was reviewed four times render identically. Ordered by cost rather than by the
- * state machine's sequence — the reader is looking for where the time went.
+ * **今天的只给 `时:分:秒`,跨天的带上日期。** 一个 `/et` 通常在同一天里跑完,给每一行
+ * 都戴上 `07-31` 是纯噪音;而一个跑了一整夜、或者昨天 `--resume` 回来的 run,不带日期的
+ * `03:14:07` 会让人把两天前的事读成刚刚发生。判据是「和现在是不是同一天」,不是时长 ——
+ * 凌晨 0:05 看一条 23:50 的记录,时长只差 15 分钟,但那是「昨天」。
  *
- * Sub-second phases are dropped: they are noise beside a phase measured in minutes, and a row
- * reading `0s` invites the reader to wonder what went wrong there.
+ * 解析不了就原样吐回去:node.md 可以手工编辑,而一个渲染函数不该因为一个坏字符串而
+ * 让整屏消失。
  */
-export function phaseTimeBody(n: TaskNode): string {
+export function timePoint(iso: string | undefined, nowMs = Date.now()): string {
+  if (!iso) return ''
+  const ms = Date.parse(iso)
+  if (!Number.isFinite(ms)) return iso
+  const d = new Date(ms)
+  const p2 = (v: number): string => String(v).padStart(2, '0')
+  const hms = `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+  const now = new Date(nowMs)
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()
+  return sameDay ? hms : `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${hms}`
+}
+
+/** 毫秒 → 人读的时长。分钟以上给 `12m30s`,秒级给 `45s`,不足 1 秒给 `<1s`(不是 `0s`)。 */
+export function durText(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return ''
+  if (ms < 1000) return '<1s'
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m${s % 60}s`
+  return `${Math.floor(m / 60)}h${m % 60}m`
+}
+
+/**
+ * 这个节点的**时间线** —— 创建、开始、结束、总跨度。
+ *
+ * 用户原话:「任务运行和阶段运行,都要有具体的运行时间点,现在只有一个运行了多长时间。」
+ * 树上那个 `749s` 回答不了他真正在问的:**那是什么时候的事**。一个 12 分钟的执行是刚刚
+ * 还在跑,还是两小时前就跑完了、之后一直卡在等验收 —— 两者在树上一模一样。
+ *
+ * 「结束」缺席时明说**进行中**,并按 `now` 算已经跑了多久;不拿 `now` 去冒充结束时刻。
+ * 一个被杀在半路的节点也走这一支,而它显示的是「(进行中)」加上一个不再增长的开始时刻 ——
+ * 那正是它的真实状态,而不是「刚刚还在跑」。
+ */
+export function timelineBody(n: TaskNode, nowMs = Date.now()): string {
+  /**
+   * **没跑过就整段不画。**
+   *
+   * 一个还在排队的节点只有「创建于」可说,而这一段的标题是「时间」—— 它承诺回答的是
+   * 「这个任务什么时候跑的」。给一个从没跑过的节点画一段只写着创建时刻、后面跟着
+   * 「开始 —」的框,是拿一段版面去说「无可奉告」。树上那一行的「排队中」已经把这件事
+   * 说清楚了。
+   */
+  if (!n.startedAt && !n.finishedAt) return ''
+  const rows: string[] = []
+  if (n.createdAt) rows.push(`创建 ${timePoint(n.createdAt, nowMs)}`)
+  if (n.startedAt) rows.push(`开始 ${timePoint(n.startedAt, nowMs)}`)
+  // 措辞对两种情况都得成立:一种是真的没跑过,另一种是跑过但归位时把开始时刻清掉了
+  // (reseat 的预算耗尽分支 —— 留着它会让耗时跨过整个关机时间)。「没有记录」两种都不撒谎。
+  else rows.push('开始 —(没有记录)')
+  const started = n.startedAt ? Date.parse(n.startedAt) : NaN
+  const span = (end: number): string =>
+    Number.isFinite(started) && Number.isFinite(end) && end >= started ? ` · 历时 ${durText(end - started)}` : ''
+  /**
+   * **「结束了没有」看状态,不看 `finishedAt` 在不在。**
+   *
+   * 评审实测出来的 P1:`finishedAt` 只有 `commit()` 一个写点,而节点进入终态的写点有
+   * 六个 —— `propagateBlocked` 的两条(被牵连阻断、中止扫描)直接写 `status`,
+   * `reseat` 的预算耗尽分支、`resumeCore` 的结构性阻断也是。于是一个两天前被牵连阻断的
+   * 节点在这一段上写着「结束 —(进行中,至今 47h43m)」,而且**每秒往上跳**。
+   *
+   * 这是 `startedAt` 那条注释里记着的同一个缺陷第三次复发(「172800s 并每秒往上跳」),
+   * 而它每次都是从「渲染层拿一个字段的缺席当状态」进来的。所以这次把判据换成状态本身:
+   * 终态就一定要给一个结束的说法,拿不到精确时刻就退回 `updatedAt` 并**说明它是近似的**
+   * —— 那个字段每一次落盘都会被重写,它至少不会比真结束时刻早。
+   */
+  const ended = isTerminal(n.status)
+  if (n.finishedAt) {
+    rows.push(`结束 ${timePoint(n.finishedAt, nowMs)}${span(Date.parse(n.finishedAt))}`)
+  } else if (ended && n.updatedAt) {
+    rows.push(`结束 ${timePoint(n.updatedAt, nowMs)}(近似:取最后一次落盘时刻)${span(Date.parse(n.updatedAt))}`)
+  } else if (ended) {
+    rows.push('结束 —(已终止,但盘上没有留下结束时刻)')
+  } else if (Number.isFinite(started)) {
+    // 「至今」而不是「历时」:它还没结束,这个数还在涨。
+    rows.push(`结束 —(进行中,至今 ${durText(nowMs - started)})`)
+  }
+  return rows.join('\n')
+}
+
+/**
+ * 各阶段耗时**与时间点** (spec §10.2)。
+ *
+ * 详情页原本只有一个总耗时,而它回答不了打开这个面板的人真正的问题:一个跑了 20 分钟
+ * 是因为执行器慢,另一个跑了 20 分钟是因为被评审打回了四次 —— 两者长得一模一样。
+ * 而只有时长仍然答不了第二个问题:**那是什么时候的事**(见 timelineBody)。
+ */
+export function phaseTimeBody(n: TaskNode, nowMs = Date.now()): string {
   const LABEL: Partial<Record<string, string>> = {
     PLANNING: '分析', PLAN_REVIEW: '质疑讨论', EXECUTING: '执行',
     VERIFYING: '测试验证', ACCEPTANCE: '验收',
@@ -97,11 +184,61 @@ export function phaseTimeBody(n: TaskNode): string {
     // two mislead each other.
     REWORK: '返工前同步集成分支', INTEGRATION_ACCEPT: '集成验收', SCORING: '观察', MERGE: '合并',
   }
-  return Object.entries(n.phaseMs ?? {})
-    .filter(([, ms]) => Number.isFinite(ms) && ms >= 1000)
-    .sort((a, b) => b[1] - a[1])
-    .map(([status, ms]) => `${LABEL[status] ?? status} ${Math.round(ms / 1000)}s`)
-    .join(' · ')
+  /**
+   * 一行一个阶段,**按发生顺序**排,每行带上它的时间窗口。
+   *
+   * 改了两件事,各有各的理由:
+   *  - 原来按耗时倒序、挤在一行(`执行 749s · 验收 12s`)。加上时间点之后一行装不下,
+   *    而一旦分行,**时间顺序**就是唯一读得懂的顺序 —— 那是一条时间线,不是排行榜。
+   *    「时间花在哪」并没有丢:每行都带着时长,而且都对齐在同一列。
+   *  - 一秒以内的阶段:**有时间点的留,没有的照旧丢掉**。判据是「这一行还有没有信息」——
+   *    带时间点时,一个 0.2 秒的 MERGE 恰恰说明合并是干净的、而且说得出是什么时候;
+   *    而一条光秃秃的 `方案评审 0s` 只会让人以为那里出了问题(这是原来那条过滤存在的
+   *    全部理由,它对老数据仍然成立)。
+   *
+   * 没有时间点的老 node.md 退回原来的样子(只有时长),而不是印一行空白的箭头。
+   */
+  const entries = Object.entries(n.phaseMs ?? {})
+    .filter(([status, ms]) =>
+      Number.isFinite(ms) && ms >= 0 &&
+      (ms >= 1000 || n.phaseAt?.[status as keyof typeof n.phaseAt] !== undefined))
+  const at = (status: string): { first: string; last?: string } | undefined => n.phaseAt?.[status as keyof typeof n.phaseAt]
+  // 进过但一毫秒都没记上的阶段(正在跑、或者进程被杀在这一步)也要出现 —— 那种时候
+  // 「它是什么时候开始的」恰恰是唯一有用的信息。
+  for (const status of Object.keys(n.phaseAt ?? {})) {
+    if (!entries.some(([k]) => k === status)) entries.push([status, 0])
+  }
+  const orderOf = (status: string): number => {
+    const t = at(status)?.first
+    const ms = t ? Date.parse(t) : NaN
+    // 没有时间点的排在最后,彼此之间保持耗时倒序 —— 老数据不至于被打散成随机顺序。
+    return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER
+  }
+  return entries
+    .sort((a, b) => (orderOf(a[0]) - orderOf(b[0])) || (b[1] - a[1]))
+    .map(([status, ms]) => {
+      const t = at(status)
+      const label = LABEL[status] ?? status
+      const dur = ms > 0 ? durText(ms) : '<1s'
+      if (!t) return `${label} ${dur}`
+      /**
+       * `last` 缺席 = 进了还没出来。照实说,不拿 now 去填 —— 那会让一个被杀在半路的
+       * 节点显示成「刚刚还在跑」。
+       *
+       * **但节点已经终态时不能写「进行中」**:那一档的真实情况是「这个阶段的离开时刻
+       * 没被记下来」(崩溃在这一步、或者恢复之后再没回到过它),而屏幕上写「进行中」
+       * 会让一个已验收的节点看起来还有活的阶段。评审实测过这条:一个崩在 EXECUTING、
+       * 恢复后改走拆分路线的节点,详情页永远挂着「执行 18:08:20 → 进行中」。
+       */
+      const end = t.last ? timePoint(t.last, nowMs) : (isTerminal(n.status) ? '(未记录)' : '进行中')
+      /**
+       * 箭头两端是**窗口**(第一次进入 → 最后一次离开),后面那个数是**累计**停留时长。
+       * 返工多轮时两者对不上(窗口 6m31s 而累计 12s),而屏幕上一个字都没解释 ——
+       * 验收点名的就是这个。一个「累计」把两个数各自说清楚。
+       */
+      return `${label} ${timePoint(t.first, nowMs)} → ${end} · 累计 ${dur}`
+    })
+    .join('\n')
 }
 
 /**
@@ -117,9 +254,13 @@ export function phaseTimeBody(n: TaskNode): string {
 export function usageBody(n: TaskNode, resolveNode?: (id: string) => TaskNode | undefined): string {
   const own = n.usage
   const line = (label: string, u: UsageTotals): string => {
-    const parts = [`${u.calls} 次调用`, `${formatTokens(totalTokens(u))} tokens`]
+    const est = u.estimated ?? 0
+    // 估算要**说清楚有几次**,不只是一个 ≈:「12 次调用,其中 3 次是估的」和
+    // 「12 次全是估的」是两种完全不同的可信度,而用户拿这个数去判断花了多少钱。
+    const parts = [`${u.calls} 次调用`, `${est > 0 ? '≈' : ''}${formatTokens(totalTokens(u))} tokens`]
     if (u.input > 0 || u.output > 0) parts.push(`输入 ${formatTokens(u.input)} / 输出 ${formatTokens(u.output)}`)
     if (u.cacheRead > 0 || u.cacheWrite > 0) parts.push(`缓存 读 ${formatTokens(u.cacheRead)} / 写 ${formatTokens(u.cacheWrite)}`)
+    if (est > 0) parts.push(`其中 ${est} 次是估算(上游没报用量,或是 CLI 档员工)`)
     return `${label}: ${parts.join(' · ')}`
   }
   const rows: string[] = []
@@ -243,7 +384,9 @@ export function detailSections(
     { title: '阻断原因', body: n.blockedReason, color: 'error' },
     { title: '评分', body: scoreBody(n) },
     { title: '迭代次数', body: iterationBody(n) },
-    { title: '各阶段耗时', body: phaseTimeBody(n) },
+    // 时间线排在各阶段之前:先回答「这个任务是什么时候的事」,再回答「时间花在哪一步」。
+    { title: '时间', body: timelineBody(n) },
+    { title: '各阶段耗时与时间点', body: phaseTimeBody(n) },
     // 紧挨着耗时:两者回答的是同一个问题的两半 ——「这个节点贵在哪」。
     { title: '模型用量', body: usageBody(n, resolveNode) },
     // 每轮一行的骨架是我们拼的,但 blockingSummary 是评审员写的散文 —— 上色的收益

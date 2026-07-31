@@ -1,5 +1,6 @@
 import { logError } from '../../../utils/log.js'
-import { anthropicEventsToSSE, createBlockWriter, type Evt } from './blocks.js'
+import { anthropicEventsToSSE, createBlockWriter, type Evt, fallbackUsage } from './blocks.js'
+import type { StreamCtx } from './protocols.js'
 
 /** 上游的 finish_reason → anthropic 的 stop_reason。**chat 独有** —— responses 没有这个字段。 */
 const STOP: Record<string, string> = { stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use', content_filter: 'end_turn' }
@@ -63,7 +64,7 @@ export function reasoningTextOf(delta: unknown): string {
 /** 一次工具调用攒到的东西。id / name 可能比第一条 arguments 晚到。 */
 interface ToolAcc { id?: string; name?: string; args: string }
 
-export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>, ctx: { anthropicModel: string }): AsyncGenerator<Evt> {
+export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>, ctx: StreamCtx): AsyncGenerator<Evt> {
   // 块的开合记账归 blocks.ts —— 它维护的两条不变量(同一时刻只开一个块、stop 必须配得上
   // 一个先发出去的 start)在两个协议上逐字相同,而破了它 claude.ts 直接抛 RangeError。
   const w = createBlockWriter(ctx)
@@ -175,5 +176,5 @@ export async function* openaiChunksToAnthropicEvents(chunks: AsyncIterable<any>,
     if (choice?.finish_reason) stopReason = STOP[choice.finish_reason] ?? 'end_turn'
   }
   for (const acc of toolAcc.values()) yield* w.toolUse(acc)
-  yield* w.finish(stopReason, usage)
+  yield* w.finish(stopReason, fallbackUsage(usage, w, ctx))
 }

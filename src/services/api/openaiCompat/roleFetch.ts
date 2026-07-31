@@ -1,4 +1,6 @@
 import type { RoleClientConfig } from '../../../tools/AgentTool/roles/roleTypes.js'
+import { proxyRouteNote, registerDirectHosts } from '../../../utils/lanDirect.js'
+import { estimateBodyTokens } from '../tokenEstimate.js'
 import { anthropicEventsToSSE } from './blocks.js'
 import { PROTOCOL_ROUTES, TRANSLATING_PROTOCOLS } from './protocols.js'
 import { drainText, joinRoute, parseSSE, sniffSSE } from './sse.js'
@@ -16,6 +18,18 @@ import { upstreamFailureMessage } from './upstreamError.js'
  * 严格一点的网关会对陌生头直接 4xx/502,而那种 502 是**空体**的 —— 也就是用户报的
  * 那一句「Bad Gateway」,什么线索都没有。
  */
+/**
+ * 这个进程里第几次翻译响应。见签发 request-id 那一段。
+ *
+ * 计数器 + 随机段,而不是纯随机:同一次运行里的顺序读得出来(排查时有用),
+ * 而随机段保证跨进程/跨 run 不撞 —— 用量表是按这个 id 去重的,撞一次就少记一次调用。
+ */
+let requestSeq = 0
+function mintRequestId(): string {
+  requestSeq += 1
+  return `req_role_${requestSeq}_${Math.random().toString(36).slice(2, 10)}`
+}
+
 function scrubAnthropicHeaders(headers: Headers): void {
   // 先快照再删:一边迭代一边 delete 在 Headers 上是未定义行为。
   for (const key of [...headers.keys()]) {
@@ -58,6 +72,16 @@ function failureResponse(status: number, message: string): Response {
 
 export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetch): typeof fetch {
   const target = new URL(cfg.apiUrl)
+  /**
+   * 内网端点在**这里**再登记一次直连(见 utils/lanDirect)。
+   *
+   * 主登记点在配置载入那一侧(rolesFromSettings),这一处是纵深防御:员工配置不止一条
+   * 来路(测试、SDK 调用方、以后新增的来源都可能直接造一个 RoleClientConfig),而漏登记的
+   * 后果不是「少一点优化」,是这个员工在有全局代理的机器上**一次都连不通**。
+   *
+   * 放在构造期而不是请求期:构造只发生一次,请求发生几百次,而 `NO_PROXY` 是进程级的。
+   */
+  registerDirectHosts([cfg.apiUrl])
   return (async (url: any, init: any = {}) => {
     // Normalize via the WHATWG Headers API (case-insensitive) so we don't
     // silently drop SDK-set headers passed as a `Headers` instance — spreading
@@ -92,7 +116,25 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
       const apiSuffix = v1 >= 0 ? orig.pathname.slice(v1) : orig.pathname
       const base = target.pathname.replace(/\/+$/, '').replace(/\/v1$/, '')
       const dest = new URL(base + apiSuffix + orig.search, target.origin)
-      return inner(dest.toString(), { ...init, headers })
+      const res = await inner(dest.toString(), { ...init, headers })
+      /**
+       * **上游没给 `request-id` 就补一个。**
+       *
+       * 这条分支是原样转发,不翻译 —— 但用量表按 request-id 去重,而第三方 anthropic 兼容
+       * 网关基本不回这个头。缺了它:SDK 的 `streamRequestId` 是 undefined → `reportApiUsage`
+       * 直接丢弃 → **子 agent 内部的自动压缩在这一档完全看不见**,而那正是那条旁路存在的
+       * 唯一理由。评审点名的就是这个缺口。
+       *
+       * 只补、不覆盖:上游给了的话那是它自己的追踪 id,比我们编的有用得多(用户拿它去
+       * 找网关日志)。
+       *
+       * 复制一层响应而不是原地改:`Response.headers` 在多数运行时上是不可变的。
+       * body 是流,`new Response(res.body, …)` 直接转交,不额外缓冲。
+       */
+      if (res.headers.get('request-id')) return res
+      const withId = new Headers(res.headers)
+      withId.set('request-id', mintRequestId())
+      return new Response(res.body, { status: res.status, statusText: res.statusText, headers: withId })
     }
 
     /**
@@ -122,7 +164,11 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
       (returnStatus: number, body: string, extra?: { notStreamed?: true; connectFailed?: true; emptyStream?: true }): Response =>
         failureResponse(returnStatus, upstreamFailureMessage({
           roleName: cfg.roleName, protocol: cfg.apiProtocol, url: dest,
-          status, statusText, body, ...extra,
+          status, statusText, body,
+          // 「走的代理还是直连」现算,不在构造期算一次:`NO_PROXY` 是进程级的,而一次
+          // run 里另一个员工的登记会改变这个答案 —— 印一个过期的判断比不印更糟。
+          route: proxyRouteNote(dest),
+          ...extra,
         }))
     let res: Response
     try {
@@ -171,7 +217,29 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      */
     if (sniff.bytes === 0) return fail(502, '', { emptyStream: true })
     if (!sniff.isSSE) return fail(502, await drainText(sniff.stream), { notStreamed: true })
-    const events = proto.toAnthropicEvents(parseSSE(new Response(sniff.stream)), { anthropicModel: anthropicBody.model })
-    return new Response(anthropicEventsToSSE(events), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    /**
+     * 给这次响应**签一个 request-id**。
+     *
+     * SDK 从 `request-id` 响应头里读它(`api-promise.js`:`response.headers.get('request-id')`),
+     * 一路挂到每条 assistant 消息上。第三方网关基本不给这个头,于是 `/et` 这边所有员工调用的
+     * requestId 都是 undefined —— 而**用量按请求去重**要靠它:没有 id 就只能退回按
+     * `message.id` 去重,而 OpenAI 兼容后端恰恰是最容易缺 id 的一档。
+     *
+     * 它同时是「这次的用量是估出来的」这条信息的唯一载体(见 tokenEstimate 的注释)。
+     *
+     * 用 `req_` 前缀 + 计数器 + 随机段:不与上游的 id 空间冲突,同进程内唯一,肉眼可辨来源。
+     */
+    const requestId = mintRequestId()
+    const events = proto.toAnthropicEvents(parseSSE(new Response(sniff.stream)), {
+      anthropicModel: anthropicBody.model,
+      requestId,
+      // 输入侧的估算只有这一层算得出来 —— 翻译层手上只有响应帧,没有请求体。
+      // 惰性:上游给了真 usage 时这个函数一次都不会被调(见 StreamCtx.estimatedInput)。
+      estimatedInput: () => estimateBodyTokens(outBody),
+    })
+    return new Response(anthropicEventsToSSE(events), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream', 'request-id': requestId },
+    })
   }) as typeof fetch
 }

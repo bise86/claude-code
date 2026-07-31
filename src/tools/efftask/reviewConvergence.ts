@@ -135,7 +135,8 @@ function similarPrepared(a: Prepared, b: Prepared): boolean {
  * 两条阻断意见是不是同一条(字符串入口)。
  *
  * **这个函数每调一次都要重建两边的二元组集合。** 放进 O(n²) 的合并循环里实测过:
- * 5 席 × 3 轮 × 20 条,单次 feedbackItems 要 752 ms,而 reviewPrompt 把它放在函数体里
+ * 5 席 × 3 轮 × 20 条,单次 feedbackItems 在**没有预处理**的那一版要 752 ms(现在
+ * 是 8~92 ms,见下面 prepare 的注释),而 reviewPrompt 把它放在函数体里
  * → 每个席位各算一遍完全相同的结果 → 一轮 15 次 = **11.3 秒的主线程同步阻塞**,
  * 期间整个界面(含别的节点正在跑的日志窗)不刷新。
  *
@@ -157,7 +158,9 @@ export function similarItem(a: string, b: string): boolean {
 export function feedbackItems(log: readonly RoundtableRecord[]): FeedbackItem[] {
   const items: FeedbackItem[] = []
   // 与 items 平行的预处理数组。合并是 O(n²) 的比较,不预处理的话每次比较都要把**两边**
-  // 重新归一 + 重建二元组集合 —— 那正是 752 ms 的来源。
+  // 重新归一 + 重建二元组集合 —— 那正是 752 ms 的来源。预处理之后同一份输入是
+  // **8~92 ms**(200 字 / 2000 字两档,评审复测)。O(n²) 还在,只是常数被压掉了一个量级;
+  // 「一轮算一次而不是一席算一次」那条规矩仍然成立,但它现在防的是浪费,不是卡死。
   const prep: Prepared[] = []
   for (const rec of log ?? []) {
     if (!rec || !Array.isArray(rec.verdicts)) continue
@@ -240,13 +243,24 @@ function trim(stuck: FeedbackItem[], fresh: FeedbackItem[]): { stuck: FeedbackIt
  * 取代「只带最后一轮的拼接串」。分成两组是关键:作者要能一眼看出哪几条是它连着几轮没
  * 回应的老账 —— 那正是它一直在打地鼠的原因。
  */
-export function planFeedbackPrompt(items: readonly FeedbackItem[]): string {
+export function planFeedbackPrompt(
+  items: readonly FeedbackItem[],
+  /**
+   * 这些意见是**哪一关**提的。默认「评审」——方案圆桌,这个模块最初的唯一调用方。
+   *
+   * 参数化而不是复制一份:执行返工循环(测试验证 / 验收)撞的是**同一个病**,而且是
+   * 更贵的那一份 —— 那一侧每一轮都要付一次带写工具的执行调用。而「打地鼠」的成因逐字
+   * 相同:反馈只带最后一轮,于是第 1 轮的意见在第 2 轮被改跑偏,第 3 轮又被提回来。
+   * 两份实现意味着第二次踩同一组坑,而这里唯一真正不同的只有这个名词。
+   */
+  label = '评审',
+): string {
   if (items.length === 0) return ''
   const rounds = Math.max(...items.flatMap(i => i.rounds), 0)
   const allStuck = stuckItems(items)
   const cut = trim(allStuck, items.filter(it => !allStuck.includes(it)))
   const parts: string[] = [
-    `前 ${rounds} 轮评审共提出 ${items.length} 条阻断意见,按轮次汇总如下` +
+    `前 ${rounds} 轮${label}共提出 ${items.length} 条阻断意见,按轮次汇总如下` +
       (cut.dropped > 0 ? `(只列其中 ${MAX_FEEDBACK_ITEMS} 条,另有 ${cut.dropped} 条未列出,全文见 node.md 的评审记录)` : '') +
       '。',
   ]
@@ -272,7 +286,27 @@ export function planFeedbackPrompt(items: readonly FeedbackItem[]): string {
  * 放行 —— 而相似度判定**会误判**(见 similarItem),把一条第一次提出的意见谎报成老账,
  * 那就是在用一句假话换一个通过。这里只要求它**说清楚**,不替它下结论。
  */
-export function reviewRepeatNotice(items: readonly FeedbackItem[], round: number): string {
+export function reviewRepeatNotice(
+  items: readonly FeedbackItem[],
+  round: number,
+  /**
+   * 这是哪一关的圆桌。默认「评审」(方案圆桌)。
+   *
+   * 测试验证 / 验收 / 集成验收三关此前**一条历史都看不到**:每一轮都拿着同一份产出
+   * 从零开一次会,于是最容易发生的事就是每轮换一批新要求 —— 执行者改完上一轮的,
+   * 这一轮又被别的理由挡回去,直到迭代耗尽。方案那一侧早就治过这个病(见文件头),
+   * 这里只是把同一份药给另外三关。
+   */
+  label = '评审',
+  /**
+   * 这一关判的是**什么东西**。默认「方案」;执行侧那三关判的是这一版产出。
+   *
+   * 必须跟着 label 一起换,否则测试验证员会读到「若新**方案**已经回应了它,请指出是
+   * 方案的哪一句回应的」—— 而它手上根本没有方案要评,它在跑测试。一句和场景对不上的
+   * 指令,模型要么忽略它(白花 token),要么真的去评方案(那一关就废了)。
+   */
+  subject = '方案',
+): string {
   if (round <= 1 || items.length === 0) return ''
   const seen = items.filter(it => it.rounds.length > 0)
   if (seen.length === 0) return ''
@@ -281,12 +315,12 @@ export function reviewRepeatNotice(items: readonly FeedbackItem[], round: number
   const shown = seen.slice(0, MAX_FEEDBACK_ITEMS)
   const dropped = seen.length - shown.length
   return capText([
-    `本轮是第 ${round} 轮评审。前几轮已经提出过下面这些意见` +
+    `本轮是第 ${round} 轮${label}。前几轮已经提出过下面这些意见` +
       (dropped > 0 ? `(只列 ${MAX_FEEDBACK_ITEMS} 条,另有 ${dropped} 条未列出)` : '') +
       '(按出现轮次标注):',
     ...shown.map((it, i) => `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮) ${capText(it.text, MAX_ITEM_CHARS)}`),
-    '对其中每一条:若新方案已经回应了它,请指出是方案的哪一句回应的;若仍未回应,请指出',
-    '方案缺了什么。不要仅因为措辞眼熟就放行,也不要把同一条换个说法再提一遍。',
+    `对其中每一条:若新${subject}已经回应了它,请指出是${subject}的哪一处回应的;若仍未回应,请指出`,
+    `${subject}缺了什么。不要仅因为措辞眼熟就放行,也不要把同一条换个说法再提一遍。`,
   ].join('\n'), MAX_SUMMARY_CHARS)
 }
 

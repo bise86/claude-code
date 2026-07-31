@@ -13,7 +13,7 @@ import { createRunControl } from './control.js'
 import { NodeCancelledError } from './runAgentAdapter.js'
 import { EffTaskOrchestrator } from './orchestrator.js'
 import type { RunAgentFn } from './roundtable.js'
-import { DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, type EffTaskConfig } from './types.js'
+import { createNode, DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, type EffTaskConfig, type TaskNode } from './types.js'
 
 const NOW = '2026-07-28T00:00:00Z'
 const vtag = (req: { prompt: string }): string =>
@@ -176,6 +176,50 @@ describe('取消单个节点', () => {
     // 也**不能**带 capCategory:那会让阻断卡去劝用户提高超时/把节点拆小。
     expect(jia.capCategory).toBeUndefined()
     expect(jia.capBlocked).toBe(false)
+    /**
+     * **点名取消**要留下结构化的痕迹,不能只留在理由文本里。
+     *
+     * 下游消费者是重做:整个 run 被中断的那一批要连带放开(否则依赖链上的下游永远
+     * 推不动 —— 用户报过),而用户看着某个节点按下的 x 是一个决定,不能被别人的一次
+     * 重做悄悄复活。两者的 `interrupted` 都是 true,分辨它们的只有这个字段。
+     */
+    expect(jia.cancelled).toBe(true)
+  })
+
+  /**
+   * **两个方向都要写。**
+   *
+   * 只写「取消时置 true」的话,一个上一轮被取消、这一轮重跑又因为别的原因失败的节点
+   * 会带着旧标记回来 —— 而重做那侧读的正是这个字段:它会把这个节点当成「用户不想跑它」
+   * 而永久摁住,连带整条依赖链,屏幕上什么都不会说。
+   *
+   * 所以这里用一棵**带着旧标记**的种子树:它必须在这一次失败之后变成 false。
+   */
+  it('上一轮被取消、这一轮因别的原因失败 —— 旧的取消标记必须被清掉', async () => {
+    const control = createRunControl()
+    const runAgent: RunAgentFn = async req => {
+      // 没有 cancelNode:这是一次真的调用失败
+      if (req.phase === 'execute') throw new Error('上游 500')
+      return allPass(req)
+    }
+    // 一棵只有 root 的树,root 已经过了方案这道门、坐在 READY 上 —— 也就是重做把一个
+    // 被取消的节点放回队列之后的样子。
+    const seed: TaskNode[] = [{
+      ...createNode({ id: 'root', title: '根', goal: '目标', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+      kind: 'executable', status: 'READY',
+      reviewLog: [{ round: 1, verdicts: [], synthesized: { pass: true, blockingSummary: '' } }],
+      cancelled: true, // 上一轮被用户点名取消过
+    }]
+    const orch = new EffTaskOrchestrator(
+      cfg(), { runAgent, control, persist: async () => {}, now: () => NOW, onUpdate: () => {} },
+      new AbortController().signal,
+      seed,
+    )
+    await orch.run()
+    const root = orch.nodes().find(n => n.id === 'root')!
+    expect(root.status).toBe('BLOCKED')
+    expect(root.blockedReason).not.toContain('已被用户取消')
+    expect(root.cancelled).toBe(false)
   })
 
   it('**分析环节**被取消也走同一条路 —— 两个阻断点是分开写的', async () => {

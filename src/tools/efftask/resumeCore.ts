@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES } from './types.js'
+import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
@@ -391,6 +391,14 @@ export function validateLoadedNodes(
     // stopped at BLOCKED 已中断 forever.
     if (n.interrupted !== undefined && n.interrupted !== true) n.interrupted = false
     if (n.mergeConflict !== undefined && n.mergeConflict !== true) n.mergeConflict = false
+    /**
+     * 同一条 `!== true → false` 的规矩,而这一个的方向要说清楚:
+     * `cancelled` 是**摁住**用的(重做时不连带放开被点名取消的节点),所以一个真值非布尔
+     * (手改出来的 `cancelled: "yes"`)归到 false 是**放宽**——那个节点会跟着中断的那一批
+     * 一起被放开,最坏是多跑一次用户本来不想跑的任务;反过来把任意真值当成 true,则是让
+     * 一个手抖写下的字符串永久摁死一条依赖链,而屏幕上没有任何解释。
+     */
+    if (n.cancelled !== undefined && n.cancelled !== true) n.cancelled = false
     // Same `!== true → false` discipline, and for a sharper reason than the others: this flag
     // is what stops 补救拆分 happening twice. A truthy non-boolean (`revised: "yes"` from a
     // hand-edited node.md) is not `=== true`, so the node would buy a SECOND corrective
@@ -404,9 +412,36 @@ export function validateLoadedNodes(
       const raw = (n.phaseMs ?? {}) as Record<string, unknown>
       const clean: Record<string, number> = {}
       for (const [k, v] of Object.entries(raw)) {
-        if (LEGAL_STATUS.has(k) && Number.isFinite(v) && (v as number) >= 0) clean[k] = Math.trunc(v as number)
+        // 键限定在**活动状态**:生产里 commit() 只给这几个记账,而一个手改的
+        // `ACCEPTED: 5000` 会在详情页渲染成一行没有中文标签的原始枚举名。
+        if (ACTIVE_STATUSES.has(k as never) && Number.isFinite(v) && (v as number) >= 0) clean[k] = Math.trunc(v as number)
       }
       n.phaseMs = clean as TaskNode['phaseMs']
+    }
+    /**
+     * 各阶段的时间点。同一条规矩,只是值是**时间串**:
+     *  - 键必须是合法状态(手写的 `EXECUTNG` 会在详情页渲成一行没人认识的东西);
+     *  - `first` 必须是能解析的时间,否则渲染层的 `Date.parse` 会给出 `NaN`,
+     *    而那一行会印成 `Invalid Date`;
+     *  - `last` 允许缺席 —— 那是「进了还没出来」的**正常**形态(正在跑,或者进程被杀在
+     *    这一步),不是坏数据。解析不了的 `last` 当缺席处理:少说一句永远比说错一句好。
+     */
+    if (n.phaseAt !== undefined) {
+      const raw = (n.phaseAt ?? {}) as Record<string, unknown>
+      const clean: Record<string, { first: string; last?: string }> = {}
+      for (const [k, v] of Object.entries(raw)) {
+        if (!ACTIVE_STATUSES.has(k as never) || v === null || typeof v !== 'object') continue
+        const at = v as { first?: unknown; last?: unknown }
+        if (typeof at.first !== 'string' || !Number.isFinite(Date.parse(at.first))) continue
+        const last = typeof at.last === 'string' && Number.isFinite(Date.parse(at.last)) ? at.last : undefined
+        clean[k] = last === undefined ? { first: at.first } : { first: at.first, last }
+      }
+      n.phaseAt = clean as TaskNode['phaseAt']
+    }
+    // 结束时刻:解析不了就当没有。留着一个垃圾串会让详情页印出 `Invalid Date`,
+    // 而这个字段同时是「这个节点有没有结论」的显示判据。
+    if (n.finishedAt !== undefined && (typeof n.finishedAt !== 'string' || !Number.isFinite(Date.parse(n.finishedAt)))) {
+      n.finishedAt = undefined
     }
     /**
      * 用量:和 phaseMs 同一个道理,而且更容易看出错来 —— 它会被渲染成

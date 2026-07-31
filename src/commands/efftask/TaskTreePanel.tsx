@@ -37,7 +37,9 @@ export const KIND_GLYPH = { decompose: '⊞', executable: '▪', unknown: '·' }
  */
 export function usageTag(n: TaskNode, byId: Map<string, TaskNode>): string {
   const u = subtreeUsage(n, id => byId.get(id))
-  return isEmptyUsage(u) ? '' : ` ⇅${u.calls}/${formatTokens(totalTokens(u))}`
+  // 里面有估出来的数就带 ≈ —— 见 UsageTotals.estimated。一个字符,而它挡住的是
+  // 「把估算显示成实测」那一类假话(上游不报用量、以及 CLI 档员工)。
+  return isEmptyUsage(u) ? '' : ` ⇅${u.calls}/${(u.estimated ?? 0) > 0 ? '≈' : ''}${formatTokens(totalTokens(u))}`
 }
 
 /**
@@ -565,7 +567,7 @@ export function TaskTreePanel(props: {
             「面板高度 = 边框 2 + 表头 1 + height + 提示」是下面行预算的前提 ——
             多一行就把底部的图例和按键提示顶出屏幕。行末那个标记已经有同样的让路规矩。 */}
         {isEmptyUsage(total) || columns < HEADER_USAGE_MIN_COLUMNS ? null : (
-          <Text dimColor>{'  '}⇅{total.calls} 次 · {formatTokens(totalTokens(total))} tokens</Text>
+          <Text dimColor>{'  '}⇅{total.calls} 次 · {(total.estimated ?? 0) > 0 ? '≈' : ''}{formatTokens(totalTokens(total))} tokens</Text>
         )}
         {rows.length > view.slice.length ? <Text dimColor>{'  '}{idx + 1}/{rows.length}</Text> : null}
       </Text>

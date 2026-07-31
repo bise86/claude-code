@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import { reseatTransientNodes } from './reseat.js'
-import { createNode, emptyPhaseRoles, DEFAULT_CAPS, type TaskNode } from './types.js'
+import { createNode, emptyPhaseRoles, DEFAULT_CAPS, PHASE_NAMES, type TaskNode } from './types.js'
 
 const NOW = '2026-07-25T00:00:00.000Z'
 const mk = (over: Partial<TaskNode> = {}): TaskNode => ({
@@ -725,5 +725,42 @@ describe('三张状态表必须覆盖同一批「进行中」状态', () => {
     expect(`${st}:${n.execStatus.includes('上次运行在')}`).toBe(`${st}:true`)
     expect(`${st}:${n.execStatus.includes('某个阶段')}`).toBe(`${st}:false`)
     expect(`${st}:${n.execStatus.includes(st)}`).toBe(`${st}:false`)
+  })
+})
+
+/**
+ * 「预算耗尽」那条**早退**分支同样要清那三个字段 —— 评审点名的两条存活变异。
+ *
+ * 它绕过下面整段归位清理:留着 `startedAt`/`finishedAt` 会让详情页一边写「已终止」、
+ * 一边把耗时算成跨过整个关机时间;而留着的 `cancelled` 是一个跨 run 存活的摁住位,
+ * 这条分支恰好是「活干完了、判的人没预算了」那一类 —— 最可能被后续一次重做碰到的节点。
+ */
+describe('恢复时预算已耗尽的那条早退分支', () => {
+  const node = (over: Record<string, unknown> = {}) => ({
+    id: 'n', title: 't', goal: 'g', parentId: null, childIds: [], deps: [],
+    kind: 'executable', status: 'ACCEPTANCE',
+    phaseRoles: Object.fromEntries(PHASE_NAMES.map(p => [p, []])),
+    plan: { solution: '', keyPoints: '', risks: '', acceptance: '' },
+    execStatus: '干完了', blockedReason: '', reviewLog: [], acceptLog: [], score: {},
+    iteration: { planReview: 0, acceptance: 3, integration: 0, scoring: 0, mergeResolve: 0 },
+    depth: 0, createdAt: 'T0', updatedAt: 'T0',
+    startedAt: '2026-07-28T00:00:00.000Z', finishedAt: '2026-07-28T01:00:00.000Z',
+    cancelled: true,
+    ...over,
+  }) as never as TaskNode
+
+  it('清掉 startedAt / cancelled,并给一个结束时刻', () => {
+    const n = node()
+    const out = reseatTransientNodes([n], 'T9', { ...DEFAULT_CAPS, maxIterations: 3 })
+    expect(out.exhausted).toEqual(['n'])
+    expect(n.status).toBe('BLOCKED')
+    // 留着旧的开始时刻 → 详情页把关机的那几十小时算成耗时(这个仓库付过三次学费)
+    expect(n.startedAt).toBeUndefined()
+    // 已终止就要有结束时刻,否则渲染层只能靠猜
+    expect(n.finishedAt).toBe('T9')
+    // 跨 run 存活的摁住位:留着它,下一次重做会把这个节点当成「用户不想跑」
+    expect(n.cancelled).toBe(false)
+    // 失败点仍然要记(这条分支原来就有,别被顺手改掉)
+    expect(n.failedAt).toBe('ACCEPTANCE')
   })
 })

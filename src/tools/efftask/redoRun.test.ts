@@ -192,3 +192,33 @@ describe('预演与执行用同一份环节实况', () => {
     expect(started).toBe(1)
   })
 })
+
+/**
+ * 被删掉的子树的**历史运行记录**也要一起走。
+ *
+ * 用户报的现象:「重做其父任务,但是其子任务的历史运行记录还有,未完全删除掉。」
+ * 而它比「屏幕上多几行旧东西」更糟:`childId` 由「父id + 序号 + 标题 slug」算出,
+ * 重新拆一次同一个父节点,新子节点的 id 常常和被删的那个**逐字相同** —— 上一轮的输出
+ * 会原样挂到新节点的详情页上,而表头写着这一轮的状态。
+ */
+describe('删掉的节点带走它的实时输出', () => {
+  it('拿到的是 plan.deleted,而且发生在换树之前', async () => {
+    const dropped: string[][] = []
+    const { deps, log } = spy({
+      onDropStreams(ids) { log.push('dropStreams'); dropped.push([...ids]) },
+    })
+    await runRedo(TREE(), 'root', 'plan', 'T1', deps)
+    expect(dropped).toEqual([['root/00-a']])
+    // 先删流、后换树:反过来的话中间那一帧里,新节点会显示上一轮同名节点的输出。
+    expect(log.indexOf('dropStreams')).toBeLessThan(log.indexOf('nodes'))
+    // 而且必须在落盘之后 —— 落盘失败时那些记录还有用(problems 会让用户自己去看)。
+    expect(log.indexOf('commit')).toBeLessThan(log.indexOf('dropStreams'))
+  })
+
+  it('一个节点都没删的重做不去碰它', async () => {
+    const { deps, log } = spy({ onDropStreams() { log.push('dropStreams') } })
+    // 「重做执行环节」不删任何子节点
+    await runRedo(TREE(), 'root/00-a', 'execute', 'T1', deps)
+    expect(log).not.toContain('dropStreams')
+  })
+})

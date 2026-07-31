@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { createStreamStore } from '../../tools/efftask/agentStream.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
-import { NodeDetail, detailSections } from './NodeDetail.js'
+import { NodeDetail, detailSections, durText, timePoint, timelineBody } from './NodeDetail.js'
 
 const NOW = new Date().toISOString()
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, 30))
@@ -630,5 +630,73 @@ describe('补充指引(你写的)必须有地方看得见', () => {
     const mixed = detailSections(mk({ guidance: { execute: '  ', review: '看并发' } }))
       .find(s => s.title === '补充指引(你写的)')!
     expect(mixed.body).toBe('质疑讨论: 看并发')
+  })
+})
+
+/**
+ * 时刻的写法:同天只给时分秒,跨天带上日期。
+ *
+ * 评审点名的存活变异 —— 注释花了整段论证「凌晨 0:05 看一条 23:50 的记录,时长只差
+ * 15 分钟,但那是昨天」,而没有任何测试。
+ */
+describe('timePoint / durText', () => {
+  const at = (s: string) => Date.parse(s)
+
+  it('同一天只给时分秒', () => {
+    expect(timePoint('2026-07-31T09:05:07', at('2026-07-31T23:00:00'))).toBe('09:05:07')
+  })
+
+  it('跨天带日期 —— 哪怕只差 15 分钟', () => {
+    // 凌晨 0:05 看一条 23:50 的记录:时长很短,但那是昨天。
+    const shown = timePoint('2026-07-30T23:50:00', at('2026-07-31T00:05:00'))
+    expect(shown).toContain('07-30')
+    expect(shown).toContain('23:50:00')
+  })
+
+  it('解析不了就原样吐回去,不炸也不编', () => {
+    expect(timePoint('前天', at('2026-07-31T00:05:00'))).toBe('前天')
+    expect(timePoint(undefined)).toBe('')
+  })
+
+  it('时长:不足一秒给 <1s,分钟以上给 m/h', () => {
+    expect(durText(500)).toBe('<1s')
+    expect(durText(45_000)).toBe('45s')
+    expect(durText(90_000)).toBe('1m30s')
+    expect(durText(3_600_000 + 60_000)).toBe('1h1m')
+    expect(durText(-1)).toBe('')
+  })
+})
+
+/**
+ * 终态节点上那句「进行中,至今 47h」—— 评审的 P1,复验点名它**没有仓库测试兜底**。
+ *
+ * `finishedAt` 只有 `commit()` 一个写点,而节点进入终态的写点有六个:`propagateBlocked`
+ * 的两条(被牵连阻断、中止扫描)直接写 status。所以判据必须是状态本身。
+ */
+describe('timelineBody 对终态节点不许说「进行中」', () => {
+  const n = (over: Record<string, unknown>) => ({
+    id: 'x', title: 't', goal: 'g', status: 'BLOCKED', createdAt: '2026-07-29T09:00:00.000Z',
+    updatedAt: '2026-07-29T10:00:00.000Z', startedAt: '2026-07-29T09:30:00.000Z',
+    childIds: [], deps: [], phaseRoles: {}, plan: {}, execStatus: '', blockedReason: '',
+    reviewLog: [], acceptLog: [], score: {}, iteration: {}, depth: 0, kind: 'executable',
+    ...over,
+  }) as never
+
+  it('BLOCKED 且没有 finishedAt(被牵连阻断那条路)→ 退回最后落盘时刻,并说明是近似', () => {
+    const body = timelineBody(n({}), Date.parse('2026-07-31T09:00:00.000Z'))
+    expect(body).toContain('结束')
+    expect(body).toContain('近似')
+    expect(body).not.toContain('进行中')
+  })
+
+  it('连 updatedAt 都没有时照实说没有,而不是编一个', () => {
+    const body = timelineBody(n({ updatedAt: '' }), Date.parse('2026-07-31T09:00:00.000Z'))
+    expect(body).toContain('没有留下结束时刻')
+    expect(body).not.toContain('进行中')
+  })
+
+  it('反向:还在跑的节点照旧说「进行中,至今 …」', () => {
+    const body = timelineBody(n({ status: 'EXECUTING' }), Date.parse('2026-07-29T10:00:00.000Z'))
+    expect(body).toContain('进行中,至今')
   })
 })

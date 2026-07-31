@@ -135,6 +135,21 @@ function richNode(): TaskNode {
   n.guidance = { all: '别动 src/legacy', execute: '先跑一遍 bun test' }
   n.worktree = { branch: 'b', path: '/wt/root' }
   n.startedAt = NOW
+  /**
+   * 被用户**点名取消**过。它决定重做时这个节点会不会被连带放开 —— 一个手写的真值
+   * 会把一整条依赖链永久摁住,而屏幕上没有任何解释。
+   */
+  n.cancelled = false
+  /**
+   * 各阶段的时间点、以及节点的结束时刻。和 `phaseMs` 同一类敌意输入面,只是值是
+   * **时间串**:渲染层要 `Date.parse` 它们,一个坏串会印出 `Invalid Date`;
+   * 而 `last` 缺席是**正常**形态(进了还没出来),不能被当成坏数据删掉。
+   */
+  n.phaseAt = {
+    EXECUTING: { first: NOW, last: NOW },
+    ACCEPTANCE: { first: NOW },
+  }
+  n.finishedAt = NOW
   n.score = {
     plan: { role: 'scorer', score: 80, rationale: '结构清楚' },
     exec: { role: 'scorer', score: 90, rationale: '测试齐全' },
@@ -564,4 +579,49 @@ describe('run.md 的每个配置字段被写坏,readRunManifest 都不许抛', (
       }
     })
   }
+})
+
+/**
+ * 第 5 项(时间点)与第 4 项(取消标记)的**读回校验**。
+ *
+ * 评审点名:这几条的清理与校验一条测试都没有(变异 M25/M26/M10 全部存活)。而这个
+ * 文件正是为这一类存在的 —— node.md 按设计可以手工编辑,而渲染层会 `Date.parse` 这些串。
+ */
+describe('时间点与取消标记的读回校验', () => {
+  const load = (over: Record<string, unknown>) => {
+    const n = { ...(richNode() as unknown as Record<string, unknown>), ...over }
+    return validateLoadedNodes([n as never]).nodes[0] as unknown as Record<string, unknown>
+  }
+
+  it('phaseAt 的键限定在**活动状态** —— 别的会渲染成一行原始枚举名', () => {
+    const v = load({ phaseAt: { ACCEPTED: { first: NOW }, EXECUTNG: { first: NOW }, EXECUTING: { first: NOW } } })
+    expect(Object.keys(v.phaseAt as object)).toEqual(['EXECUTING'])
+  })
+
+  it('phaseMs 的键同样限定 —— 两处必须是同一份判据', () => {
+    const v = load({ phaseMs: { ACCEPTED: 5000, EXECUTING: 1000 } })
+    expect(Object.keys(v.phaseMs as object)).toEqual(['EXECUTING'])
+  })
+
+  it('first 解析不了就整条丢掉,last 解析不了只丢 last', () => {
+    const v = load({
+      phaseAt: {
+        EXECUTING: { first: '不是时间' },
+        ACCEPTANCE: { first: NOW, last: '也不是时间' },
+      },
+    })
+    expect((v.phaseAt as Record<string, unknown>).EXECUTING).toBeUndefined()
+    // last 缺席是**正常形态**(进了还没出来),不是坏数据 —— 不能把整条连坐掉
+    expect((v.phaseAt as Record<string, { first: string; last?: string }>).ACCEPTANCE).toEqual({ first: NOW })
+  })
+
+  it('finishedAt 解析不了就当没有 —— 否则详情页印出 Invalid Date', () => {
+    expect(load({ finishedAt: '前天' }).finishedAt).toBeUndefined()
+    expect(load({ finishedAt: NOW }).finishedAt).toBe(NOW)
+  })
+
+  it('cancelled 只认真正的 true —— 手抖写下的字符串不该永久摁住一条依赖链', () => {
+    expect(load({ cancelled: 'yes' }).cancelled).toBe(false)
+    expect(load({ cancelled: true }).cancelled).toBe(true)
+  })
 })

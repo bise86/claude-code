@@ -99,12 +99,39 @@ export function shouldBypassProxy(
     const hostname = url.hostname.toLowerCase()
     const port = url.port || (url.protocol === 'https:' ? '443' : '80')
     const hostWithPort = `${hostname}:${port}`
+    /**
+     * IPv6 字面量的两种写法都要能匹配。
+     *
+     * `url.hostname` 对 `http://[::1]:8000` 给的是**带方括号**的 `[::1]`,而 NO_PROXY 里
+     * 两种写法都真实存在:Bun 的 fetch 只认带方括号的,curl 只认裸的 —— 所以我们自己
+     * 往里写的时候两种都写(见 utils/lanDirect 的 noProxyForms)。
+     *
+     * 而下面那条 `pattern.includes(':')` 判 host:port 的规则会把**每一个** IPv6 字面量
+     * 都当成 host:port —— 于是 `::1` 和 `[::1]` 两种写法一个都匹配不上,只有
+     * `[::1]:8000` 那种带端口的才行。实测出来的后果:内网 IPv6 端点真的直连了,而
+     * 连不上时的诊断印的是「本次请求经由代理 …」—— 两块屏幕对同一个端点给出相反的答案。
+     */
+    const bareHost = hostname.replace(/^\[|\]$/g, '')
+    const isIpv6 = bareHost.includes(':')
 
     // Split by comma or space and trim each entry
     const noProxyList = noProxy.split(/[,\s]+/).filter(Boolean)
 
     return noProxyList.some(pattern => {
       pattern = pattern.toLowerCase().trim()
+
+      /**
+       * IPv6 的条目先判掉,再轮到 host:port —— 顺序就是判据:
+       *  - `[::1]` / `[::1]:8000`:带方括号,剥掉之后按地址(+端口)比;
+       *  - `::1`:裸的 IPv6(冒号不止一个),按地址比 —— 它没有端口可言。
+       */
+      if (pattern.startsWith('[')) {
+        const m = /^\[([^\]]+)\](?::(\d+))?$/.exec(pattern)
+        if (m) return bareHost === m[1] && (m[2] === undefined || port === m[2])
+      }
+      if ((pattern.match(/:/g)?.length ?? 0) > 1) {
+        return isIpv6 && bareHost === pattern
+      }
 
       // Check for port-specific match
       if (pattern.includes(':')) {

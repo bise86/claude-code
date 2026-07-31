@@ -1124,3 +1124,34 @@ describe('README 的强制通过一节说的和代码干的是同一件事', () 
     expect(README).toContain(norm('预先批准**不会**让节点跳过执行环节'))
   })
 })
+
+/**
+ * 用量那一节说的和代码干的是同一件事 —— 这一组是新加的三条来源各自的锚。
+ *
+ * 这个文件存在的理由就是「文档承诺了、代码没做」这一类,而用量这一节刚刚把
+ * 「自动压缩漏算」从**已知缺陷**改写成**已修复**。那句话如果哪天变回假的,得有东西变红。
+ */
+describe('README 的用量口径和代码对得上', () => {
+  it('说「自动压缩已经算进来了」,那 claude.ts 就得真的在结算成本处上报', () => {
+    const claude = readFileSync(new URL('../../services/api/claude.ts', import.meta.url), 'utf8')
+    // 两处结算点(流式的 message_delta、非流式兜底)各自都要报 —— 只报一处的话,
+    // 走另一条路的调用在用量表上是免费的。
+    expect(claude.split('reportApiUsage(').length - 1).toBeGreaterThanOrEqual(2)
+    // 而且必须带 requestId:那是和消息那侧去重的唯一键,不带就会让每次调用翻倍。
+    expect(claude).toContain('requestId: streamRequestId ?? undefined')
+  })
+
+  it('说「翻译层给每次响应签一个 request-id」,那响应头里就得真有', () => {
+    const src = readFileSync(new URL('../../services/api/openaiCompat/roleFetch.ts', import.meta.url), 'utf8')
+    expect(src).toContain("'request-id': requestId")
+  })
+
+  it('说「≈ 表示估出来的」,那三处显示就都得读这个字段', () => {
+    const detail = readFileSync(new URL('../../commands/efftask/NodeDetail.tsx', import.meta.url), 'utf8')
+    const panel = readFileSync(new URL('../../commands/efftask/TaskTreePanel.tsx', import.meta.url), 'utf8')
+    expect(detail).toContain('u.estimated')
+    // 树行标记和表头合计
+    expect(panel.split('estimated').length - 1).toBeGreaterThanOrEqual(2)
+    expect(README).toContain(norm('`≈` 表示这个数是估出来的'))
+  })
+})

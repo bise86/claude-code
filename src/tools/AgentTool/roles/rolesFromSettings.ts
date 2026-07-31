@@ -1,5 +1,6 @@
 import { z } from 'zod/v4'
 import { logError } from '../../../utils/log.js'
+import { registerDirectHosts } from '../../../utils/lanDirect.js'
 import type { EffortValue } from '../../../utils/effort.js'
 import { ROLE_API_PROTOCOLS } from '../../../services/api/openaiCompat/protocols.js'
 import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from './roleThinking.js'
@@ -200,6 +201,15 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
         ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name }
         : undefined
+      /**
+       * 内网端点**在载入时**就登记直连(见 utils/lanDirect)。
+       *
+       * 这是主登记点:它跑在任何一次调用之前,而且每一条员工都必经这里。全局代理
+       * (`HTTPS_PROXY`)到不了用户自己的局域网,而 Bun 的 fetch 连 `127.0.0.1` 都照走代理 ——
+       * 不登记的话,一个指向 `192.168.x.x` 的员工在这台机器上一次都连不通,而同一个地址
+       * `curl` 是通的。公网地址不碰(那是代理该管的)。
+       */
+      if (roleClientConfig) registerDirectHosts([roleClientConfig.apiUrl])
       const promptStr = r.prompt
       out.push({ role: r, agentDef: {
         agentType: r.name,

@@ -597,6 +597,13 @@ describe('改回去要变红的四处', () => {
     expect(head).toContain('onProblems: setRedoProblems')
     // 新树进 state:少了它界面显示的还是重做前那棵。
     expect(head).toContain('onNodes: setNodes')
+    /**
+     * 被删子树的实时输出跟着走。少了这一跳,用户报的那条就会回来:重做父任务之后,
+     * 新拆出来的子节点顶着**上一轮同名节点**的运行记录(childId 由「父id + 序号 +
+     * 标题 slug」算出,重拆一次常常逐字相同)。顺序与参数由 redoRun.test.ts 钉住,
+     * 这里守的是「真存储被接上了」——store 那侧的行为由 agentStream.test.ts 钉。
+     */
+    expect(head).toMatch(/onDropStreams:[\s\S]{0,80}streams\.current\.dropNodes\(ids\)/)
   })
 
   it('交给 commitRedo 的 before 是 runRedo 给的那份,不是组件手上的', () => {
@@ -758,5 +765,21 @@ describe('靠主循环上下文的工具不能进子 agent', () => {
     const src = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
     expect(src).toContain('return subAgentToolPool(all).filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name))')
     expect(src).toMatch(/verifyToolPool[\s\S]{0,120}subAgentToolPool\(all\)/)
+  })
+})
+
+/**
+ * 出网路线那一块要**真的拿到员工端点**。
+ *
+ * `proxyNoticeLines` 自己有单测(startupConfirm.test.ts),但那证明不了它拿到了东西:
+ * 把 `apiUrls` 这个 prop 剪掉,函数照样返回一个只有「检测到全局代理」的列表 —— 关口
+ * 上少的正是「哪几个端点会绕过它直连、哪几个仍走代理」,而那才是用户配了内网员工之后
+ * 唯一能提前发现问题的地方。这个文件挂不起来,所以只能守这一跳的文本。
+ */
+describe('启动关口拿得到员工端点', () => {
+  it('ConfirmStartup 收到 apiUrls,而且取的是 roleClientConfig.apiUrl', () => {
+    const el = element('ConfirmStartup')
+    expect(el.startsWith('<ConfirmStartup')).toBe(true)
+    expect(el).toMatch(/apiUrls=\{props\.agentModels\.map\(a => a\.roleClientConfig\?\.apiUrl\)\}/)
   })
 })

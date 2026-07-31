@@ -2468,6 +2468,13 @@ describe('spec §16:方案阶段必须被告知"可能冲突的子任务要用�
 describe('spec §10.2:各阶段耗时要被累计下来', () => {
   // 详情页原本只有一个总耗时,而它回答不了打开这个面板的人真正的问题:一个跑了 20 分钟
   // 是因为执行器慢,另一个跑了 20 分钟是因为被评审打回了四次 —— 两者长得一模一样。
+  /**
+   * 一个 commit 消费**一个**时刻。
+   *
+   * 上一版每次 commit 里写死了「会调 2 次 now()」,而那是实现细节:commit 现在
+   * 一次迁移只取一次时间(五处写入共用它),多补一处写入就会让这种排程错位。
+   * 一格一次迁移读起来也直白得多。
+   */
   const clock = (times: string[]) => { let i = 0; return () => times[Math.min(i++, times.length - 1)] }
 
   it('离开一个活动态时把停留时长记到那个阶段名下', async () => {
@@ -2475,10 +2482,8 @@ describe('spec §10.2:各阶段耗时要被累计下来', () => {
     const ctx = {
       ...ctxFor([n], (async () => '') as RunAgentFn),
       now: clock([
-        '2026-07-26T00:00:00.000Z', // commit(PLANNING) 的 updatedAt
-        '2026-07-26T00:00:00.000Z',
+        '2026-07-26T00:00:00.000Z', // commit(PLANNING)
         '2026-07-26T00:00:30.000Z', // commit(PLAN_REVIEW):离开 PLANNING,记 30s
-        '2026-07-26T00:00:30.000Z',
       ]),
     }
     await commitForTest(n, 'PLANNING', ctx)
@@ -2492,10 +2497,10 @@ describe('spec §10.2:各阶段耗时要被累计下来', () => {
     const ctx = {
       ...ctxFor([n], (async () => '') as RunAgentFn),
       now: clock([
-        '2026-07-26T00:00:00.000Z', '2026-07-26T00:00:00.000Z',
-        '2026-07-26T00:00:10.000Z', '2026-07-26T00:00:10.000Z', // 离开 EXECUTING:10s
-        '2026-07-26T00:00:20.000Z', '2026-07-26T00:00:20.000Z',
-        '2026-07-26T00:00:35.000Z', '2026-07-26T00:00:35.000Z', // 再离开 EXECUTING:15s
+        '2026-07-26T00:00:00.000Z',
+        '2026-07-26T00:00:10.000Z', // 离开 EXECUTING:10s
+        '2026-07-26T00:00:20.000Z',
+        '2026-07-26T00:00:35.000Z', // 再离开 EXECUTING:15s
       ]),
     }
     await commitForTest(n, 'EXECUTING', ctx)
@@ -3347,7 +3352,22 @@ describe('测试验证判不通过时,原因必须到达能修它的人', () => 
     await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }))
     const last = prompts[prompts.length - 1]
     expect(last).toContain(BLOCK)
-    expect(last).not.toContain('验收点 3 没达成')
+    /**
+     * 判据是**位置**,不是「整篇里有没有这句话」。
+     *
+     * 上一版断言的是整篇不含那条验收意见,而那条断言现在会把一件对的事判红:执行者拿到的
+     * 「历次未通过纪要」**本来就该**包含更早那轮的验收意见 —— 用户要的正是「在上一轮失败的
+     * 基础上修正」,而那份纪要给每一条都标了它出现在第几轮。
+     *
+     * 真正不能发生的是**冒名**:「上一轮…阻断意见」那个槽位里装着另一道关口两轮前的意见,
+     * 而提示词明确告诉执行者那是上一轮的。所以只看那个槽位。
+     */
+    const slot = last.slice(last.indexOf('上一轮验收未通过'), last.indexOf('请针对性返工'))
+    expect(slot).toContain(BLOCK)
+    expect(slot).not.toContain('验收点 3 没达成')
+    // 而纪要那一段里它要在,并且标着**它自己**的轮次 —— 那才是「带着上一轮的教训」。
+    expect(last).toContain('验收点 3 没达成')
+    expect(last).toMatch(/第 1 轮\) 验收点 3 没达成/)
   })
 
   it('验证者改了工作区时,那条注记也要进提示词', async () => {
@@ -3518,7 +3538,7 @@ describe('测试验证的返工路径(此前三条分支零覆盖)', () => {
 })
 
 describe('验证裁决在记录里能和验收区分开', () => {
-  it('测试验证那条记录带上 step,验收那条不带', async () => {
+  it('测试验证和验收各自带上自己的 step', async () => {
     // 两者共用 acceptLog 和 iteration.acceptance,于是 node.md 的「## 验收记录」里会出现
     // 两条 round 1 —— 而升级卡片写的正是「先看该节点的验收记录」。
     const agent: RunAgentFn = async req => {
@@ -3531,7 +3551,10 @@ describe('验证裁决在记录里能和验收区分开', () => {
     n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
     n.phaseRoles = { ...emptyPhaseRoles(), verify: [{ roleName: 'tester' }] }
     await stepExecute(n, ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles }))
-    expect(n.acceptLog.map(r => r.step)).toEqual(['verify', undefined])
+    // 验收那条从「省略」改成显式 'accept':历次未通过纪要要按关口分组,而一份显式的
+    // 标记让「这条是哪一关的」不依赖于一个默认值。老 node.md 里省略的记录仍按验收读
+    // (stepOfRound),所以这不是一次不兼容的改动。
+    expect(n.acceptLog.map(r => r.step)).toEqual(['verify', 'accept'])
   })
 })
 
@@ -4407,7 +4430,12 @@ describe('评审收敛真的接上了', () => {
     // 字符串的 === 比的是值不是身份,各算各的照样相等,那条探针是空的。真正要钉的是
     // 「这次调用发生在哪一层」,而那件事在运行时观测不到。
     const SRC = readFileSync(new URL('./pipeline.ts', import.meta.url), 'utf8')
-    const body = SRC.slice(SRC.indexOf('function reviewPrompt('), SRC.indexOf('function executePrompt('))
+    // 只切 reviewPrompt **自己的函数体**(到它自己那个行首的 } 为止)。切到下一个函数
+    // 声明为止的话,写在 executePrompt 头上的一段注释也会被圈进来 —— 而那段注释解释的
+    // 正是「为什么这份聚合不能放在 per-seat 的函数里」,于是这条闸门会被一句赞同它的
+    // 注释判红。
+    const from = SRC.indexOf('function reviewPrompt(')
+    const body = SRC.slice(from, SRC.indexOf('\n}', from))
     expect(`reviewPrompt 里还在算: ${body.includes('feedbackItems')}`).toBe('reviewPrompt 里还在算: false')
     expect(SRC).toContain('const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog)')
   })
@@ -4563,5 +4591,240 @@ describe('redoFrom: 从质疑讨论重做', () => {
     await stepStart(n, ctxFor([n], runAgent))
     expect(seen).toEqual(['plan', 'review'])
     expect(n.plan.solution).toBe('新方案')
+  })
+})
+
+/**
+ * 阶段的**时间点**(TaskNode.phaseAt)与节点的结束时刻(finishedAt)。
+ *
+ * 用户原话:「任务运行和阶段运行,都要有具体的运行时间点,现在只有一个运行了多长时间。」
+ * 累计时长(phaseMs)回答不了「那是什么时候的事」——一个 12 分钟的执行是刚刚在跑,
+ * 还是两小时前就跑完、之后一直卡在等验收,两者在屏幕上一模一样。
+ */
+describe('阶段时间点', () => {
+  const node = (over: Partial<TaskNode> = {}): TaskNode =>
+    createNode({ id: 'n', title: 't', goal: 'g', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'T0', ...over }) as TaskNode
+
+  const ctxAt = (clock: { now: string }) => ({
+    config: { goalPrompt: '', parallelism: 1, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS } },
+    byId: new Map(), persist: async () => {}, now: () => clock.now, onUpdate: () => {},
+    signal: new AbortController().signal, runAgent: (async () => '') as never,
+    reserveNodes: () => ({ release: () => {} }),
+  }) as never
+
+  it('进入时记 first、离开时记 last', async () => {
+    const clock = { now: '2026-07-31T09:00:00.000Z' }
+    const n = node()
+    await commitForTest(n, 'EXECUTING', ctxAt(clock))
+    expect(n.phaseAt?.EXECUTING?.first).toBe('2026-07-31T09:00:00.000Z')
+    // 还没出来 —— last 缺席是**正常形态**,不是坏数据。拿 now 填会让一个被杀在半路的
+    // 节点显示成「刚刚还在跑」。
+    expect(n.phaseAt?.EXECUTING?.last).toBeUndefined()
+
+    clock.now = '2026-07-31T09:02:00.000Z'
+    await commitForTest(n, 'ACCEPTANCE', ctxAt(clock))
+    expect(n.phaseAt?.EXECUTING?.last).toBe('2026-07-31T09:02:00.000Z')
+    expect(n.phaseAt?.ACCEPTANCE?.first).toBe('2026-07-31T09:02:00.000Z')
+  })
+
+  it('返工三轮:first 停在第一次,last 跟到最后一次', async () => {
+    const clock = { now: '2026-07-31T09:00:00.000Z' }
+    const n = node()
+    await commitForTest(n, 'EXECUTING', ctxAt(clock))
+    clock.now = '2026-07-31T09:01:00.000Z'
+    await commitForTest(n, 'ACCEPTANCE', ctxAt(clock))
+    clock.now = '2026-07-31T09:02:00.000Z'
+    await commitForTest(n, 'EXECUTING', ctxAt(clock)) // 第二轮
+    clock.now = '2026-07-31T09:05:00.000Z'
+    await commitForTest(n, 'ACCEPTANCE', ctxAt(clock))
+    // 两个数各自回答一半:窗口的两端在这里,中间每一轮的分段在输出页卡的那几条流里。
+    expect(n.phaseAt?.EXECUTING?.first).toBe('2026-07-31T09:00:00.000Z')
+    expect(n.phaseAt?.EXECUTING?.last).toBe('2026-07-31T09:05:00.000Z')
+  })
+
+  it('终态盖结束时刻,回到活动态就抹掉 —— 两个方向都写', async () => {
+    const clock = { now: '2026-07-31T09:00:00.000Z' }
+    const n = node()
+    await commitForTest(n, 'EXECUTING', ctxAt(clock))
+    expect(n.finishedAt).toBeUndefined()
+    clock.now = '2026-07-31T09:10:00.000Z'
+    await commitForTest(n, 'ACCEPTED', ctxAt(clock))
+    expect(n.finishedAt).toBe('2026-07-31T09:10:00.000Z')
+    // 重做把它放回队列、这次又跑起来 —— 顶着上一次的结束时刻会让详情页把它显示成
+    // 「已经结束」,而它正在跑。
+    clock.now = '2026-07-31T09:20:00.000Z'
+    await commitForTest(n, 'EXECUTING', ctxAt(clock))
+    expect(n.finishedAt).toBeUndefined()
+  })
+
+  it('阻断也算有结论', async () => {
+    const clock = { now: '2026-07-31T09:00:00.000Z' }
+    const n = node()
+    await commitForTest(n, 'BLOCKED', ctxAt(clock))
+    expect(n.finishedAt).toBe('2026-07-31T09:00:00.000Z')
+  })
+})
+
+/**
+ * 用户原话:「执行、测试、验收,如果重复多轮,会将上一轮为什么没有通过的原因带到第二轮不。
+ * 在其失败的基础上进行修正。所有有多轮的,都应该类似的思路。」
+ *
+ * 方案圆桌那一侧早就治过这个病(reviewConvergence:反馈只带最后一轮 → 作者打地鼠;
+ * 评审员看不到自己提过什么 → 每轮换一批新要求)。而**执行侧的三关**当时一条都没接上,
+ * 尽管那一侧每一轮都要多付一次带写工具的执行调用。
+ */
+describe('多轮:上一轮的教训要带到下一轮', () => {
+  const leaf = () => {
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    return n
+  }
+
+  it('执行者拿到的是**历次**未通过的汇总,而且标着各自的轮次', async () => {
+    const prompts: string[] = []
+    let acceptRounds = 0
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') { prompts.push(req.prompt); return '```json\n{"execStatus":"改了"}\n```' }
+      acceptRounds++
+      // 前两轮各提一条不同的意见,第三轮放行
+      if (acceptRounds === 1) return vtag(req) + '\n{"pass":false,"blocking":["第一条:少了回滚"],"comments":""}\n```'
+      if (acceptRounds === 2) return vtag(req) + '\n{"pass":false,"blocking":["第二条:错误码没覆盖"],"comments":""}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = leaf()
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles, caps: { ...cfg.caps, maxIterations: 5 } }))
+    const third = prompts[2]!
+    // 第三轮执行时,第 1 轮那条**也**要在场 —— 只带上一轮的话,执行者会把第 1 轮改好的
+    // 地方在第 2 轮改跑偏,第 3 轮又被提回来。这就是「打地鼠」。
+    expect(third).toContain('第一条:少了回滚')
+    expect(third).toContain('第二条:错误码没覆盖')
+    expect(third).toMatch(/第 1 轮\) 第一条/)
+  })
+
+  it('验收员看得到**自己**前几轮提过什么', async () => {
+    const acceptPrompts: string[] = []
+    let acceptRounds = 0
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      acceptPrompts.push(req.prompt)
+      acceptRounds++
+      return acceptRounds < 2
+        ? vtag(req) + '\n{"pass":false,"blocking":["少了回滚方案"],"comments":""}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = leaf()
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }))
+    // 第一轮没有历史可讲
+    expect(acceptPrompts[0]).not.toContain('前几轮已经提出过')
+    // 第二轮要能看到自己上一轮说了什么 —— 否则每轮都是从零开一次会,最容易发生的事
+    // 就是换一批新理由把同一份产出再挡一次。
+    expect(acceptPrompts[1]).toContain('前几轮已经提出过')
+    expect(acceptPrompts[1]).toContain('少了回滚方案')
+    // 措辞不能推着它放行(和方案圆桌同一条规矩:相似度会误判)
+    expect(acceptPrompts[1]).not.toContain('请判通过')
+  })
+
+  it('测试验证的历史不会跟验收的混在一起', async () => {
+    const verifyPrompts: string[] = []
+    let verifyRounds = 0
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      if (req.phase === 'verify') {
+        verifyPrompts.push(req.prompt)
+        verifyRounds++
+        return verifyRounds < 2
+          ? vtag(req) + '\n{"pass":false,"blocking":["测试没跑通:超时"],"comments":""}\n```'
+          : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      }
+      return vtag(req) + '\n{"pass":false,"blocking":["验收侧的意见"],"comments":""}\n```'
+    }
+    const node = leaf()
+    node.phaseRoles = { ...emptyPhaseRoles(), verify: [{ roleName: 'tester' }] }
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }))
+    expect(verifyPrompts.length).toBeGreaterThan(1)
+    expect(verifyPrompts[1]).toContain('测试没跑通:超时')
+    // 把验收的意见交给测试验证员去复核,它既回应不了,也会把它当成一条自己没提过的新要求
+    expect(verifyPrompts[1]).not.toContain('验收侧的意见')
+    // 而且要自称是测试验证那一关,不能自称评审
+    expect(verifyPrompts[1]).toContain('轮测试验证')
+  })
+})
+
+/**
+ * 评审实测出来的两条串关(P2):新加的历次纪要过滤对了,而它**旁边**那两段没有。
+ */
+describe('「上一轮」那一段也要按关取', () => {
+  const leaf = () => {
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    // 这个节点先长过子节点、后来又回到执行循环 —— acceptLog 的最后一条是集成验收的意见
+    n.acceptLog = [
+      { round: 1, verdicts: [{ role: 'qa', pass: false, blocking: ['叶子验收的意见'], comments: '' }], synthesized: { pass: false, blockingSummary: '叶子验收的意见' }, step: 'accept' },
+      { round: 1, verdicts: [{ role: 'arch', pass: false, blocking: ['集成的意见:子任务合起来没达成父目标'], comments: '' }], synthesized: { pass: false, blockingSummary: '集成的意见:子任务合起来没达成父目标' }, step: 'integrate' },
+    ] as never
+    return n
+  }
+
+  it('执行者的「上一轮验收未通过」不许装着集成验收的意见', async () => {
+    const prompts: string[] = []
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') { prompts.push(req.prompt); return '```json\n{"execStatus":"改了"}\n```' }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = leaf()
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }))
+    const slot = prompts[0]!.slice(prompts[0]!.indexOf('上一轮验收未通过'), prompts[0]!.indexOf('请针对性返工'))
+    expect(slot).toContain('叶子验收的意见')
+    // 同一段提示词里,旁边那段按关分组的纪要过滤对了,这一段没有 —— 两个口径打架
+    expect(slot).not.toContain('集成的意见')
+  })
+
+  it('老 node.md(记录没标 step)谁的历史都不算 —— 分不出来就宁可少说', async () => {
+    const prompts: string[] = []
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      prompts.push(req.prompt)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = leaf()
+    // 老记录:一条集成意见,没有 step
+    node.acceptLog = [
+      { round: 1, verdicts: [{ role: 'arch', pass: false, blocking: ['老的集成意见'], comments: '' }], synthesized: { pass: false, blockingSummary: '老的集成意见' } },
+      { round: 2, verdicts: [{ role: 'arch', pass: false, blocking: ['老的集成意见'], comments: '' }], synthesized: { pass: false, blockingSummary: '老的集成意见' } },
+    ] as never
+    node.iteration = { ...node.iteration, acceptance: 2 }
+    await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }))
+    // 验收圆桌的「你前几轮提过」里不该出现一条来路不明的老记录
+    for (const p of prompts) expect(p).not.toContain('前几轮已经提出过')
+  })
+})
+
+/**
+ * 集成验收的记录要**自报家门**。
+ *
+ * 验收点名的存活变异:改回 `push(rec)` 之后全量 2941 条一条都不红,而它的用户可见后果是
+ * 集成验收的意见被交给叶子验收员当成自己提过的话去复核。
+ */
+describe('集成验收的记录标 step', () => {
+  it('acceptLog 里那条集成裁决带着 integrate', async () => {
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        return '```plan\n{"kind":"decompose","solution":"s","acceptance":"a","children":[{"title":"甲","deps":[]}]}\n```'
+      }
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const parent = root()
+    parent.kind = 'decompose'
+    parent.status = 'WAITING_CHILDREN'
+    parent.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    const child = { ...root(), id: 'root/00-a', title: '甲', parentId: 'root', status: 'ACCEPTED', depth: 1, kind: 'executable' } as TaskNode
+    parent.childIds = ['root/00-a']
+    await stepIntegrate(parent, ctxFor([parent, child], agent, cfg))
+    expect(parent.acceptLog.at(-1)?.step).toBe('integrate')
   })
 })

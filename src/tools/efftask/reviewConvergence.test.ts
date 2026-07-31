@@ -214,7 +214,7 @@ describe('reviewRepeatNotice —— 评审员此前完全看不到历史', () =>
     // 判断本身可能是错的(字符 n-gram 分不开「换说法的同一条」和「同模板的另一条」)。
     const n = reviewRepeatNotice(items, 3)
     expect(n).not.toContain('请判通过')
-    expect(n).toContain('哪一句')
+    expect(n).toContain('哪一处')
     expect(n).toContain('不要仅因为措辞眼熟就放行')
   })
 
@@ -334,5 +334,31 @@ describe('预算是怎么花的', () => {
     expect(Array.from(planFeedbackPrompt(nasty)).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
     expect(Array.from(exhaustionReason(nasty, 3)).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
     expect(Array.from(reviewRepeatNotice(nasty, 3)).length).toBeLessThanOrEqual(MAX_SUMMARY_CHARS + 40)
+  })
+})
+
+/**
+ * `label` / `subject` 两个参数 —— 评审点名的**存活变异**:把 `${subject}` 全换回硬编码
+ * 「方案」,294 条测试全绿。而这两个参数正是「把方案圆桌那份药给另外三关」的全部内容:
+ * 一个测试验证员读到「若新**方案**已经回应了它」时,手上根本没有方案要评。
+ */
+describe('换一关用时,措辞跟着换', () => {
+  const items = feedbackItems([
+    round(1, [v('tester', ['auth.test.ts:42 期望 200 实际 500'])]),
+    round(2, [v('tester', ['auth.test.ts:42 期望 200 实际 500'])]),
+  ])
+
+  it('reviewRepeatNotice 的关名和判的东西都跟着参数走', () => {
+    const n = reviewRepeatNotice(items, 3, '测试验证', '这一版产出')
+    expect(n).toContain('第 3 轮测试验证')
+    expect(n).toContain('若新这一版产出已经回应了它')
+    // 默认那一份仍然说「评审 / 方案」——老调用点一个字都不变
+    expect(n).not.toContain('轮评审')
+    expect(n).not.toContain('若新方案')
+  })
+
+  it('planFeedbackPrompt 的关名跟着参数走', () => {
+    expect(planFeedbackPrompt(items, '测试验证/验收')).toContain('轮测试验证/验收共提出')
+    expect(planFeedbackPrompt(items)).toContain('轮评审共提出')
   })
 })

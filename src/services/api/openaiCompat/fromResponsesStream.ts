@@ -1,5 +1,6 @@
 import { logError } from '../../../utils/log.js'
-import { createBlockWriter, type Evt } from './blocks.js'
+import { createBlockWriter, type Evt, fallbackUsage } from './blocks.js'
+import type { StreamCtx } from './protocols.js'
 import { encodeReasoningSignature } from './toResponsesRequest.js'
 
 /**
@@ -22,7 +23,7 @@ import { encodeReasoningSignature } from './toResponsesRequest.js'
 interface PendingCall { callId?: string; name?: string; args: string; fromDelta: string }
 
 export async function* responsesEventsToAnthropicEvents(
-  frames: AsyncIterable<any>, ctx: { anthropicModel: string },
+  frames: AsyncIterable<any>, ctx: StreamCtx,
 ): AsyncGenerator<Evt> {
   const w = createBlockWriter(ctx)
   const calls = new Map<string, PendingCall>()
@@ -208,5 +209,5 @@ export async function* responsesEventsToAnthropicEvents(
     emittedTool = true
   }
   if (emittedTool && stopReason === 'end_turn') stopReason = 'tool_use'
-  yield* w.finish(stopReason, usage)
+  yield* w.finish(stopReason, fallbackUsage(usage, w, ctx))
 }

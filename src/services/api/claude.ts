@@ -229,6 +229,7 @@ import { getInitializationStatus } from '../lsp/manager.js'
 import { isToolFromMcpServer } from '../mcp/utils.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { CLIENT_REQUEST_ID_HEADER, getAnthropicClient } from './client.js'
+import { reportApiUsage } from './usageSink.js'
 import {
   API_ERROR_MESSAGE_PREFIX,
   CUSTOM_OFF_SWITCH_MESSAGE,
@@ -2254,6 +2255,22 @@ async function* queryModel(
               usage,
               options.model,
             )
+            /**
+             * 同一处顺手把用量**旁路上报**一份(见 services/api/usageSink)。
+             *
+             * 收在这里,因为这是「一次真实请求的最终用量已经确定」的唯一一处 —— 而
+             * /et 的用量表原来只看得见被 yield 出来的 assistant 消息:子 agent 内部的
+             * 自动压缩(一次读满上下文窗口的完整调用)在那张表上一条都没有。
+             *
+             * 没人在听时是一次 getStore() 的开销;去重靠 requestId,两边同一个键。
+             */
+            reportApiUsage({
+              requestId: streamRequestId ?? undefined,
+              input: usage.input_tokens ?? 0,
+              output: usage.output_tokens ?? 0,
+              cacheRead: usage.cache_read_input_tokens ?? 0,
+              cacheWrite: usage.cache_creation_input_tokens ?? 0,
+            })
 
             const refusalMessage = getErrorMessageIfRefusal(
               part.delta.stop_reason,
@@ -2835,6 +2852,14 @@ async function* queryModel(
         fallbackUsage,
         options.model,
       )
+      // 非流式兜底那一路同样要上报 —— 少了它,一次走这条路的调用在用量表上是免费的。
+      reportApiUsage({
+        requestId: streamRequestId ?? undefined,
+        input: fallbackUsage.input_tokens ?? 0,
+        output: fallbackUsage.output_tokens ?? 0,
+        cacheRead: fallbackUsage.cache_read_input_tokens ?? 0,
+        cacheWrite: fallbackUsage.cache_creation_input_tokens ?? 0,
+      })
     }
   }
 

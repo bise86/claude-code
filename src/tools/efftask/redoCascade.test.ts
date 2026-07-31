@@ -353,3 +353,165 @@ describe('reopenPropagatedBlocks(纯函数)', () => {
     expect(reopenPropagatedBlocks(byId(nodes), 'T9').sort()).toEqual(['a', 'b'])
   })
 })
+
+/**
+ * 用户报的第二个场景:**任务在跑,取消掉,再重做**。
+ *
+ * 中止(Esc / Ctrl+C / 关掉视图)走的是 `propagateBlocked(aborted=true)`:每一个非终态节点
+ * 被扫成 `BLOCKED + interrupted:true + 理由「已中断」`。而「已中断」不在 PROPAGATED 那三个
+ * 理由里 —— 修之前它们被当成**真失败的种子**,不但自己不放开,还会顺着父/子/依赖三条边
+ * 把死亡集合扩散出去,把本该放开的下游一起摁住。
+ *
+ * 用户看到的就是:重做完了,依赖任务还红着,一次模型调用都不会发生。
+ */
+describe('整个 run 被中断之后重做', () => {
+  /** 中止扫过之后的形态:A 自己失败在先(理由是判决),其余全是「已中断」。 */
+  function interruptedTree(): TaskNode[] {
+    return [
+      node('root', { kind: 'decompose', childIds: ['A', 'B'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true }),
+      reviewed('A', { parentId: 'root', status: 'BLOCKED', blockedReason: '执行失败: 上游报错', failedAt: 'EXECUTING', depth: 1 }),
+      reviewed('B', { parentId: 'root', deps: ['A'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true, depth: 1 }),
+    ]
+  }
+
+  it('重做失败节点时,被中断的依赖任务一起回队列', () => {
+    const plan = ok(planRedo(interruptedTree(), 'A', 'execute', 'T1'))
+    expect(at(plan, 'A').status).toBe('READY')
+    // 这一条就是用户报的那句「其依赖任务的状态没有更新过来」
+    expect(at(plan, 'B').status).not.toBe('BLOCKED')
+    expect(at(plan, 'B').blockedReason).toBe('')
+    expect(at(plan, 'B').interrupted).toBe(false)
+    // 被中断的节点重开后不该带着旧的开始时刻 —— 否则树上会显示跨过整个关机时间的耗时
+    expect(at(plan, 'B').startedAt).toBeUndefined()
+  })
+
+  it('恢复(--resume)那条路不受影响:它有自己更细的归位规则', () => {
+    // 不带 includeInterrupted 时,「已中断」既不是种子也不是候选 —— 保持原样,
+    // 由 reseat 自己那套(按被杀阶段选座位、预算耗尽先挡下、补一行注记)来处理。
+    const nodes = interruptedTree()
+    const reopened = reopenPropagatedBlocks(byId(nodes), 'T1')
+    expect(reopened).toEqual([])
+    expect(nodes.find(n => n.id === 'B')!.status).toBe('BLOCKED')
+  })
+
+  it('用户**点名取消**的那一个不会被别人的重做悄悄复活', () => {
+    const nodes = interruptedTree()
+    // B 不是被扫到的,是用户按 x 取消的 —— 那是一个决定
+    const b = nodes.find(n => n.id === 'B')!
+    b.blockedReason = '已被用户取消(/et --resume 会重新排队,也可以在结束屏上按 r 重做)'
+    b.cancelled = true
+    const plan = ok(planRedo(nodes, 'A', 'execute', 'T1'))
+    expect(at(plan, 'B').status).toBe('BLOCKED')
+    expect(at(plan, 'B').cancelled).toBe(true)
+  })
+
+  it('重做**被取消的那个节点自己**时,它当然回队列,而且取消标记被清掉', () => {
+    const nodes = interruptedTree()
+    const b = nodes.find(n => n.id === 'B')!
+    b.blockedReason = '已被用户取消(…)'
+    b.cancelled = true
+    const plan = ok(planRedo(nodes, 'B', 'execute', 'T1'))
+    expect(at(plan, 'B').status).toBe('READY')
+    expect(at(plan, 'B').cancelled).toBe(false)
+    // 留着的话它下一次因为别的原因阻断时,会被误当成「用户不想跑它」而永久摁住
+    expect(at(plan, 'B').interrupted).toBe(false)
+  })
+
+  it('上游还真失败着的时候,被中断的下游继续留红 —— 放得太多和放得太少一样错', () => {
+    const nodes = [
+      node('root', { kind: 'decompose', childIds: ['A', 'B', 'C'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true }),
+      reviewed('A', { parentId: 'root', status: 'BLOCKED', blockedReason: '执行失败', failedAt: 'EXECUTING', depth: 1 }),
+      // B 依赖 A(A 没被重做,仍然真失败着),C 依赖 B
+      reviewed('B', { parentId: 'root', deps: ['A'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true, depth: 1 }),
+      reviewed('C', { parentId: 'root', deps: ['B'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true, depth: 1 }),
+    ]
+    // 重做的是 C 自己,A 仍然挂着
+    const plan = ok(planRedo(nodes, 'C', 'execute', 'T1'))
+    expect(at(plan, 'A').status).toBe('BLOCKED')
+    // B 的上游(A)还挂着,放开它只会白烧调用 —— 树上会写「排队中」而它根本推不动
+    expect(at(plan, 'B').status).toBe('BLOCKED')
+  })
+})
+
+/**
+ * 中止那一刻**自己真失败**的节点,不许被别人的重做顺手放开。
+ *
+ * 评审实测出来的 P1:`blockWithReason` 写的是 `interrupted = keepInterrupted ||
+ * ctx.signal.aborted` —— 一次 Esc 会让「编译不过」和「被扫到」拿到同一个布尔。
+ * 只看那个布尔的话,用户重做 B、系统把 A 也重跑一遍,而且抹掉了 A 的失败证据。
+ */
+describe('中断标记不等于「被中止扫到」', () => {
+  it('带着真判决的节点即使 interrupted 也不放开,证据一个字不动', () => {
+    const nodes = [
+      node('root', { kind: 'decompose', childIds: ['A', 'B'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true }),
+      // A 在中止的同一刻自己失败了:有失败点 = commit() 记的,那是它自己的判决
+      reviewed('A', {
+        parentId: 'root', status: 'BLOCKED', blockedReason: '执行失败: 编译不过',
+        failedAt: 'EXECUTING', interrupted: true, depth: 1,
+      }),
+      reviewed('B', { parentId: 'root', status: 'BLOCKED', blockedReason: '已中断', interrupted: true, depth: 1 }),
+    ]
+    const plan = ok(planRedo(nodes, 'B', 'execute', 'T1'))
+    expect(at(plan, 'A').status).toBe('BLOCKED')
+    expect(at(plan, 'A').blockedReason).toBe('执行失败: 编译不过')
+    expect(at(plan, 'A').failedAt).toBe('EXECUTING')
+    expect(at(plan, 'B').status).toBe('READY')
+  })
+
+  it('触阀停下的节点同理 —— capBlocked 也是一次判决', () => {
+    const nodes = [
+      node('root', { kind: 'decompose', childIds: ['A', 'B'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true }),
+      reviewed('A', {
+        parentId: 'root', status: 'BLOCKED', blockedReason: '验收迭代超限(3)',
+        capBlocked: true, capCategory: 'rework', interrupted: true, depth: 1,
+      }),
+      reviewed('B', { parentId: 'root', status: 'BLOCKED', blockedReason: '已中断', interrupted: true, depth: 1 }),
+    ]
+    const plan = ok(planRedo(nodes, 'B', 'execute', 'T1'))
+    expect(at(plan, 'A').status).toBe('BLOCKED')
+    // 清掉它就等于让 --retry-blocked 找不到这个节点,而它正是该被 retry 的那一类
+    expect(at(plan, 'A').capBlocked).toBe(true)
+  })
+
+  it('真的只是被扫到的(没有失败点、没触阀)照常放开', () => {
+    // 正向锚:上面两条不能靠「什么都不放开」来满足。
+    const nodes = [
+      node('root', { kind: 'decompose', childIds: ['A', 'B'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true }),
+      reviewed('A', { parentId: 'root', status: 'BLOCKED', blockedReason: '执行失败', failedAt: 'EXECUTING', depth: 1 }),
+      reviewed('B', { parentId: 'root', deps: [], status: 'BLOCKED', blockedReason: '已中断', interrupted: true, depth: 1 }),
+    ]
+    const plan = ok(planRedo(nodes, 'A', 'execute', 'T1'))
+    expect(at(plan, 'B').status).toBe('READY')
+  })
+})
+
+/**
+ * 被取消的上游会**连坐**下游 —— 那是对的(它们本来也推不动),但屏幕上得说出来。
+ *
+ * 验收报的:用户看到的是「重做完了,还有一批任务红着」,而那正是他上一次报障的那句话。
+ */
+describe('被取消的上游摁住的那些要点名', () => {
+  it('重做别的节点时,把仍被取消上游摁住的数量说出来', () => {
+    const nodes = [
+      node('root', { kind: 'decompose', childIds: ['P', 'T'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true }),
+      // P 被用户点名取消
+      reviewed('P', {
+        parentId: 'root', status: 'BLOCKED', blockedReason: '已被用户取消(…)',
+        cancelled: true, interrupted: true, depth: 1,
+      }),
+      // Q 依赖 P —— 它推不动,而它的理由只写着「已中断」
+      reviewed('Q', { parentId: 'root', deps: ['P'], status: 'BLOCKED', blockedReason: '已中断', interrupted: true, depth: 1 }),
+      reviewed('T', { parentId: 'root', status: 'BLOCKED', blockedReason: '执行失败', failedAt: 'EXECUTING', depth: 1 }),
+    ]
+    nodes[0]!.childIds = ['P', 'Q', 'T']
+    const plan = ok(planRedo(nodes, 'T', 'execute', 'T1'))
+    expect(plan.warnings.some(w => w.includes('取消过') && w.includes('1 个'))).toBe(true)
+    // 而且不许顺手改它们的阻断原因 —— 那会让下一次重做把它们当成真失败的种子
+    expect(at(plan, 'Q').blockedReason).toBe('已中断')
+  })
+
+  it('一个被取消的都没有时,不多这一句', () => {
+    const plan = ok(planRedo(chain(), 'A', 'execute', 'T1'))
+    expect(plan.warnings.some(w => w.includes('取消过'))).toBe(false)
+  })
+})

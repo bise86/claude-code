@@ -10,7 +10,12 @@ import type { EffTaskConfig, PhaseName, RoleBinding } from './types.js'
 export interface AgentModelInfo {
   agentType: string
   model?: string
-  roleClientConfig?: { apiProtocol?: string; backendModel?: string }
+  /**
+   * `apiUrl` 只被关口的「出网路线」那一块读(见 startupConfirm.proxyNoticeLines):
+   * 有全局代理时,哪些员工会绕过它直连、哪些仍走代理,是用户唯一能提前发现
+   * 「代理到不了这个内网地址」的地方。模型解析本身不看它。
+   */
+  roleClientConfig?: { apiProtocol?: string; backendModel?: string; apiUrl?: string }
 }
 
 /**

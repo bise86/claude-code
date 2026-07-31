@@ -837,20 +837,78 @@ describe('spec §10.2:详情页要显示各阶段耗时', () => {
       node: mk({ id: 'n', phaseMs: { ACCEPTANCE: 8_000, PLAN_REVIEW: 45_000, EXECUTING: 120_000 } }),
     })
     expect(f).toContain('各阶段耗时')
-    expect(f).toContain('执行 120s')
+    // 分钟以上给 `2m0s` 而不是 `120s`:加上时间点之后这一列要和时刻并排读,而一个
+    // 45 分钟的执行环节原来印的是 `2700s`。
+    expect(f).toContain('执行 2m0s')
     expect(f).toContain('质疑讨论 45s')
-    // 顺序:执行(120)必须排在方案评审(45)前面,方案评审又要排在验收(8)前面 ——
-    // 读的人是来找"时间花哪了"的。
-    expect(f.indexOf('执行 120s')).toBeLessThan(f.indexOf('质疑讨论 45s'))
+    // 顺序:**没有时间点**的老数据仍然按耗时倒序 —— 执行(120)排在质疑讨论(45)前面,
+    // 质疑讨论又在验收(8)前面。读的人是来找"时间花哪了"的。
+    expect(f.indexOf('执行 2m0s')).toBeLessThan(f.indexOf('质疑讨论 45s'))
     expect(f.indexOf('质疑讨论 45s')).toBeLessThan(f.indexOf('验收 8s'))
   })
 
-  it('不足一秒的阶段不列 —— 一行 0s 只会让人以为那里出了问题', async () => {
+  it('不足一秒、又没有时间点的阶段不列 —— 一行 0s 只会让人以为那里出了问题', async () => {
     // 用一个生产**真的会产出**的状态。第一版拿 SCORING 当样本 —— 而当时 SCORING 压根不在
     // 白名单里、phaseMs 里永远不会出现它,所以那条断言测的是一个不存在的情况。
     const f = await mountDetail({ node: mk({ id: 'n', phaseMs: { EXECUTING: 60_000, PLAN_REVIEW: 300 } }) })
-    expect(f).toContain('执行 60s')
-    expect(f).not.toContain('方案评审')
+    expect(f).toContain('执行 1m0s')
+    // 断言的是**这个状态的中文标签**。上一版写的是 `not.toContain('方案评审')`,而
+    // PLAN_REVIEW 的标签是「质疑讨论」—— 那条断言恒真,把整条过滤删掉照样绿。
+    expect(f).not.toContain('质疑讨论')
+  })
+
+  /**
+   * 用户原话:「任务运行和阶段运行,都要有具体的运行时间点,现在只有一个运行了多长时间。」
+   *
+   * 一个 `749s` 回答不了他真正在问的那个问题:**那是什么时候的事**。
+   */
+  it('有时间点时,每个阶段印出「什么时候进、什么时候出」,并按发生顺序排', async () => {
+    const f = await mountDetail({
+      node: mk({
+        id: 'n',
+        // 插入顺序和时间顺序相反 —— 排序真的发生了才会绿。
+        phaseMs: { ACCEPTANCE: 8_000, EXECUTING: 120_000 },
+        phaseAt: {
+          EXECUTING: { first: '2026-07-31T09:00:00.000Z', last: '2026-07-31T09:02:00.000Z' },
+          ACCEPTANCE: { first: '2026-07-31T09:05:00.000Z', last: '2026-07-31T09:05:08.000Z' },
+        },
+      }),
+    })
+    expect(f).toMatch(/执行 \d\d:\d\d:\d\d → \d\d:\d\d:\d\d · 累计 2m0s/)
+    expect(f).toMatch(/验收 \d\d:\d\d:\d\d → \d\d:\d\d:\d\d · 累计 8s/)
+    // 时间线不是排行榜:先发生的排前面,哪怕它更短。
+    expect(f.indexOf('执行')).toBeLessThan(f.indexOf('验收'))
+  })
+
+  it('进了还没出来的阶段说「进行中」,不拿此刻冒充结束时刻', async () => {
+    // 一个被杀在半路的节点走的也是这一支。拿 now 去填会让它显示成「刚刚还在跑」。
+    const f = await mountDetail({
+      node: mk({ id: 'n', phaseMs: {}, phaseAt: { EXECUTING: { first: '2026-07-31T09:00:00.000Z' } } }),
+    })
+    expect(f).toContain('进行中')
+  })
+
+  it('节点自己的时间线:创建 / 开始 / 结束', async () => {
+    const f = await mountDetail({
+      node: mk({
+        id: 'n', status: 'ACCEPTED',
+        createdAt: '2026-07-31T08:00:00.000Z',
+        startedAt: '2026-07-31T09:00:00.000Z',
+        finishedAt: '2026-07-31T09:30:00.000Z',
+      }),
+    })
+    expect(f).toContain('创建')
+    expect(f).toContain('开始')
+    expect(f).toContain('结束')
+    // 开始→结束的跨度,和「各阶段耗时」的合计不是一回事(中间还有排队和等子任务)
+    expect(f).toContain('历时 30m0s')
+  })
+
+  it('还没结束的节点说「进行中,至今 …」,而不是印一个空的结束时刻', async () => {
+    const f = await mountDetail({
+      node: mk({ id: 'n', status: 'EXECUTING', startedAt: new Date(Date.now() - 65_000).toISOString() }),
+    })
+    expect(f).toContain('进行中,至今')
   })
 
   it('REWORK 那一行不能叫"返工" —— 它量的不是返工', async () => {

@@ -28,6 +28,19 @@ export interface RedoRunDeps {
   onProblems: (problems: string[]) => void
   /** 新树进 state。不做这一步,界面显示的还是重做前那棵。 */
   onNodes: (nodes: TaskNode[]) => void
+  /**
+   * 被删掉的那些节点的**历史运行记录**也一并扔掉。
+   *
+   * 用户报的现象:「重做其父任务,但是其子任务的历史运行记录还有,未完全删除掉。」
+   * 子树从内存和磁盘上都删干净了,而实时输出是按 nodeId 存在另一个活存储里的 ——
+   * 没有任何东西通知它。更要命的是 `childId` 由「父id + 序号 + 标题 slug」算出:
+   * 同一个父节点重新拆一次,新子节点的 id 常常和被删的那个**逐字相同**,于是上一轮的
+   * 输出会挂到新节点的详情页上。
+   *
+   * 做成 deps 上的一个回调,和这里的其他五步同因:它长在 efftask.tsx 里的话,唯一的
+   * 防线又会变成源码文本断言,而那种断言证明不了「这一步真的被调用过、而且带着对的参数」。
+   */
+  onDropStreams?: (nodeIds: readonly string[]) => void
   /** 重新启动编排。**这是整个功能的目的**,少了它重做只是改了改树。 */
   start: (nodes: TaskNode[]) => void
   /** 关掉关口、回到 done 视图。 */
@@ -72,6 +85,12 @@ export async function runRedo(
   // 不会有任何报错。
   const { problems } = await deps.commit(computed, nodes)
   deps.onProblems(problems)
+  /**
+   * 历史运行记录跟着节点一起走。**排在 `onNodes` 之前** —— 那一句会让界面立刻用新树重画,
+   * 而重画时详情页要按 nodeId 去取流:先换树后删流,中间那一帧里,一个刚建出来的新节点
+   * 会显示上一轮同名节点的输出。差一帧也是说假话。
+   */
+  if (computed.deleted.length > 0) deps.onDropStreams?.(computed.deleted)
   deps.onNodes(computed.nodes)
   // 落盘在前、重启在后。反过来的话编排器会在一棵还没写下去的树上开跑,
   // 中途崩溃就什么都恢复不了。
@@ -145,6 +164,9 @@ async function runPastFailedPhase(
   // 会走 resetForExecute,那时是有工作区要放的。
   const { problems } = await deps.commit(computed, nodes)
   deps.onProblems(problems)
+  // 跳过/强制通过通常一个节点都不删(deleted 恒为空),但走的是同一套 deps ——
+  // 判据放在 `deleted` 上而不是入口上,以后哪条路开始删节点都不会漏。
+  if (computed.deleted.length > 0) deps.onDropStreams?.(computed.deleted)
   deps.onNodes(computed.nodes)
   deps.start(computed.nodes)
 }

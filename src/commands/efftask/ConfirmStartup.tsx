@@ -4,7 +4,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, costLine, guidanceLines, mcpNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, costLine, guidanceLines, mcpNoticeLines, proxyNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -13,6 +13,14 @@ export function ConfirmStartup(props: {
   isolation?: 'worktree' | 'none'
   /** 本次会话可用的 MCP 工具名。关口要说清它们在哪些环节可用、以及挡不住什么。 */
   mcpToolNames?: string[]
+  /**
+   * 名册上那些 `execMode:'api'` 员工的端点。**只在配了全局代理时**才渲染成一块。
+   *
+   * 用户报过一次「配了 roles 就连不上」,真凶是一条早就忘了的 `HTTPS_PROXY` —— 代理
+   * 到不了他自己的局域网,而同一台机器上 curl 那个地址是通的。现在内网端点会自动
+   * 绕过代理直连(utils/lanDirect),而自动发生的事更需要在关口上说出来。
+   */
+  apiUrls?: (string | undefined)[]
   /**
    * Role names this session can actually dispatch — spec §2 第一关's "名册可编辑".
    *
@@ -170,6 +178,14 @@ export function ConfirmStartup(props: {
         <Box flexDirection="column">
           <Text color="warning">MCP 工具:</Text>
           {mcpNoticeLines(props.mcpToolNames ?? []).map(l => <Text key={l} color="warning">  · {l}</Text>)}
+        </Box>
+      )}
+      {/* 出网路线。**不是警告色**:这是一件已经替用户处理好的事(内网端点自动直连),
+          不是「有一部分不会生效」。没配代理时整块不画 —— 那时候它是纯噪音。 */}
+      {proxyNoticeLines(props.apiUrls ?? []).length > 0 && (
+        <Box flexDirection="column">
+          <Text bold>出网路线:</Text>
+          {proxyNoticeLines(props.apiUrls ?? []).map(l => <Text key={l} dimColor>  · {l}</Text>)}
         </Box>
       )}
       {noticeLines(shown).length > 0 && (

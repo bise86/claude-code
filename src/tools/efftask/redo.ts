@@ -720,6 +720,8 @@ function reopenAncestor(n: TaskNode, now: string): boolean {
   n.status = n.childIds.length > 0 ? 'WAITING_CHILDREN' : n.kind === 'executable' ? 'READY' : 'CREATED'
   n.blockedReason = ''
   n.interrupted = false
+  // 同 reopenPropagatedNode:祖先重开了,「被点名取消过」的标记不该跨过这一次重开。
+  n.cancelled = false
   n.capBlocked = false
   n.capCategory = undefined
   /**
@@ -736,6 +738,8 @@ function reopenAncestor(n: TaskNode, now: string): boolean {
   // 这次重做没打算让祖先重新分析。
   n.iteration = { ...n.iteration, integration: 0, scoring: 0 }
   n.startedAt = undefined
+  // 和 startedAt 成对:重开 = 还没有结论。
+  n.finishedAt = undefined
   n.updatedAt = now
   return true
 }
@@ -805,9 +809,13 @@ function reopenPropagatedNode(n: TaskNode, now: string): void {
   n.blockedReason = ''
   n.failedAt = undefined
   n.interrupted = false
+  // 它是被连带放开的,那个「被点名取消过」的标记到此为止 —— 留着的话,它下一次
+  // 因为别的原因阻断时会被误当成「用户不想跑它」。
+  n.cancelled = false
   n.capBlocked = false
   n.capCategory = undefined
   n.startedAt = undefined
+  n.finishedAt = undefined
   n.updatedAt = now
 }
 
@@ -843,8 +851,67 @@ function reopenPropagatedNode(n: TaskNode, now: string): void {
  *
  * @returns 被放开的节点 id(按 byId 的顺序)
  */
-export function reopenPropagatedBlocks(byId: ReadonlyMap<string, TaskNode>, now: string): string[] {
+export function reopenPropagatedBlocks(
+  byId: ReadonlyMap<string, TaskNode>,
+  now: string,
+  /**
+   * 把**被中断**的节点也算成「被牵连」(默认不算)。
+   *
+   * ## 为什么这是重做必须打开、恢复必须关掉的一个开关
+   *
+   * 用户报的现象:「之前任务在运行,取消掉后,重做其父任务,依赖任务的状态没有更新过来」。
+   * 病根是 `propagateBlocked(aborted)` —— 一次 Esc / Ctrl+C / 关掉视图,会把**每一个**
+   * 非终态节点扫成 `BLOCKED` + `interrupted: true` + 理由「已中断」。而「已中断」不在
+   * `PROPAGATED` 那三个理由里,于是重做时它们被当成**真失败的种子**:不但自己不放开,
+   * 还会顺着父/子/依赖三条边把死亡集合扩散出去,把本来该放开的下游一起摁住。
+   * 结果就是他看到的那句:重做完了,依赖它的那些任务还红着,一次模型调用都不会发生。
+   *
+   * 中断**不是对任何节点的判决**,这一点 `reseat.ts` 早就承认了(`--resume` 重开的正是
+   * 这一批)。差别只在于:`--resume` 有一套自己的、更细的归位规则(按被杀时的阶段选座位、
+   * 预算耗尽的先挡下来、补一行「上次运行在 X 中断」的注记),所以那条路**不能**从这里
+   * 顺手把它们放开 —— 那会让节点跳过它自己的归位逻辑(实测:被放开之后 `ACTIVE.has(status)`
+   * 和 `wasInterrupted` 双双为假,reseat 的循环直接 `continue` 跳过它)。
+   *
+   * 而重做没有那套规则,也不需要:它要的就是「把这棵树重新变得能跑」。
+   *
+   * **用户点名取消的那一个不在此列**(`cancelled`),那是一个决定,不是一次意外 ——
+   * 见 TaskNode.cancelled。
+   */
+  opts: { includeInterrupted?: boolean } = {},
+): string[] {
   const blocked = [...byId.values()].filter(n => n.status === 'BLOCKED')
+  /**
+   * 这一条阻断是**别人的失败**溅到它身上的吗。
+   *
+   * 两个来源:`propagateBlocked` 写的那三种理由,以及(只在重做那条路上)整个 run 被中断
+   * 时的那一扫。结构性损坏永远不算 —— 那是盘上的树自己对不上,重开只会让一批上游无法
+   * 核实的工作跑起来。
+   */
+  const isCollateral = (n: TaskNode): boolean => {
+    if (isStructural(n.blockedReason)) return false
+    if (PROPAGATED.has(n.blockedReason)) return true
+    if (opts.includeInterrupted !== true || n.interrupted !== true || n.cancelled === true) return false
+    /**
+     * **`interrupted` 不等于「被中止扫到」。**
+     *
+     * 评审实测出来的 P1:`blockWithReason` 写的是 `interrupted = keepInterrupted ||
+     * ctx.signal.aborted` —— 也就是说,中止那一刻**自己真失败**的节点(编译不过、预算
+     * 耗尽)同样带着 `interrupted: true`。只看这个布尔的话,用户重做 B,系统会顺手把
+     * 一个「执行失败: 编译不过」的 A 也放回队列,并把它的 `blockedReason` / `failedAt` /
+     * `capBlocked` 一起抹掉 —— 证据没了,钱照烧,屏幕上只有一句「连带恢复了 N 个」。
+     *
+     * 判据用 `failedAt` 和 `capBlocked`,**不是理由文本**:
+     *  - `commit()` 对**节点自己的**每一次失败都记 `failedAt`(它是唯一还看得见上一个
+     *    状态的地方);
+     *  - 而 `propagateBlocked` 的中止扫描**显式**把 `failedAt` 清成 undefined
+     *    (那条路上还写着「这不是这个节点的失败」);
+     *  - `capBlocked` 则是安全阀停下的那一类,同样是一次判决。
+     *
+     * 所以「被中止扫到」= 中断标记在、而它自己没有失败点、也没有触阀。两个字段都是
+     * 结构化的、两个方向都写、都有读回校验 —— 比一个共享的中文串可靠得多。
+     */
+    return n.failedAt === undefined && n.capBlocked !== true
+  }
   /** 盘上引用不全的节点永远推不动 —— 当种子,不当候选。 */
   const dangling = (n: TaskNode): boolean =>
     n.deps.some(id => !byId.has(id)) || n.childIds.some(id => !byId.has(id))
@@ -866,7 +933,7 @@ export function reopenPropagatedBlocks(byId: ReadonlyMap<string, TaskNode>, now:
     }
   }
   for (const n of blocked) {
-    if (!PROPAGATED.has(n.blockedReason) || dangling(n)) kill(n)
+    if (!isCollateral(n) || dangling(n)) kill(n)
   }
   while (stack.length > 0) {
     const cur = stack.pop()!
@@ -876,11 +943,55 @@ export function reopenPropagatedBlocks(byId: ReadonlyMap<string, TaskNode>, now:
   }
   const reopened: string[] = []
   for (const n of blocked) {
-    if (dead.has(n.id) || !PROPAGATED.has(n.blockedReason)) continue
+    if (dead.has(n.id) || !isCollateral(n)) continue
     reopenPropagatedNode(n, now)
     reopened.push(n.id)
   }
   return reopened
+}
+
+/**
+ * 还有几个节点是**被一个「用户点名取消」的上游摁住**的。
+ *
+ * 验收报的:P1 被取消之后重做另一个节点 T,`P` 的父节点、以及依赖 P 的 Q 仍然留红,
+ * 而它们的阻断原因写的是「已中断」—— 语义上说得通(Q 本来也推不动),但屏幕上没有
+ * 任何东西把这件事和「你取消过 P1」联系起来,用户很可能照着同一个现象再报一次。
+ *
+ * 所以数出来、在重做摘要里说一句。**只数,不改任何节点**:改写它们的阻断原因会让
+ * 那条理由离开 `PROPAGATED` 那个集合,而下一次重做会把它们当成真失败的种子 ——
+ * 一个显示问题换来一个状态问题,不划算。
+ */
+export function heldByCancelledCount(byId: ReadonlyMap<string, TaskNode>): number {
+  const cancelled = [...byId.values()].filter(n => n.status === 'BLOCKED' && n.cancelled === true)
+  if (cancelled.length === 0) return 0
+  /** 谁在依赖它 —— 和不动点那边同一个方向。 */
+  const dependents = new Map<string, TaskNode[]>()
+  for (const n of byId.values()) {
+    for (const d of n.deps) {
+      const arr = dependents.get(d)
+      if (arr) arr.push(n)
+      else dependents.set(d, [n])
+    }
+  }
+  const seen = new Set(cancelled.map(n => n.id))
+  const stack = [...cancelled]
+  let held = 0
+  while (stack.length > 0) {
+    const cur = stack.pop()!
+    // 沿三条边扩散,和 propagateBlocked 的方向一致:父←子、子←父、依赖方←依赖。
+    const next = [
+      ...(cur.parentId !== null ? [byId.get(cur.parentId)] : []),
+      ...cur.childIds.map(id => byId.get(id)),
+      ...(dependents.get(cur.id) ?? []),
+    ]
+    for (const m of next) {
+      if (!m || seen.has(m.id) || m.status !== 'BLOCKED') continue
+      seen.add(m.id)
+      held++
+      stack.push(m)
+    }
+  }
+  return held
 }
 
 /**
@@ -925,11 +1036,15 @@ function reseatForRerun(
   target.capBlocked = false
   target.capCategory = undefined
   target.mergeConflict = false
+  // 取消标记跟着清:用户按 r 就是改主意了,而留着它会让这个节点在**下一次**重做时
+  // 被当成「他决定不跑的那一个」而摁住。和 failedAt / capBlocked 同规矩,无条件写。
+  target.cancelled = false
   // 失败点跟着清:它说的是「上一次是在哪一步倒下的」,而这个节点此刻正要重新起跑。
   // 留着的话,一个重跑后因为**别的**原因(比如子节点阻断)停下的节点会带着旧失败点,
   // 而快捷键会照它提供一个错的动作。commit() 也会清,这里是让纯函数的返回值就已经是对的。
   target.failedAt = undefined
   target.startedAt = undefined
+  target.finishedAt = undefined
   target.updatedAt = opts.now
   const reopened: string[] = []
   let p = target.parentId === null ? undefined : byId.get(target.parentId)
@@ -950,11 +1065,29 @@ function reseatForRerun(
    * 刚刚在上面被放开 —— 顺序反过来的话,第一轮扫描时 target 还是 BLOCKED,依赖它的
    * 那一批会被「上游还挂着」挡住,而这正是用户报的那个现象。
    */
-  const cascaded = reopenPropagatedBlocks(byId, opts.now)
+  /**
+   * `includeInterrupted: true` —— 重做要连带放开**被中断**的那一批。
+   *
+   * 用户报的场景就是这个:任务在跑、他取消掉(或者按 Esc 中止整个 run)、再重做父任务。
+   * 一次中止会把每一个非活动节点扫成 `BLOCKED + interrupted + 理由「已中断」`,而那个
+   * 理由不在 PROPAGATED 里 —— 于是它们被当成真失败的种子,连带把下游一起摁死:
+   * 重做完成之后,依赖任务还红着,一次模型调用都不会发生。见那个参数自己的注释。
+   */
+  const cascaded = reopenPropagatedBlocks(byId, opts.now, { includeInterrupted: true })
   if (cascaded.length > 0) {
     // 说出来:多级恢复是用户看不见的连带效果。一句话,而且**不带 id 清单** ——
     // 这一屏本来就在跟高度打架(见 redoSummary 的注释),一行 12 个 id 会把别的警告挤掉。
-    opts.warnings.push(`连带恢复了 ${cascaded.length} 个被牵连阻断的任务(依赖链上的下游及其子树)`)
+    opts.warnings.push(`连带恢复了 ${cascaded.length} 个被牵连阻断/被中断的任务(依赖链上的下游及其子树)`)
+  }
+  /**
+   * 还留红的那些里,有多少是被一个**你自己取消过**的节点摁着的。
+   *
+   * 不说的话,用户看到的是「重做完了,还有一批任务红着」—— 而那正是他上一次报障的
+   * 那句话。说清楚之后他知道下一步该按在哪个节点上(见 heldByCancelledCount)。
+   */
+  const held = heldByCancelledCount(byId)
+  if (held > 0) {
+    opts.warnings.push(`另有 ${held} 个任务仍被阻断:它们的上游有你**取消过**的任务 —— 想让它们跑起来,要先重做那个被取消的节点`)
   }
   return reopened
 }

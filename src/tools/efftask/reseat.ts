@@ -254,13 +254,35 @@ export function reseatTransientNodes(
       n.blockedReason = `恢复时该阶段预算已耗尽(${spent}/${caps.maxIterations}),不再重试`
       n.interrupted = false // a later resume must not reopen it again
       /**
+       * 这条**早退**分支同样要清那三个字段 —— 它绕过了下面那一整段归位清理。
+       *
+       * 评审实测:被这条分支阻断的节点留着上一次的 `startedAt`/`finishedAt`,于是详情页
+       * 一边写着「已终止」,一边把耗时算成跨过整个关机时间的 72 小时;而留着的 `cancelled`
+       * 是一个**跨 run 存活的摁住位**,而这条分支恰好是「活干完了、判的人没预算了」那一类
+       * —— 最可能被后续一次重做碰到的节点。
+       *
+       * `startedAt` 清掉的语义和下面那段逐字相同:这个节点会从下一个活动阶段重新计时。
+       */
+      n.cancelled = false
+      n.startedAt = undefined
+      n.finishedAt = now
+      /**
        * 失败点。`wasStatus` 早就在手上(上面 target 的判定和下面那条注记都在用它),
        * 唯独这里没记 —— 而这恰恰是**最需要「跳过失败环节」的那一类节点**:活干完了,
        * 判的人没预算了。评审实跑:`ACCEPTANCE` + acceptance=3 的节点在这里阻断之后,
        * `R` 回「这条记录来自更早的版本,或者被手工改过」,`s` 回「看不出…无法跳过」——
        * 两个新键在它身上全废。
        */
-      n.failedAt = wasStatus
+      /**
+       * **`BLOCKED` 不是一个环节**,记上去等于把失败点抹成一个没有含义的值。
+       *
+       * `commit()` 对同一个坑有防线(`if (prev !== 'BLOCKED')`,注释写明了理由),
+       * 而这一处缺了它 —— 复验实测:Esc 中止那条主流路径上,`propagateBlocked` 已经把
+       * 节点扫成 BLOCKED,于是下一次 `--resume` 看到的 `wasStatus` 就是 `'BLOCKED'`,
+       * `failedPhaseOf` 查不到这个键、返回 undefined,`R`/`s` 两个快捷键在它身上全废。
+       * 硬杀那条路(status 还停在 ACCEPTANCE)不受影响,那正是这一行原本要救的场景。
+       */
+      if (wasStatus !== 'BLOCKED') n.failedAt = wasStatus
       n.updatedAt = now
       exhausted.push(n.id)
       continue
@@ -268,6 +290,9 @@ export function reseatTransientNodes(
 
     n.status = target
     n.interrupted = false
+    // 归位 = 重新起跑。取消标记也到此为止 —— `/et --resume` 明确承诺会重新排队被取消的
+    // 节点(阻断原因里就是这么写的),而留着它会让**重做**在之后把它当成「用户不想跑」。
+    n.cancelled = false
     // 归位 = 重新起跑,上一次的失败点作废(和 redo 的 reseatForRerun 逐字同因:留着它,
     // R/s 会照一个属于上辈子的失败点给出动作)。手工跳过的一次性标记同理。
     n.failedAt = undefined
@@ -294,6 +319,9 @@ export function reseatTransientNodes(
      * — 「耗时将从恢复后的首个活动阶段重新计时」.
      */
     n.startedAt = undefined
+    // 结束时刻同理:这个节点正被放回队列,它已经**没有**结论了。留着的话详情页会
+    // 一边显示「进行中」一边显示一个两天前的结束时刻。
+    n.finishedAt = undefined
     // NOTE the matching cost, recorded rather than glossed: the time this node spent in the
     // phase it was killed in is DISCARDED, not banked. `phaseMs` accumulates inside commit()
     // on the way out of a status, and a killed node never takes that exit — reseat writes

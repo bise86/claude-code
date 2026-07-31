@@ -3,6 +3,7 @@ import {
   addUsage, createUsageMeter, EMPTY_USAGE, formatTokens, isEmptyUsage,
   sanitizeUsage, subtreeUsage, totalTokens, type UsageNode,
 } from './usage.js'
+import { markEstimatedUsage, _resetEstimatedUsage } from '../../services/api/tokenEstimate.js'
 import { createAssistantAPIErrorMessage, createAssistantMessage } from '../../utils/messages.js'
 import { makeRunAgentFn } from './runAgentAdapter.js'
 
@@ -246,5 +247,133 @@ describe('接线:用量记在**节点**上', () => {
       await fn({ phase, node: node as never, role: null, system: 's', prompt: 'p', signal: new AbortController().signal })
     }
     expect(node.usage?.calls).toBe(3)
+  })
+})
+
+/**
+ * 用户报的第二件事:「token 统计效果没有了,而且之前数据也不准确,不管 CLI 还是 API
+ * 都要准确」。
+ *
+ * 这一组守的是**口径**那一半:同一次请求从两条路各报一次时不能翻倍,而估算出来的数
+ * 必须一路带着「这是估的」走到界面上。
+ */
+describe('按 requestId 去重 —— 消息和旁路上报是同一次调用', () => {
+  const msg = (over: Record<string, unknown> = {}) => ({
+    type: 'assistant', requestId: 'req_1',
+    message: { id: 'msg_1', model: 'claude', usage: { input_tokens: 100, output_tokens: 20 } },
+    ...over,
+  })
+
+  it('两条路报同一次请求,只算一次调用', () => {
+    const m = createUsageMeter()
+    m.observe(msg())
+    m.observeApi({ requestId: 'req_1', input: 100, output: 20, cacheRead: 0, cacheWrite: 0 })
+    const t = m.totals()
+    expect(t.calls).toBe(1)
+    expect(t.input).toBe(100)
+    expect(t.output).toBe(20)
+  })
+
+  it('旁路报了一次消息看不见的调用(自动压缩)—— 那一次要算进来', () => {
+    // 这正是这条旁路存在的理由:一次压缩是一次读满上下文窗口的完整调用,而它的产出
+    // 以 UserMessage 回到主循环,消息那条路一条都看不见。
+    const m = createUsageMeter()
+    m.observe(msg())
+    m.observeApi({ requestId: 'req_compact', input: 180_000, output: 900, cacheRead: 0, cacheWrite: 0 })
+    expect(m.totals().calls).toBe(2)
+    expect(m.totals().input).toBe(180_100)
+  })
+
+  it('没有 requestId 时退回 message.id,两条不同的消息还是两次调用', () => {
+    const m = createUsageMeter()
+    m.observe({ type: 'assistant', message: { id: 'a', usage: { input_tokens: 1, output_tokens: 1 } } })
+    m.observe({ type: 'assistant', message: { id: 'b', usage: { input_tokens: 1, output_tokens: 1 } } })
+    expect(m.totals().calls).toBe(2)
+  })
+
+  it('同一次请求的两条消息(流式)仍然只算一次,逐字段取最大', () => {
+    const m = createUsageMeter()
+    // message_start 那一份 output 是 0,后到的那一份才是真数 —— 也可能反过来到达。
+    m.observe(msg({ message: { id: 'msg_1', usage: { input_tokens: 100, output_tokens: 0 } } }))
+    m.observe(msg({ message: { id: 'msg_1', usage: { input_tokens: 100, output_tokens: 55 } } }))
+    m.observe(msg({ message: { id: 'msg_1', usage: { input_tokens: 100, output_tokens: 0 } } }))
+    expect(m.totals()).toMatchObject({ calls: 1, input: 100, output: 55 })
+  })
+})
+
+describe('估算标记', () => {
+  it('登记过的 requestId 会让这一次调用带上 estimated', () => {
+    _resetEstimatedUsage()
+    markEstimatedUsage('req_est')
+    const m = createUsageMeter()
+    m.observe({ type: 'assistant', requestId: 'req_est', message: { id: 'x', usage: { input_tokens: 10, output_tokens: 5 } } })
+    m.observe({ type: 'assistant', requestId: 'req_real', message: { id: 'y', usage: { input_tokens: 10, output_tokens: 5 } } })
+    expect(m.totals().calls).toBe(2)
+    expect(m.totals().estimated).toBe(1)
+  })
+
+  it('相加时估算次数一起累计,一次都没有就不带这个字段', () => {
+    const a = { calls: 1, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, estimated: 1 }
+    const b = { calls: 1, input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }
+    expect(addUsage(a, b).estimated).toBe(1)
+    expect(addUsage(b, b).estimated).toBeUndefined()
+  })
+
+  it('读回时保留,而且夹到调用次数以内', () => {
+    // 少了读回,一份估算值在 --resume 之后会被显示成实测值 —— 那比不显示更糟。
+    expect(sanitizeUsage({ calls: 3, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, estimated: 2 })?.estimated).toBe(2)
+    // 手改出来的大数:「3 次调用,其中 99 次是估算」
+    expect(sanitizeUsage({ calls: 3, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, estimated: 99 })?.estimated).toBe(3)
+    expect(sanitizeUsage({ calls: 3, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, estimated: -1 })?.estimated).toBeUndefined()
+  })
+})
+
+/**
+ * **每次都回同一个 `request-id` 的网关**。
+ *
+ * 评审实测出来的少报:转发层写死一个常量 request-id 时,整趟运行的几十次调用会被
+ * 合成一次(`{calls:1, input:3000}` 对真值 `{calls:3, input:6000}`)。方向正是
+ * 「比多报更糟」的那个 —— 用户照着一个偏小的数去放宽 caps。
+ */
+describe('恒定 request-id 的网关', () => {
+  const msgOf = (mid: string, input: number) => ({
+    type: 'assistant', requestId: 'SAME',
+    message: { id: mid, usage: { input_tokens: input, output_tokens: 100 } },
+  })
+
+  it('message.id 不同就是不同的调用', () => {
+    const m = createUsageMeter()
+    m.observe(msgOf('chatcmpl-1', 1000))
+    m.observe(msgOf('chatcmpl-2', 2000))
+    m.observe(msgOf('chatcmpl-3', 3000))
+    expect(m.totals().calls).toBe(3)
+    expect(m.totals().input).toBe(6000)
+  })
+
+  it('同一次流式调用里那几条共用 id 的消息仍然只算一次', () => {
+    const m = createUsageMeter()
+    m.observe(msgOf('chatcmpl-1', 1000))
+    m.observe(msgOf('chatcmpl-1', 1000))
+    expect(m.totals().calls).toBe(1)
+  })
+})
+
+describe('旁路上报和消息的先后不影响结果', () => {
+  const msg = { type: 'assistant', requestId: 'R', message: { id: 'M', usage: { input_tokens: 100, output_tokens: 20 } } }
+
+  it('消息先到', () => {
+    const m = createUsageMeter()
+    m.observe(msg)
+    m.observeApi({ requestId: 'R', input: 100, output: 20, cacheRead: 0, cacheWrite: 0 })
+    expect(m.totals()).toMatchObject({ calls: 1, input: 100, output: 20 })
+  })
+
+  it('旁路先到 —— 消息到达时要把它认领回来', () => {
+    // 非流式兜底那条路是先 push 消息再上报,而重试/回落都可能换序。认领不掉的话
+    // 同一次请求被记成两次调用,而那正是这个键设计要防的第一件事。
+    const m = createUsageMeter()
+    m.observeApi({ requestId: 'R', input: 100, output: 20, cacheRead: 0, cacheWrite: 0 })
+    m.observe(msg)
+    expect(m.totals()).toMatchObject({ calls: 1, input: 100, output: 20 })
   })
 })

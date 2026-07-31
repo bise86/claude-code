@@ -45,10 +45,12 @@
  * 抄一份字面量的风险(对面改名后这里静默失效)由 `usage.test.ts` 里一条**直接比对源头**
  * 的断言接住 —— 那条断言只在测试里付出依赖代价,不在运行期。
  */
+import { isEstimatedUsage } from '../../services/api/tokenEstimate.js'
+
 const SYNTHETIC_MODEL = '<synthetic>'
 
 export interface UsageTotals {
-  /** 模型调用次数(不同的 message.id 数)。 */
+  /** 模型调用次数(不同的请求数)。 */
   calls: number
   input: number
   output: number
@@ -56,6 +58,21 @@ export interface UsageTotals {
   cacheRead: number
   /** 写入缓存的输入 token。 */
   cacheWrite: number
+  /**
+   * 其中有几次调用的 token 数是**估出来的**,不是上游报的。
+   *
+   * 来源两处,都不是我们能改的:
+   *  - OpenAI 兼容网关忽略 `stream_options.include_usage`(实测存在)——那一次调用的
+   *    真实用量我们永远拿不到;
+   *  - CLI 档员工:它是另一个进程,除非它自己在协议里报,否则外面只看得见文本。
+   *
+   * 不估的话那些调用记成 0,而 0 会让整段用量在界面上消失 —— 用户看到的是「统计没了」,
+   * 而那些 token 是真花掉的。估算 + 一个 `≈` 是实话;0 是假话。
+   *
+   * **必须能被读回**(见 sanitizeUsage):少了它,`--resume` 之后一份估算值会被显示成
+   * 实测值,那比不显示更糟。
+   */
+  estimated?: number
 }
 
 export const EMPTY_USAGE: UsageTotals = { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
@@ -63,12 +80,16 @@ export const EMPTY_USAGE: UsageTotals = { calls: 0, input: 0, output: 0, cacheRe
 export function addUsage(a: UsageTotals | undefined, b: UsageTotals | undefined): UsageTotals {
   const x = a ?? EMPTY_USAGE
   const y = b ?? EMPTY_USAGE
+  const estimated = (x.estimated ?? 0) + (y.estimated ?? 0)
   return {
     calls: x.calls + y.calls,
     input: x.input + y.input,
     output: x.output + y.output,
     cacheRead: x.cacheRead + y.cacheRead,
     cacheWrite: x.cacheWrite + y.cacheWrite,
+    // 一次都没估过就**不带这个字段**:带一个 0 会让每一个节点的 node.md 都多一行,
+    // 而它想说的事(「这些数里有估算」)在 0 的时候根本不成立。
+    ...(estimated > 0 ? { estimated } : {}),
   }
 }
 
@@ -96,9 +117,19 @@ function num(v: unknown): number {
 export function sanitizeUsage(raw: unknown): UsageTotals | undefined {
   if (raw === null || typeof raw !== 'object') return undefined
   const r = raw as Record<string, unknown>
+  const est = num(r.estimated)
   const out: UsageTotals = {
     calls: num(r.calls), input: num(r.input), output: num(r.output),
     cacheRead: num(r.cacheRead), cacheWrite: num(r.cacheWrite),
+    /**
+     * **必须读回。** 少了这一句,一份带估算的用量在 `--resume` 之后会被显示成实测值 ——
+     * 那个方向的错(把估算说成实测)比不显示更糟,而这个仓库为「只写不读的字段」
+     * 已经付过一次学费(见 feishu/roleDefs 那一组)。
+     *
+     * 夹到 calls:估算次数不可能多于调用次数,一个手改出来的大数会让界面上出现
+     * 「3 次调用,其中 99 次是估算」。
+     */
+    ...(est > 0 ? { estimated: Math.min(est, num(r.calls)) } : {}),
   }
   return isEmptyUsage(out) ? undefined : out
 }
@@ -109,19 +140,21 @@ export function sanitizeUsage(raw: unknown): UsageTotals | undefined {
  * 返回 undefined 表示「这条消息不是一次模型调用」——  合成消息、非 assistant 消息、
  * 没有 usage 字段的消息都归到这一档。
  */
-function readMessage(m: unknown): { id: string; usage: Omit<UsageTotals, 'calls'> } | undefined {
-  const msg = m as { type?: string; message?: { id?: unknown; model?: unknown; usage?: unknown } }
+function readMessage(m: unknown): { key: string; requestId?: string; estimated: boolean; usage: Omit<UsageTotals, 'calls' | 'estimated'> } | undefined {
+  const msg = m as { type?: string; requestId?: unknown; message?: { id?: unknown; model?: unknown; usage?: unknown } }
   if (msg?.type !== 'assistant') return undefined
   const inner = msg.message
   if (!inner || typeof inner !== 'object') return undefined
   if (inner.model === SYNTHETIC_MODEL) return undefined
   const u = inner.usage as Record<string, unknown> | undefined
   if (!u || typeof u !== 'object') return undefined
-  // id 缺席时退回一个**不会和别人相等**的键。合并成一个 id 会把 N 次调用记成 1 次,
-  // 而那个方向的错(少报)比多报更糟:用户会照着一个偏小的数去放宽 caps。
-  const id = typeof inner.id === 'string' && inner.id.length > 0 ? inner.id : `anon-${anonSeq++}`
   return {
-    id,
+    key: keyOf(msg.requestId, inner.id),
+    requestId: typeof msg.requestId === 'string' && msg.requestId.length > 0 ? msg.requestId : undefined,
+    // 这一次的数是不是估出来的。判据挂在 requestId 上,由发出估算的那一层登记
+    // (见 services/api/tokenEstimate:塞进 usage 里的自定义字段会被 claude.ts 的
+    // 白名单静默丢掉,所以只能走旁路)。
+    estimated: isEstimatedUsage(msg.requestId),
     usage: {
       input: num(u.input_tokens), output: num(u.output_tokens),
       cacheRead: num(u.cache_read_input_tokens), cacheWrite: num(u.cache_creation_input_tokens),
@@ -129,11 +162,60 @@ function readMessage(m: unknown): { id: string; usage: Omit<UsageTotals, 'calls'
   }
 }
 
+/**
+ * 一次调用的**去重键**。
+ *
+ * 优先用 `requestId`,因为同一次请求会从两条路各报一次:消息上的 `usage`,以及
+ * `claude.ts` 结算成本时的旁路上报(那条路才看得见子 agent 内部的自动压缩)。
+ * 两边带的是同一个 requestId —— 用它当键,两份自然合成一次;换成 message.id 的话,
+ * 旁路那一份没有 message.id,会被记成**另一次调用**,调用次数和 token 双双翻倍。
+ *
+ * 退回 message.id 的场景:老的/不带 request-id 头的端点(翻译层已经给自己的响应签了
+ * 一个,见 roleFetch)。两者都没有时给一个不会和别人相等的键 —— 合并成一个的后果是
+ * 把 N 次调用记成 1 次,而少报比多报更糟:用户会照着一个偏小的数去放宽 caps。
+ */
+function keyOf(requestId: unknown, messageId: unknown): string {
+  const rid = typeof requestId === 'string' && requestId.length > 0 ? requestId : undefined
+  const mid = typeof messageId === 'string' && messageId.length > 0 ? messageId : undefined
+  /**
+   * **两个都有时,键里两个都带上。**
+   *
+   * 只按 requestId 的话,一个**每次都回同一个 `request-id` 头**的网关(转发层写死、
+   * 或者干脆回一个常量)会把整趟运行的几十次调用合成一次 —— 评审实测:三次调用记成
+   * `{calls:1, input:3000}`,而真值是 `{calls:3, input:6000}`。方向正是这个函数自己
+   * 的注释说「比多报更糟」的那个:用户照着一个偏小的数去放宽 caps。
+   *
+   * 加上 message.id 之后,同一次流式调用里那几条共用 id 的消息仍然合成一次(它们的
+   * (rid, mid) 完全相同),而不同调用因为 message.id 不同而分开。旁路上报没有
+   * message.id,它的归并见 observeApi —— 它会挂到同一个 rid 下**最后一条**消息上。
+   */
+  if (rid && mid) return `req:${rid}#msg:${mid}`
+  if (rid) return `req:${rid}`
+  if (mid) return `msg:${mid}`
+  return `anon:${anonSeq++}`
+}
+
 let anonSeq = 0
+
+/** 一次调用记下来的东西。`estimated` 只要有一条来源说是估的,就是估的。 */
+interface CallUsage {
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  estimated: boolean
+}
 
 export interface UsageMeter {
   /** 喂一条子 agent 消息。**永不抛** —— 它跑在模型消息热路径上。 */
   observe(message: unknown): void
+  /**
+   * 喂一条**旁路上报**(services/api/usageSink)。
+   *
+   * 存在的理由是消息那条路看不见子 agent 内部的自动压缩 —— 一次压缩就是一次读满上下文
+   * 窗口的完整调用,而它的产出以 UserMessage 回到主循环。去重和消息那侧共用 requestId。
+   */
+  observeApi(r: { requestId?: string; input: number; output: number; cacheRead: number; cacheWrite: number }): void
   /** 到此为止的合计。 */
   totals(): UsageTotals
   /** 上一次 `take()` 之后新增的部分,并把游标推到当前。 */
@@ -141,47 +223,96 @@ export interface UsageMeter {
 }
 
 export function createUsageMeter(): UsageMeter {
-  /** message.id → 该次调用目前见过的最大用量。见文件头「取最大」那一条。 */
-  const byId = new Map<string, Omit<UsageTotals, 'calls'>>()
+  /** 去重键 → 该次调用目前见过的最大用量。见文件头「取最大」那一条。 */
+  const byId = new Map<string, CallUsage>()
+  /** requestId → 该 id 下**最近一条消息**的键。旁路上报靠它找到自己该并到哪儿。 */
+  const lastKeyByRid = new Map<string, string>()
   let taken: UsageTotals = EMPTY_USAGE
   const sum = (): UsageTotals => {
     let out: UsageTotals = { ...EMPTY_USAGE, calls: byId.size }
+    let est = 0
     for (const u of byId.values()) {
+      if (u.estimated) est++
       out = {
         calls: out.calls,
         input: out.input + u.input, output: out.output + u.output,
         cacheRead: out.cacheRead + u.cacheRead, cacheWrite: out.cacheWrite + u.cacheWrite,
       }
     }
-    return out
+    return est > 0 ? { ...out, estimated: est } : out
+  }
+  /** 逐字段取最大 —— 见 observe 里那段注释;两条来源共用这一条合并规则。 */
+  const merge = (key: string, next: CallUsage): void => {
+    const prev = byId.get(key)
+    byId.set(key, prev === undefined ? next : {
+      input: Math.max(prev.input, next.input),
+      output: Math.max(prev.output, next.output),
+      cacheRead: Math.max(prev.cacheRead, next.cacheRead),
+      cacheWrite: Math.max(prev.cacheWrite, next.cacheWrite),
+      // 「估算」是**粘性**的:两条来源里只要有一条是估出来的,这一次调用就该带着 ≈。
+      estimated: prev.estimated || next.estimated,
+    })
   }
   return {
     observe(message) {
       try {
         const r = readMessage(message)
         if (!r) return
-        const prev = byId.get(r.id)
-        byId.set(r.id, prev === undefined ? r.usage : {
-          // 逐字段取最大。整条替换会在「后到的那条恰好是 message_start 那一份」时倒退,
-          // 而那一份的 output_tokens 是 0。
-          input: Math.max(prev.input, r.usage.input),
-          output: Math.max(prev.output, r.usage.output),
-          cacheRead: Math.max(prev.cacheRead, r.usage.cacheRead),
-          cacheWrite: Math.max(prev.cacheWrite, r.usage.cacheWrite),
-        })
+        // 逐字段取最大。整条替换会在「后到的那条恰好是 message_start 那一份」时倒退,
+        // 而那一份的 output_tokens 是 0。
+        /**
+         * **先把「先到的那条旁路上报」认领回来。**
+         *
+         * 两条来源没有固定的先后:`claude.ts` 在 message_delta 处上报,那通常在消息
+         * 之后,但非流式兜底那条路是先 push 消息再上报,而任何一次重试/回落都可能换序。
+         * 旁路那条没有 message.id,只能先落在 `req:<rid>` 这个裸键上;消息到达时如果
+         * 发现它在,就把它并进这条消息的键里 —— 否则同一次请求会被记成两次调用,
+         * 而那正是这个键设计要防的第一件事。
+         */
+        if (r.requestId !== undefined) {
+          const bare = `req:${r.requestId}`
+          if (bare !== r.key) {
+            const pending = byId.get(bare)
+            if (pending) { merge(r.key, pending); byId.delete(bare) }
+          }
+        }
+        merge(r.key, { ...r.usage, estimated: r.estimated })
+        if (r.requestId !== undefined) lastKeyByRid.set(r.requestId, r.key)
       } catch {
         /* 热路径,永不抛 —— 见文件头 */
+      }
+    },
+    observeApi(r) {
+      try {
+        /**
+         * 旁路上报没有 message.id,而键里现在带着它(见 keyOf)。所以归并到**这个
+         * requestId 下最近见过的那条消息**的键上 —— 那正是它在说的那次调用。
+         *
+         * 一条消息都没见过就自己开一个 `req:` 键:那是这条旁路存在的理由 ——
+         * 子 agent 内部的自动压缩根本不产生 assistant 消息。
+         */
+        const key = (r.requestId !== undefined ? lastKeyByRid.get(r.requestId) : undefined)
+          ?? keyOf(r.requestId, undefined)
+        merge(key, {
+          input: num(r.input), output: num(r.output),
+          cacheRead: num(r.cacheRead), cacheWrite: num(r.cacheWrite),
+          estimated: isEstimatedUsage(r.requestId),
+        })
+      } catch {
+        /* 同上 */
       }
     },
     totals: sum,
     take() {
       const now = sum()
+      const est = (now.estimated ?? 0) - (taken.estimated ?? 0)
       const delta: UsageTotals = {
         calls: now.calls - taken.calls,
         input: now.input - taken.input,
         output: now.output - taken.output,
         cacheRead: now.cacheRead - taken.cacheRead,
         cacheWrite: now.cacheWrite - taken.cacheWrite,
+        ...(est > 0 ? { estimated: est } : {}),
       }
       taken = now
       return delta

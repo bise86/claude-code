@@ -455,3 +455,117 @@ describe('树外那两条流要能在树出来之后打开', () => {
     ).id)
   })
 })
+
+/**
+ * 节点被重做删掉之后,它的流也要没。
+ *
+ * 不清的话有两个后果,后一个才是用户报的那个:
+ *  1. 全局上限被一批已经不存在的事件长期占着;
+ *  2. `childId` 是「父id + 序号 + 标题 slug」算出来的 —— 重拆一次同一个父节点,新子节点
+ *     的 id 和被删的那个逐字相同,于是**上一轮的输出挂到了新节点头上**。
+ */
+describe('重做删掉节点时一并扔掉它的历史记录', () => {
+  it('流没了,总量减回去,dropped/historical 的记账也一起清', () => {
+    const s = createStreamStore()
+    const h = s.open({ nodeId: 'root/00-a', phaseLabel: '执行', label: '主模型' })
+    h.push({ kind: 'text', text: '第一轮的产出' })
+    h.push({ kind: 'text', text: '还有一行' })
+    h.end()
+    s.markHistorical(['root/00-a'])
+    const keep = s.open({ nodeId: 'root/00-b', phaseLabel: '执行', label: '主模型' })
+    keep.push({ kind: 'text', text: '别人的' })
+    const before = s.totalEvents()
+
+    expect(s.dropNodes(['root/00-a'])).toBe(1)
+    expect(s.streams('root/00-a')).toEqual([])
+    expect(s.nodes()).toEqual(['root/00-b'])
+    expect(s.isHistorical('root/00-a')).toBe(false)
+    expect(s.droppedEvents('root/00-a')).toBe(0)
+    // 总量要真的减回去:虚高的 total 会让全局上限去压**还在被看**的流的墓碑。
+    expect(s.totalEvents()).toBe(before - 2)
+    // 别人的流一根汗毛都不能少
+    expect(s.streams('root/00-b')).toHaveLength(1)
+  })
+
+  it('删过之后同 id 的新节点从零开始 —— 这就是用户报的那一条', () => {
+    const s = createStreamStore()
+    s.open({ nodeId: 'root/00-a', phaseLabel: '执行', label: '主模型' }).push({ kind: 'text', text: '上一轮' })
+    s.dropNodes(['root/00-a'])
+    // 重做之后重新拆出来的同名子节点
+    s.open({ nodeId: 'root/00-a', phaseLabel: '分析', label: '主模型' })
+    expect(s.streams('root/00-a')).toHaveLength(1)
+    expect(s.streams('root/00-a')[0]!.meta.phaseLabel).toBe('分析')
+  })
+
+  /**
+   * **迟到的消息不许把记账重新建出来。**
+   *
+   * 评审实测(P2):drop 完之后一条迟到消息就让 `droppedEvents` 回到 1 —— 而重做之后
+   * 新建的**同 id** 节点会顶着那句「有 1 条输出没能留下来」,那 1 条属于上一次运行。
+   * `total` 同理:幽灵事件顶高的 total 会让全局上限去压真正在被看的流。
+   *
+   * 这不是理论:runAgentAdapter 的超时是 Promise.race,poll 赢了之后并不停下 consume(),
+   * provider 缓冲里的消息会在 end() 之后继续到达 —— 那个文件自己的注释就是这么写的。
+   */
+  it('删掉之后迟到的消息一律丢弃,不记账、不占总量', () => {
+    const s = createStreamStore()
+    const h = s.open({ nodeId: 'gone', phaseLabel: '执行', label: '主模型' })
+    // 先灌满单流上限,让 droppedEvents 真的有值 —— 否则这条断言无论删不删都过
+    for (let i = 0; i < MAX_EVENTS_PER_STREAM + 5; i++) h.push({ kind: 'text', text: 'x' + i })
+    expect(s.droppedEvents('gone')).toBeGreaterThan(0)
+    s.dropNodes(['gone'])
+    expect(s.droppedEvents('gone')).toBe(0)
+    const before = s.totalEvents()
+    for (let i = 0; i < 5; i++) h.push({ kind: 'text', text: '迟到的' })
+    h.end('晚到的收口')
+    expect(s.droppedEvents('gone')).toBe(0)
+    expect(s.totalEvents()).toBe(before)
+    expect(s.nodes()).toEqual([])
+  })
+
+  it('被删掉的流不进已收口队列 —— 否则全局淘汰会去压一条没人能打开的流', () => {
+    const s = createStreamStore()
+    const doomed = s.open({ nodeId: 'gone', phaseLabel: '执行', label: '主模型' })
+    doomed.push({ kind: 'text', text: 'x' })
+    doomed.end()
+    const alive = s.open({ nodeId: 'keep', phaseLabel: '执行', label: '主模型' })
+    alive.push({ kind: 'text', text: 'y' })
+    alive.end()
+    s.dropNodes(['gone'])
+    /**
+     * 灌满**全局**上限,逼 enforceGlobal 去已收口队列里找受害者。
+     *
+     * 必须用很多条流:单条流有自己的环形缓冲(MAX_EVENTS_PER_STREAM),满了之后
+     * 丢一条补一条,`total` 根本不涨 —— 拿一条流灌两万次是灌不到全局上限的。
+     * 每个节点最多 40 条完整的流,所以还要分几个节点。
+     */
+    const perStream = MAX_EVENTS_PER_STREAM
+    const need = Math.ceil((MAX_TOTAL_EVENTS + perStream) / perStream)
+    for (let i = 0; i < need; i++) {
+      const f = s.open({ nodeId: `filler-${Math.floor(i / 30)}`, phaseLabel: '执行', label: '主模型' })
+      for (let j = 0; j < perStream; j++) f.push({ kind: 'text', text: 'z' })
+      f.end()
+    }
+    // 队列里如果还留着被删的那条,它会先被压成墓碑,而真正该让位的是 keep 那条
+    expect(s.streams('keep')[0]!.tombstone).toBe(true)
+    /**
+     * 记账不许飘负。被删的流已经在 dropNodes 里减过一次账,如果它还能被 enforceGlobal
+     * 压第二次,total 会一路减到负数 —— 那时候全局上限**永远**不触发,而这个上限是
+     * 「一场没人看的长跑不能把内存吃光」的唯一防线。
+     */
+    expect(s.totalEvents()).toBeGreaterThanOrEqual(0)
+    // 注:「被删的流有没有从已收口队列里摘掉」本身没有观测点(队列不外露)。
+    // 它防的是队列里堆积死条目,而 orphan 标记 + 清空事件已经让一次误压变成无害的空操作。
+  })
+
+  it('通知订阅者 —— 界面要重画;没删到东西时不空叫', () => {
+    const s = createStreamStore()
+    s.open({ nodeId: 'x', phaseLabel: '执行', label: '主模型' })
+    let ticks = 0
+    s.subscribe(() => { ticks++ })
+    s.dropNodes(['不存在的节点'])
+    expect(ticks).toBe(0)
+    s.dropNodes(['x'])
+    expect(ticks).toBe(1)
+  })
+})

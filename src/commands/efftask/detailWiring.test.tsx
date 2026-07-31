@@ -150,3 +150,19 @@ describe('工具摘要解析器:真的会带着输入去调 userFacingName', () 
     expect(briefResolverFor(tools)('Boom', {})).toBeUndefined()
   })
 })
+
+/**
+ * 「起…止…共…」那一行也占一行 —— 评审点名的存活变异。
+ *
+ * 这个数错了的后果写在 doneSummaryRows 自己的注释里:面板按可用高度排版,而这个框画在
+ * 它**下面**、高度随内容变;少算一行,详情页最底下那条页签条就会被顶出屏幕。
+ */
+describe('doneSummaryRows 把 run 时间窗那一行也数进去', () => {
+  const base = { viewOnly: false, hasReason: false, hasHandoffResult: false, followUps: 0, handoffLines: 0, redoProblems: 0 }
+  it('有那一行就多一行', () => {
+    expect(doneSummaryRows({ ...base, hasRunSpan: true })).toBe(doneSummaryRows(base) + 1)
+  })
+  it('没有就不多', () => {
+    expect(doneSummaryRows({ ...base, hasRunSpan: false })).toBe(doneSummaryRows(base))
+  })
+})

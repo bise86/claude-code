@@ -4,6 +4,7 @@ import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs, provi
 import { createAssistantAPIErrorMessage } from '../../utils/messages.js'
 import { createRunControl } from './control.js'
 import { pwd } from '../../utils/cwd.js'
+import { reportApiUsage } from '../../services/api/usageSink.js'
 
 describe('runAgentAdapter helpers', () => {
   it('collectText concatenates assistant text blocks', () => {
@@ -1163,5 +1164,123 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     } catch (e) {
       expect((e as Error).name).toBe('PhaseTimeoutError')
     }
+  })
+})
+
+/**
+ * 用量:**消息之外的那些调用也要算钱**。
+ *
+ * 用户报的是「token 统计…不管 CLI 还是 API 都要准确」。消息那条路只看得见被 yield
+ * 出来的调用,而子 agent 一生里最贵的几次可能根本不产生 assistant 消息 —— 首当其冲是
+ * 自动压缩:一次压缩就是一次读满上下文窗口的完整调用(200k 模型上 15~18 万输入 token),
+ * 产出以 UserMessage 回到主循环。这个节点为它付了钱,而用量表上一条都没有。
+ *
+ * 旁路上报(services/api/usageSink)补的就是这一段。这里模拟 `claude.ts` 在结算成本时
+ * 发出的那次上报 —— **在生成器体内**发出,因为那才是它真实发生的位置(ALS 按异步调用链
+ * 归属,而生成器体要到第一次 next() 才执行)。
+ */
+describe('节点用量把旁路上报也算进去', () => {
+  const base = (runAgentImpl: unknown) => ({
+    toolUseContext: {} as any,
+    canUseTool: (async () => ({ behavior: 'allow' })) as any,
+    availableTools: [] as any,
+    readOnlyTools: [] as any,
+    activeAgents: [],
+    mainModelDefault: { agentType: 'main' } as any,
+    runAgentImpl: runAgentImpl as any,
+  })
+
+  it('消息里看不见的那次调用被记进 node.usage', async () => {
+    async function* fakeRun(): AsyncGenerator<any> {
+      // 子 agent 内部的自动压缩:一次真实请求,没有对应的 assistant 消息
+      reportApiUsage({ requestId: 'req_compact', input: 180_000, output: 900, cacheRead: 0, cacheWrite: 0 })
+      yield {
+        type: 'assistant', requestId: 'req_answer',
+        message: { id: 'm1', content: [{ type: 'text', text: 'done' }], usage: { input_tokens: 1_000, output_tokens: 50 } },
+      }
+    }
+    const node: any = { id: 'n1' }
+    await makeRunAgentFn(base(fakeRun))({
+      phase: 'execute', node, role: null, system: 's', prompt: 'p',
+      signal: new AbortController().signal,
+    } as any)
+    expect(node.usage.calls).toBe(2)
+    expect(node.usage.input).toBe(181_000)
+  })
+
+  it('同一次请求两条路都报到时只算一次 —— 否则每一次调用都会翻倍', async () => {
+    async function* fakeRun(): AsyncGenerator<any> {
+      // claude.ts 会为**每一次**请求上报,包括那些同时也 yield 了消息的
+      reportApiUsage({ requestId: 'req_answer', input: 1_000, output: 50, cacheRead: 0, cacheWrite: 0 })
+      yield {
+        type: 'assistant', requestId: 'req_answer',
+        message: { id: 'm1', content: [{ type: 'text', text: 'done' }], usage: { input_tokens: 1_000, output_tokens: 50 } },
+      }
+    }
+    const node: any = { id: 'n1' }
+    await makeRunAgentFn(base(fakeRun))({
+      phase: 'plan', node, role: null, system: 's', prompt: 'p',
+      signal: new AbortController().signal,
+    } as any)
+    expect(node.usage.calls).toBe(1)
+    expect(node.usage.input).toBe(1_000)
+    expect(node.usage.output).toBe(50)
+  })
+
+  it('不在这条调用链上的上报不会记到这个节点头上', async () => {
+    // 并行跑着几十个节点,而 sink 是按异步调用链归属的。串台的话,一个节点的账会记到
+    // 另一个节点身上,而两个数字都错。
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', requestId: 'r1', message: { id: 'm1', content: [], usage: { input_tokens: 5, output_tokens: 1 } } }
+    }
+    const node: any = { id: 'n1' }
+    const p = makeRunAgentFn(base(fakeRun))({
+      phase: 'plan', node, role: null, system: 's', prompt: 'p',
+      signal: new AbortController().signal,
+    } as any)
+    // 链外的一次上报(比如主循环自己的调用)
+    reportApiUsage({ requestId: 'outside', input: 99_999, output: 1, cacheRead: 0, cacheWrite: 0 })
+    await p
+    expect(node.usage.calls).toBe(1)
+    expect(node.usage.input).toBe(5)
+  })
+})
+
+/**
+ * 结账之后到达的上报不再计入这个节点。
+ *
+ * 评审实测:子 agent 里一个不 await 的后台任务会在节点收口之后继续上报,而那时
+ * `commit()` 已经把节点落过盘 —— 屏幕上那个数会在一个「已完成」的节点上自己往上跳,
+ * 而 node.md 里是另一个数。
+ */
+describe('节点结账之后不再收账', () => {
+  it('调用返回之后的上报被忽略', async () => {
+    /**
+     * 迟到的那一下必须**在 sink 的上下文里**发生,否则这条测试是空的:
+     * `reportApiUsage` 在调用时读 AsyncLocalStorage,从测试自己的上下文里调压根就没有
+     * sink 可报 —— 那样即使 `settled` 这道闸整个删掉,测试照样绿。
+     * 所以在生成器体内 `setTimeout` 排一个:定时器回调继承的是排它时的那个上下文。
+     */
+    let fired: Promise<void> | undefined
+    async function* fakeRun(): AsyncGenerator<any> {
+      fired = new Promise<void>(resolve => {
+        setTimeout(() => {
+          reportApiUsage({ requestId: 'req_late', input: 99_999, output: 1, cacheRead: 0, cacheWrite: 0 })
+          resolve()
+        }, 20)
+      })
+      yield { type: 'assistant', requestId: 'req_answer', message: { id: 'm1', content: [], usage: { input_tokens: 10, output_tokens: 2 } } }
+    }
+    const node: any = { id: 'n1' }
+    await makeRunAgentFn({
+      toolUseContext: {} as any,
+      canUseTool: (async () => ({ behavior: 'allow' })) as any,
+      availableTools: [] as any, readOnlyTools: [] as any,
+      activeAgents: [], mainModelDefault: { agentType: 'main' } as any,
+      runAgentImpl: fakeRun as any,
+    })({ phase: 'plan', node, role: null, system: 's', prompt: 'p', signal: new AbortController().signal } as any)
+    const before = { ...node.usage }
+    await fired
+    expect(node.usage).toEqual(before)
   })
 })

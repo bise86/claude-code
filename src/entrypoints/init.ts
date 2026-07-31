@@ -44,6 +44,7 @@ import {
 // initializeTelemetry is loaded lazily via import() in setMeterState() to defer
 // ~400KB of OpenTelemetry + protobuf modules until telemetry is actually initialized.
 // gRPC exporters (~700KB via @grpc/grpc-js) are further lazy-loaded within instrumentation.ts.
+import { registerDirectHosts } from '../utils/lanDirect.js'
 import { configureGlobalAgents } from '../utils/proxy.js'
 import { isBetaTracingEnabled } from '../utils/telemetry/betaSessionTracing.js'
 import { getTelemetryAttributes } from '../utils/telemetryAttributes.js'
@@ -139,6 +140,28 @@ export const init = memoize(async (): Promise<void> => {
       duration_ms: Date.now() - mtlsStart,
     })
     logForDebugging('[init] configureGlobalMTLS complete')
+
+    /**
+     * 内网端点绕过代理直连(见 utils/lanDirect)。
+     *
+     * 这里登记的只有**会话自己的那几个 base URL**;员工端点(`roles[]`)在
+     * `rolesFromSettings` / `buildRoleFetch` 里登记,那**晚于**这一行,而且必须如此 ——
+     * 员工配置要到用户敲 `/et` 时才读。
+     *
+     * 排在 `configureGlobalAgents()` **之前**是为了 Node/undici 那条路:
+     * `EnvHttpProxyAgent` 在构造时就把 `NO_PROXY` 抄了一份进去,而 `getProxyAgent` 是
+     * memoize 的,之后再改环境变量对它无效。**这条约束保护不到员工端点**(它们必然更晚),
+     * 而那没有关系:这个 fork 跑在 Bun 上,Bun 原生 fetch 不吃 undici 的 global dispatcher、
+     * 每次请求现读 `NO_PROXY`;axios 那条路也是每次请求现算 `shouldBypassProxy`。
+     * 写清楚是因为一句「必须排在前面」如果解释不了「那员工端点怎么办」,下一个人会以为
+     * 那里有个 bug,或者更糟 —— 以为这一行保护了它没保护的东西。
+     */
+    registerDirectHosts([
+      process.env.ANTHROPIC_BASE_URL,
+      process.env.ANTHROPIC_BEDROCK_BASE_URL,
+      process.env.ANTHROPIC_VERTEX_BASE_URL,
+      process.env.ANTHROPIC_FOUNDRY_BASE_URL,
+    ])
 
     // Configure global HTTP agents (proxy and/or mTLS)
     const proxyStart = Date.now()

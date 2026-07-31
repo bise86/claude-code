@@ -11,6 +11,7 @@ import { eventsFromMessage, type BriefResolver } from './agentEvents.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { RoleBinding } from './types.js'
 import { addUsage, createUsageMeter, isEmptyUsage } from './usage.js'
+import { withApiUsageSink } from '../../services/api/usageSink.js'
 
 /**
  * caps.nodeTimeoutMs tripped (spec §11 的第四个阀).
@@ -621,7 +622,7 @@ export function makeRunAgentFn(deps: {
       if (isEmptyUsage(delta)) return
       req.node.usage = addUsage(req.node.usage, delta)
     }
-    const consume = async (): Promise<void> => {
+    const consumeMessages = async (): Promise<void> => {
       for await (const message of invoke()) {
         // 有输出 = 没卡住。stall 时钟从这里重置 —— 这就是「静默时长」和「总时长」的区别。
         markProgress()
@@ -634,6 +635,35 @@ export function makeRunAgentFn(deps: {
         if (req.signal.aborted || timedOut) break
       }
     }
+    /**
+     * **整段消费包在用量旁路里**(services/api/usageSink)。
+     *
+     * 消息那条路只看得见被 yield 出来的调用,而子 agent 一生里最贵的几次可能根本不产生
+     * assistant 消息 —— 首当其冲是**自动压缩**:它对子 agent 不设防,一次压缩就是一次
+     * 读满上下文窗口的完整调用(200k 模型上 15~18 万输入 token),产出以 UserMessage
+     * 回到主循环。这个节点为它付了钱,而用量表上一条都没有。
+     *
+     * 包住的是**整个消费**,不是发起调用的那一句:AsyncLocalStorage 按异步调用链归属,
+     * 而生成器的函数体要到第一次 next() 才执行 —— 只包工厂调用的话,上下文在它真正
+     * 跑起来之前就已经退出了(这正是下面 runWithCwdOverride 那段注释记着的同一个坑)。
+     *
+     * 去重靠 requestId,和消息那侧同一个键(见 usage.ts 的 keyOf)。
+     */
+    /**
+     * 这次调用**已经结账了**。之后到达的上报一律不再记进这个节点。
+     *
+     * 评审实测:子 agent 里一个不 await 的后台任务会在节点收口之后继续上报,而那时
+     * `commit()` 已经把节点落过盘 —— 屏幕上那个数会在一个「已完成」的节点上自己往上跳,
+     * 而 node.md 里是另一个数。归属其实是对的(那笔钱确实是这个节点花的),但一个
+     * 事后还在变的统计比一个略偏小的统计更难信。
+     */
+    let settled = false
+    const consume = async (): Promise<void> =>
+      withApiUsageSink(r => {
+        if (settled) return
+        meter.observeApi(r)
+        bankUsage()
+      }, consumeMessages)
     // Hoisted so the outer finally can clear it on EVERY exit path. It used to be cleared by
     // `void work.finally(...)`, but `.finally()` returns a DERIVED promise: when `work`
     // rejected, that derived promise rejected with nothing attached to it. The caller still
@@ -675,6 +705,9 @@ export function makeRunAgentFn(deps: {
       }
       throw e
     } finally {
+      // 结账。之后到达的旁路上报不再记进这个节点 —— 见 settled 的注释。
+      // 放在这里而不是 consume() 之后:超时、中断、抛出三条路都绕过那个位置。
+      settled = true
       if (poll) clearInterval(poll)
       if (timer) clearInterval(timer)
       unregister?.()
