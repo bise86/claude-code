@@ -73,30 +73,18 @@ import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { logError } from '../../utils/log.js'
 
 
-// Read-only tool pool for plan/review/accept/observer: they must be able to READ the repo
-// to judge anything, they just must not be able to WRITE it.
-import { BASH_TOOL_NAME } from '../../tools/BashTool/toolName.js'
-import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
-import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
-import { NOTEBOOK_EDIT_TOOL_NAME } from '../../tools/NotebookEditTool/constants.js'
-import { TASK_OUTPUT_TOOL_NAME } from '../../tools/TaskOutputTool/constants.js'
-import { TASK_STOP_TOOL_NAME } from '../../tools/TaskStopTool/prompt.js'
-
-export const READ_ONLY_TOOL_NAMES = new Set(['Read', 'Glob', 'Grep'])
-
 /**
- * 会改盘的工具。非执行环节从会话工具池里**减掉这些**,而不是只放行三件套。
+ * 这套工具池经历过三代,值得在这里留一句,免得有人第三次走回第一代:
  *
- * 从白名单换成黑名单是有原因的:白名单是 `{Read, Glob, Grep}` 三个写死的名字,于是
- * **所有 `mcp__*` 工具连带被滤掉** —— 用户配了查文档/查数据库的 MCP server,以为
- * 评审员能用,实际只有执行者能用,而且关口上看不出任何迹象。起草者同样只能靠这三个
- * 工具摸黑,复杂仓库里它经常直接说「访问不了文件系统,请你贴代码」。
+ *  1. 白名单 `{Read, Glob, Grep}` —— **所有 `mcp__*` 连带被滤掉**。用户配了查文档/
+ *     查数据库的 MCP server,以为评审员能用,实际只有执行者能用,而关口上看不出任何
+ *     迹象;起草者也只能靠这三个工具摸黑,复杂仓库里经常直接回「访问不了文件系统,
+ *     请你贴代码」。
+ *  2. 黑名单分三档(执行 / 测试验证 / 其余)—— MCP 回来了,写工具按环节给。
+ *  3. 现在:**不分档**,七个环节共用一个黑名单池子。见 subAgentToolPool。
  *
- * Bash 在这一档里也要减掉:它能写(`echo >`、`sed -i`、`git apply`),测试验证档
- * 单独把它加回去,那一档另有工作区前后比对做闸门。
- *
- * 诚实的边界:**挡不住会写的 MCP 工具** —— 没有可靠办法从名字判断 `mcp__x__y` 是否
- * 只读。放开 MCP 就接受了这一点,所以关口要说出来,让用户自己决定给评审席位配什么。
+ * 判据从「这个环节该不该写」变成了「这个工具在子 agent 里能不能用」,而后者只有
+ * 一个答案是否定的(Skill)。
  */
 /**
  * 靠**主循环注入的上下文**才能用的工具 —— 子 agent 一律拿不到。
@@ -179,43 +167,24 @@ export function briefResolverFor(
 }
 
 /**
- * 所有子 agent 池子的共同底子。三个池子都从这里长出来,少一个就漏一个。
+ * 子 agent 的工具池。**七个环节共用这一个** —— 不再按环节分档。
+ *
+ * 曾经有三档(执行拿全部、测试验证只读+跑命令、其余纯只读),用户明确要求取消:各环节
+ * 一律继承会话里的全部工具和全部 MCP。**代价要写在这里,不能只写在提交信息里**:
+ * 评审员/验收员现在拿得到 Edit/Write/Bash,于是「执行者与评审者分离」不再由工具清单
+ * 保证 —— 一个评审角色可以自己把问题改掉再判通过。
+ *
+ * 剩下的防线是**行为**而不是能力,两道都还在:
+ *  1. 测试验证环节前后比对 worktree 的 `git status` 指纹(pipeline.ts 的 verifySnapshot),
+ *     动了就判该轮作废并返工。它本来就不依赖工具清单 —— Bash 早就能写(echo >、sed -i、
+ *     git apply),那道闸门存在的理由正是「工具清单挡不住这件事」;
+ *  2. canUseTool 仍然逐次询问,除非用户自己 allowlist 或开了 bypassPermissions。
+ *
+ * 唯一还被摘掉的是 CONTEXT_DEPENDENT_TOOL_NAMES(目前只有 Skill),而那**不是限制能力**:
+ * Skill 要主循环把技能清单塞进消息里才有意义,子 agent 拿到的是一个必然失败的工具。
  */
 export function subAgentToolPool<T extends { name: string }>(all: T[]): T[] {
   return all.filter(t => !CONTEXT_DEPENDENT_TOOL_NAMES.has(t.name))
-}
-
-export const WRITE_CAPABLE_TOOL_NAMES = new Set([
-  FILE_EDIT_TOOL_NAME, FILE_WRITE_TOOL_NAME, NOTEBOOK_EDIT_TOOL_NAME, BASH_TOOL_NAME,
-])
-
-/**
- * 非执行环节的工具池:会话里的一切,减去会改盘的。
- *
- * 提成可导出的纯函数,和 verifyToolPool 同一个理由 —— 接线要能被单独钉住。
- */
-export function nonExecuteToolPool<T extends { name: string }>(all: T[]): T[] {
-  return subAgentToolPool(all).filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name))
-}
-/**
- * 测试验证档在只读之上多这些 —— 它得能真的跑测试。
- *
- * 名字必须是本仓库的**规范工具名**:早先写的 'BashOutput' / 'KillShell' 在这里是死名
- * (它们只在 permissionRuleParser 里作为旧别名存在),后果是后台起的 shell 读不到输出、
- * 杀不掉 —— 而 filter 匹配不上不会报错,只会静默少给两个工具。
- */
-export const RUN_COMMAND_TOOL_NAMES = new Set([BASH_TOOL_NAME, TASK_OUTPUT_TOOL_NAME, TASK_STOP_TOOL_NAME])
-
-/**
- * 测试验证档的工具池。
- *
- * 提成可导出的纯函数,是因为它此前**整条接线零覆盖**:把它删掉、把 filter 条件删掉、
- * 把 RUN_COMMAND_TOOL_NAMES 清空 —— 三种改法各自都是全套测试全绿,而验证者会静默退回
- * 只读工具、跑不了任何命令,也就是这个环节的全部存在理由没了。
- */
-export function verifyToolPool<T extends { name: string }>(all: T[]): T[] {
-  return subAgentToolPool(all)
-    .filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name) || RUN_COMMAND_TOOL_NAMES.has(t.name))
 }
 
 const CANCELLED: StartupDecision = { parallelism: 0, approved: false }
@@ -338,9 +307,13 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   const rateGate = createRateLimitGate()
   const canUseTool = context.canUseTool ?? hasPermissionsToUseTool
   const mainModelDefault = pickMainAgentDefinition(allAgents)
-  // 非执行环节的池子:会话里的一切,减去会改盘的(含 MCP —— 见 WRITE_CAPABLE_TOOL_NAMES)。
-  // 此前是写死的 {Read, Glob, Grep} 白名单,连带把所有 mcp__* 滤掉了。
-  const readOnlyTools: Tools = nonExecuteToolPool(context.options.tools)
+  /**
+   * 七个环节共用的池子:会话里的一切(含全部 `mcp__*`),只减掉 Skill。
+   *
+   * 曾经在这里分三档,现在只有一个 —— 见 subAgentToolPool 上面那段关于代价的说明。
+   * 仍然走池子函数而不是裸的 `context.options.tools`,是因为 Skill 必须摘掉。
+   */
+  const subAgentTools: Tools = subAgentToolPool(context.options.tools)
   const runAgent: RunAgentFn = makeRunAgentFn({
     toolUseContext: context,
     canUseTool,
@@ -349,12 +322,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     // 同一下回车也会打开光标所在节点的详情页。
     onHumanWait: w => { humanWaitOut.current?.(w) },
     control,
-    // subAgentToolPool 而不是裸的 context.options.tools:执行环节原来一个都不滤,
-    // 所以它是唯一还能拿到 Skill 的地方 —— 而它恰好是最费钱的那个环节。
-    availableTools: subAgentToolPool(context.options.tools), // execute phase only
-    readOnlyTools, // plan / review / accept / integrate / observer
-    // 测试验证要真的把测试跑起来,所以在只读之上加执行命令的能力。
-    verifyTools: verifyToolPool(context.options.tools),
+    // 七个环节共用同一份。分档取消之后这里只剩一个入口 —— 少一个入口就少一处能悄悄
+    // 退化成「某个环节工具变少了」的地方。
+    availableTools: subAgentTools,
     activeAgents,
     mainModelDefault,
     // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded
@@ -372,7 +342,6 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     toolUseContext: context,
     canUseTool,
     availableTools: [],
-    readOnlyTools: [],
     activeAgents,
     mainModelDefault,
     timeoutMs: () => capsRef.nodeTimeoutMs,
@@ -457,6 +426,12 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       baseRoleNotices={[...roleLoadNotices(), ...collectedRoles.notices, ...collectedSkip.notices]}
       baseSkipSteps={collectedSkip.steps}
       mcpToolNames={context.options.tools.filter(t => t.name.startsWith('mcp__')).map(t => t.name)}
+      // 服务器状态和工具名是**两件事**:待审批的服务器不连接,于是它一个工具都不贡献,
+      // 只看工具名的话「配了但没连上」和「根本没配」长得一模一样 —— 而前者用户报过。
+      // `?? []` 不是防御性冗余:这一行画在启动关口上,而关口是 /et 的第一屏。类型上
+      // mcpClients 是必填,但非交互/SDK 那几条路造的 context 未必填全 —— 在这里抛异常
+      // 等于「输入 /et 只得到一屏堆栈,一次模型调用都没有」。
+      mcpServers={(context.options.mcpClients ?? []).map(c => ({ name: c.name, type: c.type }))}
       // The roster must say which model each seat runs on, and that answer lives in the
       // agent definitions + the session model — neither of which parseDirectives can see.
       agentModels={activeAgents}
@@ -692,6 +667,8 @@ type RunnerProps = {
   baseSkipSteps?: PhaseName[]
   /** 本次会话可用的 MCP 工具名。关口要说清它们在哪些环节可用、以及挡不住什么。 */
   mcpToolNames?: string[]
+  /** 本次会话的 MCP 服务器与连接状态。待审批的服务器不贡献任何工具 —— 见 ConfirmStartup。 */
+  mcpServers?: { name: string; type: string }[]
   unsupportedRoles: string[]
   agentModels: AgentModelInfo[]
   mainModel: string
@@ -1704,9 +1681,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       <ConfirmStartup
         config={config}
         isolation={isolation}
-        // 会话级 MCP 工具。放开之后所有环节都能用,而「挡不住会写的 MCP」这件事
+        // 会话级 MCP 工具。所有环节都能用,而「评审席位可以自己改完再判通过」这件事
         // 必须在用户按 y 之前说出来 —— 这是他要自己决定的取舍。
         mcpToolNames={props.mcpToolNames}
+        // 服务器状态单独一份:「配了但卡在待审批」是用户报过的那一种,而它在工具名里
+        // 表现为一片空白 —— 和「根本没配 MCP」无法区分。
+        mcpServers={props.mcpServers}
         // 出网路线:有全局代理时,哪些员工的端点会绕过它直连、哪些仍走代理。
         // 用户报过一次「配了 roles 就连不上」,真凶是一条早就忘了的 HTTPS_PROXY。
         apiUrls={props.agentModels.map(a => a.roleClientConfig?.apiUrl)}

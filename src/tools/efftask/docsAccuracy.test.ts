@@ -807,35 +807,40 @@ describe('README 的子 agent 继承一节说的和代码干的是同一件事',
   const src = (p: string) => readFileSync(new URL(p, ROOT), 'utf8')
   const MCP_TOOL = 'mcp__gitlab__list_issues'
 
-  it('显式 tools 白名单是精确全名查表,而工具池本身对 MCP 免检', () => {
+  it('显式 tools 白名单管不到 MCP —— 两段各自补一遍,漏一段就漏掉一半', () => {
     /**
-     * README 说「工具名是精确全名匹配,没有 `mcp__<服务器>__*` 前缀通配」。
+     * README 说「显式 `tools` 白名单**管不到 MCP**,`mcp__*` 无条件继承」。
      *
      * 本来想用行为探针(直接调 resolveAgentTools 走三种写法),但那个模块 import 进来会
      * 触发 AgentTool.tsx 的循环初始化(`Cannot access 'agentToolResultSchema' before
      * initialization`),测试根本起不来 —— 记在这里,免得下一个人再试一遍。
      *
-     * 退回结构探针,但钉的是**会随改动一起变**的位置关系:白名单解析那一段里一个前缀
-     * 匹配都没有。哪天有人往里加前缀展开,这条就红,提醒的是「去改文档」。
+     * 退回结构探针。这里要盯的是**两段**,而它们各自能独立退化:
+     *  - filterToolsForAgent 那条 `startsWith('mcp__') → true`(池子对 MCP 免检);
+     *  - 白名单解析末尾那个补回循环(白名单本身管不到 MCP)。
+     * 早先只有前一段,而后一段不存在 —— README 当时说的正是「白名单会静默吃掉 MCP」。
+     * 删掉补回循环、只留免检,这条就红,提醒的是「去改文档」。
      */
     const utils = src('src/tools/AgentTool/agentToolUtils.ts')
     const poolFilter = utils.slice(0, utils.indexOf('export function resolveAgentTools'))
     const whitelist = utils.slice(utils.indexOf('export function resolveAgentTools'))
     expect(whitelist.length).toBeGreaterThan(500) // 切歪了就别往下断言了
 
-    // 白名单:逐个键去查表,没有任何前缀/通配匹配。
+    // 白名单本体仍然是逐个键查表(所以内建工具确实要写全名)……
     expect(whitelist).toContain('availableToolMap.get(toolName)')
-    expect(whitelist).not.toContain('startsWith(')
+    // ……但末尾把 mcp__* 无条件补回来,于是 MCP 不受白名单约束。
+    expect(whitelist).toContain("if (!tool.name.startsWith('mcp__') || resolvedToolsSet.has(tool)) continue")
     // 而「不写 tools 或写 ["*"] 才是全给」也在这一段里,是同一个判据。
     expect(whitelist).toContain("agentTools.length === 1 && agentTools[0] === '*'")
 
-    // 池子那一半:MCP 对黑名单免检 —— 这就是内建 Explore/Plan 的 MCP 还在的原因,
-    // 也是「白名单吃掉 MCP」和「黑名单吃不掉」这两句话必须分开写的原因。
+    // 池子那一半:MCP 对黑名单也免检。两段是同一个立场的两处落点。
     expect(poolFilter).toContain("if (tool.name.startsWith('mcp__')) {")
 
-    expect(README).toContain(norm('没有 `mcp__<服务器>__*` 前缀通配'))
-    expect(README).toContain(norm('| 普通子 agent，写了显式 `tools` 白名单 | **要逐个列全名** | 继承 |'))
+    expect(README).toContain(norm('`mcp__*` 无条件继承'))
+    expect(README).toContain(norm('| 普通子 agent，写了显式 `tools` 白名单 | 继承 | 继承 |'))
     expect(README).toContain(norm('不写 `tools` 或写 `["*"]` 才是全给'))
+    // 唯一的摘除口径也要在文档里 —— 否则用户没有任何办法收回某个 MCP 工具。
+    expect(README).toContain(norm('用 `disallowedTools`'))
   })
 
   it('换协议丢不掉 CLAUDE.md,因为它走的是 user 消息而不是 system', () => {

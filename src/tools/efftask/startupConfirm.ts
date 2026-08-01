@@ -277,26 +277,64 @@ export function skipConflictLines(config: EffTaskConfig): string[] {
  * 有个连带后果你得知道」。把后者塞进前者的标题下,就是 spec §7.5 批评 notices 块
  * 「标题说 A、内容说 B」的同一个错,只是换了个块。
  */
+/** MCP 服务器的连接状态 → 关口上那个词。`SerializedClient['type']` 的五个取值。 */
+const MCP_STATUS_TEXT: Record<string, string> = {
+  connected: '已连接',
+  pending: '待审批(不会连接,它的工具一个都不会出现)',
+  failed: '连接失败',
+  'needs-auth': '待登录',
+  disabled: '已停用',
+}
+
 /**
  * MCP 在这次 run 里的边界。
  *
  * 必须说,因为它同时是**能力**和**风险**,而两者用户都看不见:
- *  - 能力:2026-07 起所有环节都拿得到 MCP(此前只有执行环节有,而关口一个字没提,
- *    用户配了查文档的 server 却以为评审员在用它);
- *  - 风险:内建写工具挡得住,**会写的 MCP 挡不住** —— 没有可靠办法从 `mcp__x__y`
- *    这个名字判断它是否只读。所以评审席位上的角色如果带着写能力 MCP,它能自己把
- *    问题改了再判通过。这是用户要自己决定的事,不是可以替他咽下去的事。
+ *  - 能力:所有环节都拿得到 MCP(更早只有执行环节有,而关口一个字没提,用户配了
+ *    查文档的 server 却以为评审员在用它);
+ *  - 风险:分档取消之后,评审/验收席位拿得到 Edit/Write/Bash,也拿得到任何带写能力
+ *    的 MCP —— 它能自己把问题改了再判通过。这是用户要自己决定的事,不是可以替他
+ *    咽下去的事。
  *
- * 没有 MCP 工具时返回空 —— 说一件不存在的事同样是噪音。
+ * **服务器状态是第三件事**,而它是用户报「没看到 MCP」时最常见的真凶:项目级
+ * `.mcp.json` 的服务器要审批,卡在待审批就根本不连接,于是工具表里空空如也 ——
+ * 而在此之前,关口和窗口都对此一个字都没有。所以哪怕一个工具都没有,只要有服务器
+ * 就要把这一行印出来。
+ *
+ * 两样都没有时才返回空 —— 说一件不存在的事同样是噪音。
  */
-export function mcpNoticeLines(mcpToolNames: string[]): string[] {
-  if (mcpToolNames.length === 0) return []
-  const shown = mcpToolNames.slice(0, 3).map(n => clip(n, 28)).join('、')
-  const more = mcpToolNames.length > 3 ? ` 等 ${mcpToolNames.length} 个` : ''
-  return [
-    `本次所有环节(不只是执行)都能用 MCP:${shown}${more}`,
-    '内建写工具(Edit/Write/NotebookEdit/Bash)仍然只有执行环节有;但**会写的 MCP 挡不住** —— 给评审/验收席位配带写能力 MCP 的角色时,它可以自己改完再判通过。',
-  ]
+export function mcpNoticeLines(
+  mcpToolNames: string[],
+  servers: readonly { name: string; type: string }[] = [],
+): string[] {
+  if (mcpToolNames.length === 0 && servers.length === 0) return []
+  const lines: string[] = []
+  if (mcpToolNames.length > 0) {
+    const shown = mcpToolNames.slice(0, 3).map(n => clip(n, 28)).join('、')
+    const more = mcpToolNames.length > 3 ? ` 等 ${mcpToolNames.length} 个` : ''
+    lines.push(`本次所有环节(不只是执行)都能用 MCP:${shown}${more}`)
+  }
+  if (servers.length > 0) {
+    // 状态分组而不是逐个列:一屏放不下十个服务器,而用户要看的是「有没有没连上的」。
+    const byStatus = new Map<string, string[]>()
+    for (const s of servers) {
+      const text = MCP_STATUS_TEXT[s.type] ?? s.type
+      byStatus.set(text, [...(byStatus.get(text) ?? []), clip(s.name, 24)])
+    }
+    // 已连接的排最后:没连上的才是用户需要动手的那些,让它们排在前面。
+    // 比较器必须**同时看 a 和 b**:只看 a 的写法不是一个合法的全序,三组以上时
+    // 结果由引擎实现决定 —— 那种排序在两组的测试里永远是绿的。
+    const rank = (s: string) => (s === '已连接' ? 1 : 0)
+    const groups = [...byStatus.entries()].sort((a, b) => rank(a[0]) - rank(b[0]))
+    lines.push(`服务器:${groups.map(([st, ns]) => `${ns.join('、')} ${st}`).join(';')}`)
+    if (servers.some(s => s.type === 'pending')) {
+      lines.push('待审批的服务器要在 .claude/settings.json 里预批:`"enabledMcpjsonServers": ["名字"]`,或 `"enableAllProjectMcpServers": true`。')
+    }
+  }
+  if (mcpToolNames.length > 0) {
+    lines.push('各环节现在一律拿到**全部工具**(含 Edit/Write/Bash)和**全部 MCP** —— 给评审/验收席位配的角色可以自己改完再判通过。测试验证环节仍有工作区前后比对:它改了盘,该轮裁决作废。')
+  }
+  return lines
 }
 
 /**

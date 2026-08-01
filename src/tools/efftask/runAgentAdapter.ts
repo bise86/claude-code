@@ -285,20 +285,16 @@ export function pickAgentDefinition(
 export function makeRunAgentFn(deps: {
   toolUseContext: ToolUseContext
   canUseTool: CanUseToolFn
-  availableTools: Tools
-  // REAL read-only tools (Read/Glob/Grep), filtered from the parent pool by the caller.
-  // NOT [] — plan/review/accept/observer must be able to READ the repo to judge anything;
-  // they just must not be able to WRITE it. (The one-shot config-extraction call is the
-  // only no-tools caller, and it gets its own RunAgentFn.)
-  readOnlyTools: Tools
   /**
-   * 测试验证档:只读 + 能跑命令。
+   * 七个环节共用的工具池。**曾经这里有三个字段**(availableTools / readOnlyTools /
+   * verifyTools),按环节分档;分档取消之后只剩这一个。
    *
-   * 明确记下它挡不住什么:Bash 本身就能写(echo >、sed -i、git apply),所以这一档
-   * 相对 execute 减掉的是**便利**,不是能力。真正证明「它没改代码」的是流水线在这一场
-   * 前后比对 worktree 的 git status —— 工具清单只是第一道,不是那道。
+   * 保持单字段是有意的:三个字段意味着三条可以各自悄悄退化的路,而它们的差异
+   * 在窗口里看不出来 —— 一个环节少拿了工具,表现只是「这个角色好像没查代码」。
+   *
+   * 一次性的配置抽取调用传 `[]`(它只把文本改写成 JSON),那是唯一的空工具调用点。
    */
-  verifyTools?: Tools
+  availableTools: Tools
   activeAgents: AgentDefinition[]
   mainModelDefault: AgentDefinition
   /**
@@ -396,34 +392,55 @@ export function makeRunAgentFn(deps: {
     // 不收的话它会永远停在「运行中」,而且永远不进可淘汰集合。
     if (req.signal.aborted) { req.stream?.end('已中断'); return '' }
     const picked = pickAgentDefinition(req.role, deps.activeAgents, deps.mainModelDefault)
-    // Per-phase tool gating: only the execute phase gets the write-capable tool pool.
-    // 三档:执行拿全部;测试验证拿只读 + 跑命令;其余只读。
-    const tools: Tools =
-      req.phase === 'execute' ? deps.availableTools
-      : req.phase === 'verify' ? (deps.verifyTools ?? deps.readOnlyTools)
-      : deps.readOnlyTools
     /**
-     * 角色自带的 mcpServers **不再被剥掉**(此前非执行环节一律 `mcpServers: undefined`)。
+     * 七个环节拿同一份工具。**按环节分档已经取消**(用户明确要求:各环节一律继承全部
+     * 工具和全部 MCP),角色自带的 `mcpServers` 也不再被剥掉。
      *
-     * 改动理由是用户的明确要求:各环节的子 agent 都要能用工具和 MCP。此前评审员/验收员
-     * 连**只读**的 MCP 都拿不到 —— 查不了文档、查不了数据库,只能凭 Read/Glob/Grep 猜,
-     * 而关口对此一个字都没说。
+     * 放弃了什么要写清楚,不能只写在提交信息里:评审/验收席位现在拿得到 Edit/Write/Bash,
+     * 也拿得到任何带写能力的 MCP —— **一个评审角色可以自己把问题改掉再判通过**,
+     * 「执行者与评审者分离」不再由工具清单保证。
      *
-     * 被放弃的那条保护要写清楚:runAgent 在工具分档**之后**才把 `agentMcpTools` 合并
-     * 回来(runAgent.ts 的 `uniqBy([...resolvedTools, ...agentMcpTools])`),所以一个声明了
-     * 写能力 MCP 的角色被挂在评审席位上时,**能自己把问题改了再判通过** —— 执行者与
-     * 评审者分离在这种配置下失效。
+     * 剩下的两道防线都是**行为**而不是能力,都不依赖分档:
+     *  1. 测试验证环节前后比对 worktree 的 git status 指纹(pipeline.ts 的 verifySnapshot),
+     *     动了就判该轮作废并返工。它本来就是为「工具清单挡不住这件事」而存在的 ——
+     *     Bash 早就能写(echo >、sed -i、git apply),分档从来没真正拦住过谁;
+     *  2. canUseTool 仍然逐次询问,除非用户自己 allowlist 或开了 bypassPermissions。
      *
-     * 剩下的防线有三道,都不依赖这次剥离:
-     *  1. 内建写工具(Edit/Write/NotebookEdit/Bash)仍然只有执行环节拿得到
-     *     —— 见 WRITE_CAPABLE_TOOL_NAMES;
-     *  2. canUseTool 仍然会对 MCP 调用询问,除非用户自己 allowlist 或开了 bypassPermissions;
-     *  3. 测试验证环节有工作区前后比对(git status --porcelain 指纹),动了就判该轮作废。
-     *
-     * 关口会把「MCP 在所有环节可用、且挡不住会写的 MCP」说给用户听,让他自己决定给
-     * 评审席位配什么角色。`disallowedTools` 不是替代方案:它只在 resolveAgentTools 内部
-     * 生效,而那一步跑在 MCP 合并**之前**,filterToolsForAgent 对任何 `mcp__*` 都无条件返回 true。
+     * 关口会把这件事说给用户听,让他自己决定给评审席位配什么角色。
      */
+    const tools: Tools = deps.availableTools
+    /**
+     * 「这个子 agent 到底带着什么出门」—— 每次派发在日志窗口打头一行。
+     *
+     * 存在的理由是用户报的原话:「没看到日志」。MCP 只在会话启动时由主进程连一次,
+     * 此前**没有任何一处**说过某个子 agent 拿到了几个工具、里面有没有 MCP;工具表退化成
+     * 空的(白名单吃掉 MCP、服务器卡在待审批、池子函数被改坏)在窗口里和「模型自己
+     * 不想调工具」长得一模一样。这一行把两者分开。
+     *
+     * 只数不列全:服务器名去重后最多三个,工具全名太长且一屏放不下。
+     * 整段包在 try 里 —— 一行日志不能把一次真实派发带走。
+     *
+     * **空池子不打这一行。** 唯一的空池子调用点是一次性的配置抽取(它只把文本改写成
+     * JSON,`availableTools: []`),而它跑在用户敲完 `/et` 看到的**第一屏**上,而且也带
+     * 着窗口 —— 打出来就是一行「工具 0 个 · 无 MCP」,读起来像一句警告,实际什么问题
+     * 都没有。代价是「七个环节真的一个工具都没有」这种退化重新变得无声,但那要求会话
+     * 级工具表整个是空的,不是现实中会发生的退化;真正会发生的那种(MCP 没了)这一行
+     * 照样说得出来。
+     */
+    if (tools.length > 0) {
+      try {
+        const mcpNames = tools.map(t => t.name).filter(n => n.startsWith('mcp__'))
+        const servers = [...new Set(mcpNames.map(n => n.split('__')[1] ?? '?'))]
+        const shown = servers.slice(0, 3).join('、')
+        const more = servers.length > 3 ? ` 等 ${servers.length} 个服务器` : ''
+        req.stream?.push({
+          kind: 'text',
+          text: mcpNames.length > 0
+            ? `[工具 ${tools.length} 个 · 其中 MCP ${mcpNames.length} 个:${shown}${more}]\n`
+            : `[工具 ${tools.length} 个 · 无 MCP]\n`,
+        })
+      } catch { /* 日志而已 */ }
+    }
     const agentDefinition: AgentDefinition = picked
     /**
      * 把「等人」这段时间从 stall 时钟里摘出去。

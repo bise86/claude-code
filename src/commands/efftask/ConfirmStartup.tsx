@@ -14,6 +14,14 @@ export function ConfirmStartup(props: {
   /** 本次会话可用的 MCP 工具名。关口要说清它们在哪些环节可用、以及挡不住什么。 */
   mcpToolNames?: string[]
   /**
+   * 本次会话的 MCP 服务器和它们的连接状态。
+   *
+   * 和 `mcpToolNames` 分开传是必须的:用户报「没看到 MCP」时,最常见的真凶是项目级
+   * `.mcp.json` 的服务器卡在**待审批**——它不连接,于是工具名那一份是空的,只看工具
+   * 就什么都说不出来。要说清「有服务器,但没连上」就得看这一份。
+   */
+  mcpServers?: { name: string; type: string }[]
+  /**
    * 名册上那些 `execMode:'api'` 员工的端点。**只在配了全局代理时**才渲染成一块。
    *
    * 用户报过一次「配了 roles 就连不上」,真凶是一条早就忘了的 `HTTPS_PROXY` —— 代理
@@ -174,10 +182,10 @@ export function ConfirmStartup(props: {
           {guidanceLines(shown).map(l => <Text key={l} dimColor>  {l}</Text>)}
         </Box>
       )}
-      {mcpNoticeLines(props.mcpToolNames ?? []).length > 0 && (
+      {mcpNoticeLines(props.mcpToolNames ?? [], props.mcpServers ?? []).length > 0 && (
         <Box flexDirection="column">
           <Text color="warning">MCP 工具:</Text>
-          {mcpNoticeLines(props.mcpToolNames ?? []).map(l => <Text key={l} color="warning">  · {l}</Text>)}
+          {mcpNoticeLines(props.mcpToolNames ?? [], props.mcpServers ?? []).map(l => <Text key={l} color="warning">  · {l}</Text>)}
         </Box>
       )}
       {/* 出网路线。**不是警告色**:这是一件已经替用户处理好的事(内网端点自动直连),

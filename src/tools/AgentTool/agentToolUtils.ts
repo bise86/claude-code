@@ -215,6 +215,24 @@ export function resolveAgentTools(
     }
   }
 
+  /**
+   * MCP 工具**无条件继承**,显式 `tools` 白名单管不到它们。
+   *
+   * 此前这里是纯精确全名查表,而白名单**没有 `mcp__<服务器>__*` 通配**:任何一个写了
+   * `tools: ["Read", "Grep"]` 的 agent,项目 `.mcp.json` 里的工具会被静默全部拿掉 ——
+   * 配置里一个字都没提 MCP,用户看到的却是「主模型能用、子 agent 用不了」,而且没有
+   * 任何一处报错或提示。`filterToolsForAgent` 上面那条 `startsWith('mcp__') → true`
+   * 早就是这个立场了,只是白名单这一段把它推翻了。
+   *
+   * 要拿掉某个 MCP 工具,用 `disallowedTools` —— 它在上面已经作用于 allowedAvailableTools,
+   * 所以被 disallow 的根本进不了这个循环。
+   */
+  for (const tool of allowedAvailableTools) {
+    if (!tool.name.startsWith('mcp__') || resolvedToolsSet.has(tool)) continue
+    resolved.push(tool)
+    resolvedToolsSet.add(tool)
+  }
+
   return {
     hasWildcard: false,
     validTools,

@@ -101,7 +101,12 @@ const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
 /** 再把空格去掉:带边框的 Box 里那一行渲出来是 `q/Esc退出·回车看节点详情·r重做选中的任务`,词间空格没了(实测)。 */
 const squash = (s: string) => strip(s).replace(/[ \t]/g, '')
 
-async function mount(args: string, settings: Record<string, unknown>, tools: { name: string }[] = []) {
+async function mount(
+  args: string,
+  settings: Record<string, unknown>,
+  tools: { name: string }[] = [],
+  mcpClients: { name: string; type: string }[] = [],
+) {
   FAKE_SETTINGS = settings
   const tty = fakeTty()
   const done: string[] = []
@@ -113,6 +118,9 @@ async function mount(args: string, settings: Record<string, unknown>, tools: { n
         mainLoopModel: 'main',
         // 抽取模型:这一层只回默认,让「配置文件那条录入口」单独可见。
         tools,
+        // 服务器状态和工具名是**两件事**:待审批的服务器不贡献工具,于是只看 tools
+        // 的话「配了但没连上」和「根本没配」无法区分 —— 关口那一行专治这个。
+        mcpClients,
       },
       abortController: new AbortController(),
     } as never,
@@ -228,7 +236,7 @@ describe('飞书批准不能被当成「清空跳过」', () => {
 })
 
 describe('MCP 工具要一路走到关口上', () => {
-  it('会话里有 mcp__* 时,关口说清它们在所有环节可用、以及挡不住什么', async () => {
+  it('会话里有 mcp__* 时,关口说清它们在所有环节可用、以及换来的代价', async () => {
     // 这条钉的是**接线**:mcpNoticeLines 写对了、单测全绿,但如果 efftask.tsx 不把
     // context.options.tools 里的 mcp__* 传给关口,用户什么都看不到 —— 而这正是
     // collectSkipSteps 死掉整整一版的同一个形状。
@@ -236,13 +244,33 @@ describe('MCP 工具要一路走到关口上', () => {
       { name: 'Read' }, { name: 'mcp__docs__search' },
     ])
     await tick(10)
-    const f = strip(tty.frames())
+    const f = squash(tty.frames())
     expect(`关口列出了 MCP: ${f.includes('mcp__docs__search')}`).toBe('关口列出了 MCP: true')
-    expect(`关口说了挡不住: ${f.includes('挡不住')}`).toBe('关口说了挡不住: true')
+    // 分档取消之后要说的是这句 —— 评审席位能自己改完再放行。
+    expect(`关口说了代价: ${f.includes('自己改完再判通过')}`).toBe('关口说了代价: true')
     app.unmount()
   })
 
-  it('会话里没有 MCP 时,关口不提这件事', async () => {
+  /**
+   * 服务器状态那一行的**接线**。
+   *
+   * 它单独值一条测试:用户报「没看到 MCP」时最常见的真凶是项目级 `.mcp.json` 卡在待审批 ——
+   * 而那种情况下 `tools` 里一个 `mcp__*` 都没有,只传工具名的话关口整块都不画,
+   * 用户看到的和「根本没配 MCP」一模一样。这条走的正是那个形状:零工具、一个待审批服务器。
+   */
+  it('服务器卡在待审批、一个工具都没有时,关口仍然说出来并给预批的办法', async () => {
+    const { tty, app } = await mount('把 README 翻译成英文', {}, [{ name: 'Read' }], [
+      { name: 'gitlab', type: 'pending' },
+    ])
+    await tick(10)
+    const f = squash(tty.frames())
+    expect(`关口点名了服务器: ${f.includes('gitlab')}`).toBe('关口点名了服务器: true')
+    expect(`关口说了待审批: ${f.includes('待审批')}`).toBe('关口说了待审批: true')
+    expect(`关口给了预批办法: ${f.includes('enabledMcpjsonServers')}`).toBe('关口给了预批办法: true')
+    app.unmount()
+  })
+
+  it('既没有 MCP 工具也没有服务器时,关口不提这件事', async () => {
     const { tty, app } = await mount('把 README 翻译成英文', {}, [{ name: 'Read' }])
     await tick(10)
     expect(`误报 MCP: ${strip(tty.frames()).includes('MCP工具:')}`).toBe('误报 MCP: false')

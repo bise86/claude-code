@@ -17,7 +17,7 @@
  */
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { nonExecuteToolPool, subAgentToolPool, verifyToolPool } from './efftask.js'
+import { subAgentToolPool } from './efftask.js'
 
 const SRC = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
 /** 关口组件自己的源码 —— 编辑器接线在这里,不在 efftask.tsx。 */
@@ -267,11 +267,18 @@ describe('上游限流闸门的接线', () => {
   })
 })
 
-describe('测试验证的工具池接线', () => {
-  it('verifyTools 真的传给了 runAgent 适配器', () => {
-    // 剪断它:验证者静默退回只读工具、跑不了任何命令,而这个环节的**全部存在理由**就是
-    // 「能真的把测试跑起来」。实测过:删掉这一行,全套测试一条都不红。
-    expect(SRC).toContain('verifyTools: verifyToolPool(context.options.tools)')
+describe('子 agent 的工具池接线', () => {
+  it('七个环节共用的那一份真的传给了 runAgent 适配器', () => {
+    // 分档取消之后只剩这**一个**入口。剪断它,所有环节一起失去工具 —— 而窗口里的表现
+    // 只是「模型好像不太爱调工具」,没有任何一处报错。
+    expect(SRC).toContain('const subAgentTools: Tools = subAgentToolPool(context.options.tools)')
+    expect(SRC).toContain('availableTools: subAgentTools,')
+  })
+
+  it('适配器上不再有分档字段 —— 有的话就是分档在偷偷复活', () => {
+    // 三个字段意味着三条能各自悄悄退化的路。合成一个之后,这条守着它不再分叉。
+    expect(SRC).not.toContain('readOnlyTools')
+    expect(SRC).not.toContain('verifyTools')
   })
 })
 
@@ -317,49 +324,32 @@ describe('组件里不许出现只存在于 call() 作用域的绑定', () => {
   })
 })
 
-describe('工具档位:非执行环节要拿得到 MCP,但拿不到写工具', () => {
-  // 旧实现是白名单 `{Read, Glob, Grep}`,于是**所有 mcp__* 连带被滤掉** —— 用户配了
-  // 查文档/查数据库的 MCP,以为评审员能用,实际只有执行者能用;起草者也只能靠三个
-  // 工具摸黑,复杂仓库里经常直接回「访问不了文件系统,请你贴代码」。
+describe('工具池:七个环节一律拿全部工具和全部 MCP', () => {
+  // 更早的实现是白名单 `{Read, Glob, Grep}`,于是**所有 mcp__* 连带被滤掉** —— 用户配了
+  // 查文档/查数据库的 MCP,以为评审员能用,实际只有执行者能用。后来改成黑名单分三档,
+  // 现在分档也取消了:用户明确要求各环节一律继承全部工具和全部 MCP。
   const pool = [
     { name: 'Read' }, { name: 'Glob' }, { name: 'Grep' },
     { name: 'Edit' }, { name: 'Write' }, { name: 'NotebookEdit' }, { name: 'Bash' },
     { name: 'mcp__docs__search' }, { name: 'mcp__db__query' }, { name: 'TodoWrite' },
   ]
 
-  it('非执行档:MCP 留下,四个写工具全部拿掉', () => {
-    const names = nonExecuteToolPool(pool).map(t => t.name)
-    expect(names).toContain('mcp__docs__search')
-    expect(names).toContain('mcp__db__query')
-    expect(names).toContain('Read')
-    for (const w of ['Edit', 'Write', 'NotebookEdit', 'Bash']) {
-      expect(`${w} 漏进非执行档: ${names.includes(w)}`).toBe(`${w} 漏进非执行档: false`)
-    }
+  it('写工具、读工具、MCP 一个不减', () => {
+    const names = subAgentToolPool(pool).map(t => t.name)
+    expect(names).toEqual(pool.map(t => t.name))
   })
 
-  it('测试验证档 = 非执行档 + 跑命令的能力', () => {
-    const names = verifyToolPool(pool).map(t => t.name)
-    expect(names).toContain('Bash')                 // 它得真的把测试跑起来
-    expect(names).toContain('mcp__db__query')       // MCP 同样留着
-    for (const w of ['Edit', 'Write', 'NotebookEdit']) {
-      expect(`${w} 漏进测试验证档: ${names.includes(w)}`).toBe(`${w} 漏进测试验证档: false`)
-    }
-  })
-
-  it('非执行档不是白名单 —— 没见过的工具默认留下', () => {
-    // 这条区分「减去写工具」和「只放行三件套」两种实现:后者会把任何新工具静默丢掉,
+  it('不是白名单 —— 没见过的工具默认留下', () => {
+    // 这条区分「减去 Skill」和「只放行一张枚举表」两种实现:后者会把任何新工具静默丢掉,
     // 而 MCP 工具的名字是用户装什么就叫什么,枚举不完。
-    const names = nonExecuteToolPool([{ name: '某个以后才有的只读工具' }]).map(t => t.name)
-    expect(names).toEqual(['某个以后才有的只读工具'])
+    const names = subAgentToolPool([{ name: '某个以后才有的工具' }]).map(t => t.name)
+    expect(names).toEqual(['某个以后才有的工具'])
   })
 
-  it('生产接线用的就是这个函数', () => {
-    expect(SRC).toContain('const readOnlyTools: Tools = nonExecuteToolPool(context.options.tools)')
-    expect(SRC).toContain('verifyTools: verifyToolPool(context.options.tools)')
-    // 执行档仍然拿全部**写工具** —— 少给了执行者就改不了代码;但要过一遍
-    // subAgentToolPool。它原来是唯一不过滤的地方,于是也是唯一还能拿到 Skill 的地方,
-    // 而那恰好是最费钱的环节(用户实测:Skill(Skill) → Unknown skill: bash)。
-    expect(SRC).toContain('availableTools: subAgentToolPool(context.options.tools), // execute phase only')
+  it('唯一的例外是 Skill —— 那不是限制能力,是它在子 agent 里必然失败', () => {
+    // 用户实测过:Skill(Skill) → Unknown skill: bash。技能清单由主循环塞进消息里,
+    // 子 agent 没有那份清单。
+    expect(subAgentToolPool([...pool, { name: 'Skill' }]).map(t => t.name)).not.toContain('Skill')
   })
 })
 
@@ -745,13 +735,11 @@ describe('改回去要变红的四处', () => {
 })
 
 describe('靠主循环上下文的工具不能进子 agent', () => {
-  it('三个池子都滤掉 Skill', () => {
+  it('池子滤掉 Skill', () => {
     // 用户实测:Skill(Skill) ⎿ Unknown skill: bash。
     // 技能清单是主循环消息管线的 attachment,efftask 的子 agent 消息是自己拼的 ——
     // 工具在、清单不在,模型只能猜,每猜一次白烧一轮调用。
     const all = [{ name: 'Skill' }, { name: 'Read' }, { name: 'Bash' }]
-    expect(nonExecuteToolPool(all).map(t => t.name)).toEqual(['Read'])
-    expect(verifyToolPool(all).map(t => t.name)).toEqual(['Read', 'Bash'])
     expect(subAgentToolPool(all).map(t => t.name)).toEqual(['Read', 'Bash'])
   })
 
@@ -760,11 +748,17 @@ describe('靠主循环上下文的工具不能进子 agent', () => {
     expect(subAgentToolPool(all)).toHaveLength(3)
   })
 
-  it('三个池子都从同一个底子长出来 —— 少接一个就漏一个', () => {
-    // 黑名单意味着以后新增的这类工具会重复这个坑;共同底子是唯一不会漏的形状。
+  it('池子里只有这一条 filter —— 多一条就是分档在偷偷复活', () => {
+    /**
+     * 分档取消之后,退化方向变了:不再是「某一档少给了工具」,而是「有人往这个唯一的
+     * 池子里再加一条 filter」。那种改法在窗口里完全无声 —— 某个环节静默少拿工具,
+     * 表现只是「这个角色好像没查代码」。所以这里数 filter 的条数。
+     */
     const src = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
-    expect(src).toContain('return subAgentToolPool(all).filter(t => !WRITE_CAPABLE_TOOL_NAMES.has(t.name))')
-    expect(src).toMatch(/verifyToolPool[\s\S]{0,120}subAgentToolPool\(all\)/)
+    const body = src.slice(src.indexOf('export function subAgentToolPool'))
+    const fn = body.slice(0, body.indexOf('\n}') + 2)
+    expect((fn.match(/\.filter\(/g) ?? []).length).toBe(1)
+    expect(fn).toContain('!CONTEXT_DEPENDENT_TOOL_NAMES.has(t.name)')
   })
 })
 

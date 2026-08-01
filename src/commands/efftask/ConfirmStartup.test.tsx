@@ -564,11 +564,14 @@ describe('关口显示的必须是**编辑后**的状态,不是传进来的那�
 })
 
 describe('关口要说清 MCP 的边界', () => {
-  const mountMcp = async (mcpToolNames: string[]) => {
+  const mountMcp = async (
+    mcpToolNames: string[],
+    mcpServers: { name: string; type: string }[] = [],
+  ) => {
     const { stdin, stdout, lastFrame } = fakeTty()
     const app = await render(
       React.createElement(ConfirmStartup as never, {
-        config: { ...config, phaseRoles: emptyPhaseRoles() }, mcpToolNames, onDecision: () => {},
+        config: { ...config, phaseRoles: emptyPhaseRoles() }, mcpToolNames, mcpServers, onDecision: () => {},
       } as never),
       { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
     )
@@ -576,17 +579,48 @@ describe('关口要说清 MCP 的边界', () => {
     return { lastFrame, app }
   }
 
-  it('有 MCP 时:说清所有环节可用,而且说清挡不住会写的 MCP', async () => {
+  it('有 MCP 时:说清所有环节可用,而且说清换来的代价', async () => {
     // 两句都必须有。只说「能用」是在卖能力而藏起风险;只说风险又解释不了为什么放开。
+    // 代价那句在 2026-08 变了:分档取消之后,评审席位拿得到的不只是会写的 MCP,
+    // 连内建 Edit/Write/Bash 都有 —— 关口必须说的是这件更大的事。
     const m = await mountMcp(['mcp__docs__search', 'mcp__db__query'])
     const f = m.lastFrame()
     expect(f).toContain('所有环节')
     expect(f).toContain('mcp__docs__search')
-    expect(f).toContain('挡不住')
+    expect(f).toContain('自己改完再判通过')
     m.app.unmount()
   })
 
-  it('没有 MCP 时一个字都不说 —— 说一件不存在的事同样是噪音', async () => {
+  /**
+   * 「有服务器但一个工具都没有」——用户报「没看到 MCP」时最常见的那个形状。
+   *
+   * 待审批的项目级服务器根本不连接,于是工具名那一份是空的。只看工具名的话关口整块
+   * 都不画,而用户明明在 `.mcp.json` 里配了 —— 他看到的和「根本没配」一模一样。
+   */
+  it('有服务器但没连上时照样说,而且给出预批的办法', async () => {
+    const m = await mountMcp([], [{ name: 'gitlab', type: 'pending' }])
+    const f = m.lastFrame()
+    expect(f).toContain('gitlab')
+    expect(f).toContain('待审批')
+    expect(f).toContain('enabledMcpjsonServers')
+    m.app.unmount()
+  })
+
+  it('没连上的排在已连接的前面 —— 要动手的是前者', async () => {
+    // 名字**故意不互为子串**:第一版用了「连上的 / 没连上的」,而后者包含前者,
+    // indexOf 找的根本不是它以为的那一个,这条测试怎么排都是绿的。
+    const m = await mountMcp(['mcp__ok__x'], [
+      { name: 'alpha', type: 'connected' },
+      { name: 'bravo', type: 'failed' },
+      { name: 'charlie', type: 'pending' },
+    ])
+    const f = m.lastFrame() ?? ''
+    expect(f.indexOf('bravo')).toBeLessThan(f.indexOf('alpha'))
+    expect(f.indexOf('charlie')).toBeLessThan(f.indexOf('alpha'))
+    m.app.unmount()
+  })
+
+  it('工具和服务器都没有时一个字都不说 —— 说一件不存在的事同样是噪音', async () => {
     const m = await mountMcp([])
     expect(m.lastFrame()).not.toContain('MCP 工具:')
     m.app.unmount()

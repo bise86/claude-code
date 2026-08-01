@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { verifyToolPool } from '../../commands/efftask/efftask.js'
+import { subAgentToolPool } from '../../commands/efftask/efftask.js'
 import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs, providerErrorOf, ProviderApiError } from './runAgentAdapter.js'
 import { createAssistantAPIErrorMessage } from '../../utils/messages.js'
 import { createRunControl } from './control.js'
@@ -63,7 +63,6 @@ describe('runAgentAdapter helpers', () => {
         toolUseContext: {} as never,
         canUseTool: (async () => ({ behavior: 'allow' })) as never,
         availableTools: [] as never,
-        readOnlyTools: [] as never,
         activeAgents: [{ agentType: '架构' } as never],
         mainModelDefault: { agentType: 'main' } as never,
         runAgentImpl: fake as never,
@@ -113,7 +112,6 @@ describe('runAgentAdapter helpers', () => {
       toolUseContext: {} as never,
       canUseTool: (async () => ({ behavior: 'allow' })) as never,
       availableTools: [] as never,
-      readOnlyTools: [] as never,
       activeAgents: [] as never,
       mainModelDefault: { agentType: 'main' } as never,
       runAgentImpl: fake as never,
@@ -142,7 +140,6 @@ describe('runAgentAdapter helpers', () => {
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
       availableTools: [] as any, // fixture only: the injected runAgentImpl ignores tools
-      readOnlyTools: [] as any, // (real wiring passes Read/Glob/Grep — see Task 11)
       activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fakeRun as any,
@@ -165,7 +162,6 @@ describe('runAgentAdapter helpers', () => {
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
       availableTools: [] as any, // fixture only: the injected runAgentImpl ignores tools
-      readOnlyTools: [] as any, // (real wiring passes Read/Glob/Grep — see Task 11)
       activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fakeRun as any,
@@ -185,7 +181,6 @@ describe('runAgentAdapter helpers', () => {
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
       availableTools: [] as any,
-      readOnlyTools: [] as any,
       activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fakeRun as any,
@@ -203,7 +198,6 @@ describe('runAgentAdapter helpers', () => {
     toolUseContext: {} as any,
     canUseTool: (async () => ({ behavior: 'allow' })) as any,
     availableTools: [{ name: 'Write' }] as any,
-    readOnlyTools: [{ name: 'Read' }] as any,
     activeAgents: [],
     mainModelDefault: { agentType: 'main' } as any,
     runAgentImpl: runAgentImpl as any,
@@ -213,36 +207,86 @@ describe('runAgentAdapter helpers', () => {
     signal: new AbortController().signal, ...over,
   }) as any
 
-  it('only the execute phase receives the write-capable tool pool', async () => {
+  /**
+   * 七个环节拿**同一份**工具池。
+   *
+   * 这条替换掉了原来的两条(「只有执行环节拿写工具」「verify 拿 verifyTools」)——
+   * 按环节分档已经取消,各环节一律继承全部工具和全部 MCP。
+   *
+   * 反着钉是有意的:任何一个环节被重新加上过滤,这里立刻红。而**在窗口里看不出区别** ——
+   * 一个环节少拿了工具,表现只是「这个角色好像没查代码」,和模型自己不想调工具一模一样。
+   * 池子里三样东西各自代表一类:写工具、读工具、MCP,少放一类就少钉一类。
+   */
+  it('七个环节拿的是同一份工具池 —— 写工具、读工具、MCP 一个都不少', async () => {
+    const POOL = [{ name: 'Write' }, { name: 'Read' }, { name: 'mcp__db__query' }]
     const seen: Record<string, string[]> = {}
     for (const phase of ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer'] as const) {
       async function* fakeRun(args: any): AsyncGenerator<any> {
         seen[phase] = (args.availableTools as { name: string }[]).map(t => t.name)
         yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }
       }
-      await makeRunAgentFn(baseDeps(fakeRun))(req({ phase }))
+      const deps = { ...baseDeps(fakeRun), availableTools: POOL as never }
+      await makeRunAgentFn(deps)(req({ phase }))
     }
-    expect(seen.execute).toEqual(['Write'])
-    // 新增的两个环节也要在这条循环里 —— 漏掉它们,这条测试对它们一个字都没说。
-    for (const phase of ['plan', 'review', 'accept', 'integrate', 'observer']) {
-      expect(seen[phase]).toEqual(['Read']) // may read the repo, may never write to it
+    for (const phase of ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer']) {
+      expect(seen[phase]).toEqual(['Write', 'Read', 'mcp__db__query'])
     }
-    // verify 有自己的档位:deps 没给 verifyTools 时回落只读(这个 baseDeps 就没给)。
-    expect(seen.verify).toEqual(['Read'])
   })
 
-  it('verify 拿的是 verifyTools,不是只读池', async () => {
-    // 删掉 runAgentAdapter 的 verify 分支,此前是全套测试全绿 —— 验证者静默退回只读,
-    // 跑不了任何命令,这个环节的全部存在理由就没了。
-    let got: string[] = []
-    // biome-ignore lint/suspicious/noExplicitAny: fake agent runner
-    async function* fakeRun(args: any): AsyncGenerator<any> {
-      got = (args.availableTools as { name: string }[]).map(t => t.name)
+  /**
+   * 派发时那一行「带着什么出门」。用户报的原话是「没看到日志」——
+   * 工具表退化成空的,在窗口里和「模型自己不想调工具」长得一模一样,这一行把两者分开。
+   */
+  it('每次派发在日志窗口打头一行,数出工具总数和 MCP 服务器', async () => {
+    const pushed: string[] = []
+    async function* fakeRun(): AsyncGenerator<any> {
       yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }
     }
-    const deps = { ...baseDeps(fakeRun), verifyTools: [{ name: 'Bash' }, { name: 'Read' }] as never }
-    await makeRunAgentFn(deps)(req({ phase: 'verify' }))
-    expect(got).toEqual(['Bash', 'Read'])
+    const deps = {
+      ...baseDeps(fakeRun),
+      availableTools: [{ name: 'Read' }, { name: 'mcp__db__query' }, { name: 'mcp__gitlab__list_issues' }] as never,
+    }
+    await makeRunAgentFn(deps)(req({
+      phase: 'review',
+      stream: { push: (e: any) => { if (e.kind === 'text') pushed.push(e.text) }, end: () => {} },
+    }))
+    // 总数是 3、MCP 是 2、服务器去重成 db 与 gitlab —— 三个数各自能独立错,所以逐个钉。
+    expect(pushed[0]).toContain('工具 3 个')
+    expect(pushed[0]).toContain('MCP 2 个')
+    expect(pushed[0]).toContain('db、gitlab')
+  })
+
+  /**
+   * 空池子不打表头。
+   *
+   * 唯一的空池子调用点是一次性的配置抽取(`availableTools: []`,只把文本改写成 JSON),
+   * 而它跑在用户敲完 `/et` 看到的**第一屏**上、也带着窗口 —— 打出来是一行
+   * 「工具 0 个 · 无 MCP」,读起来像警告,实际什么问题都没有。
+   */
+  it('空工具池不打表头 —— 那是配置抽取那一次,不是退化', async () => {
+    const pushed: unknown[] = []
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }
+    }
+    const deps = { ...baseDeps(fakeRun), availableTools: [] as never }
+    await makeRunAgentFn(deps)(req({
+      phase: 'plan',
+      stream: { push: (e: unknown) => pushed.push(e), end: () => {} },
+    }))
+    expect(pushed.filter((e: any) => e.kind === 'text' && String(e.text).startsWith('[工具'))).toEqual([])
+  })
+
+  it('一个 MCP 都没有时说「无 MCP」,而不是印一个空列表', async () => {
+    const pushed: string[] = []
+    async function* fakeRun(): AsyncGenerator<any> {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }
+    }
+    const deps = { ...baseDeps(fakeRun), availableTools: [{ name: 'Read' }] as never }
+    await makeRunAgentFn(deps)(req({
+      phase: 'plan',
+      stream: { push: (e: any) => { if (e.kind === 'text') pushed.push(e.text) }, end: () => {} },
+    }))
+    expect(pushed[0]).toContain('无 MCP')
   })
 
   it('forwards cancellation INTO the sub-agent, not just between messages', async () => {
@@ -304,7 +348,10 @@ describe('runAgentAdapter helpers', () => {
     const text = await makeRunAgentFn(baseDeps(fakeRun))(
       req({ phase: 'plan', stream: { push: (e: any) => evs.push(e.text), end: () => {} } }),
     )
-    expect(evs).toEqual(['AAA', 'BBB'])
+    // 第 0 条是派发时那行「带着什么出门」的表头,模型的消息从第 1 条起。
+    expect(evs[0]).toStartWith('[工具 ')
+    expect(evs.slice(1)).toEqual(['AAA', 'BBB'])
+    // 表头**只进窗口,不进返回值** —— 混进去的话它会被当成这一场的产出送进下一个环节。
     expect(text).toBe('AAABBB')
   })
 
@@ -321,9 +368,10 @@ describe('runAgentAdapter helpers', () => {
     await makeRunAgentFn(baseDeps(fakeRun))(
       req({ phase: 'plan', stream: { push: (e: any) => { kinds.push(e.kind); briefs.push(e.brief ?? e.text) }, end: () => {} } }),
     )
-    expect(kinds).toEqual(['thinking', 'tool', 'result'])
-    expect(briefs[1]).toBe('Read(a.ts)')
-    expect(briefs[2]).toBe('读到了')
+    // kinds[0] 是派发表头(text),模型的事件从第 1 条起。
+    expect(kinds.slice(1)).toEqual(['thinking', 'tool', 'result'])
+    expect(briefs[2]).toBe('Read(a.ts)')
+    expect(briefs[3]).toBe('读到了')
   })
 
   it('调用结束时收口窗口 —— 这是唯一一个所有模型调用必经的点', async () => {
@@ -427,7 +475,6 @@ describe('a hung provider is bounded by the phase deadline', () => {
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
       availableTools: [] as any,
-      readOnlyTools: [] as any,
       activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       timeoutMs: 60,
@@ -449,7 +496,6 @@ describe('a hung provider is bounded by the phase deadline', () => {
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
       availableTools: [] as any,
-      readOnlyTools: [] as any,
       activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       timeoutMs: 5000,
@@ -479,7 +525,6 @@ describe('the deadline must not turn a provider error into a crash report', () =
         toolUseContext: {} as any,
         canUseTool: (async () => ({ behavior: 'allow' })) as any,
         availableTools: [] as any,
-        readOnlyTools: [] as any,
         activeAgents: [],
         mainModelDefault: { agentType: 'main' } as any,
         timeoutMs: 600_000, // the value the real command passes
@@ -520,7 +565,6 @@ describe('各环节的子 agent 都拿得到自己的 MCP(2026-07 起的新约�
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
       availableTools: [{ name: 'Write' }] as any,
-      readOnlyTools: [{ name: 'Read' }] as any,
       activeAgents: [mcpAgent],
       mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fake as any,
@@ -531,9 +575,9 @@ describe('各环节的子 agent 都拿得到自己的 MCP(2026-07 起的新约�
     // 旧约定是非执行环节一律剥掉 mcpServers,于是评审员/验收员连**只读** MCP 都没有,
     // 只能凭 Read/Glob/Grep 猜,而关口对此一个字都没说。用户要求各环节都能用 MCP。
     //
-    // 换来的代价必须记清楚:runAgent 在工具分档**之后**才合并 agentMcpTools,所以一个
-    // 声明了写能力 MCP 的角色挂在评审席位上时,能自己改完再判通过。剩下的防线是
-    // 「内建写工具仍然只有执行环节有」+ canUseTool 询问 + 测试验证的工作区指纹比对。
+    // 换来的代价必须记清楚:一个声明了写能力 MCP 的角色挂在评审席位上时,能自己改完
+    // 再判通过。分档取消之后连内建写工具也一样 —— 剩下的防线只有行为面的两道:
+    // canUseTool 询问 + 测试验证环节的工作区指纹比对。
     for (const phase of ['plan', 'review', 'accept', 'observer'] as const) {
       seenDefs.sec = 'unset'
       await fnFor()({
@@ -544,8 +588,16 @@ describe('各环节的子 agent 都拿得到自己的 MCP(2026-07 起的新约�
     }
   })
 
-  it('但内建的写工具仍然只有执行环节拿得到', async () => {
-    // 这条是放开 MCP 之后**唯一**还在结构上拦着「评审员自己改」的东西,必须钉死。
+  it('内建写工具现在也每个环节都有 —— 分档取消,评审员自己改不再被结构拦着', async () => {
+    /**
+     * 这条**翻过面**了。它曾经断言的是「写工具只有执行环节拿得到」,并且注释里写着
+     * 那是放开 MCP 之后唯一还在结构上拦着「评审员自己改」的东西。用户明确要求取消分档,
+     * 于是那道结构性的拦截**没有了**,这条测试改成钉住新的事实。
+     *
+     * 留着它而不是删掉,是因为「评审席位能不能写」这件事必须有一条测试**明说**当前答案 ——
+     * 删掉的话,以后谁想不通某个评审员为什么改了代码,在测试里找不到任何一句话。
+     * 剩下的防线是行为面的:测试验证环节的工作区指纹比对 + canUseTool 询问。
+     */
     const seenTools: Record<string, string[]> = {}
     async function* fake(args: { agentDefinition: { agentType: string }; availableTools: { name: string }[] }): AsyncGenerator<any> {
       seenTools[args.agentDefinition.agentType] = args.availableTools.map(t => t.name)
@@ -555,7 +607,6 @@ describe('各环节的子 agent 都拿得到自己的 MCP(2026-07 起的新约�
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
       availableTools: [{ name: 'Write' }, { name: 'Read' }, { name: 'mcp__db__query' }] as any,
-      readOnlyTools: [{ name: 'Read' }, { name: 'mcp__db__query' }] as any,
       activeAgents: [mcpAgent],
       mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fake as any,
@@ -563,7 +614,7 @@ describe('各环节的子 agent 都拿得到自己的 MCP(2026-07 起的新约�
     for (const phase of ['plan', 'review', 'accept', 'observer'] as const) {
       seenTools.sec = []
       await fn({ phase, node: {} as any, role: { roleName: 'sec' }, system: 's', prompt: 'p', signal: new AbortController().signal })
-      expect(`${phase} 拿到写工具: ${seenTools.sec.includes('Write')}`).toBe(`${phase} 拿到写工具: false`)
+      expect(`${phase} 拿到写工具: ${seenTools.sec.includes('Write')}`).toBe(`${phase} 拿到写工具: true`)
       expect(`${phase} 拿到 MCP: ${seenTools.sec.includes('mcp__db__query')}`).toBe(`${phase} 拿到 MCP: true`)
     }
     seenTools.sec = []
@@ -606,7 +657,6 @@ describe('the phase deadline follows the RUN config, not a frozen default', () =
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
       availableTools: [] as any,
-      readOnlyTools: [] as any,
       activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       timeoutMs: () => limit,
@@ -627,7 +677,7 @@ describe('the phase deadline follows the RUN config, not a frozen default', () =
     const fn = makeRunAgentFn({
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
-      availableTools: [] as any, readOnlyTools: [] as any, activeAgents: [],
+      availableTools: [] as any, activeAgents: [],
       mainModelDefault: { agentType: 'main' } as any,
       timeoutMs: 5000, runAgentImpl: quick as any,
     })
@@ -635,37 +685,45 @@ describe('the phase deadline follows the RUN config, not a frozen default', () =
   })
 })
 
-describe('测试验证档的工具池(此前整条接线零覆盖)', () => {
-  // 三种改法 —— 删掉 verifyTools 接线、删掉 runAgentAdapter 的 verify 分支、把
-  // RUN_COMMAND_TOOL_NAMES 清空 —— 此前**各自都是全套测试全绿**,而验证者会静默退回
-  // 只读工具、跑不了任何命令,也就是这个环节的全部存在理由没了。
+describe('子 agent 的工具池:七个环节共用一个', () => {
+  /**
+   * 分档取消之后,这一组从「验证档减掉了什么」翻面成「一个都不许减」。
+   *
+   * 翻面的理由:曾经有三个池子函数,退化路径是「某一档少给了工具」;现在只有一个,
+   * 退化路径变成「有人重新往里加 filter」。测试要盯的是**现在这条**。
+   */
   const tools = [
     { name: 'Read' }, { name: 'Glob' }, { name: 'Grep' },
     { name: 'Bash' }, { name: 'TaskOutput' }, { name: 'TaskStop' },
     { name: 'Edit' }, { name: 'Write' }, { name: 'NotebookEdit' },
+    { name: 'mcp__db__query' },
   ]
 
-  it('验证档拿得到 Bash —— 没有它,这个环节做不了它唯一该做的事', () => {
-    expect(verifyToolPool(tools).map(t => t.name)).toContain('Bash')
+  it('写工具全在 —— 评审/验收也拿得到,这是取消分档的直接后果', () => {
+    const names = subAgentToolPool(tools).map(t => t.name)
+    for (const w of ['Edit', 'Write', 'NotebookEdit', 'Bash']) {
+      expect(`${w}:${names.includes(w)}`).toBe(`${w}:true`)
+    }
   })
 
-  it('拿不到编辑类工具', () => {
-    const names = verifyToolPool(tools).map(t => t.name)
-    for (const w of ['Edit', 'Write', 'NotebookEdit']) expect(`${w}:${names.includes(w)}`).toBe(`${w}:false`)
-  })
-
-  it('后台 shell 的读输出/停止也在 —— 名字必须是仓库的规范名', () => {
-    // 早先写的 'BashOutput' / 'KillShell' 在这里是死名,filter 匹配不上不报错,
-    // 只会静默少给两个工具:后台起的 shell 读不到输出、杀不掉。
-    const names = verifyToolPool(tools).map(t => t.name)
+  it('后台 shell 的读输出/停止在,而且名字是仓库的规范名', () => {
+    // 早先写的 'BashOutput' / 'KillShell' 是死名,匹配不上不报错,只会静默少给两个工具:
+    // 后台起的 shell 读不到输出、杀不掉。名字这条坑和池子怎么分档无关,所以留着。
+    const names = subAgentToolPool(tools).map(t => t.name)
     expect(names).toContain('TaskOutput')
     expect(names).toContain('TaskStop')
     expect(names).not.toContain('BashOutput')
   })
 
-  it('只读那三个照旧在', () => {
-    const names = verifyToolPool(tools).map(t => t.name)
-    for (const r of ['Read', 'Glob', 'Grep']) expect(`${r}:${names.includes(r)}`).toBe(`${r}:true`)
+  it('只读那三个和 MCP 照旧在', () => {
+    const names = subAgentToolPool(tools).map(t => t.name)
+    for (const r of ['Read', 'Glob', 'Grep', 'mcp__db__query']) {
+      expect(`${r}:${names.includes(r)}`).toBe(`${r}:true`)
+    }
+  })
+
+  it('唯一被摘掉的是 Skill —— 它需要主循环把技能清单塞进消息里', () => {
+    expect(subAgentToolPool([...tools, { name: 'Skill' }]).map(t => t.name)).not.toContain('Skill')
   })
 })
 
@@ -674,7 +732,6 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     toolUseContext: {} as never,
     canUseTool: (async () => ({ behavior: 'allow' })) as never,
     availableTools: [] as never,
-    readOnlyTools: [] as never,
     activeAgents: [],
     mainModelDefault: { agentType: 'main' } as never,
     runAgentImpl: runAgentImpl as never,
@@ -1184,7 +1241,6 @@ describe('节点用量把旁路上报也算进去', () => {
     toolUseContext: {} as any,
     canUseTool: (async () => ({ behavior: 'allow' })) as any,
     availableTools: [] as any,
-    readOnlyTools: [] as any,
     activeAgents: [],
     mainModelDefault: { agentType: 'main' } as any,
     runAgentImpl: runAgentImpl as any,
@@ -1275,7 +1331,7 @@ describe('节点结账之后不再收账', () => {
     await makeRunAgentFn({
       toolUseContext: {} as any,
       canUseTool: (async () => ({ behavior: 'allow' })) as any,
-      availableTools: [] as any, readOnlyTools: [] as any,
+      availableTools: [] as any,
       activeAgents: [], mainModelDefault: { agentType: 'main' } as any,
       runAgentImpl: fakeRun as any,
     })({ phase: 'plan', node, role: null, system: 's', prompt: 'p', signal: new AbortController().signal } as any)

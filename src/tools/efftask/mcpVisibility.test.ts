@@ -10,11 +10,7 @@
  */
 import { describe, expect, it } from 'bun:test'
 
-import {
-  subAgentToolPool,
-  nonExecuteToolPool,
-  verifyToolPool,
-} from '../../commands/efftask/efftask.js'
+import { subAgentToolPool } from '../../commands/efftask/efftask.js'
 import { renderStreamLines } from '../../commands/efftask/logView.js'
 import { eventsFromMessage } from './agentEvents.js'
 import { createStreamStore } from './agentStream.js'
@@ -54,33 +50,24 @@ const resolver = (name: string, input: unknown): string | undefined => {
 
 describe('MCP 工具进不进得了子 agent 的工具池', () => {
   /**
-   * 三个池子都是**黑名单**,所以 `mcp__*` 今天全在。
+   * 池子是**黑名单**,所以 `mcp__*` 今天全在。
    *
    * 这条断言的价值不在「现在是对的」,在于**以后**:黑名单意味着有人往里加一条
    * `mcp__` 前缀就能把所有环节的 MCP 静默拿掉,而现有测试一条都不会红。
+   *
+   * 曾经这里按环节分三档,现在只有一个 —— 七个环节共用。
    */
   const names = (ts: { name: string }[]) => ts.map(t => t.name)
-  it('执行档留着 MCP', () => {
-    expect(names(subAgentToolPool(TOOLS))).toContain('mcp__gitlab__list_issues')
-  })
-  it('只读档(方案/评审/验收/集成/观察)留着 MCP', () => {
-    const pool = names(nonExecuteToolPool(TOOLS))
+  it('MCP 全在,写工具也全在(分档取消之后各环节同一份)', () => {
+    const pool = names(subAgentToolPool(TOOLS))
     expect(pool).toContain('mcp__gitlab__list_issues')
     expect(pool).toContain('mcp__ctx7__resolve-library-id')
-    // 同一份断言顺带钉住写工具确实被摘掉了 —— 否则「MCP 还在」可能只是因为池子没过滤。
-    expect(pool).not.toContain('Edit')
-    expect(pool).not.toContain('Bash')
-  })
-  it('测试验证档留着 MCP,而且拿得到 Bash', () => {
-    const pool = names(verifyToolPool(TOOLS))
-    expect(pool).toContain('mcp__gitlab__list_issues')
+    // 顺带钉住写工具 —— 它们现在也在,而且这就是取消分档的那个代价本身。
+    expect(pool).toContain('Edit')
     expect(pool).toContain('Bash')
-    expect(pool).not.toContain('Edit')
   })
-  it('三个池子都不给 Skill —— 它要主循环塞进消息里的技能清单', () => {
-    for (const pool of [subAgentToolPool(TOOLS), nonExecuteToolPool(TOOLS), verifyToolPool(TOOLS)]) {
-      expect(names(pool)).not.toContain('Skill')
-    }
+  it('不给 Skill —— 它要主循环塞进消息里的技能清单', () => {
+    expect(names(subAgentToolPool(TOOLS))).not.toContain('Skill')
   })
 })
 
