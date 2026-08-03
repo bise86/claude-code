@@ -154,6 +154,21 @@ const zodAlias = {
     // 相同,所以本机怎么跑都发现不了。
     const flat = fileURLToPath(new URL('../vendor/zod-v4.js', import.meta.url))
     build.onResolve({ filter: /^zod(\/v4)?$/ }, () => ({ path: flat }))
+    /**
+     * **`zod/v4-mini` 也要收进来** —— 它是和 classic 并列的另一套 API,不是 v4 的子路径,
+     * 上面那条 `/^zod(\/v4)?$/` 匹配不到它。
+     *
+     * 漏掉它的代价是实测出来的、而且只在**编译产物**里出现:`@modelcontextprotocol/sdk`
+     * 的 zod-compat `import * as z4mini from 'zod/v4-mini'`,那条链照旧走 bun 1.3.14 那条
+     * 坏掉的 `export *` codegen,产物里编出来的是
+     * `const result = safeParse3(schema, data)` 而 `safeParse3` **从未被定义**。
+     *
+     * 于是二进制里**每一台** MCP 服务器都连不上,http / sse / stdio 一视同仁,报错全是
+     * `safeParse3 is not defined`;而 `bun run` 跑源码一切正常。用户为此报了三轮
+     * 「mcp 加载不了」,而屏幕上那句话当时还被写成了「needs authentication」。
+     */
+    const flatMini = fileURLToPath(new URL('../vendor/zod-v4-mini.js', import.meta.url))
+    build.onResolve({ filter: /^zod\/v4-mini$/ }, () => ({ path: flatMini }))
   },
 }
 
