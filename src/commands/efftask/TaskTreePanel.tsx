@@ -8,6 +8,7 @@ import { useStreamTick } from './AgentLogPane.js'
 import { runControlAction, budgetRows, clipToWidth, lastActivity, detailEntryHint } from './logView.js'
 import { currentMouseAvailability } from './mouseEnv.js'
 import { addUsage, EMPTY_USAGE, formatTokens, isEmptyUsage, subtreeUsage, totalTokens, type UsageTotals } from '../../tools/efftask/usage.js'
+import { reworkLine, reworkMarker } from '../../tools/efftask/reworkReason.js'
 import { stringWidth } from '../../ink/stringWidth.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { useIsInsideModal, useModalOrTerminalSize } from '../../context/modalContext.js'
@@ -507,7 +508,19 @@ export function TaskTreePanel(props: {
       if (act) activity.set(r.node.id, `${open.meta.phaseLabel}·${open.meta.label} ${act}`)
     }
   }
-  const cost = rows.map(r => (activity.has(r.node.id) ? 2 : 1))
+  /**
+   * 「这一轮为什么在重做」—— 派生的,不是状态(见 tools/efftask/reworkReason.ts)。
+   *
+   * 在这里算一次而不是在渲染里逐行算:`cost` 要先知道哪些行会多占一个终端行,而那正是
+   * 这一格有没有内容决定的 —— 两处各算一遍就是两份判据,而不一致的那一次会让窗口预算
+   * 算错、把底部的按键提示顶出屏幕(`budgetedViewport` 的注释里量过这笔账)。
+   */
+  const rework = new Map<string, string>()
+  for (const r of rows) {
+    const line = reworkLine(r.node)
+    if (line) rework.set(r.node.id, line)
+  }
+  const cost = rows.map(r => (activity.has(r.node.id) || rework.has(r.node.id) ? 2 : 1))
   const view = budgetedViewport(rows, cost, idx, height)
   const counts: Record<UiStatus, number> = { done: 0, running: 0, queued: 0, failed: 0 }
   for (const n of props.nodes) counts[uiStatus(n.status)]++
@@ -580,7 +593,7 @@ export function TaskTreePanel(props: {
         const act = activity.get(n.id)
         // 标题先按剩余宽度截,状态和耗时才不会被 truncate-end 从右边吃掉。
         // 前缀 = 光标 1 + 缩进 2×depth + 折叠 1 + 空格 1 + 状态字形 1 + 空格 1 + 类型 1 + 空格 1
-        const base = ` [${n.status}]${n.mergeConflict === true ? ' 待人工解冲突' : ''} ${elapsed(n, nowMs)}${scoreTag(n)}${hidden}`
+        const base = ` [${n.status}]${n.mergeConflict === true ? ' 待人工解冲突' : ''} ${elapsed(n, nowMs)}${reworkMarker(n)}${scoreTag(n)}${hidden}`
         /**
          * 用量标记**放得下才画**。
          *
@@ -619,13 +632,17 @@ export function TaskTreePanel(props: {
               {'  '.repeat(depth)}
               {fold} {GLYPH[ui]} {kindGlyph(n)} {title}{' '}
               <Text dimColor>
-                [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{scoreTag(n)}{hidden}{usage}
+                [{n.status}]{n.mergeConflict === true ? ' 待人工解冲突' : ''} {elapsed(n, nowMs)}{reworkMarker(n)}{scoreTag(n)}{hidden}{usage}
               </Text>
             </Text>
-            {/* 「此刻在调什么工具」—— 不用进详情视图就答得上来。1s 采样,不承诺逐条。 */}
-            {act ? (
+            {/* 「此刻在调什么工具」—— 不用进详情视图就答得上来。1s 采样,不承诺逐条。
+                没有活动时,同一格改说「这一轮为什么在重做」。
+                **两者共用一行**,不是各占一行:行数是 `cost` 里那个 1/2 的前提,而
+                「面板高度 = 边框 2 + 表头 1 + height + 提示」再多一行就把底部的图例和
+                按键提示顶出 24 行的屏幕。活动更新更快、也更当下,所以它优先。 */}
+            {act || rework.get(n.id) ? (
               <Text dimColor wrap="truncate-end">
-                {'   '}{'  '.repeat(depth)}⎿ {act}
+                {'   '}{'  '.repeat(depth)}⎿ {act || rework.get(n.id)}
               </Text>
             ) : null}
           </Box>

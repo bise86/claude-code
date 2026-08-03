@@ -26,6 +26,7 @@ import {
   type SectionSpec,
 } from './logView.js'
 import { formatTokens, isEmptyUsage, subtreeUsage, totalTokens, type UsageTotals } from '../../tools/efftask/usage.js'
+import { reworkReason } from '../../tools/efftask/reworkReason.js'
 import { currentMouseAvailability } from './mouseEnv.js'
 import { useLiveState } from './useLiveState.js'
 import { stringWidth } from '../../ink/stringWidth.js'
@@ -310,6 +311,22 @@ export function guidanceBody(n: TaskNode): string {
   return rows.join('\n')
 }
 
+/**
+ * 「本轮返工原因」那一段。
+ *
+ * 比树行上那一句多两样东西:**不截断的原文**,和一句「下一轮会带着它跑」——后者不是废话,
+ * 它回答的是用户真正在问的第二个问题(「这个原因和建议有没有传给下一轮」)。传是真的传了
+ * (方案侧 planFeedbackPrompt、执行侧拿测试验证+验收的累积账),但屏幕上从来没说过。
+ */
+function reworkBody(n: TaskNode): string {
+  const r = reworkReason(n)
+  if (!r) return ''
+  const carried = r.step === 'review'
+    ? '下一轮重拟方案时,这条连同更早几轮的意见会一起交给方案作者(按轮次标注,不只带最后一轮)。'
+    : '下一轮返工时,测试验证和验收两关的累积意见会一起交给执行者。'
+  return `第 ${r.rounds} 轮${PHASE_LABEL[r.step]}未通过:\n${r.why}\n\n${carried}`
+}
+
 /** 评审 / 验收记录:每轮一行。 */
 function roundsBody(log: TaskNode['reviewLog']): string {
   return log
@@ -382,6 +399,16 @@ export function detailSections(
     { title: '补充指引(你写的)', body: guidanceBody(n), md: true },
     // 红色是**语义**(这是把节点挡下来的那条),不能被 markdown 的行内颜色顶掉。
     { title: '阻断原因', body: n.blockedReason, color: 'error' },
+    /**
+     * 「这一轮为什么在重做」——**排在两段流水账之前**,因为它回答的是另一个问题。
+     *
+     * 「评审记录 / 验收记录」在下面,那是历史(每一轮一行);而用户报的是「重拟和重做时,
+     * 其原因没有列清楚」—— 他要的是**此刻**这一轮被谁打回来的那一条。让他从一段十几行的
+     * 流水账里自己找出最后一条未通过,就是把这个问题原样丢回去。
+     *
+     * 内容是从同两份记录派生的(reworkReason),所以不会和下面那两段对不上。
+     */
+    { title: '本轮返工原因', body: reworkBody(n), md: true },
     { title: '评分', body: scoreBody(n) },
     { title: '迭代次数', body: iterationBody(n) },
     // 时间线排在各阶段之前:先回答「这个任务是什么时候的事」,再回答「时间花在哪一步」。

@@ -1143,3 +1143,80 @@ describe('拆分任务 / 执行任务 要一眼分得开', () => {
     app.unmount()
   })
 })
+
+/**
+ * 树上要看得出「这个任务在返工,而且是因为什么」。
+ *
+ * 用户原话:「重拟和重做时,其原因没有列清楚,不知道啥原因导致的。」在这之前,一个被验收
+ * 打回、正在跑第二轮的节点,在树上和一个第一次执行的节点**逐字相同** —— 唯一的线索要按
+ * 回车进详情页、再从一段流水账里自己找最后一条未通过。
+ */
+describe('返工要在树上看得见(真渲染器)', () => {
+  const failedRound = (round: number, why: string, step: string): any => ({
+    round, verdicts: [], synthesized: { pass: false, blockingSummary: why }, step,
+  })
+
+  it('返工过的节点带 ↻N,没返工的不带', async () => {
+    const nodes = [
+      mk({ id: 'root', title: '返工过两轮的', status: 'EXECUTING',
+        iteration: { planReview: 1, acceptance: 1, integration: 0, scoring: 0, mergeResolve: 0 } }),
+      mk({ id: 'root2', title: '一次过的', status: 'EXECUTING' }),
+    ]
+    const { lastFrame, app } = await mount({ nodes })
+    const rows = lastFrame().split('\n')
+    app.unmount()
+    expect(rows.find(r => r.includes('返工过两轮的'))).toContain('↻2')
+    expect(rows.find(r => r.includes('一次过的'))).not.toContain('↻')
+  })
+
+  it('原因就挂在下一行 —— 第几轮、哪一关、说了什么', async () => {
+    const nodes = [mk({
+      id: 'root', title: '在返工的', status: 'EXECUTING',
+      iteration: { planReview: 0, acceptance: 1, integration: 0, scoring: 0, mergeResolve: 0 },
+      acceptLog: [failedRound(1, '退款回调的重试丢了', 'accept')],
+    })]
+    const { lastFrame, app } = await mount({ nodes })
+    const frame = lastFrame()
+    app.unmount()
+    expect(frame).toContain('第 1 轮')
+    expect(frame).toContain('验收未通过')
+    expect(frame).toContain('退款回调的重试丢了')
+  })
+
+  it('测试验证和验收要分得开 —— 用户要照着修的东西不一样', async () => {
+    const nodes = [mk({
+      id: 'root', title: '在返工的', status: 'EXECUTING',
+      acceptLog: [failedRound(1, '两个用例没跑', 'verify')],
+    })]
+    const { lastFrame, app } = await mount({ nodes })
+    const frame = lastFrame()
+    app.unmount()
+    expect(frame).toContain('测试验证未通过')
+  })
+})
+
+/**
+ * 返工那一行**也要进行预算**。
+ *
+ * 「面板高度 = 边框 2 + 表头 1 + height + 提示」是 `budgetedViewport` 全部预算的前提,而
+ * 它按 `cost` 知道哪些行会多占一个终端行。返工那一行是**第二个**会让一行变两行的东西
+ * (第一个是「此刻在调什么工具」)—— 漏进预算的话,10 行的窗口会画出 20 个终端行,
+ * 顶掉的正是底部的图例和按键提示。变异测试实测:去掉 cost 里的返工那一项,只有这条会挂。
+ */
+describe('返工那一行要算进行预算', () => {
+  it('每行都带返工原因时,画出去的树行数减半', async () => {
+    const nodes = Array.from({ length: 20 }, (_, i) =>
+      mk({
+        id: `n${i}`, title: `任务${i}`, status: 'EXECUTING',
+        acceptLog: [{ round: 1, verdicts: [], synthesized: { pass: false, blockingSummary: `第${i}条意见` }, step: 'accept' }],
+      } as never))
+    const { lastFrame, app } = await mount({ nodes, maxRows: 10 })
+    const frame = lastFrame()
+    app.unmount()
+    const reworkRows = frame.split('\n').filter(l => l.includes('⎿ 第 1 轮')).length
+    // 10 行预算 ÷ 每行 2 个终端行 = 5 个节点
+    expect(reworkRows).toBe(5)
+    // 而底部的提示必须还在屏幕上 —— 那正是预算算错时第一个消失的东西。
+    expect(frame).toContain('Esc/q 退出')
+  })
+})

@@ -700,3 +700,55 @@ describe('timelineBody 对终态节点不许说「进行中」', () => {
     expect(body).toContain('进行中,至今')
   })
 })
+
+/**
+ * 「本轮返工原因」—— 用户报的是「重拟和重做时,其原因没有列清楚,不知道啥原因导致的」。
+ *
+ * 断言落在 `detailSections`(纯函数)上,理由同上:屏幕上任何时刻只有一屏。
+ */
+describe('本轮返工原因', () => {
+  const mk = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id: 'root', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+  const rec = (round: number, pass: boolean, why: string, step?: string): any => ({
+    round, verdicts: [], synthesized: { pass, blockingSummary: why }, ...(step ? { step } : {}),
+  })
+
+  it('没返工时整段不出现 —— 空段落是死格', () => {
+    expect(detailSections(mk()).some(s => s.title === '本轮返工原因')).toBe(false)
+  })
+
+  it('排在两段流水账**之前** —— 它回答的是「此刻」,不是「历史上都提过什么」', () => {
+    const secs = detailSections(mk({
+      status: 'EXECUTING',
+      acceptLog: [rec(1, false, '早一轮的意见', 'verify'), rec(2, false, '缺回滚方案', 'accept')],
+    } as Partial<TaskNode>))
+    const i = secs.findIndex(s => s.title === '本轮返工原因')
+    const j = secs.findIndex(s => s.title === '验收记录')
+    expect(i).toBeGreaterThanOrEqual(0)
+    expect(j).toBeGreaterThanOrEqual(0)
+    expect(i).toBeLessThan(j)
+  })
+
+  it('给的是**最后一条**未通过的原文,不截断', () => {
+    const long = '缺回滚方案'.repeat(50)
+    const secs = detailSections(mk({
+      status: 'EXECUTING', acceptLog: [rec(1, false, '早一轮'), rec(2, false, long)],
+    } as Partial<TaskNode>))
+    const body = secs.find(s => s.title === '本轮返工原因')!.body
+    expect(body).toContain(long)
+    expect(body).not.toContain('早一轮')
+  })
+
+  it('说清楚这条意见会不会带到下一轮 —— 那是用户问的第二个问题', () => {
+    const plan = detailSections(mk({
+      status: 'PLANNING', reviewLog: [rec(1, false, '没有拆分依据')],
+    } as Partial<TaskNode>)).find(s => s.title === '本轮返工原因')!.body
+    expect(plan).toContain('方案作者')
+    const exec = detailSections(mk({
+      status: 'EXECUTING', acceptLog: [rec(1, false, '测试没跑', 'verify')],
+    } as Partial<TaskNode>)).find(s => s.title === '本轮返工原因')!.body
+    expect(exec).toContain('执行者')
+  })
+})
