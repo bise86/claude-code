@@ -681,3 +681,50 @@ describe('续跑关口的编辑器也要认识「被跳过」', () => {
     m.app.unmount()
   })
 })
+
+/**
+ * 恢复关口也要印那三行 git 开关。
+ *
+ * 收口和推送都发生在这一趟的**末尾**:关口上不说,用户要等跑完才发现产出没合回来、
+ * 或者被推到了远程。而这三个值是从 run.md 读回来的(手改 run.md 也是一条路)。
+ */
+describe('恢复关口要显示这一趟的 git 开关', () => {
+  const mountResume = async (over: Record<string, unknown>) => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, onDecision: () => {}, ...over } as never),
+      // biome-ignore lint/suspicious/noExplicitAny: fake TTY streams for a headless render
+      { stdin: t.stdin as any, stdout: t.stdout as any, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    return { ...t, app }
+  }
+
+  it('从 run.md 恢复出来的「保留分支 + 自动推送」要显示出来', async () => {
+    const g = await mountResume({ config: { ...config, finish: 'keep', autoPush: true } })
+    const f = g.lastFrame()
+    g.app.unmount()
+    expect(f).toContain('保留 efftask 分支')
+    expect(f).toContain('自动推送: 开')
+  })
+
+  it('只读 —— 恢复关口不画切换键(这一趟的隔离方式在上一趟就定了)', async () => {
+    const g = await mountResume({ config: { ...config, finish: 'keep' } })
+    const f = g.lastFrame()
+    g.app.unmount()
+    expect(f).not.toContain('(m 切换)')
+  })
+
+  it('「池子没建起来」和「用户自己选了共享」说的不是同一句话', async () => {
+    const chosen = await mountResume({ config: { ...config, isolation: 'shared' }, isolation: 'none' })
+    const cf = chosen.lastFrame()
+    chosen.app.unmount()
+    // 主动选的:不能说「用不了」——那会让他以为出了问题。
+    expect(cf).not.toContain('不是你选的')
+
+    const broken = await mountResume({ config, isolation: 'none' })
+    const bf = broken.lastFrame()
+    broken.app.unmount()
+    expect(bf).toContain('不是你选的')
+  })
+})

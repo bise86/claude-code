@@ -242,6 +242,11 @@ export async function runOrchestrator(
       resolveConflict: root
         ? makeHandoffConflictResolver({ runAgent: args.runAgent, node: root, signal: args.signal })
         : undefined,
+      // 关口上选的收口方式和自动推送。**从 config 读**(不是另开一个参数):它已经被
+      // `applyStartupDecision` 写进去、被 run.md 落盘、也被 `--resume` 读回,多一条传递路径
+      // 就多一处会漂移的地方。
+      finish: args.config.finish,
+      autoPush: args.config.autoPush,
     })
     if (out.merged) args.config.pendingHandoff = undefined
     if (out.result) {

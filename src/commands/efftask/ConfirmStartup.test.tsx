@@ -15,6 +15,7 @@ import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { ConfirmStartup } from './ConfirmStartup.js'
 import { applyStartupDecision, costLine } from '../../tools/efftask/startupConfirm.js'
+import type { StartupDecision } from '../../tools/efftask/startupConfirm.js'
 import { DEFAULT_CAPS, emptyPhaseRoles } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 
@@ -624,5 +625,78 @@ describe('关口要说清 MCP 的边界', () => {
     const m = await mountMcp([])
     expect(m.lastFrame()).not.toContain('MCP 工具:')
     m.app.unmount()
+  })
+})
+
+/**
+ * git 三个开关(隔离方式 / 收口方式 / 自动推送)。
+ *
+ * 用户要的是「默认主干开发,可以选择使用分支开发」。关口是唯一能做这个选择的地方,而
+ * 「屏幕上写着一套、送出去的决策是另一套」正是这个关口存在要防的失真 —— 所以断言同时落在
+ * **帧**和**决策**上。
+ */
+describe('启动关口的 git 三个开关', () => {
+  const mountGate = async (over: Record<string, unknown> = {}) => {
+    const decisions: StartupDecision[] = []
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmStartup, { config, onDecision: (d: StartupDecision) => decisions.push(d), ...over }),
+      // biome-ignore lint/suspicious/noExplicitAny: fake TTY streams for a headless render
+      { stdin: t.stdin as any, stdout: t.stdout as any, exitOnCtrlC: false, patchConsole: false },
+    )
+    await new Promise(r => setTimeout(r, 20))
+    return { ...t, app, decisions }
+  }
+
+  it('默认那三行画得出来,而且回车送出的就是默认值', async () => {
+    const g = await mountGate()
+    expect(g.lastFrame()).toContain('worktree 隔离')
+    expect(g.lastFrame()).toContain('合回当前分支')
+    g.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    g.app.unmount()
+    expect(g.decisions[0]).toMatchObject({ isolation: 'worktree', finish: 'merge', autoPush: false })
+  })
+
+  it('w 切共享工作树:屏幕改口,决策也跟着改', async () => {
+    const g = await mountGate()
+    g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
+    expect(g.lastFrame()).toContain('共享工作树')
+    g.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    g.app.unmount()
+    expect(g.decisions[0]).toMatchObject({ isolation: 'shared' })
+  })
+
+  it('m 切保留分支,p 开自动推送', async () => {
+    const g = await mountGate()
+    g.stdin.press('m'); await new Promise(r => setTimeout(r, 20))
+    g.stdin.press('p'); await new Promise(r => setTimeout(r, 20))
+    expect(g.lastFrame()).toContain('保留 efftask 分支')
+    // 渲染器只写**增量**,所以断言落在改动那一行的独有片段上,不是整行原文。
+    expect(g.lastFrame()).toContain('跑完会 git push efftask 分支')
+    g.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    g.app.unmount()
+    expect(g.decisions[0]).toMatchObject({ finish: 'keep', autoPush: true })
+  })
+
+  it('隔离用不了时 w 是死键 —— 而且键位提示里不写它', async () => {
+    // 一个按了不动的键比没有这个键更糟:用户会以为是自己按错了。
+    const g = await mountGate({ isolationReason: '当前目录不是 git 仓库' })
+    g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
+    expect(g.lastFrame()).not.toContain('worktree 隔离,可并行')
+    expect(g.lastFrame()).not.toContain('w 隔离方式')
+    g.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    g.app.unmount()
+    expect(g.decisions[0]).toMatchObject({ isolation: 'shared' })
+  })
+
+  it('config 上已有的选择要当初值显示 —— --resume 恢复出来的那份不能被显示成默认', async () => {
+    const g = await mountGate({ config: { ...config, finish: 'keep', autoPush: true } })
+    expect(g.lastFrame()).toContain('保留 efftask 分支')
+    expect(g.lastFrame()).toContain('跑完会 git push')
+    g.app.unmount()
   })
 })

@@ -45,7 +45,7 @@ export type FinishPlan =
  */
 export function planFinish(
   h: PendingHandoff | undefined,
-  opts: { dirty: boolean; dirtyDetail?: string },
+  opts: { dirty: boolean; dirtyDetail?: string; finish?: 'merge' | 'keep' },
 ): FinishPlan {
   if (!h || h.commits <= 0) return { action: 'none' }
   /**
@@ -64,6 +64,26 @@ export function planFinish(
       ],
     }
   }
+  /**
+   * 用户在关口上选了**分支开发** —— 不合,而且这不是一次失败。
+   *
+   * 仍然走 `skip` 那一档(它就是「没合,并且说清为什么」),但措辞必须和「合不了」分得开:
+   * 一句「没有自动合并」后面跟着一串排查步骤,对一个**主动**选了保留分支的人是噪音,
+   * 而且会让他以为出了问题。这里给的是他接下来真正要做的两件事。
+   *
+   * **排在「没跑完」之后**:两句话都是真的,而「这一趟没跑完」更要紧 —— 一个选了保留分支
+   * 的人看到那句话才知道这条分支上是半成品。
+   */
+  if (opts.finish === 'keep') {
+    return {
+      action: 'skip',
+      why: `按你选的「保留分支」,本次没有合并 —— 产出在分支 ${h.branch}(${h.commits} 个提交)上`,
+      followUps: [
+        `要合进来:git merge ${h.branch}`,
+        `要发 PR:git push -u origin ${h.branch}`,
+      ],
+    }
+  }
   if (opts.dirty) {
     return {
       action: 'skip',
@@ -79,6 +99,30 @@ export function planFinish(
   return { action: 'merge' }
 }
 
+/**
+ * `git push` 当前分支。
+ *
+ * **`-u` + 显式分支名**,不是裸 `git push`:裸推送的行为取决于 `push.default` 和有没有
+ * upstream —— 一个没设过 upstream 的分支上,裸推送直接失败,而用户打开的开关叫「自动推送」。
+ * 分支名从 `symbolic-ref` 拿(这条路径已经确认过不是 detached HEAD)。
+ */
+async function pushCurrent(git: GitFn, cwd: string): Promise<{ ok: boolean; message: string }> {
+  const head = await git(['symbolic-ref', '--short', '--quiet', 'HEAD'], cwd)
+  const branch = head.stdout.trim()
+  if (head.code !== 0 || branch.length === 0) {
+    return { ok: false, message: '自动推送没能执行:取不到当前分支名' }
+  }
+  return pushBranch(git, cwd, branch)
+}
+
+/** `git push -u origin <branch>`。失败时**把 git 的原话带出来** —— 它通常就是修法本身。 */
+async function pushBranch(git: GitFn, cwd: string, branch: string): Promise<{ ok: boolean; message: string }> {
+  const res = await git(['push', '-u', 'origin', branch], cwd)
+  if (res.code === 0) return { ok: true, message: `已推送 ${branch} 到 origin` }
+  const why = (res.stderr || res.stdout).trim()
+  return { ok: false, message: `自动推送 ${branch} 失败${why ? `: ${why}` : ''}(合并本身不受影响)` }
+}
+
 export interface FinishOutcome {
   /** 产出此刻**在当前目录里**吗。done 视图那句话按它写 —— 写错就是一句可照做的假话。 */
   merged: boolean
@@ -91,6 +135,13 @@ export interface FinishOutcome {
   conflicted?: boolean
   /** 给用户看的一行 + 后续动作。`none` 时没有(屏幕上照旧只印分支说明)。 */
   result?: HandoffResult
+  /**
+   * 自动推送发生过吗、结果如何。没开这个开关时**整个字段缺席**(不是一条「未推送」)——
+   * 一个从没打开过推送的人不需要每次跑完都被告知没推送。
+   *
+   * 推送失败**不影响 `merged`**:合并已经发生了,把它说成没发生才是假话。两件事分开报。
+   */
+  push?: { ok: boolean; message: string }
 }
 
 /**
@@ -110,6 +161,10 @@ export async function finishHandoff(deps: {
    * 刚才发生过一次合并。
    */
   resolveConflict?: ConflictResolver
+  /** 关口上选的收口方式。`undefined` = 默认合回当前分支(见 EffTaskConfig.finish)。 */
+  finish?: 'merge' | 'keep'
+  /** 关口上打开的自动推送。默认关 —— 推送是对外动作,必须由人打开。 */
+  autoPush?: boolean
 }): Promise<FinishOutcome> {
   const { handoff: h, git, cwd } = deps
   try {
@@ -143,15 +198,29 @@ export async function finishHandoff(deps: {
       }
     }
     const dirty = h.outcome === 'completed' ? await trackedChanges(git, cwd) : { dirty: false }
-    const plan = planFinish(h, { dirty: dirty.dirty, dirtyDetail: dirty.detail })
+    const plan = planFinish(h, { dirty: dirty.dirty, dirtyDetail: dirty.detail, finish: deps.finish })
     if (plan.action === 'none') return { merged: false }
     if (plan.action === 'skip') {
-      return { merged: false, result: { ok: false, message: plan.why, followUps: plan.followUps } }
+      /**
+       * 没合,但**产出仍然是完整的**(用户选了保留分支、而且这一趟正常跑完了)——
+       * 这一档也要推。开关的语义是「把产出送到远程」,而不是「合并成功之后顺便推一下」;
+       * 分支开发的人恰恰是最需要它的那个(推完就能发 PR)。
+       *
+       * 合不了的那几档(没跑完、脏树、detached)**不推**:那些是「有问题,先别动」。
+       */
+      const push = deps.autoPush === true && deps.finish === 'keep' && h.outcome === 'completed'
+        ? await pushBranch(git, cwd, h.branch)
+        : undefined
+      return { merged: false, result: { ok: false, message: plan.why, followUps: plan.followUps }, ...(push ? { push } : {}) }
     }
     // 走**现成的**那一份:脏树复查、失败时如实报告、分支原样保留全在里面,而收口关口
     // 按的也是同一个函数。两份实现迟早给出两种答案。
     const res = await runHandoffChoice('merge', h, git, cwd, deps.resolveConflict)
-    if (res.ok) return { merged: true, result: res }
+    if (res.ok) {
+      // 合成功了才推当前分支 —— 没合的话,推上去的是一份不含本次产出的分支。
+      const push = deps.autoPush === true ? await pushCurrent(git, cwd) : undefined
+      return { merged: true, result: res, ...(push ? { push } : {}) }
+    }
     // 失败了 —— 工作区被留在半合并状态了吗?这一问必须由**我们**来问:这一路是自动
     // 发生的,而屏幕上那句「你的工作区未被改动」得按答案改口。
     const conflicted = (await mergeLeftovers(git, cwd)).length > 0

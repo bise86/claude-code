@@ -1080,6 +1080,75 @@ describe('跳过的环节必须能从 run.md 读回', () => {
   })
 })
 
+describe('git 三个开关必须能从 run.md 读回', () => {
+  const md = (body: string) => `---\ngoalPrompt: g\n${body}---\n\n`
+
+  it('读回三个值', async () => {
+    const { config } = await readRunManifest(
+      fsWith({ '/r/run.md': md('isolation: shared\nfinish: keep\nautoPush: true\n') }), '/r')
+    expect(config.isolation).toBe('shared')
+    expect(config.finish).toBe('keep')
+    expect(config.autoPush).toBe(true)
+  })
+
+  it('老 run.md 没有这三个键 → undefined,而且不报噪音', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': '---\ngoalPrompt: g\n---\n\n' }), '/r')
+    expect(config.isolation).toBeUndefined()
+    expect(config.finish).toBeUndefined()
+    expect(config.autoPush).toBeUndefined()
+    expect(degraded.filter(d => /isolation|finish|autoPush/.test(d))).toEqual([])
+  })
+
+  it('手改成非法值 → 丢弃并说清按什么走', async () => {
+    const { config, degraded } = await readRunManifest(
+      fsWith({ '/r/run.md': md('isolation: yes\nfinish: rebase\n') }), '/r')
+    expect(config.isolation).toBeUndefined()
+    expect(config.finish).toBeUndefined()
+    expect(degraded.join(' ')).toContain('worktree')
+    expect(degraded.join(' ')).toContain('merge')
+  })
+
+  it('autoPush 只认真正的布尔 —— 字符串 "false" 是 truthy,而误开一次就是一次真的对外推送', async () => {
+    const { config, degraded } = await readRunManifest(
+      fsWith({ '/r/run.md': md('autoPush: "false"\n') }), '/r')
+    expect(config.autoPush).toBeUndefined()
+    expect(degraded.join(' ')).toContain('autoPush')
+  })
+
+  it('写进去 → 读回来(writeRunManifest 是白名单;漏了它,恢复关口会把「保留分支」显示成「合回当前分支」)', async () => {
+    const files: Record<string, string> = {}
+    const fs2: FsLike = {
+      ...fsWith(files),
+      readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error('ENOENT'); return v },
+      writeFile: async (p: string, c: string) => { files[p] = c },
+    }
+    const base = {
+      goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [],
+    }
+    await writeRunManifest(fs2, '/r', { ...base, isolation: 'shared', finish: 'keep', autoPush: true } as EffTaskConfig, [])
+    const { config } = await readRunManifest(fs2, '/r')
+    expect(config.isolation).toBe('shared')
+    expect(config.finish).toBe('keep')
+    expect(config.autoPush).toBe(true)
+  })
+
+  it('默认值不写进 frontmatter —— 新 run 的 run.md 要和以前逐字一样', async () => {
+    const files: Record<string, string> = {}
+    const fs2: FsLike = {
+      ...fsWith(files),
+      readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error('ENOENT'); return v },
+      writeFile: async (p: string, c: string) => { files[p] = c },
+    }
+    await writeRunManifest(fs2, '/r', {
+      goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
+      notices: [], isolation: 'worktree', finish: 'merge', autoPush: false,
+    } as EffTaskConfig, [])
+    expect(files['/r/run.md']).not.toContain('isolation')
+    expect(files['/r/run.md']).not.toContain('finish')
+    expect(files['/r/run.md']).not.toContain('autoPush')
+  })
+})
+
 describe('落选稿从盘上读回来时要逐条校验', () => {
   // alternatives 是 validateLoadedNodes 唯一不就地补字段的 plan 字段,所以坏数据能
   // 原样穿过去,而 serializeNode 会把它渲染进 body:一条 {staff:1} 就是 [object Object]。

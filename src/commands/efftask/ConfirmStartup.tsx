@@ -4,7 +4,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, contextWindowNoticeLines, costLine, guidanceLines, mcpNoticeLines, proxyNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, contextWindowNoticeLines, costLine, finishChoice, gitChoiceLines, guidanceLines, isolationChoice, mcpNoticeLines, proxyNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -86,6 +86,19 @@ export function ConfirmStartup(props: {
     Object.fromEntries(PHASE_NAMES.map(p => [p, [...(props.config.phaseRoles[p] ?? [])]])) as Record<PhaseName, RoleBinding[]>,
   )
   const [skip, setSkip, skipRef] = useLiveState<PhaseName[]>(props.config.skipSteps ?? [])
+  /**
+   * 三个 git 开关。**初值从 config 读**(不是写死默认值)—— 提示词里指定过、或者
+   * `--resume` 从 run.md 恢复出来的选择,必须在关口上原样显示,否则用户会以为它没生效。
+   *
+   * 隔离**根本不可用**时钉死在 shared:那时候这不是一个选择(`isolationReason` 那一块
+   * 单独解释为什么),而一个按了不动的开关比没有这个开关更糟。
+   */
+  const forcedShared = props.isolationReason !== undefined
+  const [iso, setIso, isoRef] = useLiveState<'worktree' | 'shared'>(
+    forcedShared ? 'shared' : isolationChoice(props.config),
+  )
+  const [fin, setFin, finRef] = useLiveState<'merge' | 'keep'>(finishChoice(props.config))
+  const [push, setPush, pushRef] = useLiveState<boolean>(props.config.autoPush === true)
   const [editing, setEditing, editingRef] = useLiveState(false)
   const [phaseIdx, setPhaseIdx, phaseRef] = useLiveState(0)
   const [roleIdx, setRoleIdx, roleRef] = useLiveState(0)
@@ -99,6 +112,9 @@ export function ConfirmStartup(props: {
       // 必须带上:编辑器承诺「勾选任一员工即恢复」,不带就是纯 no-op —— 用户勾完人,
       // 界面上的「已跳过」标记消失了,run 照样跳过,那一席永远不会被派发。
       skipSteps: skipRef.current,
+      // 三个开关同上:屏幕上写着「保留分支」而决策里没有这个字段 = 用户按 y 时相信的事
+      // 和真正发生的事不一样,正是这个关口存在要防的失真。
+      isolation: isoRef.current, finish: finRef.current, autoPush: pushRef.current,
     })
 
   useInput((input, key) => {
@@ -131,6 +147,20 @@ export function ConfirmStartup(props: {
     if (key.leftArrow || input === '-') { setParallelism(clampParallelism(parRef.current - 1)); props.onEdited?.(); return }
     if (key.rightArrow || input === '+' || input === '=') { setParallelism(clampParallelism(parRef.current + 1)); props.onEdited?.(); return }
     if (input.toLowerCase() === 'r') { setEditing(true); return }
+    /**
+     * 三个 git 开关。**隔离不可用时 `w` 不接** —— 那时候屏幕上写的是「不是你选的」,
+     * 而一个按了不动的键会让人以为是自己按错了。
+     */
+    if (input.toLowerCase() === 'w' && !forcedShared) {
+      setIso(isoRef.current === 'worktree' ? 'shared' : 'worktree'); props.onEdited?.(); return
+    }
+    // 收口方式只在真的会有集成分支时才可切:共享工作树下一次提交都不会发生。
+    if (input.toLowerCase() === 'm' && isoRef.current === 'worktree' && !forcedShared) {
+      setFin(finRef.current === 'merge' ? 'keep' : 'merge'); props.onEdited?.(); return
+    }
+    if (input.toLowerCase() === 'p' && isoRef.current === 'worktree' && !forcedShared) {
+      setPush(!pushRef.current); props.onEdited?.(); return
+    }
     // 「或初始化 git」 (spec §8). Only live when the caller supplied a handler AND isolation is
     // actually unavailable — an advertised key that does nothing is the failure this repo has
     // paid for repeatedly.
@@ -151,12 +181,19 @@ export function ConfirmStartup(props: {
   //
   // 同样的道理,成本行也必须用 shown:在编辑器里加三个验收席位后,屏幕上的
   // 「预估上限」纹丝不动(实测 2400,真值 4200)—— spec §7.2 点名说低估比高估糟。
-  const shown: EffTaskConfig = { ...props.config, phaseRoles: roster, skipSteps: skip }
+  // 三个 git 开关同样要进 shown —— 屏幕上那三行读的是 shown,而按 y 送出去的是这三个 ref。
+  // 两者读不同的来源,就是「显示一套、执行另一套」。
+  const shown: EffTaskConfig = { ...props.config, phaseRoles: roster, skipSteps: skip, isolation: iso, finish: fin, autoPush: push }
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 启动确认</Text>
       <Text>目标: {goalLine(props.config.goalPrompt)}</Text>
       <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: props.isolation })}</Text>
+      {/* git 三行。**不是警告色** —— 这是用户要自己决定的取舍,不是「有一部分不会生效」。
+          编辑名册时不画键位提示(那时候 w/m/p 归编辑器)。 */}
+      {gitChoiceLines(shown, { editable: !editing, unavailable: props.isolationReason }).map(l => (
+        <Text key={l} dimColor>{l}</Text>
+      ))}
       <Text bold>角色名册{editing ? '(编辑中)' : ''}:</Text>
       {editing
         ? rosterEditorLines(roster, available, phaseIdx, roleIdx, undefined, skipRef.current).map((line, i) => (
@@ -253,6 +290,9 @@ export function ConfirmStartup(props: {
       ) : (
         <Text dimColor>
           回车/y 开始 · r 编辑角色名册 · ←/→ 调整并行数
+          {/* w/m/p 只在真的可切时才写 —— 隔离用不了的时候它们是死键,而一个按了没反应的
+              键和一个不存在的键在排查时差别很大(这个仓库为这条付过好几次学费)。 */}
+          {forcedShared ? '' : ` · w 隔离方式${iso === 'worktree' ? ' · m 收口方式 · p 自动推送' : ''}`}
           {props.isolationReason && props.onInitGit ? ' · g 初始化 git 并重试隔离' : ''}
           {' · Esc/n 取消'}
         </Text>

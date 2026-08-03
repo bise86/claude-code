@@ -40,6 +40,16 @@ export interface StartupDecision {
    * Only meaningful on the resume gate; the startup gate has no tree to show yet.
    */
   viewOnly?: boolean
+  /**
+   * 隔离方式 / 收口方式 / 自动推送 —— 关口上的三个开关。
+   *
+   * 和 `phaseRoles`、`skipSteps` 同一条规矩:**缺省 = 不变**,不是「关掉」。飞书那张卡上
+   * 没有这三个开关,而它是能赢下这场竞速的 —— 把缺省读成 false/默认值,等于让一次飞书批准
+   * 静默推翻用户刚在终端上按过的选择。
+   */
+  isolation?: 'worktree' | 'shared'
+  finish?: 'merge' | 'keep'
+  autoPush?: boolean
 }
 
 
@@ -216,7 +226,71 @@ export function applyStartupDecision(config: EffTaskConfig, decision: StartupDec
     phaseRoles: decision.phaseRoles ?? config.phaseRoles,
     // 同样的「缺省 = 不变」语义:飞书那条路没有这个开关,不能把它当成「清空跳过」。
     skipSteps: decision.skipSteps ?? config.skipSteps,
+    // 三个开关同上。`autoPush` 尤其不能写成 `decision.autoPush ?? false` ——
+    // 那会让一次飞书批准把用户在终端上刚打开的推送悄悄关掉。
+    isolation: decision.isolation ?? config.isolation,
+    finish: decision.finish ?? config.finish,
+    autoPush: decision.autoPush ?? config.autoPush,
   }
+}
+
+/** 隔离方式的默认值 —— 没选过就是 worktree 隔离(可并行)。 */
+export function isolationChoice(config: EffTaskConfig): 'worktree' | 'shared' {
+  return config.isolation ?? 'worktree'
+}
+/** 收口方式的默认值 —— 没选过就是合回当前分支(主干开发)。 */
+export function finishChoice(config: EffTaskConfig): 'merge' | 'keep' {
+  return config.finish ?? 'merge'
+}
+
+/**
+ * 关口上那两行开关 + 推送那一行。
+ *
+ * **一定要说出代价**,不只说选了什么:共享工作树的代价是执行串行 + 执行者在你的检出里
+ * 改代码,保留分支的代价是产出不会自动出现在你手上。这个关口存在的全部意义就是让用户在
+ * 花钱之前知道自己批准了什么。
+ *
+ * @param unavailable 隔离**根本不可用**时的原因(非 git 仓库等)。给了就说明白:
+ *   这一行不是他选的,是环境定的 —— 否则用户会盯着一个按了不动的开关。
+ */
+export function gitChoiceLines(
+  config: EffTaskConfig,
+  opts: { editable?: boolean; unavailable?: string } = {},
+): string[] {
+  const iso = isolationChoice(config)
+  const fin = finishChoice(config)
+  const key = (k: string): string => (opts.editable === false ? '' : `(${k} 切换)`)
+  const out: string[] = []
+  out.push(
+    opts.unavailable
+      ? `隔离方式: 共享工作树(执行串行)—— 不是你选的,当前环境用不了隔离:${clip(opts.unavailable, 40)}`
+      : iso === 'worktree'
+        ? `隔离方式: worktree 隔离,可并行执行 ${key('w')}`
+        : `隔离方式: 共享工作树 —— 执行者直接改你当前目录,而且执行阶段强制串行 ${key('w')}`,
+  )
+  // 非隔离运行压根没有集成分支,收口方式无从谈起 —— 说了就是承诺一件不会发生的事。
+  if (iso === 'worktree' && !opts.unavailable) {
+    out.push(
+      fin === 'merge'
+        ? `收口方式: 跑完合回当前分支(主干开发)${key('m')}`
+        : `收口方式: 保留 efftask 分支不合并(分支开发),产出不会自动出现在你的工作目录里 ${key('m')}`,
+    )
+  }
+  /**
+   * 共享工作树下**没有推送这回事**:没有池子就没有任何一次提交(pipeline 的
+   * `if (!ctx.worktrees || !node.worktree) return true`),改动就摊在用户的工作目录里。
+   * 这种时候还给一个「自动推送」开关,是承诺一件不会发生的事。
+   */
+  if (iso === 'shared' || opts.unavailable) {
+    out.push('自动推送: 不适用 —— 共享工作树不产生任何提交,改动会直接留在你的工作目录里(要自己 commit)')
+  } else {
+    out.push(
+      config.autoPush === true
+        ? `自动推送: 开 —— 跑完会 git push ${fin === 'merge' ? '当前分支' : 'efftask 分支'} ${key('p')}`
+        : `自动推送: 关(推送要你自己来)${key('p')}`,
+    )
+  }
+  return out
 }
 
 /**

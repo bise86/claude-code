@@ -1227,7 +1227,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           setHandoffState(st)
           // 退出报告读的是 call() 作用域里的这个盒子(onExit 读不到 state)。
           props.handoffStateOut.current = st
-          if (out.result) setHandoffResult(out.result)
+          /**
+           * 推送的结果**并进那条消息的 followUps**,不另开一块。
+           *
+           * 它和收口是同一件事的两半,而完成视图上那一格已经有位置;另开一个 state 就要
+           * 在 done 视图、退出报告、run.md 三处各接一遍,而其中任何一处漏掉,用户看到的
+           * 就是「推送开着,但没人说推没推成」。失败尤其要说 —— 那正是他要自己去补的一步。
+           */
+          if (out.result) {
+            setHandoffResult(out.push
+              ? { ...out.result, followUps: [...(out.result.followUps ?? []), out.push.message] }
+              : out.result)
+          } else if (out.push) {
+            setHandoffResult({ ok: out.push.ok, message: out.push.message })
+          }
         },
         // 升级人工 (spec §8). Rides the SAME shared client the startup card uses —
         // read at escalation time, not at gate time, because the bridge may connect
@@ -1663,6 +1676,23 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // edits that were not yet committed are discarded if the FEISHU surface wins the race.
         // There is no channel from the gate's React state to the Feishu surface.
         const effectiveConfig: EffTaskConfig = applyStartupDecision(config, decision)
+        /**
+         * 用户选了**共享工作树** —— 把已经建好的池子放下。
+         *
+         * 池子是在关口**打开之前**建的(关口要说清这一趟是哪种运行),而这个选择是在关口上
+         * 做的,所以只能在这儿兑现。放下之后 `ctx.worktrees === undefined`,执行阶段走的就是
+         * 既有的非隔离回落:共享工作目录 + 串行执行 + 不产生任何提交。
+         *
+         * **不去删那条集成分支和它的工作区**:`init()` 是可重入的、而且从不移动已存在的
+         * 集成分支,下一趟会原样接手 —— 这和用户在关口按 Esc 那条路的处置逐字相同
+         * (见 makeWorktreePool 调用处的注释)。
+         */
+        if (effectiveConfig.isolation === 'shared') {
+          poolRef.current = undefined
+          // 状态也要跟着改口:它是「这一趟**实际**隔离了没有」,而运行视图的表头、
+          // run.md 的那条 notice 都读它。留着 'worktree' 就是屏幕上说隔离、实际共享。
+          setIsolation('none')
+        }
         setApproved(effectiveConfig)
         // RESUME skips the third gate. Its tree already exists on disk — drafting a fresh
         // root plan would ask the user to confirm a decomposition the run is not going to

@@ -910,6 +910,28 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   }
 
   /**
+   * 三个 git 开关。**必须读回** —— 恢复关口拿读回来的 config 当初值渲染,读不回来的话,
+   * 用户上一趟选的「保留分支」会在恢复时静默变回「合回当前分支」,而他多半是直接回车的。
+   *
+   * 手改 run.md 绕开一切校验,所以取值也要在这里过一遍白名单:一个写成 `isolation: yes`
+   * 的值不能被当成 'shared'(那会让整趟运行的执行方式变掉,而屏幕上写的是另一件事)。
+   */
+  if (fm.isolation !== undefined) {
+    if (fm.isolation === 'worktree' || fm.isolation === 'shared') base.isolation = fm.isolation
+    else degraded.push(`run.md 里的 isolation「${String(fm.isolation)}」不是合法取值(worktree / shared),已忽略,按 worktree 走`)
+  }
+  if (fm.finish !== undefined) {
+    if (fm.finish === 'merge' || fm.finish === 'keep') base.finish = fm.finish
+    else degraded.push(`run.md 里的 finish「${String(fm.finish)}」不是合法取值(merge / keep),已忽略,按 merge 走`)
+  }
+  if (fm.autoPush !== undefined) {
+    // 只有**真正的 true** 才算开。字符串 'false' 是 truthy,而这个开关的方向是不对称的:
+    // 误开一次就是一次不该发生的对外推送。
+    if (typeof fm.autoPush === 'boolean') base.autoPush = fm.autoPush
+    else degraded.push(`run.md 里的 autoPush「${String(fm.autoPush)}」不是 true/false,已忽略(按关处理)`)
+  }
+
+  /**
    * 定向注入(§定向注入)。**必须读回** —— writeRunManifest 整文件重写 run.md,一个只写不读的
    * 字段会在第一次 `--resume` 时清零:恢复后的名册一模一样,而模型收到的东西变了,
    * 而界面上没有任何地方能让用户发现。`roleDefs` 和 `resumes` 都为这条注释付过学费。

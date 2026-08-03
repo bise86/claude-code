@@ -5,7 +5,7 @@ import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from '../../tool
 import { useLiveState } from './useLiveState.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import {
-  capsLine, clampParallelism, goalLine, noticeLines, parallelismLine, rosterLines, rosterEditorLines, toggleRole, resumeSummarySections,
+  capsLine, clampParallelism, gitChoiceLines, goalLine, noticeLines, parallelismLine, rosterLines, rosterEditorLines, toggleRole, resumeSummarySections,
   type ResumeSummary, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -132,6 +132,23 @@ export function ConfirmResume(props: {
         * 用户改完盘、进来看不到自己改的数生效没有。飞书的恢复卡一直是印的,两个界面
         * 因此在恢复路径上说着不同的话。
         */}
+      {/*
+        * git 三行**恢复路径上也要印**,理由和上面那条安全阀逐字相同:这三个开关是从 run.md
+        * 读回来的(手改 run.md 也是一条路),而收口和推送都发生在这一趟的**末尾** —— 用户
+        * 在这里看不到,就要等跑完才发现产出没合回来 / 或者被推到了远程。
+        *
+        * **只读**:恢复关口不给切换。这一趟的隔离方式在上一趟已经决定了(集成分支和各节点
+        * 的 worktree 都已经在盘上),而在这儿改它会让恢复出来的树和它的工作区对不上。
+        */}
+      {/* 「池子没建起来」和「用户自己选了共享」要分开说 —— 前者是环境的事,后者是他的决定,
+          而对着一个主动选了共享工作树的人说「用不了隔离」会让他以为出了问题。 */}
+      {gitChoiceLines(shown, {
+        editable: false,
+        unavailable: props.isolation === 'none' && (shown.isolation ?? 'worktree') === 'worktree'
+          ? '这一趟没有可用的隔离工作区' : undefined,
+      }).map(l => (
+        <Text key={l} dimColor>{l}</Text>
+      ))}
       <Text dimColor>{capsLine(shown)}</Text>
       <Text bold>角色名册{editing ? '(编辑中)' : ''}:</Text>
       {editing

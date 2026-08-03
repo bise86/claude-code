@@ -383,6 +383,17 @@ export async function writeRunManifest(
     // 而界面上没有任何地方能让用户发现。roleDefs 和 skipSteps 都是为这条注释付过学费的。
     ...(cfg.phaseGuidance && Object.keys(cfg.phaseGuidance).length > 0 ? { phaseGuidance: cfg.phaseGuidance } : {}),
     ...(cfg.roleGuidance && cfg.roleGuidance.length > 0 ? { roleGuidance: cfg.roleGuidance } : {}),
+    /**
+     * 三个 git 开关。同一条白名单规矩,而这三个尤其不能漏:
+     * `--resume` 的关口会拿读回来的 config 当**初值**渲染,读不回来的话,用户上一趟明明
+     * 选了「保留分支」,恢复之后关口显示「合回当前分支」—— 而他多半是直接回车的。
+     *
+     * **写条件是「不等于默认值」而不是「有值」**:默认那两个不写,新 run 的 frontmatter
+     * 才和以前逐字一样(和上面 resumeGuidance 那几条同一条规矩)。
+     */
+    ...(cfg.isolation && cfg.isolation !== 'worktree' ? { isolation: cfg.isolation } : {}),
+    ...(cfg.finish && cfg.finish !== 'merge' ? { finish: cfg.finish } : {}),
+    ...(cfg.autoPush === true ? { autoPush: true } : {}),
     // 独立于 status 落盘 —— 见 EffTaskConfig.pendingHandoff:status 先写下 completed 而
     // 集成分支还没处置,用户直接关终端就再也没人管那条分支了。
     ...(cfg.pendingHandoff ? { pendingHandoff: cfg.pendingHandoff } : {}),

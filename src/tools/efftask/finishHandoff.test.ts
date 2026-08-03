@@ -222,3 +222,90 @@ describe('自动收口撞上冲突时,解决者必须被真的传下去', () => 
     expect(out.conflicted).toBe(true)
   })
 })
+
+describe('收口方式:保留分支(分支开发)', () => {
+  it('planFinish:选了 keep 就不合,而且措辞不能读成「出问题了」', () => {
+    const p = planFinish(h(), { dirty: false, finish: 'keep' })
+    expect(p.action).toBe('skip')
+    if (p.action !== 'skip') throw new Error('unreachable')
+    expect(p.why).toContain('保留分支')
+    // 一个主动选了保留分支的人不该看到一串排查步骤 —— 给的是他接下来真正要做的事。
+    expect(p.followUps.join('\n')).toContain('git merge efftask/001/integration')
+    expect(p.followUps.join('\n')).toContain('git push')
+  })
+
+  it('「没跑完」排在它前面 —— 两句都真,而半成品这件事更要紧', () => {
+    const p = planFinish(h({ outcome: 'blocked', reason: '3 个节点被阻断' }), { dirty: false, finish: 'keep' })
+    if (p.action !== 'skip') throw new Error('unreachable')
+    expect(p.why).toContain('3 个节点被阻断')
+  })
+
+  it('finishHandoff:选了 keep 就**一次 merge 都不跑**', async () => {
+    const g = fakeGit()
+    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', finish: 'keep' })
+    expect(g.ran('merge')).toBe(false)
+    expect(out.merged).toBe(false)
+    expect(out.result?.message).toContain('保留分支')
+  })
+
+  it('默认(不传 finish)仍然是合回当前分支 —— 主干开发是默认', async () => {
+    const g = fakeGit()
+    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo' })
+    expect(out.merged).toBe(true)
+  })
+})
+
+describe('自动推送:默认关,开了才推', () => {
+  it('不开就一次 push 都不跑', async () => {
+    const g = fakeGit()
+    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo' })
+    expect(g.ran('push')).toBe(false)
+    expect(out.push).toBeUndefined()
+  })
+
+  it('合成功 + 开了推送 → 推**当前分支**,而且带 -u 和显式分支名', async () => {
+    // 裸 `git push` 的行为取决于 push.default 和有没有 upstream —— 一个没设过 upstream
+    // 的分支上它直接失败,而用户打开的开关叫「自动推送」。
+    const g = fakeGit({ 'symbolic-ref --short': { stdout: 'feature/x\n' } })
+    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', autoPush: true })
+    expect(out.merged).toBe(true)
+    expect(g.ran('push -u origin feature/x')).toBe(true)
+    expect(out.push?.ok).toBe(true)
+  })
+
+  it('保留分支 + 开了推送 → 推的是**集成分支**(那正是要发 PR 的那条)', async () => {
+    const g = fakeGit()
+    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', finish: 'keep', autoPush: true })
+    expect(g.ran('push -u origin efftask/001/integration')).toBe(true)
+    expect(g.ran('merge')).toBe(false)
+  })
+
+  it('合不了的那几档不推 —— 那些是「有问题,先别动」', async () => {
+    const dirty = fakeGit({ 'diff --quiet': { code: 1 } })
+    expect((await finishHandoff({ handoff: h(), git: dirty.git, cwd: '/repo', autoPush: true })).push).toBeUndefined()
+    expect(dirty.ran('push')).toBe(false)
+    const blocked = fakeGit()
+    expect((await finishHandoff({ handoff: h({ outcome: 'blocked' }), git: blocked.git, cwd: '/repo', finish: 'keep', autoPush: true })).push).toBeUndefined()
+    expect(blocked.ran('push')).toBe(false)
+  })
+
+  it('推送失败**不能**把「已合并」说成没合并 —— 那是两件事', async () => {
+    const g = fakeGit({
+      'symbolic-ref --short': { stdout: 'feature/x\n' },
+      'push': { code: 1, stderr: 'fatal: No configured push destination' },
+    })
+    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', autoPush: true })
+    expect(out.merged).toBe(true)         // 合并真的发生了
+    expect(out.result?.ok).toBe(true)
+    expect(out.push?.ok).toBe(false)
+    // git 的原话要带出来 —— 它通常就是修法本身。
+    expect(out.push?.message).toContain('No configured push destination')
+  })
+
+  it('取不到当前分支名时如实说,不去裸推一把', async () => {
+    const g = fakeGit({ 'symbolic-ref --short': { code: 1 } })
+    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', autoPush: true })
+    expect(out.push?.ok).toBe(false)
+    expect(g.ran('push')).toBe(false)
+  })
+})

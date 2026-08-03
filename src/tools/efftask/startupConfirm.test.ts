@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -1342,5 +1342,79 @@ describe('contextWindowNoticeLines —— 自动压缩按哪个窗口触发', ()
 
   it('assumed 但没有窗口值的不算 —— 那种条目说不出任何有用的话', () => {
     expect(contextWindowNoticeLines([{ name: 'x', assumed: true }])).toEqual([])
+  })
+})
+
+describe('git 三个开关 —— 关口上要说出代价', () => {
+  const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
+    notices: [], ...over,
+  })
+
+  it('默认 = worktree 隔离 + 合回当前分支 + 不推送', () => {
+    const l = gitChoiceLines(cfg()).join('\n')
+    expect(l).toContain('worktree 隔离')
+    expect(l).toContain('合回当前分支')
+    expect(l).toContain('自动推送: 关')
+  })
+
+  it('共享工作树要写明两条代价:改你的目录、而且串行', () => {
+    const l = gitChoiceLines(cfg({ isolation: 'shared' })).join('\n')
+    expect(l).toContain('你当前目录')
+    expect(l).toContain('串行')
+  })
+
+  it('共享工作树下不谈收口方式 —— 那时候压根没有集成分支', () => {
+    const l = gitChoiceLines(cfg({ isolation: 'shared' })).join('\n')
+    expect(l).not.toContain('收口方式')
+    // 推送同理:没有池子就没有任何一次提交,给一个开关是承诺一件不会发生的事。
+    expect(l).toContain('不适用')
+  })
+
+  it('保留分支要说清后果:产出不会自动出现在工作目录里', () => {
+    expect(gitChoiceLines(cfg({ finish: 'keep' })).join('\n')).toContain('不会自动出现')
+  })
+
+  it('推送开着时要说清推的是哪一条', () => {
+    expect(gitChoiceLines(cfg({ autoPush: true })).join('\n')).toContain('当前分支')
+    expect(gitChoiceLines(cfg({ autoPush: true, finish: 'keep' })).join('\n')).toContain('efftask 分支')
+  })
+
+  it('隔离根本不可用时说明「不是你选的」,而且不画键位', () => {
+    const l = gitChoiceLines(cfg(), { unavailable: '当前目录不是 git 仓库' }).join('\n')
+    expect(l).toContain('不是你选的')
+    expect(l).toContain('不是 git 仓库')
+    expect(l).not.toContain('(w 切换)')
+  })
+
+  it('editable: false 时不画键位 —— 编辑名册时 w/m/p 归编辑器', () => {
+    expect(gitChoiceLines(cfg(), { editable: false }).join('\n')).not.toContain('切换')
+  })
+})
+
+describe('applyStartupDecision 对三个开关的「缺省 = 不变」', () => {
+  const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
+    notices: [], ...over,
+  })
+
+  it('决策里带了就按决策来', () => {
+    const out = applyStartupDecision(cfg(), {
+      parallelism: 3, approved: true, isolation: 'shared', finish: 'keep', autoPush: true,
+    })
+    expect(out.isolation).toBe('shared')
+    expect(out.finish).toBe('keep')
+    expect(out.autoPush).toBe(true)
+  })
+
+  it('决策里没带 → 保留 config 上的值,**不能**读成关掉', () => {
+    // 飞书那张卡没有这三个开关,而它能赢下这场竞速 —— 读成默认值等于让一次飞书批准
+    // 静默推翻用户刚在终端上按过的选择。
+    const out = applyStartupDecision(cfg({ isolation: 'shared', finish: 'keep', autoPush: true }), {
+      parallelism: 3, approved: true,
+    })
+    expect(out.isolation).toBe('shared')
+    expect(out.finish).toBe('keep')
+    expect(out.autoPush).toBe(true)
   })
 })
