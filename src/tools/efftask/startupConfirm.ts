@@ -1,6 +1,7 @@
 import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES, PHASE_LABEL } from './types.js'
 import { hostOf, isLanHost } from '../../utils/lanDirect.js'
 import { getProxyUrl } from '../../utils/proxy.js'
+import { formatContextWindow } from '../AgentTool/roles/roleContextWindow.js'
 import { stripControl } from './persistence.js'
 import { allowsMultipleSeats } from './roleDefs.js'
 import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
@@ -371,6 +372,34 @@ export function proxyNoticeLines(
     out.push(`以下端点仍走代理:${viaProxy.map(h => clip(h, 30)).join('、')}`)
   }
   return out
+}
+
+/**
+ * 每个员工按**哪个上下文窗口**做自动压缩 —— 只在有话可说时才占一行。
+ *
+ * 为什么值一块关口位置:翻译型协议的员工跑在别人的模型上,而引擎的压缩阈值算的是父会话
+ * Claude 模型的窗口(`runAgent.ts:352` 故意这么设,引擎要拿它做 Claude 的算术)。没声明
+ * 窗口时我们**估一个** —— 一个估出来的数悄悄决定「什么时候压缩」是不行的:估大了那一席会
+ * 在跑到一半时撞上游 400,估小了会白压几次。关口是唯一能在花钱之前说这句话的地方。
+ *
+ * 声明过的员工**不列** —— 那是用户自己写的数,复述一遍只是噪音。全都声明过时整块不画。
+ *
+ * @param roles 这次会用到的员工(名字 + 归一后的窗口 + 是不是估的)
+ */
+export function contextWindowNoticeLines(
+  roles: readonly { name?: string; window?: number; assumed?: boolean }[],
+): string[] {
+  const assumed: string[] = []
+  for (const r of roles) {
+    if (r.assumed !== true || r.window === undefined) continue
+    const label = `${clip(r.name || '未命名员工', 20)}(按 ${formatContextWindow(r.window)} 估)`
+    if (!assumed.includes(label)) assumed.push(label)
+  }
+  if (assumed.length === 0) return []
+  return [
+    `以下员工没有声明 contextWindow,自动压缩按估算值触发:${assumed.join('、')}`,
+    '窗口比这个小的话,那一席会在上下文涨满时被上游拒绝;想准确就在 settings.json 的这条员工上写 "contextWindow": <该模型真正的窗口>。',
+  ]
 }
 
 export function skipConsequenceLines(config: EffTaskConfig): string[] {

@@ -29,14 +29,34 @@ import { trySessionMemoryCompaction } from './sessionMemoryCompact.js'
 // Based on p99.99 of compact summary output being 17,387 tokens.
 const MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000
 
-// Returns the context window size minus the max output tokens for the model
-export function getEffectiveContextWindowSize(model: string): number {
-  const reservedTokensForSummary = Math.min(
-    getMaxOutputTokensForModel(model),
-    MAX_OUTPUT_TOKENS_FOR_SUMMARY,
-  )
-  let contextWindow = getContextWindowForModel(model, getSdkBetas())
+/**
+ * 小窗口下,保留给摘要的额度最多占窗口的这么多。
+ *
+ * 固定的 20k 对 200k 窗口是 10%,对一个 32k 的网关模型是 62% —— 减完再减 13k 缓冲就是负数,
+ * 而负阈值的语义是「每一轮都压」:压缩本身又是一次调用,那一席位会在压缩循环里烧钱直到
+ * 熔断器跳闸。按比例夹住之后,200k/1M 这两档的算术**一个字节都没变**(20k 本来就更小)。
+ */
+const SUMMARY_RESERVE_FRACTION = 0.2
+/** 同上,缓冲区在小窗口下按比例夹。200k 档不受影响(13k < 18k)。 */
+const AUTOCOMPACT_BUFFER_FRACTION = 0.1
 
+// Returns the context window size minus the max output tokens for the model
+export function getEffectiveContextWindowSize(
+  model: string,
+  /**
+   * 这一档**真正**的上下文窗口 —— 员工声明的那个数(见 roles/roleContextWindow.ts)。
+   *
+   * 翻译型协议的员工跑在别人的模型上,而 `model` 参数拿到的是父会话的 Claude 模型
+   * (`runAgent.ts` 故意这么设,引擎要拿它做 Claude 的算术)。不接这个口子的话,一个 128k
+   * 的员工在 opus[1m] 会话里的压缩阈值是 1M —— 永远不压,直接撞上游 400。
+   */
+  contextWindowOverride?: number,
+): number {
+  let contextWindow = contextWindowOverride ?? getContextWindowForModel(model, getSdkBetas())
+
+  // 环境变量的夹取必须排在保留额度**之前**算。原来它在后面无所谓 —— 保留额度只看模型;
+  // 现在它按比例跟着窗口走,排在后面就会用一个已经被夹掉的窗口去减一份按原窗口算的保留,
+  // 而 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=30000` 正是拿来测小窗口的那个开关。
   const autoCompactWindow = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
   if (autoCompactWindow) {
     const parsed = parseInt(autoCompactWindow, 10)
@@ -44,6 +64,12 @@ export function getEffectiveContextWindowSize(model: string): number {
       contextWindow = Math.min(contextWindow, parsed)
     }
   }
+
+  const reservedTokensForSummary = Math.min(
+    getMaxOutputTokensForModel(model),
+    MAX_OUTPUT_TOKENS_FOR_SUMMARY,
+    Math.floor(contextWindow * SUMMARY_RESERVE_FRACTION),
+  )
 
   return contextWindow - reservedTokensForSummary
 }
@@ -69,11 +95,21 @@ export const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
 // in a single session, wasting ~250K API calls/day globally.
 const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
 
-export function getAutoCompactThreshold(model: string): number {
-  const effectiveContextWindow = getEffectiveContextWindowSize(model)
+export function getAutoCompactThreshold(
+  model: string,
+  contextWindowOverride?: number,
+): number {
+  const effectiveContextWindow = getEffectiveContextWindowSize(
+    model,
+    contextWindowOverride,
+  )
 
   const autocompactThreshold =
-    effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
+    effectiveContextWindow -
+    Math.min(
+      AUTOCOMPACT_BUFFER_TOKENS,
+      Math.floor(effectiveContextWindow * AUTOCOMPACT_BUFFER_FRACTION),
+    )
 
   // Override for easier testing of autocompact
   const envPercent = process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
@@ -93,6 +129,7 @@ export function getAutoCompactThreshold(model: string): number {
 export function calculateTokenWarningState(
   tokenUsage: number,
   model: string,
+  contextWindowOverride?: number,
 ): {
   percentLeft: number
   isAboveWarningThreshold: boolean
@@ -100,10 +137,13 @@ export function calculateTokenWarningState(
   isAboveAutoCompactThreshold: boolean
   isAtBlockingLimit: boolean
 } {
-  const autoCompactThreshold = getAutoCompactThreshold(model)
+  const autoCompactThreshold = getAutoCompactThreshold(
+    model,
+    contextWindowOverride,
+  )
   const threshold = isAutoCompactEnabled()
     ? autoCompactThreshold
-    : getEffectiveContextWindowSize(model)
+    : getEffectiveContextWindowSize(model, contextWindowOverride)
 
   const percentLeft = Math.max(
     0,
@@ -119,7 +159,10 @@ export function calculateTokenWarningState(
   const isAboveAutoCompactThreshold =
     isAutoCompactEnabled() && tokenUsage >= autoCompactThreshold
 
-  const actualContextWindow = getEffectiveContextWindowSize(model)
+  const actualContextWindow = getEffectiveContextWindowSize(
+    model,
+    contextWindowOverride,
+  )
   const defaultBlockingLimit =
     actualContextWindow - MANUAL_COMPACT_BUFFER_TOKENS
 
@@ -165,6 +208,8 @@ export async function shouldAutoCompact(
   // pre-snip context, so tokenCountWithEstimation can't see the savings.
   // Subtract the rough-delta that snip already computed.
   snipTokensFreed = 0,
+  /** 员工自己的上下文窗口(见 getEffectiveContextWindowSize 的同名参数)。 */
+  contextWindowOverride?: number,
 ): Promise<boolean> {
   // Recursion guards. session_memory and compact are forked agents that
   // would deadlock.
@@ -223,16 +268,20 @@ export async function shouldAutoCompact(
   }
 
   const tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed
-  const threshold = getAutoCompactThreshold(model)
-  const effectiveWindow = getEffectiveContextWindowSize(model)
+  const threshold = getAutoCompactThreshold(model, contextWindowOverride)
+  const effectiveWindow = getEffectiveContextWindowSize(
+    model,
+    contextWindowOverride,
+  )
 
   logForDebugging(
-    `autocompact: tokens=${tokenCount} threshold=${threshold} effectiveWindow=${effectiveWindow}${snipTokensFreed > 0 ? ` snipFreed=${snipTokensFreed}` : ''}`,
+    `autocompact: tokens=${tokenCount} threshold=${threshold} effectiveWindow=${effectiveWindow}${contextWindowOverride ? ` roleWindow=${contextWindowOverride}` : ''}${snipTokensFreed > 0 ? ` snipFreed=${snipTokensFreed}` : ''}`,
   )
 
   const { isAboveAutoCompactThreshold } = calculateTokenWarningState(
     tokenCount,
     model,
+    contextWindowOverride,
   )
 
   return isAboveAutoCompactThreshold
@@ -265,11 +314,18 @@ export async function autoCompactIfNeeded(
   }
 
   const model = toolUseContext.options.mainLoopModel
+  /**
+   * 翻译型协议的员工跑在别人的模型上,而 `mainLoopModel` 是父会话的 Claude 模型
+   * (`runAgent.ts:352` 故意这么设)。这里是**唯一**同时看得见「这次查询属于哪个员工」和
+   * 「压缩该不该发生」的地方 —— 见 getEffectiveContextWindowSize 的参数注释。
+   */
+  const roleWindow = toolUseContext.options.roleClientConfig?.contextWindow
   const shouldCompact = await shouldAutoCompact(
     messages,
     model,
     querySource,
     snipTokensFreed,
+    roleWindow,
   )
 
   if (!shouldCompact) {
@@ -280,7 +336,7 @@ export async function autoCompactIfNeeded(
     isRecompactionInChain: tracking?.compacted === true,
     turnsSincePreviousCompact: tracking?.turnCounter ?? -1,
     previousCompactTurnId: tracking?.turnId,
-    autoCompactThreshold: getAutoCompactThreshold(model),
+    autoCompactThreshold: getAutoCompactThreshold(model, roleWindow),
     querySource,
   }
 

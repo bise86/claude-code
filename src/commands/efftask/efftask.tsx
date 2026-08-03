@@ -1776,6 +1776,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 出网路线:有全局代理时,哪些员工的端点会绕过它直连、哪些仍走代理。
         // 用户报过一次「配了 roles 就连不上」,真凶是一条早就忘了的 HTTPS_PROXY。
         apiUrls={props.agentModels.map(a => a.roleClientConfig?.apiUrl)}
+        // 自动压缩按哪个窗口触发。只列**估出来的**那些 —— 用户自己声明过的数不用复述。
+        contextWindows={props.agentModels.map(a => ({
+          name: a.agentType, window: a.contextWindow, assumed: a.contextWindowAssumed,
+        }))}
         // spec §2 第一关 "名册可编辑". Only roles this session can actually dispatch — the
         // roster must not offer a seat the run would then silently downgrade to the main model.
         availableRoles={dispatchableRoles(props.knownRoles, props.unsupportedRoles)}

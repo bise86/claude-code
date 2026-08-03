@@ -10,6 +10,7 @@ import type { ToolUseContext } from '../../Tool.js'
 import type { AssistantMessage, Message } from '../../types/message.js'
 import { logError } from '../../utils/log.js'
 import { estimateTokens, markEstimatedUsage } from '../../services/api/tokenEstimate.js'
+import { fitPromptToWindow } from './cliPromptFit.js'
 
 /**
  * Minimal process handle abstraction so `runCliAgent` can be driven by a
@@ -514,7 +515,17 @@ async function* runInteractiveInner(
  * moment the caller has a stream in hand.
  */
 export function runCliAgent(
-  agentDef: { command: string; args?: string[]; roleCwd?: string; interactive?: boolean },
+  agentDef: {
+    command: string
+    args?: string[]
+    roleCwd?: string
+    interactive?: boolean
+    /**
+     * 这台 CLI 的上下文窗口(token),由员工配置声明。声明了才封顶 —— 理由见 cliPromptFit
+     * 的文件头:外部 CLI 自己带上下文管理,替它猜一个数然后动手截是在造信息丢失。
+     */
+    contextWindow?: number
+  },
   task: CliAgentTask,
   toolUseContext: ToolUseContext,
   canUseTool: CanUseToolFn,
@@ -524,11 +535,26 @@ export function runCliAgent(
   const spawn = deps?.spawn ?? defaultSpawn
   const proc = spawn(agentDef.command, agentDef.args ?? [], { cwd: agentDef.roleCwd })
 
+  /**
+   * 封顶在**两档之前**做,不是在各自的写 stdin 处各做一遍:两档的写法不同(交互档裹进一个
+   * JSON 的 `prompt` 字段,非交互档整段进 stdin),而「提示词该多长」是同一件事。分开做的话
+   * 迟早只有一档被改到 —— 而症状是「同一个员工换了 interactive 就撞窗口」。
+   */
+  const fitted = fitPromptToWindow(task.prompt, agentDef.contextWindow)
+  if (fitted.truncated) {
+    logError(
+      new Error(
+        `[cli agent] 提示词超出为该员工声明的上下文窗口(${agentDef.contextWindow}),已省略中间约 ${fitted.droppedChars} 个字符(原估算 ${fitted.originalTokens} token)`,
+      ),
+    )
+  }
+  const sent: CliAgentTask = fitted.truncated ? { ...task, prompt: fitted.prompt } : task
+
   if (agentDef.interactive) {
-    return runInteractive(proc, agentDef, task, toolUseContext, canUseTool)
+    return runInteractive(proc, agentDef, sent, toolUseContext, canUseTool)
   }
 
-  return withKillOnDispose(proc, runNonInteractive(proc, task, toolUseContext))
+  return withKillOnDispose(proc, runNonInteractive(proc, sent, toolUseContext))
 }
 
 // Non-interactive: prompt -> stdin, full stdout -> result (single-shot).

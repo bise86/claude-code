@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test'
-import { parseRoles } from './rolesFromSettings.js'
+import { parseRoles, roleLoadIssues } from './rolesFromSettings.js'
 
 describe('parseRoles', () => {
   it('parses an api role and KEEPS the api client fields (not stripped)', () => {
@@ -11,8 +11,55 @@ describe('parseRoles', () => {
     expect(out[0].agentDef.execMode).toBe('api')
     // roleName 一起带下去:上游失败时那句话要点名是哪个员工 —— 一次 /et 可以有十几个
     // 员工同时在说话,不点名的话「某个 openai 员工挂了」对手上有三个的人毫无用处。
-    expect(out[0].agentDef.roleClientConfig).toEqual({ apiProtocol: 'openai', apiUrl: 'https://x/v1', apiToken: 'sk', backendModel: 'gpt-4o', thinkingDepth: 'high', roleName: 'rev' })
+    // contextWindow 也一起带下去:翻译型协议没声明窗口时按 128k 估(见 roleContextWindow),
+    // 而这个字段是**自动压缩唯一能看见员工身份的地方** —— 掉了它,压缩阈值会退回按父会话
+    // Claude 模型的窗口算,一个 128k 的员工在 opus[1m] 会话里永远不压,直接撞上游 400。
+    expect(out[0].agentDef.roleClientConfig).toEqual({ apiProtocol: 'openai', apiUrl: 'https://x/v1', apiToken: 'sk', backendModel: 'gpt-4o', thinkingDepth: 'high', roleName: 'rev', contextWindow: 128_000 })
   })
+  describe('contextWindow', () => {
+    const api = (extra: Record<string, unknown>) => parseRoles([{
+      name: 'rev', whenToUse: 'review', execMode: 'api',
+      apiProtocol: 'openai', apiUrl: 'https://x/v1', apiToken: 'sk', model: 'gpt-4o', ...extra,
+    }], 'userSettings')
+
+    it('声明了就听用户的,数字和 128k 两种写法都收', () => {
+      expect(api({ contextWindow: 32_000 })[0].agentDef.roleClientConfig?.contextWindow).toBe(32_000)
+      expect(api({ contextWindow: '32k' })[0].agentDef.roleClientConfig?.contextWindow).toBe(32_000)
+      expect(api({ contextWindow: 32_000 })[0].agentDef.contextWindowAssumed).toBe(false)
+    })
+
+    it('没声明的翻译型协议按默认值估,并标成 assumed(关口要说出来)', () => {
+      const d = api({})[0].agentDef
+      expect(d.contextWindow).toBe(128_000)
+      expect(d.contextWindowAssumed).toBe(true)
+    })
+
+    it('anthropic 协议不干预 —— 引擎自己那套 Claude 算术是准的', () => {
+      const out = parseRoles([{ name: 'a', whenToUse: 'w', execMode: 'api',
+        apiProtocol: 'anthropic', apiUrl: 'https://x/v1', apiToken: 'sk', model: 'claude-opus-4-5' }], 'userSettings')
+      expect(out[0].agentDef.contextWindow).toBeUndefined()
+      expect(out[0].agentDef.roleClientConfig?.contextWindow).toBeUndefined()
+    })
+
+    it('写错了不静默:整条员工照常载入,但记一条能照做的诊断', () => {
+      const out = api({ contextWindow: 'huge' })
+      // **不能**因为一个可选字段写错就跳过整条员工 —— 那是 thinkingDepth 踩过的坑,
+      // 用户看到的是「这个员工不存在」。
+      expect(out).toHaveLength(1)
+      expect(out[0].agentDef.contextWindow).toBe(128_000)
+      const issue = roleLoadIssues().find(i => i.reason.includes('contextWindow'))
+      expect(issue?.reason).toContain('128k')
+    })
+
+    it('cli 档:声明了才封顶,没声明就不干预', () => {
+      const declared = parseRoles([{ name: 'c1', whenToUse: 'w', execMode: 'cli', command: 'x', contextWindow: '200k' }], 'userSettings')
+      expect(declared[0].agentDef.contextWindow).toBe(200_000)
+      const bare = parseRoles([{ name: 'c2', whenToUse: 'w', execMode: 'cli', command: 'x' }], 'userSettings')
+      expect(bare[0].agentDef.contextWindow).toBeUndefined()
+      expect(bare[0].agentDef.contextWindowAssumed).toBe(false)
+    })
+  })
+
   it('parses a cli role keeping command/args/interactive', () => {
     const out = parseRoles([{ name: 'c', whenToUse: 'w', execMode: 'cli', command: 'adapter', args: ['--json'], interactive: true }], 'localSettings')
     expect(out[0].agentDef.execMode).toBe('cli')

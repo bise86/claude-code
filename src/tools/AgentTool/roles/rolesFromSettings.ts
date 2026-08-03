@@ -4,6 +4,7 @@ import { registerDirectHosts } from '../../../utils/lanDirect.js'
 import type { EffortValue } from '../../../utils/effort.js'
 import { ROLE_API_PROTOCOLS } from '../../../services/api/openaiCompat/protocols.js'
 import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from './roleThinking.js'
+import { MAX_ROLE_CONTEXT_WINDOW, MIN_ROLE_CONTEXT_WINDOW, parseContextWindow, roleContextWindow } from './roleContextWindow.js'
 import type { RoleClientConfig } from './roleTypes.js'
 
 /**
@@ -76,6 +77,11 @@ const RoleSchema = z.object({
   // 会让**整条员工**校验失败被跳过 —— 而 docs/roles-setup.md 明写着可以填一个数字。
   // 用户读到的是「无效值会被忽略」,以为最坏是这个字段不生效。
   thinkingDepth: z.union([z.string(), z.number()]).optional(),
+  /**
+   * 这个员工的上下文窗口。同 thinkingDepth 收两种写法(`128000` / `"128k"`)—— RoleSchema
+   * 是 .strict(),写法不收就是**整条员工被跳过**,而用户看到的是「这个员工不存在」。
+   */
+  contextWindow: z.union([z.string(), z.number()]).optional(),
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   interactive: z.boolean().optional(),
@@ -130,6 +136,15 @@ export type RoleAgentDefinition = {
   roleCwd?: string
   model?: string
   effort?: EffortValue
+  /**
+   * 这个员工的上下文窗口(token 数),已按协议归一(见 roleContextWindow)。
+   *
+   * api 档的真正消费者是 `roleClientConfig.contextWindow`(压缩发生在查询循环里);这里这一份
+   * 是给 **cli 档**和界面用的 —— cli 档没有 roleClientConfig,而关口要把「估的」那几条说出来。
+   */
+  contextWindow?: number
+  /** 上面那个数是我们估的(不是用户声明的)。关口按它写措辞。 */
+  contextWindowAssumed?: boolean
 }
 
 export function parseRoles(rawRoles: unknown, source: string): { role: any; agentDef: RoleAgentDefinition }[] {
@@ -192,6 +207,16 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
       if (r.thinkingDepth !== undefined && r.thinkingDepth !== '' && level === undefined) {
         issues.push({ name: r.name, source, reason: `thinkingDepth "${String(r.thinkingDepth)}" 无法识别,已忽略;可用值:${ROLE_THINKING_LEVELS.join(' / ')} 或一个整数` })
       }
+      /**
+       * 上下文窗口。解析失败**不静默** —— 一个写错的 `contextWindow` 会让这个员工回落到
+       * 「按 Claude 模型的窗口压缩」,而那正是这个字段存在要修的毛病:症状是跑到一半上游
+       * 回 400,而屏幕上的建议会把人引到 model 名上去。
+       */
+      const declaredWindow = parseContextWindow(r.contextWindow)
+      if (r.contextWindow !== undefined && r.contextWindow !== '' && declaredWindow === undefined) {
+        issues.push({ name: r.name, source, reason: `contextWindow "${String(r.contextWindow)}" 无法识别,已忽略;写成 token 数(128000)或 128k,范围 ${MIN_ROLE_CONTEXT_WINDOW}~${MAX_ROLE_CONTEXT_WINDOW}` })
+      }
+      const window = roleContextWindow({ execMode: r.execMode, apiProtocol: protocol, declared: declaredWindow })
       const translating = protocol !== 'anthropic'
       const wire = r.execMode === 'api'
         ? resolveRoleThinking({ level, protocol, model: r.model ?? '' })
@@ -199,7 +224,7 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
       if (wire.note) issues.push({ name: r.name, source, reason: wire.note })
       const parsedEffort = translating ? undefined : (wire.value as EffortValue | undefined)
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
-        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name }
+        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value }
         : undefined
       /**
        * 内网端点**在载入时**就登记直连(见 utils/lanDirect)。
@@ -226,6 +251,8 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
         roleCwd: r.cwd,
         model: r.model,
         effort: parsedEffort,
+        contextWindow: window.value,
+        contextWindowAssumed: window.assumed,
       }})
     } catch (e) {
       logError(e)

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -1312,5 +1312,35 @@ describe('runSpanLine 的老数据回落', () => {
       N({ createdAt: '2026-07-29T09:00:00.000Z', finishedAt: '2026-07-29T09:30:00.000Z', updatedAt: '2026-07-29T23:00:00.000Z', status: 'ACCEPTED' }),
     ], NOW2)
     expect(line).toContain('共 30m0s')
+  })
+})
+
+describe('contextWindowNoticeLines —— 自动压缩按哪个窗口触发', () => {
+  it('全都声明过时一个字都不说 —— 复述用户自己写的数是噪音', () => {
+    expect(contextWindowNoticeLines([
+      { name: 'a', window: 32_000, assumed: false },
+      { name: 'b' },
+    ])).toEqual([])
+  })
+
+  it('估出来的那些要点名,并且带上估的是多少', () => {
+    const lines = contextWindowNoticeLines([{ name: 'K3', window: 128_000, assumed: true }])
+    expect(lines.length).toBeGreaterThan(0)
+    expect(lines[0]).toContain('K3')
+    expect(lines[0]).toContain('128k')
+    // 必须给出可照做的那一句 —— 只说「估的」等于把问题丢回给用户。
+    expect(lines.join(' ')).toContain('contextWindow')
+  })
+
+  it('同名只列一次', () => {
+    const lines = contextWindowNoticeLines([
+      { name: 'K3', window: 128_000, assumed: true },
+      { name: 'K3', window: 128_000, assumed: true },
+    ])
+    expect(lines[0]!.split('K3').length - 1).toBe(1)
+  })
+
+  it('assumed 但没有窗口值的不算 —— 那种条目说不出任何有用的话', () => {
+    expect(contextWindowNoticeLines([{ name: 'x', assumed: true }])).toEqual([])
   })
 })

@@ -909,15 +909,25 @@ describe('README 的子 agent 继承一节说的和代码干的是同一件事',
     expect(README).toContain(norm('工作目录（`cwd` 不填就是父进程的）'))
   })
 
-  it('cli 档收不到系统提示 —— 它的入参就只有四个字段', () => {
+  it('cli 档收不到系统提示 —— 它的入参里没有任何一个提示词字段', () => {
     /**
-     * README 把这条标成「最容易踩」。它成立的原因是结构性的:runCliAgent 的 agentDef
-     * 入参只声明了 command/args/roleCwd/interactive,系统提示没有地方进去。哪天有人
-     * 把它加进这个类型,文档那一行就得跟着改。
+     * README 把这条标成「最容易踩」。它成立的原因是结构性的:runCliAgent 的 `agentDef`
+     * 入参里**没有**任何提示词字段,系统提示没有地方进去。哪天有人把它加进这个类型,
+     * 文档那一行就得跟着改。
+     *
+     * 断言的是**字段名**,不是那一行的原文。原来这里对着整行签名做逐字比对,于是给这个类型
+     * 加一个与提示词无关的字段(`contextWindow`)、或者把它换行排版,都会让这条测试失败 ——
+     * 而它要守的东西一个字都没变。逐字比对在这里守错了对象。
      */
-    expect(src('src/tools/AgentTool/cliAgentRunner.ts')).toContain(
-      'agentDef: { command: string; args?: string[]; roleCwd?: string; interactive?: boolean }',
-    )
+    const runnerSrc = src('src/tools/AgentTool/cliAgentRunner.ts')
+    const start = runnerSrc.indexOf('export function runCliAgent(')
+    expect(start).toBeGreaterThan(0)
+    const paramBlock = runnerSrc.slice(start, runnerSrc.indexOf('task: CliAgentTask,', start))
+    for (const field of ['command', 'args', 'roleCwd', 'interactive']) {
+      expect(paramBlock).toContain(field)
+    }
+    // 提示词类字段一个都不许有(注释里出现「prompt」这个词不算 —— 判的是字段声明)。
+    expect(paramBlock).not.toMatch(/^\s*(system)?[Pp]rompt\??:/m)
     // 而 api 档的系统提示是另一条路:算好之后只喂给 runAgent 的 override。
     expect(src('src/tools/AgentTool/AgentTool.tsx')).toContain('systemPrompt: asSystemPrompt(enhancedSystemPrompt)')
     expect(README).toContain(norm('**员工自己配的 `prompt`（系统提示）**'))

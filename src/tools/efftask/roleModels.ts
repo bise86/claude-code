@@ -16,6 +16,14 @@ export interface AgentModelInfo {
    * 「代理到不了这个内网地址」的地方。模型解析本身不看它。
    */
   roleClientConfig?: { apiProtocol?: string; backendModel?: string; apiUrl?: string }
+  /**
+   * 这个员工按哪个上下文窗口做自动压缩,以及那个数是不是我们估的。
+   *
+   * 同 `apiUrl`:模型解析本身不看它,只有关口的「上下文窗口」那一块读 —— 一个估出来的数
+   * 决定「什么时候压缩」,而估大了那一席会在跑到一半时被上游拒绝(见 roleContextWindow)。
+   */
+  contextWindow?: number
+  contextWindowAssumed?: boolean
 }
 
 /**

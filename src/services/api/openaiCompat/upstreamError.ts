@@ -80,8 +80,31 @@ export function upstreamBodyText(body: string): string {
  * 每一条都指向一个具体的配置键(apiUrl / apiToken / apiProtocol / model),因为这一层
  * 唯一能被用户修的东西就是 `.claude/settings.json` 里的那几行。
  */
+/**
+ * 上游说的是「上下文超了」吗。
+ *
+ * 各家写法不一样,但都绕不开这几个词。收得宽一点是对的:判错的代价只是多给一条建议,
+ * 而漏判的代价是把人引到 model 名上去 —— 400 那一档的通用建议第一句就是「先查 model
+ * 写得对不对」,对着一个跑了半小时、上下文涨满的席位说这句话,等于让他去改一个没错的字段。
+ */
+export function looksLikeContextOverflow(body: string): boolean {
+  const s = body.toLowerCase()
+  return (
+    s.includes('context_length_exceeded') ||
+    s.includes('context length') ||
+    s.includes('context window') ||
+    s.includes('maximum context') ||
+    s.includes('too many tokens') ||
+    s.includes('prompt is too long') ||
+    s.includes('input length and `max_tokens` exceed') ||
+    s.includes('reduce the length') ||
+    s.includes('上下文') ||
+    (s.includes('token') && (s.includes('exceed') || s.includes('too long')))
+  )
+}
+
 export function upstreamAdvice(
-  f: Pick<UpstreamFailure, 'status' | 'protocol' | 'notStreamed' | 'connectFailed' | 'emptyStream'> & { emptyBody?: boolean },
+  f: Pick<UpstreamFailure, 'status' | 'protocol' | 'notStreamed' | 'connectFailed' | 'emptyStream'> & { emptyBody?: boolean; body?: string },
 ): string {
   const route = f.protocol === 'openai-responses' ? '/responses' : '/chat/completions'
   const otherProtocol = f.protocol === 'openai-responses' ? 'openai' : 'openai-responses'
@@ -117,6 +140,19 @@ export function upstreamAdvice(
     return `这个地址上没有 ${route}。路由段我们会自动归一,写不写都行;要查的是 apiUrl 的**路径前缀**对不对(各家不一样:/v1、/openai/v1、/api/v1、/v1beta/openai)。如果这个网关只实现了另一种方言,把 apiProtocol 改成 ${otherProtocol}`
   }
   if (f.status === 400 || f.status === 422) {
+    /**
+     * **上下文超了要单独说。**
+     *
+     * 这一档以前和「请求体不对」共用一条建议,而那条建议的第一句是「先查 model 写得对不对」——
+     * 对一个跑到一半、上下文涨满的席位,那是让人去改一个没错的字段。
+     *
+     * 真正的修法是让自动压缩**认得这个员工的窗口**:翻译型协议的员工跑在别人的模型上,而
+     * 引擎的压缩阈值算的是父会话 Claude 模型的窗口(`runAgent.ts:352` 故意这么设),没声明
+     * 窗口时按 128k 估 —— 上游窗口比这个小,就会一直撞到这里。
+     */
+    if (looksLikeContextOverflow(f.body ?? '')) {
+      return `这是**上下文超了**,不是请求体写错。在 settings.json 里给这个员工写上 contextWindow(这台模型真正的窗口,比如 "contextWindow": 32000),自动压缩就会在撞上游之前先压一次;也可以把任务拆小、或者调低 caps.maxIterations 少攒几轮返工历史`
+    }
     return `上游拒绝了请求体(上面就是它的原话)。先查 model 写得对不对,再看它是不是根本不认 ${route} 这套字段 —— 后者换 ${otherProtocol} 协议`
   }
   if (f.status === 429) return '上游限流了。把 caps.maxSeatsPerPhase 调小以降低并发,或者把 apiToken 换成配额更宽的那个'

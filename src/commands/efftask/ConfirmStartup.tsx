@@ -4,7 +4,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, costLine, guidanceLines, mcpNoticeLines, proxyNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, contextWindowNoticeLines, costLine, guidanceLines, mcpNoticeLines, proxyNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -29,6 +29,13 @@ export function ConfirmStartup(props: {
    * 绕过代理直连(utils/lanDirect),而自动发生的事更需要在关口上说出来。
    */
   apiUrls?: (string | undefined)[]
+  /**
+   * 每个员工按哪个上下文窗口做自动压缩。**只列估出来的那些**(见 contextWindowNoticeLines)。
+   *
+   * 必须上关口:一个估出来的数决定「什么时候压缩」,而估错的两个方向代价不一样 —— 估大了
+   * 那一席跑到一半被上游拒绝,估小了白压几次。这是花钱之前唯一能说这句话的地方。
+   */
+  contextWindows?: { name?: string; window?: number; assumed?: boolean }[]
   /**
    * Role names this session can actually dispatch — spec §2 第一关's "名册可编辑".
    *
@@ -194,6 +201,14 @@ export function ConfirmStartup(props: {
         <Box flexDirection="column">
           <Text bold>出网路线:</Text>
           {proxyNoticeLines(props.apiUrls ?? []).map(l => <Text key={l} dimColor>  · {l}</Text>)}
+        </Box>
+      )}
+      {/* 上下文窗口。**自己一块,不是警告色** —— 这不是「有一部分不会生效」,而是一件
+          已经替用户定好、但他有权改的事(同「出网路线」那一块的规矩)。全都声明过时不画。 */}
+      {contextWindowNoticeLines(props.contextWindows ?? []).length > 0 && (
+        <Box flexDirection="column">
+          <Text bold>上下文窗口:</Text>
+          {contextWindowNoticeLines(props.contextWindows ?? []).map(l => <Text key={l} dimColor>  · {l}</Text>)}
         </Box>
       )}
       {noticeLines(shown).length > 0 && (

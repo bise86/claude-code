@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { MAX_UPSTREAM_BODY, upstreamAdvice, upstreamBodyText, upstreamFailureMessage } from './upstreamError.js'
+import { looksLikeContextOverflow, MAX_UPSTREAM_BODY, upstreamAdvice, upstreamBodyText, upstreamFailureMessage } from './upstreamError.js'
 
 const base = { protocol: 'openai-responses', url: 'https://gw/v1/responses', status: 502, statusText: 'Bad Gateway', body: '' }
 
@@ -20,6 +20,53 @@ describe('upstreamBodyText', () => {
     expect(out.endsWith('…')).toBe(true)
     const emoji = '👍'.repeat(MAX_UPSTREAM_BODY + 10)
     expect(upstreamBodyText(emoji)).not.toContain('�')
+  })
+})
+
+describe('上下文超了要单独说', () => {
+  const bodies = [
+    '{"error":{"message":"This model\'s maximum context length is 32768 tokens, however you requested 41000 tokens","code":"context_length_exceeded"}}',
+    '{"error":{"message":"prompt is too long: 137500 tokens > 135000 maximum"}}',
+    '{"error":{"message":"Please reduce the length of the messages."}}',
+    '{"error":{"message":"输入超出模型上下文长度限制"}}',
+    '{"error":{"message":"input tokens exceed the configured limit"}}',
+  ]
+
+  it('认得各家的写法', () => {
+    for (const b of bodies) expect(looksLikeContextOverflow(b)).toBe(true)
+  })
+
+  it('不把普通的请求体错误当成上下文超限', () => {
+    for (const b of [
+      '{"error":{"message":"model `gpt-5.9` does not exist"}}',
+      '{"error":{"message":"unsupported parameter: temperature"}}',
+      '',
+    ]) {
+      expect(looksLikeContextOverflow(b)).toBe(false)
+    }
+  })
+
+  it('400 那一档换一条建议 —— 不能再让人去查 model 名', () => {
+    for (const body of bodies) {
+      const a = upstreamAdvice({ status: 400, protocol: 'openai', body })
+      expect(a).toContain('contextWindow')
+      // 「先查 model 写得对不对」正是这条分支要顶掉的那句话
+      expect(a).not.toContain('先查 model')
+    }
+  })
+
+  it('没有上下文字样时 400 的建议逐字不变', () => {
+    const plain = upstreamAdvice({ status: 400, protocol: 'openai', body: '{"error":"bad request"}' })
+    expect(plain).toBe(upstreamAdvice({ status: 400, protocol: 'openai' }))
+  })
+
+  it('整句话里带得上这条建议', () => {
+    const msg = upstreamFailureMessage({
+      roleName: 'K3', protocol: 'openai', url: 'https://gw/v1/chat/completions',
+      status: 400, statusText: 'Bad Request', body: bodies[0]!,
+    })
+    expect(msg).toContain('contextWindow')
+    expect(msg).toContain('员工「K3」')
   })
 })
 

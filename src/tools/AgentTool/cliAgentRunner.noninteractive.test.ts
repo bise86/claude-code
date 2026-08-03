@@ -139,6 +139,49 @@ describe('runCliAgent non-interactive', () => {
     expect(capturedStdin).toBe('the exact prompt')
   })
 
+  describe('提示词按声明的窗口封顶', () => {
+    /** 抓住真正写进 stdin 的那一段 —— 判据只能是这个,不是函数的返回值。 */
+    const capture = (): { spawn: any; get: () => string } => {
+      let stdin = ''
+      return {
+        get: () => stdin,
+        spawn: () => ({
+          stdin: { write: (d: string) => { stdin += d }, end: () => {} },
+          stdout: (async function* () { yield Buffer.from('ok') })(),
+          stderr: (async function* () {})(),
+          kill: () => {}, exited: Promise.resolve(0),
+        }),
+      }
+    }
+    const run = async (agentDef: any, prompt: string, spawn: any): Promise<void> => {
+      for await (const _ of runCliAgent(
+        agentDef, { prompt, description: 'd' },
+        { options: {} } as any, (async () => ({ behavior: 'allow' })) as any, {} as any,
+        { spawn } as any,
+      )) { /* drain */ }
+    }
+
+    it('没声明窗口时一个字节都不动 —— 外部 CLI 自己带上下文管理', async () => {
+      const c = capture()
+      const long = 'x'.repeat(2_000_000)
+      await run({ execMode: 'cli', interactive: false, command: 'x' }, long, c.spawn)
+      expect(c.get()).toBe(long)
+    })
+
+    it('声明了窗口、而且真的超了,才截 —— 通知在最前面', async () => {
+      const c = capture()
+      await run({ execMode: 'cli', interactive: false, command: 'x', contextWindow: 32_000 }, 'x'.repeat(2_000_000), c.spawn)
+      expect(c.get().length).toBeLessThan(2_000_000)
+      expect(c.get().startsWith('〔提示词过长已被截断〕')).toBe(true)
+    })
+
+    it('声明了窗口但装得下时,仍然逐字原样', async () => {
+      const c = capture()
+      await run({ execMode: 'cli', interactive: false, command: 'x', contextWindow: 32_000 }, 'the exact prompt', c.spawn)
+      expect(c.get()).toBe('the exact prompt')
+    })
+  })
+
   it('trims trailing whitespace/newlines from stdout', async () => {
     const agentDef = { execMode: 'cli', interactive: false, command: 'x', args: [] } as any
     const msgs: any[] = []
