@@ -88,7 +88,7 @@ describe('runOrchestrator reports the run it just drove', () => {
     const pool = {
       init: async () => ({ ok: true }),
       acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'efftask/001/n-' + n.id, gitRoot: '/repo' }),
-      // Always conflicts: one auto-resolve, one re-acceptance, then a human is owed a card.
+      // Always conflicts: caps.mergeResolveAttempts 次自动解决(每次都重跑验收),额度用完才欠人一张卡。
       commitAndMerge: async () => { merges++; return { ok: false, kind: 'conflict', files: ['src/pay.ts'] } },
       release: async () => ({ removed: false, keptBecause: '冲突未解决' }),
       dispose: async () => ({ kept: [] }),
@@ -113,7 +113,7 @@ describe('runOrchestrator reports the run it just drove', () => {
       () => {},
     )
 
-    expect(merges).toBe(2) // original + the one bounded retry
+    expect(merges).toBe(DEFAULT_CAPS.mergeResolveAttempts! + 1) // original + 每次自动解决之后的一次重试
     expect(escalations).toEqual([{ branch: 'efftask/001/n-root', path: '/wt/root', files: ['src/pay.ts'] }])
     expect(outcomes[0]?.status).toBe('blocked')
   })
@@ -263,6 +263,8 @@ describe('收口:跑完就把产出送回当前目录', () => {
     commits?: number
     answers?: Record<string, { code?: number; stdout?: string; stderr?: string }>
     withGit?: boolean
+    /** 收口撞上冲突时被派去解冲突的那一位。默认什么都不回答(这条路上没人调用它)。 */
+    runAgent?: RunAgentFn
   } = {}) => {
     const fs = memFs()
     const g = git(over.answers)
@@ -278,7 +280,7 @@ describe('收口:跑完就把产出送回当前目录', () => {
     const settledWithHandoff: boolean[] = []
     await runOrchestrator(
       {
-        config, runDir: '/run/004', fs, runAgent: (async () => '') as RunAgentFn,
+        config, runDir: '/run/004', fs, runAgent: over.runAgent ?? ((async () => '') as RunAgentFn),
         signal: new AbortController().signal, worktrees: poolWithCommits(over.commits ?? 3) as never,
         seed: doneSeed() as never, cwd: '/repo',
         ...(over.withGit === false ? {} : { git: g.fn as never }),
@@ -888,5 +890,76 @@ describe('运行中调过的并发度要落进 run.md', () => {
     )
     expect(fs.files.get('/run/008/run.md') ?? '').toContain('parallelism: 5')
     expect(config.parallelism).toBe(5)
+  })
+})
+
+describe('收口撞上冲突:模型先解一次(用户要求的那件事)', () => {
+  /**
+   * 这一跳只能在 runOrchestrator 这一层断:`makeHandoffConflictResolver` 要一个根节点,
+   * 而根节点是 `liveNodes` 里的 —— 那份数组由编排器在 run 之后填,收口读的就是它。
+   * 断在 finishHandoff 那一层只能证明「传下去的东西会被用」,证明不了这里传了东西。
+   */
+  it('冲突 → 真的派出一次带写工具的模型调用,解完复核通过就提交', async () => {
+    const fs = memFs()
+    const calls: string[][] = []
+    let statuses = 0
+    const git = async (args: string[]) => {
+      calls.push(args)
+      const [a, b] = args
+      if (a === 'diff') return { code: 0, stdout: '', stderr: '' }
+      if (a === 'symbolic-ref') return { code: 0, stdout: 'refs/heads/main\n', stderr: '' }
+      if (a === 'rev-parse') return { code: 0, stdout: 'cafe123\n', stderr: '' }
+      if (a === 'merge' && b === '--abort') return { code: 0, stdout: '', stderr: '' }
+      if (a === 'merge') return { code: 1, stdout: '', stderr: 'CONFLICT (content): Merge conflict in pay.ts' }
+      // 第一次问是合并之后(有冲突),之后是模型解完之后(干净)。
+      if (a === 'status') return { code: 0, stdout: statuses++ === 0 ? 'UU pay.ts\n' : '', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    const dispatched: { phase: string; cwd?: string; prompt: string; nodeId: string }[] = []
+    const runAgent: RunAgentFn = async req => {
+      dispatched.push({ phase: req.phase, cwd: req.cwd, prompt: req.prompt, nodeId: req.node.id })
+      return ''
+    }
+    const results: { merged: boolean; result?: { ok: boolean; message: string } }[] = []
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/005', fs, runAgent,
+        signal: new AbortController().signal,
+        worktrees: {
+          init: async () => ({ ok: true }),
+          acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b', gitRoot: '/repo' }),
+          commitAndMerge: async () => ({ ok: true, merged: true }),
+          release: async () => ({ removed: true }),
+          dispose: async () => ({ kept: [] }),
+          handoff: async () => ({ branch: 'efftask/005/integration', commits: 3, kept: [], salvage: [], integrationPath: '/wt/integration' }),
+          withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+          integrationPath: '/wt/integration',
+          integrationBranchName: 'efftask/005/integration',
+        } as never,
+        seed: [{
+          id: 'root', title: '根任务', goal: 'g', parentId: null, childIds: [], deps: [],
+          kind: 'executable' as const, status: 'ACCEPTED' as const,
+          phaseRoles: emptyPhaseRoles(),
+          plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+          execStatus: '做完了', blockedReason: '', reviewLog: [], acceptLog: [], score: {},
+          iteration: { planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+          depth: 0, createdAt: 'T0', updatedAt: 'T0',
+        }] as never,
+        cwd: '/repo', git: git as never,
+        onHandoffResult: r => results.push(r as never),
+      },
+      () => {}, () => {}, () => {},
+    )
+    expect(dispatched.length).toBe(1)
+    // execute 才带写工具;跑在**用户的检出**里,不是隔离工作区 —— 冲突现场在那儿。
+    expect(dispatched[0]!.phase).toBe('execute')
+    expect(dispatched[0]!.cwd).toBe('/repo')
+    expect(dispatched[0]!.nodeId).toBe('root')
+    expect(dispatched[0]!.prompt).toContain('pay.ts')
+    expect(dispatched[0]!.prompt).toContain('efftask/005/integration')
+    // 解完了才提交,而且屏幕上说的是实话。
+    expect(calls.some(c => c[0] === 'commit')).toBe(true)
+    expect(results[0]?.merged).toBe(true)
+    expect(results[0]?.result?.message).toContain('已自动解决')
   })
 })

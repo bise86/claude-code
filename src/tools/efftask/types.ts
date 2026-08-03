@@ -615,9 +615,33 @@ export interface Caps {
    * 默认保持精化:改默认会让已经配了多席的用户什么都没动,而成本和形态都变了。
    */
   planConverge?: '圆桌' | '精化'
+  /**
+   * 一次运行里,同一个节点最多**自动解几次合并冲突**。默认 6。
+   *
+   * 为什么这么多:每一次解决之后都要重跑一次验收,而**被验收否决**是这条路上最常见的
+   * 结局 —— 而否决理由恰恰是解决者最需要、上一次调用时还不存在的信息。给的次数就是
+   * 「带着新意见再改一版」的次数;给 1 次等于「第一版就得对」,而叫醒一个人的代价比
+   * 多打几次模型调用高得多。
+   *
+   * **按运行计,不是终身计**(见 PipelineCtx.mergeResolveThisRun):`--resume` 回来重新
+   * 给满。所以这个数是「一口气自己试几次」,不是「这个节点这辈子的额度」。
+   *
+   * 0 是合法值,含义是**关掉自动解决**:冲突直接升级人工。想要旧那种「只试一次」的
+   * 行为写 1。
+   */
+  mergeResolveAttempts?: number
 }
+/** `caps.mergeResolveAttempts` 的合法区间。一份真相,parseDirectives / resumeCore 共用。 */
+export const MIN_MERGE_RESOLVE = 0
+/**
+ * 上限 20。再往上不是给用户更多能力,而是让一个**解不动**的冲突把整轮预算烧在同一棵
+ * 越改越脏的树上 —— 每一次都从上一次改过的状态开始,而且每一次都要再开一场验收圆桌。
+ */
+export const MAX_MERGE_RESOLVE = 20
 export const DEFAULT_CAPS: Caps = {
   maxDepth: 5, maxNodes: 100, maxIterations: 3,
+  // 6 次自动解冲突。理由见 Caps.mergeResolveAttempts —— 关键是「叫醒人」的代价。
+  mergeResolveAttempts: 6,
   // 静默 10 分钟 = 挂死。作为「一条消息都不吐」的判据,这个数已经很宽松了。
   nodeTimeoutMs: 600_000,
   // 7 天。人不在键盘前是常态。

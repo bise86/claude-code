@@ -209,3 +209,139 @@ describe('丢弃 —— 唯一不可逆的那个', () => {
     expect(lines).toContain('run 目录')
   })
 })
+
+describe('收口合并撞上冲突:先让模型解一次', () => {
+  /**
+   * 这一组不用上面那个 `gitOf`:它按 `args.slice(0, 2)` 建键,而这条路上
+   * `diff --cached --quiet`(脏树判据)和 `diff --cached -U0 --`(冲突标记复核)会撞成
+   * 同一个键 —— 两件完全不同的事共用一个夹具答案,测出来的东西就不是被测的东西了。
+   */
+  const fakeGit = (over: {
+    mergeFails?: boolean
+    /** `git status --porcelain` 依次返回的内容 —— 合并后、模型解完后。 */
+    statuses?: string[]
+    stagedDiff?: string
+    commitFails?: boolean
+    abortFails?: boolean
+    addFails?: boolean
+  } = {}): { git: GitFn; calls: string[][] } => {
+    const calls: string[][] = []
+    let statusIdx = 0
+    const statuses = over.statuses ?? ['UU a.ts\n', '']
+    const git: GitFn = async args => {
+      calls.push(args)
+      const [a, b] = args
+      if (a === 'diff' && args.includes('--quiet')) return { code: 0, stdout: '', stderr: '' }
+      if (a === 'rev-parse') return { code: 0, stdout: 'abc1234\n', stderr: '' }
+      if (a === 'merge' && b === '--abort') return { code: over.abortFails ? 1 : 0, stdout: '', stderr: '' }
+      if (a === 'merge') {
+        return over.mergeFails === false
+          ? { code: 0, stdout: '', stderr: '' }
+          : { code: 1, stdout: '', stderr: 'CONFLICT (content): Merge conflict in a.ts' }
+      }
+      if (a === 'status') {
+        const out = statuses[Math.min(statusIdx, statuses.length - 1)] ?? ''
+        statusIdx++
+        return { code: 0, stdout: out, stderr: '' }
+      }
+      if (a === 'add') return { code: over.addFails ? 1 : 0, stdout: '', stderr: 'add 炸了' }
+      if (a === 'diff') return { code: 0, stdout: over.stagedDiff ?? '', stderr: '' }
+      if (a === 'commit') return { code: over.commitFails ? 1 : 0, stdout: '', stderr: 'commit 炸了' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    return { git, calls }
+  }
+
+  it('模型解完、git 复核通过 → 真的提交,并告诉用户怎么撤销', async () => {
+    // 用户原话:「这个应该要模型自动解决冲突问题」。这条路以前只会把冲突现场丢给他。
+    const seen: { files: string[]; branch: string; cwd: string }[] = []
+    const { git, calls } = fakeGit()
+    const r = await runHandoffChoice('merge', H, git, '/repo', async info => { seen.push(info) })
+    expect(r.ok).toBe(true)
+    expect(r.message).toContain('已自动解决')
+    expect(calls.some(c => c[0] === 'commit')).toBe(true)
+    // 解决者知道自己在解谁、解哪些文件、在哪解 —— 少一样它都只能猜。
+    expect(seen).toEqual([{ files: ['a.ts'], branch: H.branch, cwd: '/repo' }])
+    // 撤销命令带真实的 sha:给一条错的 reset 目标比不给危险得多。
+    expect(r.followUps!.join('\n')).toContain('git reset --hard abc1234')
+    // 没人复核过这份解决,这句话不能省。
+    expect(r.followUps!.join('\n')).toContain('没有经过评审')
+  })
+
+  it('只 add 冲突的那几个文件,不 `add -A`', async () => {
+    // `add -A` 会把用户检出里本来就有的未跟踪文件一起卷进这次合并提交 —— 而这次合并是
+    // 自动发生的,他根本不知道有东西被提交了。
+    const { git, calls } = fakeGit()
+    await runHandoffChoice('merge', H, git, '/repo', async () => {})
+    const add = calls.find(c => c[0] === 'add')!
+    expect(add).toEqual(['add', '--', 'a.ts'])
+  })
+
+  it('模型说解完了但还有未合并路径 → 不提交,还原工作区', async () => {
+    // 模型的自述不是判据。git 说了算。
+    const { git, calls } = fakeGit({ statuses: ['UU a.ts\n', 'UU a.ts\n'] })
+    const r = await runHandoffChoice('merge', H, git, '/repo', async () => {})
+    expect(r.ok).toBe(false)
+    expect(r.message).toContain('仍有未解决的冲突文件')
+    expect(calls.some(c => c[0] === 'commit')).toBe(false)
+    expect(calls.some(c => c[0] === 'merge' && c[1] === '--abort')).toBe(true)
+    expect(r.followUps!.join('\n')).toContain('已还原到合并前')
+  })
+
+  it('解决结果里还留着冲突标记 → 不提交,还原工作区', async () => {
+    // 「把两边都留下」是解冲突最常见的假动作:文件里 <<<<<<< 原样躺着,而 git 认为已解决。
+    const { git, calls } = fakeGit({
+      stagedDiff: '+++ b/a.ts\n+<<<<<<< HEAD\n+旧的\n+>>>>>>> efftask/001/integration\n',
+    })
+    const r = await runHandoffChoice('merge', H, git, '/repo', async () => {})
+    expect(r.ok).toBe(false)
+    expect(r.message).toContain('还留着冲突标记')
+    expect(r.message).toContain('a.ts')
+    expect(calls.some(c => c[0] === 'commit')).toBe(false)
+  })
+
+  it('光杆 `=======` 不算冲突标记 —— 那是 Markdown 的下划线', async () => {
+    // 反过来的代价更大:一份好的解决被判成没解干净,然后被 abort 掉。真的残留三种标记都在。
+    const { git, calls } = fakeGit({ stagedDiff: '+++ b/README.md\n+标题\n+=======\n' })
+    const r = await runHandoffChoice('merge', H, git, '/repo', async () => {})
+    expect(r.ok).toBe(true)
+    expect(calls.some(c => c[0] === 'commit')).toBe(true)
+  })
+
+  it('解决调用自己抛了 → 还原工作区,并说清是调用失败', async () => {
+    const { git, calls } = fakeGit()
+    const r = await runHandoffChoice('merge', H, git, '/repo', async () => { throw new Error('上游限流') })
+    expect(r.ok).toBe(false)
+    expect(r.message).toContain('上游限流')
+    expect(calls.some(c => c[0] === 'merge' && c[1] === '--abort')).toBe(true)
+  })
+
+  it('提交失败也要还原,不能把半合并留给用户', async () => {
+    const { git, calls } = fakeGit({ commitFails: true })
+    const r = await runHandoffChoice('merge', H, git, '/repo', async () => {})
+    expect(r.ok).toBe(false)
+    expect(r.message).toContain('提交失败')
+    expect(calls.some(c => c[0] === 'merge' && c[1] === '--abort')).toBe(true)
+  })
+
+  it('连 --abort 都失败时,如实说工作区还停在半合并状态', async () => {
+    // 这时候说「已还原到合并前」就是一句可照做的假话:他会以为不用管。
+    const { git } = fakeGit({ abortFails: true, statuses: ['UU a.ts\n', 'UU a.ts\n'] })
+    const r = await runHandoffChoice('merge', H, git, '/repo', async () => {})
+    expect(r.ok).toBe(false)
+    const ups = r.followUps!.join('\n')
+    expect(ups).toContain('未完成的合并')
+    expect(ups).toContain('git merge --abort')
+    expect(ups).not.toContain('已还原到合并前')
+  })
+
+  it('不给解决者时行为一个字节都不变 —— 留下现场,让用户自己解', async () => {
+    // 关口/收口以外的调用点(测试、别的分支)不该因为这个特性而改变行为。
+    const { git, calls } = fakeGit()
+    const r = await runHandoffChoice('merge', H, git, '/repo')
+    expect(r.ok).toBe(false)
+    expect(r.message).toContain('合并失败')
+    expect(calls.some(c => c[0] === 'merge' && c[1] === '--abort')).toBe(false)
+    expect(r.followUps!.join('\n')).toContain('未完成的合并')
+  })
+})

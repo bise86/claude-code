@@ -15,6 +15,7 @@ import { createRateLimitGate } from '../../tools/efftask/rateLimitGate.js'
 import { searchUnavailableReason } from '../../utils/ripgrep.js'
 import { SKILL_TOOL_NAME } from '../../tools/SkillTool/constants.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
+import type { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
@@ -22,8 +23,10 @@ import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/pers
 import { failedRedoTarget, forcePassFailedPhaseReason, redoContextOf, redoUnavailableReason, skipFailedPhaseReason, type RedoEntry, type RedoPlan } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
 import { runForcePass, runRedo, runSkip } from '../../tools/efftask/redoRun.js'
+import { liveRedoUnavailableReason } from '../../tools/efftask/liveRedo.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
 import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
+import { makeHandoffConflictResolver } from '../../tools/efftask/handoffResolve.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
 import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResumeArgs.js'
 import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resumeCore.js'
@@ -768,6 +771,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 那三个运行中的干预键(p / i / x)一起消失,而什么都没有出错。
    */
   const [forcePassFrom, setForcePassFrom] = React.useState<Phase>('done')
+  /**
+   * 重做 / 跳过关口开之前是哪一屏。和 `forcePassFrom` 同一个理由,只是它们晚了一步才
+   * 需要:在「运行中也能重做」之前,这两个关口只可能从结束屏进来。
+   *
+   * 它决定的不只是取消时回哪一屏 —— 还决定这次重做是**并进正在跑的那一棵树**还是
+   * **重启一个编排器**(见 redoDeps 的 `from`)。写死 'done' 的话,运行中按下的重做会
+   * 在别的节点还跑着的时候另起一个编排器,同一批节点被派两遍。
+   */
+  const [redoFrom, setRedoFrom] = React.useState<Phase>('done')
   /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
   const [redoProblems, setRedoProblems] = React.useState<string[]>([])
   /**
@@ -862,6 +874,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const { columns: termColumns } = useTerminalSize()
   /** 并行占用 reader, handed over once by runOrchestrator. */
   const poolRead = React.useRef<(() => { inUse: number; limit: number }) | null>(null)
+  /**
+   * 正在跑的那个编排器 —— **运行中重做**唯一的把手(用户原话:「不需要整体返回失败才能
+   * 重做任务或阶段,在其它任务还在运行时就可以重做」)。
+   *
+   * 跑完会被置回 null(runOrchestrator 在 finally 里交还),所以「现在还有没有人在听」
+   * 这个判断读它就够了 —— 而那个判断决定这次重做是就地换树还是重启编排。
+   */
+  const orchRef = React.useRef<EffTaskOrchestrator | null>(null)
   const [summary, setSummary] = React.useState<ResumeSummary | null>(null)
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
@@ -1192,6 +1212,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         cwd: getCwd(),
         // 并行占用 (spec §10.1). One call, storing a live reader for the status bar.
         onPool: read => { poolRead.current = read },
+        // 运行中重做的把手。两次调用都要收:开跑时存下,跑完时置回 null。
+        onOrchestrator: o => { orchRef.current = o ?? null },
         /**
          * 收口(spec §8 的自动那一半):跑完就把集成分支合回**当前目录**。
          *
@@ -1274,7 +1296,21 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 抽出来是因为「按下确认之后要做的六件事」漏掉任何一件的后果都是「界面纹丝不动」,
    * 而那正是验收在这个文件里造出 14 条存活变异的地方。一份实现,两个入口。
    */
-  const redoDeps = React.useCallback((cfg: EffTaskConfig, dir: string) => ({
+  /**
+   * 一次重做的六步接线。`from` 决定**最后一步**是什么:
+   *
+   *  - `'done'`(结束屏那条路):`start` = 起一个新的编排器,把新树当种子;
+   *  - `'running'`(运行中那条路):`start` = 把新树并进**正在跑的**那一棵,并且在落盘
+   *    之前先用 `hold` 把要动的节点从调度里扣下来(见 redoRun 的 canApply)。
+   *
+   * 起第二个编排器是运行中最不能做的事:此刻别的节点正在跑,老编排器仍持有它们的在飞
+   * 调用、仍会 commit 进自己那棵树,而新编排器会把同一批节点再派一遍 —— 这个仓库为
+   * 「三下回车起了三个编排器」已经付过一次学费。
+   */
+  const redoDeps = React.useCallback((cfg: EffTaskConfig, dir: string, from: 'running' | 'done' = 'done') => {
+    /** 运行中那条路上,`canApply` 扣住的那批节点由 `start` 释放。 */
+    let hold: { release: () => void } | null = null
+    return ({
     commit: (plan: RedoPlan, before: readonly TaskNode[]) => commitRedo(
       {
         fs: props.fs, runDir: dir, config: cfg, pool: poolRef.current ?? undefined,
@@ -1289,10 +1325,49 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
      */
     onDropStreams: (ids: readonly string[]) => { streams.current.dropNodes(ids) },
     onNodes: setNodes,
-    start: (n: TaskNode[]) => startRun(cfg, n),
-    onDone: () => setPhase('done'),
+    /**
+     * 落盘之前的那一问,**只在运行中那条路上有**。
+     *
+     * 编排器已经跑完(orchRef 是 null)时返回 undefined 而不是一句拒绝:那意味着这次
+     * 重做该走结束屏那条路,而下面的 `start` 也会照着同一个判据去 startRun。两处判据
+     * 必须是同一个,否则会出现「问的时候说在跑、做的时候说没在跑」。
+     */
+    canApply: from === 'running'
+      ? (affected: readonly string[]): string | undefined => {
+        const orch = orchRef.current
+        if (!orch) return undefined
+        const held = orch.hold(affected)
+        if (!held.ok) return held.reason
+        hold = held
+        return undefined
+      }
+      : undefined,
+    start: (n: TaskNode[], affected: readonly string[]) => {
+      const orch = from === 'running' ? orchRef.current : null
+      if (!orch) { hold?.release(); startRun(cfg, n); return }
+      const applied = orch.applyLive(n, affected)
+      // 扣住的一定要放回去 —— 换树成功与否都放:失败时那批节点得能继续被调度
+      // (它们此刻在盘上是重做后的样子,但内存里还是旧的,让运行照旧继续是唯一诚实的结局)。
+      hold?.release()
+      if (!applied.ok) {
+        /**
+         * 换树没成 —— 而**盘上已经是新树了**。如实说,并且给出唯一能兑现的下一步。
+         *
+         * 这一句在正常情况下到不了(hold 已经把窗口关掉了),留着是因为它描述的状态
+         * 真实存在:磁盘和内存不一致时,用户唯一的出路是让这一轮跑完再 /et --resume。
+         */
+        setRedoProblems([
+          `${applied.reason} —— 这次重做已经写进磁盘,但没有并进正在跑的那一轮;` +
+          `等本轮结束后 /et --resume 会按重做后的树继续。`,
+        ])
+        return
+      }
+      setPhase('running')
+    },
+    onDone: () => { hold?.release(); setPhase(from) },
+    })
     // biome-ignore lint/correctness/useExhaustiveDependencies: props are stable for a mount
-  }), [props.fs, startRun])
+  }, [props.fs, startRun])
 
   /** 这次重做/跳过要按哪份环节实况算 —— 关口预演和真正执行必须是同一份。 */
   const phaseCtxOf = React.useCallback(
@@ -1314,9 +1389,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // 可以不一样,而用户是照着屏幕按的确认。
     void runRedo(
       nodes, target.id, entry, new Date().toISOString(),
-      redoDeps(cfg, runDir), phaseCtxOf(target, cfg), guidance,
+      redoDeps(cfg, runDir, redoFrom === 'running' ? 'running' : 'done'), phaseCtxOf(target, cfg), guidance,
     )
-  }, [config, runDir, nodes, redoDeps, phaseCtxOf])
+  }, [config, runDir, nodes, redoDeps, phaseCtxOf, redoFrom])
 
   /**
    * 执行一次「跳过失败的环节」。
@@ -1332,9 +1407,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     setSkipTarget(null)
     void runSkip(
       nodes, target.id, new Date().toISOString(),
-      redoDeps(cfg, runDir), phaseCtxOf(target, cfg), guidance,
+      redoDeps(cfg, runDir, redoFrom === 'running' ? 'running' : 'done'), phaseCtxOf(target, cfg), guidance,
     )
-  }, [config, runDir, nodes, redoDeps, phaseCtxOf])
+  }, [config, runDir, nodes, redoDeps, phaseCtxOf, redoFrom])
 
   /**
    * 执行一次「强制通过失败的环节」—— 阻断后那条路。
@@ -1351,9 +1426,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     setForcePassTarget(null)
     void runForcePass(
       nodes, target.id, new Date().toISOString(),
-      redoDeps(cfg, runDir), phaseCtxOf(target, cfg), guidance,
+      redoDeps(cfg, runDir, forcePassFrom === 'running' ? 'running' : 'done'), phaseCtxOf(target, cfg), guidance,
     )
-  }, [config, runDir, nodes, redoDeps, phaseCtxOf])
+  }, [config, runDir, nodes, redoDeps, phaseCtxOf, forcePassFrom])
 
   /**
    * 执行收口选择,然后把待收口记录从 run.md 里划掉。
@@ -1366,7 +1441,18 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     if (!h || !runId) return
     let result: HandoffResult
     try {
-      result = await runHandoffChoice(choice, h, gitRunner, getCwd())
+      /**
+       * 关口里那次合并也让模型先解一次冲突 —— 和自动收口(runOrchestrator)同一件事,
+       * 不能只在一条路上有:两条路合的是同一条分支、进的是同一个检出,行为不一样的话
+       * 「跑完直接合」和「resume 进关口再合」会给出两种结果,而用户根本不知道自己走的是哪条。
+       *
+       * 拿不到根节点(恢复路径下 nodes 尚未载入)就不接线,退回留下冲突现场的老行为。
+       */
+      const root = nodes.find(n => n.id === 'root')
+      result = await runHandoffChoice(
+        choice, h, gitRunner, getCwd(),
+        root ? makeHandoffConflictResolver({ runAgent: props.runAgent, node: root, signal: props.signal }) : undefined,
+      )
     } catch (e) {
       result = { ok: false, message: `收口失败: ${e instanceof Error ? e.message : String(e)}` }
     }
@@ -1404,7 +1490,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // props.effRoot,不是裸 effRoot:那个绑定只存在于 call() 的作用域,组件里没有。
   // 依赖数组**每次 render 都求值**,所以裸写它 = EffTaskRunner 第一次渲染就抛
   // ReferenceError,/et 输入任何内容都只得到一屏红色堆栈,一次模型调用都没有。
-  }, [pendingHandoff, runId, props.effRoot, props.fs])
+  }, [pendingHandoff, runId, props.effRoot, props.fs, props.runAgent, props.signal, nodes])
 
   // ---- 启动关口第三关: 起草根方案 + 首层任务树 (spec §2) ----
   React.useEffect(() => {
@@ -1753,7 +1839,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 失败在分析环节的拆分型节点,它的入口是「任务重做」,而那一条会删掉整棵子树。
         initialEntry={redoEntry ?? undefined}
         onConfirm={(entry, guidance) => applyRedo(redoTarget, entry, guidance)}
-        onCancel={() => { setRedoTarget(null); setRedoEntry(null); setPhase('done') }}
+        // 取消要回**它来的那一屏**。写死 done 的话,运行中按 r 又按 Esc,run 还在跑而
+        // 界面已经变成结束屏 —— 树不再更新,p / i / x 三个干预键一起消失,什么都没出错。
+        onCancel={() => { setRedoTarget(null); setRedoEntry(null); setPhase(redoFrom) }}
       />
     )
   }
@@ -1767,7 +1855,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 屏幕上算出来的后果和实际发生的可以不一样。
         phases={phaseCtxOf(skipTarget, config)}
         onConfirm={guidance => applySkip(skipTarget, guidance)}
-        onCancel={() => { setSkipTarget(null); setPhase('done') }}
+        onCancel={() => { setSkipTarget(null); setPhase(redoFrom) }}
       />
     )
   }
@@ -1816,6 +1904,46 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 算出可选的环节并逐条说明原因,而在这儿再判一次就是第二份判据。
        */
       onForcePass={node => { setForcePassTarget(node); setForcePassFrom('running'); setPhase('confirmForcePass') }}
+      /**
+       * 运行中的重做三键。**别的任务照常跑** —— 确认之后新树是被并进正在跑的那一棵,
+       * 不是另起一个编排器(见 redoDeps 的 `from` 和 orchestrator.applyLive)。
+       *
+       * 这里只挡一件事:**目标节点自己正在跑**。那种情形下重做要先把它停下来,而替用户
+       * 决定「砍掉它正在飞的调用」不是这个键该做的事 —— 说清楚让他按 x。剩下的判断
+       * (这个环节能不能重入、会删掉几个子任务)照旧归关口和 failedRedoTarget。
+       */
+      onRedo={node => {
+        const why = liveRedoUnavailableReason({
+          running: orchRef.current !== null,
+          nodeRunning: orchRef.current?.runningNodeIds().includes(node.id) === true,
+          title: node.title,
+        })
+        if (why) { setRedoProblems([why]); return }
+        setRedoTarget(node); setRedoEntry(null); setRedoFrom('running'); setPhase('confirmRedo')
+      }}
+      onRedoFailed={node => {
+        const why = liveRedoUnavailableReason({
+          running: orchRef.current !== null,
+          nodeRunning: orchRef.current?.runningNodeIds().includes(node.id) === true,
+          title: node.title,
+        })
+        if (why) { setRedoProblems([why]); return }
+        const byId = new Map(nodes.map(n => [n.id, n]))
+        const found = failedRedoTarget(node, byId, config ? phaseCtxOf(node, config) : undefined)
+        if ('error' in found) { setRedoProblems([found.error]); return }
+        setRedoTarget(node); setRedoEntry(found.entry); setRedoFrom('running'); setPhase('confirmRedo')
+      }}
+      onSkipFailed={node => {
+        const why = liveRedoUnavailableReason({
+          running: orchRef.current !== null,
+          nodeRunning: orchRef.current?.runningNodeIds().includes(node.id) === true,
+          title: node.title,
+        })
+        if (why) { setRedoProblems([why]); return }
+        const blocked = skipFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
+        if (blocked) { setRedoProblems([blocked]); return }
+        setSkipTarget(node); setRedoFrom('running'); setPhase('confirmSkip')
+      }}
       runControl={{
         paused,
         // 真相在 control 里,state 只是让提示行重绘 —— 两边分开的话它们迟早不一致,
@@ -1854,7 +1982,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 挡在**按键这一刻**,而不是让他选完环节、看完后果、确认完再看一遍失败。
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
         if (why) { setRedoProblems([why]); return }
-        setRedoTarget(node); setRedoEntry(null); setPhase('confirmRedo')
+        setRedoTarget(node); setRedoEntry(null); setRedoFrom('done'); setPhase('confirmRedo')
       }}
       /**
        * 快速重做失败的那个环节(`R`)。
@@ -1870,7 +1998,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         const found = failedRedoTarget(node, byId, config ? phaseCtxOf(node, config) : undefined)
         // 拿不到就**说原因**,而不是把用户送进一屏什么都按不动的关口。
         if ('error' in found) { setRedoProblems([found.error]); return }
-        setRedoTarget(node); setRedoEntry(found.entry); setPhase('confirmRedo')
+        setRedoTarget(node); setRedoEntry(found.entry); setRedoFrom('done'); setPhase('confirmRedo')
       }}
       /** 跳过失败的那个环节继续往下走(`s`)。同样两道闸门,同样的顺序。 */
       onSkipFailed={viewOnly ? undefined : node => {
@@ -1878,7 +2006,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         if (why) { setRedoProblems([why]); return }
         const blocked = skipFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
         if (blocked) { setRedoProblems([blocked]); return }
-        setSkipTarget(node); setPhase('confirmSkip')
+        setSkipTarget(node); setRedoFrom('done'); setPhase('confirmSkip')
       }}
       /**
        * 强制通过失败的那个环节(`f`)。闸门和 `s` 逐字相同(它们共用一份实现),
@@ -1953,6 +2081,18 @@ export function RunningView(props: {
    * 它的落点是 `setPhase('confirmForcePass')`,不是一个即时动作。
    */
   onForcePass?: (node: TaskNode) => void
+  /**
+   * 运行中的重做三键(`r` 任务/阶段重做、`R` 快速重做失败环节、`s` 跳过失败环节)。
+   *
+   * 用户原话:「任务失败了,不需要整体返回失败才能重做任务或阶段,在其它任务还在运行时
+   * 就可以重做。」在这之前这三个键**只挂在结束屏上** —— 一个节点在第三分钟失败,用户要
+   * 等整棵树跑完、拿到一个 blocked,才能去动它。
+   *
+   * 和 `onForcePass` 一样是「弹一屏关口」而不是即时动作,所以和 runControl 分开传。
+   */
+  onRedo?: (node: TaskNode) => void
+  onRedoFailed?: (node: TaskNode) => void
+  onSkipFailed?: (node: TaskNode) => void
 }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
@@ -1960,7 +2100,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.

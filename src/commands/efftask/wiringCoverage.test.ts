@@ -195,7 +195,7 @@ describe('收口关口的接线(spec §8)', () => {
   })
 
   it('选择真的会去跑 git,而不是只切个界面', () => {
-    expect(SRC).toContain('runHandoffChoice(choice, h, gitRunner, getCwd())')
+    expect(SRC).toContain('runHandoffChoice(\n        choice, h, gitRunner, getCwd(),')
   })
 
   it('成功之后把待收口从 run.md 划掉,失败则留着', () => {
@@ -571,15 +571,22 @@ describe('改回去要变红的四处', () => {
     // 四条出口现在住在 redoDeps 里 —— 重做和跳过共用一份(见 redoRun.ts 的注释:
     // 两份实现意味着第二次踩同一组坑)。
     const body = SRC.slice(SRC.indexOf('const redoDeps = React.useCallback'))
-    const head = body.slice(0, 1200)
+    // 窗口按**下一个声明**切,不按字符数:redoDeps 的注释会随功能变长,而一个按 1200 字符
+    // 切出来的窗口迟早把 `start:` 挤到外面 —— 那时这条闸门会因为「找不到」而变红,
+    // 读起来像接线断了,实际上只是注释多写了几行。
+    const head = body.slice(0, body.indexOf('const phaseCtxOf'))
     // 落盘:少了它,树只在内存里改过,下次 --resume 全丢。
     expect(head).toMatch(/commit:\s*\(plan: RedoPlan, before: readonly TaskNode\[\]\) => commitRedo\(/)
     // 重启:startRun 是这个文件里 runOrchestrator 的**唯一**调用点。少了它,用户按完
     // 确认会看到树变了、节点退回排队中,然后永远停在那儿。
-    expect(head).toMatch(/start:\s*\(n: TaskNode\[\]\) => startRun\(cfg, n\)/)
+    // 重启 / 就地换树:两条路共用这一个出口(见 redoDeps 的 `from`)。少了它,用户按完
+    // 确认会看到树变了、节点退回排队中,然后永远停在那儿。
+    expect(head).toMatch(/start:\s*\(n: TaskNode\[\], affected: readonly string\[\]\) => \{/)
+    expect(head).toContain('startRun(cfg, n); return')
+    expect(head).toContain('orch.applyLive(n, affected)')
     // 两个入口都真的用了这份 deps。少了任何一个,那条路的六件事一件都不会发生。
-    expect(SRC).toMatch(/runRedo\([\s\S]{0,220}redoDeps\(cfg, runDir\)/)
-    expect(SRC).toMatch(/runSkip\([\s\S]{0,220}redoDeps\(cfg, runDir\)/)
+    expect(SRC).toMatch(/runRedo\([\s\S]{0,220}redoDeps\(cfg, runDir, /)
+    expect(SRC).toMatch(/runSkip\([\s\S]{0,220}redoDeps\(cfg, runDir, /)
     // 补充指引一路交到底 —— 见上面那条注释。
     expect(SRC).toMatch(/runRedo\([\s\S]{0,260}guidance,/)
     expect(SRC).toMatch(/runSkip\([\s\S]{0,260}guidance,/)
@@ -647,25 +654,35 @@ describe('改回去要变红的四处', () => {
     expect(SRC).toContain('setParallelismTick(t => t + 1)')
   })
 
-  it('运行中的树上**没有** r / R / s 三个键 —— 编排器正握着这些节点', () => {
+  it('运行中的树上**有** r / R / s 三个键,而且走的是就地换树那条路', () => {
     /**
-     * README 明写着这一条,而它此前**没有任何东西守着**:给 `RunningView` 接上
-     * `onRedo` / `onRedoFailed` / `onSkipFailed` 三个回调,全套测试 0 fail(验收实测)。
-     * 接上去的后果是重做会在编排器正在改这些节点的时候动它们 —— 而 `redoUnavailableReason`
-     * 那道闸门只挡「被 Esc 中断过的 run」,挡不住「run 还在跑」。
+     * 用户原话:「任务失败了,不需要整体返回失败才能重做任务或阶段,在其它任务还在运行时
+     * 就可以重做。」在这之前这三个键只挂在结束屏上 —— 一个节点在第三分钟失败,他要等
+     * 整棵树跑完、拿到一个 blocked,才能去动它。
+     *
+     * **接上去本身不是安全的**,而这条闸门守的正是那个差别:此前不接的理由是「编排器正
+     * 握着这些节点」,那个理由今天由两道真闸门顶着,而不是由「键不存在」顶着 ——
+     *  1. `liveRedoUnavailableReason`:目标节点自己正在跑就不许重做(让用户先按 x);
+     *  2. `orchestrator.hold`:落盘**之前**把要动的节点从调度里扣下来,换完树再放。
+     * 少了任何一道,重做就会在编排器正在改这些节点的时候动它们。
      *
      * 断言落在**渲染 RunningView 的那一处 JSX** 上:它是这个挂不起来的文件里唯一的接线点。
      */
     const running = element('RunningView')
     expect(running).toContain('runControl={{')
     for (const wire of ['onRedo=', 'onRedoFailed=', 'onSkipFailed=']) {
-      expect(`RunningView 上有 ${wire}: ${running.includes(wire)}`).toBe(`RunningView 上有 ${wire}: false`)
+      expect(`RunningView 上有 ${wire}: ${running.includes(wire)}`).toBe(`RunningView 上有 ${wire}: true`)
     }
-    // 而 DoneView 上三个都在 —— 否则这条断言用「两边都没有」也能满足。
+    // DoneView 上三个也都在 —— 否则这条断言用「两边都有」也能被一个把结束屏拆了的改动满足。
     const done = SRC.slice(SRC.indexOf('<DoneView'))
     for (const wire of ['onRedo=', 'onRedoFailed=', 'onSkipFailed=']) {
       expect(`DoneView 上有 ${wire}: ${done.includes(wire)}`).toBe(`DoneView 上有 ${wire}: true`)
     }
+    // 两道闸门都真的接在运行中那三个回调里。少了第一道,按 r 会去动一个正在跑的节点;
+    // 少了 `setRedoFrom('running')`,这次重做会在别的节点还跑着的时候另起一个编排器。
+    expect(occurrences('liveRedoUnavailableReason({')).toBe(3)
+    expect(occurrences("setRedoFrom('running')")).toBe(3)
+    expect(SRC).toContain('const held = orch.hold(affected)')
     // 夹取只有一份(control 里),这里不许再算一遍 —— 两份夹取会在边界上分叉,
     // 而表头和页脚会各说一个数。
     expect(SRC).not.toContain('Math.min(MAX_PARALLELISM')
@@ -775,5 +792,21 @@ describe('启动关口拿得到员工端点', () => {
     const el = element('ConfirmStartup')
     expect(el.startsWith('<ConfirmStartup')).toBe(true)
     expect(el).toMatch(/apiUrls=\{props\.agentModels\.map\(a => a\.roleClientConfig\?\.apiUrl\)\}/)
+  })
+})
+
+/**
+ * 收口关口那一次合并也要能让模型解冲突。
+ *
+ * 自动收口那条路(runOrchestrator)有行为用例钉着,这一条没有:`settleHandoff` 在
+ * `EffTaskRunner` 里,而那个组件挂不起来(见文件头)。剪断它的后果不是报错,是**两条路
+ * 给出两种结果** —— 同一条分支、同一个检出,「跑完直接合」会自动解冲突,「resume 进关口
+ * 再合」把冲突现场丢给用户,而用户根本不知道自己走的是哪条。
+ */
+describe('收口关口的合并也带着解冲突的人', () => {
+  it('settleHandoff 把解决者传给了 runHandoffChoice', () => {
+    expect(occurrences('makeHandoffConflictResolver({ runAgent: props.runAgent')).toBe(1)
+    // 第五个参数的位置就是解决者 —— 传成 undefined 或者干脆不传都会让关口退回老行为。
+    expect(SRC).toMatch(/runHandoffChoice\(\s*choice, h, gitRunner, getCwd\(\),\s*\n\s*root \? makeHandoffConflictResolver/)
   })
 })

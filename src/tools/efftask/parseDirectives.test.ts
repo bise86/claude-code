@@ -368,6 +368,37 @@ describe('caps 里两个新旋钮要有正常入口', () => {
     expect(huge.caps.nodeTimeoutMs).toBe(7_200_000)
   })
 
+  it('自动解冲突的次数可以用一句话调,0 = 关掉', async () => {
+    // 用户原话:「合并冲突解决次数不止 2 次,可以默认 6 次,然后还可以更改。」没有这个
+    // 入口的话,「还可以更改」只能靠手改 run.md 再 --resume —— 和 nodeTimeoutMs 当初
+    // 的处境逐字相同。
+    const many = await parseDirectives('解冲突给 10 次机会', {
+      knownRoles: [], modelJson: json({ caps: { mergeResolveAttempts: 10 } }),
+    })
+    expect(many.caps.mergeResolveAttempts).toBe(10)
+    const off = await parseDirectives('冲突别自动解,直接叫我', {
+      knownRoles: [], modelJson: json({ caps: { mergeResolveAttempts: 0 } }),
+    })
+    expect(off.caps.mergeResolveAttempts).toBe(0)
+    // 没说就是默认 6。
+    const dflt = await parseDirectives('x', { knownRoles: [], modelJson: json({}) })
+    expect(dflt.caps.mergeResolveAttempts).toBe(6)
+  })
+
+  it('自动解冲突次数的夹取和 resumeCore 读回时那一份相同(0–20),坏值回落到默认', async () => {
+    const huge = await parseDirectives('x', { knownRoles: [], modelJson: json({ caps: { mergeResolveAttempts: 999 } }) })
+    expect(huge.caps.mergeResolveAttempts).toBe(20)
+    const neg = await parseDirectives('x', { knownRoles: [], modelJson: json({ caps: { mergeResolveAttempts: -3 } }) })
+    expect(neg.caps.mergeResolveAttempts).toBe(0)
+    /**
+     * **坏值不能回落到 0。** 0 在这里是一个真实的意思(关掉自动解决),所以把一个
+     * 解析不出来的值静默解释成 0,等于用一个「写坏了」换来「功能被关掉」,而用户
+     * 写它的意图恰恰相反。
+     */
+    const junk = await parseDirectives('x', { knownRoles: [], modelJson: json({ caps: { mergeResolveAttempts: '六次' } }) })
+    expect(junk.caps.mergeResolveAttempts).toBe(6)
+  })
+
   it('maxSeatsPerPhase 真的作用到席位上,不只是存进 caps', async () => {
     // 只断言 caps 里的数值,等于只验证「配置被记下来了」;剪断传给 applyRoleDefsToPhases
     // 的那一跳,数值还在、席位照旧超编。

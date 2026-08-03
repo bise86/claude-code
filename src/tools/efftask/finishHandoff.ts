@@ -25,7 +25,8 @@
 // 关口原样留在 `--resume` 那条路上(用户清理完工作区再进来,四个选项一个不少)。
 import type { PendingHandoff } from './types.js'
 import {
-  mergeLeftovers, runHandoffChoice, trackedChanges, type GitFn, type HandoffResult,
+  mergeLeftovers, runHandoffChoice, trackedChanges,
+  type ConflictResolver, type GitFn, type HandoffResult,
 } from './handoffActions.js'
 
 export type FinishPlan =
@@ -101,6 +102,14 @@ export async function finishHandoff(deps: {
   handoff: PendingHandoff | undefined
   git: GitFn
   cwd: string
+  /**
+   * 自动合并撞上冲突时,派模型去解一次。不给就退回原来的行为(留下冲突现场)。
+   *
+   * 这一路**没有任何人按过键**,所以解不成时 `autoResolveMerge` 会把工作区 abort 回合并前
+   * ——「自动发生的事必须能自动收拾干净」比「把现场留给用户」更重要,因为用户压根不知道
+   * 刚才发生过一次合并。
+   */
+  resolveConflict?: ConflictResolver
 }): Promise<FinishOutcome> {
   const { handoff: h, git, cwd } = deps
   try {
@@ -141,7 +150,7 @@ export async function finishHandoff(deps: {
     }
     // 走**现成的**那一份:脏树复查、失败时如实报告、分支原样保留全在里面,而收口关口
     // 按的也是同一个函数。两份实现迟早给出两种答案。
-    const res = await runHandoffChoice('merge', h, git, cwd)
+    const res = await runHandoffChoice('merge', h, git, cwd, deps.resolveConflict)
     if (res.ok) return { merged: true, result: res }
     // 失败了 —— 工作区被留在半合并状态了吗?这一问必须由**我们**来问:这一路是自动
     // 发生的,而屏幕上那句「你的工作区未被改动」得按答案改口。

@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
+import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
@@ -799,6 +799,17 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
     nodeTimeoutMs: clampInt(caps.nodeTimeoutMs, 1000, 7_200_000, DEFAULT_CAPS.nodeTimeoutMs),
     // 上限 30 天:这条阀挡的是「永远没人回答」,不是「回答得慢」。
     humanTimeoutMs: clampInt(caps.humanTimeoutMs, 1000, 30 * 24 * 60 * 60 * 1000, DEFAULT_CAPS.humanTimeoutMs),
+    /**
+     * 自动解冲突的次数。**逐字段重建的这一份必须带上它**,否则一个配了「冲突试 12 次」的
+     * run 一恢复就悄悄退回默认 —— 而恢复恰恰是这个旋钮最要紧的时刻(用户是被升级卡叫回来的)。
+     *
+     * 缺省(老 run.md 里没有这个字段)回落到默认 6,不是 0:0 的含义是「关掉自动解决」,
+     * 把「没写」解释成「关掉」就是一次只在恢复路径上发生的静默功能退化。
+     */
+    mergeResolveAttempts: clampInt(
+      caps.mergeResolveAttempts, MIN_MERGE_RESOLVE, MAX_MERGE_RESOLVE,
+      DEFAULT_CAPS.mergeResolveAttempts ?? 6,
+    ),
   }
   // Rebuilding field-by-field silently dropped scoreThreshold, so a run configured with one
   // lost it on resume. Carry it when present.

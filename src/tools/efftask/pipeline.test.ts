@@ -1140,7 +1140,8 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     const agent = (async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'plan') return leafPlan
       if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
-      if (req.phase === 'accept' && ++accepts === 2) {
+      // 第一次验收之后**每一次**都否决 —— 于是没有任何一版解决走到过合并。
+      if (req.phase === 'accept' && ++accepts >= 2) {
         return vtag(req) + '\n{"pass":false,"blocking":["解决冲突时丢掉了退款分支"],"comments":""}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -1155,14 +1156,139 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     await stepStart(n, ctx)
     await stepExecute(n, ctx)
     expect(n.status).toBe('BLOCKED')
-    expect(merges).toBe(1)              // it never tried to merge the rejected resolution
+    // 被否决的那几版**从来没有**被合过:合并只发生过最初那一次,之后每一版解决都停在
+    // 验收就地否决 —— 一次都没有走到 commitAndMerge。
+    expect(merges).toBe(1)
     expect(escalations.length).toBe(1)  // a human is told
     expect(n.execStatus).toContain('丢掉了退款分支') // and WHY, not just "conflict"
   })
 
-  it('resolves AT MOST once, then escalates to a human with the facts', async () => {
-    // Unbounded resolution would spend write-capable calls on a merge that keeps failing, each
-    // attempt starting from a tree the last one already edited.
+  it('第二次解决带着验收的否决理由进去 —— 那是它唯一的价值', async () => {
+    // 一次运行给两次(MERGE_RESOLVE_PER_RUN)。第二次和第一次唯一的差别就是这条理由:
+    // 第一次调用时它还不存在,而它恰恰是解决者最需要知道的东西。
+    const n = root()
+    let accepts = 0
+    const resolvePrompts: string[] = []
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        if (req.prompt.includes('冲突')) resolvePrompts.push(req.prompt)
+        return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      }
+      if (req.phase === 'accept' && ++accepts === 2) {
+        return vtag(req) + '\n{"pass":false,"blocking":["解决冲突时丢掉了退款分支"],"comments":""}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    let merges = 0
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => (++merges >= 2
+          ? { ok: true, merged: true }
+          : { ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+        // 第二轮进来时的真实状态:上一版解决已 git add,MERGE_HEAD 还在,没有未合并路径。
+        conflictState: async () => ({ markers: false, staged: true, stale: false, files: [] }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(resolvePrompts.length).toBe(2)
+    expect(resolvePrompts[1]).toContain('丢掉了退款分支')   // 否决理由被带了进去
+    expect(resolvePrompts[1]).toContain('git add')           // 而且说清了别提交
+    expect(resolvePrompts[1]).not.toContain('冲突现场')      // 那里已经没有 <<<<<<< 了
+    expect(n.status).toBe('ACCEPTED')                        // 第二次过了验收,合了
+    expect(n.iteration.mergeResolve).toBe(2)
+  })
+
+  it('重试轮**先测量再动手** —— 决不对着一份被否决的解决跑 mergeIntegrationIntoNode', async () => {
+    // 那个函数的第一句是 `git add -A` + `commit`:对着「已 git add 但被验收否决」的工作区
+    // 调用它,会把被否决的代码提交进分支,紧接着的 merge 回答 Already up to date,于是
+    // 「解决成功」并合入 —— 验收拒绝过的东西就这样进了集成分支。
+    const n = root()
+    let accepts = 0
+    let localMerges = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      if (req.phase === 'accept' && ++accepts >= 2) {
+        return vtag(req) + '\n{"pass":false,"blocking":["还是不对"],"comments":""}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+        mergeIntegrationIntoNode: async () => { localMerges++; return { ok: true, conflicted: true, files: ['src/a.ts'] } },
+        conflictState: async () => ({ markers: false, staged: true, stale: false, files: [] }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    // 只有第一轮造现场。后面每一轮读到 staged,原地改。
+    expect(localMerges).toBe(1)
+    expect(n.iteration.mergeResolve).toBe(DEFAULT_CAPS.mergeResolveAttempts!)
+    expect(n.status).toBe('BLOCKED')
+  })
+
+  it('测不出工作区状态就升级人工,不拿 mergeIntegrationIntoNode 兜底', async () => {
+    // 兜底会走上面那条「提交被否决的解决」的路 —— 而这正是测量失败时最需要挡住的。
+    const n = root()
+    let accepts = 0
+    let localMerges = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      if (req.phase === 'accept' && ++accepts >= 2) {
+        return vtag(req) + '\n{"pass":false,"blocking":["还是不对"],"comments":""}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+        mergeIntegrationIntoNode: async () => { localMerges++; return { ok: true, conflicted: true, files: ['src/a.ts'] } },
+        conflictState: async () => { throw new Error('git 挂了') },
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(localMerges).toBe(1)                 // 第一轮那次,没有第二次
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('git 挂了')
+  })
+
+  it('解冲突的调用本身没打通时,不消耗第二次机会去重打一遍', async () => {
+    // 第二次的价值是「带着否决理由再改一版」,这里没有那样东西可带 —— 重来一次就是同一个
+    // 提示词打同一条失败的链路。runPhase 对执行环节本来也不重试,同一个立场。
+    const n = root()
+    let resolveCalls = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        if (req.prompt.includes('冲突')) { resolveCalls++; throw new Error('provider 502') }
+        return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(resolveCalls).toBe(1)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.execStatus).toContain('provider 502')  // 而且说清了是什么失败
+  })
+
+  it('用完 caps.mergeResolveAttempts 次之后带着事实升级人工', async () => {
+    // 无上限的重试会反复烧写工具调用,而且每一次都从上一次已经改脏的树开始。默认 6 次之后
+    // 交给人 —— 但下一次 --resume 是新的 6 次(预算按运行计,见 mergeResolveThisRun)。
     const n = root()
     let merges = 0
     const escalations: Record<string, unknown>[] = []
@@ -1175,15 +1301,82 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     }
     await stepStart(n, ctx)
     await stepExecute(n, ctx)
-    expect(merges).toBe(2)             // one original + exactly one retry
-    expect(n.iteration.mergeResolve).toBe(1)
+    expect(merges).toBe(DEFAULT_CAPS.mergeResolveAttempts! + 1) // 原始那次 + 每次解决之后的重试
+    expect(n.iteration.mergeResolve).toBe(DEFAULT_CAPS.mergeResolveAttempts!)
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain('合并冲突')
     expect(n.blockedReason).toContain('/wt/root')
     // 升级人工: the card carries the same facts the tree shows, so the user can act from either.
     expect(escalations.length).toBe(1)
     expect(escalations[0]!.node).toBe(n) // the card names the node, not just a path
-    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'], attempted: true, state: { markers: true, staged: false, stale: false }, integrationBranch: 'efftask/001/integration' })
+    expect({ ...escalations[0], node: undefined }).toEqual({ node: undefined, branch: 'worktree-root', path: '/wt/root', files: ['src/a.ts'], attempts: DEFAULT_CAPS.mergeResolveAttempts, state: { markers: true, staged: false, stale: false }, integrationBranch: 'efftask/001/integration' })
+  })
+
+  it('caps.mergeResolveAttempts 说几次就是几次', async () => {
+    // 这个旋钮的**唯一**证明。默认值写死在 pipeline 里的话,用户在关口上看到的
+    // 「自动解冲突 3 次/节点」和实际跑的次数可以完全无关,而两者都不会报错。
+    const n = root()
+    let merges = 0
+    const ctx = {
+      ...ctxFor([n], okAgent(), { ...cfg, caps: { ...cfg.caps, mergeResolveAttempts: 3 } }),
+      worktrees: fakePool({
+        commitAndMerge: async () => { merges++; return { ok: false, kind: 'conflict', files: ['src/a.ts'] } },
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.iteration.mergeResolve).toBe(3)
+    expect(merges).toBe(4)
+    expect(n.status).toBe('BLOCKED')
+  })
+
+  it('caps.mergeResolveAttempts = 0 → 一次都不自动解,直接等人工', async () => {
+    // 0 是一个真实的选择(「冲突别自动解、直接叫我」),不是「没配」。它必须真的关掉这条路:
+    // 派一次带写工具的调用去改用户的代码,而用户刚说过不要,是这个旋钮最不能出的错。
+    const n = root()
+    let merges = 0
+    const resolves: string[] = []
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        if (req.prompt.includes('冲突')) resolves.push(req.prompt)
+        return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const escalations: { attempts: number }[] = []
+    const ctx = {
+      ...ctxFor([n], agent, { ...cfg, caps: { ...cfg.caps, mergeResolveAttempts: 0 } }),
+      onEscalate: (e: { attempts: number }) => { escalations.push(e) },
+      worktrees: fakePool({
+        commitAndMerge: async () => { merges++; return { ok: false, kind: 'conflict', files: ['src/a.ts'] } },
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(resolves).toEqual([])          // 一次解冲突调用都没派
+    expect(merges).toBe(1)                // 也没有第二次合并
+    expect(n.iteration.mergeResolve).toBe(0)
+    expect(n.status).toBe('BLOCKED')
+    // 卡片上那句话要说「本次没试」,而不是编一个次数出来。
+    expect(escalations[0]?.attempts).toBe(0)
+  })
+
+  it('老 run.md 没有这个字段时回落到默认,不是回落到 0', async () => {
+    // `?? 0` 会让每一份在这个字段出现之前写下的 run.md 一恢复就彻底关掉自动解决 ——
+    // 一次只在恢复路径上发生、而且没有任何提示的功能退化。
+    const n = root()
+    const capsWithout = { ...cfg.caps }
+    delete (capsWithout as { mergeResolveAttempts?: number }).mergeResolveAttempts
+    const ctx = {
+      ...ctxFor([n], okAgent(), { ...cfg, caps: capsWithout }),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.iteration.mergeResolve).toBe(DEFAULT_CAPS.mergeResolveAttempts)
   })
 
   it('blockedReason stands on its own when there is no Feishu bridge', async () => {
@@ -3980,14 +4173,13 @@ describe('跳过验收 × 合并冲突:三个调用点都不能谎报完成', ()
     expect(n.status).toBe('WAITING_CHILDREN')
   })
 
-  it('升级卡不能说反话:本次真的试过自动解冲突', async () => {
-    // triedThisRun 漏传 → 重入时 attempted 停在 false → 卡片说「自动解决机会已在此前用完,
-    // 本次未再尝试」,而本次实实在在跑了一次解冲突 + 一次带写工具的 execute 调用。
-    //
-    // 这里断的是**升级回调收到的值**,不是源码字面量。上一版断的是源码里有
-    // `return mergeAndRelease(node, ctx, true)` —— 而通过分支里恰好有一模一样的一行,
-    // 于是漏传 triedThisRun 的变异被那一行满足,测试全绿。
-    const escalations: { attempted: boolean }[] = []
+  it('升级卡不能说反话:本次真的试过自动解冲突,而且说得出试了几次', async () => {
+    // 次数若取自持久化的 iteration.mergeResolve,卡片会把上几次会话的尝试算进本次;若退回
+    // 一个布尔,「已自动尝试解决一次」这句话在预算变成两次的那一刻就成了假话。断的是
+    // **升级回调收到的值**,不是源码字面量 —— 上一版断源码里有
+    // `return mergeAndRelease(node, ctx, true)`,而通过分支里恰好有一模一样的一行,
+    // 于是漏传的变异被那一行满足,测试全绿。
+    const escalations: { attempts: number }[] = []
     const n = root()
     n.kind = 'executable'; n.status = 'READY'
     n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
@@ -3995,11 +4187,11 @@ describe('跳过验收 × 合并冲突:三个调用点都不能谎报完成', ()
       ...ctxFor([n], async req => growAgent(req), { ...cfg, skipSteps: ['accept'] as never }),
       // 两次都冲突:第一次触发自动解决,解完重入时再冲突一次 → 走到升级。
       worktrees: pool({ commitAndMerge: async () => ({ ok: false, kind: 'conflict', message: 'C' }) }) as never,
-      onEscalate: (e: { attempted: boolean }) => { escalations.push(e) },
+      onEscalate: (e: { attempts: number }) => { escalations.push(e) },
     }
     await stepExecute(n, ctx)
     expect(escalations.length).toBeGreaterThan(0)
-    expect(`本次尝试过自动解决: ${escalations[0].attempted}`).toBe('本次尝试过自动解决: true')
+    expect(`本次自动解决次数: ${escalations[0].attempts}`).toBe(`本次自动解决次数: ${DEFAULT_CAPS.mergeResolveAttempts}`)
   })
 })
 

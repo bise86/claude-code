@@ -285,6 +285,27 @@ describe('readRunManifest recovers the config the run was started with', () => {
     const under = await readRunManifest(fsWith({ '/r/run.md': md(['  nodeTimeoutMs: 0']) }), '/r')
     expect(under.config.caps.nodeTimeoutMs).toBe(1000)
   })
+  it('自动解冲突的次数要读得回来 —— 恢复恰恰是它最要紧的时刻', async () => {
+    /**
+     * 逐字段重建的那份 caps 漏掉它的话,一个配了「冲突试 12 次」的 run 一恢复就悄悄退回
+     * 默认 —— 而用户是**被升级卡叫回来的**,他按 --resume 图的就是「再自动试一轮」。
+     *
+     * 缺省(这个字段出现之前写下的 run.md)必须回落到默认 6,不是 0:把「没写」解释成
+     * 「关掉自动解决」是一次只在恢复路径上发生、而且没有任何提示的功能退化。
+     */
+    const md = (caps: string[]) => ['---', 'runId: 001', 'parallelism: 3', 'phaseRoles:', '  plan: []', 'caps:', ...caps, 'goalPrompt: 目标', '---', ''].join('\n')
+    const kept = await readRunManifest(fsWith({ '/r/run.md': md(['  mergeResolveAttempts: 12']) }), '/r')
+    expect(kept.config.caps.mergeResolveAttempts).toBe(12)
+    const off = await readRunManifest(fsWith({ '/r/run.md': md(['  mergeResolveAttempts: 0']) }), '/r')
+    expect(off.config.caps.mergeResolveAttempts).toBe(0)
+    const absent = await readRunManifest(fsWith({ '/r/run.md': md(['  maxDepth: 4']) }), '/r')
+    expect(absent.config.caps.mergeResolveAttempts).toBe(DEFAULT_CAPS.mergeResolveAttempts)
+    // 夹取和 parseDirectives 那一份相同(0–20):两处不一致的话,同一个数在启动时被接受、
+    // 在恢复时被改写,而屏幕上没有任何东西解释它为什么变了。
+    const over = await readRunManifest(fsWith({ '/r/run.md': md(['  mergeResolveAttempts: 999']) }), '/r')
+    expect(over.config.caps.mergeResolveAttempts).toBe(20)
+  })
+
   it('a missing or corrupt manifest degrades to defaults instead of throwing', async () => {
     // The manifest is ONE file. Losing it must not cost the user the whole tree — every
     // node.md is still there, and the roster is re-confirmable at the gate.

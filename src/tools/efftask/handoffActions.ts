@@ -21,6 +21,82 @@ export interface HandoffResult {
   followUps?: string[]
 }
 
+/**
+ * 派一次模型去解冲突。**在用户自己的检出里**。
+ *
+ * 注入而不是直接调 runAgent:这个模块是纯的(见文件头),而 `RunAgentFn` 要节点、要角色、
+ * 要窗口 —— 那些东西住在命令层。这里只声明「有人能去解」,谁去、带什么工具由接线方决定。
+ *
+ * 返回值**不是判据**。模型说自己解完了不算数,`autoResolveMerge` 一律拿 git 复核:
+ * 还有未合并路径、暂存区里还留着冲突标记、commit 不成 —— 任何一条都算没解成,然后
+ * `git merge --abort` 把用户的工作区还原。这是「宁可重做,不可谎报」在这条路上的样子。
+ */
+export type ConflictResolver = (info: {
+  files: string[]
+  /** 合进来的那条分支(集成分支)。不给的话模型不知道自己在解谁和谁的冲突。 */
+  branch: string
+  cwd: string
+}) => Promise<void>
+
+/** 暂存区里还留着冲突标记的文件。空 = 干净。 */
+async function stagedMarkers(git: GitFn, cwd: string, files: string[]): Promise<string[]> {
+  if (files.length === 0) return []
+  const diff = await git(['diff', '--cached', '-U0', '--', ...files], cwd)
+  if (diff.code !== 0) return []
+  const out: string[] = []
+  let current = ''
+  for (const line of diff.stdout.split('\n')) {
+    if (line.startsWith('+++ b/')) { current = line.slice('+++ b/'.length).trim(); continue }
+    // 只认带尾随空格的 `<<<<<<< ` / `>>>>>>> `,**不认光杆 `=======`**:后者是 Markdown 的
+    // setext 下划线,一个讲合并冲突的文档、一条分隔线都会命中,而那会让一份好的解决被
+    // 判定成没解干净、然后被 abort 掉 —— 代价比漏判大得多。真的残留三种标记都会在。
+    if (current && /^\+(<{7} |>{7} )/.test(line) && !out.includes(current)) out.push(current)
+  }
+  return out
+}
+
+/**
+ * 冲突 → 派模型解 → **用 git 复核** → 提交;任何一步不成就 `git merge --abort` 还原。
+ *
+ * 导出是为了能单独测:这条路会在用户自己的检出里写文件并产生一个真的 merge commit,
+ * 而它是**自动**发生的 —— 判据必须是可以逐条钉住的,不能埋在一个只能端到端跑的分支里。
+ */
+export async function autoResolveMerge(deps: {
+  git: GitFn
+  cwd: string
+  branch: string
+  files: string[]
+  resolve: ConflictResolver
+}): Promise<{ ok: true } | { ok: false; why: string; restored: boolean }> {
+  const { git, cwd, branch, files, resolve } = deps
+  const fail = async (why: string): Promise<{ ok: false; why: string; restored: boolean }> => {
+    // 还原到合并前。git 在内容冲突时不回滚,不 abort 的话用户的工作区就停在半合并状态 ——
+    // 而他没按过任何键,屏幕上一句「你的工作区未被改动」当场变成假话。
+    const ab = await git(['merge', '--abort'], cwd)
+    return { ok: false, why, restored: ab.code === 0 }
+  }
+  try {
+    await resolve({ files, branch, cwd })
+  } catch (e) {
+    return fail(`自动解决调用失败: ${e instanceof Error ? e.message : String(e)}`)
+  }
+  // 模型被要求 git add,但**不能假设它做了**。只 add 冲突的那几个文件:`add -A` 会把用户
+  // 检出里本来就有的未跟踪文件一起卷进这次合并提交。
+  //
+  // 真 git 实测过一件要紧的事:这一句 add **本身就会消掉未合并状态** —— 模型一个字节都没改
+  // 时,带着 <<<<<<< 的文件照样被暂存,`git status` 从此干净。所以下面那道「未合并路径」
+  // 的检查抓不住「什么都没干」,真正抓住它的是**冲突标记**那一道。两道都要留。
+  const add = await git(['add', '--', ...files], cwd)
+  if (add.code !== 0) return fail(`git add 失败: ${oneLine(add.stderr) || '未知原因'}`)
+  const left = await mergeLeftovers(git, cwd)
+  if (left.length > 0) return fail(`仍有未解决的冲突文件:${left.slice(0, 5).join('、')}`)
+  const markers = await stagedMarkers(git, cwd, files)
+  if (markers.length > 0) return fail(`解决结果里还留着冲突标记:${markers.slice(0, 5).join('、')}`)
+  const commit = await git(['commit', '--no-edit'], cwd)
+  if (commit.code !== 0) return fail(`提交失败: ${oneLine(commit.stderr || commit.stdout) || '未知原因'}`)
+  return { ok: true }
+}
+
 const oneLine = (s: string): string => s.trim().split('\n').filter(Boolean).slice(0, 3).join('; ')
 
 /**
@@ -114,6 +190,13 @@ export async function runHandoffChoice(
   h: PendingHandoff,
   git: GitFn,
   cwd: string,
+  /**
+   * 给了就先让模型试着解冲突,不给就是原来的行为(留下冲突现场让用户自己解)。
+   *
+   * 可选而不是必需:这个函数被四个动作共用,而 `push`/`keep`/`discard` 与它无关;测试也
+   * 大多不需要它。真正的接线在 runOrchestrator(自动收口)和 efftask.tsx(收口关口)。
+   */
+  resolve?: ConflictResolver,
 ): Promise<HandoffResult> {
   if (choice === 'keep') {
     return { ok: true, message: `已保留分支 ${h.branch}` }
@@ -130,8 +213,51 @@ export async function runHandoffChoice(
         followUps: [`先提交或 stash,再重新收口`, ...(dirty.detail ? [`改动:${dirty.detail}`] : [])],
       }
     }
+    // 合并前的 HEAD —— 只用来在自动解决成功后给出一条**可以照做的**撤销命令。拿不到就
+    // 不承诺(下面那句 followUp 是有条件的):给一条错的 reset 目标比不给危险得多。
+    const before = await git(['rev-parse', 'HEAD'], cwd)
+    const undoAt = before.code === 0 ? before.stdout.trim() : ''
     const res = await git(['merge', '--no-edit', h.branch], cwd)
     if (res.code !== 0) {
+      /**
+       * 冲突 → 先让模型解一次(spec §8 的立场在收口这一段同样适用:能自动解决的不该叫醒人)。
+       *
+       * 解成了就是一次真的 merge commit;解不成 `autoResolveMerge` 会 `git merge --abort`
+       * 还原,然后照原来的路如实报告 —— 用户拿到的信息只多不少。
+       */
+      const toResolve = await mergeLeftovers(git, cwd)
+      if (resolve && toResolve.length > 0) {
+        const auto = await autoResolveMerge({ git, cwd, branch: h.branch, files: toResolve, resolve })
+        if (auto.ok) {
+          return {
+            ok: true,
+            message: `已合并 ${h.branch}(${h.commits} 个提交)到当前分支 —— 有 ${toResolve.length} 个文件冲突,已自动解决`,
+            followUps: [
+              `自动解决的冲突文件:${toResolve.slice(0, 5).join('、')}${toResolve.length > 5 ? ` 等 ${toResolve.length} 个` : ''}`,
+              // 这一条不是客套:自动解冲突挑的是「每个 hunk 留哪一边」,而这次没有任何人复核过。
+              '解决结果没有经过评审,建议 git show 过一眼',
+              ...(undoAt ? [`想撤销这次合并:git reset --hard ${undoAt}`] : []),
+            ],
+          }
+        }
+        // 没解成 —— 把「试过了、为什么没成、工作区现在在哪」一起交出去,而不是退回一句
+        // 泛泛的「合并失败」。下面那段照旧跑,这里只补一条前情。
+        const restored = auto.restored
+        return {
+          ok: false,
+          message: `合并失败:冲突自动解决未成功(${auto.why})`,
+          followUps: restored
+            ? [
+              `你的工作区已还原到合并前,分支 ${h.branch} 原样保留`,
+              `想自己来:git merge ${h.branch},解完冲突后 git commit`,
+            ]
+            : [
+              `分支 ${h.branch} 原样保留,但**你的工作区里留着一次未完成的合并**(自动还原也失败了)`,
+              `冲突文件:${toResolve.slice(0, 5).join('、')}${toResolve.length > 5 ? ` 等 ${toResolve.length} 个` : ''}`,
+              `解完冲突后 git commit;不想要这次合并就 git merge --abort 回到合并前`,
+            ],
+        }
+      }
       // **如实报告失败**。这里显示「已合并」是这个功能最不能出的错 —— 用户会据此
       // 去做下一步,而代码根本不在他的分支上。
       //
@@ -139,7 +265,9 @@ export async function runHandoffChoice(
       // `MERGE_HEAD` 还在。此前这一路只说「分支原样保留,没有任何东西丢失」+
       // 「冲突需要你手工解决: git merge <branch>」—— 第一句漏掉了工作区,第二句照做会
       // 得到 `error: Merging is not possible because you have unmerged files.`。
-      const conflicted = await mergeLeftovers(git, cwd)
+      // 上面那次测量,不再问一遍:两次 `git status` 之间隔着一次可能失败的自动解决,
+      // 而两个答案里不管哪个更旧,写进屏幕的都是它。
+      const conflicted = toResolve
       return {
         ok: false,
         message: `合并失败:${oneLine(res.stderr || res.stdout) || '未知原因'}`,

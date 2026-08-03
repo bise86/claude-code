@@ -9,6 +9,7 @@ import type { WorktreePool } from '../../tools/efftask/worktreePool.js'
 import type { HandoffSummary } from '../../tools/efftask/startupConfirm.js'
 import type { GitFn, HandoffResult } from '../../tools/efftask/handoffActions.js'
 import { finishHandoff } from '../../tools/efftask/finishHandoff.js'
+import { makeHandoffConflictResolver } from '../../tools/efftask/handoffResolve.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { finishEffTaskRun, markEffTaskPendingHandoff, registerEffTaskRun, updateEffTaskRun } from '../../tasks/EffTaskTask/EffTaskTask.js'
 import type { SetAppState } from '../../Task.js'
@@ -66,6 +67,15 @@ export async function runOrchestrator(
     cwd?: PipelineCtx['cwd']
     /** 并行占用 (spec §10.1): called ONCE with a live reader for the status bar. */
     onPool?: (read: () => { inUse: number; limit: number }) => void
+    /**
+     * 运行中重做 (用户原话:「不需要整体返回失败才能重做任务或阶段,在其它任务还在运行时
+     * 就可以重做」)。**调用两次**:开跑时给出这一轮的编排器,收尾时给 `undefined`。
+     *
+     * 第二次不能省 —— 界面拿它判「现在还有没有人在听」。留着一个已经跑完的编排器,
+     * 用户按下的重做会被并进一棵没人再调度的树:屏幕说重做了,而一个调用都不会发生。
+     * (`applyLive` 自己还有一道 `finished` 守卫兜底,但那时话已经说出去了。)
+     */
+    onOrchestrator?: (orch: EffTaskOrchestrator | undefined) => void
     /**
      * 后台任务登记 (spec §10): make this run visible in `/tasks` and the footer pill, with
      * live counts, and stoppable from there through the run's OWN controller.
@@ -217,10 +227,21 @@ export async function runOrchestrator(
   const handOff = async (): Promise<void> => {
     if (handoffDone || !args.git) return
     handoffDone = true
+    /**
+     * 收口撞上冲突时派模型去解(用户明确要求:「这个应该要模型自动解决冲突问题」)。
+     *
+     * 根节点是这一趟的目标本身,拿它当 `RunAgentFn` 的节点 —— 见 makeHandoffConflictResolver。
+     * `liveNodes` 在这里已经被编排器填过了(handOff 排在 run 之后),真拿不到根节点就不接线,
+     * 收口退回「留下冲突现场」的老行为。
+     */
+    const root = liveNodes.find(n => n.id === 'root')
     const out = await finishHandoff({
       handoff: args.config.pendingHandoff,
       git: args.git,
       cwd: args.cwd ?? process.cwd(),
+      resolveConflict: root
+        ? makeHandoffConflictResolver({ runAgent: args.runAgent, node: root, signal: args.signal })
+        : undefined,
     })
     if (out.merged) args.config.pendingHandoff = undefined
     if (out.result) {
@@ -258,6 +279,9 @@ export async function runOrchestrator(
     // 并行占用 (spec §10.1): hand the panel a LIVE reader, once. A per-tick callback would
     // fire many times a second for a number that only the header shows.
     args.onPool?.(() => orch.slotUsage())
+    // 运行中重做要够得着这一轮的编排器。**在 run() 之前交出去** —— 交在后面就等于
+    // 「跑完才给」,而这个功能的全部意义是在跑的过程中用它。
+    args.onOrchestrator?.(orch)
     setNodes(orch.nodes()) // seed with the root so the tree isn't blank on first paint
     void queueManifest(orch.nodes()) // run.md exists from the first frame, not just at the end
     liveNodes = orch.nodes()
@@ -280,6 +304,9 @@ export async function runOrchestrator(
     // is the one that leaves a task with no other way to reach a terminal status.
     settle(failed)
   } finally {
+    // 编排器不再听了。**必须在 finally 里** —— happy path 和异常路径都要收回这个把手,
+    // 而漏掉异常路径的表现是:一个已经炸掉的 run 上,重做看起来是成功的。
+    try { args.onOrchestrator?.(undefined) } catch { /* UI only */ }
     // The reclaim the happy path may not have reached. A no-op when it did.
     await reclaim(liveNodes)
     /**

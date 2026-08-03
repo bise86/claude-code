@@ -1,5 +1,5 @@
 // src/tools/efftask/parseDirectives.ts
-import { clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_ROLE_GUIDANCE, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
+import { clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, DEFAULT_PARALLELISM, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_ROLE_GUIDANCE, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { extractJsonBlock } from './parseOutput.js'
 import { applyRoleDefsToPhases, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
@@ -10,7 +10,7 @@ export type ModelJsonFn = (prompt: string) => Promise<string>
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
   "skipSteps": ["要整个跳过的环节名"],
-  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化", "nodeTimeoutMs"?: number },
+  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化", "nodeTimeoutMs"?: number, "mergeResolveAttempts"?: number },
   "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }],
   "phaseGuidance": { "环节名": "指令里点名给这个环节的那几句话" },
   "roleGuidance": [{ "name": "角色名或员工名", "text": "指令里点名给这个人的那几句话" }] }
@@ -19,6 +19,7 @@ phaseRoles 的值是**员工名**数组(可派发的身份)。
 - 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
 - 用户说**人数**(「至少 2 个人通过」「要 3 票」)→ caps.quorumSeats,就是那个人数。**不要**把人数写进 quorum:「至少 2 人」写成 quorum=2 的含义是 2%,等于 1 票就放行,和用户的意思正好相反。
 caps.maxSeatsPerPhase 是每个阶段最多几席。
+caps.mergeResolveAttempts 是**一个节点的合并冲突最多让模型自动解几次**(每次解完都会重跑验收)。用户说「冲突多试几次」「解冲突给 10 次机会」「冲突别自动解、直接叫我」→ 填这里(最后那句 = 0)。默认 6。
 caps.nodeTimeoutMs 是**一次调用最多可以多久没有任何输出**(毫秒)。用户说「阶段超时 20 分钟」「每步最多等半小时」「模型慢,超时给久一点」→ 换算成毫秒填这里(20 分钟 = 1200000)。他说的是「多久没动静算卡死」,不是「一个节点最多跑多久」—— 一直在吐字就永远不算超时。
 skipSteps:用户说「跳过X」「不做X」「X就不用了」时,把那个环节名放进来。没说就省略。
 caps.planConverge:分析环节多员工时怎么收敛 ——「各自出稿再融合」=圆桌,「一稿传下去改」=精化(默认)。
@@ -260,6 +261,17 @@ export async function parseDirectives(
   // 这两条同样需要入口:只有 readRunManifest 读回而没人写进去的话,它们只能靠手改
   // run.md 再 --resume 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
   if (caps.maxSeatsPerPhase !== undefined) c.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
+  /**
+   * 自动解冲突的次数。**下限是 0**,而 0 在这里是一个真实的意思(「别自动解,直接叫我」)——
+   * 所以 clampInt 的 fallback 不能是 0:那样一个写坏的值(`"六次"`)会被静默解释成关掉功能,
+   * 而用户写它的意图恰恰相反。回落到默认 6。
+   */
+  if (caps.mergeResolveAttempts !== undefined) {
+    c.mergeResolveAttempts = clampInt(
+      caps.mergeResolveAttempts, MIN_MERGE_RESOLVE, MAX_MERGE_RESOLVE,
+      DEFAULT_CAPS.mergeResolveAttempts ?? 6,
+    )
+  }
   /**
    * 静默超时:此前**只能手改 run.md**。
    *

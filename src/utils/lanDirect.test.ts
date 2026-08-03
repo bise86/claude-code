@@ -240,6 +240,10 @@ describe('真 socket:有代理时内网直连', () => {
 
   const SRC = new URL('./lanDirect.ts', import.meta.url).pathname
   const ROLE_FETCH = new URL('../services/api/openaiCompat/roleFetch.ts', import.meta.url).pathname
+  const MCP_CLIENT = new URL('../services/mcp/client.ts', import.meta.url).pathname
+  const CONFIG = new URL('./config.ts', import.meta.url).pathname
+  // 探针跑在 /tmp 里,裸包名解析不到 —— 走绝对路径。
+  const SDK = new URL('../../node_modules/@modelcontextprotocol/sdk/dist/esm', import.meta.url).pathname
 
   it('登记之前打不通、登记之后打得通', async () => {
     const r = await probe(`
@@ -310,6 +314,58 @@ describe('真 socket:有代理时内网直连', () => {
     `)
     expect(r.registeredAtBuild).toBe(true)
     expect(r.status).toBe(200)
+  })
+
+  /**
+   * **MCP 的 http/sse 端点走同一条规矩。**
+   *
+   * 这条是用户报的原话「mcp 加载失败……两个 http、一个 stdio,都是失败」查出来的:一台
+   * 开着 `HTTPS_PROXY` 的机器上,Bun 的 fetch 连 127.0.0.1 都塞给代理,于是本机 / 内网的
+   * MCP 服务器一律 ✗ Failed to connect,而 stdio 那个照常连上(它不走 fetch)。
+   *
+   * 断在 `connectToServer` 这一层,不是断 registerDirectHosts:后者早就是对的,坏的是
+   * **没有人为 MCP 调它** —— 角色端点(roleFetch)、init 都调了,唯独 MCP 这条路没有。
+   * 这正是这个仓库反复出现的那种「实现了、测试了、就是没接线」。
+   */
+  it('MCP 的 http 端点在有代理时也能直连出去', async () => {
+    const r = await probe(`
+      import { connectToServer } from '${MCP_CLIENT}'
+      import { enableConfigs } from '${CONFIG}'
+      import { Server } from '${SDK}/server/index.js'
+      import { StreamableHTTPServerTransport } from '${SDK}/server/streamableHttp.js'
+      import { ListToolsRequestSchema } from '${SDK}/types.js'
+      import http from 'node:http'
+      enableConfigs()
+      const transports = {}
+      const srv = http.createServer(async (req, res) => {
+        const sid = req.headers['mcp-session-id']
+        let t = sid ? transports[sid] : undefined
+        if (!t) {
+          t = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => 's1',
+            onsessioninitialized: id => { transports[id] = t },
+          })
+          const s = new Server({ name: 'probe', version: '1' }, { capabilities: { tools: {} } })
+          s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
+          await s.connect(t)
+        }
+        let body
+        if (req.method === 'POST') {
+          const chunks = []
+          for await (const c of req) chunks.push(c)
+          try { body = JSON.parse(Buffer.concat(chunks).toString()) } catch {}
+        }
+        await t.handleRequest(req, res, body)
+      })
+      await new Promise(r => srv.listen(0, '127.0.0.1', () => r()))
+      const url = \`http://127.0.0.1:\${srv.address().port}/mcp\`
+      const res = await connectToServer('probe', { type: 'http', url, scope: 'project' })
+      console.log(JSON.stringify({ type: res.type, noProxy: process.env.NO_PROXY }))
+      srv.close()
+    `)
+    // 接线断掉时这里是 'failed' —— 实测验证过(把那一句 registerDirectHosts 删掉再跑)。
+    expect(r.type).toBe('connected')
+    expect(String(r.noProxy)).toContain('127.0.0.1')
   })
 })
 

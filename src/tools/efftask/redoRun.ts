@@ -1,4 +1,5 @@
 import { attachGuidance, planForcePass, planRedo, planSkip, type RedoContext, type RedoEntry, type RedoPlan } from './redo.js'
+import { affectedByRedo } from './liveRedo.js'
 import type { PhaseName, TaskNode } from './types.js'
 
 /**
@@ -41,8 +42,24 @@ export interface RedoRunDeps {
    * 防线又会变成源码文本断言,而那种断言证明不了「这一步真的被调用过、而且带着对的参数」。
    */
   onDropStreams?: (nodeIds: readonly string[]) => void
-  /** 重新启动编排。**这是整个功能的目的**,少了它重做只是改了改树。 */
-  start: (nodes: TaskNode[]) => void
+  /**
+   * 让新树真的跑起来。**这是整个功能的目的**,少了它重做只是改了改树。
+   *
+   * 两条路共用这一个口子(见 liveRedo.ts):结束屏那条起一个新编排器;运行中那条把新树
+   * 并进正在跑的那一棵,而它需要 `affected` —— 所以这个参数在这里,不在调用方各自重算。
+   */
+  start: (nodes: TaskNode[], affected: readonly string[]) => void
+  /**
+   * 落盘**之前**问一次「这次重做现在能不能做」,并且**把它要动的节点扣下来**。
+   *
+   * 运行中重做专用。为什么必须在落盘之前:算新树和落盘之间隔着一次 await,调度循环完全
+   * 可能在那期间把其中一个节点派出去(最真实的是被放回的祖先——别的子任务恰好这时跑完)。
+   * 等到换树那一刻才发现就晚了:盘上已经写完,磁盘是新树、内存是旧树,而屏幕说重做成功。
+   *
+   * 返回一句话 = 不能做,这次重做**什么都不会发生**(planXxx 是纯函数,到这里盘上一个
+   * 字节都没动过)。返回 undefined = 扣住了,由调用方在 `start` 之后释放。
+   */
+  canApply?: (affected: readonly string[]) => string | undefined
   /** 关掉关口、回到 done 视图。 */
   onDone: () => void
 }
@@ -73,6 +90,15 @@ export async function runRedo(
     deps.onDone()
     return
   }
+  const affected = affectedByRedo(computed, targetId)
+  const blocked = deps.canApply?.(affected)
+  if (blocked) {
+    // 和 planRedo 出错那一支同一个立场:盘上一个字节都没动过,所以说清原因、关掉关口,
+    // 用户可以先去处理那个正在跑的节点再回来。
+    deps.onProblems([`重做未执行: ${blocked}`])
+    deps.onDone()
+    return
+  }
   if (guidance && guidance.text.trim().length > 0) {
     const target = computed.nodes.find(n => n.id === targetId)
     // 找不到目标节点在这条路上不可达(planRedo 成功就意味着它在),但静默丢掉用户亲手写的
@@ -94,7 +120,7 @@ export async function runRedo(
   deps.onNodes(computed.nodes)
   // 落盘在前、重启在后。反过来的话编排器会在一棵还没写下去的树上开跑,
   // 中途崩溃就什么都恢复不了。
-  deps.start(computed.nodes)
+  deps.start(computed.nodes, affected)
 }
 
 /**
@@ -154,6 +180,13 @@ async function runPastFailedPhase(
     deps.onDone()
     return
   }
+  const affected = affectedByRedo(computed, targetId)
+  const blocked = deps.canApply?.(affected)
+  if (blocked) {
+    deps.onProblems([`${what}未执行: ${blocked}`])
+    deps.onDone()
+    return
+  }
   if (guidance && guidance.text.trim().length > 0) {
     const target = computed.nodes.find(n => n.id === targetId)
     if (target) attachGuidance(target, guidance.scope, guidance.text)
@@ -168,5 +201,5 @@ async function runPastFailedPhase(
   // 判据放在 `deleted` 上而不是入口上,以后哪条路开始删节点都不会漏。
   if (computed.deleted.length > 0) deps.onDropStreams?.(computed.deleted)
   deps.onNodes(computed.nodes)
-  deps.start(computed.nodes)
+  deps.start(computed.nodes, affected)
 }

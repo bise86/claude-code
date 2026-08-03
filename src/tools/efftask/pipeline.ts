@@ -1,7 +1,7 @@
 // src/tools/efftask/pipeline.ts
 import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
-import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, MANUAL_PASS_ROLE, PHASE_LABEL } from './types.js'
+import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
@@ -61,7 +61,9 @@ export interface PipelineCtx {
    * with no Feishu bridge; the node still blocks with the details in blockedReason either way.
    */
   onEscalate?: (info: {
-    node: TaskNode; branch: string; path: string; files: string[]; attempted: boolean
+    node: TaskNode; branch: string; path: string; files: string[]
+    /** 本次运行里为这个节点派出去的自动解决调用次数。见 ConflictEscalation.attempts。 */
+    attempts: number
     /** MEASURED state of that worktree, so the card can describe it instead of guessing. */
     state: { markers: boolean; staged: boolean; stale: boolean }
     integrationBranch?: string
@@ -106,6 +108,32 @@ export interface PipelineCtx {
    * so the number at the confirmation gate is the real ceiling rather than a per-step one.
    */
   slots?: SlotPool
+  /**
+   * 本次运行里,每个节点已经用掉的**自动解决合并冲突**次数。node id → 次数。
+   *
+   * **刻意不落盘,也刻意不看 `iteration.mergeResolve`。** 那个计数器是持久化的累计记录,
+   * 用它当闸门等于「一个节点这辈子只能自动解一次冲突」:解完被验收否决、或者用户按照
+   * 升级卡的指示 `--resume` 回来,都不会再有第二次 —— 而卡片上写的是「恢复后会重跑验收
+   * 再合并」,用户读到的意思是它会再试。预算改成**每次运行**独立计,恢复即回满。
+   *
+   * 这个 Map 的实例住在 orchestrator 上(一次运行一个),不是住在 `ctx()` 的返回值里 ——
+   * `ctx()` 每次调用都新建一个对象,状态挂在那上面等于每一步都回满。见 orchestrator.ctx()。
+   * 手搭 ctx 的测试可以不给:缺省时下面会就地建一个,预算仍然在单次调用链里生效。
+   */
+  mergeResolveThisRun?: Map<string, number>
+}
+
+/**
+ * 这次 run 允许同一个节点自动解几次合并冲突。默认 6,由 `caps.mergeResolveAttempts` 决定。
+ *
+ * **回落到默认值,不是回落到 0。** 这个字段是可选的:一份在它存在之前写下的 run.md 读回来
+ * 就没有它,而 `?? 0` 会让那些 run 一恢复就彻底关掉自动解决 —— 一个静默的、只在恢复路径上
+ * 发生的功能退化。夹取同样在这里做一次:盘上那份是可以手改的。
+ */
+function mergeResolveBudget(ctx: PipelineCtx): number {
+  const raw = ctx.config.caps.mergeResolveAttempts ?? DEFAULT_CAPS.mergeResolveAttempts ?? 0
+  if (!Number.isFinite(raw)) return DEFAULT_CAPS.mergeResolveAttempts ?? 0
+  return Math.min(MAX_MERGE_RESOLVE, Math.max(MIN_MERGE_RESOLVE, Math.round(raw)))
 }
 
 /**
@@ -2231,6 +2259,53 @@ async function growTree(
 }
 
 /**
+ * 摆在解决者面前的**到底是什么**,以及在没有现场时把现场造出来。
+ *
+ * `fresh` 为真时(本节点这辈子还没自动解过冲突)行为与引入重试之前逐字节相同:直接把集成
+ * 分支合进节点工作区。此时工作区必然干净 —— commitAndMerge 在冲突后 `reset --hard` 的是
+ * **集成**工作区,节点自己的那份连 MERGE_HEAD 都没有(见 mergeIntegrationIntoNode 的注释)。
+ *
+ * `fresh` 为假(重试轮 / `--resume` 回来的那一轮)时**必须先测量**:那里极可能躺着一份刚被
+ * 验收否决的解决,已经 git add、MERGE_HEAD 还在。对着它调 `mergeIntegrationIntoNode` 会
+ * `add -A` + `commit` —— 把被否决的代码提交进分支,然后 merge 回答 Already up to date,
+ * 整条链把「验收拒绝过的东西」当成「解决成功」合进去。这正是 conflictState 那段注释里写的
+ * 「telling the user to git add and commit would commit exactly the code the reviewers just
+ * refused」,只是这一次犯错的是我们自己而不是用户。
+ */
+type ConflictScene =
+  | { ok: true; kind: 'fresh' | 'markers' | 'stale' | 'staged'; files: string[] }
+  /** 冲突自己消失了(对面动过了)—— 没有可解的,直接重试合并。 */
+  | { ok: true; kind: 'clean'; files?: undefined }
+  | { ok: false; message: string }
+
+async function conflictScene(node: TaskNode, ctx: PipelineCtx, fresh: boolean): Promise<ConflictScene> {
+  const pool = ctx.worktrees
+  if (!pool) return { ok: false, message: '没有可用的隔离池' }
+  if (!fresh) {
+    let probed: { markers: boolean; staged: boolean; stale: boolean; files: string[] }
+    try {
+      probed = await pool.conflictState(node)
+    } catch (e) {
+      /**
+       * 测不出来就**不动手**。缺省回退到 mergeIntegrationIntoNode 是不行的:上一段说的那条
+       * 「提交被否决的解决」的路,恰恰是在测量失败时最需要挡住的。宁可升级人工。
+       */
+      return { ok: false, message: `无法探测工作区状态: ${e instanceof Error ? e.message : String(e)}` }
+    }
+    // 顺序照抄 conflictState 自己的判定顺序:stale(标记已被提交进去)必须排在 markers 前面,
+    // 它返回的 markers 也是 true,而两者要给解决者的指令完全不同。
+    if (probed.stale) return { ok: true, kind: 'stale', files: probed.files }
+    if (probed.markers) return { ok: true, kind: 'markers', files: probed.files }
+    if (probed.staged) return { ok: true, kind: 'staged', files: [] }
+    // 干净:上一轮的合并被谁 abort 掉了(或者根本没做成)。照第一轮那样重新造一个现场。
+  }
+  const local = await pool.mergeIntegrationIntoNode(node)
+  if (!local.ok) return { ok: false, message: local.message }
+  if (!local.conflicted) return { ok: true, kind: 'clean' }
+  return { ok: true, kind: 'fresh', files: local.files }
+}
+
+/**
  * Merge the node's worktree into the integration branch, then release it.
  *
  * Returns false when the node must NOT be accepted — a conflict or an infrastructure failure.
@@ -2240,7 +2315,7 @@ async function growTree(
  * An un-isolated run short-circuits to true: there is nothing to merge, the executor wrote
  * straight into the shared tree.
  */
-async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = false): Promise<boolean> {
+async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
   /**
    * "Nothing to merge" and "the pool that owned my commits is gone" are NOT the same answer.
    *
@@ -2275,23 +2350,40 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
       // the run's own "已取消" in the same second.
       if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
 
-      // spec §8: 触发一次"合并解决". Bounded to one — an unbounded loop spends write-capable
-      // calls on a merge that keeps failing, each attempt starting from a tree the last one
-      // already edited. Tested BEFORE the increment, so a resumed node gets no second attempt.
-      let attempted = triedThisRun
-      if (node.iteration.mergeResolve < 1) {
+      // spec §8: 触发"合并解决"。预算见 caps.mergeResolveAttempts(默认 6)—— **每次运行**
+      // 独立计,不是终身一次:每一次解完被验收否决之后都还有下一次,而下一次手里多了一样
+      // 上一次不可能有的东西 —— 否决理由本身。人工 `--resume` 回来也重新回满(升级卡
+      // 承诺的就是这个)。
+      const spentByNode = (ctx.mergeResolveThisRun ??= new Map<string, number>())
+      /** 上一轮验收否决的理由,带给下一轮解决者。第一轮没有。 */
+      let rejection: string | undefined
+      const budget = mergeResolveBudget(ctx)
+      while ((spentByNode.get(node.id) ?? 0) < budget) {
+        /**
+         * **先测量再动手**,而且只在重试轮次测。
+         *
+         * 重试进来时,工作区里极可能躺着一份**刚被验收否决**的解决(已 git add,MERGE_HEAD
+         * 还在)。`mergeIntegrationIntoNode` 的第一句就是 `add -A` + `commit` —— 对着那种
+         * 状态调用它,会把被否决的代码提交进分支,紧接着的 merge 回答 Already up to date,
+         * 于是「解决成功」并合入。第一轮(`iteration.mergeResolve === 0`)不测量,走的是
+         * 原来那条路:那时工作区必然是干净的(commitAndMerge 冲突后会 reset 集成工作区,
+         * 见 mergeIntegrationIntoNode 的注释),多一次探测只是多一次 git。
+         */
+        const priorAttempts = node.iteration.mergeResolve
+        spentByNode.set(node.id, (spentByNode.get(node.id) ?? 0) + 1)
         node.iteration.mergeResolve += 1
-        // Put the conflict INTO this node's own worktree first. Without this the resolver is
-        // sent to a clean directory (see mergeIntegrationIntoNode) and can only pretend.
-        const local = await ctx.worktrees.mergeIntegrationIntoNode(node)
-        if (!local.ok) {
-          await blockWithReason(node, `合并失败(基础设施):无法在节点工作区重现冲突: ${local.message}`, ctx)
+        const scene = await conflictScene(node, ctx, priorAttempts === 0)
+        if (!scene.ok) {
+          await blockWithReason(node, `合并失败(基础设施):无法在节点工作区重现冲突: ${scene.message}`, ctx)
           return false
         }
-        if (!local.conflicted) {
+        if (scene.kind === 'clean') {
           // The other side moved on and the merge is now clean — nothing to resolve. Retry.
-          return mergeAndRelease(node, ctx, true)
+          return mergeAndRelease(node, ctx)
         }
+        // 测量拿不到文件名时(staged 那一支没有未合并路径)退回第一次合并报的那份。
+        const files = scene.files.length > 0 ? scene.files : res.files
+        const fileList = files.map(f => '- ' + quote(f)).join('\n')
         const tag = answerTag(ANSWER_TAGS.exec)
         const resolve = await runPhase(ctx, {
           phase: 'execute', node, role: firstRole(node, 'execute'), system: 'execute',
@@ -2303,22 +2395,40 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
              * 一个字都不知道 —— 偏偏它是最可能去改那些文件的一次。
              */
             seatPreamble(ctx, firstRole(node, 'execute'), 'execute', node) +
-            `已把集成分支 ${quote(ctx.worktrees.integrationBranchName)} 合并进你的工作区,产生了冲突。` +
-            `当前工作目录里就是冲突现场(带 <<<<<<< / >>>>>>> 标记)。\n` +
-            `请解决冲突,保留双方的意图,不要简单丢弃任何一边;解决后 git add 冲突文件即可,不要提交。\n` +
-            `冲突文件:\n${local.files.map(f => '- ' + quote(f)).join('\n')}\n` +
+            (scene.kind === 'staged'
+              /**
+               * 第二次机会**唯一的价值**就在这一段:把验收的否决理由交给解决者。
+               *
+               * 不能照抄第一轮的文案:那份解决已经 git add 在那里了,叫它「解决冲突」它会
+               * 在一个没有 <<<<<<< 的目录里找现场(那正是 mergeIntegrationIntoNode 存在的
+               * 理由所记的老病)。这里要说的是「你上一版被否了,理由是 X,在它上面改」。
+               */
+              ? `你上一轮解决的冲突已经 git add 在暂存区,但**验收没有通过**:` +
+                `${rejection ?? '(理由见 node.md 的验收记录)'}\n` +
+                `当前工作目录里就是那份未提交的解决,请在它的基础上修正 —— 不要重新合并,` +
+                `也不要 git commit;改完 git add 即可。\n` +
+                (files.length > 0 ? `涉及的文件:\n${fileList}\n` : '')
+              : scene.kind === 'stale'
+                ? `这个分支的文件里残留了**已经提交进去**的冲突标记(<<<<<<< / >>>>>>>):\n${fileList}\n` +
+                  `请清理掉残留标记,保留双方的意图,不要简单丢弃任何一边;` +
+                  `改完 git add 即可,不要提交。\n`
+                : `已把集成分支 ${quote(ctx.worktrees.integrationBranchName)} 合并进你的工作区,产生了冲突。` +
+                  `当前工作目录里就是冲突现场(带 <<<<<<< / >>>>>>> 标记)。\n` +
+                  `请解决冲突,保留双方的意图,不要简单丢弃任何一边;解决后 git add 冲突文件即可,不要提交。\n` +
+                  `冲突文件:\n${fileList}\n`) +
             `解决后输出:{ "execStatus":"如何解决的" }。` + answerRule(tag),
           cwd: node.worktree.path, signal: ctx.signal,
         }, {
           // 不是「执行」:它和主执行流是两件事,共用一个表头会让人以为执行跑了两遍。
           phaseLabel: '解决合并冲突',
-          round: node.iteration.mergeResolve + 1,
+          round: node.iteration.mergeResolve,
           label: (firstRole(node, 'execute')?.roleName || firstRole(node, 'execute')?.roleTag) || '主模型',
           model: firstRole(node, 'execute')?.model,
         })
-        // Set only once the executor has actually been asked. Setting it on entry made the
-        // card claim an attempt on the branch that recurses without ever calling the model.
-        attempted = true
+        // 计数就是 spentByNode 本身,不再另有一个布尔跟着走:它在派单**之前**加一,而升级卡
+        // 读的也是它。两个变量记同一件事,迟早给出两种答案 —— 这一处以前就是靠一句
+        // 「Set only once the executor has actually been asked」的注释在维持同步。
+        // 唯一的偏差是「调用抛异常」那一轮:仍然算一次尝试,而它确实派出去了。
         // The resolve call is the longest window in this path (a write-capable model call with
         // the node timeout). An abort landing inside it arrived here with no check and fell
         // straight through to onEscalate: the run said 已取消 while the card said 等待人工.
@@ -2327,6 +2437,14 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           // Record WHY. Every other runPhase failure in this file reports its reason; letting
           // this one fall silently into the generic conflict message hid timeouts entirely.
           node.execStatus = `${node.execStatus}\n(自动解决冲突未能完成: ${resolve.reason})`
+          /**
+           * 调用本身没打通(超时 / 限流 / provider 报错)——**不消耗第二次机会去重打一遍**。
+           *
+           * 第二次机会的全部意义是「带着验收的否决理由再改一版」,这里没有那样东西可带,
+           * 重来一次就是同一个提示词打同一条失败的链路。runPhase 对执行环节本来也不重试
+           * (`attempts = 1`,理由见那里:写工具可能已经改过文件了),这一支跟它同一个立场。
+           */
+          break
         } else {
           node.execStatus = `${node.execStatus}\n(合并冲突解决)${parseExecOutput(resolve.text, tag).execStatus}`
           if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
@@ -2347,7 +2465,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
             // 漏掉这里的话,一个已经被强制通过的验收会在解冲突之后原样复活开会,而那个
             // 标记还留在节点上等着下一轮再放行一次 —— 用户按的那一下既没生效也没消失。
             //
-            // **必须和通过分支走同一个出口** `return mergeAndRelease(node, ctx, true)`,
+            // **必须和通过分支走同一个出口** `return mergeAndRelease(node, ctx)`,
             // 不能自己拍板 ACCEPTED。这里是 mergeAndRelease 内部,函数签名是 Promise<boolean>:
             //  - 裸 `return` 返回 undefined,调用方的 `if (!(await mergeAndRelease(...)))`
             //    会把成功当失败;
@@ -2355,8 +2473,6 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
             //    调用方本该把它置成 WAITING_CHILDREN。实测:冲突 + 跳过验收 → 父节点
             //    ACCEPTED(终态),子节点停在 CREATED 永远不被调度,run 报告完成而那个
             //    子任务一次都没跑。
-            // triedThisRun=true 也不能漏:漏了的话重入时 attempted 停在 false,升级卡会说
-            // 「自动解决机会已在此前用完,本次未再尝试」,而本次实实在在跑了一次解冲突。
             if (isForcePassed(ctx, 'accept', node)) {
               applyForcePass(
                 ctx, node, 'accept', node.acceptLog, node.acceptLog.length + 1,
@@ -2364,7 +2480,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
               )
             } else noteOnNode(node, '自动解决冲突后的复验已跳过')
             consumeSkip(node, 'accept')
-            return mergeAndRelease(node, ctx, true)
+            return mergeAndRelease(node, ctx)
           }
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
             phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
@@ -2372,8 +2488,16 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
           })
           node.acceptLog.push(rec)
           if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
-          if (!infraExhausted && rec.synthesized.pass) return mergeAndRelease(node, ctx, true)
-          node.execStatus = `${node.execStatus}\n(冲突解决后验收未通过: ${rec.synthesized.blockingSummary || '验收角色调用失败'})`
+          if (!infraExhausted && rec.synthesized.pass) return mergeAndRelease(node, ctx)
+          const why = rec.synthesized.blockingSummary || '验收角色调用失败'
+          node.execStatus = `${node.execStatus}\n(冲突解决后验收未通过: ${why})`
+          /**
+           * 一桌验收全是 infra 失败 —— 没有人对这份解决做出过判断,重解一版毫无依据。
+           * 和上面那条 `break` 同一个立场:预算留给「有理由可带」的那一轮。
+           */
+          if (infraExhausted) break
+          // 下一轮带着这条理由进去。这是第二次机会唯一的、也是全部的价值。
+          rejection = why
         }
       }
       // MEASURE the worktree instead of asserting anything about it. A blanket re-merge here
@@ -2409,13 +2533,11 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx, triedThisRun = 
               : `进入该路径后自行 git merge ${ctx.worktrees.integrationBranchName} 重现冲突并解决;`) +
         `随后用 /et --resume 继续。`
       // Escalate BEFORE blocking, so the card carries the same facts the tree will show.
-      // `attempted` is threaded through the recursion rather than derived from
-      // iteration.mergeResolve, which is PERSISTED: a node resumed with its one attempt
-      // already spent makes none this run, and a card claiming "已自动尝试解决一次" would be
-      // describing something that happened in a previous session — or, after an interrupt,
-      // something that never finished at all.
+      // 次数取自**本次运行**的计数器,不是 iteration.mergeResolve —— 后者是持久化的累计值,
+      // 一个恢复回来的节点带着上几次会话的次数,卡上写出来就是在描述别的会话发生的事
+      // (中断的那次更糟:它记着一次从未跑完的尝试)。
       try {
-        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files, attempted, state, integrationBranch: ctx.worktrees.integrationBranchName })
+        ctx.onEscalate?.({ node, branch: node.worktree.branch, path: node.worktree.path, files, attempts: spentByNode.get(node.id) ?? 0, state, integrationBranch: ctx.worktrees.integrationBranchName })
       } catch { /* a notification failure must not change the run's verdict */ }
       await blockWithReason(node, detail, ctx)
       return false
@@ -2568,7 +2690,8 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     try {
       ctx.onEscalate?.({
         node, branch: node.worktree.branch, path: node.worktree.path, files: [],
-        attempted: false, state: { markers: false, staged: true, stale: false },
+        // 0 —— 这一路否决的是**人手**改的那一版,模型这一趟一次都没被派出去。
+        attempts: 0, state: { markers: false, staged: true, stale: false },
         integrationBranch: ctx.worktrees?.integrationBranchName,
       })
     } catch { /* a notification failure must not change the run's verdict */ }

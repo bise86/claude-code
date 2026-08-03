@@ -2,12 +2,29 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
+
+# **不要 cd 到 ROOT_DIR。** 这个进程的工作目录就是用户敲命令的那个目录,而整个 CLI 是按
+# `process.cwd()` 找项目的:`.mcp.json`(项目级 MCP 服务器)、`.claude/settings.json`、
+# CLAUDE.md、git 仓库、@ 补全的文件树,全都从那里起算。
+#
+# 实测过 cd 之后的样子:在一个带 `.mcp.json`(3 个服务器,单独跑全部能连上)的目录里
+# 敲 `claude-haha mcp list`,回答是「No MCP servers configured」—— 而同一个入口文件
+# 直接用 bun 在同一个目录里跑,三个服务器全部 ✓ Connected。项目级的一切都在读
+# claude-code 仓库自己的目录,而不是用户的项目。
+#
+# 当初 cd 是为了让 bun 读到仓库根的 `bunfig.toml`(它的 preload 注入 MACRO 全局量,
+# 缺了它启动就是 `ReferenceError: MACRO is not defined`)。bunfig 是按 **cwd** 找的,
+# 所以换成显式 `--preload <绝对路径>`:同样的注入,不用动工作目录。
+PRELOAD="$ROOT_DIR/preload.ts"
+
+# `--env-file` 也必须是绝对路径(以前是相对的 `.env`,靠 cd 才成立)。文件不存在时 bun
+# 自己会忽略,所以不需要额外判断。
+ENV_FILE="$ROOT_DIR/.env"
 
 # Force recovery CLI (simple readline REPL, no Ink TUI)
 if [[ "${CLAUDE_CODE_FORCE_RECOVERY_CLI:-0}" == "1" ]]; then
-  exec bun --env-file=.env ./src/localRecoveryCli.ts "$@"
+  exec bun --env-file="$ENV_FILE" --preload "$PRELOAD" "$ROOT_DIR/src/localRecoveryCli.ts" "$@"
 fi
 
 # Default: full CLI with Ink TUI
-exec bun --env-file=.env ./src/entrypoints/cli.tsx "$@"
+exec bun --env-file="$ENV_FILE" --preload "$PRELOAD" "$ROOT_DIR/src/entrypoints/cli.tsx" "$@"

@@ -72,6 +72,7 @@ import {
 import { getMCPUserAgent } from '../../utils/http.js'
 import { maybeNotifyIDEConnected } from '../../utils/ide.js'
 import { maybeResizeAndDownsampleImageBuffer } from '../../utils/imageResizer.js'
+import { registerDirectHosts } from '../../utils/lanDirect.js'
 import { logMCPDebug, logMCPError } from '../../utils/log.js'
 import {
   getBinaryBlobSavedMessage,
@@ -606,6 +607,23 @@ export const connectToServer = memoize(
     },
   ): Promise<MCPServerConnection> => {
     const connectStartTime = Date.now()
+    /**
+     * 内网 MCP 端点**绕过代理直连**(见 utils/lanDirect)。
+     *
+     * 一台开着 `HTTPS_PROXY` 的机器上,Bun 的 fetch 连 `127.0.0.1` 都照走代理 —— 于是
+     * 一个跑在本机或内网上的 http/sse MCP 服务器一律连不上,`/mcp` 上一排 ✗ Failed to
+     * connect,而同一个地址 curl 得好好的。实测复现:两个 127.0.0.1 上的 http 服务器,
+     * `HTTP_PROXY` 指向一个死端口 → 两个都失败,stdio 那个照常连上(它不走 fetch)。
+     *
+     * `registerDirectHosts` 只登记判定为内网的主机名(回环 / 私网段 / .local 等),公网
+     * 地址一个都不碰 —— 公司代理该管的仍然归它管。这一句放在 connectToServer 里,是因为
+     * 它是所有连接路径的必经点:`/mcp`、会话启动、`claude mcp list` 都从这里过。
+     */
+    registerDirectHosts([
+      'url' in serverRef && typeof serverRef.url === 'string'
+        ? serverRef.url
+        : undefined,
+    ])
     let inProcessServer:
       | { connect(t: Transport): Promise<void>; close(): Promise<void> }
       | undefined

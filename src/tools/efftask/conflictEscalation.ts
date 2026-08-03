@@ -14,14 +14,17 @@ export type ConflictEscalation = {
   path: string
   files: string[]
   /**
-   * Whether an automatic resolution was attempted IN THIS RUN.
+   * How many automatic resolutions were attempted IN THIS RUN.
    *
-   * Not derivable from the node: `iteration.mergeResolve` is persisted, so a resumed node
-   * whose one attempt was spent in an earlier session carries `mergeResolve === 1` while
-   * making no attempt at all. A card claiming 已自动尝试解决一次 there would be describing a
-   * previous session — or, after an interrupt, an attempt that never finished.
+   * Not derivable from the node: `iteration.mergeResolve` is a persisted CUMULATIVE record, so
+   * a resumed node carries the attempts of every earlier session too. A card counting those
+   * would be describing a previous session — or, after an interrupt, an attempt that never
+   * finished. It is a number rather than a boolean because the budget is no longer one:
+   * 「已自动尝试解决一次」was a fixed sentence that went false the moment a second attempt
+   * became possible, and the count is exactly what tells the user whether the model gave up
+   * after one bad call or after two reviewed tries.
    */
-  attempted: boolean
+  attempts: number
   /**
    * MEASURED state of that worktree at escalation time — not assumed.
    *
@@ -48,9 +51,9 @@ export function escalationLines(e: ConflictEscalation, runId?: string): string[]
     `工作区: ${e.path}`,
     // The file list is what turns "there is a conflict" into "open these".
     e.files.length > 0 ? `冲突文件: ${e.files.join('、')}` : '冲突文件: (未能读出文件列表)',
-    e.attempted
-      ? '该节点已自动尝试解决一次未成功,现已暂停等待人工。'
-      : '该节点的自动解决机会已在此前用完,本次未再尝试,现已暂停等待人工。',
+    e.attempts > 0
+      ? `该节点本次已自动尝试解决 ${e.attempts} 次仍未成功,现已暂停等待人工。`
+      : '本次运行没有再尝试自动解决(该节点在本次运行里的额度已用完),现已暂停等待人工。',
     // Written from the measurement. `staged` in particular must not say "git add 并 commit":
     // what is staged there is the resolution acceptance JUST REJECTED, so that instruction
     // would have the user commit verbatim the code the reviewers refused.
@@ -69,7 +72,10 @@ export function escalationLines(e: ConflictEscalation, runId?: string): string[]
           : '处理方式: cd 到上面的工作区。那里目前没有冲突现场 —— 请自行把集成分支合并进来' +
             '(git merge <上面的集成分支>),解决冲突后提交。',
     `集成分支: ${e.integrationBranch ?? '(未知)'}`,
-    `恢复: /et --resume ${runId ?? '<运行 ID>'};恢复后会重跑验收再合并。`,
+    // 自动解决的额度是**按次运行**算的,恢复即回满 —— 这句话必须说出来,否则用户会以为
+    // 「机会已经用完了,我不解就没人解」,而实际上他把冲突留在原地再 resume 一次,模型
+    // 还会带着这一轮的验收意见再试。
+    `恢复: /et --resume ${runId ?? '<运行 ID>'};恢复后会重跑验收再合并,若仍有冲突会重新给两次自动解决。`,
   ]
 }
 

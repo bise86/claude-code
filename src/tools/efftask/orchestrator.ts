@@ -85,6 +85,140 @@ export class EffTaskOrchestrator {
   nodes(): TaskNode[] { return [...this.byId.values()] }
 
   /**
+   * 此刻真的在跑的节点 id。
+   *
+   * 存在的理由只有一个:**运行中重做**要判「这次重做碰到的节点里有没有正在跑的」。
+   * 那张表原来是 `run()` 里的一个局部量,而这个判断必须由外面(界面按下 r 的那一刻)问得到。
+   */
+  private inFlightIds = new Set<string>()
+  runningNodeIds(): readonly string[] { return [...this.inFlightIds] }
+
+  /**
+   * 编排器在「等某个节点跑完」时的额外唤醒口。
+   *
+   * 运行中就地换树之后必须立刻重扫:不叫醒的话,新放回可推进状态的那个节点要等到
+   * **另一个**节点跑完才被看见 —— 而「其它任务还在跑一个二十分钟的执行环节」正是用户
+   * 按下重做的那一刻。和 `waitForParallelism` 同一个理由、同一个形状。
+   */
+  private wakeup: { promise: Promise<void>; wake: () => void } = makeWakeup()
+  private nudge(): void {
+    const w = this.wakeup
+    this.wakeup = makeWakeup()
+    w.wake()
+  }
+
+  /**
+   * 清掉某个节点的「原地打转」记账 —— 见 run() 里的 stalls。
+   *
+   * 重做把节点放回可推进状态时必须清:那个计数器记的是「同一个状态连着交出两次」,
+   * 而重做后的第一步正好又会落在同一个状态上,于是节点会被判成空转、强制阻断,
+   * 理由还是一句和重做完全无关的「节点未能推进」。
+   */
+  private clearStall: (id: string) => void = () => {}
+
+  /** `run()` 已经返回了吗。见 applyLive 的第一道守卫。 */
+  private finished = false
+
+  /**
+   * 被**扣住**、暂时不许调度的节点 id。
+   *
+   * 运行中重做的第二道闸门,而且是唯一airtight的那道:算新树和落盘之间隔着一次 `await`,
+   * 而调度循环在那期间完全可能把其中一个节点派出去 —— 最真实的是被放回的祖先(别的子任务
+   * 恰好在这时跑完,它就进了集成验收)。等到换树那一刻才发现,盘上已经写完了,于是磁盘上
+   * 是新树、内存里是旧树,而屏幕说重做成功。
+   *
+   * 所以顺序是:扣住 → 落盘 → 换树(换完自动释放)。扣住这一步是同步的,和「这一刻谁在飞」
+   * 的判断在同一个回合里,中间挤不进任何东西。
+   */
+  private held = new Set<string>()
+
+  /**
+   * 运行中重做的第一步:把这些节点从调度里扣下来。
+   *
+   * 失败(有节点正在跑)时**什么都没发生** —— 调用方还没落过盘,可以原样告诉用户。
+   */
+  hold(ids: readonly string[]): { ok: true; release: () => void } | { ok: false; reason: string } {
+    if (this.finished) return { ok: false, reason: '本次编排已经结束(最后一个任务刚跑完),这次重做要走结束屏那条路' }
+    const busy = ids.filter(id => this.inFlightIds.has(id))
+    if (busy.length > 0) {
+      const names = busy.map(id => this.byId.get(id)?.title ?? id)
+      return {
+        ok: false,
+        reason: `这次重做会动到正在运行的任务(${names.join('、')})—— 请先在树上选中它按 x 取消,再重做。` +
+          `直接换树的话,它此刻在飞的调用会把结果写进一个已经不在树里的节点。`,
+      }
+    }
+    for (const id of ids) this.held.add(id)
+    let released = false
+    // 释放要**叫醒循环**:上面那条「扣住时不判走不动」的分支正睡在 wakeup 上,而一次
+    // 失败的重做(算得出新树、落盘却失败了)只会释放、不会换树 —— 不叫醒的话它睡到天荒地老。
+    return { ok: true, release: () => { if (released) return; released = true; for (const id of ids) this.held.delete(id); this.nudge() } }
+  }
+
+  /**
+   * 运行中就地换树 (用户原话:「不需要整体返回失败才能重做任务或阶段,在其它任务还在
+   * 运行时就可以重做」)。
+   *
+   * **不重启编排器。** 重启的语义是「把这一轮作废、重新开一轮」,而此刻别的节点正在跑 ——
+   * 它们的在飞调用会变成孤儿:老编排器仍持有它们、仍会 commit 进一棵没人再看的树,
+   * 而新编排器会把同一批节点再派一遍。所以这里是把新树**并进正在跑的那一棵**。
+   *
+   * 拒绝的唯一条件是「这次重做碰到的节点里有正在跑的」:那个节点的 step 手里攥着**旧对象**
+   * 的引用,换树之后它的 commit 会落进一个已经不在树里的对象 —— 产出看着跑完了,树上却
+   * 什么都没有。让用户先取消它(x)再重做,比替他做这个决定要诚实。
+   *
+   * 没被碰到的在飞节点**保留原对象**(不取新树里那份克隆):它们的 step 正拿着旧引用,
+   * 换成克隆等于把它们这一轮的进展扔掉。
+   */
+  applyLive(
+    next: readonly TaskNode[],
+    /** 这次重做碰过的节点 id(目标、被删的子树、被放回的祖先、被改写依赖的)。 */
+    affected: readonly string[],
+  ): { ok: true } | { ok: false; reason: string } {
+    /**
+     * 循环已经走完了 —— 换树也没有人再去调度它。
+     *
+     * 真实可达:用户在最后一个节点跑完的那一瞬按下 r。此时该走结束屏那条路(重启编排器),
+     * 而不是悄悄改一棵没人再看的树 —— 那会让屏幕显示「已重做」而实际一个调用都不会发生。
+     */
+    if (this.finished) return { ok: false, reason: '本次编排已经结束(最后一个任务刚跑完),这次重做要走结束屏那条路' }
+    const busy = affected.filter(id => this.inFlightIds.has(id))
+    if (busy.length > 0) {
+      const names = busy.map(id => this.byId.get(id)?.title ?? id)
+      return {
+        ok: false,
+        reason: `这次重做会动到正在运行的任务(${names.join('、')})—— 请先在树上选中它按 x 取消,再重做。` +
+          `直接换树的话,它此刻在飞的调用会把结果写进一个已经不在树里的节点。`,
+      }
+    }
+    const byId = new Map<string, TaskNode>()
+    for (const n of next) byId.set(n.id, this.inFlightIds.has(n.id) ? (this.byId.get(n.id) ?? n) : n)
+    // 在飞的节点必须仍在新树里。deleted ⊆ affected,所以这一条到不了 —— 但它挡的是
+    // 「以后某条路开始删节点却忘了报进 affected」,那时的表现是一个跑完的节点凭空消失。
+    for (const id of this.inFlightIds) {
+      if (!byId.has(id)) return { ok: false, reason: `新树里没有正在运行的节点 ${id},已放弃这次重做` }
+    }
+    if (!byId.has('root')) return { ok: false, reason: '新树里没有根节点,已放弃这次重做' }
+    /**
+     * **原地改这个 Map,不换对象。** `ctx()` 把 `this.byId` 直接交给每一个在跑的 step,
+     * 换成新 Map 的话它们手里那份永远停在换树之前 —— 一个在飞的拆分节点会把新子任务
+     * 建进一棵没人再看的树里。
+     */
+    this.byId.clear()
+    for (const [id, n] of byId) this.byId.set(id, n)
+    for (const id of affected) {
+      this.clearStall(id)
+      // 用户取消过、又决定重做的节点:不清的话 registerCall 一登记就发现它在 cancelled 里,
+      // 立刻 abort → 又是一次 NodeCancelledError。startRun 那条路靠 clearAllCancels 解决,
+      // 这里只清被碰到的这几个 —— 别的节点正在跑,它们的取消标记不该被顺手抹掉。
+      this.deps.control?.clearCancel(id)
+    }
+    this.safeUpdate()
+    this.nudge()
+    return { ok: true }
+  }
+
+  /**
    * 并行占用 (spec §10.1's 顶部状态条). Live, because it changes many times per second and
    * mirroring it into React state would repaint the tree on every reviewer.
    *
@@ -153,9 +287,19 @@ export class EffTaskOrchestrator {
    */
   private slots = createSlotPool(() => this.limit())
 
+  /**
+   * 自动解冲突的**本次运行**预算(node id → 已用次数)。见 PipelineCtx.mergeResolveThisRun。
+   *
+   * 住在**实例**上,不是住在 `ctx()` 里 —— `ctx()` 每次调用都新建一个对象,挂在那上面
+   * 等于每一步都回满,预算形同虚设。一次运行一个 orchestrator,所以「每次运行两次、
+   * `--resume` 回满」这句话由这个字段的生命周期直接兑现。
+   */
+  private mergeResolveThisRun = new Map<string, number>()
+
   private ctx(): PipelineCtx {
     return {
       config: this.cfg,
+      mergeResolveThisRun: this.mergeResolveThisRun,
       reserveNodes: this.reserveNodes,
       worktrees: this.deps.worktrees,
       onEscalate: this.deps.onEscalate,
@@ -175,12 +319,27 @@ export class EffTaskOrchestrator {
   }
 
   async run(): Promise<{ status: 'completed' | 'blocked'; reason?: string }> {
+    // finally,不是在每一个 return 前面各写一句:那个循环有五个出口,而漏掉任何一个的
+    // 表现是「重做说成功了,却什么都没跑」。
+    try { return await this.runLoop() } finally { this.finished = true }
+  }
+
+  private async runLoop(): Promise<{ status: 'completed' | 'blocked'; reason?: string }> {
     const stalls = createStallTracker()
+    // 让 applyLive 够得着(重做把节点放回可推进状态时要清掉它的空转记账)。
+    this.clearStall = id => stalls.clear(id)
     /**
      * node id → its pending task. Used ONLY for dedup: a queued-but-not-started execute is
      * in here too, so pickBatch will not hand out the same node twice.
      */
     const inFlight = new Map<string, Promise<void>>()
+    /**
+     * `inFlightIds` 是这张表的**镜像**,给外面(运行中重做)问「谁正在跑」。
+     *
+     * 镜像而不是让外面直接读 inFlight:这张表里存的是 promise,而外面只该知道 id ——
+     * 交出去的话,一个 UI 回调可以 await 它,而它 resolve 的时机是编排器的内部细节。
+     */
+    this.inFlightIds.clear()
     /**
      * Steps that have actually STARTED. The pool budget is charged against this, NOT against
      * inFlight: a queued execute holds no resource, and charging it would let a tree with
@@ -257,7 +416,7 @@ export class EffTaskOrchestrator {
       // isolate, so "pool exists" really does mean "no two executors share a tree".
       const serialiseExecute = kind === 'execute' && this.deps.worktrees === undefined
       const task = serialiseExecute ? (executeChain = executeChain.then(step, step)) : step()
-      return task.finally(() => { inFlight.delete(n.id) })
+      return task.finally(() => { inFlight.delete(n.id); this.inFlightIds.delete(n.id) })
     }
 
     for (;;) {
@@ -323,9 +482,27 @@ export class EffTaskOrchestrator {
       const budget = this.limit() - running()
       // NO await between pickBatch and the dispatch loop — that is what makes the dependency
       // check atomic (see pickBatch's contract).
-      const batch = pickBatch(this.nodes(), this.byId, new Set(inFlight.keys()), budget)
-      for (const { node, kind } of batch) inFlight.set(node.id, launch(node, kind))
+      // 扣住的节点算作「此刻不可派」——和在飞的走同一个口子(见 hold)。
+      const batch = pickBatch(this.nodes(), this.byId, new Set([...inFlight.keys(), ...this.held]), budget)
+      for (const { node, kind } of batch) {
+        // 镜像**先于** launch 建立:launch 里第一件事就是 await(拿槽位),而运行中重做
+        // 的判断可能落在那之后 —— 后设的话会有一个「已经在跑、但外面看不见」的窗口。
+        this.inFlightIds.add(node.id)
+        inFlight.set(node.id, launch(node, kind))
+      }
 
+      /**
+       * **扣住的时候不许判「走不动」。**
+       *
+       * hold 期间(算完新树、正在落盘)那几个节点是故意不可派的。少了这一条,一个「只剩
+       * 这一个失败节点、别的都跑完了」的树会在用户按下确认的那一瞬被判成 blocked 收尾,
+       * 而重做正落在半空中:盘上写完了,却再没有编排器去跑它。等换树(或者 hold 被释放)
+       * 把这一觉叫醒。
+       */
+      if (inFlight.size === 0 && this.held.size > 0) {
+        await Promise.race([this.wakeup.promise, abortSignalPromise(this.signal)])
+        continue
+      }
       if (inFlight.size === 0) {
         /**
          * 一个都没在跑、也一个都挑不出来。
@@ -347,6 +524,11 @@ export class EffTaskOrchestrator {
       // 一份**只有一条**的唤醒规则。
       const wakeups: Promise<unknown>[] = [Promise.race([...inFlight.values()]).catch(() => {})]
       if (this.deps.control) wakeups.push(this.deps.control.waitForParallelism(limitGen))
+      // …**或者**运行中就地换了树(applyLive)。少了这一项,重做出来的节点要等到另一个
+      // 节点跑完才被看见 —— 而「别的任务还在跑一个二十分钟的执行环节」正是用户按下重做
+      // 的那一刻。读的是**当前**那个 wakeup(nudge 会把它换掉再兑现),所以这一轮之后
+      // 到来的每一次换树都会把这一觉叫醒。
+      wakeups.push(this.wakeup.promise)
       await Promise.race(wakeups)
     }
   }
@@ -477,6 +659,13 @@ export class EffTaskOrchestrator {
  * 监听器用 `once: true`:暂停/恢复可以来回很多次,每次都挂一个不摘的监听器会在
  * 一次长跑里堆起来(AbortSignal 上超过 10 个监听器 node 还会打警告)。
  */
+/** 一个可以从外面兑现的 promise。和 control.ts 里的 `deferred` 同形状、同理由。 */
+function makeWakeup(): { promise: Promise<void>; wake: () => void } {
+  let wake = (): void => {}
+  const promise = new Promise<void>(res => { wake = res })
+  return { promise, wake }
+}
+
 function abortSignalPromise(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve()
   return new Promise<void>(res => {

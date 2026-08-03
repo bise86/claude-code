@@ -153,6 +153,13 @@ echo "explain this code" | ./bin/claude-haha -p
 ./bin/claude-haha --help
 ```
 
+> `bin/claude-haha` **保持你敲命令时所在的目录**，所以可以（也应该）在你自己的项目里直接
+> 调它的绝对路径：`/path/to/claude-code/bin/claude-haha`。项目级的 `.mcp.json`、
+> `.claude/settings.json`、CLAUDE.md、git 仓库都按那个目录起算。
+>
+> （早前这个脚本会先 `cd` 到本仓库再启动，于是在一个配好 `.mcp.json` 的项目里
+> `mcp list` 回答的是「No MCP servers configured」——读的是本仓库自己的目录。）
+
 #### Windows
 
 > **前置要求**：必须安装 [Git for Windows](https://git-scm.com/download/win)（提供 Git Bash，项目内部 Shell 执行依赖它）。
@@ -161,16 +168,25 @@ Windows 下启动脚本 `bin/claude-haha` 是 bash 脚本，无法在 cmd / Powe
 
 **方式一：PowerShell / cmd 直接调用 Bun（推荐）**
 
+> **在你的项目目录里跑，不要先 `cd` 到本仓库**。项目级的一切都按当前工作目录起算：
+> `.mcp.json`（项目级 MCP 服务器）、`.claude/settings.json`、CLAUDE.md、git 仓库。
+> 站在本仓库里启动的话，这些会全部读到本仓库自己的那一份——`.mcp.json` 里配好的服务器
+> 会表现为「No MCP servers configured」。把 `<REPO>` 换成本仓库的绝对路径：
+
 ```powershell
 # 交互 TUI 模式
-bun --env-file=.env ./src/entrypoints/cli.tsx
+bun --env-file=<REPO>\.env --preload <REPO>\preload.ts <REPO>\src\entrypoints\cli.tsx
 
 # 无头模式
-bun --env-file=.env ./src/entrypoints/cli.tsx -p "your prompt here"
+bun --env-file=<REPO>\.env --preload <REPO>\preload.ts <REPO>\src\entrypoints\cli.tsx -p "your prompt here"
 
 # 降级 Recovery CLI
-bun --env-file=.env ./src/localRecoveryCli.ts
+bun --env-file=<REPO>\.env --preload <REPO>\preload.ts <REPO>\src\localRecoveryCli.ts
 ```
+
+> `--preload` 不能省：`MACRO` 全局量由它注入，缺了启动就是
+> `ReferenceError: MACRO is not defined`。（`bunfig.toml` 里那份 preload 只在 cwd 恰好是
+> 本仓库时才生效，而这里恰恰不希望 cwd 是本仓库。）
 
 **方式二：Git Bash 中运行**
 
@@ -192,6 +208,17 @@ bun --env-file=.env ./src/localRecoveryCli.ts
 ```
 
 它会先弹一个**启动关口**让你确认：目标、并行数、名册（谁在什么环节干活）、预估调用数上限。确认之后自主执行，只在需要工具权限、触发安全阀、或合并冲突时才打扰你。跑完之后**自动把集成分支合并回你当前的分支**——产出就在当前目录里。工作区不干净、或者这一趟没正常跑完时不会自动合，屏幕上会说清原因和怎么手工来（分支原样保留，什么都不会丢）。
+
+**合并冲突先由模型自己解**，两处都是：
+
+| 冲突发生在 | 谁来解 | 解不了怎么办 |
+|------------|--------|--------------|
+| 节点工作区 → 集成分支（运行中） | 该节点的执行角色，在它自己的工作区里解，**解完重跑一次验收**才允许合入 | 一次运行给 **6 次**（每一次都带着上一轮验收的否决理由再改一版）；用完才发升级卡等人工，而 `--resume` 回来额度**重新给满** |
+| 集成分支 → 你自己的分支（收口） | 主模型，在你的检出里解 | 解完由 **git 复核**（还有未合并路径 / 暂存区里还留着冲突标记 / commit 不成，任何一条都算没解成）；不通过就 `git merge --abort` 把你的工作区还原到合并前，再照实告诉你 |
+
+收口那次自动解决成功时，屏幕上会列出解了哪些文件、提醒这份解决**没有经过评审**，并给出一条可以照做的 `git reset --hard <合并前的 sha>`。
+
+次数可以用一句话改：「解冲突给 10 次机会」→ `caps.mergeResolveAttempts: 10`（0–20）；说「冲突别自动解、直接叫我」就是 0——一撞上冲突直接等人工。不是默认值时启动关口的安全阀行会印出来。
 
 ### 两个核心概念：员工与角色
 
@@ -716,8 +743,8 @@ bun --env-file=.env ./src/localRecoveryCli.ts
 | 空格 | 折叠状态切换 |
 | 回车 | 打开光标那一行的详情页 |
 | **鼠标点击** | 和在那一行按回车完全一样：光标移过去 + 打开详情页 |
-| `r` | 重做（run 结束后才有） |
-| `R` | **快速重做失败的那个环节**（只对失败节点有意义，run 结束后才有） |
+| `r` | 重做（**运行中也能按**，见下） |
+| `R` | **快速重做失败的那个环节**（只对失败节点有意义；运行中也能按） |
 | `s` | **跳过失败的那个环节**继续往下走（同上） |
 | `f` | **强制通过**：失败节点上是「覆盖那次不通过」，运行中节点上是「预先批准某个环节」 |
 | `p` / `i` / `x` | 暂停调度 / 追加一句指令 / 取消光标选中的那个节点（只在运行中有） |
@@ -726,6 +753,19 @@ bun --env-file=.env ./src/localRecoveryCli.ts
 
 `R` 和 `s` 只在**光标停在一个失败节点上**时才写进底部提示行：它们对一个没失败的节点本来就
 不可用，而那一行是截断的——无条件多写 20 列会把右边的「Esc/q 退出」吃掉。
+
+**运行中重做**：一个任务失败了，不用等整棵树跑完再从结束屏重来——当场按 `r` / `R` / `s` 就行，
+**别的任务照常跑**。确认之后新树是被**并进正在跑的那一轮**，不是另起一个编排器（另起一个的
+后果是同一批节点被派两遍，而老编排器还攥着它们在飞的调用）。两道闸门顶着：
+
+- 目标节点**自己正在跑**时不许重做，屏幕会让你先按 `x` 取消它——替你砍掉一个在飞的调用
+  不是这个键该做的决定；
+- 落盘**之前**先把这次重做要动的节点（目标 + 被删的子树 + 被放回的祖先 + 被改写依赖的）
+  从调度里扣下来，换完树再放。少了这一步，算新树和落盘之间那次 `await` 里调度器完全可能
+  把其中一个派出去——最真实的是被放回的祖先，别的子任务恰好这时跑完，它就进了集成验收。
+
+编排器已经收尾的那一瞬按下的重做会退回结束屏那条路（重启一个编排器），而不是悄悄改一棵
+没人再调度的树。
 
 `f` 的提示**跟着光标所在节点的状态换措辞**（失败节点上写「强制通过它」，运行中节点上写
 「预先批准」）：这个键在两种节点上做的是两件事，写死一句的话总有一半时候那一行在说另一件事。

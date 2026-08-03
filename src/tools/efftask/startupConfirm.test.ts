@@ -904,6 +904,17 @@ describe('关口要说出多对多的代价', () => {
     expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, quorum: 60 } }))).toContain('需 60% 席位赞成')
   })
 
+  it('自动解冲突改过默认值就要印出来,0 印的是后果而不是那个数', () => {
+    // 「自动解冲突 0 次」读起来像笔误;它真正的含义是「一撞上冲突就停下来等人」——
+    // 那是用户在关口上唯一需要确认的那件事。
+    expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, mergeResolveAttempts: 10 } }))).toContain('自动解冲突 10 次/节点')
+    const off = capsLine(mk({ caps: { ...DEFAULT_CAPS, mergeResolveAttempts: 0 } }))
+    expect(off).toContain('合并冲突不自动解决(直接等人工)')
+    expect(off).not.toContain('0 次')
+    // 默认值不印 —— 这一行已经在跟宽度打架(和静默超时同一条规矩)。
+    expect(capsLine(mk())).not.toContain('自动解冲突')
+  })
+
   it('全票是默认,不啰嗦', () => {
     expect(capsLine(mk())).not.toContain('席位赞成')
     expect(capsLine(mk({ caps: { ...DEFAULT_CAPS, quorum: 100 } }))).not.toContain('席位赞成')

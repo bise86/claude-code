@@ -38,7 +38,8 @@ function spy(over: Partial<RedoRunDeps> = {}) {
   const log: string[] = []
   const seen: {
     commitPlan?: RedoPlan; commitBefore?: readonly TaskNode[]
-    problems?: string[]; nodes?: TaskNode[]; started?: TaskNode[]
+    problems?: string[]; nodes?: TaskNode[]; started?: TaskNode[]; affected?: readonly string[]
+    canApplyArg?: readonly string[]
   } = {}
   const deps: RedoRunDeps = {
     async commit(plan, before) {
@@ -49,12 +50,49 @@ function spy(over: Partial<RedoRunDeps> = {}) {
     },
     onProblems(p) { log.push('problems'); seen.problems = p },
     onNodes(n) { log.push('nodes'); seen.nodes = n },
-    start(n) { log.push('start'); seen.started = n },
+    start(n, affected) { log.push('start'); seen.started = n; seen.affected = affected },
     onDone() { log.push('done') },
     ...over,
   }
   return { deps, log, seen }
 }
+
+describe('运行中重做:落盘之前先问一次,能不能做', () => {
+  /**
+   * 用户原话:「任务失败了,不需要整体返回失败才能重做任务或阶段,在其它任务还在运行时
+   * 就可以重做。」运行中那条路把新树**并进正在跑的那一棵**,而这只在「这次重做碰到的
+   * 节点里没有正在跑的」时才安全 —— 那个判断必须发生在**落盘之前**。
+   */
+  it('拒绝时一个字节都不写,并且如实说原因', async () => {
+    const { deps, log, seen } = spy({
+      canApply: (affected: readonly string[]) => {
+        seen.canApplyArg = affected
+        return '这次重做会动到正在运行的任务(子任务甲)'
+      },
+    })
+    await runRedo(TREE(), 'root/00-a', 'execute', 'T1', deps)
+    // 落盘、上屏、重启一个都没发生 —— planRedo 是纯函数,到这里盘上一个字节都没动过。
+    expect(log).toEqual(['problems', 'done'])
+    expect(seen.problems?.[0]).toContain('重做未执行')
+    expect(seen.problems?.[0]).toContain('正在运行的任务')
+    // 问的时候要说清**碰了哪些节点**,否则编排器无从判断。
+    expect(seen.canApplyArg).toContain('root/00-a')
+  })
+
+  it('放行时照常走完四步,并把 affected 交给 start', async () => {
+    const { deps, log, seen } = spy({ canApply: () => undefined })
+    await runRedo(TREE(), 'root/00-a', 'execute', 'T1', deps)
+    expect(log).toEqual(['commit', 'problems', 'nodes', 'start'])
+    // `start` 拿得到 affected —— 运行中那条路要用它去 applyLive,自己重算一份就是第二份判据。
+    expect(seen.affected).toContain('root/00-a')
+  })
+
+  it('不给 canApply 时行为一个字节不变(结束屏那条路)', async () => {
+    const { deps, log } = spy()
+    await runRedo(TREE(), 'root/00-a', 'execute', 'T1', deps)
+    expect(log).toEqual(['commit', 'problems', 'nodes', 'start'])
+  })
+})
 
 describe('一次成功的重做', () => {
   it('四步全都发生,而且顺序是 落盘 → 上屏 → 进 state → 重启', async () => {

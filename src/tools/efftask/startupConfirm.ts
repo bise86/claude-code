@@ -745,7 +745,19 @@ export function capsLine(config: EffTaskConfig): string {
     : c.nodeTimeoutMs < 60_000
       ? ` · 静默超时 ${Math.round(c.nodeTimeoutMs / 1000)} 秒`
       : ` · 静默超时 ${Math.round(c.nodeTimeoutMs / 60000)} 分钟`
-  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}${converge}${silence}`
+  /**
+   * 自动解冲突的次数,**只在不是默认值时印**(和静默超时同一条规矩:默认值印出来只是噪声)。
+   *
+   * 0 必须单独说,而且要说的是**后果**而不是那个数字:「自动解冲突 0 次」读起来像个笔误,
+   * 而它真正的含义是「一撞上冲突就停下来等人」—— 那是用户在关口上唯一需要确认的那件事。
+   */
+  const mr = c.mergeResolveAttempts ?? DEFAULT_CAPS.mergeResolveAttempts
+  const merge = mr === DEFAULT_CAPS.mergeResolveAttempts
+    ? ''
+    : mr === 0
+      ? ' · 合并冲突不自动解决(直接等人工)'
+      : ` · 自动解冲突 ${mr} 次/节点`
+  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}${converge}${silence}${merge}`
 }
 
 /**

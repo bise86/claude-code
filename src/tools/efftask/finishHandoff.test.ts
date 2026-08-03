@@ -183,3 +183,42 @@ describe('finishHandoff —— 真的去跑 git,并如实报告', () => {
     expect(out.result?.message).toContain('spawn EAGAIN')
   })
 })
+
+describe('自动收口撞上冲突时,解决者必须被真的传下去', () => {
+  it('冲突 → 派解决者 → 复核通过 → 合成了', async () => {
+    // 这一跳曾经断在别处两次(onEscalate / openStream):声明了、实现了、测试了,就是
+    // 没有人把它传下去。这里断的是「解决者被调用过」,不是源码里有没有那个词。
+    let called = 0
+    const git: GitFn = async args => {
+      const [a, b] = args
+      if (a === 'diff') return { code: 0, stdout: '', stderr: '' }
+      if (a === 'symbolic-ref') return { code: 0, stdout: 'refs/heads/main\n', stderr: '' }
+      if (a === 'rev-parse') return { code: 0, stdout: 'deadbee\n', stderr: '' }
+      if (a === 'merge' && b === '--abort') return { code: 0, stdout: '', stderr: '' }
+      if (a === 'merge') return { code: 1, stdout: '', stderr: 'CONFLICT (content): a.ts' }
+      if (a === 'status') return { code: 0, stdout: called === 0 ? 'UU a.ts\n' : '', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    const out = await finishHandoff({
+      handoff: h(), git, cwd: '/repo',
+      resolveConflict: async () => { called++ },
+    })
+    expect(called).toBe(1)
+    expect(out.merged).toBe(true)
+    expect(out.result!.message).toContain('已自动解决')
+  })
+
+  it('不给解决者时行为不变:留下冲突现场,并说清工作区在哪', async () => {
+    const git: GitFn = async args => {
+      const [a] = args
+      if (a === 'diff') return { code: 0, stdout: '', stderr: '' }
+      if (a === 'symbolic-ref') return { code: 0, stdout: 'refs/heads/main\n', stderr: '' }
+      if (a === 'merge') return { code: 1, stdout: '', stderr: 'CONFLICT (content): a.ts' }
+      if (a === 'status') return { code: 0, stdout: 'UU a.ts\n', stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    const out = await finishHandoff({ handoff: h(), git, cwd: '/repo' })
+    expect(out.merged).toBe(false)
+    expect(out.conflicted).toBe(true)
+  })
+})
