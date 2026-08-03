@@ -191,6 +191,55 @@ export async function normalizeOAuthErrorBody(
 /* eslint-enable eslint-plugin-n/no-unsupported-features/node-builtins */
 
 /**
+ * 一次 OAuth 失败到底该怎么跟用户说。
+ *
+ * 用户报的原话是「mcp 还是加载不了」,而他盯着的两条错误是:
+ *
+ *   SDK auth failed: HTTP 404: Invalid OAuth error response: [{"expected":"string",
+ *     "code":"invalid_type","path":["error"],…}]. Raw body: {"detail":"Not Found"}
+ *   SDK auth failed: Failed to parse JSON
+ *
+ * 两条都在说 OAuth,而实测证明那两台服务器**根本没有 OAuth**,也根本不需要认证:直接
+ * POST 一次 initialize(甚至带一个瞎编的 Bearer)都返回 200 并正常握手。第一条里的
+ * `{"detail":"Not Found"}` 是 FastAPI 对 `/.well-known/oauth-authorization-server` 的
+ * 404;第二条是另一台服务器把同一个路径交给了前端 SPA,回了一坨 HTML。
+ *
+ * 也就是说:**认证流程本身没坏,它只是被派去问一个不存在的东西**,然后把「没问到」报成了
+ * 「认证失败」。真正坏掉的是**在这之前**那次连接 —— 而那条错误一个字都没出现在屏幕上。
+ * 用户于是照着这条线索去查 token、查 OAuth,查了个空。
+ *
+ * 这个函数不修连接,它只让这一屏说实话:认出「这台服务器没有 OAuth 元数据」的几种形状,
+ * 换成一句指向真正现场的话。原文一并留着 —— 诊断信息只能加,不能换掉。
+ */
+export function describeOAuthFailure(raw: string, serverUrl?: string): string {
+  /**
+   * 判据是**发现阶段的失败形状**,不是去 grep 某一句文案。
+   *
+   *  - `Invalid OAuth error response` / `expected string, received undefined`:拿到了 JSON,
+   *    但它不是 OAuth 错误对象(FastAPI 的 `{"detail":"Not Found"}` 就是这样);
+   *  - `Failed to parse JSON` / `Unexpected token`:压根不是 JSON(SPA 的 index.html);
+   *  - `HTTP 404`:元数据路径不存在。
+   *
+   * 三者都指向同一件事:那个地址上没有 OAuth 服务器。任何一条命中就够 —— 它们是同一个
+   * 现象在不同服务端框架下的三种长相。
+   */
+  const noMetadata =
+    raw.includes('Invalid OAuth error response') ||
+    raw.includes('Failed to parse JSON') ||
+    raw.includes('Unexpected token') ||
+    /HTTP 404\b/.test(raw)
+  if (!noMetadata) return raw
+  const where = serverUrl ? `(${new URL(serverUrl).origin} 上的 /.well-known/oauth-* )` : '(/.well-known/oauth-* )'
+  return (
+    `这台服务器没有 OAuth 元数据 ${where} —— 它多半根本不需要认证。\n` +
+    `真正失败的是**在认证之前**那次连接,而不是认证本身。请看 ` +
+    `~/.cache/claude-cli-nodejs/<项目目录>/mcp-logs-<服务器名>/ 里最后一条 ` +
+    `「HTTP Connection failed」/「SSE Connection failed」—— 那一行才是病根。\n` +
+    `原始错误:${raw}`
+  )
+}
+
+/**
  * Creates a fetch function with a fresh 30-second timeout for each OAuth request.
  * Used by ClaudeAuthProvider for metadata discovery and token refresh.
  * Prevents stale timeout signals from affecting auth operations.
@@ -341,26 +390,12 @@ export function getServerKey(
 }
 
 /**
- * True when we have probed this server before (OAuth discovery state is
- * stored) but hold no credentials to try. A connection attempt in this
- * state is guaranteed to 401 — the only way out is the user running
- * /mcp to authenticate.
+ * 这里原来有一个 `hasMcpDiscoveryButNoToken` —— 「存过 OAuth 记录但手上没 token」就跳过连接,
+ * 理由是「这种状态下连过去必然 401」。**那句话对一台根本不需要认证的服务器是假的**,而假的
+ * 那一刻它就成了一个没有 TTL 的永久死锁:一次失败的认证会写下一条没有 token 的记录,从此
+ * 连接再也不会被发起,面板永远显示「需要认证」。已删除,判据改回「真的收到过 401」。
+ * 完整的病理见 client.ts 里那段注释。
  */
-export function hasMcpDiscoveryButNoToken(
-  serverName: string,
-  serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
-): boolean {
-  // XAA servers can silently re-auth via cached id_token even without an
-  // access/refresh token — tokens() fires the xaaRefresh path. Skipping the
-  // connection here would make that auto-auth branch unreachable after
-  // invalidateCredentials('tokens') clears the stored tokens.
-  if (isXaaEnabled() && serverConfig.oauth?.xaa) {
-    return false
-  }
-  const serverKey = getServerKey(serverName, serverConfig)
-  const entry = getSecureStorage().read()?.mcpOAuth?.[serverKey]
-  return entry !== undefined && !entry.accessToken && !entry.refreshToken
-}
 
 /**
  * Revokes a single token on the OAuth server.
@@ -1191,7 +1226,7 @@ export async function performMCPOAuthFlow(
         } catch (error) {
           logMCPDebug(serverName, `SDK auth error: ${error}`)
           cleanup()
-          rejectOnce(new Error(`SDK auth failed: ${errorMessage(error)}`))
+          rejectOnce(new Error(`SDK auth failed: ${describeOAuthFailure(errorMessage(error), serverConfig.url)}`))
         }
       })
 

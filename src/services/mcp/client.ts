@@ -129,7 +129,6 @@ import { clearKeychainCache } from '../../utils/secureStorage/macOsKeychainHelpe
 import { sleep } from '../../utils/sleep.js'
 import {
   ClaudeAuthProvider,
-  hasMcpDiscoveryButNoToken,
   wrapFetchWithStepUpDetection,
 } from './auth.js'
 import { markClaudeAiMcpConnected } from './claudeai.js'
@@ -2322,13 +2321,30 @@ export async function getMcpToolsCommandsAndResources(
       // we re-probe servers that cannot succeed until the user runs /mcp.
       // Each probe is a network round-trip for connect-401 plus OAuth
       // discovery, and print mode awaits the whole batch (main.tsx:3503).
+      /**
+       * 只认**真的 401 留下的那条缓存**,不再认「存过 OAuth 记录但手上没 token」。
+       *
+       * 被删掉的那半条判据是 `hasMcpDiscoveryButNoToken`,它的注释写着「A connection attempt
+       * in this state is guaranteed to 401」—— 这句话对一台**根本不需要认证**的服务器是假的,
+       * 而假的那一刻它就变成了一个**永久**的死锁(那个判据没有 TTL):
+       *
+       *   面板因为任何一次短暂故障报了「需要认证」→ 用户按下认证 → 那台服务器没有 OAuth,
+       *   发现端点回 404 或者一坨 HTML,流程失败,但**已经把一条没有 token 的记录写进了
+       *   凭据存储** → 从此这个判据恒为真 → 连接**再也不会被发起**,面板永远显示
+       *   「needs authentication」,而每次认证都会失败成同样的样子。
+       *
+       * 用户实测撞的就是这条:三台服务器(29 个工具 / 15 个工具 / Context7)在无 Authorization、
+       * 瞎编 Bearer、空 Bearer 三种情况下**全部 200 并正常握手**,而客户端一次连接都没发过。
+       *
+       * 代价是:真正需要 OAuth 的服务器,每次会话会多打一次注定 401 的请求(这正是这个优化
+       * 出现之前的行为)。换来的是「没有任何一台服务器会被一次失败的认证永久锁死」。
+       * 真 401 之后的那条 15 分钟缓存留着 —— 它是**测量**出来的,不是推断出来的。
+       */
       if (
         (config.type === 'claudeai-proxy' ||
           config.type === 'http' ||
           config.type === 'sse') &&
-        ((await isMcpAuthCached(name)) ||
-          ((config.type === 'http' || config.type === 'sse') &&
-            hasMcpDiscoveryButNoToken(name, config)))
+        (await isMcpAuthCached(name))
       ) {
         logMCPDebug(name, `Skipping connection (cached needs-auth)`)
         onConnectionAttempt({
