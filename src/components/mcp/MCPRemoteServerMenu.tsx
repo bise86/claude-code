@@ -53,6 +53,19 @@ export function MCPRemoteServerMenu({
   } = useTerminalSize();
   const [isAuthenticating, setIsAuthenticating] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  /**
+   * 连接**自己**失败的那句话。
+   *
+   * 这一屏原来只画 `error` —— 而那个 state 只由「认证」这个动作写(见 handleAuthenticate)。
+   * 于是一台连不上的服务器,屏幕上要么什么原因都没有(Status: ✘ failed,下面空着),要么
+   * 显示的是**上一次认证**的报错 —— 而认证和连接是两件事。用户实测撞的正是后者:三台不需要
+   * 认证的服务器连不上,屏幕上却是一整屏 OAuth 的话,真正的传输错误只写进了
+   * `~/.cache/claude-cli-nodejs/…/mcp-logs-*`,而那是个要用户自己去翻的地方。
+   *
+   * `connectToServer` 早就把它带出来了(失败分支上的 `error: errorMessage(error)`),
+   * 一路挂在 `client` 上,只是没有人画。动作报错优先 —— 用户刚按下的那一下更近。
+   */
+  const connectionError = server.client.type === 'failed' ? server.client.error : undefined;
   const mcp = useAppState(s => s.mcp);
   const setAppState = useSetAppState();
   const [authorizationUrl, setAuthorizationUrl] = React.useState<string | null>(null);
@@ -577,8 +590,8 @@ export function MCPRemoteServerMenu({
             </Box>}
         </Box>
 
-        {error && <Box marginTop={1}>
-            <Text color="error">Error: {error}</Text>
+        {(error || connectionError) && <Box marginTop={1}>
+            <Text color="error">Error: {error || connectionError}</Text>
           </Box>}
 
         {menuOptions.length > 0 && <Box marginTop={1}>

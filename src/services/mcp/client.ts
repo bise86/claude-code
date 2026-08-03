@@ -2412,7 +2412,9 @@ export async function getMcpToolsCommandsAndResources(
 
       // Still update with the client but no tools/commands
       onConnectionAttempt({
-        client: { name, type: 'failed' as const, config },
+        // 原因要跟着走。丢掉它,`/mcp` 那一屏就只剩一个「✘ failed」和一片空白 ——
+        // 而这条路(握手成功、拉工具清单失败)恰恰是最需要说清楚的那一种。
+        client: { name, type: 'failed' as const, config, error: errorMessage(error) },
         tools: [],
         commands: [],
       })

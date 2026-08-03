@@ -3939,6 +3939,12 @@ async function run(): Promise<CommanderCommand> {
     } = await import('./cli/handlers/mcp.js');
     await mcpGetHandler(name);
   });
+  mcp.command('doctor [name]').description('Diagnose why an MCP server will not connect: proxy route, an unauthenticated handshake, OAuth discovery, and the real connection error. Read-only.').action(async (name?: string) => {
+    const {
+      mcpDoctorHandler
+    } = await import('./cli/handlers/mcp.js');
+    await mcpDoctorHandler(name);
+  });
   mcp.command('add-json <name> <json>').description('Add an MCP server (stdio or SSE) with a JSON string').option('-s, --scope <scope>', 'Configuration scope (local, user, or project)', 'local').option('--client-secret', 'Prompt for OAuth client secret (or set MCP_CLIENT_SECRET env var)').action(async (name: string, json: string, options: {
     scope?: string;
     clientSecret?: true;
