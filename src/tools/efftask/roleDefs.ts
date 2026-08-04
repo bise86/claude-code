@@ -147,8 +147,12 @@ export function parseRoleDefs(
     const purpose = str(o.purpose)
     // 阶段必须固定为五个之一,而且原因比「配置得进去、永远不执行」更严重:自由阶段名会被
     // **删掉** —— resumeCore 和 startupConfirm 都用 Object.fromEntries(PHASE_NAMES.map(…))
-    // 重建 phaseRoles,未知键第一次 --resume 就没了;而 makeRunAgentFn 按 phase === 'execute'
-    // 决定给不给写工具,自由阶段名永远只拿到只读工具集。
+    // 重建 phaseRoles,未知键第一次 --resume 就没了。
+    //
+    // (这里原来还有一句「而 makeRunAgentFn 按 phase === 'execute' 决定给不给写工具,自由
+    // 阶段名永远只拿到只读工具集」—— 那是**假的**:按环节分档早就取消了,今天七个环节共用
+    // 一个工具池,`makeRunAgentFn` 里没有任何 phase 分支。删掉它,而不是留着当第二条理由:
+    // 上面那条「第一次 --resume 就没了」本身已经足够,而一条假理由会让下一个人按它去改代码。)
     if (!stage) {
       notices.push(`${opts.source}:角色「${name}」没有写 step(在哪个环节使用),该角色不生效`)
       return

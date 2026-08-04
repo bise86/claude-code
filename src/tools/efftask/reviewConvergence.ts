@@ -19,9 +19,9 @@
  *
  * 全纯函数。数据从已经落盘的 `node.reviewLog` 里读,不新增任何状态。
  */
-import type { RoundtableRecord } from './types.js'
+import type { PhaseName, RoundtableRecord } from './types.js'
 import { STRICTNESS_LEVELS, type Strictness } from './strictness.js'
-import { capText, MAX_SUMMARY_CHARS } from './parseOutput.js'
+import { capText, MAX_BLOCKING_CHARS, MAX_SUMMARY_CHARS } from './parseOutput.js'
 
 export interface FeedbackItem {
   /** 意见原文(取自结构化的 verdict.blocking,不是拼接后的字符串)。 */
@@ -179,6 +179,33 @@ export function feedbackItems(log: readonly RoundtableRecord[]): FeedbackItem[] 
   // **8~92 ms**(200 字 / 2000 字两档,评审复测)。O(n²) 还在,只是常数被压掉了一个量级;
   // 「一轮算一次而不是一席算一次」那条规矩仍然成立,但它现在防的是浪费,不是卡死。
   const prep: Prepared[] = []
+  /**
+   * 本次日志里所有**被撤回**的意见,连同撤回发生在第几轮(见 `Verdict.retracted`)。
+   *
+   * 为什么带轮次:撤回只对**撤回之前**提出的那些成立。一条在第 2 轮被撤回、第 3 轮由另一位
+   * 席位重新提出的意见,是一条**新的**意见 —— 它带着新的证据。不比轮次的话,第 2 轮那次
+   * 撤回会把它永久压掉,而「永久」正是撤回不该有的力度:那等于给了任何一席一票否决全部
+   * 后续同类意见的权力。
+   *
+   * **必须是独立的一趟前置扫描,不能和下面那趟合起来。** 撤回按定义发生在被撤那条**之后**
+   * 的某一轮,所以边走边收集时,第 1 轮的条目是在第 2 轮的撤回被读到之前就建好的 —— 判据
+   * 恒为假,整个字段静默失效。第一版就是这么写的,三条用例同时红。
+   */
+  const retractions: { prep: Prepared; round: number; step?: PhaseName }[] = []
+  for (const rec of log ?? []) {
+    if (!rec || !Array.isArray(rec.verdicts)) continue
+    for (const v of rec.verdicts) {
+      // infra 那一席什么都没判过,它的 retracted 不可能有内容;和下面滤 blocking 同一条理由。
+      if (v?.infra === true) continue
+      for (const raw of v?.retracted ?? []) {
+        if (typeof raw !== 'string') continue
+        const p = prepare(raw.trim())
+        if (p.norm.length === 0) continue
+        // step 要跟着走,理由与 `crossSeatNotice` 的分组键逐字相同 —— 见下面那条判据。
+        retractions.push({ prep: p, round: rec.round, step: rec.step })
+      }
+    }
+  }
   for (const rec of log ?? []) {
     if (!rec || !Array.isArray(rec.verdicts)) continue
     for (const v of rec.verdicts) {
@@ -190,6 +217,30 @@ export function feedbackItems(log: readonly RoundtableRecord[]): FeedbackItem[] 
         const text = raw.trim()
         const p = prepare(text)
         if (p.norm.length === 0) continue
+        /**
+         * 被**后来某一轮**撤回的这一次提出,整条跳过。
+         *
+         * 判据落在「这一次提出」而不是「这条意见」上,是拿一条测试换来的:同一条意见在
+         * 第 1 轮提出、第 2 轮被撤回、第 3 轮由另一席带着新证据重新提出时,`items` 会把
+         * 三次合并成一条。按「整条」判的话,那条的 `rounds` 会是 `[1、3]` —— 于是它落进
+         * `stuckItems`,被报成「被提过不止一轮,至今没有被回应」,而第 1 轮那次**已经作废了**。
+         * 一条撤回过的账重新变成老账,正是撤回要治的那件事。
+         *
+         * 轮次比较不能省:撤回只对**撤回之前**提出的成立。不比的话,第 2 轮那次撤回会把
+         * 第 3 轮重新提出的同一条永久压掉 —— 那等于给任何一席一票否决全部后续同类意见。
+         */
+        /**
+         * 判据里的 `r.step === rec.step` 和轮次比较**同等必要**,而这是拿一条验收换来的。
+         *
+         * 测试验证与验收共用 `acceptLog`、两关各自计数(`gateRound` 按 step 过滤后 +1),
+         * 所以只比 `round` 时会发生两件都不该发生的事:
+         *  - **跨关撤回**:verify 第 2 轮的一次撤回,把 accept 第 1 轮提的意见压掉 ——
+         *    一个测试验证席位撤掉了验收关的账,而它从来没看过那一关的判据;
+         *  - **撤未来的账**:verify 已经跑到第 3 轮时,accept 第 1 轮**刚提出**的意见
+         *    因为 1 < 3 当场消失,而它在时间上是最新的。
+         * 两条都实测复现过。`crossSeatNotice` 那边的分组键是同一个理由。
+         */
+        if (retractions.some(r => r.step === rec.step && r.round > rec.round && similarPrepared(r.prep, p))) continue
         const at = prep.findIndex(q => similarPrepared(q, p))
         if (at >= 0) {
           const hit = items[at]!
@@ -209,6 +260,73 @@ export function feedbackItems(log: readonly RoundtableRecord[]): FeedbackItem[] 
   }
   for (const it of items) it.rounds.sort((a, b) => a - b)
   return items
+}
+
+/**
+ * 「本轮不止一个席位提了意见,而它们之间没有经过统一」—— 给**方案作者 / 执行者**的提醒。
+ *
+ * ## 它治的是什么
+ *
+ * 用户实测到的那次运行:第 1 轮两位评审各自提出一条阻断意见,而**两条要求互斥**——
+ * 一位要求把某个数字改成 7,另一位要求改成 13,而正确答案是 14。作者照着其中一条改了
+ * (那在系统看来完全是「响应了阻断意见」),于是第 2 轮整轮被用来修评审员自己造的错数。
+ * 三轮的迭代上限,两轮花在这上面。
+ *
+ * 圆桌的席位是**并行**的,互相看不见彼此的裁决(见 `runRoundtable`),`synthesizeVerdicts`
+ * 也只是把各席的 blocking 用 `'; '` 拼起来 —— 全流程没有任何一处会发现两条要求互斥。
+ * 作者拿到的是一串并列的要求,而最省力的路径就是挑一条照做。
+ *
+ * ## 为什么不做自动检测
+ *
+ * 试过,砍掉了。用「祈使词 + 数字」正则加 ASCII 标识符锚点做配对,评审实测 **5 组正常
+ * 意见 5 组全部误报**(「子任务改为 3 个」vs「超时改为 30 秒」、版本号、行号、quorum vs
+ * 席位数、日期 vs 迭代上限)—— 因为锚点靠的是 `api`/`proto`/`pipeline.ts` 这类在单一项目里
+ * 几乎必然共现的 token。而漏报另有四类(无祈使词的断言式、中文数字、无 ASCII 锚点的纯
+ * 中文冲突、版本号在小数点处截断)。命中面窄、误报面宽,方向是反的。
+ *
+ * 靠既有的相似度归组也不行:那两条真实意见的二元组 Jaccard 实测 **0.1471**,而
+ * `SIMILAR_THRESHOLD` 是 0.5;把阈值降到 0.15 **仍然接不住**(0.1471 < 0.15),要降到 0.147
+ * 以下 —— 那等于把 `feedbackItems` 的合并判据整个废掉。
+ *
+ * (这个数是对**未截断的完整原文**算的,原文在事故那台机器的 node.md 里、不在本仓库。
+ * `factEvidence.test.ts` 里那两个常量是**摘首句**,拿它们复算得到的是 0.1215 —— 两个数
+ * 都真,量的不是同一份输入。验收核对时踩过这一脚,所以写在这里。)
+ *
+ * 所以这里只报**事实**(有几席各自提了意见),把「哪两条互斥」留给读得懂内容的那一方。
+ * 一句无条件的提醒接得住全部形态,而且没有误报可言。
+ */
+export function crossSeatNotice(log: readonly RoundtableRecord[]): string {
+  const recs = (log ?? []).filter(r => r && Array.isArray(r.verdicts))
+  const last = recs[recs.length - 1]
+  if (!last) return ''
+  /**
+   * 只看**最后一条记录所属的那一组**,而分组键是 `(step, round)` 不是 `round`。
+   *
+   * 单独用 `round` 在执行侧的调用点上是错的:测试验证与验收**共用 `acceptLog`**,而两关
+   * 各自计数(`gateRound` 按 step 过滤后 +1),所以同一个 `round` 数会同时出现在两关的记录上。
+   * 只按 round 分组时,verify 第 2 轮和 accept 第 2 轮会被当成同一场圆桌 —— 而它们是两个
+   * 关口、两批不同的席位,两边的要求本来就都该做。那会凭空造出一句「本轮有 2 个席位各自
+   * 提了意见,它们没有经过统一」,而这句话是假的。
+   *
+   * 取「最后一条记录」而不是「round 最大的那一组」,同样是因为两关的编号互不可比:
+   * verify 跑到第 3 轮而 accept 才第 1 轮时,时间上最新的是 accept 那条。日志是追加写的,
+   * 最后一条就是最新的那一场。
+   */
+  const seats = new Set<string>()
+  for (const rec of recs) {
+    if (rec.round !== last.round || rec.step !== last.step) continue
+    for (const v of rec.verdicts) {
+      // infra = 这一席的调用没打通,它没有对工作做出任何判断 —— 不算一个「提了意见的席位」。
+      if (v?.infra === true) continue
+      if ((v?.blocking ?? []).some(b => typeof b === 'string' && b.trim().length > 0)) {
+        seats.add(v.role ?? 'main')
+      }
+    }
+  }
+  if (seats.size < 2) return ''
+  return `本轮有 ${seats.size} 个席位各自提了阻断意见,它们之间**没有经过统一**,可能互相矛盾。\n` +
+    `先通读全部条目再动手:两条要求把同一处改成不同的样子时,**不要挑一条照做** ——\n` +
+    `自己取证,按核实结果改,并写明你跑了什么、为什么另一条不成立。`
 }
 
 /**
@@ -248,8 +366,40 @@ export const MAX_FEEDBACK_ITEMS = 20
  */
 export const MAX_ITEM_CHARS = 160
 
-const bullet = (it: FeedbackItem, i: number): string =>
-  `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮) ${capText(it.text, MAX_ITEM_CHARS)}`
+/**
+ * 这一段实际能给**每条**多少字 —— 按条数**均分**,不是写死 160。
+ *
+ * ## 为什么必须动态
+ *
+ * 验收实测,而且实测的正是这次事故本身。事故第 1 轮那两条阻断意见分别是 406 字和 276 字,
+ * 而它们互斥的落点(「将 E 改为 13 个」「统一修正为实际值 7」)都在**尾部**。按 160 字砍完,
+ * 作者真正拿到的是:
+ *
+ *   1. [总监] proto 归属与计数矛盾:api/ 下实际只有 7 个 .proto…(已截断,原文 406 字)
+ *   2. [架构] proto 数量事实错误且与验收E冲突。但实测 /home/…(已截断,原文 276 字)
+ *
+ * 两条要求的**数字一个都没进来**。于是 `crossSeatNotice` 那句「两条要求把同一处改成不同的
+ * 样子时不要挑一条照做」指着一份**看不出矛盾**的清单说话 —— 正文里唯一残存的诉求还都指向 7。
+ * 提醒在场、依据被截掉,那不是修好了,那是把病换了个位置。
+ *
+ * ## 为什么均分是对的
+ *
+ * `MAX_ITEM_CHARS = 160` 从来不是「一条意见需要多少字」的判断,它是「20 条塞进 4000 字预算」
+ * 的算术下界(见那个常量原来的注释:「而且是**均匀**地缩,不是砍掉后 18 条」)。条数少的时候
+ * 按下界发钱,等于把预算白白扔掉:2 条时每条能给 1800 字,两条原文都装得下。
+ *
+ * 上界是 `MAX_BLOCKING_CHARS`(单条阻断意见本身的上限),再多也没有内容可发。
+ * 下界保持 `MAX_ITEM_CHARS`,所以 20 条满载时的行为与改动前一致。
+ */
+export function itemBudget(n: number): number {
+  // 预留给抬头、分组标题、以及「另有 N 条未列出」那句 —— 不预留的话满载时正文会挤掉它们。
+  const RESERVE = 600
+  const share = Math.floor((MAX_SUMMARY_CHARS - RESERVE) / Math.max(1, n))
+  return Math.min(MAX_BLOCKING_CHARS, Math.max(MAX_ITEM_CHARS, share))
+}
+
+const bullet = (budget: number) => (it: FeedbackItem, i: number): string =>
+  `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮) ${capText(it.text, budget)}`
 
 /** 按「老账优先」裁到 MAX_FEEDBACK_ITEMS,返回被裁掉的条数。 */
 function trim(stuck: FeedbackItem[], fresh: FeedbackItem[]): { stuck: FeedbackItem[]; fresh: FeedbackItem[]; dropped: number } {
@@ -277,11 +427,24 @@ export function planFeedbackPrompt(
    * 两份实现意味着第二次踩同一组坑,而这里唯一真正不同的只有这个名词。
    */
   label = '评审',
+  /**
+   * 排在条目清单**前面**的一段提醒(目前只有 `crossSeatNotice`)。
+   *
+   * **它在 `capText` 之外,并且从条目的额度里扣掉自己的长度。** 这不是讲究,是实测:
+   * 满载 20 条时这个函数的输出是 **4016 字**,而 `MAX_SUMMARY_CHARS` 是 4000 —— 余量是
+   * **负的**。把提醒拼进 `parts` 再一起截,截掉的就是清单**末尾的真实意见**,而抬头那句
+   * 「只列其中 20 条,另有 N 条未列出」是在裁剪之前算的,于是它会谎报仍列着 20 条。
+   * 这个仓库反复在修的就是「残缺的视图看起来完完整整」。
+   */
+  notice = '',
 ): string {
   if (items.length === 0) return ''
   const rounds = Math.max(...items.flatMap(i => i.rounds), 0)
   const allStuck = stuckItems(items)
   const cut = trim(allStuck, items.filter(it => !allStuck.includes(it)))
+  // 每条能给多少字,按**实际列出的条数**均分 —— 见 `itemBudget`。写死 160 时,事故里那两条
+  // 互斥要求的落点全在被截掉的尾巴里,而这一整段正是为了让作者看出它们互斥。
+  const line = bullet(itemBudget(cut.stuck.length + cut.fresh.length))
   const parts: string[] = [
     `前 ${rounds} 轮${label}共提出 ${items.length} 条阻断意见,按轮次汇总如下` +
       (cut.dropped > 0 ? `(只列其中 ${MAX_FEEDBACK_ITEMS} 条,另有 ${cut.dropped} 条未列出,全文见 node.md 的评审记录)` : '') +
@@ -290,16 +453,43 @@ export function planFeedbackPrompt(
   if (cut.stuck.length > 0) {
     parts.push(
       `【被提过不止一轮,至今没有被回应】` +
-        '必须逐条明确回应:要么在方案里解决,要么写明为什么不适用。',
-      ...cut.stuck.map(bullet),
+        '必须逐条明确回应:要么在方案里解决,要么写明为什么不适用,' +
+        /**
+         * 第三个出口。**没有它,一条错误的意见就只剩「照做」这一条路。**
+         *
+         * 用户实测那次:第 1 轮两位评审要求把同一个数字分别改成 7 和 13(正确值是 14)。
+         * 作者手上只有「解决」和「不适用」两个选项,而「不适用」答的是「这条不适用于本方案」,
+         * 不是「这条本身是错的」。于是它挑了一条照做 —— 完全服从了阻断意见,却把方案改错了。
+         *
+         * 要求附**范围**而不只是命令与输出,是拿一条评审意见换来的:一个只跑了
+         * `find api/ -name '*.proto'` 的作者附上命令和输出都属实,而它的结论(全仓总数是 7)
+         * 仍然是错的 —— 错就错在命令覆盖的范围够不着它要否定的那句话。裁决侧核的正是这一维
+         * (见 pipeline.ts 的 `REBUTTAL_RULE`),这里必须把它要出来。
+         */
+        '要么**举证指出这一条的事实前提有误**(附你跑的命令与原始输出,以及命令覆盖的范围)。',
+      ...cut.stuck.map(line),
     )
   }
   if (cut.fresh.length > 0) {
     // 不是「本轮新增」:fresh 的判据是「只出现过一轮」,那一轮可能是第 1 轮。第 4 轮
     // 构造提示词时,三条分别只在第 1/2/3 轮出现过的意见会被全部标成「本轮新增」。
-    parts.push('【只被提过一轮】', ...cut.fresh.map(bullet))
+    /**
+     * 措辞要和老账那组**一样硬**,而这是拿一条验收换来的。
+     *
+     * 原来这里只有一句压缩的「(同样是三选一…)」,不要求附命令、输出、范围。而事故里那两条
+     * 互斥的错误意见**都是第 1 轮提出的** —— 也就是说它们走的正是这一组:举证要求最该落地的
+     * 地方,措辞最松。
+     */
+    parts.push(
+      '【只被提过一轮】同样逐条回应,三选一:在方案里解决 / 写明为什么不适用 / ' +
+        '**举证指出这一条的事实前提有误**(附命令与原始输出,以及命令覆盖的范围)。',
+      ...cut.fresh.map(line),
+    )
   }
-  return capText(parts.join('\n'), MAX_SUMMARY_CHARS)
+  // 提醒在截断之外,条目在截断之内,而且条目的额度要把提醒的长度扣掉 —— 见 `notice` 的注释。
+  // 下限 1 而不是 0:`capText(s, 0)` 会退化成一个只剩标记的字符串,那比截断更难读。
+  const head = notice ? notice + '\n' : ''
+  return head + capText(parts.join('\n'), Math.max(1, MAX_SUMMARY_CHARS - head.length))
 }
 
 /**
@@ -332,7 +522,11 @@ export function reviewRepeatNotice(
   /**
    * 本轮的严格度。历史条目里档位与它**不同**的会被标注,并追加一段限定语。
    *
-   * 省略 = 没设档位 = 与引入档位之前逐字相同的输出。
+   * 省略 = 没设档位 = **跨档限定语那一段**不渲染。
+   *
+   * (原来这里写的是「与引入档位之前逐字相同的输出」。那句话现在是假的:本函数后来又加了
+   * 两段与档位无关的文字 —— 举证反驳的限定语、以及跨席位互斥的提醒。逐字相同这条承诺只在
+   * `strictness.ts` 的那几个函数上成立,不在这里。)
    */
   now?: Strictness,
 ): string {
@@ -356,9 +550,26 @@ export function reviewRepeatNotice(
     `本轮是第 ${round} 轮${label}。前几轮已经提出过下面这些意见` +
       (dropped > 0 ? `(只列 ${MAX_FEEDBACK_ITEMS} 条,另有 ${dropped} 条未列出)` : '') +
       '(按出现轮次标注):',
-    ...shown.map((it, i) => `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮${mark(it)}) ${capText(it.text, MAX_ITEM_CHARS)}`),
+    // 同样按条数均分,理由见 `itemBudget` —— 而这一段尤其不能截:下面 3c 那句要求裁决员
+    // 「找出两条来自不同席位、对同一处给出不同值的意见」,写死 160 字时那些值正好在尾巴里。
+    ...shown.map((it, i) => `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮${mark(it)}) ${capText(it.text, itemBudget(shown.length))}`),
     `对其中每一条:若新${subject}已经回应了它,请指出是${subject}的哪一处回应的;若仍未回应,请指出`,
     `${subject}缺了什么。不要仅因为措辞眼熟就放行,也不要把同一条换个说法再提一遍。`,
+    /**
+     * 对上面那句无条件追责的**第一条限定**:作者举证反驳掉的那些不算「未回应」。
+     *
+     * 排在它后面,和下面的跨档限定语同一条规矩(见那一段) —— 这是对它的限定,不是并列的新规则。
+     *
+     * 为什么必须有:第三个出口(见 `planFeedbackPrompt` 里那句「举证指出这一条的事实前提
+     * 有误」)只有在裁决侧被接住才成立。作者举证的那一轮,这条意见**还在**历史清单里
+     * (`retracted` 要等这一轮的裁决写下来才生效),而它后面跟着的正是那句无条件的
+     * 「若仍未回应,请指出缺了什么」—— 不限定的话,一个照着读的裁决员会把「作者反驳了我」
+     * 直接读成「作者没回应」,第三个出口当场作废。
+     *
+     * 措辞仍然**不推着放行**:说的是「按结论核」,不是「作者说错了就算错了」。
+     */
+    `其中若${subject === '方案' ? '作者' : '执行者'}举证说某一条的**事实前提有误**,不要把它当成「未回应」——` +
+      `按它给的命令与覆盖范围核那条结论成不成立,核出来是你(或同僚)那条错了,就写进 "retracted"。`,
     /**
      * 跨档限定语。
      *
@@ -378,6 +589,41 @@ export function reviewRepeatNotice(
         `**不要因为它出现过就沿用上一轮的结论,也不要因为降了档就当它没出现过。**`,
       ]
       : []),
+    /**
+     * **让裁决员看见自己和同僚互斥** —— 这是那次事故真正的病根,而修它几乎不要钱。
+     *
+     * 上面那份清单早就带着 `[role]` 标签把**全部席位**的历史意见铺给每一席了,数据一直在场;
+     * 缺的只是一句「看到了之后该怎么办」。用户实测那次:第 1 轮两位评审要求把同一个数字
+     * 分别改成 7 和 13(正确值 14),而圆桌的席位是并行的、互相看不见 —— 所以最早能发现
+     * 互斥的时刻**就是第 2 轮**,也就是这一段渲染的时刻。第 2 轮真的有一位评审自己发现了
+     * (「上一版方案的 14 恰好是正确的全仓总数」),但那是碰运气,没有任何一句话要求它去看。
+     *
+     * 只在条目跨 ≥2 个席位时出现:单席位的历史里不存在「不同席位互斥」这回事,那时这一段
+     * 是纯噪声 —— 而它进的是**每一个**席位的提示词。
+     *
+     * 排在最后,不打断上面两条限定语与那句无条件追责的相邻关系:它是一条**并列的**新指令
+     * (讲的是清单内部的矛盾),不是对那句话的限定。
+     */
+    ...(new Set(shown.map(it => it.role)).size >= 2
+      ? [
+        `上面若有两条来自**不同席位**、对同一处给出了不同的值或不同的改法,先把它解决掉再判本轮:`,
+        `自己取证确定哪个对(**两个都可能是错的**)。`,
+        /**
+         * 落点必须点名 blocking / retracted,**不能是 comments**,而这是拿一条验收换来的。
+         *
+         * 草案这里写的是「在 comments 里写明你核的结果」。验收拿事故日志实证了那是一条死路:
+         * `synthesizeVerdicts` 只在「pass 为 false 且 blocking 为空」时才回落到 comments,
+         * 而 `feedbackItems` **只读 `v.blocking`** —— 一个判 pass 的裁决员把核出来的正确值
+         * 写进 comments,作者永远看不到。
+         *
+         * 事故里这一幕真的发生过:第 2 轮架构席 `pass:true, blocking:[]`,而「上一版方案的
+         * 14 恰好是正确的全仓总数」就躺在它的 comments 里;作者第 3 轮的输入完全来自总监
+         * 写进 blocking 的那句。把裁决员往 comments 上推,等于把唯一能救回这轮的信息埋掉。
+         */
+        `核出来同僚那条是错的:把那条摘进 "retracted",并把**正确的值**写进你自己的 blocking ——`,
+        `只写进 comments 的话它到不了${subject === '方案' ? '方案作者' : '执行者'}那里。`,
+      ]
+      : []),
   ].join('\n'), MAX_SUMMARY_CHARS)
 }
 
@@ -386,9 +632,32 @@ export function reviewRepeatNotice(
  *
  * 原来是把最后一轮的拼接串原样贴上。它答不了用户真正的问题 —— **哪几条是一直没解决的**。
  */
-export function exhaustionReason(items: readonly FeedbackItem[], max: number): string {
+export function retractedCount(log: readonly RoundtableRecord[]): number {
+  let n = 0
+  for (const rec of log ?? []) {
+    for (const v of rec?.verdicts ?? []) {
+      if (v?.infra === true) continue
+      n += (v?.retracted ?? []).filter(s => typeof s === 'string' && s.trim().length > 0).length
+    }
+  }
+  return n
+}
+
+export function exhaustionReason(
+  items: readonly FeedbackItem[], max: number,
+  /**
+   * 过程中被撤回了几条(`retractedCount`)。
+   *
+   * **必须说出来。** 撤回是这套里唯一能让一条真实提出过的意见在下游全线消失的机制:它不进
+   * `items`,所以既不在「至今未解决」里,也不在「只被提过一轮」里。而这句话正是运行被打死
+   * 那一刻用户唯一会读的东西 —— 少了这个数,一次误撤或滥撤在这里和「从没有人提过」完全
+   * 一样。给的是**指路**而不是正文:原文在 node.md 的评审记录里(那一侧也渲染了)。
+   */
+  retracted = 0,
+): string {
   const head = `评审迭代超限(${max})`
-  if (items.length === 0) return head
+  const tail = retracted > 0 ? `;另有 ${retracted} 条意见在过程中被撤回(见 node.md 评审记录的「↩ 本轮撤回」)` : ''
+  if (items.length === 0) return head + tail
   const allStuck = stuckItems(items)
   const cut = trim(allStuck, items.filter(it => !allStuck.includes(it)))
   const seg: string[] = []
@@ -403,7 +672,7 @@ export function exhaustionReason(items: readonly FeedbackItem[], max: number): s
   }
   // 这句会原样进 node.blockedReason,而 blockedReason 又会被卡片和树引用 —— 它是
   // node.md 体积的第二大来源,预算和 blockingSummary 用同一个。
-  return capText(`${head}: ${seg.join(';')}`, MAX_SUMMARY_CHARS)
+  return capText(`${head}: ${seg.join(';')}${tail}`, MAX_SUMMARY_CHARS)
 }
 
 /**

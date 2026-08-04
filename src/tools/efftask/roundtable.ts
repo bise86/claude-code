@@ -81,7 +81,18 @@ export function synthesizeVerdicts(
 }
 
 export async function runRoundtable(args: {
-  // 'verify' 有自己的工具档位(见 runAgentAdapter):它要能跑命令,而评审/验收只读。
+  /**
+   * 这三关都从**同一个**工具池取工具 —— 按环节分档早就取消了(见 `makeRunAgentFn` 里
+   * `const tools: Tools = deps.availableTools` 那一段的注释)。这里原来写的是
+   * 「'verify' 有自己的工具档位…评审/验收只读」,那句话现在是反的:评审席位一样拿得到 Bash。
+   *
+   * 这件事**是被依赖的**,不只是历史遗留:四个裁决提示词都要求「写进 blocking 的事实断言
+   * 必须附上你实际跑过的命令(或 文件:行号)与关键输出」(见 pipeline.ts 的 `EVIDENCE_RULE`),
+   * 而那条要求只有在评审席位真的能跑命令时才不是一句空话。
+   *
+   * 「或 文件:行号」那个并列出口不能省:`runAgent` 那侧没传 `useExactTools`,最终工具还要过
+   * `resolveAgentTools` —— 一个把 `tools:` 限成只读的自定义员工仍然拿不到 Bash。
+   */
   phase: 'review' | 'accept' | 'verify'
   node: TaskNode
   roles: RoleBinding[]

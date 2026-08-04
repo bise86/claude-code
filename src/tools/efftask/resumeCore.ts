@@ -202,6 +202,22 @@ function verdictArray(v: unknown, onDrop?: () => void): RoundtableRecord['verdic
         ...(x.manual === true ? { manual: true as const } : {}),
         ...(typeof x.roleTag === 'string' && x.roleTag !== '' ? { roleTag: capText(x.roleTag, 200) } : {}),
         ...(x.rateLimited === true ? { rateLimited: true as const } : {}),
+        /**
+         * `retracted` —— **本轮撤回的历史意见**,和上面那四个死在同一行上的字段是同一类。
+         *
+         * 三份独立验收各自实跑到同一条路径:`serializeNode` 写得进 frontmatter、
+         * `parseNodeFile` 读得出来,而这个函数是**逐字段重建**的,字段清单里没有它 ——
+         * 于是每一次 `--resume` 都把撤回记录抹掉,而下一次 persist 又把抹掉的结果写回盘。
+         * 后果不是「少一个字段」:被作者举证反驳掉、裁决员已经核实撤回的那条意见会**复活**,
+         * 重新进 `feedbackItems`、重新被 `reviewRepeatNotice` 追着要回应、重新被
+         * `stuckItems` 报成「至今未解决」。`Verdict.retracted` 上写着「不落到数据上,
+         * 作废就只是提示词里的一句话」—— 少了这一行,那句话对任何 resume 过的运行都为真。
+         *
+         * 走 `blocking` 的同一对上限:node.md 可以手工编辑,而这是进入这个字段的另一道门。
+         */
+        ...(Array.isArray(x.retracted) && strArray(x.retracted).length > 0
+          ? { retracted: capBlockingList(strArray(x.retracted), '撤回项') }
+          : {}),
         ...(x.timeoutKind === 'human' || x.timeoutKind === 'stall' || x.timeoutKind === 'total'
           ? { timeoutKind: x.timeoutKind }
           : {}),

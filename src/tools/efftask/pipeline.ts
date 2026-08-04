@@ -3,7 +3,7 @@ import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreReco
 import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
-import { exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
+import { crossSeatNotice, exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, retractedCount, reviewRepeatNotice } from './reviewConvergence.js'
 import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
@@ -874,6 +874,91 @@ function quote(s: string): string {
   return s.replace(/`{3,}/g, m => '`​'.repeat(m.length))
 }
 
+/**
+ * 写进 blocking 的**事实断言**要取证,而且**结论不能超出所核范围**。四个裁决关口共用。
+ *
+ * ## 它治的是什么
+ *
+ * 用户实测的一次运行(root 节点,中级档,`maxIterations=3`):方案第 0 版说「api/…/v3rpc 下
+ * 14 个 .proto」—— 全仓总数 14 是**对的**,错的是归属。第 1 轮两位评审都判不通过:
+ *
+ *   [架构] 「实测 /…/etcd/api 下 .proto 只有 7 个 …… 需将方案与验收E中的『14』统一修正为实际值 7」
+ *   [总监] 「…… rpcpb 要么显式排除并将 E 改为 13 个 ……」
+ *
+ * 架构那条**每一个字都是真的**:它确实跑了 `find …/api -name '*.proto'`,确实是 7。错在它拿
+ * 一个子目录的结果去否定一句讲**全仓**的话,并据此要求把总数改成 7。没有一席说 14。作者照着
+ * 改成 13,第 2 轮整轮用来把 13 改回 14 —— 三轮的预算,两次返工里有一次是在修评审员造的数字。
+ *
+ * ## 为什么措辞是「结论范围」而不是「取不到证就别写」
+ *
+ * 草案原来写的是「取不到证的,写进 comments,不要放进 blocking」。两份独立评审各自指出这会和
+ * `strictness.ts` 的 `FLOOR` / `REVIEW_FLOOR` **第 2 条**正面撞车 —— 那一条是
+ * 「方案声称的做法,你在它给出的落点上找不到对应的东西 → pass 一律为 false,并在 blocking 里
+ * 写明」,而它按性质**就是**一条「在有限范围里找不到」的断言。更要命的是:事故里架构那条
+ * blocking 逐字就是 floor 第 2 条(方案说 `api/v3rpc` 下有 .proto,而那里确实没有)。于是草案
+ * 那句要么被无视,要么把 floor 拆掉 —— 而 REVIEW_FLOOR 是拿一条 P0 换来的。
+ *
+ * 所以改成约束**结论**的范围,不禁止有限范围的观察;最后那一行显式把 floor 第 2 条保下来。
+ *
+ * ## 为什么不放进 `strictnessBlock`
+ *
+ * 两条,都是评审查出来的:
+ *  1. `strictnessBlock` 在 `s === undefined` 时提前 `return ''`,而**默认运行就是不设档** ——
+ *     放在那里等于这条规则在默认配置下一个字都不生效。而「你说的话是不是真的」不是
+ *     「多好才算够」的旋钮,不该被档位门控。
+ *  2. `strictnessBlock` 的产物落在提示词**第一段**(它进的是 `brief`),而这个仓库为
+ *     「P 和 ¬P 同在、¬P 在后」付过两次代价(见 `strictness.ts` 文件头)。一条不该被覆盖的
+ *     规则要待在最后一段、紧挨输出 schema。
+ *
+ * 取证方式给了**两种**(命令 / 文件:行号),这是必需的:七个环节共用一个工具池没错,但
+ * runAgent 那侧没传 `useExactTools`,最终工具还要过 `resolveAgentTools` —— 一个把 `tools:`
+ * 限成只读的自定义员工仍然拿不到 Bash。只写「附上命令」会让那种名册下的席位无路可走。
+ */
+const EVIDENCE_RULE =
+  `写进 blocking 的**事实断言**(数量、路径、某个文件/符号存不存在、命令输出是什么),\n` +
+  `必须来自你这一轮**实际跑过或读过**的东西,并在那一条里附上命令(或 文件:行号)与关键输出。\n` +
+  `**结论不能超出你核过的范围** —— 核的是某个子目录,就只能断言那个子目录;要否定一句讲\n` +
+  `更大范围的话,把命令跑到那个范围上再说,否则就把结论限制在你核过的范围里。\n` +
+  `(说「某处找不到某个东西」时同理:写清你找过哪里。这不是要你放过它,是要你说准。)\n`
+
+/**
+ * 作者/执行者说「你这一条的前提有误」时,裁决员该怎么办。
+ *
+ * ## 判据是**结论**,不是**命令能不能重现**
+ *
+ * 草案原来写的是「自己跑一遍它给的命令,核出来它对,这一条就此作废」。反例评审给出一条
+ * 会让事故**穿过修复本身重演**的路径:作者第 2 轮只跑 `find api/ -name '*.proto' | wc -l`
+ * 得到 7 并附上命令 → 裁决员跑一遍**确实输出 7** →「命令重现」为真 → 于是总监那条正确的
+ * 14 反而被作废。命令属实 ≠ 结论成立,差的正是**覆盖范围**那一维,而那正是 `EVIDENCE_RULE`
+ * 要求作者一起交出来的东西。
+ *
+ * ## 「不要再提」那句封口令被删掉了
+ *
+ * 一条不可撤销的封口令叠上 `repeatRule` 的「不要提出上一轮没有提过的新要求」,等于把那一处
+ * 永久移出可提范围 —— 而这个仓库从 `reviewConvergence.ts` 到 `execResponsesSection` 反复申明的
+ * 规矩是**不推着裁决员放行**。现在给的是「不再计入未回应」,并明说这不妨碍它就同一处提出
+ * 一条自己核过的新意见。
+ *
+ * ## 为什么要有 `retracted`
+ *
+ * 见 `Verdict.retracted`:不落到数据上,「作废」就只是提示词里的一句话,那条意见下一轮照样
+ * 被 `feedbackItems` 捞出来。
+ */
+const REBUTTAL_RULE =
+  `其中若有一条写的是「前提有误」,判据是**它的结论成不成立**,不是它给的命令能不能重现:\n` +
+  `自己把那条命令跑一遍,并核对它覆盖的范围够不够否定你(或同僚)那句话 —— 范围不够的\n` +
+  `(例如只核了一个子目录,却要否定一句讲整个仓库的话),不成立,照旧填进 blocking。\n` +
+  `核下来确实是你那条的前提错了,就把它原样摘进本轮裁决的 "retracted",并且不再把它计入\n` +
+  `未回应;这不妨碍你就同一处提出一条**你自己核过的**新意见。\n`
+
+/**
+ * 四个裁决关口共用的输出 schema 里那个新字段。
+ *
+ * 单独抽出来是为了让四处**同时**改 —— 少给任何一关,那一关的 `REBUTTAL_RULE` 就是死配置:
+ * 提示词让它「写进 retracted」,而 schema 里没有这个键。
+ */
+const RETRACTED_FIELD = `, "retracted":string[](本轮经核实撤回的历史意见,没有就省略)`
+
 export function planPrompt(
   node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = '', brief = '',
   /**
@@ -1002,7 +1087,20 @@ export function planPrompt(
      */
     (feedback
       ? `- responses:上面每一条阻断意见对应**一项**,顺序一致,写成「第 N 条 → 在方案的哪一处解决了(引用那句话)」` +
-        `或「第 N 条 → 不适用,因为…」。**不要漏条,也不要合并成一项。**\n` +
+        `、「第 N 条 → 不适用,因为…」` +
+        /**
+         * 第三种写法。**没有它,一条错误的意见就只剩「照做」这一条路。**
+         *
+         * 前两种答的都是「这条意见对我这份方案成不成立」,没有一种答得了「这条意见本身
+         * 说错了」。用户实测那次:第 1 轮两位评审要求把同一个数字分别改成 7 和 13(正确值
+         * 是 14),作者挑了一条照做 —— 在系统看来它完全响应了阻断意见,而方案被改错了,
+         * 第 2 轮整轮拿去改回来。
+         *
+         * 范围必须一起交:一个只跑了 `find api/` 的作者,命令和输出都属实而结论仍然是错的,
+         * 差的就是那一维。裁决侧核的正是它(见 `REBUTTAL_RULE`)。
+         */
+        `,或「第 N 条 → **前提有误**:我跑了 <命令>,输出是 <输出>,它覆盖的范围是 <范围>,所以这条的前提不成立」。` +
+        `**不要漏条,也不要合并成一项。**\n` +
         `  这一段会连同新方案一起交给上一轮提意见的人逐条核对,写不实的会被当场指出来。\n`
       : '') +
     answerRule(tag)
@@ -1238,7 +1336,18 @@ function reviewPrompt(
     (notice && node.plan.responses && node.plan.responses.length > 0
       ? `方案里的 responses 是作者对上一轮意见的逐条处置。请**逐条核对是否属实**:` +
         `它说在某处解决了,就去方案里找那一处;找不到、或找到的东西答非所问,` +
-        `照旧填进 blocking 并写明是哪一条对不上。作者说了不等于做了。\n`
+        `照旧填进 blocking 并写明是哪一条对不上。作者说了不等于做了。\n` +
+        /**
+         * 第三个出口的接盘规则,**放在同一道门里面**(草案要求放外面,这里没照办)。
+         *
+         * 评审提的理由是「写在三元内部,会在方案没重出、答卷没换的那几条路径上一起消失」。
+         * 核过之后判定那个担心不成立:这道门是 `notice && responses.length > 0`,而
+         * `REBUTTAL_RULE` 讲的正是「怎么核 responses 里的某一条」—— 门关着的时候,上面那段
+         * 「请逐条核对是否属实」本身也(正确地)不在场,此时再挂一条讲 responses 怎么核的
+         * 规则,就是对着一份不存在的答卷立规矩,而那恰恰是这道门当初存在的理由
+         * (见上面那段关于「一句无从核对的自我表扬」的注释)。
+         */
+        REBUTTAL_RULE
       : '') +
     // 上一版方案。**排在 notice 之后**:下面那句「上面列出的那几条意见」指的就是 notice,
     // 排在它前面的话这个指代落在空气上。见 prevPlanSection。
@@ -1259,7 +1368,10 @@ function reviewPrompt(
      * 互不相同的要求,全部只出现过一轮),所以最严的那一档拿到的不是「不限」而是举证责任。
      */
     reviewRubric(strict, round) +
-    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +
+    // 取证与范围责任。**排在这里而不是 brief 里** —— 见 EVIDENCE_RULE 的注释:一条不该被
+    // 覆盖的规则要待在最后一段、紧挨 schema,而不是提示词的第一段。
+    EVIDENCE_RULE +
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD} }。` +
     answerRule(tag)
 }
 /**
@@ -1305,7 +1417,10 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
      */
     (feedback
       ? `\n另外:上面每一条阻断意见,在 responses 里对应**一项**,顺序一致,写成` +
-        `「第 N 条 → 改了哪个文件的哪一处 / 跑了什么命令、结果如何」或「第 N 条 → 不适用,因为…」。` +
+        `「第 N 条 → 改了哪个文件的哪一处 / 跑了什么命令、结果如何」、「第 N 条 → 不适用,因为…」,` +
+        // 第三种写法。理由与 planPrompt 那一处逐字相同(见那里),而执行侧更贵:这一关每一轮
+        // 返工都要多付一次带写工具的执行调用。接盘规则在 `execResponsesSection` 的 REBUTTAL_RULE。
+        `或「第 N 条 → **前提有误**:我跑了 <命令>,输出是 <输出>,它覆盖的范围是 <范围>,所以这条的前提不成立」。` +
         `**不要漏条,也不要合并成一项。**这一段会交给上一轮提意见的人逐条核对,写不实的会被当场指出来。`
       : '') +
     answerRule(tag)
@@ -1382,7 +1497,8 @@ function verifyPrompt(
      * 按 `stepOfRound` 过滤而来。**有账才立规矩**,这样那条蕴含关系重新成立。
      */
     (notice ? repeatRule(strict, round) : '') +
-    `输出:{ "pass":boolean, "blocking":string[], "comments":"命令与原始输出" }。` +
+    EVIDENCE_RULE +
+    `输出:{ "pass":boolean, "blocking":string[], "comments":"命令与原始输出"${RETRACTED_FIELD} }。` +
     answerRule(tag)
   )
 }
@@ -1437,7 +1553,16 @@ function execResponsesSection(node: TaskNode): string {
     // 时这一节实测 ~40 KB,而它进的是**每一个**裁决席位、verify 和 accept 各一遍、每轮一遍。
     // 截断标记落在节末(capText 自带),不会像逐条夹那样把「还有 N 条」挤掉。
     capText(r.map((s, i) => responseLine(i, typeof s === 'string' ? s : String(s), quote)).join('\n'), MAX_SUMMARY_CHARS) + '\n' +
-    `它说改了某处就去看那一处、说跑了某条命令就自己跑一遍;对不上的照旧填进 blocking 并写明是哪一条。\n`
+    `它说改了某处就去看那一处、说跑了某条命令就自己跑一遍;对不上的照旧填进 blocking 并写明是哪一条。\n` +
+    /**
+     * 执行侧的第三出口也得有人接 —— 而接盘的**不是 reviewPrompt**。
+     *
+     * 这一节由 `verifyPrompt` 和 `acceptPrompt` 渲染(执行者的答卷从来不进评审关口),所以
+     * 光在 reviewPrompt 里加处置规则,执行侧那个出口就是死配置:上面那句「对不上的照旧填进
+     * blocking」会把一条「你这条的前提有误」直接读成答非所问,于是走这个出口的执行者反而
+     * 被惩罚。评审查出来的正是这一条。
+     */
+    REBUTTAL_RULE
 }
 
 /**
@@ -1513,7 +1638,8 @@ function acceptPrompt(
     roundStakes(round, maxRounds, '验收', spent) +
     // 判据同 verifyPrompt 那一段(有账才立规矩)。
     (notice ? repeatRule(strict, round) : '') +
-    `输出:{ "pass":boolean, "blocking":string[], "comments":string }。` +
+    EVIDENCE_RULE +
+    `输出:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD} }。` +
     answerRule(tag)
   )
 }
@@ -1599,7 +1725,8 @@ function integratePrompt(
     // 判据同 verifyPrompt(有账才立规矩);evidenceChanged=false 的理由见 repeatRule 那个参数
     // —— 集成验收两轮之间子任务证据逐字节不变,「改了就该判通过」在这一关前提为假。
     (notice ? repeatRule(strict, round, false) : '') +
-    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +
+    EVIDENCE_RULE +
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD} }。` +
     answerRule(tag)
   )
 }
@@ -2271,7 +2398,23 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
   const caps = ctx.config.caps
   // Seeded from the log so a RESUMED node re-plans against the blockers it already earned
   // rather than starting blind (see lastFailureFeedback).
-  let feedback = lastFailureFeedback(node.reviewLog)
+  /**
+   * **播种也走累积反馈**,不是只带最后一轮的拼接串。
+   *
+   * 这一行原来是 `lastFailureFeedback(node.reviewLog)`,直接取 `synthesized.blockingSummary`
+   * —— 于是它绕过了 `feedbackItems` / `planFeedbackPrompt` / `crossSeatNotice` **全部三样**:
+   * 老账与新账不分组、被撤回的意见照样在场、跨席位互斥提醒一个字都没有。而循环体内(下面那处
+   * 每轮重算的 `feedback`)三样都有。
+   *
+   * 也就是说 `--resume` 之后的**第一轮**拿到的是改动前的形状 —— 而一个跑到会被 resume 的
+   * 运行,恰恰是轮次已经烧掉一些、最需要这三样的那种。验收实测到这条路径。
+   *
+   * 兜底仍然保留:`feedbackItems` 在「圆桌全是 infra 失败」时收不到任何条目
+   * (那种记录的 blocking 是「角色调用失败」,会被 `infra` 滤掉),此时 `planFeedbackPrompt`
+   * 返空串,退回原来那句拼接串 —— 和循环体内那处 `|| rec.synthesized.blockingSummary` 同源。
+   */
+  let feedback = planFeedbackPrompt(feedbackItems(node.reviewLog), '评审', crossSeatNotice(node.reviewLog))
+    || lastFailureFeedback(node.reviewLog)
   /**
    * 启动关口第三关 (spec §2): a plan a human has already seen and approved.
    *
@@ -2493,11 +2636,17 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // 没同时看到过三轮意见,它每次都在打地鼠:第 1 轮的意见在第 2 轮被改跑偏,第 3 轮
       // 又提回来,三轮烧完,说的其实是同一件事。
       const items = feedbackItems(node.reviewLog)
-      feedback = planFeedbackPrompt(items) || rec.synthesized.blockingSummary
+      /**
+       * 「本轮几席各自提了意见,它们没经过统一」—— 一轮算一次,和 `feedbackItems` 同一条规矩。
+       *
+       * 这是那次事故里唯一能在**第 2 轮**就止血的东西:第 1 轮两席要求把同一个数字分别改成
+       * 7 和 13(正确值 14),而作者手上没有任何一句话提示它「这两条互斥、都可能是错的」。
+       */
+      feedback = planFeedbackPrompt(items, '评审', crossSeatNotice(node.reviewLog)) || rec.synthesized.blockingSummary
       if (node.iteration.planReview >= caps.maxIterations) {
         // 触顶时点名**哪几条是连着几轮没解决的**,并按这个事实给下一步 —— 静态的一句
         // 「可提高 caps.maxIterations」在「同一条连提三轮」的情况下是误导。
-        await blockWithReason(node, exhaustionReason(items, caps.maxIterations), ctx, 'cap-iteration', exhaustionRemedy(items))
+        await blockWithReason(node, exhaustionReason(items, caps.maxIterations, retractedCount(node.reviewLog)), ctx, 'cap-iteration', exhaustionRemedy(items))
         return
       }
       continue
@@ -3357,9 +3506,13 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
      * 那是两批互不相干的要求。一轮算一次(执行只有一席,但 feedbackItems 是 O(n²),
      * 而返工轮次越多这份日志越长)。
      */
+    const execRework = node.acceptLog.filter(r => stepOfRound(r) === 'verify' || stepOfRound(r) === 'accept')
     const execHistory = planFeedbackPrompt(
-      feedbackItems(node.acceptLog.filter(r => stepOfRound(r) === 'verify' || stepOfRound(r) === 'accept')),
+      feedbackItems(execRework),
       '测试验证/验收',
+      // 跨席位互斥提醒。`crossSeatNotice` 自己按 (step, round) 分组 —— 这里传进去的是
+      // verify 和 accept 的**合并**日志,而两关各自计数,同一个 round 数会同时出现在两边。
+      crossSeatNotice(execRework),
     )
     const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatPreamble(ctx, execSeat, 'execute', node), execHistory), cwd: node.worktree?.path, signal: ctx.signal },
       // round 用的是 stepExecute 的局部轮次:返工每一轮都是一次独立的执行,合成一条流

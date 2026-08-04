@@ -138,7 +138,23 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
        * node.md 可以手工编辑,拿它当判据等于让改个名字就能伪装成人工放行(反过来也一样)。
        */
       const mark = v?.infra ? 'CALL-FAILED' : v?.manual ? 'MANUAL-PASS' : v?.pass ? 'pass' : 'FAIL'
-      return `  - [${stripControl(String(v?.role ?? 'unknown'))}] ${mark}${detail ? ': ' + clipBody(stripControl(detail)) : ''}`
+      /**
+       * **撤回要人读得见**,理由和上面 MANUAL-PASS 那条逐字同源。
+       *
+       * `Verdict.retracted` 会让一条历史阻断意见从 `feedbackItems` 里整条消失 —— 它不再进
+       * 作者的反馈、不再进 `stuckItems`、也不再进 `exhaustionReason`。也就是说撤回是这套
+       * 里**唯一**能让一条真实提出过的意见在下游全线消失的机制,而代码侧没有任何闸门校验
+       * 撤回者是不是提出者、撤得对不对(那需要语义)。
+       *
+       * 唯一诚实的做法是让它在**人读的那一半**留痕:frontmatter 里本来就有,但这个文件
+       * 自己的规矩是「body 才是人读的那一半」(见 strictness 那条渲染的注释)。少了这一行,
+       * 一次误撤或滥撤在 node.md 上和「这条意见从没被提过」长得一模一样。
+       */
+      const gone = (v?.retracted ?? []).length > 0
+        ? `\n    ↩ 本轮撤回 ${(v.retracted ?? []).length} 条历史意见: ` +
+          clipBody(stripControl((v.retracted ?? []).join('; ')))
+        : ''
+      return `  - [${stripControl(String(v?.role ?? 'unknown'))}] ${mark}${detail ? ': ' + clipBody(stripControl(detail)) : ''}${gone}`
     })
     return [head, ...roles].join('\n')
   }).join('\n')

@@ -316,9 +316,27 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
     ? (obj.blocking as unknown[]).map(b => (typeof b === 'string' ? b : '')).filter(Boolean)
     : []
   const blocking = capBlockingList(rawBlocking)
+  /**
+   * 本轮撤回的历史意见 (`Verdict.retracted`)。
+   *
+   * **和 `blocking` 走同一条预算**,理由也逐字相同:它是模型自由填写的字符串数组,而它会
+   * 随 verdicts 一起被 yamlStringify 进 node.md。标记里的名词要说准 —— 一份「本轮撤回的
+   * 意见」清单末尾跟着「还有 3 条阻断意见未记录」,读起来是系统丢了 3 条阻断意见。
+   *
+   * **不参与 `pass` 的计算。** 撤回一条老意见既不是通过也不是否决,判决完全由 `blocking`
+   * 决定 —— 一个撤回了 3 条、同时新提 1 条的裁决,仍然是不通过。
+   *
+   * 空数组不落字段:`retracted: []` 会给每一条老 verdict 记录凭空加一行 YAML,而
+   * 「省略 = 什么都没撤回 = 逐字相同」是这个字段对老 node.md 的承诺。
+   */
+  const rawRetracted = Array.isArray(obj.retracted)
+    ? (obj.retracted as unknown[]).map(r => (typeof r === 'string' ? r : '')).filter(Boolean)
+    : []
+  const retracted = rawRetracted.length > 0 ? capBlockingList(rawRetracted, '撤回项') : []
   const pass = obj.pass === true && blocking.length === 0
   return {
     role, pass, blocking, comments: str(obj.comments),
+    ...(retracted.length > 0 ? { retracted } : {}),
     // 补救子任务 (spec §4.1). Read from the SAME tag-verified object as the verdict itself,
     // which is exactly what makes it safe: `obj` came from a pick that required this call's
     // unguessable tag, so a `remedy` planted in the quoted evidence is unreachable here.

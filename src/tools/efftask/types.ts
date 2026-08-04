@@ -228,6 +228,21 @@ export interface Verdict {
    */
   rateLimited?: boolean
   /**
+   * 本轮经核实后**撤回**的历史意见 —— 前几轮提过(自己或同僚提的),这一轮核下来它的
+   * 事实前提不成立,所以不再算数。原样摘录那条的开头即可,`feedbackItems` 按相似度匹配。
+   *
+   * **没有这个字段,「作废」就只是提示词里的一句话。** 被作者举证反驳掉的那条仍然留在
+   * `reviewLog[].verdicts[].blocking[]` 里,`feedbackItems` 下一轮照样把它捞出来,后面跟着
+   * `reviewRepeatNotice` 那句无条件的「若仍未回应,请指出缺了什么」;而作者的举证只活在
+   * `node.plan.responses` 里,`planPrompt` 渲染下一版时把它剥掉、`prevPlan` 也剥掉 ——
+   * 于是第 3 轮的裁决员手上**没有任何反驳记录**,那条必然复活,还会被 `stuckItems` /
+   * `exhaustionReason` 报成「被提过不止一轮、至今未解决」。提示词里说一件数据层不支持的
+   * 事,和这个仓库反复在修的是同一类。
+   *
+   * 省略 = 什么都没撤回 = 与引入本字段之前逐字相同。老 node.md 里全是这个形状。
+   */
+  retracted?: string[]
+  /**
    * 集成验收不通过时,这位角色提出的**补救子任务** —— spec §4.1 的
    * `INTEGRATION_ACCEPT ──fail──▶ (回到 decompose 修订)`。
    *
