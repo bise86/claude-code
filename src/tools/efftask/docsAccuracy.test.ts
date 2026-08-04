@@ -387,6 +387,73 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
      */
   })
 
+  it('说第 2 轮起不许换一批新理由,那四关就得**都**接上那条护栏', () => {
+    expect(README).toContain(norm('四个裁决环节（质疑讨论／测试验证／验收／集成验收）从第 2 轮开始都会收到同一条护栏'))
+    // README 说的是「都」。护栏原来只挂在质疑讨论上,而执行侧那三关一条都没有 ——
+    // 只 grep 一处的话,这条断言在退化回去之后照样绿。
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    // 三关都接上了,而且**都**走 notice 门控 —— 「有账才立规矩」。少一处门控就是把护栏
+    // 接到一个没有旧账的关口上,那是验收查出来的反向失败(护栏变封嘴),见 verifyPrompt
+    // 里那一大段。所以这里数的是带门控的那个形状,不是裸的 repeatRule。
+    expect(src.split('notice ? repeatRule(strict, round').length - 1).toBe(3) // verify / accept / integrate
+    expect(src).not.toContain('\n    repeatRule(strict, round)')
+    const strict = readFileSync(new URL('src/tools/efftask/strictness.ts', ROOT), 'utf8')
+    expect(strict).toContain('export function repeatRule')          // 质疑讨论走 reviewRubric
+    expect(strict).toContain('reviewRubric(s: Strictness | undefined, round: number)')
+    // 专家档是举证责任,不是豁免 —— README 明说了这一条
+    expect(README).toContain(norm('专家档拿到的不是豁免而是**举证责任**'))
+    expect(strict).toContain('每提一条都要写明为什么上一轮没提')
+  })
+
+  it('README 说「答卷只在有问卷时才出现、护栏只在有旧账时才生效」,代码里就得有那两道门', () => {
+    expect(README).toContain(norm('**答卷只在有问卷时才出现，护栏只在有旧账时才生效。**'))
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    // 门一:护栏跟着本关自己的旧账走。三关都要,少一处就是把护栏接到没有旧账的关口上
+    // —— 那是护栏变封嘴的那个反向失败。
+    expect(src.split('notice ? repeatRule(strict, round').length - 1).toBe(3)
+    expect(src).not.toContain('\n    repeatRule(strict, round)')
+    // 门二:答卷跟着旧账走 + 轮次各关自己数
+    expect(src).toContain('!hasReworkHistory(node)')
+    expect(src).toContain('function gateRound')
+    expect(src).toContain("gateRound(node, 'verify')")
+    expect(src).toContain("gateRound(node, 'accept')")
+    // 门三:第 1 轮不收(两侧各一处)
+    expect(src).toContain('feedback && out.responses.length > 0')
+    expect(src).toContain('if (!feedback) delete node.plan.responses')
+    // 预算和轮次是两个数,README 说了会分开讲
+    expect(README).toContain(norm('把节点打死的那份返工预算是两关共用的'))
+    expect(src).toContain('测试验证与验收**共用**这一份')
+  })
+
+  it('README 说集成验收是例外,那 repeatRule 就得真的收得下这个例外', () => {
+    expect(README).toContain(norm('它两轮之间证据一个字都不会变'))
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    expect(src).toContain('repeatRule(strict, round, false)')
+    const strict = readFileSync(new URL('src/tools/efftask/strictness.ts', ROOT), 'utf8')
+    expect(strict).toContain('evidenceChanged = true')
+    expect(strict).toContain('if (!evidenceChanged) {')
+    // 例外那一支**不许**含「改了就该判通过」—— 那正是它存在的理由
+    const branch = strict.slice(strict.indexOf('if (!evidenceChanged) {'), strict.indexOf('return `- **不要提出上一轮没有提过的新要求**,除非那是这一版新引入的缺陷。'))
+    expect(branch).not.toContain('就该判通过')
+    expect(branch).toContain('与上一轮**完全相同**')
+  })
+
+  it('说返工时要逐条回应,那两侧就得**各有一个字段**接得住这份答卷', () => {
+    expect(README).toContain(norm('方案作者和执行者都会被要求逐条回应上一轮的每一条阻断意见'))
+    const types = readFileSync(new URL('src/tools/efftask/types.ts', ROOT), 'utf8')
+    expect(types).toContain('responses?: string[]')
+    expect(types).toContain('execResponses?: string[]')
+    // 「会落进 node.md」这句话:body 里得真有这两节,否则人打开文件什么都看不到
+    const pers = readFileSync(new URL('src/tools/efftask/persistence.ts', ROOT), 'utf8')
+    expect(pers).toContain('## 方案:对上一轮质疑讨论意见的逐条处置')
+    expect(pers).toContain('## 执行:对上一轮测试验证/验收意见的逐条处置')
+    // 「核对是否属实」而不是「他说改了就算改了」—— 这半句是 load-bearing 的
+    expect(README).toContain(norm('核对是否属实'))
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    expect(src).toContain('作者说了不等于做了')
+    expect(src).toContain('要核对是否属实,不是通过的依据')
+  })
+
   it('说跳过验收/测试验证时执行不重跑,那 pipeline 里就得有那条豁免', () => {
     expect(README).toContain(norm('**跳过测试验证 / 验收时执行环节不重跑**'))
     const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')

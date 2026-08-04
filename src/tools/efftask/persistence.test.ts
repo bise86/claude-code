@@ -479,6 +479,50 @@ describe('落选稿要真的落到人读得到的那一半', () => {
 })
 
 
+/**
+ * 「对上一轮意见的逐条处置」也要落到人读得到的那一半。
+ *
+ * 和落选稿是同一条规矩,但追责价值更高:这两节是「作者/执行者当时**声称**这一条已经解决」
+ * 的唯一书面记录。事后要查的正是这句话 —— 哪一条是它说改了而其实没改的。
+ */
+describe('逐条处置要落到 body', () => {
+  const withResponses = (plan?: string[], exec?: string[]) => {
+    const n = createNode({ id: 'root', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', ...(plan ? { responses: plan } : {}) }
+    if (exec) n.execResponses = exec
+    return n
+  }
+
+  it('两节各自成段,而且分得开是哪一关的账', () => {
+    const md = serializeNode(withResponses(['第 1 条 → 方案第 3 步'], ['第 1 条 → 改了 src/a.ts']))
+    expect(md).toContain('## 方案:对上一轮质疑讨论意见的逐条处置')
+    expect(md).toContain('1. 第 1 条 → 方案第 3 步')
+    expect(md).toContain('## 执行:对上一轮测试验证/验收意见的逐条处置')
+    expect(md).toContain('1. 第 1 条 → 改了 src/a.ts')
+  })
+
+  it('没有回应时不画空段', () => {
+    expect(serializeNode(withResponses())).not.toContain('逐条处置')
+  })
+
+  it('逐条夹,不是整节夹 —— 一条长的不许把后面的条目连编号一起顶掉', () => {
+    const md = serializeNode(withResponses(undefined, ['X'.repeat(5000), '第 2 条 → 不适用']))
+    const body = md.slice(md.indexOf('## 执行:对上一轮'))
+    expect(body).toContain('完整内容见 frontmatter')
+    // 第 2 条必须还在。整节夹的话读者看到的是一份**看起来完整**的一条清单。
+    expect(body).toContain('2. 第 2 条 → 不适用')
+  })
+
+  it('手工编辑出来的坏值不许让 commit 抛 —— 抛一次这个节点每次 --resume 都死同一处', () => {
+    const n = withResponses()
+    ;(n as { execResponses?: unknown }).execResponses = [{ a: 1 }, null]
+    expect(() => serializeNode(n)).not.toThrow()
+    ;(n as { execResponses?: unknown }).execResponses = 'boom'
+    expect(() => serializeNode(n)).not.toThrow()
+    expect(serializeNode(n)).not.toContain('## 执行:对上一轮')
+  })
+})
+
 describe('removeNodeDirs 不许删出 run 目录之外', () => {
   const probeFs = (touched: string[]): FsLike => ({
     readFile: async () => '', writeFile: async () => {}, mkdir: async () => {},

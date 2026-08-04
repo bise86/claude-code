@@ -1187,6 +1187,59 @@ describe('落选稿从盘上读回来时要逐条校验', () => {
   })
 })
 
+/**
+ * 逐条处置的读回校验。
+ *
+ * 比落选稿更要紧一档:这两个字段会**原样进裁决提示词**(reviewPrompt 把整份 plan
+ * stringify 进去,execResponsesSection 逐条渲染),而它们旁边写着「作者声称第 N 条已解决,
+ * 请核对是否属实」。一条 [object Object] 在那里读起来像一条真的回应,而这一关正是靠
+ * 逐条核对收敛的 —— 坏数据在这里不是显示问题,是判据问题。
+ */
+describe('逐条处置从盘上读回来时要逐条校验', () => {
+  const withResponses = (planR: unknown, execR: unknown) =>
+    mk({
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', responses: planR } as never,
+      execResponses: execR,
+    } as never)
+
+  it('不是数组 → 整个丢掉并记进 repairs', () => {
+    const out = validateLoadedNodes([withResponses('boom', 'boom')], OPTS)
+    expect((out.nodes[0].plan as { responses?: unknown }).responses).toBeUndefined()
+    expect(out.nodes[0].execResponses).toBeUndefined()
+    expect(out.repairs.join(' ')).toContain('方案逐条处置')
+    expect(out.repairs.join(' ')).toContain('执行逐条处置')
+  })
+
+  it('数组里的坏条目被剔除,好的留下', () => {
+    const out = validateLoadedNodes([withResponses(
+      ['第 1 条 → 已改', { a: 1 }, null, '   '],
+      ['第 1 条 → 跑了 bun test', 5],
+    )], OPTS)
+    expect((out.nodes[0].plan as { responses?: unknown }).responses).toEqual(['第 1 条 → 已改'])
+    expect(out.nodes[0].execResponses).toEqual(['第 1 条 → 跑了 bun test'])
+    expect(out.repairs.join(' ')).toContain('3 条格式非法')
+  })
+
+  it('全是坏的 → 字段整个消失,而不是留一个空数组', () => {
+    const out = validateLoadedNodes([withResponses([{ a: 1 }], [null])], OPTS)
+    expect('responses' in (out.nodes[0].plan as object)).toBe(false)
+    expect('execResponses' in (out.nodes[0] as object)).toBe(false)
+  })
+
+  it('合法的原样留着,不报噪音', () => {
+    const out = validateLoadedNodes([withResponses(['第 1 条 → 已改'], ['第 1 条 → 已改'])], OPTS)
+    expect((out.nodes[0].plan as { responses?: unknown }).responses).toEqual(['第 1 条 → 已改'])
+    expect(out.repairs.join(' ')).not.toContain('逐条处置')
+  })
+
+  it('老 node.md 没有这两个字段 —— 不许凭空补出来', () => {
+    const out = validateLoadedNodes([mk({ plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' } as never })], OPTS)
+    expect('responses' in (out.nodes[0].plan as object)).toBe(false)
+    expect('execResponses' in (out.nodes[0] as object)).toBe(false)
+    expect(out.repairs.join(' ')).not.toContain('逐条处置')
+  })
+})
+
 describe('--resume 之后收敛方式不能变', () => {
   // 这个夹取删掉后全量一条不红,而后果是同一个 run 前后两种形态:第一段用圆桌,
   // 恢复之后静默退回精化,用户毫不知情。

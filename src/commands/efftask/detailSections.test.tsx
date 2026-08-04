@@ -752,3 +752,54 @@ describe('本轮返工原因', () => {
     expect(exec).toContain('执行者')
   })
 })
+
+/**
+ * 「对上一轮意见的逐条处置」——「本轮返工原因」的另一半。
+ *
+ * 上面那段说的是**别人提了什么**,这两段说的是**它自己回了什么**。盯着一个第 3 轮还没过
+ * 的节点看的人,要判断的正是「它到底改了没、还是每轮都在说同一句话」,而那个判断只有把
+ * 问和答摆在一起才做得出来。
+ */
+describe('逐条处置在详情页上', () => {
+  const mk = (over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id: 'root', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW }),
+    ...over,
+  })
+
+  it('没有回应时两段都不出现 —— 空段落是死格', () => {
+    const titles = detailSections(mk()).map(s => s.title)
+    expect(titles.some(t => t.includes('逐条处置'))).toBe(false)
+  })
+
+  it('两侧分得开是哪一关的账,而且各自逐条编号', () => {
+    const secs = detailSections(mk({
+      plan: { solution: 's', keyPoints: '', risks: '', acceptance: '', responses: ['已在第 3 步写明'] },
+      execResponses: ['改了 src/a.ts', '不适用'],
+    } as Partial<TaskNode>))
+    const p = secs.find(s => s.title === '方案:对上一轮意见的逐条处置')!
+    const e = secs.find(s => s.title === '执行:对上一轮意见的逐条处置')!
+    expect(p.body).toBe('1. 已在第 3 步写明')
+    expect(e.body).toBe('1. 改了 src/a.ts\n2. 不适用')
+  })
+
+  it('紧跟在「本轮返工原因」后面 —— 问和答要挨着', () => {
+    const secs = detailSections(mk({
+      status: 'EXECUTING',
+      acceptLog: [{ round: 1, verdicts: [], synthesized: { pass: false, blockingSummary: '缺回滚' }, step: 'accept' }] as never,
+      execResponses: ['改了 src/a.ts'],
+    } as Partial<TaskNode>))
+    const i = secs.findIndex(s => s.title === '本轮返工原因')
+    const j = secs.findIndex(s => s.title === '执行:对上一轮意见的逐条处置')
+    expect(i).toBeGreaterThanOrEqual(0)
+    expect(j).toBe(i + 1)
+  })
+
+  it('手工编辑出来的坏值不许让详情页抛 —— 抛一次整个 /et 界面就黑了', () => {
+    const n = mk()
+    ;(n as { execResponses?: unknown }).execResponses = [{ a: 1 }, null]
+    expect(() => detailSections(n)).not.toThrow()
+    ;(n as { execResponses?: unknown }).execResponses = 'boom'
+    expect(() => detailSections(n)).not.toThrow()
+    expect(detailSections(n).some(s => s.title.includes('逐条处置'))).toBe(false)
+  })
+})

@@ -27,6 +27,9 @@ import {
 } from './logView.js'
 import { formatTokens, isEmptyUsage, subtreeUsage, totalTokens, type UsageTotals } from '../../tools/efftask/usage.js'
 import { reworkReason } from '../../tools/efftask/reworkReason.js'
+// node.md 那侧同名的函数用的就是它 —— 两处必须是同一份实现,否则「同一份数据两种处理」
+// 会以另一种形式回来(见 responsesBody 的注释)。
+import { stripControl } from '../../tools/efftask/persistence.js'
 import { currentMouseAvailability } from './mouseEnv.js'
 import { useLiveState } from './useLiveState.js'
 import { stringWidth } from '../../ink/stringWidth.js'
@@ -327,6 +330,30 @@ function reworkBody(n: TaskNode): string {
   return `第 ${r.rounds} 轮${PHASE_LABEL[r.step]}未通过:\n${r.why}\n\n${carried}`
 }
 
+/**
+ * 「对上一轮意见的逐条处置」——一条一行,带编号。
+ *
+ * 编号是**重新数的**,不沿用条目正文里的「第 N 条」:那串数字是模型写的,它和上面
+ * 「本轮返工原因」里的意见顺序对不对得上,这里没有任何办法核实。屏幕上自己数一遍,
+ * 至少「一共回了几条」这个数是真的 —— 而这需要**续行缩进**才成立:条目正文是模型写的,
+ * 它换一行就顶格,屏幕上两条含换行的回应看起来是四条、编号 1/2/2/3。验收实测过这一条,
+ * 它恰好是上面那句话自称要消掉的东西。
+ *
+ * 非字符串项在恢复那一侧就被剔掉了(validateLoadedNodes),这里的 String() 是纵深防御:
+ * 详情页在 render 里抛,整个 /et 界面就黑了。
+ *
+ * `stripControl` 同理,而它是验收查出来的一处不对称:`persistence.ts` 里同名的那个函数
+ * 剥了,这里没剥 —— 同一份数据、同一个函数名、两种处理。一个 `[2J` 走到这里就是
+ * 清屏 + 改标题。(旁边 `execStatus`/`plan.solution` 也没剥,那是既有面,不在这次范围内;
+ * 但一段自称「纵深防御」的注释底下漏掉真正要防的那样,是这次的事。)
+ */
+function responsesBody(items: string[] | undefined): string {
+  if (!Array.isArray(items) || items.length === 0) return ''
+  return items
+    .map((s, i) => `${i + 1}. ${stripControl(typeof s === 'string' ? s : String(s)).split('\n').join('\n   ')}`)
+    .join('\n')
+}
+
 /** 评审 / 验收记录:每轮一行。 */
 function roundsBody(log: TaskNode['reviewLog']): string {
   return log
@@ -422,6 +449,16 @@ export function detailSections(
      * 内容是从同两份记录派生的(reworkReason),所以不会和下面那两段对不上。
      */
     { title: '本轮返工原因', body: reworkBody(n), md: true },
+    /**
+     * 「它声称是怎么处置的」——紧跟在「为什么被打回来」后面,因为这两段是一问一答。
+     *
+     * 上面那段说的是**别人提了什么**,这两段说的是**它自己回了什么**。一个盯着第 3 轮还
+     * 没过的节点看的人,要判断的正是「它到底改了没、还是每轮都在说同一句话」,而那个判断
+     * 只有把问和答摆在一起才做得出来。空的自动不显示(见下面的 filter),所以第 1 轮和
+     * 从没返工过的节点版面逐字不变。
+     */
+    { title: '方案:对上一轮意见的逐条处置', body: responsesBody(n.plan.responses), md: true },
+    { title: '执行:对上一轮意见的逐条处置', body: responsesBody(n.execResponses), md: true },
     { title: '评分', body: scoreBody(n) },
     { title: '迭代次数', body: iterationBody(n) },
     // 时间线排在各阶段之前:先回答「这个任务是什么时候的事」,再回答「时间花在哪一步」。

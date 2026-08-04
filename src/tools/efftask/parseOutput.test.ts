@@ -1,6 +1,6 @@
 // src/tools/efftask/parseOutput.test.ts
 import { describe, expect, it } from 'bun:test'
-import { answerTag, extractJsonBlock, parsePlanOutput, parseVerdict, parseExecOutput, capText, capBlockingList, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS, MAX_NEW_CHILDREN, parseRemedy } from './parseOutput.js'
+import { answerTag, extractJsonBlock, parsePlanOutput, parseVerdict, parseExecOutput, capText, capBlockingList, capResponses, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS, MAX_NEW_CHILDREN, parseRemedy } from './parseOutput.js'
 
 describe('parseOutput', () => {
   it('extractJsonBlock finds fenced json', () => {
@@ -363,5 +363,47 @@ describe('parseRemedy:补救子任务的形状校验(此前完全没有直测)',
     // 没有 remedy 字段(而不是空数组):找不到本次 tag 的裁决块时走的是早退分支,整个
     // remedy 概念都不存在。reviseDecomposition 读的是 `v.remedy ?? []`,两者等价。
     expect(v.remedy).toBeUndefined()
+  })
+})
+
+/**
+ * 「逐条处置」的解析边界。
+ *
+ * 这两个字段是这条链上唯一一段**由模型写、原样进裁决提示词、而且旁边写着「作者声称第 N 条
+ * 已解决」**的文本(见 NodePlan.responses)。所以它的解析要按敌意输入对待:一条
+ * `[object Object]` 在裁决员眼里长得像一条真的回应,而这一关正是靠逐条核对收敛的。
+ */
+describe('capResponses:逐条处置的解析边界', () => {
+  it('非数组、非字符串项、空白项一律丢掉', () => {
+    expect(capResponses(undefined)).toEqual([])
+    expect(capResponses('第 1 条 → 已改')).toEqual([])   // 单个字符串不是列表
+    expect(capResponses({ 1: 'a' })).toEqual([])
+    expect(capResponses(['第 1 条 → 已改', null, 5, { a: 1 }, '  ', '第 2 条 → 不适用']))
+      .toEqual(['第 1 条 → 已改', '第 2 条 → 不适用'])
+  })
+
+  it('和 blocking 用**同一对**上限 —— 否则回应会在意见还看得见的时候先被截掉', () => {
+    const many = Array.from({ length: MAX_BLOCKING_ITEMS + 5 }, (_, i) => `第 ${i + 1} 条 → 已改`)
+    const out = capResponses(many)
+    expect(out.length).toBe(MAX_BLOCKING_ITEMS + 1)
+    // 丢了多少要说出来:一份**看起来完整**的短清单会被读成「他只回应了 20 条」
+    expect(out[out.length - 1]).toContain('还有')
+    const long = capResponses(['x'.repeat(MAX_BLOCKING_CHARS + 100)])
+    expect(long[0]).toContain('已截断')
+  })
+
+  it('parsePlanOutput / parseExecOutput 都接得住,而且缺席时不补空数组', () => {
+    const plan = parsePlanOutput('```json\n{"kind":"executable","solution":"s","responses":["第 1 条 → 已改"]}\n```')
+    expect(plan.plan.responses).toEqual(['第 1 条 → 已改'])
+    // 缺席 = 一条都没回应,那本身就是裁决员该看见的事实,不该被一个空数组掩盖成
+    // 「这一节存在但是空的」——node.md 上也就少一节空标题。
+    expect(parsePlanOutput('```json\n{"kind":"executable","solution":"s"}\n```').plan.responses).toBeUndefined()
+
+    const tag = answerTag('exec')
+    const exec = parseExecOutput('```' + tag + '\n{"execStatus":"改了","responses":["第 1 条 → 已改"]}\n```', tag)
+    expect(exec.responses).toEqual(['第 1 条 → 已改'])
+    expect(parseExecOutput('```' + tag + '\n{"execStatus":"改了"}\n```', tag).responses).toEqual([])
+    // 整段回复兜底那一支同样要给出这个字段,否则调用方读到 undefined.length 就抛了
+    expect(parseExecOutput('我改完了').responses).toEqual([])
   })
 })

@@ -383,6 +383,42 @@ export function validateLoadedNodes(
       if (kept.length > 0) n.plan.alternatives = kept
       else delete (n.plan as { alternatives?: unknown }).alternatives
     }
+    /**
+     * 两份「逐条处置」。和 alternatives 同一条理由,而后果更直接:这两个字段会**原样进
+     * 裁决提示词**(reviewPrompt 整份 stringify、`execResponsesSection` 逐条渲染),
+     * 一条 `{a:1}` 会在评审员眼里变成一条内容为 `[object Object]` 的「回应」,而它旁边
+     * 写着「作者说他解决了第 3 条」。非字符串项和空白项一律丢掉,丢了要记进 repairs。
+     */
+    const fixResponses = (get: () => unknown, set: (v: string[] | undefined) => void, what: string): void => {
+      const raw = get()
+      if (raw === undefined) return
+      const arr = Array.isArray(raw) ? raw : []
+      const kept = arr.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+      const dropped = (Array.isArray(raw) ? arr.length : 1) - kept.length
+      if (dropped > 0) repairs.push(`节点 ${n.id} 的${what}有 ${dropped} 条格式非法,已剔除`)
+      /**
+       * **在恢复边界上也要重新夹一次上限**,不能只滤类型。
+       *
+       * `capBlockingList` 自己的注释写着它「Shared by the parse boundary and the resume
+       * boundary, because they disagreed」—— 而这两个新字段当初只接了解析那一侧。node.md
+       * 是手工可编辑的文本,崩溃残留也长这样;验收实测:盘上放 5000 条 × 508 字,恢复之后
+       * **一条没夹**原样回到内存,再落盘就是 9.5 MB 的 node.md,而 `commit()` 每次阶段跳转
+       * 都全量重写它。旁边 `verdict.blocking` 走同一条恢复路径,它是夹了的。
+       *
+       * `capBlockingList` 幂等,所以对已经夹过的值重跑无害(那正是它幂等的原因)。
+       */
+      set(kept.length > 0 ? capBlockingList(kept, '回应') : undefined)
+    }
+    fixResponses(
+      () => (n.plan as { responses?: unknown }).responses,
+      v => { if (v) n.plan.responses = v; else delete (n.plan as { responses?: unknown }).responses },
+      '方案逐条处置',
+    )
+    fixResponses(
+      () => (n as { execResponses?: unknown }).execResponses,
+      v => { if (v) n.execResponses = v; else delete (n as { execResponses?: unknown }).execResponses },
+      '执行逐条处置',
+    )
     // Entries, not just the array. serializeNode's body now walks `r.verdicts` and
     // `v.blocking`, so a half-written entry — exactly what a crash leaves behind — makes
     // every persist THROW. commit() catches it and blocks the node with a bare JS TypeError

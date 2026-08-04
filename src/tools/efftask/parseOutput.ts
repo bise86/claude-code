@@ -198,7 +198,18 @@ export const MAX_SUMMARY_CHARS = 4000
  */
 export const DROPPED_MARKER = '…(还有'
 
-export function capBlockingList(items: string[]): string[] {
+export function capBlockingList(
+  items: string[],
+  /**
+   * 被丢掉的**是什么**,写进标记里。
+   *
+   * 默认「阻断意见」= 这个函数原来唯一的调用场景,老行为逐字不变。`capResponses` 要传
+   * 「回应」:一份标题为「执行者对上一轮**阻断意见**的逐条处置」的清单,末尾跟着一句
+   * 「还有 3 条**阻断意见**未记录」,读起来是「系统又丢了 3 条意见」——而丢的是 3 条回应。
+   * 没静默截断,但标错了东西,和静默截断一样会让人对着一份残缺的清单做判断。
+   */
+  what = '阻断意见',
+): string[] {
   // IDEMPOTENT. A list that already carries the marker is passed through untouched: the
   // resume path runs this over values the parse path already capped, and re-deriving the
   // count there rewrote "还有 30 条" into "还有 1 条" — a number that describes this pass
@@ -208,7 +219,7 @@ export function capBlockingList(items: string[]): string[] {
   if (alreadyCapped) return items.map(b => capText(b, MAX_BLOCKING_CHARS))
   const capped = items.map(b => capText(b, MAX_BLOCKING_CHARS))
   if (capped.length <= MAX_BLOCKING_ITEMS) return capped
-  return [...capped.slice(0, MAX_BLOCKING_ITEMS), `${DROPPED_MARKER} ${items.length - MAX_BLOCKING_ITEMS} 条阻断意见未记录)`]
+  return [...capped.slice(0, MAX_BLOCKING_ITEMS), `${DROPPED_MARKER} ${items.length - MAX_BLOCKING_ITEMS} 条${what}未记录)`]
 }
 
 /** Truncate by CODE POINTS, marking the cut so a reader knows it happened. */
@@ -224,6 +235,22 @@ function str(v: unknown, fallback = ''): string {
   return capText(typeof v === 'string' ? v : fallback)
 }
 
+/**
+ * 「逐条处置」列表的解析 + 夹取。
+ *
+ * 走 `capBlockingList` 的**同一对上限**(20 条 × 2000 字)不是偷懒:这份列表是**对着**
+ * blocking 列表写的,一条意见一项。给它一个更小的上限,回应就会在阻断意见还看得见的
+ * 时候先被截掉 —— 裁决员于是读到「第 18 条没有回应」,而其实是我们没给它地方写。
+ *
+ * 非数组、非字符串项、空白项一律丢掉:这个字段会原样进裁决提示词,`[object Object]`
+ * 在那里读起来像一条真的回应。
+ */
+export function capResponses(v: unknown): string[] {
+  if (!Array.isArray(v)) return []
+  const items = v.map(x => (typeof x === 'string' ? x.trim() : '')).filter(s => s.length > 0)
+  return items.length === 0 ? [] : capBlockingList(items, '回应')
+}
+
 export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] } {
   // A plan carries at least one plan-ish key; a bare echo of the goal has none.
   // Ambiguity is tolerated here: a wrong plan is caught by the review roundtable.
@@ -234,6 +261,10 @@ export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
     risks: str(obj?.risks),
     acceptance: str(obj?.acceptance),
   }
+  // 逐条处置。只在模型真的给了非空数组时挂上去 —— 缺席和「一条都没回应」在评审员眼里
+  // 是同一件该被看见的事(见 NodePlan.responses),补一个空数组只会让 node.md 多一节空标题。
+  const responses = capResponses(obj?.responses)
+  if (responses.length > 0) plan.responses = responses
   const rawChildren = Array.isArray(obj?.children) ? (obj!.children as unknown[]) : []
   const children = rawChildren
     .map(c => {
@@ -360,20 +391,23 @@ export function parseNewChildren(o: Record<string, unknown>): NewChildSpec[] {
 
 export function parseExecOutput(
   text: string, tag: string = ANSWER_TAGS.exec,
-): { execStatus: string; newChildren: NewChildSpec[] } {
+): { execStatus: string; newChildren: NewChildSpec[]; responses: string[] } {
   const { obj } = pickAnswer(text, tag, o => typeof o.execStatus === 'string')
   // newChildren is read from a SEPARATE, tag-REQUIRED pick. Grafting nodes onto the tree is
   // a structural change, and the lenient pick above matches any same-shaped object anywhere
   // in the reply — including text quoted INTO the prompt. Reusing it meant an untagged
   // ```json block, or even bare prose, could grow the tree (reproduced).
   const { obj: tagged } = pickAnswer(text, tag, o => typeof o.execStatus === 'string', true)
-  if (obj) return { execStatus: str(obj.execStatus), newChildren: tagged ? parseNewChildren(tagged) : [] }
+  // responses 走**宽松**的那次 pick,和 execStatus 同源 —— 它不是结构性变更(不动树、
+  // 不放行任何东西),只是一段给下一关读的说明。绑到 tagged 上的话,一个漏打标签的
+  // 回复会把自述留下、把回应丢掉,而裁决员看到的是「他一条都没回应」。
+  if (obj) return { execStatus: str(obj.execStatus), newChildren: tagged ? parseNewChildren(tagged) : [], responses: capResponses(obj.responses) }
   // Untagged fallback: the whole reply becomes the status. A growth request must NOT be
   // honoured from untagged text — grafting nodes onto the tree is a structural change, and
   // the tag is the only thing separating "my answer" from text quoted into the prompt.
   // Capped like every other field: this fallback is the single biggest contributor to
   // node.md's size, because it takes the model's ENTIRE reply verbatim.
-  return { execStatus: capText(text.trim()), newChildren: [] }
+  return { execStatus: capText(text.trim()), newChildren: [], responses: [] }
 }
 
 /**

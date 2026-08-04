@@ -99,6 +99,15 @@ function richNode(): TaskNode {
   n.kind = 'executable'
   n.status = 'BLOCKED'
   n.execStatus = '改了 src/a.ts'
+  /**
+   * 对上一轮意见的逐条处置 —— 两份都是新的敌意输入面,而且是**直接进裁决提示词**的那种:
+   * `execResponsesSection` 逐条渲染给测试验证/验收席位,`plan.responses` 随整份方案
+   * stringify 给评审席位。一个 `{a:1}` 会在裁决员眼里变成一条内容为 `[object Object]`
+   * 的「回应」,而它旁边写着「作者声称第 N 条已解决」—— 比渲染成乱码更糟的是它**看起来
+   * 像一条真的回应**,而这一关正是靠逐条核对收敛的。
+   */
+  n.execResponses = ['第 1 条 → 已在 src/a.ts 补上回滚', '第 2 条 → 不适用']
+  n.plan.responses = ['第 1 条 → 已在 solution 第 3 步写明']
   n.blockedReason = '验收迭代超限(3)'
   n.interrupted = false
   n.mergeConflict = true

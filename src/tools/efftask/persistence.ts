@@ -153,6 +153,27 @@ function scoreBody(node: TaskNode): string {
   return [line('plan', node.score.plan), line('exec', node.score.exec)].join('\n')
 }
 
+/**
+ * 一节「逐条处置」。
+ *
+ * `clipBody` 是**逐条**夹的,不是整节夹的:一条 2000 字的回应(上限见 capResponses)会把
+ * 后面所有条目连同它们的编号一起顶掉,而读的人看到的是一份**看起来完整**的短清单 ——
+ * 这个仓库反复在修的正是这一类。
+ *
+ * DEFENSIVE:和 roundtableBody 同一条理由。这段跑在每一次 commit 上,而
+ * `validateLoadedNodes` 之外还有手工编辑过的 node.md;这里抛一次,节点就会带着一条裸
+ * TypeError 阻断,而且每次 --resume 都复现。一节 body 不值一个死掉的 run。
+ */
+function responsesBody(heading: string, items: unknown): string {
+  if (!Array.isArray(items) || items.length === 0) return ''
+  // 续行缩进,理由见 pipeline 的 `responseLine`:条目正文是模型写的,它换一行就顶格,
+  // 于是屏幕上「一共回了几条」这个数当场失真(两条含换行的回应看起来是四条,编号 1/2/2/3)
+  // —— 而重新编号本来就是为了保住那个数。
+  const lines = items.map((s, i) =>
+    `${i + 1}. ${clipBody(stripControl(typeof s === 'string' ? s : String(s))).split('\n').join('\n   ')}`)
+  return `${heading}\n${lines.join('\n')}\n\n`
+}
+
 // machine-state frontmatter fields (everything except derived human body)
 export function serializeNode(node: TaskNode): string {
   const fm = { ...node }
@@ -165,7 +186,13 @@ export function serializeNode(node: TaskNode): string {
     `## 重点\n${c(node.plan.keyPoints)}\n\n` +
     `## 风险点\n${c(node.plan.risks)}\n\n` +
     `## 验收点\n${c(node.plan.acceptance)}\n\n` +
+    // 逐条处置。**body 也要有** —— 它是「作者/执行者当时声称这条已经解决了」的唯一书面
+    // 记录,而事后追责问的正是这句话:哪一条是它说改了而其实没改的。只落进 frontmatter
+    // 等于只做到机器可读那一半,这个文件自己的规矩是 body 才是人读的那一半(见 alternatives)。
+    // 省略 = 没有回应(第 1 轮,或者一条都没答),老 node.md 的形状逐字不变。
+    responsesBody('## 方案:对上一轮质疑讨论意见的逐条处置', node.plan.responses) +
     `## 执行状态\n${c(node.execStatus)}\n\n` +
+    responsesBody('## 执行:对上一轮测试验证/验收意见的逐条处置', node.execResponses) +
     (node.blockedReason ? `## 阻断原因\n${c(node.blockedReason)}\n\n` : '') +
     // 落选稿。只落进 frontmatter 而 body 不渲染的话,「不静默截断」只做到了机器可读那一半
     // —— body 才是人读的那一半。

@@ -131,6 +131,22 @@ export const MAIN_STAFF = ''
 export interface NodePlan {
   solution: string; keyPoints: string; risks: string; acceptance: string
   /**
+   * 方案作者对**上一轮**质疑讨论每一条阻断意见的逐条处置。一条意见一项。
+   *
+   * 为什么必须是一个字段,而不是让作者把话写进 `solution` 里:
+   *
+   * `planFeedbackPrompt` 早就在要求作者「必须逐条明确回应:要么在方案里解决,要么写明
+   * 为什么不适用」,而 `reviewRepeatNotice` 也早就在要求评审员「指出是方案的哪一处回应
+   * 了它」。两句话都在,**中间那个存放答案的地方不在** —— 作者的回应无处可写,评审员
+   * 只能拿着新旧两版方案自己去反推「这一条到底算不算被回应了」。反推是要靠猜的,而
+   * 猜出来的结论每一席、每一轮都不一样。用户量到的就是这个:「第一轮未过,有了修改意见
+   * 第二轮必定要过 —— 感觉现在全靠随机。」
+   *
+   * 空 / 缺席 = 这一轮没有上一轮(第 1 轮),或者作者一条都没回应 —— 后者本身就是评审员
+   * 该看见的事实,所以**不补默认值**。
+   */
+  responses?: string[]
+  /**
    * 圆桌模式下**落选的那几份稿**(见 caps.planConverge)。
    *
    * 只留 solution 一段并单独夹取到 ALT_SOLUTION_CHARS —— plan 的四个字段各自已经是
@@ -280,6 +296,21 @@ export interface TaskNode {
   phaseRoles: Record<PhaseName, RoleBinding[]>
   plan: NodePlan
   execStatus: string
+  /**
+   * 执行者对**上一轮**测试验证 / 验收每一条阻断意见的逐条处置。一条意见一项。
+   *
+   * 和 `NodePlan.responses` 是同一件事的执行侧那一半,理由逐字相同(见那里)—— 只是这
+   * 一侧更贵:每一轮返工都要多付一次带写工具的执行调用。
+   *
+   * **不并进 `execStatus`。** execStatus 是「这一轮做了什么」的自述,而这里是「上一轮那
+   * 几条各自怎么处置的」;混在一段自由文本里,裁决员就得先把它俩拆开才能逐条核对,而
+   * 那正是这个字段要消掉的那次反推。分开还有一个硬理由:`integratePrompt` 会把 execStatus
+   * 原样铺给集成验收席位,而那一关判的是另一件事,不该收到叶子层的返工问答。
+   *
+   * **每一轮无条件覆写**(包括覆写成 undefined):留着上一轮的回应,裁决员会拿着一份
+   * 描述两轮之前的答卷去核对这一轮的产出。
+   */
+  execResponses?: string[]
   // Why a separate field: execStatus may hold real completed-work evidence that the
   // acceptance roundtable still needs to see. Blocking must never overwrite it.
   blockedReason: string
