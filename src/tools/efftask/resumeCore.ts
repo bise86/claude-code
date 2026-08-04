@@ -3,6 +3,7 @@ import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGOR
 import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
+import { isStrictness } from './strictness.js'
 import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
 import { sanitizeUsage } from './usage.js'
 
@@ -214,6 +215,24 @@ function roundArray(v: unknown, onDrop?: () => void): RoundtableRecord[] {
           ? ((r.synthesized as { blockingSummary: string }).blockingSummary)
           : '',
       },
+      /**
+       * `step` 一直在这里被静默丢掉 —— 逐字段重建只列了上面三个键,而 `serializeNode` 是
+       * `{...node}` 全量倾倒,所以它**写得出去、读不回来**。后果不是少一个字段:
+       *
+       *  - `stepOfRound()` 对每条历史记录返回 undefined → `judgeNotice` 的
+       *    `filter(r => stepOfRound(r) === step)` 恒为空 → **每一次 `--resume` 之后,测试
+       *    验证/验收/集成验收三关的「你前几轮提过什么」全部失效**,退回 reviewConvergence
+       *    整个文件专门治的那个病(每轮换一批新理由,直到迭代耗尽);
+       *  - `stepExecute` 里 `acceptLog.filter(r => r.step !== 'integrate')` 恢复后不再过滤
+       *    任何东西 → 一条集成验收意见会被当成「上一轮**验收**未通过」喂给执行者。
+       *
+       * 新加的 `strictness` 会一模一样地死在这里,所以两条一起修。校验按 `verdictArray`
+       * 里 `manual`/`roleTag` 的规矩来:只认严格合法值 —— 手改 node.md 是一条绕开全部
+       * 上游校验的路。
+       */
+      ...(typeof r.step === 'string' && (PHASE_NAMES as readonly string[]).includes(r.step)
+        ? { step: r.step as PhaseName } : {}),
+      ...(isStrictness(r.strictness) ? { strictness: r.strictness } : {}),
     }))
 }
 
@@ -833,6 +852,22 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   if (caps.quorum !== undefined) rebuilt.quorum = clampInt(caps.quorum, 1, 100, 100)
   if (caps.quorumSeats !== undefined) rebuilt.quorumSeats = clampInt(caps.quorumSeats, 1, 20, 1)
   if (caps.planConverge === '圆桌' || caps.planConverge === '精化') rebuilt.planConverge = caps.planConverge
+  /**
+   * 严格度档位。照 `planConverge` 那一行的保守规矩:只认严格相等的四个字面量。
+   *
+   * **缺席一律回落 `undefined`(= 现状 = 全票 + 判据空白),绝不给具名默认档。** 老 run.md
+   * 里没有这个字段,而默认成「高级」会让一个原本全票跑的旧 run 恢复之后变成 quorum 80 ——
+   * 5 席下是 4/5,也就是**恢复之后变松了**,而屏幕上没有任何东西会说这件事。
+   */
+  if (isStrictness(caps.strictness)) rebuilt.strictness = caps.strictness
+  else if (caps.strictness !== undefined) {
+    // 照 scoreThreshold 那一支的规矩:回落要**说出来**。三条入口里 parseDirectives 会
+    // notice、scoreThreshold 会 degraded,只有手改 run.md 这条不说 —— 而它正是恢复路径。
+    degraded.push(
+      `run.md 里的 caps.strictness 不是合法档位(写的是 ${JSON.stringify(caps.strictness)}),` +
+      `已忽略:本次按不设档运行(圆桌全票、判据由各评审员自己把握)`,
+    )
+  }
   base.caps = rebuilt
 
   const pr = (fm.phaseRoles ?? {}) as Record<string, unknown>

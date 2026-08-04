@@ -33,6 +33,7 @@ import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resume
 import { reseatTransientNodes } from '../../tools/efftask/reseat.js'
 import { acquireRunLock, listRuns, releaseRunLock, reserveRun, type RunSummary } from '../../tools/efftask/runRegistry.js'
 import { createRunControl, type RunControl } from '../../tools/efftask/control.js'
+import { adjustStrictness } from '../../tools/efftask/strictness.js'
 import { AddDirective } from './AddDirective.js'
 import { ConfirmRedo } from './ConfirmRedo.js'
 import { ConfirmSkip } from './ConfirmSkip.js'
@@ -1387,8 +1388,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     (target: TaskNode, cfg: EffTaskConfig) =>
       // isolated:跳过验收能不能安全放行要靠它(见 RedoContext.isolated)。只有这一层
       // 看得见那个池子。
-      redoContextOf(target, cfg, { isolated: poolRef.current !== undefined }),
-    [],
+      redoContextOf(target, cfg, {
+        isolated: poolRef.current !== undefined,
+        // 现读,不快照:关口是在用户按下 r 的那一刻渲染的,而档位可以在那之前的任何
+        // 一秒被调过。见 redoSummary 里那一行说的事。
+        strictness: control.strictness() ?? cfg.caps.strictness,
+      }),
+    [control],
   )
 
   const applyRedo = React.useCallback((
@@ -2000,6 +2006,19 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           control.setParallelism(cur + d)
           setParallelismTick(t => t + 1)
         },
+        /**
+         * 调严格度。基准取 control 现在的值,没调过才回落到关口批准的那一档 ——
+         * 和并发度那一条逐字同因(一直拿 config 当基准的话,连按两次只会跳一级)。
+         *
+         * 阶梯与「不设」的关系交给 `adjustStrictness`(一份真相),这里不重复算。
+         */
+        onAdjustStrictness: d => {
+          const cur = control.strictness() ?? config.caps.strictness
+          control.setStrictness(adjustStrictness(cur, d))
+          // control 不是 React state,不 tick 的话改完屏幕不动 —— 和并发度同一个坑。
+          setParallelismTick(t => t + 1)
+        },
+        strictness: control.strictness() ?? config.caps.strictness,
       }}
     />
   }

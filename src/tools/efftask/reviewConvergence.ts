@@ -20,6 +20,7 @@
  * 全纯函数。数据从已经落盘的 `node.reviewLog` 里读,不新增任何状态。
  */
 import type { RoundtableRecord } from './types.js'
+import { STRICTNESS_LEVELS, type Strictness } from './strictness.js'
 import { capText, MAX_SUMMARY_CHARS } from './parseOutput.js'
 
 export interface FeedbackItem {
@@ -28,6 +29,22 @@ export interface FeedbackItem {
   role: string
   /** 出现在哪几轮,升序。 */
   rounds: number[]
+  /**
+   * 这条意见被提出时所处的**最严**那一档(跨轮取最严)。没设档位的记录不参与。
+   *
+   * 为什么必须有:档位可以在运行中调,而这一段历史会被原样铺进后续每一轮的提示词,
+   * 后面跟着一条**无条件的追责指令**(「若仍未回应,请指出缺了什么」)。降档之后,它会
+   * 逼着中级档的评审员把一条只在专家档下才算阻断的意见重新提成 blocking —— 降档等于
+   * 没降,而且是静默的。取**最严**而不是最后一次:要提醒的是「这条当初的门槛比现在高」。
+   */
+  strictness?: Strictness
+}
+
+/** 档位的严格度序。`undefined`(没设档)不参与比较 —— 见 `strictness.ts` 对它的说明。 */
+function stricterOf(a: Strictness | undefined, b: Strictness | undefined): Strictness | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  return STRICTNESS_LEVELS.indexOf(a) >= STRICTNESS_LEVELS.indexOf(b) ? a : b
 }
 
 /**
@@ -177,9 +194,15 @@ export function feedbackItems(log: readonly RoundtableRecord[]): FeedbackItem[] 
         if (at >= 0) {
           const hit = items[at]!
           if (!hit.rounds.includes(rec.round)) hit.rounds.push(rec.round)
+          // 同一条意见跨轮跨档时取**最严**的那一档,理由见 FeedbackItem.strictness。
+          const s = stricterOf(hit.strictness, rec.strictness)
+          if (s !== undefined) hit.strictness = s
           continue
         }
-        items.push({ text, role: v.role ?? 'main', rounds: [rec.round] })
+        items.push({
+          text, role: v.role ?? 'main', rounds: [rec.round],
+          ...(rec.strictness !== undefined ? { strictness: rec.strictness } : {}),
+        })
         prep.push(p)
       }
     }
@@ -306,6 +329,12 @@ export function reviewRepeatNotice(
    * 指令,模型要么忽略它(白花 token),要么真的去评方案(那一关就废了)。
    */
   subject = '方案',
+  /**
+   * 本轮的严格度。历史条目里档位与它**不同**的会被标注,并追加一段限定语。
+   *
+   * 省略 = 没设档位 = 与引入档位之前逐字相同的输出。
+   */
+  now?: Strictness,
 ): string {
   if (round <= 1 || items.length === 0) return ''
   const seen = items.filter(it => it.rounds.length > 0)
@@ -314,13 +343,41 @@ export function reviewRepeatNotice(
   // 5 席就是 5 份。
   const shown = seen.slice(0, MAX_FEEDBACK_ITEMS)
   const dropped = seen.length - shown.length
+  /**
+   * 只在与本轮**不同**时标 —— 相同就是噪声,而这一段是 per-seat 计费的。
+   *
+   * 两边都得有值才比:`undefined` 是「没设档位」,它和任何一档都不构成「跨档」——
+   * 那是引入本特性之前的全部历史,给它扣一顶「/undefined 档」的帽子只会让模型困惑。
+   */
+  const mark = (it: FeedbackItem): string =>
+    it.strictness !== undefined && now !== undefined && it.strictness !== now ? ` /${it.strictness}档` : ''
+  const crossed = shown.some(it => mark(it).length > 0)
   return capText([
     `本轮是第 ${round} 轮${label}。前几轮已经提出过下面这些意见` +
       (dropped > 0 ? `(只列 ${MAX_FEEDBACK_ITEMS} 条,另有 ${dropped} 条未列出)` : '') +
       '(按出现轮次标注):',
-    ...shown.map((it, i) => `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮) ${capText(it.text, MAX_ITEM_CHARS)}`),
+    ...shown.map((it, i) => `  ${i + 1}. [${it.role}] (第 ${it.rounds.join('、')} 轮${mark(it)}) ${capText(it.text, MAX_ITEM_CHARS)}`),
     `对其中每一条:若新${subject}已经回应了它,请指出是${subject}的哪一处回应的;若仍未回应,请指出`,
     `${subject}缺了什么。不要仅因为措辞眼熟就放行,也不要把同一条换个说法再提一遍。`,
+    /**
+     * 跨档限定语。
+     *
+     * 上面那句「若仍未回应,请指出缺了什么」是**无条件**的,所以降档之后它会逼着评审员
+     * 把一条只在更严档位下才算阻断的意见重新提成 blocking。这一段是对它的限定,不是
+     * 一条并列的新规则 —— 所以必须排在它**后面**。
+     *
+     * 升档方向一并覆盖:那一半同样需要说清,否则「档位提高了所以我这次要求更多」看起来
+     * 就是「换一个角度再挑一遍」,而后者正是上面那句话禁止的事。
+     */
+    ...(crossed
+      ? [
+        `上面标了档位的那几条,是在与本轮不同的严格度下提出的;本轮是**${now}**档。对它们:`,
+        `先按**本轮**判据重新掂量 —— 仍然落在本轮 blocking 范围内的,照旧要求${subject}回应;`,
+        `只有在更严的档位下才算阻断的,写进 comments 并注明「按本轮档位不阻断」。反过来,本轮`,
+        `档位更严时可以就同一处提出更高的要求,但要写明是因为档位提高了。`,
+        `**不要因为它出现过就沿用上一轮的结论,也不要因为降了档就当它没出现过。**`,
+      ]
+      : []),
   ].join('\n'), MAX_SUMMARY_CHARS)
 }
 

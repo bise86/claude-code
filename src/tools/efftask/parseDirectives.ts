@@ -1,6 +1,7 @@
 // src/tools/efftask/parseDirectives.ts
 import { clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, DEFAULT_PARALLELISM, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_ROLE_GUIDANCE, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
+import { isStrictness, STRICTNESS_LEVELS } from './strictness.js'
 import { extractJsonBlock } from './parseOutput.js'
 import { applyRoleDefsToPhases, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
 
@@ -10,7 +11,7 @@ export type ModelJsonFn = (prompt: string) => Promise<string>
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
   "skipSteps": ["要整个跳过的环节名"],
-  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化", "nodeTimeoutMs"?: number, "mergeResolveAttempts"?: number },
+  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化", "nodeTimeoutMs"?: number, "mergeResolveAttempts"?: number, "strictness"?: ${STRICTNESS_LEVELS.map(s => `"${s}"`).join('|')} },
   "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }],
   "phaseGuidance": { "环节名": "指令里点名给这个环节的那几句话" },
   "roleGuidance": [{ "name": "角色名或员工名", "text": "指令里点名给这个人的那几句话" }] }
@@ -23,6 +24,12 @@ caps.mergeResolveAttempts 是**一个节点的合并冲突最多让模型自动�
 caps.nodeTimeoutMs 是**一次调用最多可以多久没有任何输出**(毫秒)。用户说「阶段超时 20 分钟」「每步最多等半小时」「模型慢,超时给久一点」→ 换算成毫秒填这里(20 分钟 = 1200000)。他说的是「多久没动静算卡死」,不是「一个节点最多跑多久」—— 一直在吐字就永远不算超时。
 skipSteps:用户说「跳过X」「不做X」「X就不用了」时,把那个环节名放进来。没说就省略。
 caps.planConverge:分析环节多员工时怎么收敛 ——「各自出稿再融合」=圆桌,「一稿传下去改」=精化(默认)。
+caps.strictness 是**严格度档位** —— 质疑讨论/测试验证/验收/集成验收四关「多好才算够」的尺子。用户描述的是**标准高低**而不是次数或人数时填这里:
+- 「随便跑跑」「先能用就行」「demo 而已」「别太较真」→ 初级
+- 「正常标准」「按验收点来就行」→ 中级
+- 「严格一点」「要处理边界」「不能有回归」→ 高级
+- 「按最高标准」「生产级」「要考虑并发和失败恢复」「挑剔一点」→ 专家
+没提标准高低就**省略**(省略 = 保持现有行为:全票通过、判据由各评审员自己把握)。注意和另外两件事分开:说「多试几轮」是 maxIterations,说「几个人通过」是 quorum/quorumSeats,都不是这个字段。
 roles 是**任务角色**定义 —— 指令里凡是描述了「某个角色在哪个阶段、产出什么、起什么作用、由谁担当」的,抽到这里。
 角色名可以任意(架构师、安全、前端);step 必须是那几个之一 —— 用户说的中文环节名对应关系:${PHASE_NAMES.map(x => `${PHASE_LABEL[x]}=${x}`).join('、')};staff 填员工名,没说由谁担当就省略。
 phaseGuidance / roleGuidance 是**定向注入**:指令里凡是「某个环节该怎么做」「某个人要注意什么」的话,原文抄进去,它会被拼进那个环节/那一席的提示词。
@@ -290,6 +297,19 @@ export async function parseDirectives(
   // 只收这两个值,别的写法(roundtable/refine/乱写)一律回落默认的精化 —— 但**必须说出来**。
   // 静默回落是这里最坏的形态:用户说了「分析用 roundtable」,系统跑精化,关口在两种模式下
   // 逐字相同,notices 是空的,没有任何界面能让他发现自己要的模式没生效。
+  /**
+   * 严格度档位。和 planConverge 逐字同规矩:只收合法值,**回落必须说出来**。
+   *
+   * 静默回落在这里格外坏:用户说了「按最高标准做」,系统按现状跑(全票 + 判据空白),
+   * 而关口在两种情况下印的东西不一样但他不知道该找什么 —— 他会以为那句话生效了。
+   */
+  if (isStrictness(caps.strictness)) c.strictness = caps.strictness
+  else if (caps.strictness !== undefined) {
+    base.notices.push(
+      `严格度档位「${String(caps.strictness)}」不是 ${STRICTNESS_LEVELS.join('/')} 之一,` +
+      `本次不设档位(判据由各评审员自己把握、圆桌全票通过)`,
+    )
+  }
   if (caps.planConverge === '圆桌' || caps.planConverge === '精化') c.planConverge = caps.planConverge
   else if (caps.planConverge !== undefined) {
     base.notices.push(`分析环节的收敛方式(planConverge)「${String(caps.planConverge)}」不是 圆桌/精化 之一,本次按默认的顺序精化跑`)

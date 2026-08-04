@@ -518,7 +518,17 @@ describe('改回去要变红的四处', () => {
     // 隔离与否只有这一层看得见,而「跳过验收」能不能安全放行全靠它(见 RedoContext.isolated)。
     // 写死 false 的话,一个丢了工作区引用的节点会被允许跳过验收 —— 把一个空工作区合进
     // 集成分支并判「已验收」。
-    expect(SRC).toContain('{ isolated: poolRef.current !== undefined }')
+    // 不含外层花括号:`redoContextOf` 的第三个参数后来多了 `strictness`,于是这个对象
+    // 字面量变成了多行。钉整个字面量会让「往里加一个字段」变成一次假失败,而这条断言
+    // 真正要守的是**这个表达式**没有被写死成 false。
+    expect(SRC).toContain('isolated: poolRef.current !== undefined')
+    /**
+     * 重做关口要说出这一趟按哪一档跑。
+     *
+     * 少了它的场景很具体:用户降到初级 → 半成品被放行 → 在结束屏上按 r 重做 → 拿到的
+     * 是**又一次初级**,而屏幕上从头到尾没提过档位(它是 run 级持续状态,重做不清它)。
+     */
+    expect(SRC).toContain('strictness: control.strictness() ?? cfg.caps.strictness')
   })
 
   it('R / s / f 三个键真的接到了失败判据上,而且拿不到时**说原因**', () => {

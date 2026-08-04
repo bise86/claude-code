@@ -905,6 +905,7 @@ export function anchoredFrom(
 export type RunControlKey =
   | 'togglePause' | 'addDirective' | 'cancelNode'
   | 'raiseParallelism' | 'lowerParallelism'
+  | 'raiseStrictness' | 'lowerStrictness'
 
 export function runControlAction(input: string, key: { ctrl?: boolean; meta?: boolean }): RunControlKey | null {
   // 组合键归终端和 REPL,别抢。
@@ -922,6 +923,17 @@ export function runControlAction(input: string, key: { ctrl?: boolean; meta?: bo
   // 一个 `+++++++` 是常事 —— 那会把并发从 1 直接推到 8。
   if (k === '+' || k === '=') return 'raiseParallelism'
   if (k === '-' || k === '_') return 'lowerParallelism'
+  /**
+   * 严格度升/降一档。
+   *
+   * 和 `+`/`-` 同一条规矩:**一次一步,不按重复次数走**。终端把按住 300ms 合批成
+   * 一个 `>>>>>` 是常事,而档位每跳一级都会真的改变接下来每一场圆桌的判据。
+   *
+   * `,`/`.` 一并收:`<`/`>` 要按 Shift,而不同终端对 Shift 组合的上报并不一致 ——
+   * 只认带 Shift 的那个写法会让这个键在一部分终端上直接失灵。
+   */
+  if (k === '>' || k === '.') return 'raiseStrictness'
+  if (k === '<' || k === ',') return 'lowerStrictness'
   return null
 }
 

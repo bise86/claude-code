@@ -30,7 +30,11 @@ const cfg = (): EffTaskConfig => ({
   goalPrompt: '把登录接口打通',
   parallelism: 5,
   phaseRoles: emptyPhaseRoles(),
-  caps: DEFAULT_CAPS,
+  // **拷贝,不是引用。** `queueManifest` 里把运行中调过的档位同步回 `config.caps` 是全
+  // 仓库唯一一处原地改 caps;生产路径上 config.caps 一律是 `{...DEFAULT_CAPS}`,而这里
+  // 拿引用的话,任何一条给它 setStrictness 的用例都会把模块级常量写脏 —— 跨文件、静默、
+  // 只在测试顺序变化时才显形。今天还没有那样的用例,所以这一行是**在它出现之前**堵上。
+  caps: { ...DEFAULT_CAPS },
   notices: [],
 })
 

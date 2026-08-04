@@ -306,6 +306,15 @@ export function TaskTreePanel(props: {
      * 而表头和页脚会各说一个数。
      */
     onAdjustParallelism?: (d: number) => void
+    /**
+     * 调严格度,`d` 是方向(±1)。给了才有 `<` / `>` 两个键。
+     *
+     * 和 `onAdjustParallelism` 同规矩:面板**不持有那个值**,唯一真相在 RunControl 里,
+     * 屏幕上显示的是 `strictness` 现读出来的那一份。
+     */
+    onAdjustStrictness?: (d: number) => void
+    /** 当前生效的档位,`undefined` = 没设。只用于显示。 */
+    strictness?: string
   }
 }): React.ReactElement {
   // Tick once a second so elapsed times keep moving even when no node transitions —
@@ -433,6 +442,15 @@ export function TaskTreePanel(props: {
       }
       if (act === 'lowerParallelism' && props.runControl.onAdjustParallelism) {
         props.runControl.onAdjustParallelism(-1)
+        return
+      }
+      // 同上那条「没接就不吞掉」的规矩。
+      if (act === 'raiseStrictness' && props.runControl.onAdjustStrictness) {
+        props.runControl.onAdjustStrictness(1)
+        return
+      }
+      if (act === 'lowerStrictness' && props.runControl.onAdjustStrictness) {
+        props.runControl.onAdjustStrictness(-1)
         return
       }
     }
@@ -570,6 +588,13 @@ export function TaskTreePanel(props: {
         {props.pool && props.runControl?.onAdjustParallelism && columns >= HEADER_HINT_MIN_COLUMNS
           ? <Text dimColor>{' '}+/-</Text>
           : null}
+        {/* 严格度。**和并行度同一条规矩:键位提示紧挨着它要改的那个东西。**
+            没设档位时整段不画 —— 印一个「严格度 未设」会让一个从来没用过这个旋钮的用户
+            以为自己漏配了什么,而不设档正是默认且完全正常的形态。 */}
+        {props.runControl?.strictness
+          ? <Text dimColor>{'  '}严格度 {props.runControl.strictness}
+            {props.runControl.onAdjustStrictness && columns >= HEADER_HINT_MIN_COLUMNS ? ' </>' : ''}</Text>
+          : null}
         {props.serialExecute === true
           ? <Text color="warning">{'  '}执行串行(无隔离工作区)</Text>
           : null}
@@ -686,6 +711,7 @@ export function TaskTreePanel(props: {
              */
             : `Esc/q 退出${props.runControl
               ? ` · ${props.runControl.paused ? '⏸ 已暂停(p 恢复)' : 'p 暂停'} · i 追加指令 · x 取消选中任务`
+                + (props.runControl.onAdjustStrictness ? ' · <> 严格度' : '')
               : ''}${props.onRedo ? ' · r 重做' : ''}${failedKeysHint}`
               + ` · ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · ${detailEntryHint(mouse)}`
               + `    ${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定`}

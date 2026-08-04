@@ -13,6 +13,7 @@ import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, humanTimeoutRemedy, totalTimeoutRemedy, type BlockCategory } from './escalation.js'
 import { NodeCancelledError, PhaseTimeoutError, ProviderApiError, type TimeoutKind } from './runAgentAdapter.js'
 import type { RunControl } from './control.js'
+import { resolvedQuorum, reviewRubric, strictnessBlock, verifyRequirement, type Strictness } from './strictness.js'
 
 /** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
 export type NodeSlots = { release: () => void }
@@ -733,10 +734,35 @@ async function roundtableWithInfraRetry(args: {
   ctx: PipelineCtx
   /** Where the reviewers should read from — the node's worktree when it is isolated. */
   cwd?: string
+  /**
+   * 本轮的严格度快照,由调用点算一次传进来 —— **这一场圆桌从派发到合成到落盘,认的是
+   * 同一个值。**
+   *
+   * 少了这个参数会怎样(评审推演,复现路径完整):3 席验收、1 席 429 打不通。第一桌在专家
+   * 档下派出、按 `quorum=100` 合成为不通过。用户在第二桌重派那一席期间降到初级 —— 而这个
+   * 函数在**同一个 for 循环里读两次 caps**(派发时一次、合并后重新合成时一次),中间隔着
+   * N 次真实模型调用(分钟级)。于是第一桌那两条在专家档提示词下产生的裁决,被按初级的
+   * 门槛重新合成了:没有任何一个席位改变过意见,结论从不通过变成通过。而写进 acceptLog
+   * 的那条记录只能盖一个 `strictness` 戳 —— 盖哪个都是假的。
+   *
+   * 省略 = 现读(一次性调用和测试用)。
+   */
+  strictness?: Strictness
 }): Promise<{ rec: RoundtableRecord; infraExhausted: boolean }> {
   // At least one attempt regardless of a programmatically-supplied cap: zero attempts would
   // leave `rec` undefined and every caller dereferences it.
   const max = Math.max(1, args.ctx.config.caps.maxIterations)
+  /** 这一场认的那一档。取一次,派发/合成/盖戳三处共用。 */
+  const strict = args.strictness ?? effectiveStrictness(args.ctx)
+  /**
+   * 这一场的通过门槛。走 `resolvedQuorum`,所以用户显式写过 quorum/quorumSeats 时档位的
+   * 数值维度整个不参与 —— 理由见 `strictness.ts`:否则一个只写了 `quorumSeats=2` 的用户
+   * 选了最松的档反而会**变严**(`synthesizeVerdicts` 的 `seatsOnly` 分支被打破)。
+   */
+  const quorum = resolvedQuorum({ ...args.ctx.config.caps, strictness: strict })
+  const quorumSeats = args.ctx.config.caps.quorumSeats
+  /** 盖戳。不设档时**不加这个键**,这样 node.md 与引入本特性之前逐字相同。 */
+  const stamp = (r: RoundtableRecord): RoundtableRecord => strict === undefined ? r : { ...r, strictness: strict }
   let rec!: RoundtableRecord
   /**
    * 上一桌合并后的全量裁决。**只重派 infra 失败的那几席**,其余席位的裁决原样留着。
@@ -755,11 +781,11 @@ async function roundtableWithInfraRetry(args: {
     const tag = answerTag(ANSWER_TAGS.verdict)
     /** 这一桌派哪几席:首桌全派,之后只派上一桌 infra 失败的。 */
     const only = merged?.flatMap((v, i) => (v.infra === true ? [i] : []))
-    const fresh = await runRoundtable({
+    const raw = await runRoundtable({
       phase: args.phase, node: args.node, roles: args.roles, round: args.round,
       system: args.system, prompt: (seat: RoleBinding | null) => args.buildPrompt(tag, seat),
       runAgent: args.ctx.runAgent, signal: args.ctx.signal, answerTag: tag, cwd: args.cwd,
-      quorum: args.ctx.config.caps.quorum, quorumSeats: args.ctx.config.caps.quorumSeats,
+      quorum, quorumSeats,
       openStream: args.ctx.openStream,
       // 集成验收走的是 phase:'accept'(只有 system 不同),表头照 phase 写会把整个 run 的
       // 最终裁决标成「验收」,和 node.md 的验收记录、和关口对用户讲的两个不同环节全对不上。
@@ -767,6 +793,7 @@ async function roundtableWithInfraRetry(args: {
       slots: args.ctx.slots,
       ...(only ? { only } : {}),
     })
+    const fresh = stamp(raw)
     /**
      * **中止和取消排在合并之前判。**
      *
@@ -782,13 +809,17 @@ async function roundtableWithInfraRetry(args: {
       const next = [...merged]
       only.forEach((seat, k) => { next[seat] = fresh.verdicts[k]! })
       merged = next
-      rec = {
+      rec = stamp({
         round: fresh.round,
         verdicts: next,
         // 重新合成:法定人数是对**全量**席位算的,只拿这一桌重派的几席去算会得出
         // 完全不同的答案(极端情形:1 席重派通过 → 100% 赞成 → 整桌通过)。
-        synthesized: synthesizeVerdicts(next, args.ctx.config.caps.quorum, args.ctx.config.caps.quorumSeats),
-      }
+        //
+        // 用的是**循环外那个快照**,不是现读 —— 见 args.strictness 的注释:两处现读之间
+        // 隔着几分钟的模型调用,运行中改一次档就能让同一条记录的 verdicts 和 synthesized
+        // 出自两套规则。
+        synthesized: synthesizeVerdicts(next, quorum, quorumSeats),
+      })
     } else {
       merged = fresh.verdicts
       rec = fresh
@@ -969,6 +1000,8 @@ function ctxGoal(node: TaskNode): string { return node.goal }
 function reviewPrompt(
   node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>,
   tag: string, brief = '', notice = '', round = 1, maxRounds = 3,
+  /** 本轮的严格度快照。由调用点算一次,和 quorum、`RoundtableRecord.strictness` 同源。 */
+  strict: Strictness | undefined = effectiveStrictness(ctx),
 ): string {
   return brief +
     judgeGuidance(ctx) +
@@ -978,18 +1011,18 @@ function reviewPrompt(
     // 「第 N 轮不过整个任务就中止」不是吓唬,是事实(见 stepStart 的 cap-iteration 分支)。
     // 评审员不知道自己手上握着什么,就会按「还能更好」的标准打分。
     `第 ${maxRounds} 轮仍不通过,这个任务会被整个中止,一行代码都不会写。\n` +
-    `判据:\n` +
-    `- blocking 只填**会让执行失败、或让产出没法验收**的问题。\n` +
-    `- 方案不需要完美,只需要「能开始干、干完能按验收点验」。能达到这条就判通过。\n` +
-    `- 可以更好但不阻塞的,写进 comments,**不要**放进 blocking(放进去等同于否决)。\n` +
-    (round > 1
-      // 这一条是冲着实测来的:一次运行里三轮评审提了 **12 条互不相同**的要求
-      // (「缺少执行步骤」「缺少范围界定」「缺少输出物定义」……),全部只出现过一轮。
-      // 方案每轮都在按上一轮改,而评审每轮都换一批新要求 —— 这种组合下迭代上限
-      // 是必然会撞到的,和方案质量无关。
-      ? `- **不要提出上一轮没有提过的新要求**,除非那是这一版新引入的缺陷。\n` +
-        `  上一轮要求改的地方改了,就该判通过;换一个角度再挑一遍,这个任务就会被中止。\n`
-      : '') +
+    /**
+     * 判据本体**按档取值** —— 这几行原来是写死的,而写死的那三条本身就是中级档的内容。
+     *
+     * 为什么不能改成「在 seatPreamble 里追加一段」:`brief` 是提示词的**第一段**,而这里
+     * 是**最后一段**、紧挨输出 schema。追加的话专家档的抬头要隔着整份方案去压一句
+     * 「方案不需要完美…能达到这条就判通过」,而后者还带着「blocking 等同于否决」的代价
+     * 标签。三份独立评审各自推出同一个结论:四档在这一关会坍缩成一档,而且是现状那一档。
+     *
+     * `round > 1` 那条护栏也进了 `reviewRubric` —— 它是为一次实测事故加的(三轮提了 12 条
+     * 互不相同的要求,全部只出现过一轮),所以最严的那一档拿到的不是「不限」而是举证责任。
+     */
+    reviewRubric(strict, round) +
     `输出 json:{ "pass":boolean, "blocking":string[], "comments":string }。` +
     answerRule(tag)
 }
@@ -1045,6 +1078,8 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
  */
 function verifyPrompt(
   node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '', notice = '',
+  /** 本轮的严格度快照。理由同 reviewPrompt。 */
+  strict: Strictness | undefined = effectiveStrictness(ctx),
 ): string {
   return (
     brief +
@@ -1053,8 +1088,15 @@ function verifyPrompt(
     (notice ? notice + '\n' : '') +
     `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
     `执行者的自述(仅供参考,不能作为通过依据):${quote(node.execStatus) || '(没有报告任何产出)'}\n` +
-    `要求:跑测试/构建/复现步骤,把**实际执行的命令与原始输出**写进 comments;` +
-    `跑不起来、或没有可跑的验证手段,如实说明并判不通过。\n` +
+    /**
+     * 证据要求**按档取值**。这一行原来写死的是「没有可跑的验证手段,如实说明并判不通过」,
+     * 而初级/中级档要说的是同一个谓词的**反面** —— 追加注入会让 P 和 ¬P 出现在同一份
+     * 提示词里,而 ¬P 在后(紧挨 schema)。那个豁免一次都不会发生。
+     *
+     * 豁免一律带**留痕**义务(见 `strictness.ts` 的 NO_MEANS_NOTE):降档可以降标准,
+     * 不能降留痕 —— node.md 上必须永远读得出「这个节点是在没有验证的情况下通过的」。
+     */
+    verifyRequirement(strict) +
     `**不要修改代码** —— 你的职责是验证,不是修复。发现问题填进 blocking 交回执行者。\n` +
     `输出:{ "pass":boolean, "blocking":string[], "comments":"命令与原始输出" }。` +
     answerRule(tag)
@@ -1069,7 +1111,16 @@ function acceptPrompt(
     judgeGuidance(ctx) +
     `请验收执行结果是否达成验收点。\n` +
     (notice ? notice + '\n' : '') +
-    `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
+    /**
+     * 目标要**无条件**渲染 —— 原来它只出现在「验收点为空」的兜底分支里。
+     *
+     * 后果是高级/专家档在这一关唯一的区分性指令不可执行:「验收点本身有遗漏时可以指出」
+     * 和「按目标判,不只按验收点判」都需要知道目标是什么,而提示词里一个字都没有。地板
+     * 第 1 条(「报告的内容与目标无关」)在这一关同样悬空。集成验收那边一直是对的
+     * (它渲染「父目标」),这是把同一份东西补给叶子验收。
+     */
+    `目标:${quote(ctxGoal(node))}\n` +
+    `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据上面的目标判断)'}\n` +
     `执行状态:${quote(node.execStatus) || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
     `输出:{ "pass":boolean, "blocking":string[], "comments":string }。` +
     answerRule(tag)
@@ -1541,7 +1592,7 @@ function guidanceBlock(title: string, text: string | undefined): string {
  * onBlocked、openStream 各一次)。
  */
 export function seatPreamble(
-  ctx: { config: EffTaskConfig }, seat: RoleBinding | null, phase: PhaseName, node?: TaskNode,
+  ctx: { config: EffTaskConfig; control?: RunControl }, seat: RoleBinding | null, phase: PhaseName, node?: TaskNode,
   /**
    * 到哪个环节下面去找**这一席的角色简报** —— 默认就是 `phase`。
    *
@@ -1551,6 +1602,8 @@ export function seatPreamble(
    * 逐条核对验收点」,而借用了验收席位就收不到,那句话谁也读不到 —— 实测过。
    */
   briefPhase: PhaseName = phase,
+  /** 本轮的严格度快照。裁决类环节由调用点算一次传进来,和 quorum、记录上的戳同源。 */
+  strict: Strictness | undefined = effectiveStrictness(ctx),
 ): string {
   const out: string[] = []
   const brief = seatBrief(ctx, seat, briefPhase)
@@ -1626,11 +1679,39 @@ export function seatPreamble(
       out.push(guidanceBlock(label, node.guidance[p]))
     }
   }
+  /**
+   * 严格度那一段。**独立于 `out`,而且排在定向注入之前。**
+   *
+   * 两条都是评审拿具体后果换来的:
+   *
+   *  1. **不进 `out`** —— 下面那句 `targeted.length === 0` 的提前返回是 `JUDGE_NOTE` 的
+   *     唯一闸门。档位文本一旦进了 `targeted`,长度就恒 > 0,于是 `JUDGE_NOTE`(「用户补充
+   *     的约束优先于原方案的枝节…都不算未完成」)会对**每一个裁决席位无条件生效**,哪怕
+   *     用户一句定向注入都没写 —— 那时这句话本身就是假的,而它是全提示词里最强的一句
+   *     放行指令。反过来,把它拼在 `:return` 那一行的话,没有定向注入时(绝大多数运行的
+   *     常态)会走提前返回,档位**整个丢掉**,表现成「大部分时候不生效、偶尔生效」。
+   *  2. **排在定向注入之前** —— 档位是默认判据,用户点名说的话是特例。反过来排的话,
+   *     「初级:缺边界一律写 comments」和用户点名的「这里要特别小心并发边界」谁赢由模型
+   *     掷骰子。`strictnessBlock` 末尾那句「用户点名补充的约束优先于它」是这个位置关系
+   *     的自我声明。
+   */
   const targeted = out.filter(x => x.length > 0)
-  if (targeted.length === 0) return brief
+  const level = strictnessBlock(strict, phase, targeted.length > 0)
+  if (targeted.length === 0) return brief + level
   // 裁决席位多一句「以补充后的意图为准」。少了它,上面那段实测的死循环照旧发生 ——
   // 看得到不等于知道该拿它当什么。
-  return brief + targeted.join('') + (judging ? JUDGE_NOTE : '') + '\n'
+  return brief + level + targeted.join('') + (judging ? JUDGE_NOTE : '') + '\n'
+}
+
+/**
+ * 这一刻生效的严格度 —— 运行中调过的优先,没调过按关口批准的那一份。
+ *
+ * 和 `control.parallelism()` 逐字同规矩:真相在 `control` 里,`config.caps.strictness` 是
+ * 关口批准过的那份快照。原地改 `config.caps` 既不会触发重绘,也让「用户批准的是专家」
+ * 和「现在跑的是初级」这两件事再也分不开。
+ */
+export function effectiveStrictness(ctx: { config: EffTaskConfig; control?: RunControl }): Strictness | undefined {
+  return ctx.control?.strictness() ?? ctx.config.caps.strictness
 }
 
 /**
@@ -1740,10 +1821,14 @@ function stepOfRound(rec: RoundtableRecord): PhaseName | undefined {
  * 一轮算一次(调用点在圆桌之外),理由见 reviewPrompt 的 notice:席位是 per-seat 的,
  * 而 `feedbackItems` 是 O(n²) 的相似度比较(复测最坏输入 8~92 ms)。
  */
-function judgeNotice(node: TaskNode, step: PhaseName, round: number, label: string, subject: string): string {
+function judgeNotice(
+  node: TaskNode, step: PhaseName, round: number, label: string, subject: string,
+  /** 本轮的严格度。跨档的历史条目会被标注并附一段限定语,见 reviewRepeatNotice。 */
+  strict?: Strictness,
+): string {
   return reviewRepeatNotice(
     feedbackItems(node.acceptLog.filter(r => stepOfRound(r) === step)),
-    round, label, subject,
+    round, label, subject, strict,
   )
 }
 
@@ -1895,14 +1980,19 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
         : '质疑讨论环节已跳过:本节点的方案没有经过任何评审')
       consumeSkip(node, 'review')
     } else {
-    const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog), node.iteration.planReview + 1)
+    /**
+     * 这一场认哪一档。**取一次**,判据文本 / quorum / 记录上的戳三处共用 ——
+     * 理由见 `roundtableWithInfraRetry` 的 `strictness` 参数。
+     */
+    const strict = effectiveStrictness(ctx)
+    const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog), node.iteration.planReview + 1, '评审', '方案', strict)
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
       system: 'review',
       // 一轮算一次,不是一席算一次:reviewLog 在这一轮之内不变。
       buildPrompt: (tag, seat) =>
-        reviewPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'review', node), reviewNotice, node.iteration.planReview + 1, caps.maxIterations),
-      ctx,
+        reviewPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'review', node, 'review', strict), reviewNotice, node.iteration.planReview + 1, caps.maxIterations, strict),
+      ctx, strictness: strict,
     })
     node.reviewLog.push(rec)
     // runRoundtable resolves even when the run was cancelled mid-flight (it collects
@@ -2482,9 +2572,12 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
             consumeSkip(node, 'accept')
             return mergeAndRelease(node, ctx)
           }
+          // 圆桌之前求值一次,理由同别处:判据文本、quorum、记录上的戳必须同源。
+          const cs = effectiveStrictness(ctx)
           const { rec, infraExhausted } = await roundtableWithInfraRetry({
             phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
-            system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatPreamble(ctx, seat, 'accept', node)), ctx, cwd: node.worktree.path,
+            system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatPreamble(ctx, seat, 'accept', node, 'accept', cs)), ctx, cwd: node.worktree.path,
+            strictness: cs,
           })
           node.acceptLog.push(rec)
           if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return false }
@@ -2666,13 +2759,16 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       return
     }
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
+    // 圆桌之前求值一次,理由同别处。
+    const humanResolveStrict = effectiveStrictness(ctx)
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       // acceptLog.length + 1, like the other conflict path. iteration.acceptance is never
       // incremented on either, so using it here reproduced a round number already in the log:
       // 验收记录 rendered 第 2 轮 twice, once before and once after 第 3 轮 — and the card sends
       // the user to exactly that record.
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.acceptLog.length + 1,
-      system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatPreamble(ctx, seat, 'accept', node)), ctx, cwd: node.worktree.path,
+      system: 'accept', buildPrompt: (t, seat) => acceptPrompt(node, ctx, t, seatPreamble(ctx, seat, 'accept', node, 'accept', humanResolveStrict)), ctx, cwd: node.worktree.path,
+      strictness: humanResolveStrict,
     })
     node.acceptLog.push(rec)
     if (!infraExhausted && rec.synthesized.pass) {
@@ -2912,12 +3008,21 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // 与「它会不会改代码」毫无关系。
       const before = await verifySnapshot(node, ctx)
       // 这一关自己前几轮提过什么。**一轮算一次**(圆桌之外),见 judgeNotice。
-      const verifyNotice = judgeNotice(node, 'verify', node.iteration.acceptance + 1, '测试验证', '这一版产出')
+      /**
+       * 每一场圆桌**之前重新求值一次** —— 不是「下一次进入环节时」。
+       *
+       * `stepExecute` 是一次函数调用里的一个无界 `for(;;)`:执行 / 测试验证 / 验收 / 评分 /
+       * 返工全在这一个循环里。一个跑第 2 轮返工的节点**从来没有**「下一次进入验收环节」
+       * 那个时刻,它一直在环节里面。按入口快照的话,用户降档对这个节点永不生效 —— 而他
+       * 去调档的时刻,恰恰是看着这个节点第 3 轮还没过的时候。
+       */
+      const strict = effectiveStrictness(ctx)
+      const verifyNotice = judgeNotice(node, 'verify', node.iteration.acceptance + 1, '测试验证', '这一版产出', strict)
       const v = await roundtableWithInfraRetry({
         phase: 'verify', node, roles: node.phaseRoles.verify, round: node.iteration.acceptance + 1,
         system: 'verify',
-        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node), verifyNotice),
-        ctx, cwd: node.worktree?.path,
+        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node, 'verify', strict), verifyNotice, strict),
+        ctx, cwd: node.worktree?.path, strictness: strict,
       })
       node.acceptLog.push({ ...v.rec, step: 'verify' })
       const after = await verifySnapshot(node, ctx)
@@ -2998,10 +3103,13 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       return
     }
     if (!(await commit(node, 'ACCEPTANCE', ctx))) return
-    const acceptNotice = judgeNotice(node, 'accept', node.iteration.acceptance + 1, '验收', '这一版产出')
+    // 每一场圆桌之前重新求值一次,理由见测试验证那一处。
+    const acceptStrict = effectiveStrictness(ctx)
+    const acceptNotice = judgeNotice(node, 'accept', node.iteration.acceptance + 1, '验收', '这一版产出', acceptStrict)
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'accept', node, roles: node.phaseRoles.accept, round: node.iteration.acceptance + 1,
-      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'accept', node), acceptNotice), ctx, cwd: node.worktree?.path,
+      system: 'accept', buildPrompt: (tag, seat) => acceptPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'accept', node, 'accept', acceptStrict), acceptNotice), ctx, cwd: node.worktree?.path,
+      strictness: acceptStrict,
     })
     // 显式标上「验收」。历次未通过纪要按关口分组,而**老 node.md 里没有这个字段的记录
     // 谁的历史都不算**(见 stepOfRound:那种记录可能是叶子验收,也可能是集成验收,
@@ -3124,7 +3232,9 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       await commit(node, 'ACCEPTED', ctx)
       return
     }
-    const integrateNotice = judgeNotice(node, 'integrate', node.iteration.integration + 1, '集成验收', '子任务的结果')
+    // 每一场圆桌之前重新求值一次,理由见测试验证那一处。
+    const integrateStrict = effectiveStrictness(ctx)
+    const integrateNotice = judgeNotice(node, 'integrate', node.iteration.integration + 1, '集成验收', '子任务的结果', integrateStrict)
     const runIntegrate = async () => roundtableWithInfraRetry({
       // 集成提交(integrate)自己的席位。
       //
@@ -3135,8 +3245,8 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       round: node.iteration.integration + 1, system: 'integrate',
       // 见 phaseLabel 的注释:不显式给的话,整个 run 的最终裁决会被标成「验收」。
       phaseLabel: PHASE_LABEL.integrate,
-      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'integrate', node, integrateBriefPhase(node)), integrateNotice), // child evidence, NOT acceptPrompt
-      ctx,
+      buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'integrate', node, integrateBriefPhase(node), integrateStrict), integrateNotice), // child evidence, NOT acceptPrompt
+      ctx, strictness: integrateStrict,
       // The INTEGRATION worktree, not the user's tree. This roundtable accepts every
       // decompose node — including root, i.e. the run's final verdict — and under isolation
       // the user's checkout contains none of the run's work.

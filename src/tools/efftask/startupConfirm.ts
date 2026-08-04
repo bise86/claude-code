@@ -4,6 +4,7 @@ import { getProxyUrl } from '../../utils/proxy.js'
 import { formatContextWindow } from '../AgentTool/roles/roleContextWindow.js'
 import { stripControl } from './persistence.js'
 import { allowsMultipleSeats } from './roleDefs.js'
+import { quorumSeatsNeeded, STRICTNESS_QUORUM } from './strictness.js'
 import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from './types.js'
 
 export interface StartupDecision {
@@ -817,6 +818,40 @@ export function capsLine(config: EffTaskConfig): string {
   if (c.quorum !== undefined && c.quorum < 100) parts.push(`需 ${c.quorum}% 席位赞成`)
   if (c.quorumSeats !== undefined) parts.push(`需至少 ${c.quorumSeats} 席赞成`)
   const quorum = parts.length > 0 ? ` · 圆桌${parts.join('、')}` : ''
+  /**
+   * 严格度档位。**印的是这几关实际席位数下的绝对门槛,不是百分比。**
+   *
+   * 百分比会骗人,而且是算术事实不是措辞问题:`synthesizeVerdicts` 的判据是
+   * `approving * 100 >= need * judged.length`,于是 51% 在 1~2 席上、80% 在 1~4 席上都
+   * **与全票逐字节等价**。关口印「需 51% 席位赞成」而实际要 2/2,用户读到的是「一票反对
+   * 也能过」—— 直到节点被打回才发现。等价时必须自己说出来。
+   *
+   * 用户显式写过 quorum/quorumSeats 时档位的数值维度整个不参与(见 resolvedQuorum),
+   * 这一行也要照实说,否则关口在暗示一件没发生的事。
+   */
+  const strictness = (() => {
+    const s = c.strictness
+    if (s === undefined) return ''
+    const overridden = c.quorum !== undefined || c.quorumSeats !== undefined
+    if (overridden) return ` · 严格度 ${s}(判据;圆桌门槛按你指定的那个,档位不改它)`
+    const q = STRICTNESS_QUORUM[s]
+    /**
+     * **按关报,不取最大值。** 上一版取四关席位数的 `Math.max` 印一个数,而各关席位数
+     * 常常不同:review 5 席 / accept 3 席时印「4/5 席赞成即通过」,而 accept 关真实门槛
+     * 是 3/3 全票。那等于把「骗人」从百分比换成了最大席位数,而这一段代码存在的全部
+     * 理由就是不骗人。
+     *
+     * 只列**真的放宽了**的那几关;一关都没放宽时说整句「与全票同义」。
+     */
+    const per = (['review', 'verify', 'accept', 'integrate'] as const)
+      .map(p => ({ p, m: (config.phaseRoles?.[p] ?? []).length }))
+      .filter(x => x.m > 0)
+      .map(x => ({ ...x, need: quorumSeatsNeeded(q, x.m) }))
+    const relaxed = per.filter(x => x.need < x.m)
+    if (relaxed.length === 0) return ` · 严格度 ${s}(在本次席位数下与全票同义,不放宽任何东西)`
+    const rest = per.length > relaxed.length ? ',其余各关仍需全票' : ''
+    return ` · 严格度 ${s}(圆桌 ${relaxed.map(x => `${PHASE_LABEL[x.p]} ${x.need}/${x.m}`).join('、')} 席赞成即通过${rest})`
+  })()
   // 分析的收敛方式同时改变**形态**和**成本**,却在关口上一个字都没有:圆桌和精化两种
   // 配置下这一行此前逐字相同,只有成本数字差一点,而没有任何一句话解释那点差额是什么。
   // 判据和 quorum 一样 —— 改变行为的开关必须说出来,藏起来正是这个关口存在要防的失败。
@@ -860,7 +895,7 @@ export function capsLine(config: EffTaskConfig): string {
     : mr === 0
       ? ' · 合并冲突不自动解决(直接等人工)'
       : ` · 自动解冲突 ${mr} 次/节点`
-  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${quorum}${converge}${silence}${merge}`
+  return `安全阀: 深度${c.maxDepth} / 节点${c.maxNodes} / 迭代${c.maxIterations} · ${score}${strictness}${quorum}${converge}${silence}${merge}`
 }
 
 /**

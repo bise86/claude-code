@@ -346,7 +346,20 @@ function roundsBody(log: TaskNode['reviewLog']): string {
       const detail = manual
         ? r.verdicts.find(v => v.manual === true)?.comments ?? ''
         : r.synthesized.blockingSummary
-      return `第 ${r.round} 轮 ${head}${detail ? ': ' + detail : ''}`
+      /**
+       * 「哪一关」和「按哪一档判的」这两件事,`persistence.ts` 的 `roundtableBody` 都写进了
+       * node.md,而这里一个都没有 —— 上面那段注释自己定的规矩是「两边口径必须一致,否则
+       * 同一条记录在界面上和文件里读起来是两回事」。
+       *
+       * `step` 尤其要紧:验收记录这一节是**三关共用**的(测试验证/验收/集成验收),没有
+       * 标记时会出现两条「第 1 轮」而读不出哪条是谁。档位则是「第 1 轮按专家判不通过、
+       * 第 2 轮降到中级判通过」在界面上唯一读得出来的地方。
+       *
+       * 两者省略时都不画,老记录逐字不变。
+       */
+      const step = r.step && PHASE_LABEL[r.step] ? `[${PHASE_LABEL[r.step]}] ` : ''
+      const lv = r.strictness ? `(${r.strictness}档) ` : ''
+      return `${step}${lv}第 ${r.round} 轮 ${head}${detail ? ': ' + detail : ''}`
     })
     .join('\n')
 }

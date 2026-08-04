@@ -116,7 +116,17 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
     // 里会出现两条 `round 1`,而升级卡片写的正是「先看该节点的验收记录」。
     // 省略 step = 验收(老 node.md 的形状不变)。
     const step = r?.step && PHASE_LABEL[r.step] ? `[${PHASE_LABEL[r.step]}] ` : ''
-    const head = `- ${step}round ${stripControl(String(r?.round ?? '?'))}: ${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
+    /**
+     * 这一轮是按**哪一档**判的。
+     *
+     * 档位可以在运行中调,而 `RoundtableRecord.strictness` 承诺的是「『第 1 轮按专家判
+     * 不通过、第 2 轮降到中级判通过』这件事在盘上必须读得出来」。只写进 frontmatter 的话
+     * 那只做到了机器可读那一半 —— 而这个文件自己的规矩是「body 才是人读的那一半」。
+     *
+     * 省略 = 不设档,老 node.md 逐字节不变。
+     */
+    const lv = r?.strictness ? `(${stripControl(String(r.strictness))}档) ` : ''
+    const head = `- ${step}${lv}round ${stripControl(String(r?.round ?? '?'))}: ${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
     const roles = (r?.verdicts ?? []).map(v => {
       const detail = (v?.blocking ?? []).length > 0 ? (v.blocking ?? []).join('; ') : (v?.comments ?? '')
       /**

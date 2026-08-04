@@ -1,4 +1,5 @@
 import { MANUAL_PASS_ROLE, MAX_GUIDANCE_CHARS, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type NodeStatus, type PhaseName, type TaskNode } from './types.js'
+import type { Strictness } from './strictness.js'
 import { addUsage } from './usage.js'
 
 /**
@@ -152,6 +153,13 @@ export interface RedoContext {
    * 非隔离运行不存在这个问题:执行者直接写在用户的检出里,产出已经在那儿了。
    */
   isolated?: boolean
+  /**
+   * 这一刻生效的严格度档位(`control.strictness() ?? config.caps.strictness`)。
+   *
+   * 只用于关口上那一行 —— 重做**不改**档位,而这正是要说出来的那件事。
+   * 清理那一侧见 `reopenPropagatedNode`:档位是 run 级持续状态,**不在**一次性标记之列。
+   */
+  strictness?: Strictness
 }
 
 /**
@@ -220,9 +228,11 @@ export function phaseChainText(entry: RedoEntry, ctx?: RedoContext, node?: TaskN
 export function redoContextOf(
   node: TaskNode,
   cfg?: { skipSteps?: readonly PhaseName[] },
-  opts?: { isolated?: boolean },
+  opts?: { isolated?: boolean; strictness?: Strictness },
 ): RedoContext {
   return {
+    // 只有命令层看得到 `control`,所以和 isolated 一样由调用方传。
+    ...(opts?.strictness !== undefined ? { strictness: opts.strictness } : {}),
     seatCount: Object.fromEntries(
       PHASE_NAMES.map(p => [p, (node.phaseRoles?.[p] ?? []).length]),
     ) as Record<PhaseName, number>,
@@ -801,6 +811,11 @@ function reopenPropagatedNode(n: TaskNode, now: string): void {
    * 而被牵连的阻断走的是 `propagateBlocked`,**不经过** blockWithReason —— 于是这三个
    * 标记会原样活到下一次重开:一个带着 `redoFrom='review'` 被恢复到 CREATED 的节点会
    * 跳过分析,而屏幕上什么都没说。
+   *
+   * **严格度档位刻意不在此列** —— 这是上面那条规矩的**镜像**,值得单写一句给下一个照着
+   * 这三行改代码的人:档位是 run 级的**持续**状态(存在 `RunControl` 上,不是节点上),
+   * 顺手清掉它会让「用户降到初级 → 看着半成品被放行 → 按 r 重做」拿到又一次不设档的
+   * 结果。`control.clearAllForcePasses` 旁边有对称的一句。
    */
   n.skipPhase = undefined
   n.forcePass = undefined
@@ -1556,6 +1571,17 @@ export function redoSummary(
   // 照实说这次会跑哪些环节 —— 写死一句话的版本在默认配置下就是假的(测试验证是
   // opt-in,没配角色时根本不存在),而用户是按字面意思选的。
   lines.push(`「${target.title}」将重新走: ${phaseChainText(entry, ctx, target)}`)
+  /**
+   * 重做**按哪一档跑**。
+   *
+   * 少了这一行的场景是具体的:用户降到初级 → 半成品被放行 → 他在结束屏上按 `r` 重做 →
+   * 拿到的是**又一次初级**的结果,而屏幕上从头到尾没提过档位。档位是 run 级持续状态
+   * (`control` 不清它,`reopenPropagatedNode` 也不清),所以「重做会换个标准」是一个
+   * 完全错误但很自然的预期 —— 必须在按下确认之前说破。
+   */
+  if (ctx?.strictness !== undefined) {
+    lines.push(`按当前严格度「${ctx.strictness}」重跑(重做不改档位;要换标准先用 < > 调,再重做)`)
+  }
   /**
    * 节点自己会**退出终态**。
    *

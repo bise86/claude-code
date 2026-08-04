@@ -1,6 +1,7 @@
 // 纯类型导入,编译期擦除 —— roleDefs.ts 对本文件是值依赖(PHASE_NAMES/MAIN_STAFF),
 // 所以这条反向依赖必须是 `import type`,否则就成了真实的运行期循环。
 import type { RoleDef } from './roleDefs.js'
+import type { Strictness } from './strictness.js'
 import type { UsageTotals } from './usage.js'
 
 /**
@@ -235,6 +236,17 @@ export interface Verdict {
 }
 export interface RoundtableRecord {
   round: number; verdicts: Verdict[]; synthesized: { pass: boolean; blockingSummary: string }
+  /**
+   * 这一桌是按**哪一档严格度**判的。
+   *
+   * 必须记,而且必须**读得回来**:档位可以在运行中调,于是「第 1 轮按专家判不通过、
+   * 第 2 轮降到中级判通过」这件事在盘上必须读得出来。少了它,`reviewRepeatNotice` 会把
+   * 专家档提的意见原样铺进中级档那一轮的提示词,而那段话里「若仍未回应,请指出缺了
+   * 什么」是一条**无条件的追责指令** —— 降档等于没降,而且是静默的。
+   *
+   * 省略 = 没设档位(现状:全票 + 判据空白)。老 node.md 里全是这个形状。
+   */
+  strictness?: Strictness
   /**
    * 这一轮是**哪一关**开的。
    *
@@ -630,6 +642,22 @@ export interface Caps {
    * 行为写 1。
    */
   mergeResolveAttempts?: number
+  /**
+   * 严格度档位 —— 四个裁决环节「多好才算够」的那把尺子。见 `strictness.ts` 的文件头。
+   *
+   * **它是一个独立的枚举字段,数值在使用点派生,永不回写 `quorum` / `maxIterations`。**
+   * 这一条是评审拿两条真实后果换来的:
+   *
+   *  1. 回写之后,run.md 落的是数字,`--resume` 读回时「档位派生的 51」和「用户亲手写的
+   *     51」在盘上**逐字相同** —— 关口承诺的两行显示(`严格度 中级` + `你指定:quorum 80`)
+   *     在第一次恢复之后当场变成假的。
+   *  2. `maxIterations` 在 `Caps` 里是**必填**字段、`DEFAULT_CAPS` 恒给 3,所以「用户显式
+   *     写了 3」和「默认就是 3」根本区分不出来,「显式覆盖档位」这条规则在那一维上不可判定。
+   *
+   * 缺省 `undefined` = 现状 = 全票 + 判据空白。**不要给它一个具名默认档**:默认成高级会让
+   * 一个原本全票跑的旧 run 在恢复后变成 quorum 80(5 席下 4/5),也就是**恢复之后变松了**。
+   */
+  strictness?: Strictness
 }
 /** `caps.mergeResolveAttempts` 的合法区间。一份真相,parseDirectives / resumeCore 共用。 */
 export const MIN_MERGE_RESOLVE = 0

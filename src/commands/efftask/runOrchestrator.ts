@@ -124,6 +124,13 @@ export async function runOrchestrator(
      */
     const liveParallelism = args.control?.parallelism()
     if (liveParallelism !== undefined) args.config.parallelism = liveParallelism
+    /**
+     * 运行中调过的严格度同样要落进 run.md,理由与上面并发度**逐字相同** ——
+     * `--resume` 的档位是从 run.md 读回来的(readRunManifest → caps.strictness),不同步的话
+     * 「我把它降到初级」在下一次恢复时静默变回关口批准的那一档,而屏幕上从没说过这件事。
+     */
+    const liveStrictness = args.control?.strictness()
+    if (liveStrictness !== undefined) args.config.caps.strictness = liveStrictness
     manifestQueue = manifestQueue
       .then(() => writeRunManifest(args.fs, args.runDir, args.config, nodes, result))
       .catch(logError)

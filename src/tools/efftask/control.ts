@@ -1,5 +1,6 @@
 import { clampParallelism, DEFAULT_PARALLELISM, SKIPPABLE_PHASES } from './types.js'
 import type { PhaseName } from './types.js'
+import type { Strictness } from './strictness.js'
 
 /**
  * 运行中的人工干预面:**暂停**、**追加指令**、**取消单个节点**、**调并发度**、**预先批准**。
@@ -124,6 +125,28 @@ export interface RunControl {
    * 睡到下一次变更 —— 而下一次可能永远不来。
    */
   waitForParallelism(seen: number): Promise<void>
+
+  // ---- 严格度档位 ----
+  /**
+   * 用户在运行中调过的严格度;`undefined` = 没调过,按 `config.caps.strictness` 走。
+   *
+   * 和 `parallelism()` 逐字同理由:`config` 同时是 React state、是关口批准过的那份快照、
+   * 也是 `writeRunManifest` 每一帧要写的东西。原地改它既不触发重绘,也让「用户批准的是
+   * 专家」和「现在跑的是初级」这两件事再也分不开。
+   *
+   * **刻意没有代数,也没有 waitFor**,与 `setParallelism` 不同 —— 那套机制的用途是在调度
+   * 循环**睡眠中途**把它叫醒去多派几个节点。档位不改变任何节点的可派发性,它只改变下一次
+   * 构造提示词时读到的值,而提示词是在派发那一刻现算的。加代数只会每次改档白白唤醒调度
+   * 循环去重扫一棵没有变化的树。它的形状属于 `addDirective` / `forcePass` 那一类。
+   */
+  strictness(): Strictness | undefined
+  /**
+   * 调整严格度。**不打断在飞的调用**,生效单位是「下一场圆桌之前」。
+   *
+   * 不退还已经烧掉的迭代额度:退了就等于开一条绕过 `cap-iteration` 的路。已经因迭代
+   * 超限阻断的节点要按 `r` 重做才会按新档位重跑(`planRedo` 会重置对应的计数)。
+   */
+  setStrictness(s: Strictness | undefined): void
 }
 
 /** 一条追加指令的长度上限。整段提示词是要付钱的,而用户可能粘一整个文件进来。 */
@@ -145,6 +168,16 @@ export function createRunControl(): RunControl {
   /** 用户调过的并发上限,以及它改过几次。 */
   let parallelism: number | undefined
   let parallelismGen = 0
+  /**
+   * 运行中调过的严格度。
+   *
+   * **不进 `clearAllCancels` / `clearAllForcePasses` 那一批。** 那两个清的是**一次性标记**
+   * (取消、预先批准),而档位是 run 级的**持续状态**。redo 走 `applyRedo → startRun →
+   * runOrchestrator`,用的是同一个 RunControl,那两个 clear 就在那条路上 —— 顺手把档位
+   * 也清掉的话,用户降到初级、看着半成品被放行、按 `r` 重做,拿到的是又一次不设档的结果。
+   * 这个仓库为「一次性标记忘了清」付过三次学费;这一条是它的**镜像**,同样值得一行注释。
+   */
+  let strictness: Strictness | undefined
   /**
    * 「并发上限变了」这一个事件 —— **一个共享的 promise,不是一张等待者表**。
    *
@@ -273,6 +306,8 @@ export function createRunControl(): RunControl {
       limitChanged = deferred()
       prev.wake()
     },
+    strictness: () => strictness,
+    setStrictness(s) { strictness = s },
     parallelismGeneration: () => parallelismGen,
     waitForParallelism(seen) {
       // 已经变过了就立刻返回 —— 少了这一句,发生在「扫描之后、睡下之前」的那一次调整
