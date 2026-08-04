@@ -874,7 +874,18 @@ function quote(s: string): string {
   return s.replace(/`{3,}/g, m => '`​'.repeat(m.length))
 }
 
-export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = '', brief = ''): string {
+export function planPrompt(
+  node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = '', brief = '',
+  /**
+   * 返工时要不要说那句「未被质疑的部分原样保留」。**融合席位必须传 false。**
+   *
+   * `fusePrompt` 把整份 planPrompt 追加在自己后面,而它上面 6 行写的是「**不是选一份**,
+   * 是取各稿之长合成一份」。两条指令互斥,模型会挑一条而挑哪条不可控 —— 也就是这句话在
+   * 圆桌模式(`planConverge='圆桌'` 且多席)下的效果未定义。那条路上「保留」本来也无从谈起:
+   * 融合的输入是 N 份独立新稿,不是上一版。
+   */
+  keepUnchallenged = true,
+): string {
   const caps = ctx.config.caps
   const isolated = ctx.worktrees !== undefined
   return (
@@ -902,6 +913,29 @@ export function planPrompt(node: TaskNode, ctx: PlanPromptCtx, tag: string, feed
       // 作者手上就有一份标着「上一版方案」的旧答卷,而它和新问题一一对不上 —— 最省事的
       // 做法是照抄,于是新意见一条都没被回应,而 responses 看起来填得满满当当。
       ? `上一版方案(就是它需要被修订):\n${quote(JSON.stringify({ ...node.plan, alternatives: undefined, responses: undefined }))}\n上一轮评审阻断意见,请针对性修订:\n${quote(feedback)}\n`
+      : '') +
+    /**
+     * 收窄重写面 —— 这是「评审每轮换一批新意见」的另一半病因。
+     *
+     * 输出 schema 要的是**完整**四字段(下面 `四个字段都不许留空` 那句),而这里此前一个字
+     * 都没说过「没被质疑的部分别动」。于是作者每轮重出整份文档,评审员每轮拿到一份字面上
+     * 全新的方案 —— 任何「不要提上一轮没提过的新要求」的护栏都在和这件事对抗。
+     * 同一个仓库里 `rootPlan.ts` 补齐根方案时早就写着「请补齐这几处,**其余部分保留**」。
+     *
+     * **不承诺「评审员会拿两版逐段对照」。** 那句话在 `--retry-blocked` 那条路上当场为假:
+     * `reseat` 把 `planReview` 清零而不清 `reviewLog`,于是 feedback 非空(这一段渲染了)
+     * 而 round 回到 1(`prevPlanSection` 不渲染)。给作者的提示词里说假话,和这个仓库反复
+     * 在修的是同一类。
+     *
+     * 逃生条款是必需的:第 1 轮的意见完全可能是「这个不该拆,直接做」或「按文件边界重切」,
+     * 那时必要的动作恰恰是把 solution 整段重写,而下面 `:950-953` 的 kind/children 规格和
+     * 拆分指引都是**无条件**渲染、排在这一段后面的。少了这一句,两边打架而后者赢。
+     */
+    (feedback && keepUnchallenged
+      ? `修订时,上一版里**没有被质疑到的部分尽量原样保留**(未被意见触及的段落照抄,` +
+        `不要重写措辞、不要为了换个说法而调整结构)—— 改动面越小,这一轮越容易收敛。\n` +
+        `但若某条意见要求的是**改变做法本身**(例如从拆分改为直接执行、重切子任务边界),` +
+        `那一段就算被质疑到了,该怎么改怎么改。\n`
       : '') +
     // spec §16 names worktree merge conflict as the run's BIGGEST risk, and names exactly one
     // mitigation for it: 「鼓励 plan 阶段以依赖边串联可能冲突的节点」. That instruction reached
@@ -998,6 +1032,159 @@ function graftTargets(node: TaskNode, ctx: PipelineCtx): string {
 // otherwise the goal drifts every time the plan is re-emitted during review iterations.
 function ctxGoal(node: TaskNode): string { return node.goal }
 
+/** 方案的四个正文字段。prevPlan 只比这四个 —— alternatives/responses 在存进去时就剥掉了。 */
+const PLAN_FIELDS = ['solution', 'keyPoints', 'risks', 'acceptance'] as const
+const PLAN_FIELD_LABEL: Record<(typeof PLAN_FIELDS)[number], string> = {
+  solution: '完整方案', keyPoints: '重点', risks: '风险点', acceptance: '验收点',
+}
+
+/**
+ * 「上一版方案」那一段 —— 让 `repeatRule` 的 `除非那是这一版新引入的缺陷` 第一次变成**可判定**的。
+ *
+ * ## 门是结构性的,不借 `notice` 的判据
+ *
+ * 判据是「本轮方案**到底重出过没有**」,而它只能由 `prevPlan !== plan` 来回答。用 `notice`
+ * 非空当门是错的,两个方向都不蕴含:
+ *
+ *  - **notice 非空、方案没重出**:跳过分析那一支(`isSkipped(ctx,'plan')`)每轮都判、不消费,
+ *    `node.plan` 永不变而 reviewLog 照样累积;「从质疑讨论重做 → 不通过 → 按 s 跳过 → Esc →
+ *    resume」那条路还会留下一份**落后两代**的 prevPlan。渲染出来是一份空 diff,而提示词正
+ *    指着它要「新引入的缺陷」—— 那是在请评审员随便写点什么。
+ *  - **方案重出了、notice 为空**:`pass:false` 但 `blocking` 为空(只写 comments)是真实形态
+ *    (`synthesizeVerdicts` 专门处理过),此时 `feedbackItems` 收不到东西 → notice 恒空 →
+ *    本段整个静默失效,而那恰恰是最需要收敛的一类运行。
+ *
+ * ## 字段级 diff 在**代码里**算,不让模型去推断
+ *
+ * 三个好处,都是拿评审意见换来的:
+ *  1. 未改动的字段一个字都不渲染 —— 这一段是 per-seat 的,N 席付 N 份;
+ *  2. 「哪些没变」从模型的判断变成代码算出的**事实**,不需要提示词去断言一件可能为假的事;
+ *  3. **不必截断**。给 prevPlan 上字符预算是错的:`node.plan` 那边渲染时不夹
+ *     (`JSON.stringify` 全文),上一轮评审员看到的就是未夹全文;这边一夹,「上一版」就和
+ *     真正被判过的不是同一份,而下面还写着「未变动的段落上一轮已经判过」。体积控在源头
+ *     (`MAX_FIELD_CHARS`),不在这里二次夹。
+ *
+ * ## 措辞:举证责任,不是豁免;加法,不是排他
+ *
+ * 两条都是评审拿具体后果换来的:
+ *
+ *  - **不写「本轮只判两件事」。** 那是排他句式,而 `REVIEW_FLOOR`(「三条一律不放行」)在
+ *    提示词第一段、这里在几千字之后 —— 正是 `strictness.ts` 反复警告的「P 和 ¬P 同在且 ¬P
+ *    在后」,那个坑这个仓库已经踩过两次。更糟的是紧跟地板的 `YIELD_NOTE` 说「以上是本轮的
+ *    **默认**判据」,等于亲手给后面的覆盖发许可证。改成「务必**判到**」,想要的效果一个字
+ *    不损失,却不与地板和任何一档判据互斥。
+ *  - **不写「未变动的段落上一轮已经判过,不要重新挑」。** 那句话既下了结论又给了行动指令,
+ *    而它的前提在四种真实情形下为假:infra 失败的席位根本没判过、第 2 轮可能坐进一个没看过
+ *    第 1 轮的新席位、运行中可以升档、以及 `REVIEW_FLOOR` 第 3 条本身就是「评审员会不读就
+ *    盖章」的反证。它和 `planPrompt` 那句「未被质疑的部分原样保留」复合起来更是一台洗白机:
+ *    第 1 轮没被认真看的缺陷从第 2 轮起永久免疫。所以这里给的是**举证责任** —— 和专家档
+ *    `repeatRule` 同形(那一档就是这么写的),于是四档共用一份、一处都不用分叉,顺带覆盖
+ *    升档方向而不依赖 `reviewRepeatNotice` 里 `crossed` 那道条件门。
+ */
+function prevPlanSection(node: TaskNode, round: number, notice: string): string {
+  const prev = node.prevPlan
+  /**
+   * 这一行的三个判据里有两个是**纵深防御**,变异测试证明过:单独去掉 `round <= 1` 或
+   * `Array.isArray(prev)`,2138 条用例一条都不红 —— 它们各自被下面更强的那道门吸收了。
+   *
+   *  - `round <= 1`:`prevPlanRound` 恒 ≥ 1(它是 `planReview + 1`),所以 round=1 时下面那个
+   *    等式要求 `prevPlanRound === 0`,恒不成立。
+   *  - `Array.isArray(prev)`:`typeof [] === 'object'`,数组能穿过这里,但它取四个字段全是
+   *    `undefined` → 全被 `str()` 兜成空串 → 被 `usable` 那道门挡下。
+   *
+   * **保留**:两条都是 O(1) 的早退,而它们各自要挡的东西(轮次错位、盘上的数组)本来就该在
+   * 入口处说清楚。写下来是为了让下一个跑变异测试的人知道这两发存活不是探针假,是冗余。
+   */
+  if (round <= 1 || !prev || typeof prev !== 'object' || Array.isArray(prev)) return ''
+  /**
+   * 这一版是不是**紧邻的上一轮**判过的。
+   *
+   * `round` 由 `iteration.planReview + 1` 算出,而 prevPlan 的写入原本和这个计数器没有任何
+   * 绑定。三处会把计数器归零而不动 prevPlan(`redo.ts` 的任务重做与从质疑讨论重做、
+   * `reseat.ts` 的 `--retry-blocked`),于是**上一次运行**的方案会被当成本次上一轮的对照物
+   * 铺进每一席的提示词,标题还写着「上一轮评审看到的就是它」。
+   *
+   * 逐点补 `delete n.prevPlan` 是三行,但它要求后人每新增一处清 `planReview` 的代码都记得
+   * 跟上。绑定轮次号则不依赖任何调用点:计数器一归零,这个等式当场为假。人工强制通过占掉
+   * 一个 round 号的情形也被它顺带盖住 —— 那一轮没有评审员坐下,自然没有写入。
+   */
+  if (node.prevPlanRound !== round - 1) return ''
+  // 只比四个正文字段。`typeof` 兜底:node.md 手工可编辑,而 validateLoadedNodes 之外还有
+  // 直接读盘的路径 —— 一个非字符串字段在这里当成空串比较,不抛。
+  const str = (p: NodePlan | undefined, k: (typeof PLAN_FIELDS)[number]): string =>
+    typeof p?.[k] === 'string' ? p[k] : ''
+  const changed = PLAN_FIELDS.filter(k => str(prev, k) !== str(node.plan, k))
+  // 逐字未变 = 方案这一轮压根没重出(跳过分析、从质疑讨论重做、复用已确认草稿)。
+  // 那时渲染出来是一份空 diff,而下面要问「改跑偏了没有」—— 不如整段不说话。
+  if (changed.length === 0) return ''
+  /**
+   * **上一版那一侧为空的字段,不构成对照物。**
+   *
+   * 验收实测出的形态:盘上手写一个 `prevPlan: {}`,`validateLoadedNodes` 的逐字段兜底会把它
+   * 补成四个空串(它确实没走 `emptyPlan()`,但结果逐字相同),于是四个字段全被判成「改动过」、
+   * 「逐字未变」那一行整个不出现,评审员收到的是「上一版是空白的,请找出这一版新引入的缺陷」
+   * —— **整份方案都成了新引入,重复率被推到 100%**,方向和这个特性要治的病正相反。
+   *
+   * 判据落在「有没有可对照的原文」上,而不是「上一版存不存在」:一个字都拿不出来时,诚实的
+   * 做法是不说话,而不是渲染一份 `{"solution":""}` 冒充原文。
+   */
+  const usable = changed.filter(k => str(prev, k) !== '')
+  if (usable.length === 0) return ''
+  const same = PLAN_FIELDS.filter(k => !changed.includes(k))
+  return (
+    `上一轮评审看到的是**上一版**方案,它和这一版的差别如下。\n` +
+    (same.length > 0
+      ? `逐字未变的字段:${same.map(k => PLAN_FIELD_LABEL[k]).join('、')}(不再重复渲染)。\n`
+      : '') +
+    `改动过的字段,上一版原文:\n` +
+    // quote(JSON.stringify(...)) —— 和渲染 node.plan 那一处同款。JSON.stringify 不转义反引号,
+    // 一份方案正文里埋一个 ``` 就能提前关掉本次的答案围栏。**这是第二把锁,不是唯一那把**:
+    // 验收实测确认 `parseVerdict` 本身 fail-closed 且认的是本次随机标签,埋进去的 ```verdict
+    // 对不上 ```verdictxxxx,两边都判「未按要求输出裁决块」。两把锁都要,但别把功劳记错。
+    // **整份 stringify,不解引用 prev.solution** —— 盘上一个 `prevPlan: 'boom'` 才不会
+    // 在评审这一刻抛(hostileDisk 的恢复链路里没有 reviewPrompt,它兜不住这个)。
+    `${quote(JSON.stringify(Object.fromEntries(usable.map(k => [k, str(prev, k)]))))}\n` +
+    `本轮**务必判到**:\n` +
+    /**
+     * 第一条**单独按 `notice` 门控**,而不是跟着结构门走。
+     *
+     * 结构门是刻意和 `notice` 解耦的(理由见上),而这句话的所指恰恰是 `notice` 里那份编号
+     * 清单。`pass:false` 且 `blocking` 为空(只写 comments)是真实形态,那时 notice 缺席、
+     * responses 提示也被同一道门挡掉,于是这句「上面列出的那几条意见」上方一条意见都没有 ——
+     * 验收把提示词打出来才看见。排序治不了一个根本不存在的所指。
+     */
+    (notice ? `- 上面列出的那几条意见,这一版有没有真的回应;\n` : '') +
+    /**
+     * 第二条**挂在本轮判据上**,不是无限定的「有没有引入新的问题」。
+     *
+     * 原来那句是祈使句形式的新挑刺维度,靶心正是作者刚按意见改过的地方,而判据(高级档
+     * 「可预见的边界/错误路径没交代就挡」)会照单全收 —— 一次重写的 solution 必然提供新的
+     * 可挑面。**专家档下方向是反的**:那一档 `repeatRule` 本来就允许提新要求,印出来的 diff
+     * 于是从闸门变成弹药(「这是这一版新引入的」从说不出口变成有原文佐证)。挂到判据上之后,
+     * 够不够 blocking 由本轮档位说了算,而不是由「它变过」说了算。
+     */
+    `- 改动过的地方有没有把上一轮的意见改跑偏;改动带来的新问题按本轮判据够不够 blocking,\n` +
+    `  不够就写进 comments。\n`
+    /**
+     * **这里原来还有第三句**(「对没有改动的部分:该挡的照挡,但每提一条都要写明为什么上一轮
+     * 没被提出来」),验收把它否掉了,理由值得留下:
+     *
+     * 它和 `repeatRule` 非专家分支的**例外集合不相交**。那一支说「不要提上一轮没提过的新要求,
+     * 除非那是**这一版新引入的缺陷**」——没改动的字段按定义承载不了「新引入」,所以那里给的
+     * 例外是空集,即「不许提」;而这一句说「可以提,写明理由即可」,给的还是 `repeatRule` 在
+     * 这一档**不接受**的理由(「上一轮漏看的」)。P 与 ¬P 同在,而 ¬P 在前。
+     *
+     * 当初写它的论证是「和专家档 `repeatRule` 同形,于是四档共用一份、一处都不用分叉」——
+     * 那正是病因:重复策略本来就是分档的(`strictness.ts` 里集成验收那一支单独写了「除非那是
+     * 上一轮漏看的」就是证据),把专家档那份无条件发给四档,等于在三档上把闸门拆掉。
+     *
+     * 删掉不亏:专家档的 `repeatRule` 逐字就是同一套举证责任,非专家档回到它本来该有的
+     * 「不许提」。而上一轮提示词评审要防的「免死金牌」也不会回来 —— 那条禁的是**断言一件
+     * 可能为假的事**(「上一轮已经判过」),不说话不构成断言。
+     */
+  )
+}
+
 /**
  * 评审提示词。
  *
@@ -1053,6 +1240,9 @@ function reviewPrompt(
         `它说在某处解决了,就去方案里找那一处;找不到、或找到的东西答非所问,` +
         `照旧填进 blocking 并写明是哪一条对不上。作者说了不等于做了。\n`
       : '') +
+    // 上一版方案。**排在 notice 之后**:下面那句「上面列出的那几条意见」指的就是 notice,
+    // 排在它前面的话这个指代落在空气上。见 prevPlanSection。
+    prevPlanSection(node, round, notice) +
     `这是第 ${round}/${maxRounds} 轮评审。` +
     // 「第 N 轮不过整个任务就中止」不是吓唬,是事实(见 stepStart 的 cap-iteration 分支)。
     // 评审员不知道自己手上握着什么,就会按「还能更好」的标准打分。
@@ -1695,7 +1885,9 @@ function fusePrompt(
     `- **不是选一份**,是取各稿之长合成一份;某一稿的哪个点更好,就吸收哪个点。\n` +
     `- 在 keyPoints 里写清楚你吸收了哪几稿的哪些点、放弃了什么以及为什么。\n` +
     `- 子任务拆分同样要合成一份 —— 不是几份的并集,而是去重、补漏之后的那一份。\n` +
-    planPrompt(node, ctx, tag, feedback)
+    // keepUnchallenged=false:「原样保留」和上面那句「不是选一份,是取各稿之长合成一份」
+    // 互斥,见 planPrompt 那个参数。
+    planPrompt(node, ctx, tag, feedback, '', false)
   )
 }
 
@@ -2247,6 +2439,42 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // Nobody judged the plan — say that rather than blaming the plan.
       await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec), exhaustionRemedyFor(rec))
       return
+    }
+    /**
+     * 这一版**刚刚真的被判过** —— 记下来,给下一轮的评审员当对照物(见 `TaskNode.prevPlan`)。
+     *
+     * ## 位置:在两道守卫**之下**,而不是紧跟 `push`
+     *
+     * 第一版钉在 `push(rec)` 之后就收手,理由是「那一行才是这一版被判过的定义点」。**那个
+     * 理由只对了一半,而验收把另一半打出来了**:`push` 无条件执行,紧接着的 abort / infra
+     * 两道守卫才是「到底有没有人判」的判据 —— 下面那行既有注释逐字写着 "Nobody judged the
+     * plan"。写在守卫上面,等于把「评审角色连续三次调用失败」和「Esc 打在圆桌飞行中」这两种
+     * **一个裁决都没有**的情形,记成了「上一轮评审看到的就是它」。实测三条路径全部复现:
+     * 恢复之后 v1→v2 那批没人看过的改动被归进「逐字未变 = 上一轮已经判过」,方向朝着放行。
+     * 那正是这个字段的注释里写的「把架空护栏换成伪造护栏」。
+     *
+     * ## `some(v => v.infra !== true)` 不能省,挪位置不够
+     *
+     * 两道守卫都漏:**部分** infra(3 席里 1 席打不通)时 `infraExhausted` 为 false,而剩下
+     * 两席真判过 —— 那一版该记;反过来全 infra 且被 abort 早退时 `infraExhausted` 也是 false。
+     * 判据只能落在「这一桌到底有没有一席真的做出过判断」上,而那正是 `feedbackItems` 用来
+     * 滤掉 infra 的同一条判据。
+     *
+     * ## 轮次号一起记
+     *
+     * 见 `prevPlanSection` 里 `prevPlanRound` 那一段:光有方案而不绑轮次,`--retry-blocked`
+     * 和两种重做把 `planReview` 归零之后,上一次运行的方案会冒充本次的上一轮。
+     *
+     * ## 展开是 load-bearing
+     *
+     * 别「简化」成 `node.prevPlan = node.plan`:同引用会让 yamlStringify 输出锚点/别名
+     * (`plan: &a1` / `prevPlan: *a1`),读回来两者是同一个对象,于是上面那句
+     * `delete node.plan.responses` 会把 prevPlan 的一起删掉。
+     * 剥 alternatives / responses 的理由见 planPrompt 里同款的那一处。
+     */
+    if (rec.verdicts.some(v => v.infra !== true)) {
+      node.prevPlan = { ...node.plan, alternatives: undefined, responses: undefined }
+      node.prevPlanRound = node.iteration.planReview + 1
     }
     if (!rec.synthesized.pass) {
       node.iteration.planReview++

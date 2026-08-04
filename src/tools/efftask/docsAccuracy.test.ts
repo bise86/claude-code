@@ -1237,3 +1237,63 @@ describe('README 的用量口径和代码对得上', () => {
     expect(README).toContain(norm('`≈` 表示这个数是估出来的'))
   })
 })
+
+describe('README 说评审员看得见版本差异,代码里就得真的有那一段', () => {
+  it('版本对照这一段接上了,而且门是「方案变没变」不是「有没有旧账」', () => {
+    expect(README).toContain(norm('**三、评审员看得见「这一版和上一版差在哪」。**'))
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    // 段落本体存在,并且真的被 reviewPrompt 调用 —— 只声明不接线是这个仓库的老毛病。
+    expect(src).toContain('function prevPlanSection')
+    expect(src).toContain('prevPlanSection(node, round, notice)')
+    // 写入点钉在**两道守卫之下**,且判据是「这一桌真有一席做出过判断」。
+    // 锚在 `node.plan = parsed.plan` 之前的话,一次 Esc→resume 就能让一版没人看过的方案被
+    // 下一轮标成「上一轮评审看到的就是它」;只挪到 `push(rec)` 之后仍然漏掉「圆桌开完了但
+    // 一个裁决都没有」(infra 耗尽 / Esc 打在飞行中)—— 那两支的守卫在 push 下面。
+    const iGuard = src.indexOf('if (infraExhausted)')
+    const iWrite = src.indexOf('node.prevPlan = { ...node.plan')
+    const iJudged = src.indexOf('rec.verdicts.some(v => v.infra !== true)')
+    expect(iGuard).toBeGreaterThan(0)
+    expect(iWrite).toBeGreaterThan(iGuard)   // 守卫在前,写入在后
+    expect(iJudged).toBeGreaterThan(iGuard)
+    expect(iJudged).toBeLessThan(iWrite)     // 判据管着这次写入
+    // 方案和轮次戳是一对,缺一不可 —— 见 TaskNode.prevPlanRound。
+    expect(src).toContain('node.prevPlanRound = node.iteration.planReview + 1')
+    expect(src).toContain('node.prevPlanRound !== round - 1')
+    // 展开而不是同引用:同引用会写出 yaml 别名,delete node.plan.responses 会连带删掉上一版。
+    expect(src).not.toContain('node.prevPlan = node.plan\n')
+    // README 说差异是代码算的、未变字段不重复渲染。
+    expect(README).toContain(norm('差异是**代码算出来的**，不是让模型去推断'))
+    expect(src).toContain('const changed = PLAN_FIELDS.filter')
+    expect(src).toContain('逐字未变的字段')
+    // README 说方案没重出时整段不出现 —— 结构门,不借 notice。
+    expect(README).toContain(norm('**没有真正被评审员判过的那一版，绝不会被拿来当对照物。**'))
+    expect(src).toContain('if (changed.length === 0) return ')
+  })
+
+  it('措辞是加法+举证责任,不是排他+豁免', () => {
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    // 排他句式会压掉排在提示词第一段的 REVIEW_FLOOR(「P 和 ¬P 同在且 ¬P 在后」,已踩过两次),
+    // 而紧跟地板的 YIELD_NOTE 还说「以上是**默认**判据」,等于给覆盖发许可证。
+    expect(src).toContain('本轮**务必判到**')
+    expect(src).not.toContain('本轮只判这两件事')
+    // 「提示词里不出现豁免/越权举证责任」这几条否定断言钉在**构建出来的提示词**上
+    // (见 pipeline.test.ts「不排他、不发免死金牌、也不越过 repeatRule 发举证责任」),
+    // 不在这里扫源码 —— 那样会扫到解释为什么不这么写的注释本身。
+    // 这里只钉第二条 bullet 挂在本轮判据上,而不是无限定的「有没有引入新的问题」。
+    expect(src).toContain('按本轮判据够不够 blocking')
+    expect(README).toContain(norm('够不够 blocking 由本轮档位说了算'))
+  })
+
+  it('作者那一侧的「原样保留」在,而融合席不收到它', () => {
+    expect(README).toContain(norm('返工时会要求**未被质疑到的部分原样保留**'))
+    const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+    expect(src).toContain('没有被质疑到的部分尽量原样保留')
+    // 逃生条款:第 1 轮的意见可能正是「这个不该拆」,那时必要的动作就是整段重写。
+    expect(src).toContain('改变做法本身')
+    expect(README).toContain(norm('若某条意见要求的是改变做法本身'))
+    // fusePrompt 追加整份 planPrompt,而它上面写着「不是选一份,是取各稿之长合成一份」。
+    // 两条互斥,所以融合那一路必须显式关掉。
+    expect(src).toContain('planPrompt(node, ctx, tag, feedback, \'\', false)')
+    expect(src).toContain('keepUnchallenged = true')
+  })
+})

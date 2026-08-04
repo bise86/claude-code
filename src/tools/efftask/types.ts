@@ -295,6 +295,64 @@ export interface TaskNode {
   status: NodeStatus
   phaseRoles: Record<PhaseName, RoleBinding[]>
   plan: NodePlan
+  /**
+   * **上一轮质疑讨论真正判过的那一版方案。**
+   *
+   * ## 它治的是什么
+   *
+   * 评审员判的是一份**每轮被整份替换**的文档(`pipeline.ts` 的 `node.plan = parsed.plan`),
+   * 而它**看不到上一版** —— `reviewPrompt` 此前只渲染 `node.plan`。偏偏 `repeatRule`
+   * (`strictness.ts`)对非专家档说的是「不要提上一轮没提过的新要求,**除非那是这一版新引入
+   * 的缺陷**」。那个 `除非` 分支要求的判断,评审员**结构上做不出来** —— 手上只有一版。
+   * 于是出口恒开,而且它并不是在撒谎。用户量到的是「三轮 4 条意见,全部只被提过一轮」:
+   * 三轮评的根本不是同一份文档,所以没有东西可重复。
+   *
+   * `reviewConvergence.ts` 的文件头和 `reviewPrompt` 的注释都把「没有上一版方案」列为病因,
+   * 后来补上的是 reviewLog 和轮次号,**这一条从来没补**。
+   *
+   * ## 为什么写在「圆桌真的判出了东西之后」,而不是「方案被覆盖之前」
+   *
+   * 这两个时刻在代码里**不是同一个**:方案在 `commit(node,'PLAN_REVIEW')` 就落盘了,圆桌在
+   * 那之后才开。按「覆盖前」写的话,一次普通的 Esc → `--resume` 就能让这个字段说谎:v2 出好
+   * 落盘、圆桌在飞时中断、恢复后出 v3 → prevPlan=v2,而 **v1→v2 那批改动一个评审员都没看过**,
+   * 却会被提示词标上「上一轮评审看到的就是它」。那是把「架空护栏」换成「伪造护栏」,方向还
+   * 朝着放行。
+   *
+   * **但只挪到 `reviewLog.push(rec)` 之后还不够,验收把剩下那一半打了出来。** `push` 是无
+   * 条件的,紧跟它的 abort / `infraExhausted` 两道守卫才是「到底有没有人判」的判据。写在守卫
+   * 上面的话,「评审角色连续三次调用失败」和「Esc 打在圆桌飞行中」这两种**一个裁决都没有**的
+   * 情形照样会被记下来 —— 同一句谎话换了个入口。所以真正的判据是
+   * `rec.verdicts.some(v => v.infra !== true)`:这一桌至少有一席真的做出过判断。
+   * (只挪位置也不行:**部分** infra 时 `infraExhausted` 为 false 而剩下的席位真判过,那一版
+   * 该记;全 infra 且被 abort 早退时 `infraExhausted` 同样是 false。)
+   *
+   * ## 缺席 = 本轮方案没有重出过
+   *
+   * 渲染门是**结构性**的(`round > 1 && prevPlan && prevPlan 与 plan 不同`),不借 `notice`
+   * 的判据。`notice` 与「方案重出过」两个方向都不蕴含:跳过分析那一支每轮都判、不消费,
+   * 方案永不重出而 notice 照样非空;反过来「评审员只写 comments 不填 blocking」时 notice 恒空,
+   * 而那恰恰是最需要收敛的一类运行。
+   *
+   * 存的是**剥掉 `alternatives` / `responses` 的副本**,理由与 `planPrompt` 喂给作者前剥掉它们
+   * 逐字相同(落选稿带真名、破坏匿名承诺且每份 1500 字;responses 答的是再上一轮的意见)。
+   */
+  prevPlan?: NodePlan
+  /**
+   * `prevPlan` 是**第几轮**判过的。缺席 = 没有上一版。
+   *
+   * 光存方案不存轮次,这个字段和 `iteration.planReview` 之间就没有任何绑定,而渲染门用的
+   * `round` 正是 `planReview + 1`。三处会把计数器归零却不动 prevPlan(`redo.ts` 的任务重做
+   * 与从质疑讨论重做、`reseat.ts` 的 `--retry-blocked`),于是**上一次运行**的方案会被当成
+   * 本次上一轮的对照物,铺进每一席的提示词、标题还写着「上一轮评审看到的就是它」。验收实测
+   * 到的不是一份空 diff(代码注释当时是这么猜的),而是一份**落后两代的非空 diff** ——
+   * 方向上是「判得更多」而不是放水,但提示词在说假话,还要为一份废弃纪元的方案付 per-seat 的钱。
+   *
+   * 逐点补 `delete n.prevPlan` 是三行,代价是后人每新增一处清 `planReview` 的代码都得记得
+   * 跟上。绑轮次号则不依赖任何调用点:计数器一归零,`prevPlanRound === round - 1` 当场为假。
+   * 人工强制通过占掉一个 round 号的情形也被它顺带盖住 —— 那一轮没有评审员坐下、没有写入,
+   * 等式自然对不上。
+   */
+  prevPlanRound?: number
   execStatus: string
   /**
    * 执行者对**上一轮**测试验证 / 验收每一条阻断意见的逐条处置。一条意见一项。

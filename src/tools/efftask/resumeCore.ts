@@ -1,10 +1,10 @@
 import { parse as yamlParse } from 'yaml'
 import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
-import type { Caps, EffTaskConfig, NodeKind, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
+import type { Caps, EffTaskConfig, NodeKind, NodePlan, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
 import { isStrictness } from './strictness.js'
-import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS } from './parseOutput.js'
+import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS, MAX_FIELD_CHARS } from './parseOutput.js'
 import { sanitizeUsage } from './usage.js'
 
 // Exported because they ARE the post-condition: whatever this module hands back, every reader
@@ -167,7 +167,19 @@ function verdictArray(v: unknown, onDrop?: () => void): RoundtableRecord['verdic
       if (blocking.length > MAX_BLOCKING_ITEMS) onDrop?.()
       return {
         role: typeof x.role === 'string' ? x.role : 'unknown',
-        pass: x.pass === true,
+        /**
+         * **和 `parseVerdict` 同一条不变式**(`parseOutput.ts`:`obj.pass === true &&
+         * blocking.length === 0`)。这里此前只判 `x.pass === true`,于是这道门是全仓库
+         * 唯一能产出「pass:true 且 blocking 非空」的地方 —— 一个解析器按定义排除掉的形状。
+         *
+         * 后果不是理论上的:`synthesizeVerdicts` 把这种裁决算作 failing 且不计入 approving
+         * (即它照样否决圆桌),而 `feedbackItems` 照收它的 blocking。两边合起来,一份手工
+         * 编辑过、或老版本写下的 node.md 会带着一个自相矛盾的裁决穿过整条恢复链路,而
+         * node.md 上没有任何一处说得出「这一席到底是通过还是没通过」。
+         *
+         * 口径对齐之后这个状态在盘上就不存在了,所以下游不需要再为它写任何分支。
+         */
+        pass: x.pass === true && capBlockingList(blocking).length === 0,
         // Same caps as the parse boundary: node.md is hand-editable, and this is the other
         // door into the same field.
         blocking: capBlockingList(blocking),
@@ -367,6 +379,84 @@ export function validateLoadedNodes(
     if (!n.plan || typeof n.plan !== 'object') n.plan = emptyPlan()
     else for (const k of ['solution', 'keyPoints', 'risks', 'acceptance'] as const) {
       if (typeof n.plan[k] !== 'string') n.plan[k] = ''
+    }
+    /**
+     * 上一版方案。和 `n.plan` 对称的兜底,而**理由不是兼容,是这个文件的通例**:每一个
+     * 模型产出的字段在这里都有一道校验,因为 node.md 是手工可编辑的。
+     *
+     * 缺席合法(第 1 轮、或方案从没重出过),所以非对象一律 `delete` 而不是补 `emptyPlan()`
+     * —— 补一份四个空串的假上一版,会让 `prevPlanSection` 把整份方案算成「全都改动过」,
+     * 恰好把重复率推到最大。alternatives / responses 也一并剥掉:存进去时就该没有,盘上
+     * 出现说明被手改过,而它们会跟着进评审提示词。
+     */
+    const rawPrev = (n as { prevPlan?: unknown }).prevPlan
+    if (rawPrev !== undefined) {
+      if (!rawPrev || typeof rawPrev !== 'object' || Array.isArray(rawPrev)) {
+        repairs.push(`节点 ${n.id} 的上一版方案格式非法,已清除(本轮评审将不做版本对照)`)
+        delete n.prevPlan
+      } else {
+        const p = rawPrev as Record<string, unknown>
+        let bad = 0
+        for (const k of ['solution', 'keyPoints', 'risks', 'acceptance'] as const) {
+          // 坏字段要**记进 repairs**。原来这里静默补空串,于是 `prevPlan.solution: 123` 会
+          // 无声无息地变成一份「上一版这里是空的」,而 §17.2 要求修补对用户可见。
+          if (typeof p[k] !== 'string') { p[k] = ''; bad++ }
+          // 长度上限。`MAX_FIELD_CHARS` 只管模型产出那一侧,盘上手改的一路不设防 —— 实测
+          // 四字段各 200 万字时评审提示词 24 MB、node.md 24 MB,不抛不卡,直接进模型调用。
+          // 这一维对 `n.plan` 是既有敞口(上面那一段也只查 typeof),prevPlan 会把它翻倍。
+          else if ((p[k] as string).length > MAX_FIELD_CHARS) {
+            p[k] = capText(p[k] as string, MAX_FIELD_CHARS)
+            bad++
+          }
+        }
+        if (bad > 0) repairs.push(`节点 ${n.id} 的上一版方案有 ${bad} 个字段格式非法或超长,已修正`)
+        delete p.alternatives
+        delete p.responses
+        /**
+         * **四个字段全空 = 没有对照物,和「非对象」是同一件事。**
+         *
+         * 上面那句注释说「非对象一律 delete 而不是补 emptyPlan(),补一份四个空串的假上一版会
+         * 把重复率推到最大」—— 而逐字段兜底在四个字段**都坏或都缺**时造出的东西**逐字相同**。
+         * 最短复现:node.md 里手写 `prevPlan: {}`。验收把提示词打出来才看见:四个字段全被判成
+         * 「改动过」、「逐字未变」那一行整个不出现,评审员收到「上一版是空白的,请找出这一版
+         * 新引入的缺陷」—— 整份方案都成了新引入。声明了绝不造的形状,由校验器自己造了出来。
+         *
+         * `prevPlanSection` 那边还有一道 `usable` 兜底(不拿空串冒充原文),两道都要:这一道
+         * 让盘上不留这种脏数据,那一道让运行中产生的同形数据也不至于渲染出来。
+         */
+        if (['solution', 'keyPoints', 'risks', 'acceptance'].every(k => p[k] === '')) {
+          repairs.push(`节点 ${n.id} 的上一版方案四个字段全为空,已清除(空白的上一版会让整份方案都被当成新引入)`)
+          delete n.prevPlan
+        } else {
+          n.prevPlan = p as unknown as NodePlan
+        }
+      }
+    }
+    /**
+     * 当前方案被判坏、重置成空的时候,上一版也跟着走。
+     *
+     * 一份空的当前方案配一份完整的上一版,`prevPlanSection` 会把四个字段全算成「改动过」,
+     * 于是整份上一版原文被灌回提示词,而当前方案那一段是空的 —— 没有任何对照价值,只有成本。
+     * (顺带记一笔:`n.plan = emptyPlan()` 那一支**一句 repair 都不记**,而它抹掉的是整份方案。
+     * 那是既有行为,不在这次的改动面里,但两条口径不一致在同一个文件里读起来很刺眼。)
+     */
+    if (n.prevPlan && ['solution', 'keyPoints', 'risks', 'acceptance'].every(k => n.plan[k as keyof NodePlan] === '')) {
+      repairs.push(`节点 ${n.id} 的当前方案为空,上一版方案一并清除(没有可对照的东西)`)
+      delete n.prevPlan
+    }
+    /**
+     * 轮次戳。没有它,`prevPlan` 就和 `iteration.planReview` 脱钩 —— 见 `TaskNode.prevPlanRound`。
+     * 盘上戳坏了 / 缺了,退化成「没有上一版」,而不是让渲染门去信一个坏数。
+     */
+    if (n.prevPlan) {
+      const r = (n as { prevPlanRound?: unknown }).prevPlanRound
+      if (!Number.isFinite(r) || (r as number) < 1) {
+        repairs.push(`节点 ${n.id} 的上一版方案缺少有效轮次号,已清除(无法确认它是哪一轮判过的)`)
+        delete n.prevPlan
+        delete n.prevPlanRound
+      }
+    } else {
+      delete n.prevPlanRound
     }
     // alternatives 是 validateLoadedNodes 唯一不碰的 plan 字段 —— 它就地补字段,所以
     // `alternatives: 'boom'` 能原样穿过去,而 serializeNode 会把它渲染进 body,一条

@@ -556,3 +556,57 @@ describe('removeNodeDirs 不许删出 run 目录之外', () => {
     expect(failed).toEqual([])
   })
 })
+
+/**
+ * 上一版方案的往返。
+ *
+ * 它**不需要** serializeNode/parseNodeFile 各写一段:`fm = { ...node }` 整节点倾倒 +
+ * `yamlParse(...) as TaskNode` 读回,frontmatter 白拿。这条用例钉的就是「白拿」这件事仍然
+ * 成立 —— 哪天有人把 fm 改成显式字段清单,这里会红。
+ */
+describe('上一版方案要能原样躺过一次落盘', () => {
+  const mk = () => createNode({
+    id: 'root', title: 't', parentId: null, deps: [], depth: 0,
+    phaseRoles: emptyPhaseRoles(), now: NOW, goal: 'g',
+  })
+
+  it('四个字段逐字往返', () => {
+    const n = mk()
+    n.prevPlan = { solution: '上一版\n多行\t制表', keyPoints: '中文与 emoji 🌱', risks: '  行尾空格  ', acceptance: 'bun test' }
+    const back = parseNodeFile(serializeNode(n))
+    expect(back.prevPlan).toEqual(n.prevPlan)
+  })
+
+  /**
+   * `alternatives: undefined` 落盘时**键整个不输出**,不是输出 `alternatives: null`。
+   * 这一条是本特性最初最担心的翻车点:若变成 null,下游任何 `.length` 都会炸。
+   */
+  it('值为 undefined 的键不落盘,也不会读回成 null', () => {
+    const n = mk()
+    n.prevPlan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', alternatives: undefined, responses: undefined }
+    const text = serializeNode(n)
+    expect(text).not.toContain('alternatives: null')
+    expect(text).not.toContain('responses: null')
+    const back = parseNodeFile(text)
+    expect('alternatives' in back.prevPlan!).toBe(false)
+    expect(back.prevPlan!.responses).toBeUndefined()
+  })
+
+  /**
+   * **同引用会让 yaml 输出锚点/别名**(`plan: &a1` / `prevPlan: *a1`),读回来两者是同一个
+   * 对象 —— 于是 `delete node.plan.responses` 会把上一版的一起删掉。写入点那句展开
+   * (`{ ...node.plan, … }`)就是为了避开它,而后人「简化」时看不出来。
+   */
+  it('展开是 load-bearing:同引用会写出 yaml 别名', () => {
+    const n = mk()
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    // 故意写成同引用,证明这个危险是真的存在,不是假想。
+    n.prevPlan = n.plan
+    expect(serializeNode(n)).toMatch(/[&*]a\d/)
+    // 正确写法:展开一份。
+    n.prevPlan = { ...n.plan }
+    expect(serializeNode(n)).not.toMatch(/[&*]a\d/)
+    const back = parseNodeFile(serializeNode(n))
+    expect(back.prevPlan).not.toBe(back.plan)
+  })
+})

@@ -108,6 +108,17 @@ function richNode(): TaskNode {
    */
   n.execResponses = ['第 1 条 → 已在 src/a.ts 补上回滚', '第 2 条 → 不适用']
   n.plan.responses = ['第 1 条 → 已在 solution 第 3 步写明']
+  /**
+   * 上一版方案 —— 和 `plan.responses` 同一类敌意输入面,而且**恢复链路兜不住它**:
+   * `driveRecovery` 走的是 validateLoadedNodes → serializeNode → … → reseatTransientNodes,
+   * 里面没有 `reviewPrompt`,而 `reviewPrompt` 才是这个字段唯一的消费者。所以这一关扫出
+   * 的绿色对它不构成证明 —— 真正挡住 `prevPlan: 'boom'` 的是 `prevPlanSection` 整份
+   * stringify(不解引用 `.solution`)加上 validateLoadedNodes 的那段兜底,两者都得在。
+   */
+  n.prevPlan = { solution: '上一版:先改 a.ts', keyPoints: '别动 b.ts', risks: '可能冲突', acceptance: 'bun test 全绿' }
+  // 轮次戳和上一版方案是**一对** —— 缺了它 validateLoadedNodes 会把 prevPlan 一并清掉
+  // (无法确认它是哪一轮判过的),那样这个夹具就悄悄退化成「没有上一版」,什么都扫不到。
+  n.prevPlanRound = 1
   n.blockedReason = '验收迭代超限(3)'
   n.interrupted = false
   n.mergeConflict = true

@@ -1306,3 +1306,138 @@ describe('用量:盘上的垃圾值不许上屏', () => {
   })
 })
 
+
+/**
+ * 「pass:true 且 blocking 非空」这个自相矛盾的裁决,以前只有这道门产得出来。
+ *
+ * `parseVerdict` 的不变式是 `obj.pass === true && blocking.length === 0` —— 解析器按定义
+ * 排除掉这个形状。而这里此前只判 `x.pass === true`,于是一份手工编辑过、或老版本写下的
+ * node.md 能把它带进内存。后果不是理论上的:`synthesizeVerdicts` 把它算作 failing 且不计入
+ * approving(照样否决圆桌),`feedbackItems` 照收它的 blocking —— 而 node.md 上没有任何一处
+ * 说得出这一席到底是通过还是没通过。
+ */
+describe('裁决口径:两道门必须一致', () => {
+  it('盘上写着 pass:true 却列了阻断项 —— 按解析器的不变式收敛成不通过', () => {
+    const n = mk({
+      reviewLog: [{
+        round: 1,
+        verdicts: [{ role: 'a', pass: true, blocking: ['缺少回滚方案'], comments: '' }],
+        synthesized: { pass: false, blockingSummary: '' },
+      }] as unknown as TaskNode['reviewLog'],
+    })
+    validateLoadedNodes([n])
+    const v = n.reviewLog[0]!.verdicts[0]!
+    expect(v.pass).toBe(false)
+    // 阻断项本身**不许丢** —— 它是 exhaustionReason / reviewRepeatNotice 的原料,
+    // 丢了的话节点会带着一句裸「评审迭代超限(3)」死掉,一个字的原因都没有。
+    expect(v.blocking).toEqual(['缺少回滚方案'])
+  })
+
+  it('干净的通过票不受影响', () => {
+    const n = mk({
+      reviewLog: [{
+        round: 1,
+        verdicts: [{ role: 'a', pass: true, blocking: [], comments: 'ok' }],
+        synthesized: { pass: true, blockingSummary: '' },
+      }] as unknown as TaskNode['reviewLog'],
+    })
+    validateLoadedNodes([n])
+    expect(n.reviewLog[0]!.verdicts[0]!.pass).toBe(true)
+  })
+})
+
+/**
+ * 上一版方案从盘上读回来时的兜底。
+ *
+ * 不是兼容对冲(这个 run 没有历史负担),是这个文件的通例:node.md 手工可编辑,而每一个
+ * 模型产出的字段在这里都有一道校验。prevPlan 会**原样进评审提示词**。
+ */
+describe('上一版方案从盘上读回来时要校验', () => {
+  it('非对象一律清除 —— 不补一份四个空串的假上一版', () => {
+    const n = mk()
+    ;(n as unknown as { prevPlan: unknown }).prevPlan = 'boom'
+    const { repairs } = validateLoadedNodes([n])
+    expect(n.prevPlan).toBeUndefined()
+    expect(repairs.join('\n')).toContain('上一版方案')
+  })
+
+  it('补一份空的会把重复率推到最大,所以缺席就是缺席', () => {
+    const n = mk()
+    validateLoadedNodes([n])
+    // 从没重出过方案的节点,prevPlan 必须仍然是缺席 —— 补 emptyPlan() 会让 prevPlanSection
+    // 把整份方案算成「全都改动过」,恰好是这个特性要消灭的那个形状。
+    expect(n.prevPlan).toBeUndefined()
+  })
+
+  /**
+   * **校验器自己造出它声明「绝不造」的那个形状。**
+   *
+   * 上面那条注释说「非对象一律 delete 而不是补 emptyPlan()」,而逐字段兜底在四个字段都坏/都缺
+   * 时造出的东西**逐字相同**。最短复现就是盘上手写一个 `prevPlan: {}` —— 验收把提示词打出来
+   * 才看见:四个字段全被判成「改动过」、「逐字未变」整行不出现,评审员收到「上一版是空白的,
+   * 请找出这一版新引入的缺陷」,重复率被推到 100%。
+   */
+  it('四个字段全空 = 没有对照物,和非对象一样清掉', () => {
+    const n = mk()
+    n.plan = { solution: '当前版', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.prevPlanRound = 1
+    ;(n as unknown as { prevPlan: unknown }).prevPlan = {}
+    const { repairs } = validateLoadedNodes([n])
+    expect(n.prevPlan).toBeUndefined()
+    expect(repairs.join('\n')).toContain('全为空')
+  })
+
+  it('当前方案被判坏重置成空时,上一版一并清掉 —— 没有可对照的东西', () => {
+    const n = mk()
+    n.prevPlanRound = 1
+    n.prevPlan = { solution: '完整的上一版正文', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    ;(n as unknown as { plan: unknown }).plan = 'boom'   // → emptyPlan()
+    const { repairs } = validateLoadedNodes([n])
+    expect(n.prevPlan).toBeUndefined()
+    expect(repairs.join('\n')).toContain('当前方案为空')
+  })
+
+  /**
+   * 轮次戳缺了/坏了 → 退化成「没有上一版」,而不是让渲染门去信一个坏数。
+   * 没有它,`--retry-blocked` 和两种重做把 `planReview` 归零之后,上一次运行的方案会冒充
+   * 本次的上一轮 —— 见 `TaskNode.prevPlanRound`。
+   */
+  it('没有有效轮次号的上一版方案一律清掉', () => {
+    for (const bad of [undefined, 0, -1, 'x', NaN]) {
+      const n = mk()
+      n.plan = { solution: '当前版', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+      n.prevPlan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+      ;(n as unknown as { prevPlanRound: unknown }).prevPlanRound = bad
+      validateLoadedNodes([n])
+      expect(n.prevPlan).toBeUndefined()
+      expect(n.prevPlanRound).toBeUndefined()
+    }
+  })
+
+  it('超长字段夹到上限并记 repairs —— 盘上手改的那一路本来不设防', () => {
+    const n = mk()
+    n.plan = { solution: '当前版', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.prevPlanRound = 1
+    n.prevPlan = { solution: 'X'.repeat(2_000_00), keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    const { repairs } = validateLoadedNodes([n])
+    expect(n.prevPlan!.solution.length).toBeLessThanOrEqual(8000 + 200)
+    expect(repairs.join('\n')).toContain('超长')
+  })
+
+  it('字段非字符串补空串并记 repairs,alternatives/responses 一律剥掉', () => {
+    const n = mk()
+    n.plan = { solution: '当前版', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.prevPlanRound = 1
+    ;(n as unknown as { prevPlan: unknown }).prevPlan = {
+      solution: 123, keyPoints: 'k', risks: 'r', acceptance: 'a',
+      // 存进去时就该没有;盘上出现说明被手改过,而它们会跟着进评审提示词
+      // (落选稿带真名,破坏匿名承诺;responses 答的是再上一轮的意见)。
+      alternatives: [{ staff: '真名', solution: 'x' }], responses: ['第 1 条 → 编的'],
+    }
+    validateLoadedNodes([n])
+    expect(n.prevPlan!.solution).toBe('')
+    expect(n.prevPlan!.keyPoints).toBe('k')
+    expect(n.prevPlan!.alternatives).toBeUndefined()
+    expect(n.prevPlan!.responses).toBeUndefined()
+  })
+})
