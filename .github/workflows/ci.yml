@@ -21,6 +21,18 @@ jobs:
         # --frozen-lockfile:CI 不该悄悄改锁文件。锁文件对不上就红,而不是自己解决。
         run: bun install --frozen-lockfile
 
+      - name: 装 ripgrep
+        # 搜索是这个产品的地基:`ripGrep` 先找 `vendor/ripgrep`,找不到就退到系统 PATH 上的
+        # `rg`,两个都没有就整个不可用。而 `vendor/ripgrep` **不在 git 里**(git ls-files 为空),
+        # 所以 CI 上只剩系统那一条路 —— 跑机默认没有 rg,于是 ripgrepMissing.test.ts 的自检
+        # (「PATH 正常时搜索是能用的」)必然红。
+        #
+        # 装它而不是把那条自检去掉:那条自检存在的理由就是防止同一个文件里的第二条用例
+        # (「没有 rg 时模型收到的是一句能照做的话」)因为**机器上压根没有 rg** 而假绿 ——
+        # 那时它期望的失败会因为错误的原因发生。去掉自检等于把这个仓库反复在修的
+        # 「探针坏了被记成覆盖」再犯一次。
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: 跑测试
         # `bun test` 是这个仓库**唯一**的门禁 —— 没有 typecheck(`import type` 被 bun 擦除),
         # 所以一个类型层面的错误只有在跑起来时才会暴露。

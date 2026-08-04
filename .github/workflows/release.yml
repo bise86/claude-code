@@ -20,9 +20,15 @@ jobs:
           - os: macos-latest
             target: bun-darwin-arm64
             asset: claude-haha-darwin-arm64
-          - os: macos-13
-            target: bun-darwin-x64
-            asset: claude-haha-darwin-x64
+          # macos-13 / bun-darwin-x64 那一档去掉了 —— 它一直跑不过,而它是**唯一**跑在
+          # Intel mac 跑机上的一档。留着的代价是每次发布都要等它失败或被人工取消,
+          # 而 fail-fast: false 意味着其余三档照常产出、release 那一步照常能发。
+          #
+          # 后果要说清:**从此不再发 Intel mac 的二进制**。那批用户拿不到 release 产物,
+          # 只能从源码跑(`bun run ./bin/claude-haha`)。Apple 从 2020 年起转 arm,
+          # 而 arm64 那一档还在。真要把它找回来,先解决那台跑机上的编译失败,
+          # 再把这三行加回来 —— 别直接把 os 换成 macos-latest,那样产出的是 arm64 的二进制、
+          # 名字却写着 x64,冒烟测试还照样绿(它在 arm 跑机上跑 arm 产物)。
           - os: windows-latest
             target: bun-windows-x64
             asset: claude-haha-windows-x64.exe

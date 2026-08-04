@@ -35,9 +35,14 @@ function runProbe(path: string): { ok: boolean; message?: string; code?: string;
 describe('机器上没有 ripgrep 时', () => {
   it('先自检:PATH 正常时搜索是能用的', () => {
     // 没有这条,下面那条即使因为**别的原因**失败也看不出来 —— 那正是「探针坏了被
-    // 记成覆盖」的形状。
+    // 记成覆盖」的形状:机器上压根没有 rg 时,下面那条期望的失败会因为错误的原因发生。
+    //
+    // **这条用例有一个前提:这台机器能搜索。** `ripGrep` 先找 `vendor/ripgrep`,找不到就退到
+    // 系统 PATH 上的 `rg`。而 `vendor/ripgrep` 不在 git 里,所以裸跑机上只剩后一条路 ——
+    // CI 因此专门装了 ripgrep(见 .github/workflows/ci.yml)。红在这一行时先查这个,
+    // 别去改下面那条用例。
     const r = runProbe(process.env.PATH ?? '')
-    expect(`搜索可用: ${r.ok}`).toBe('搜索可用: true')
+    expect(`搜索可用: ${r.ok}(${r.message ?? '无错误'})`).toBe('搜索可用: true(无错误)')
     expect(r.hits ?? 0).toBeGreaterThan(0)
   })
 
