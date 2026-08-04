@@ -21,6 +21,23 @@ jobs:
         # --frozen-lockfile:CI 不该悄悄改锁文件。锁文件对不上就红,而不是自己解决。
         run: bun install --frozen-lockfile
 
+      - name: 装 ripgrep
+        # **这一步是给下面「打包态自检」的,不是给 `bun test` 的。**
+        #
+        # `bun test` 已经不依赖它了:`ripgrepMissing.test.ts` 自带 rg 桩子,屏蔽掉系统 rg
+        # 跑全量仍是 3304 pass / 0 fail(只屏蔽 rg,git 等照常在)。
+        #
+        # 但 `verify:binary` 有一条「打包态里**真的能搜出文件**」——它跑的是编出来的单文件
+        # 产物,而那个产物在这台机器上只能走 `mode: 'system'`(`vendor/ripgrep` 不在 git 里),
+        # 也就是靠 PATH 上的 rg。拿桩子去满足它等于把这道门禁变成空转:它要守的正是
+        # 「虚拟路径被当成真路径去 spawn」「ripgrep 解析到一条不存在的路径」这类**只有编成
+        # 产物之后才会出现**的故障,而这些只有真的搜出文件才证得了。
+        #
+        # 注意这道门禁**证明不了**「发出去的二进制自带 rg」——它证明的是解析与 spawn 的逻辑
+        # 对。产物在没装 rg 的用户机器上搜索仍然不可用,那是 vendor/ripgrep 为空的问题,
+        # 不在这一步的射程内。
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: 跑测试
         # `bun test` 是这个仓库**唯一**的门禁 —— 没有 typecheck(`import type` 被 bun 擦除),
         # 所以一个类型层面的错误只有在跑起来时才会暴露。
