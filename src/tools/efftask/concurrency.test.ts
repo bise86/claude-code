@@ -29,9 +29,9 @@ const reply = (req: { prompt: string }, body: string): string => {
   const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
   return '```' + tag + '\n' + body + '\n```'
 }
-const THREE_LEAVES = '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a",' +
+const THREE_LEAVES = '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿",' +
   '"children":[{"title":"甲","deps":[]},{"title":"乙","deps":[]},{"title":"丙","deps":[]}]}'
-const LEAF = '{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}'
+const LEAF = '{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}'
 
 /** Root decomposes into three independent leaves; everything after that passes. */
 function cooperative(opts: { delay?: number; onPhase?: (phase: string) => void } = {}) {
@@ -384,7 +384,7 @@ describe('全局并发池必须同时约束"步"和"圆桌里的角色" (spec §
         plans++
         return plans === 1
           ? '\u0060\u0060\u0060json\n{"kind":"decompose","solution":"s","keyPoints":"","risks":"","acceptance":"","children":[{"title":"A","deps":[]},{"title":"B","deps":[]},{"title":"C","deps":[]}]}\n\u0060\u0060\u0060'
-          : '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+          : '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       }
       if (req.phase === 'execute') {
         return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
@@ -417,7 +417,7 @@ describe('全局并发池必须同时约束"步"和"圆桌里的角色" (spec §
       await new Promise(r => setTimeout(r, 2))
       live--
       if (req.phase === 'plan') {
-        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       }
       if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
       const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
@@ -442,7 +442,7 @@ describe('全局并发池必须同时约束"步"和"圆桌里的角色" (spec §
     const runAgent: RunAgentFn = async req => {
       if (req.role) seen.push(req.phase + ':' + req.role.roleName)
       if (req.phase === 'plan') {
-        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       }
       if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
       const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
@@ -477,7 +477,7 @@ describe('slotUsage:状态条读的那个数', () => {
     const runAgent: RunAgentFn = async req => {
       seenPeak = Math.max(seenPeak, orch.slotUsage().inUse)
       await new Promise(r => setTimeout(r, 3))
-      if (req.phase === 'plan') return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+      if (req.phase === 'plan') return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"done"}\n\u0060\u0060\u0060'
       const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
       return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'

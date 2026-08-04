@@ -10,7 +10,7 @@
 // run would have produced answer two different questions, and the difference would only
 // surface after the gate — the exact "gate describes something other than the run" failure
 // the confirmation gates exist to prevent.
-import { ANSWER_TAGS, answerTag, parsePlanOutput } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, hollow, MIN_FIELD_CHARS, parsePlanOutput } from './parseOutput.js'
 import type { StreamHandle } from './agentStream.js'
 import { planPrompt, seatPreamble, type PlanPromptCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
@@ -275,28 +275,10 @@ export function buildRootPlanNoticeCard(args: {
 export const MIN_SOLUTION_CHARS = 12
 
 /**
- * 占位词。写了字但等于没写。
- *
- * 验收实测:`keyPoints/risks/acceptance` 填 `'无'/'无'/'无'`、`'a'/'b'/'c'`、`'-'`、`'。'`
- * 时 planGaps **一条都不报** —— 这个函数的立意是挡「模型偷懒」,而模型写三个「无」就
- * 完全绕过,连那次自动重拟都不会触发。只判空白是不够的。
+ * 占位词判据搬到了 `parseOutput.ts`(叶子模块),因为 `pipeline.ts` 也要用它 —— 子节点的
+ * 验收点同样不能只判 `=== ''`。这里 re-export,保住本模块原有的公开面。
  */
-const PLACEHOLDER = new Set([
-  '无', '暂无', '没有', '不适用', '略', '待定', '待补充', '同上', 'n/a', 'na', 'none', 'nil', 'tbd', 'todo', '-', '--', '/',
-])
-/** 字段短到这个程度也只能是占位。 */
-export const MIN_FIELD_CHARS = 4
-
-function hollow(v: unknown): boolean {
-  if (typeof v !== 'string') return true
-  const t = v.trim()
-  if (t.length === 0) return true
-  // 去掉标点空白再判,'。'、'——'、'…' 这类也算空
-  const core = t.replace(/[\s\-—…·。,.;:!?、"'`~*#\[\]()（）【】]/g, '')
-  if (core.length === 0) return true
-  if (PLACEHOLDER.has(core.toLowerCase())) return true
-  return Array.from(core).length < MIN_FIELD_CHARS
-}
+export { MIN_FIELD_CHARS, hollow }
 
 export function planGaps(plan: { solution: string; keyPoints: string; risks: string; acceptance: string } | null | undefined): string[] {
   // 它是 export 的,而且唯一调用链之外没人保证传得进对象。守 plan 本身,不只守字段。

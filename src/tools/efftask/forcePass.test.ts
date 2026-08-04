@@ -53,7 +53,7 @@ function counting(reply: (req: { phase: string; prompt: string }) => string) {
 const PASS = (req: { prompt: string }) => vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
 const FAIL = (req: { prompt: string }) => vtag(req) + '\n{"pass":false,"blocking":["回归失败"],"comments":""}\n```'
 const EXEC = '```json\n{"execStatus":"改了 foo.ts"}\n```'
-const PLAN = '```json\n{"kind":"executable","solution":"做它","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+const PLAN = '```json\n{"kind":"executable","solution":"做它","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
 
 /** log 里那条人工裁决。找不到时返回 undefined —— 断言方自己说该不该有。 */
 const manualOf = (log: TaskNode['reviewLog']) => log.find(r => r.verdicts.some(v => v.manual === true))

@@ -1,6 +1,6 @@
 // src/tools/efftask/parseOutput.test.ts
 import { describe, expect, it } from 'bun:test'
-import { answerTag, extractJsonBlock, parsePlanOutput, parseVerdict, parseExecOutput, capText, capBlockingList, capResponses, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS, MAX_NEW_CHILDREN, parseRemedy } from './parseOutput.js'
+import { answerTag, extractJsonBlock, hollow, parsePlanOutput, parseVerdict, parseExecOutput, capText, capBlockingList, capResponses, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS, MAX_NEW_CHILDREN, parseRemedy } from './parseOutput.js'
 
 describe('parseOutput', () => {
   it('extractJsonBlock finds fenced json', () => {
@@ -23,7 +23,7 @@ describe('parseOutput', () => {
     expect(extractJsonBlock(text)).toEqual({ pass: false, blocking: ['缺验收点'], comments: '' })
   })
   it('parsePlanOutput decompose with children', () => {
-    const out = parsePlanOutput('```json\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a","children":[{"title":"c1","deps":[]},{"title":"c2","deps":["c1"]}]}\n```')
+    const out = parsePlanOutput('```json\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿","children":[{"title":"c1","deps":[]},{"title":"c2","deps":["c1"]}]}\n```')
     expect(out.kind).toBe('decompose')
     expect(out.plan.solution).toBe('s')
     expect(out.children).toEqual([{ title: 'c1', deps: [] }, { title: 'c2', deps: ['c1'] }])
@@ -53,7 +53,7 @@ describe('parseOutput', () => {
   it('parseVerdict: real verdict first, trailing plan recap => still the verdict', () => {
     const text =
       '我的裁决:\n```json\n{"pass":false,"blocking":["仍缺压测数据"],"comments":"不通过"}\n```\n' +
-      '供参考,本节点的方案是:\n```json\n{"solution":"旧方案","acceptance":"a"}\n```'
+      '供参考,本节点的方案是:\n```json\n{"solution":"旧方案","acceptance":"跑 bun test 全绿"}\n```'
     const v = parseVerdict(text, 'sec')
     expect(v.pass).toBe(false)
     expect(v.blocking).toEqual(['仍缺压测数据'])
@@ -405,5 +405,108 @@ describe('capResponses:逐条处置的解析边界', () => {
     expect(parseExecOutput('```' + tag + '\n{"execStatus":"改了"}\n```', tag).responses).toEqual([])
     // 整段回复兜底那一支同样要给出这个字段,否则调用方读到 undefined.length 就抛了
     expect(parseExecOutput('我改完了').responses).toEqual([])
+  })
+})
+
+/**
+ * 坏转义 —— 一个字符把一整份方案降级成散文。
+ *
+ * 真实事故(跑机 run 001,节点 `01-rust-环境初始化`):方案师在 acceptance 里写
+ * `"最后一行含 \"Finished \`dev\` profile\""`。`\`` 不是合法 JSON 转义,整份文档 parse 失败,
+ * `parsePlanOutput` 回退成「整段原文当 solution、keyPoints/risks/acceptance 全空」。
+ * 后果是 4 个裁决席位拿到「本节点未定义验收点」,每轮从 3000 字目标里现挑判据 —— 执行跑了
+ * 3 轮,而被丢掉的方案里本来就有 8 条可机检的验收点。
+ */
+describe('坏转义修复:只在已经解析失败之后跑,而且不许打坏合法的 \\\\', () => {
+  const wrap = (tag: string, body: string): string => '```' + tag + '\n' + body + '\n```'
+
+  it('事故原文的形状:带 \\` 的方案能解析出验收点(修复前是空的)', () => {
+    const tag = answerTag('plan')
+    const body = '{"kind":"executable","solution":"落地骨架","acceptance":"A5 最后一行含 \\"Finished \\`dev\\` profile\\""}'
+    const out = parsePlanOutput(wrap(tag, body), tag)
+    expect(out.plan.acceptance).toContain('Finished')
+    expect(out.plan.acceptance).toContain('dev')
+    // 回退没有发生:solution 是字段值,不是整段回复
+    expect(out.plan.solution).toBe('落地骨架')
+    expect(out.parseFailed).toBe(false)
+  })
+
+  it('合法的 \\\\ 不被误伤 —— 这是 lookahead 写法会打坏的那一类', () => {
+    const tag = answerTag('plan')
+    // JSON 里 "C:\\path" = 字面量 C:\path。按「删掉非法转义的反斜杠」逐个扫会把它改成
+    // "C:\path",反而变成非法转义。
+    const out = parsePlanOutput(wrap(tag, '{"kind":"executable","solution":"C:\\\\path","acceptance":"ok"}'), tag)
+    expect(out.plan.solution).toBe('C:\\path')
+    // 合法转义对紧挨着一个非法转义:前者原样、后者修好
+    const mixed = parsePlanOutput(
+      wrap(tag, '{"kind":"executable","solution":"a\\\\`b","acceptance":"c\\`d"}'), tag,
+    )
+    expect(mixed.plan.solution).toBe('a\\`b')
+    expect(mixed.plan.acceptance).toBe('c`d')
+  })
+
+  it('\\uXXXX 仍然按 unicode 转义走,没有被当成非法转义吃掉', () => {
+    const tag = answerTag('plan')
+    const out = parsePlanOutput(wrap(tag, '{"kind":"executable","solution":"\\u0041\\`x","acceptance":"ok"}'), tag)
+    expect(out.plan.solution).toBe('A`x')
+  })
+
+  it('修复不许绕开「不从数组里挖元素」那条防线', () => {
+    // sliceTopLevelObject 拒绝数组里的对象;修转义只作用在它挑出来的那一段上,
+    // 挑不出来就整条丢弃 —— 一个藏在数组里的 pass:true 不能因为修了转义就浮出来。
+    expect(extractJsonBlock('这是配置: [{"pass":true,"comments":"\\`x\\`"}]')).toBeNull()
+  })
+
+  it('反向漏洞:陈旧的 pass:true + 真裁决因坏转义被丢弃 => 修复前放行,修复后 fail closed', () => {
+    const tag = answerTag('verdict')
+    // 裁决员先写了一版草稿,后面才是真结论;真结论的 blocking 里带一个反引号转义
+    // (裁决员写 `cargo test` 极常见)。修复前:真的那块 parse 不了被静默丢掉,只剩草稿,
+    // ambiguous=false → 返回 pass:true。
+    const text =
+      wrap(tag, '{"pass":true,"blocking":[]}') + '\n更正:\n' +
+      wrap(tag, '{"pass":false,"blocking":["\\`cargo test\\` 没跑"]}')
+    const v = parseVerdict(text, '测试', tag)
+    expect(v.pass).toBe(false)
+  })
+})
+
+describe('parseFailed:只说「本轮 tag 的围栏坏了」,不许把别的情形也算进来', () => {
+  it('围栏在场但 parse 不出对象 => true', () => {
+    const tag = answerTag('plan')
+    // 未闭合的对象:修转义也救不回来
+    const out = parsePlanOutput('```' + tag + '\n{"kind":"executable","solution":"半截\n```', tag)
+    expect(out.parseFailed).toBe(true)
+    expect(out.plan.acceptance).toBe('')
+  })
+  it('压根没有围栏 => false(模型没按格式答,不是「JSON 坏了」)', () => {
+    const tag = answerTag('plan')
+    expect(parsePlanOutput('我觉得应该先建骨架', tag).parseFailed).toBe(false)
+  })
+  it('围栏好 => false', () => {
+    const tag = answerTag('plan')
+    expect(parsePlanOutput('```' + tag + '\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```', tag).parseFailed).toBe(false)
+  })
+})
+
+describe('hollow:写了字但等于没写', () => {
+  it('空白/标点/占位词/太短一律算空', () => {
+    for (const v of ['', '   ', '。', '——', '无', '暂无', 'N/A', 'TBD', '-', 'abc']) {
+      expect(hollow(v)).toBe(true)
+    }
+  })
+  it('真的判据不算空', () => {
+    expect(hollow('跑 cargo check --workspace,最后一行 Finished')).toBe(false)
+  })
+})
+
+
+describe('answer tag 的大小写:两边都要 lower,否则静默降级到 generic 兜底', () => {
+  const F = '```'
+  it('混大小写的 tag 仍然算 tagged —— 两个同 tag 块要判 ambiguous,而不是宽容地挑一个', () => {
+    const one = F + 'PlanABCD\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n' + F
+    // 判据取 parseVerdict:它是 requireTag 的那一关,tagged 组恒空就等于「没给裁决」。
+    const v = parseVerdict(F + 'VerdictXY\n{"pass":true,"blocking":[]}\n' + F, 'r', 'VerdictXY')
+    expect(v.pass).toBe(true)
+    expect(parsePlanOutput(one, 'PlanABCD').plan.acceptance).toContain('全绿')
   })
 })

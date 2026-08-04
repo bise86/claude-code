@@ -30,7 +30,7 @@ const deps = (runAgent: RunAgentFn) => ({
 })
 
 const allPass: RunAgentFn = async req => {
-  if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+  if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
   if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
   return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
 }
@@ -43,8 +43,8 @@ async function completedTree(): Promise<TaskNode[]> {
       planCalls++
       // 第一次:根拆成两个子任务。之后:叶子。
       return planCalls === 1
-        ? '```plan\n{"kind":"decompose","solution":"s","acceptance":"a","children":[{"title":"甲","deps":[]},{"title":"乙","deps":[]}]}\n```'
-        : '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+        ? '```plan\n{"kind":"decompose","solution":"s","acceptance":"跑 bun test 全绿","children":[{"title":"甲","deps":[]},{"title":"乙","deps":[]}]}\n```'
+        : '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
     }
     return allPass(req)
   }

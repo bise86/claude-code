@@ -126,7 +126,14 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
      * 省略 = 不设档,老 node.md 逐字节不变。
      */
     const lv = r?.strictness ? `(${stripControl(String(r.strictness))}档) ` : ''
-    const head = `- ${step}${lv}round ${stripControl(String(r?.round ?? '?'))}: ${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
+    /**
+     * 作废的那一轮要**当场标出来**,理由和下面 MANUAL-PASS 那条逐字同源:这一节是事后
+     * 追责唯一读得到的东西,而一条已作废的裁决和一条真裁决在这里本来长得一模一样。
+     * 排在 PASS/FAIL 之前 —— 先说「这条不算数」,再说它当时判了什么。
+     */
+    const voided = typeof r?.voided === 'string' && r.voided.length > 0
+      ? `[已作废:${clipBody(stripControl(r.voided))}] ` : ''
+    const head = `- ${step}${lv}round ${stripControl(String(r?.round ?? '?'))}: ${voided}${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
     const roles = (r?.verdicts ?? []).map(v => {
       const detail = (v?.blocking ?? []).length > 0 ? (v.blocking ?? []).join('; ') : (v?.comments ?? '')
       /**

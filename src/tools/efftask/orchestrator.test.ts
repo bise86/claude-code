@@ -16,7 +16,7 @@ const deps = (runAgent: RunAgentFn) => ({ runAgent, persist: async () => {}, now
 describe('EffTaskOrchestrator (serial)', () => {
   it('single executable root: plan->review->execute->accept => completed', async () => {
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
       if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
@@ -31,7 +31,7 @@ describe('EffTaskOrchestrator (serial)', () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
         if (req.node.id === 'root') return '```json\n{"kind":"decompose","solution":"s","children":[{"title":"first","deps":[]},{"title":"second","deps":["first"]}]}\n```'
-        return '```json\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"leaf","acceptance":"跑 bun test 全绿"}\n```'
       }
       if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -50,7 +50,7 @@ describe('EffTaskOrchestrator (serial)', () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
         if (req.node.id === 'root') return '```json\n{"kind":"decompose","solution":"s","children":[{"title":"first","deps":[]},{"title":"second","deps":["first"]}]}\n```'
-        return '```json\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"leaf","acceptance":"跑 bun test 全绿"}\n```'
       }
       if (req.phase === 'execute') { execOrder.push(req.node.id); return '```json\n{"execStatus":"done"}\n```' }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -71,7 +71,7 @@ describe('EffTaskOrchestrator (serial)', () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
         if (req.node.id === 'root') return '```json\n{"kind":"decompose","solution":"s","children":[{"title":"only","deps":[]}]}\n```'
-        return '```json\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"leaf","acceptance":"跑 bun test 全绿"}\n```'
       }
       if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' // plans pass review
       if (req.phase === 'execute') return '```json\n{"execStatus":"did"}\n```'
@@ -89,7 +89,7 @@ describe('EffTaskOrchestrator (serial)', () => {
   // ---- failure-path coverage: the driver is the only thing that can hang a whole run ----
 
   const allPass: RunAgentFn = async req => {
-    if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+    if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
     if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
     return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
   }
@@ -139,7 +139,7 @@ describe('EffTaskOrchestrator (serial)', () => {
         if (req.node.id === 'root') return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"A","deps":[]},{"title":"B","deps":[]}]}\n```'
         if (req.node.id === 'root/01-a') return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"A1","deps":[]},{"title":"A2","deps":[]}]}\n```'
         if (req.node.id === 'root/02-b') return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"B1","deps":[]},{"title":"B2","deps":[]}]}\n```'
-        return '```plan\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
+        return '```plan\n{"kind":"executable","solution":"leaf","acceptance":"跑 bun test 全绿"}\n```'
       }
       return allPass(req)
     }
@@ -188,7 +188,7 @@ describe('EffTaskOrchestrator (serial)', () => {
       if (req.phase === 'plan' && req.node.id === 'root') {
         return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"A","deps":[]},{"title":"B","deps":[]}]}\n```'
       }
-      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"leaf","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"leaf","acceptance":"跑 bun test 全绿"}\n```'
       if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
       if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
       return vtag(req) + '\n{"pass":false,"blocking":["不过"],"comments":""}\n```'
@@ -205,7 +205,7 @@ describe('EffTaskOrchestrator (serial)', () => {
     const runAgent: RunAgentFn = async req => {
       calls++
       if (calls > 200) throw new Error('runaway loop')
-      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
       if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
       if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
       return vtag(req) + '\n{"pass":false,"blocking":["永远不过"],"comments":""}\n```'
@@ -231,7 +231,7 @@ describe('an interrupted run is distinguishable from a failed one', () => {
     const runAgent = (async () => {
       calls++
       if (calls >= 2) ac.abort()
-      return '```json\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a","children":[{"title":"子一","deps":[]}]}\n```'
+      return '```json\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿","children":[{"title":"子一","deps":[]}]}\n```'
     }) as unknown as RunAgentFn
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), ac.signal)
     expect(await orch.run()).toEqual({ status: 'blocked', reason: '已中断' })
@@ -271,7 +271,7 @@ describe('自动解冲突的预算按「一次运行」计', () => {
   })
 
   const cooperative = (): RunAgentFn => (async req => {
-    if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+    if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
     if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
     return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
   }) as RunAgentFn
@@ -334,7 +334,7 @@ describe('运行中重做:别的任务照跑,失败的那个当场重开', () =>
    * 扣住期间不许把 run 判成「走不动」。界面那一侧(按键 → 关口 → redoDeps)由
    * wiringCoverage 与 redoRun.test.ts 各自守着。
    */
-  const leafPlan = '```json\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
 
   /**
    * 一棵根 + 两个并行子任务:「慢」那个挂在验收里不返回(模拟一个还在跑的兄弟任务),

@@ -286,6 +286,16 @@ export interface RoundtableRecord {
    * 卡片写的正是「先看该节点的验收记录」。省略 = 验收(老 node.md 的形状不变)。
    */
   step?: PhaseName
+  /**
+   * 这一轮的判决**已经作废**,以及为什么。
+   *
+   * 目前唯一的来源:测试验证席位动了工作区(验证者只应验证,不应修复)。作废的记录仍然
+   * 留在 acceptLog 里 —— 它看到的事实有用,而且删掉一轮记录本身就是静默截断 —— 但
+   * 它和一条真裁决在盘上长得一模一样,读 node.md 的人无从分辨哪一条的结论不算数。
+   *
+   * 省略 = 正常的一轮(老 node.md 的形状不变)。
+   */
+  voided?: string
 }
 export interface ScoreRecord {
   role: string; score: number; rationale: string
@@ -425,6 +435,17 @@ export interface TaskNode {
    * sweep, because for THIS node the path is where the human's resolution lives.
    */
   mergeConflict?: boolean
+  /**
+   * 这个节点已经为「方案没有验收点」重拟过一次了。**一生一次,不是每轮一次。**
+   *
+   * `runPlanPhase` 的唯一调用点在 `stepStart` 的 `for(;;)` 里,评审不通过会 `continue`
+   * 再进一次。按「每次进来都补一次」实现的话,最坏是 `maxNodes × maxIterations` 次额外的
+   * 方案调用(默认 100×3=300,对照实测基线 427 次调用 = +70%),圆桌模式下还要再乘席位数。
+   * 理由和 rootPlan 那句「一次就够:再空就如实端出去…免得无限重试烧钱」同源。
+   *
+   * 省略 = 还没重拟过,老 node.md 逐字兼容。
+   */
+  planRetried?: boolean
   /**
    * BLOCKED because a SAFETY VALVE tripped (spec §11) — an iteration/rework limit, the node
    * cap, a phase timeout, or reviewers that could never be reached. Never because the tree

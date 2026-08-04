@@ -455,7 +455,7 @@ async function promptsFromRun(): Promise<{ review: string; judged: string[] }> {
   const seen: { phase: string; prompt: string }[] = []
   const runAgent: RunAgentFn = async req => {
     seen.push({ phase: req.phase, prompt: req.prompt })
-    if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     if (req.phase === 'execute') return '```exec\n{"execStatus":"做完了"}\n```'
     return vtag(req) + PASS
   }
@@ -493,7 +493,7 @@ describe('端到端:取证责任进了四个裁决关口', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + PASS
     }
     const n = mk({ kind: 'executable', status: 'PLANNING' })
@@ -517,7 +517,7 @@ describe('端到端:取证责任进了四个裁决关口', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + PASS
     }
     const n = mk({ kind: 'executable', status: 'PLANNING' })
@@ -632,7 +632,7 @@ describe('端到端:「前提有误」的接盘规则', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + PASS
     }
     const n = mk({ kind: 'executable', status: 'PLANNING' })
@@ -690,7 +690,7 @@ describe('端到端:「前提有误」的接盘规则', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       if (req.phase === 'plan') {
-        return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a",' +
+        return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿",' +
           '"responses":["第 1 条 → 前提有误:我跑了 find api/"]}\n```'
       }
       round++
@@ -718,7 +718,7 @@ describe('端到端:「前提有误」的接盘规则', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a","responses":["第 1 条 → …"]}\n```'
+        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿","responses":["第 1 条 → …"]}\n```'
         : vtag(req) + PASS
     }
     // 盘上已经有一轮两席都不通过的记录 —— 这正是 --resume 回来时的形状。
@@ -742,7 +742,7 @@ describe('端到端:「前提有误」的接盘规则', () => {
     let round = 0
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
-      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       round++
       return round === 1
         ? vtag(req) + '\n{"pass":false,"blocking":["proto 总数应改为 13"],"comments":""}\n```'

@@ -820,3 +820,175 @@ describe('跨分支依赖调度:一个节点看得见依赖合进来的东西吗
     expect(intFile.stdout).toContain('mine')
   })
 })
+
+/**
+ * 集成工作区被别人弄脏 —— 一次合并失败干掉整棵树。
+ *
+ * 实测事故(跑机 run 001,节点 `01-rust-环境初始化`):方案席和两个评审席都
+ * `cd .efftask-worktrees/integration` 跑了 `devenv shell cargo check --workspace`,
+ * devenv 改写了**受跟踪的** devenv.lock 并留在那儿。40 分钟后该节点测试验证 3 轮、
+ * 验收 1 轮全部通过,合并却报「您对下列文件的本地修改将被合并操作覆盖:devenv.lock」,
+ * 节点阻断,9 个兄弟节点全部「依赖阻断」,整个 run 死掉。
+ *
+ * **用例的形状是必要条件,不是随便挑的**:git 只在「本地脏文件同时被并入方改动」时才拒绝。
+ * 探针实测过 —— 脏文件与节点分支不相交时 merge 照常成功(脏改动原样留着),那种写法的用例
+ * 在不改任何实现的前提下就是绿的,证明不了任何事。所以:节点分支必须**提交对同一个文件的
+ * 改动**,intPath 里必须对**同一个文件**做未提交修改。
+ */
+describe('合并撞上被弄脏的集成工作区:洗掉重试,而不是把整棵树打死', () => {
+  const intPathOf = () => join(worktreeRoot, 'integration')
+
+  it('受跟踪文件脏且与节点分支重叠 → 清理后重试合并成功,节点的那一版进了集成分支', async () => {
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    // 基线上先有这个文件,两边才谈得上「重叠」
+    await writeFile(join(gitRoot, 'devenv.lock'), 'v1\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'lock v1'], gitRoot)
+    await git(['branch', '-f', 'efftask/001/integration', 'HEAD'], gitRoot)
+    await git(['-C', intPathOf(), 'reset', '--hard', 'efftask/001/integration'], gitRoot)
+
+    const n = node('a')
+    const lease = await p.acquire(n)
+    if ('error' in lease) throw new Error(lease.error)
+    n.worktree = { branch: lease.branch, path: lease.path }
+    await writeFile(join(lease.path, 'devenv.lock'), 'v2-node\n')
+
+    // 席位在共享的集成工作区里跑了构建,改了同一个受跟踪文件,没提交
+    await writeFile(join(intPathOf(), 'devenv.lock'), 'v1-dirtied-by-a-reviewer\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.merged).toBe(true)
+    // 清掉了什么必须报出来 —— 那个目录用户被告知「下次运行会复用」
+    expect(res.cleaned).toBeDefined()
+    expect(res.cleaned!.join('\n')).toContain('devenv.lock')
+    // 节点的成果没有被清理顺手吞掉
+    const merged = await git(['show', 'efftask/001/integration:devenv.lock'], gitRoot)
+    expect(merged.stdout.trim()).toBe('v2-node')
+  })
+
+  it('未跟踪文件挡路时同样能过 —— clean -fd 那一半也要有测试', async () => {
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    const n = node('b')
+    const lease = await p.acquire(n)
+    if ('error' in lease) throw new Error(lease.error)
+    n.worktree = { branch: lease.branch, path: lease.path }
+    await writeFile(join(lease.path, 'brandnew.txt'), 'from node\n')
+    // 同名未跟踪文件躺在集成工作区里:git 会拒绝「would be overwritten by merge」
+    await writeFile(join(intPathOf(), 'brandnew.txt'), 'left by someone\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.cleaned!.join('\n')).toContain('brandnew.txt')
+    const merged = await git(['show', 'efftask/001/integration:brandnew.txt'], gitRoot)
+    expect(merged.stdout.trim()).toBe('from node')
+  })
+
+  it('真冲突不许被重试吞掉:仍然报 conflict,而且报的是冲突文件', async () => {
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    await writeFile(join(gitRoot, 'shared.txt'), 'v1\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'shared v1'], gitRoot)
+    await git(['branch', '-f', 'efftask/001/integration', 'HEAD'], gitRoot)
+    await git(['-C', intPathOf(), 'reset', '--hard', 'efftask/001/integration'], gitRoot)
+
+    // 先让一个节点把改动合进集成分支
+    const first = node('c1')
+    const l1 = await p.acquire(first)
+    if ('error' in l1) throw new Error(l1.error)
+    first.worktree = { branch: l1.branch, path: l1.path }
+    await writeFile(join(l1.path, 'shared.txt'), 'from c1\n')
+    expect((await p.commitAndMerge(first)).ok).toBe(true)
+
+    // 第二个节点基于旧基线改同一行 → 真冲突
+    const second = node('c2')
+    const l2 = await p.acquire(second)
+    if ('error' in l2) throw new Error(l2.error)
+    second.worktree = { branch: l2.branch, path: l2.path }
+    await git(['-C', l2.path, 'reset', '--hard', 'HEAD~1'], gitRoot)
+    await writeFile(join(l2.path, 'shared.txt'), 'from c2\n')
+
+    const res = await p.commitAndMerge(second)
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.kind).toBe('conflict')
+  })
+})
+
+/**
+ * 洗掉重试那条路上的三个出口 —— 成功之外的两个也要说清「刚才抹掉了什么」,
+ * 而且**不许在一棵不属于自己的树上重试**。
+ */
+describe('洗掉重试:失败出口同样要报 cleaned;不在集成分支上就拒绝重试', () => {
+  const intPathOf = () => join(worktreeRoot, 'integration')
+
+  /** 让基线上有 shared.txt,并把集成分支对齐到它。 */
+  async function seedShared(): Promise<void> {
+    await writeFile(join(gitRoot, 'shared.txt'), 'v1\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'shared v1'], gitRoot)
+    await git(['branch', '-f', 'efftask/001/integration', 'HEAD'], gitRoot)
+    await git(['-C', intPathOf(), 'reset', '--hard', 'efftask/001/integration'], gitRoot)
+  }
+
+  it('重试之后撞上真冲突:仍报 conflict,而且把被抹掉的用户文件一起报出来', async () => {
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    await seedShared()
+    // 先让一个节点把 shared.txt 改动合进集成分支
+    const first = node('d1')
+    const l1 = await p.acquire(first)
+    if ('error' in l1) throw new Error(l1.error)
+    first.worktree = { branch: l1.branch, path: l1.path }
+    await writeFile(join(l1.path, 'shared.txt'), 'from d1\n')
+    expect((await p.commitAndMerge(first)).ok).toBe(true)
+
+    // 第二个节点基于旧基线改同一行(→ 真冲突),同时集成工作区里有别的脏东西挡住第一次合并
+    const second = node('d2')
+    const l2 = await p.acquire(second)
+    if ('error' in l2) throw new Error(l2.error)
+    second.worktree = { branch: l2.branch, path: l2.path }
+    await git(['-C', l2.path, 'reset', '--hard', 'HEAD~1'], gitRoot)
+    await writeFile(join(l2.path, 'shared.txt'), 'from d2\n')
+    await writeFile(join(l2.path, 'onlyd2.txt'), 'x\n')
+    await writeFile(join(intPathOf(), 'onlyd2.txt'), 'left by a reviewer\n')
+    await writeFile(join(intPathOf(), 'precious-user-file.txt'), '用户自己放的\n')
+
+    const res = await p.commitAndMerge(second)
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.kind).toBe('conflict')
+    // 用户文件被 clean -fd 抹掉了 —— 这一条出口以前一个字都不说
+    expect(res.cleaned).toBeDefined()
+    expect(res.cleaned!.join('\n')).toContain('precious-user-file.txt')
+  })
+
+  it('集成工作区被切到别的分支:拒绝重试,并说清它在哪儿', async () => {
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    await seedShared()
+    const n = node('e1')
+    const lease = await p.acquire(n)
+    if ('error' in lease) throw new Error(lease.error)
+    n.worktree = { branch: lease.branch, path: lease.path }
+    await writeFile(join(lease.path, 'shared.txt'), 'from e1\n')
+
+    // 有人把共享的集成工作区切走了(run 002 复用 run 001 留下的目录就是这个形状)
+    await git(['-C', intPathOf(), 'checkout', '-q', '-b', 'somebody-elses-branch'], gitRoot)
+    await writeFile(join(intPathOf(), 'shared.txt'), 'dirty\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.ok).toBe(false)
+    if (res.ok || res.kind !== 'infra') throw new Error('expected infra')
+    expect(res.message).toContain('somebody-elses-branch')
+    expect(res.message).toContain('efftask/001/integration')
+    // 没有把这个节点的提交合进别人的分支
+    const theirs = await git(['log', '--oneline', 'somebody-elses-branch'], gitRoot)
+    expect(theirs.stdout).not.toContain('e1')
+  })
+})

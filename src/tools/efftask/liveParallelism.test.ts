@@ -30,12 +30,12 @@ const reply = (req: { prompt: string }, body: string): string => {
   const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
   return '```' + tag + '\n' + body + '\n```'
 }
-const THREE_LEAVES = '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a",' +
+const THREE_LEAVES = '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿",' +
   '"children":[{"title":"甲","deps":[]},{"title":"乙","deps":[]},{"title":"丙","deps":[]}]}'
-const FIVE_LEAVES = '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a",' +
+const FIVE_LEAVES = '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿",' +
   '"children":[{"title":"甲","deps":[]},{"title":"乙","deps":[]},{"title":"丙","deps":[]},' +
   '{"title":"丁","deps":[]},{"title":"戊","deps":[]}]}'
-const LEAF = '{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}'
+const LEAF = '{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}'
 
 describe('RunControl 的并发度旋钮', () => {
   it('没调过时是 undefined —— 那是「按关口批准的那个数走」,不是 0', () => {

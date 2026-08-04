@@ -68,6 +68,24 @@ describe('圆桌记录读得回来 —— step 今天就在被丢,strictness 会
     expect(got.acceptLog[0]!.strictness).toBeUndefined()
     expect(got.acceptLog[0]!.synthesized.blockingSummary).toBe('[main] 缺回滚方案')
   })
+
+  /**
+   * `voided` 是同一行上的第三个字段,而它丢掉的后果最刺眼:一条**已作废**的裁决恢复之后
+   * 重新长得和真裁决一模一样 ——「node.md 上读得出哪一轮不算数」这个承诺只活到下一次
+   * `--resume`。step / strictness 各自死在这里过一次,这条是替第三个字段站岗的。
+   */
+  it('voided 也活过一次落盘+读回,非法值照旧丢掉', () => {
+    const why = '测试验证环节改动了工作区,该轮裁决作废'
+    const n = mk({ acceptLog: [rec({ step: 'verify', voided: why })] })
+    const disk = JSON.parse(JSON.stringify(n)) as TaskNode
+    expect(serializeNode(disk)).toContain('已作废')
+    expect(validateLoadedNodes([disk], OPTS).nodes[0]!.acceptLog[0]!.voided).toBe(why)
+    // 空串和非字符串都不算「作废」—— 否则渲染出一个空的 [已作废:]
+    for (const bad of ['', 42, {}] as never[]) {
+      const got = validateLoadedNodes([mk({ acceptLog: [rec({ voided: bad })] })], OPTS).nodes[0]!
+      expect(got.acceptLog[0]!.voided).toBeUndefined()
+    }
+  })
 })
 
 describe('run.md 里的档位读得回来', () => {
@@ -167,7 +185,7 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
     const n = mk({ kind: 'executable', status: 'PLANNING' })
@@ -185,7 +203,7 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
     const n = mk({ kind: 'executable', status: 'PLANNING' })
@@ -203,7 +221,7 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
   const threeSeatsOneReject = async (strictness?: '初级'): Promise<TaskNode> => {
     let i = 0
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       const reject = i++ === 0
       return vtag(req) + `\n{"pass":${!reject},"blocking":${reject ? '["小问题"]' : '[]'},"comments":""}\n` + '```'
     }
@@ -247,7 +265,7 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
      */
     const failedOnce = new Set<string>()
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       const who = req.role?.roleName ?? 'main'
       if (!failedOnce.has(who)) { failedOnce.add(who); throw new Error('provider unreachable') }
       return who === 'b'
@@ -280,7 +298,7 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
     let reviewRound = 0
     const runAgent: RunAgentFn = async req => {
       seen.push({ phase: req.phase, prompt: req.prompt })
-      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       reviewRound++
       // 第一轮:两席赞成一席反对 → 专家(全票)不通过。此刻用户降档。
       if (reviewRound <= 3) {

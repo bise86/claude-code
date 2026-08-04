@@ -20,9 +20,16 @@ export interface Lease {
 }
 
 export type MergeResult =
-  | { ok: true; merged: boolean }
-  | { ok: false; kind: 'conflict'; files: string[] }
-  | { ok: false; kind: 'infra'; message: string }
+  /**
+   * `cleaned`:合并失败后从集成工作区里被 `reset --hard` / `clean -fd` 抹掉的路径。
+   *
+   * 必须报出去。那个目录是产品**主动告诉用户可以复用**的(启动关口上印着「集成工作区
+   * (下次运行会复用)」),在里面被抹掉的东西不能无声消失 —— 静默清理和静默截断是同一类
+   * 毛病。空/缺省 = 什么都没清。
+   */
+  | { ok: true; merged: boolean; cleaned?: string[] }
+  | { ok: false; kind: 'conflict'; files: string[]; cleaned?: string[] }
+  | { ok: false; kind: 'infra'; message: string; cleaned?: string[] }
 
 /**
  * Serialises an async section. `acquire` and `merge` each need one: measured, 5 concurrent
@@ -282,6 +289,24 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         // reported every git failure as a conflict with a fabricated file list.
         const conflicts = await git(['diff', '--name-only', '--diff-filter=U'], intPath)
         const files = conflicts.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        /**
+         * 不是冲突的那一支:量一下这棵树到底脏在哪 —— **必须在 reset 之前**。
+         *
+         * 实测事故(跑机 run 001):方案席和两个评审席都 `cd .efftask-worktrees/integration`
+         * 跑了 `devenv shell cargo check --workspace`,devenv 改写了**受跟踪的** devenv.lock;
+         * 40 分钟后这个节点验收全过,合并却报
+         * 「您对下列文件的本地修改将被合并操作覆盖:devenv.lock」——
+         * 节点阻断,9 个兄弟全部「依赖阻断」,整个 run 死掉。
+         *
+         * 真冲突那一支不量:`status --porcelain` 那时列的是 UU 之类的冲突路径,把它们报成
+         * 「被清掉的用户改动」是在说假话。
+         */
+        // `core.quotepath=false`:否则中文/非 ASCII 路径在这里是 `"\344\270\255..."`,
+        // 而这串东西会一路进 node.md 给人看。
+        const cleaned = files.length > 0
+          ? []
+          : (await git(['-c', 'core.quotepath=false', 'status', '--porcelain'], intPath)).stdout
+            .split('\n').map(l => l.trim()).filter(Boolean)
         // Leave the integration worktree usable either way.
         //
         // On a genuine conflict MERGE_HEAD exists and `merge --abort` would also work. The
@@ -297,6 +322,68 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         await git(['reset', '--hard'], intPath)
         await git(['clean', '-fd'], intPath)
         if (files.length > 0) return { ok: false, kind: 'conflict', files }
+        /**
+         * 洗完**重试一次**。
+         *
+         * 清理动作原来只有上面那两句,而它跑在合并失败**之后** —— 于是第一次合并必然撞上
+         * 别人留下的脏东西,阻断;下一次运行反而是干净的。晚了整整一次合并。
+         *
+         * 为什么是「失败后洗+重试」而不是「合并前无条件洗」:intPath 是**共享**的,而
+         * 集成验收就在里面开会(`withIntegrationRead`),这个文件上面记过一次实测——
+         * 「a reviewer saw conflict markers and a live MERGE_HEAD mid-review, and clean -fd
+         * deleted its scratch files」。把清理常态化 = 把那个已经量到的破坏从「罕见」提成
+         * 「每次」。后置方案在正常路径上一次都不洗。
+         *
+         * 前提是真 git 量过的:合并因本地修改被拒时**工作树一个字节都没动**、没有
+         * MERGE_HEAD,所以「洗掉本地修改再合一次」不会丢掉任何已经合进去的东西。
+         * 只在确实洗掉了东西时重试 —— 树本来就干净的话,第二次会用同样的输入得到同样的失败。
+         */
+        if (cleaned.length > 0) {
+          /**
+           * **重试之前必须确认这棵树真的在集成分支上。** 验收实测过不确认的后果:
+           * `intPath` 不带 runId、`dispose()` 从不删它、`init()` 只用 `rev-parse --git-dir`
+           * 判复用 —— 于是 run 002 会接手 run 001 留下的集成工作区,它的 HEAD 还在
+           * `efftask/001/integration` 上。这时候重试会**把本节点的提交合进别人的分支**,
+           * 然后再洗一遍这棵树;而 `isMerged` 判的是 `efftask/002/integration`,永远为假,
+           * 于是阻断卡叫用户 `--retry-blocked`,每重试一次就再毁一次 —— 一句自信而错误的
+           * 建议驱动的破坏循环。宁可在这里如实报错。
+           */
+          const head = await git(['rev-parse', '--abbrev-ref', 'HEAD'], intPath)
+          const on = head.stdout.trim()
+          if (head.code !== 0 || on !== intBranch) {
+            return {
+              ok: false, kind: 'infra', cleaned,
+              message: `集成工作区 ${intPath} 当前在 ${on || '(未知)'} 上,不是集成分支 ${intBranch};` +
+                `拒绝在它上面重试合并(那会把本节点的提交合进别的分支)。` +
+                `请把它切回 ${intBranch},或删掉该目录让下次运行重建。`,
+            }
+          }
+          const again = await git(['merge', '--no-edit', branch], intPath)
+          if (await isMerged(branch)) return { ok: true, merged: true, cleaned }
+          const retryConflicts = await git(['diff', '--name-only', '--diff-filter=U'], intPath)
+          const retryFiles = retryConflicts.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+          await git(['reset', '--hard'], intPath)
+          await git(['clean', '-fd'], intPath)
+          /**
+           * `cleaned` 要跟着**每一条**出口走。验收实测:只有成功那条带它,而失败那两条
+           * 恰恰是用户最需要知道「我刚才丢了什么」的时刻 —— 一个未跟踪的用户文件被
+           * clean -fd 抹掉、重试又撞冲突,node.md / 阻断卡 / run.md 里一个字都没有。
+           */
+          if (retryFiles.length > 0) return { ok: false, kind: 'conflict', files: retryFiles, cleaned }
+          return {
+            ok: false, kind: 'infra', cleaned,
+            /**
+             * **别把 git 的成功输出当失败原因念给用户听。**
+             *
+             * `stderr || stdout` 是从上面那条抄来的惯用法,但只有重试这一格会稳定命中
+             * 「git 命令 rc=0、`isMerged` 仍为假」:实测端到用户面前的是
+             * 「合并失败(基础设施): Updating 8533347..e866727 / Fast-forward / 2 files changed」。
+             */
+            message: `合并命令已执行,但集成分支 ${intBranch} 没有前进` +
+              `(已清理集成工作区的本地改动 ${cleaned.length} 处并重试一次)。` +
+              `git 输出:${again.stderr.trim() || again.stdout.trim() || '(空)'}`,
+          }
+        }
         return { ok: false, kind: 'infra', message: merge.stderr.trim() || merge.stdout.trim() || '合并未生效' }
       })
     },

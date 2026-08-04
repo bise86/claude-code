@@ -95,7 +95,7 @@ describe('等人超时:每个环节给的都必须是等人那一版建议', () 
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan' && !planned) {
         planned = true
-        return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       throw new PhaseTimeoutError(7 * 24 * 60 * 60 * 1000, 'human')
     }
@@ -124,7 +124,7 @@ describe('等人超时:每个环节给的都必须是等人那一版建议', () 
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan' && !planned) {
         planned = true
-        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n\u0060\u0060\u0060'
+        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       }
       throw new PhaseTimeoutError(600_000, 'stall')
     }

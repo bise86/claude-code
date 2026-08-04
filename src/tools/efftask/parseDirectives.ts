@@ -212,9 +212,9 @@ export async function parseDirectives(
     for (const phase of Object.keys(kept) as PhaseName[]) {
       if ((base.skipSteps ?? []).includes(phase)) {
         base.notices.push(`你对「${PHASE_LABEL[phase]}」提的那段要求不会生效:这次运行整个跳过了这个环节`)
-      } else if ((phase === 'verify' || phase === 'observer') && base.phaseRoles[phase].length === 0) {
-        base.notices.push(`你对「${PHASE_LABEL[phase]}」提的那段要求不会生效:没给这个环节配角色,它这次不会发生`)
       }
+      // 「没配角色」那一条**不在这里判** —— 席位要到下面 `applyDefs` 那一步才从 roleDefs
+      // 落进 `phaseRoles`。见函数末尾。
     }
     if (Object.keys(kept).length > 0) base.phaseGuidance = kept
   }
@@ -337,6 +337,22 @@ export async function parseDirectives(
    * 而他的名册里那个角色叫「架构评审」—— 没有这条 notice,那段话谁也读不到,
    * 而关口上一切正常。
    */
+  /**
+   * 点给一个**这次不会跑**的环节:说出来。判在 `applyDefs` 之后,理由和下面那条逐字相同。
+   *
+   * 实测说过一次假话:run.md 里印着「你对『测试验证』提的那段要求不会生效:没给这个环节配
+   * 角色,它这次不会发生」,而同一份 run.md 的 `phaseRoles.verify` 挂着测试官,这一关实跑了
+   * 3 轮。原因就是判早了 —— 那时候席位还只在 `roleDefs` 里(`stage: verify`),
+   * 还没被 `applyDefs` 落到名册上。
+   *
+   * 判据仍和 `phaseRuns` 一致:只有 verify / observer 是「没配角色就整个不存在」。
+   */
+  for (const phase of Object.keys(cfg.phaseGuidance ?? {}) as PhaseName[]) {
+    if ((cfg.skipSteps ?? []).includes(phase)) continue // 上面已经按「整个跳过」报过了
+    if (phase !== 'verify' && phase !== 'observer') continue
+    if (cfg.phaseRoles[phase].length > 0) continue
+    cfg.notices.push(`你对「${PHASE_LABEL[phase]}」提的那段要求不会生效:没给这个环节配角色,它这次不会发生`)
+  }
   const seatNames = new Set<string>()
   for (const seats of Object.values(cfg.phaseRoles)) {
     for (const s of seats) {

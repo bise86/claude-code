@@ -24,7 +24,7 @@ function ctxFor(nodes: TaskNode[], runAgent: RunAgentFn, config = cfg()): Pipeli
 }
 
 const PLAN_REPLY =
-  '```json\n{"kind":"decompose","solution":"三步走:先设计接口,再实现服务,最后补集成测试并接上回调验签","keyPoints":"要点","risks":"风险","acceptance":"验收点",' +
+  '```json\n{"kind":"decompose","solution":"三步走:先设计接口,再实现服务,最后补集成测试并接上回调验签","keyPoints":"要点","risks":"风险","acceptance":"跑 bun test 全绿,接口有回调验签",' +
   '"children":[{"title":"设计接口","deps":[]},{"title":"实现服务","deps":["设计接口"]}]}\n```'
 
 describe('根方案关口 · 起草', () => {
@@ -36,7 +36,9 @@ describe('根方案关口 · 起草', () => {
     if (!res.ok) return
     expect(res.draft.kind).toBe('decompose')
     expect(res.draft.plan.solution).toContain('三步走')
-    expect(res.draft.plan.acceptance).toBe('验收点')
+    // 逐字往返,不是子串:降成 toContain 之后,一个在解析层给 acceptance 追加内容的改动
+    // 照样全绿 —— 实测验证过。夹具从「验收点」换成这句只是因为前者过不了占位词判据。
+    expect(res.draft.plan.acceptance).toBe('跑 bun test 全绿,接口有回调验签')
     expect(res.draft.children.map(c2 => c2.title)).toEqual(['设计接口', '实现服务'])
     // Only the first level: nothing here creates grandchildren.
     expect(res.draft.children.every(c2 => Object.keys(c2).sort().join() === 'deps,title')).toBe(true)
@@ -447,7 +449,7 @@ describe('第三关起草时要用和 run 一样的隔离规则', () => {
     const runAgent = (async (req: { prompt: string }) => {
       prompts.push(req.prompt)
       const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
-      return '```' + tag + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      return '```' + tag + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     }) as never
     const root = makeRootNode(cfg(), NOW)
     await draftRootPlan({
@@ -462,7 +464,7 @@ describe('第三关起草时要用和 run 一样的隔离规则', () => {
     const runAgent = (async (req: { prompt: string }) => {
       prompts.push(req.prompt)
       const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
-      return '```' + tag + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      return '```' + tag + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     }) as never
     const root = makeRootNode(cfg(), NOW)
     await draftRootPlan({ root, config: cfg(), runAgent, signal: new AbortController().signal })

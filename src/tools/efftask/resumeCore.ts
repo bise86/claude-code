@@ -261,6 +261,14 @@ function roundArray(v: unknown, onDrop?: () => void): RoundtableRecord[] {
       ...(typeof r.step === 'string' && (PHASE_NAMES as readonly string[]).includes(r.step)
         ? { step: r.step as PhaseName } : {}),
       ...(isStrictness(r.strictness) ? { strictness: r.strictness } : {}),
+      /**
+       * `voided` 会死在**同一行**上,理由和上面 step / strictness 逐字相同。
+       *
+       * 它的后果是三个里最刺眼的一种:一条**已作废**的裁决恢复之后重新长得和真裁决一模一样
+       * ——「node.md 上读得出哪一轮不算数」这个承诺只活到下一次 `--resume`。
+       * 校验按同一条规矩:只认非空字符串(手改 node.md 是一条绕开全部上游校验的路)。
+       */
+      ...(typeof r.voided === 'string' && r.voided.length > 0 ? { voided: r.voided } : {}),
     }))
 }
 
@@ -619,6 +627,10 @@ export function validateLoadedNodes(
     // a truthy non-boolean (`capBlocked: "yes"`) would let the retry path reopen a node no
     // valve ever stopped. Only a real `true` counts; everything else means "not a valve".
     if (n.capBlocked !== undefined && n.capBlocked !== true) n.capBlocked = false
+    // 同一条纪律。这个标志决定「补验收点那一次重拟还欠不欠」,一个真值非布尔
+    // (`planRetried: "yes"`)会让恢复回来的节点**永远**补不了那一次;写坏成 false 则相反,
+    // 每一次恢复都多烧一次方案调用。只有真的 true 算已经补过。
+    if (n.planRetried !== undefined && n.planRetried !== true) n.planRetried = false
     // Same discipline as capBlocked one line up, and it was missing: node.md is hand-editable,
     // and reseat chooses which PHASE a retried node re-enters from this string. A garbage or
     // non-string value silently took the executable seat — the review-bypass this field exists

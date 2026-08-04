@@ -41,7 +41,7 @@ function cooperative(plan: string): RunAgentFn {
   }) as unknown as RunAgentFn
 }
 
-const EXECUTABLE_PLAN = '{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}'
+const EXECUTABLE_PLAN = '{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}'
 
 describe('人工解决合并冲突后,--resume 真的接手', () => {
   // The escalation card tells the user: fix the conflict in the worktree, then run
@@ -360,7 +360,7 @@ describe('spec §4.1 补救拆分:在真实调度器下端到端跑通', () => {
         // root 先拆一个子任务;补救出来的子节点自己是可执行叶子。
         return `\`\`\`${tag}\n${req.prompt.includes('补救') || req.prompt.includes('AA')
           ? EXECUTABLE_PLAN
-          : '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"a","children":[{"title":"AA","deps":[]}]}'}\n\`\`\``
+          : '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿","children":[{"title":"AA","deps":[]}]}'}\n\`\`\``
       }
       if (req.phase === 'execute') return `\`\`\`${tag}\n{"execStatus":"改完并通过测试"}\n\`\`\``
       // 集成验收:前 3 次(maxIterations)全否,并给出补救子任务;之后放行。

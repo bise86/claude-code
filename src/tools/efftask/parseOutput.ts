@@ -90,12 +90,38 @@ function sliceTopLevelObject(t: string): string | null {
   return null
 }
 
+/**
+ * 修掉模型写坏的 JSON 转义 —— **只在文本已经解析失败之后**才跑。
+ *
+ * 实测事故:方案师在 acceptance 里写 `` "最后一行含 \"Finished \`dev\` profile\"" ``,
+ * `` \` `` 不是合法的 JSON 转义,`JSON.parse` 整份文档抛 `Invalid escape character`。
+ * 后果不是「少一个字段」而是**整份方案回退成散文**(见 `parsePlanOutput` 的 fallback):
+ * 一个字符换来一个没有验收点的节点,而 node.md 上看不出解析失败过。
+ *
+ * **写法必须是「左到右先消费合法转义对」,不能用 lookahead 逐个删非法反斜杠。** 评审实测:
+ * `{"a":"x\\\`y"}` 里的 `\\` 是**合法**的(一个真反斜杠),而按「`\` 后面不是
+ * `"\/bfnrtu` 就删掉」扫,正则会从第二个反斜杠重新起扫、把它当非法吃掉,合法的 JSON
+ * 当场被改坏(`{"a":"C:\\path"}` → `{"a":"C:\path"}`,反而 parse 不了了)。
+ *
+ * 两个坑都是踩出来的:`u` **不能**并进简单转义那个字符类(否则 `\uZZZZ` 走第二支被原样
+ * 保留,仍然 parse 失败);第二支用 `[\s\S]` 而不是 `.`(`\` 后面可能是换行)。
+ */
+function fixEscapes(s: string): string {
+  return s.replace(
+    /\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])|\\([\s\S])/g,
+    (m, bad: string | undefined) => (bad === undefined ? m : bad),
+  )
+}
+
 function collectCandidates(text: string, preferTag?: string): Candidate[] {
   const tagged: string[] = []
   const generic: string[] = []
   for (const m of text.matchAll(FENCE_RE)) {
     const tag = (m[1] ?? '').toLowerCase()
-    if (preferTag && tag === preferTag) tagged.push(m[2])
+    // 两边都 lowercase。左边一直是,右边不是 —— 今天不触发(`answerTag` 只产小写字母),
+    // 但一个混大小写的 tag 会让 tagged 组恒空、**静默降级**到 generic 兜底,而那一层
+    // 正是 requireTag 要挡的东西。
+    if (preferTag && tag === preferTag.toLowerCase()) tagged.push(m[2])
     else generic.push(m[2])
   }
   const out: Candidate[] = []
@@ -112,7 +138,12 @@ function collectCandidates(text: string, preferTag?: string): Candidate[] {
       // sit inside an array.
       const slice = sliceTopLevelObject(t)
       if (slice === null) return
-      try { parsed = JSON.parse(slice) } catch { return }
+      try { parsed = JSON.parse(slice) } catch {
+        // 最后一次机会:修掉坏转义再 parse。**只修 slice,不修整段** —— 上面那条
+        // 「不许从数组里挖元素」的判据是 `sliceTopLevelObject` 给的,绕过它去修整段
+        // 等于把那道防线拆掉。修不好就照旧丢弃。
+        try { parsed = JSON.parse(fixEscapes(slice)) } catch { return }
+      }
     }
     // Valid JSON that isn't a plain object (an array, a number, a string) is not
     // an answer. Disqualify the whole source rather than digging into it: an
@@ -251,7 +282,67 @@ export function capResponses(v: unknown): string[] {
   return items.length === 0 ? [] : capBlockingList(items, '回应')
 }
 
-export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] } {
+/**
+ * 占位词。写了字但等于没写。
+ *
+ * 验收实测:`keyPoints/risks/acceptance` 填 `'无'/'无'/'无'`、`'a'/'b'/'c'`、`'-'`、`'。'`
+ * 时 planGaps **一条都不报** —— 那个函数的立意是挡「模型偷懒」,而模型写三个「无」就
+ * 完全绕过,连那次自动重拟都不会触发。只判空白是不够的。
+ *
+ * **住在这个文件里,而不是 `rootPlan.ts`。** 它原来在那边,而现在 `pipeline.ts` 也要用它
+ * (子节点的验收点同样不能只判 `=== ''`,否则刚补上的洞在另一扇门上重开)——
+ * 但 `rootPlan.ts` 已经 `import … from './pipeline.js'`,反向再导一次就成环。
+ * `parseOutput.ts` 是叶子(只 import `types.js`),放这里两边都能拿。
+ */
+const PLACEHOLDER = new Set([
+  '无', '暂无', '没有', '不适用', '略', '待定', '待补充', '同上', 'n/a', 'na', 'none', 'nil', 'tbd', 'todo', '-', '--', '/',
+])
+/** 字段短到这个程度也只能是占位。 */
+export const MIN_FIELD_CHARS = 4
+
+export function hollow(v: unknown): boolean {
+  if (typeof v !== 'string') return true
+  const t = v.trim()
+  if (t.length === 0) return true
+  // 去掉标点空白再判,'。'、'——'、'…' 这类也算空
+  const core = t.replace(/[\s\-—…·。,.;:!?、"'`~*#\[\]()（）【】]/g, '')
+  if (core.length === 0) return true
+  if (PLACEHOLDER.has(core.toLowerCase())) return true
+  return Array.from(core).length < MIN_FIELD_CHARS
+}
+
+/**
+ * 带本轮 tag 的围栏里,有没有哪一个**连修完转义都 parse 不出对象**。
+ *
+ * 单独扫一遍,而不是从 `collectCandidates` 的返回值里推 —— 那里推不出来:tagged/generic
+ * 分组是函数内的局部变量,解析失败的那些直接 `return` 掉了,`pickAnswer` 往外只透
+ * `{obj, ambiguous}`。用 `obj === null` 近似会把三件事混成一件(**围栏坏了** / 围栏好但
+ * 缺 plan 字段 / 压根没有围栏),而这个布尔的唯一用途是让重拟提示词对模型说一句
+ * 「你上一轮的 JSON 没解析成功」—— 后两种情形下那句话是**假的**,而「提示词里说假话」
+ * 正是这个仓库反复在修的那一类。
+ */
+function taggedBlockBroken(text: string, tag: string): boolean {
+  const want = tag.toLowerCase()
+  for (const m of text.matchAll(FENCE_RE)) {
+    if ((m[1] ?? '').toLowerCase() !== want) continue
+    const t = m[2].trim()
+    const ok = (raw: string): boolean => {
+      try {
+        const o: unknown = JSON.parse(raw)
+        return !!o && typeof o === 'object' && !Array.isArray(o)
+      } catch { return false }
+    }
+    if (ok(t) || ok(fixEscapes(t))) continue
+    return true
+  }
+  return false
+}
+
+export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
+  kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[]
+  /** 本轮 tag 的围栏在场、但解析不出对象。见 `taggedBlockBroken`。 */
+  parseFailed: boolean
+} {
   // A plan carries at least one plan-ish key; a bare echo of the goal has none.
   // Ambiguity is tolerated here: a wrong plan is caught by the review roundtable.
   const { obj } = pickAnswer(text, tag, o => 'solution' in o || 'kind' in o || 'children' in o)
@@ -273,7 +364,9 @@ export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
     })
     .filter(c => c.title.length > 0)
   const kind: NodeKind = obj?.kind === 'decompose' && children.length > 0 ? 'decompose' : 'executable'
-  return { kind, plan, children }
+  // 只在**回退发生了**的时候才去扫围栏(obj 非空 = 解析成功,没什么可报告的),省掉
+  // 正常路径上每个节点一次的额外正则遍历。
+  return { kind, plan, children, parseFailed: obj === null && taggedBlockBroken(text, tag) }
 }
 
 export function parseVerdict(text: string, role: string, tag?: string): Verdict {

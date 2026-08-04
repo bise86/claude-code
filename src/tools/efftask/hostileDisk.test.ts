@@ -124,6 +124,9 @@ function richNode(): TaskNode {
   n.mergeConflict = true
   n.capBlocked = true
   n.capCategory = 'rework'
+  // 「补验收点那一次已经用掉了」。写坏成真值非布尔会让恢复回来的节点永远补不上,
+  // 而它和 capBlocked 走的是同一条 `!== true → false` 纪律。
+  n.planRetried = true
   // 补救拆分 already used once — the flag that stops it happening twice, which is the bound
   // the whole cost argument for that feature rests on.
   n.revised = true
@@ -259,7 +262,9 @@ async function driveRecovery(nodeMd: string, intactField?: keyof TaskNode): Prom
       expect(n.iteration[c]).toBeGreaterThanOrEqual(0)
     }
     // The three booleans reseat keys on, all matched with === true.
-    for (const f of ['interrupted', 'mergeConflict', 'capBlocked'] as const) {
+    // `planRetried` 走同一条纪律,但它管的是钱:写坏成一个真值非布尔会让恢复回来的节点
+    // **永远**补不上验收点;写坏成 false 则每次恢复都多烧一次方案调用。
+    for (const f of ['interrupted', 'mergeConflict', 'capBlocked', 'planRetried'] as const) {
       expect(n[f] === undefined || typeof n[f] === 'boolean').toBe(true)
     }
     // 各阶段耗时 is divided by 1000 and rendered; NaN reads as "NaNs" and a negative reads as

@@ -358,7 +358,7 @@ describe('--retry-blocked 不能让被否掉的方案绕过评审', () => {
       runAgent: async req => {
         phases.push(req.phase)
         return req.phase === 'plan'
-          ? '```json\n{"kind":"executable","solution":"改好的方案","keyPoints":"","risks":"","acceptance":"a"}\n```'
+          ? '```json\n{"kind":"executable","solution":"改好的方案","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
           : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":true,"blocking":[],"comments":""}\n```'
       },
     })
@@ -477,7 +477,7 @@ describe('capCategory:落盘、校验、和旧版本 node.md 的兼容', () => {
       reserveNodes: () => ({ release: () => {} }),
       runAgent: async req =>
         req.phase === 'plan'
-          ? '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n\u0060\u0060\u0060'
+          ? '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
           : '\u0060\u0060\u0060' + (req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":false,"blocking":["不行"],"comments":""}\n\u0060\u0060\u0060',
     })
     // The valve tripped on REVIEW, and stepStart had already written kind='executable'.

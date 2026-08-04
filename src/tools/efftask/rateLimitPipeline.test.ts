@@ -50,7 +50,7 @@ describe('分析环节吃到 429', () => {
       if (req.phase === 'plan') {
         calls++
         if (calls === 1) rateLimit()
-        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
@@ -155,7 +155,7 @@ describe('总时长超限:一直有输出但太慢', () => {
     const roster = { ...emptyPhaseRoles(), review: [{ roleName: 'a' }, { roleName: 'b' }] }
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
-        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       totalTimeout()
     }
@@ -182,7 +182,7 @@ describe('多角色圆桌耗尽在限流上 —— 用户报的正是这个场�
     const roster = { ...emptyPhaseRoles(), review: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
-        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       if (req.role?.roleName === 'b') rateLimit()
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -208,7 +208,7 @@ describe('执行环节吃到 429', () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'execute') { execCalls++; rateLimit() }
       if (req.phase === 'plan') {
-        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }

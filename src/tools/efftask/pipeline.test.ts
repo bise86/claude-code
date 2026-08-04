@@ -57,7 +57,7 @@ describe('pipeline', () => {
     const n = root()
     const runAgent: RunAgentFn = async req =>
       req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"do it","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"do it","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     const ctx = ctxFor([n], runAgent)
     await stepStart(n, ctx)
@@ -108,7 +108,10 @@ describe('pipeline', () => {
     expect(n.iteration.planReview).toBe(DEFAULT_CAPS.maxIterations)
     expect(n.blockedReason).toContain('评审迭代超限') // reason recorded, execStatus untouched
     expect(n.blockedReason).toContain('缺验收点')
-    expect(n.execStatus).toBe('')
+    // execStatus 里**没有执行者写的东西** —— 这一轮根本没派执行者。
+    // 编排器注记不算(这份 fixture 的方案确实没有验收点,补一次仍然没有,那件事要留痕);
+    // 判据因此是前缀,不是空串。
+    expect(n.execStatus.split('\n').filter(Boolean).every(l => l.startsWith('(注:'))).toBe(true)
   })
 
   it('stepExecute executable => execute + accept pass => ACCEPTED', async () => {
@@ -205,7 +208,9 @@ describe('pipeline', () => {
     expect(n.blockedReason).toContain('依赖成环')
     expect(n.childIds).toEqual([])
     expect(ctx.byId.size).toBe(1) // NO partial children left behind on a rejected group
-    expect(planPrompts[1]).toContain('成环') // the cycle was fed back as revision feedback
+    // 按内容找,不按下标找:方案缺验收点时中间会插一次「补验收点」的调用,
+    // 而这条断言要的是「成环被当成修订意见喂回去了」,不是「它恰好是第 2 次调用」。
+    expect(planPrompts.some(p => p.includes('成环'))).toBe(true)
   })
 
   it('stepStart: review fails once then passes => READY, revision prompt shows the previous plan', async () => {
@@ -213,7 +218,7 @@ describe('pipeline', () => {
     let reviewCalls = 0
     const planPrompts: string[] = []
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') { planPrompts.push(req.prompt); return '```json\n{"kind":"executable","solution":"写入 hello.txt","acceptance":"a"}\n```' }
+      if (req.phase === 'plan') { planPrompts.push(req.prompt); return '```json\n{"kind":"executable","solution":"写入 hello.txt","acceptance":"跑 bun test 全绿"}\n```' }
       reviewCalls++
       return reviewCalls === 1
         ? vtag(req) + '\n{"pass":false,"blocking":["补充验收点"],"comments":""}\n```'
@@ -357,7 +362,11 @@ describe('pipeline', () => {
     }
     await stepExecute(n, ctxFor([n], runAgent))
     const acceptPromptText = prompts[1]
-    expect(acceptPromptText).toContain('本节点未定义验收点') // blank reads as blank, not as satisfied
+    // 空要读起来是空 —— 而且要读起来是**方案的缺陷**,不是「你自己想一个」。
+    // 后者实测会让裁决员每一轮从目标里另挑一批判据(见 noAcceptanceFallback)。
+    expect(acceptPromptText).toContain('没有验收点')
+    expect(acceptPromptText).toContain('方案未定义验收点')
+    expect(acceptPromptText).toContain('不要每一轮从目标里另挑一批新判据')
   })
 
   it('aborting during the acceptance roundtable blocks instead of accepting', async () => {
@@ -393,7 +402,7 @@ describe('pipeline', () => {
 
   it('a failed persist stops the node instead of running on unrecoverable state', async () => {
     const n = root()
-    const runAgent: RunAgentFn = async () => '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+    const runAgent: RunAgentFn = async () => '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
     let writes = 0
     const ctx: PipelineCtx = {
       ...ctxFor([n], runAgent),
@@ -446,7 +455,8 @@ describe('pipeline', () => {
     expect(n.status).toBe('BLOCKED')
     expect(ctx.byId.size).toBe(1) // nothing attached
     expect(n.childIds).toEqual([])
-    expect(prompts[1]).toContain('标题重复') // retried with actionable feedback first
+    // 同上:按内容找,不按下标找。
+    expect(prompts.some(p => p.includes('标题重复'))).toBe(true)
     expect(n.blockedReason).toContain('拆分迭代超限')
   })
 
@@ -467,7 +477,7 @@ describe('pipeline', () => {
     const seen: Record<string, string> = {}
     const runAgent: RunAgentFn = async req => {
       seen[req.phase] = req.prompt
-      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
       if (req.phase === 'execute') return '```exec\n{"execStatus":"做完了"}\n```'
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
@@ -588,7 +598,7 @@ describe('the node-count cap must hold when decompositions overlap', () => {
 describe('观察评分 is advisory by default and bounded when it is not', () => {
   const scoreTag = (req: { prompt: string }) =>
     '```' + (req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score')
-  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
 
   const agentWith = (scores: { plan: number; exec: number }[], seen?: string[]) => {
     let n = 0
@@ -690,7 +700,7 @@ describe('观察评分 is advisory by default and bounded when it is not', () =>
 
 describe('动态生长: an executor grafts children onto any node (spec §4)', () => {
   const etag = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
-  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
   /** Executes once asking to graft, then behaves normally. */
   const grower = (newChildren: unknown, seen?: string[]) => {
     let asked = false
@@ -821,7 +831,7 @@ describe('动态生长: an executor grafts children onto any node (spec §4)', (
     const seen: string[] = []
     const agent = (async (req: { phase: string; prompt: string }) => {
       seen.push(req.phase)
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       // The untagged one: a plain json fence carrying a growth request.
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完","newChildren":[{"title":"偷渡","deps":[]}]}\n```'
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -870,7 +880,7 @@ describe('生长的可寻址性、并发安全与阈值入口', () => {
     const seen: string[] = []
     const agent = (async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'execute') seen.push(req.prompt)
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完"}\n```'
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as RunAgentFn
@@ -897,7 +907,7 @@ describe('生长的可寻址性、并发安全与阈值入口', () => {
         const kid = createNode({ id: 'root/01-塞进来', title: '塞进来', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
         ctx.byId.set(kid.id, kid)
         n.childIds.push(kid.id)
-        return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       // MUST carry the per-call tag: an untagged verdict is rejected fail-closed, and the
       // node would BLOCK in review before this test ever reached what it is checking — the
@@ -926,7 +936,7 @@ describe('隔离下,验收与评分必须读到被验收的工作', () => {
   // Reviewers used to get NO cwd, so the accept roundtable read the main working tree while
   // the change lived only in the node's worktree. They could do nothing but rubber-stamp the
   // executor's own prose — "a reviewer that cannot see the change is not a reviewer".
-  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
 
   it('accept and observer both run in the node worktree', async () => {
     const seen: { phase: string; cwd?: string }[] = []
@@ -986,7 +996,7 @@ describe('隔离下,验收与评分必须读到被验收的工作', () => {
 })
 
 describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后一步', () => {
-  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
   const okAgent = (seen?: string[]) => (async (req: { phase: string; prompt: string }) => {
     seen?.push(req.phase)
     if (req.phase === 'plan') return leafPlan
@@ -1065,6 +1075,46 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     expect(n.blockedReason).toContain('合并冲突')
     expect(n.blockedReason).toContain('src/a.ts')
     expect(n.blockedReason).toContain('/wt/root') // the path the user has to go to
+  })
+
+  /**
+   * 基础设施性的合并失败**必须可恢复** —— 实测过一次不可恢复的:跑机 run 001 里一个
+   * 测试验证 3 轮、验收 1 轮全过的节点,因为集成工作区被别的席位弄脏而合并失败,
+   * 阻断之后 9 个兄弟全部「依赖阻断」,而 `--resume` 和 `--retry-blocked` 都捞不回它。
+   *
+   * 判据是**字段**不是文案:`reseat` 认的是 interrupted / mergeConflict / capBlocked
+   * 三个开关,这一路以前一个都不设。
+   */
+  it('合并的基础设施失败要带 category,否则 reseat 的三个复活开关全灭', async () => {
+    const n = root()
+    const fired: { category?: string; stopped?: boolean }[] = []
+    const ctx = {
+      ...ctxFor([n], okAgent()),
+      worktrees: fakePool({ commitAndMerge: async () => ({ ok: false, kind: 'infra', message: '本地修改将被合并操作覆盖:devenv.lock' }) }) as never,
+      onBlocked: (i: { category?: string; stopped?: boolean }) => { fired.push(i) },
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.capBlocked).toBe(true)
+    expect(n.capCategory).toBe('infra')
+    expect(fired.length).toBe(1)
+    // 产出没丢,而且说得出在哪 —— 这一路不 release 工作区
+    expect(n.blockedReason).toContain('worktree-root')
+    expect(n.blockedReason).toContain('--retry-blocked')
+  })
+
+  it('合并前集成工作区被清理过 → 节点上留得下这条记录', async () => {
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], okAgent()),
+      worktrees: fakePool({ commitAndMerge: async () => ({ ok: true, merged: true, cleaned: [' M devenv.lock'] }) }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.execStatus).toContain('devenv.lock')
+    expect(n.execStatus).toContain('集成工作区')
   })
 
   it('a conflict gets ONE self-resolve attempt by the execute role, inside the worktree', async () => {
@@ -1491,7 +1541,7 @@ describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
   }
   const rejectAll = (req: { phase: string; prompt: string }) =>
     req.phase === 'plan'
-      ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
       : vtag(req) + '\n{"pass":false,"blocking":["还差得远"],"comments":""}\n```'
 
   it('评审迭代超限 → cap-iteration', async () => {
@@ -1585,7 +1635,7 @@ describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
     const n = root()
     const { ctx, fired } = ctxWithBlocks([n], async req =>
       req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
         : (() => { throw new Error('provider down') })())
     await stepStart(n, ctx)
     expect(fired.map(f => f.category)).toEqual(['infra'])
@@ -1822,7 +1872,7 @@ describe('触阀升级:被变异测试指出的 4 个没人管的调用点', () 
     const n = root()
     const { ctx, fired } = ctxWithBlocks([n], async req =>
       req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
         : (() => { throw new PhaseTimeoutError(600_000) })())
     await stepStart(n, ctx)
     expect(fired.map(f => f.category)).toEqual(['timeout'])
@@ -1958,7 +2008,7 @@ describe('确认草稿:只有可执行节点才配没有子任务', () => {
     const ctx = ctxFor([n], async req => {
       calls.push(req.phase)
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
     })
     await stepStart(n, ctx)
@@ -2750,7 +2800,7 @@ describe('各阶段耗时的账目必须和总耗时对得上', () => {
     n.phaseRoles = { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] }
     let merged = false
     const agent = (async (req: { phase: string; prompt: string }) => {
-      if (req.phase === 'plan') { bump(10_000); return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```' }
+      if (req.phase === 'plan') { bump(10_000); return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```' }
       if (req.phase === 'execute') { bump(100_000); return '```json\n{"execStatus":"做完了"}\n```' }
       if (req.phase === 'observer') {
         bump(50_000)
@@ -2859,7 +2909,7 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
     const runAgent: RunAgentFn = async req => {
       seen.push({ role: req.role?.roleName, prompt: req.prompt })
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const n = root()
@@ -2889,7 +2939,7 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') planPrompt = req.prompt
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const n = root()
@@ -2925,7 +2975,7 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
       const runAgent: RunAgentFn = async req => {
         if (req.phase === 'review') p = req.prompt
         return req.phase === 'plan'
-          ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+          ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
           : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
       }
       const n = root()
@@ -3001,7 +3051,7 @@ describe('简报到达剩下那几个调用点', () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'review') seen = req.prompt
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const n = root()
@@ -3016,7 +3066,7 @@ describe('caps.quorum 一路接到节点的评审上', () => {
   // roundtable.test.ts 证明了 runRoundtable 会用 quorum;这一条证明 pipeline 真的把
   // config.caps.quorum 交给了它 —— 少了那一跳,用户在 caps 里配的法定人数毫无作用。
   const twoOfThree = (n: TaskNode): RunAgentFn => async req => {
-    if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     return req.role?.roleName === 'c'
       ? vtag(req) + '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
       : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
@@ -3045,7 +3095,7 @@ describe('方案阶段的多员工:顺序精化,只有一个产出', () => {
   const draft = (solution: string, children: string[] = []) =>
     '```json\n' + JSON.stringify({
       kind: children.length > 0 ? 'decompose' : 'executable',
-      solution, keyPoints: 'k', risks: 'r', acceptance: 'a',
+      solution, keyPoints: 'k', risks: 'r', acceptance: '跑 bun test 全绿',
       children: children.map(t => ({ title: t, deps: [] })),
     }) + '\n```'
   const threeSeat = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
@@ -3150,7 +3200,7 @@ describe('达成结论的圆桌不该因为有席位没打通而被重试', () =
     return {
       count: () => reviews,
       agent: async req => {
-        if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         reviews++
         if (req.role?.roleName === 'c') throw new Error('provider unreachable')
         return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -3190,7 +3240,7 @@ describe('达成结论的圆桌不该因为有席位没打通而被重试', () =
     const seats: string[] = []
     const failedOnce = new Set<string>()
     const agent: RunAgentFn = async req => {
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       const who = req.role?.roleName ?? 'main'
       seats.push(who)
       // b、c 第一次打不通(infra),重派时正常出一份赞成裁决。
@@ -3584,6 +3634,49 @@ describe('测试验证判不通过时,原因必须到达能修它的人', () => 
     expect(prompts.length).toBeGreaterThan(1)
     expect(prompts[1]).toContain('改动了工作区')
   })
+
+  /**
+   * 作废的是**判决效力**,不是它看到的事实。
+   *
+   * 原来这一支把 `feedback` 整个换成「验证者改了工作区」,于是验证者刚指出的真问题
+   * (实测那一条正是「devenv 验证命令会改写受跟踪的锁文件」)一个字都到不了执行者手上 ——
+   * 下一轮它既不知道要修什么,又会被同一个问题挡回来。
+   */
+  it('作废那一轮的阻断意见仍要交给执行者,而且记录上要标明它已作废', async () => {
+    const prompts: string[] = []
+    let calls = 0
+    const pool = {
+      statusFingerprint: async () => { calls++; return calls <= 1 ? 'clean' : ' M a.ts' },
+      commitAndMerge: async () => ({ ok: true }), release: async () => ({ removed: true }),
+      refreshFromIntegration: async () => ({ ok: true }),
+    }
+    let verifies = 0
+    const agent: RunAgentFn = async req => {
+      if (req.phase === 'execute') { prompts.push(req.prompt); return '```json\n{"execStatus":"改了"}\n```' }
+      if (req.phase === 'verify' && ++verifies === 1) {
+        return vtag(req) + '\n{"pass":false,"blocking":["devenv 会改写受跟踪的锁文件"],"comments":""}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const node = n()
+    node.worktree = { branch: 'b', path: '/wt' }
+    await stepExecute(node, { ...ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }), worktrees: pool as never })
+    /**
+     * 断的是**槽位**,不是「整篇里有没有这句话」。
+     *
+     * 那条意见本来就会出现在「历次未通过纪要」那一段(它在 acceptLog 里),所以整篇搜是
+     * 一个恒真的探针 —— 变异测试实测:把这条修复整个去掉,只搜全文的断言照样绿。
+     * 真正的问题在「上一轮…阻断意见」这个槽位:它是提示词里唯一被明说「请针对性返工」的
+     * 那一段,而原来它只装得下一句「验证者改了工作区」。
+     */
+    const slot = prompts[1].slice(prompts[1].indexOf('上一轮验收未通过'), prompts[1].indexOf('请针对性返工'))
+    expect(slot).toContain('改动了工作区')
+    expect(slot).toContain('devenv 会改写受跟踪的锁文件')
+    // 盘上那条记录要自报家门 —— 否则和一条真裁决逐字相同
+    const voidedRec = node.acceptLog.find(r => r.voided !== undefined)
+    expect(voidedRec).toBeDefined()
+    expect(voidedRec!.voided).toContain('该轮裁决作废')
+  })
 })
 
 describe('评分调用失败不该买下一整轮执行(回归)', () => {
@@ -3788,7 +3881,7 @@ describe('分析环节:圆桌(各自出稿 → 融合成一份)', () => {
   const draft = (solution: string, children: string[] = []) =>
     '```json\n' + JSON.stringify({
       kind: children.length > 0 ? 'decompose' : 'executable',
-      solution, keyPoints: 'k', risks: 'r', acceptance: 'a',
+      solution, keyPoints: 'k', risks: 'r', acceptance: '跑 bun test 全绿',
       children: children.map(t => ({ title: t, deps: [] })),
     }) + '\n```'
   const threeSeat = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
@@ -3945,7 +4038,7 @@ describe('圆桌起草必须走并发池', () => {
       peak = Math.max(peak, live)
       await new Promise(r => setTimeout(r, 5))
       live--
-      return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     }
     const seats = ['a', 'b', 'c', 'd', 'e'].map(roleName => ({ roleName }))
     const n = root()
@@ -3969,7 +4062,7 @@ describe('环节跳过:七个都能跳,且跳过 ≠ 通过', () => {
       ...cfg, phaseRoles: n.phaseRoles, skipSteps: skip as never, ...extra }) }
   }
   const ok = (req: { phase: string; prompt: string }) =>
-    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     : req.phase === 'execute' ? '```json\n{"execStatus":"做完了"}\n```'
     : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
 
@@ -4205,7 +4298,7 @@ describe('跳过的环节要在 node.md 上留痕(不是留 PASS,是留「已跳
     return { n, ctx: (agent: RunAgentFn) => ctxFor([n], agent, { ...cfg, phaseRoles: n.phaseRoles, skipSteps: skip as never }) }
   }
   const ok2 = (req: { phase: string; prompt: string }) =>
-    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     : req.phase === 'execute' ? '```json\n{"execStatus":"做完了"}\n```'
     : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
 
@@ -4290,7 +4383,7 @@ describe('两个特性叠加时不能互相踩', () => {
     await stepStart(n, ctxFor([n], async req => {
       seen.push(req.phase)
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }, { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['plan'] as never,
         caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
@@ -4307,7 +4400,7 @@ describe('两个特性叠加时不能互相踩', () => {
     await stepStart(n, ctxFor([n], async req => {
       seen.push(req.phase)
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : '```json\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }, { ...cfg, phaseRoles: n.phaseRoles, skipSteps: ['review'] as never }))
     expect(seen.filter(p => p === 'review')).toEqual([])
@@ -4325,9 +4418,9 @@ describe('圆桌只剩一份稿,和注记不许重复', () => {
     let fused = 0
     await stepStart(n, ctxFor([n], async req => {
       if (req.phase === 'plan') {
-        if (req.prompt.includes('请合成')) { fused++; return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"a"}\n```' }
+        if (req.prompt.includes('请合成')) { fused++; return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```' }
         if (req.role?.roleName !== 'c') throw new Error(`${req.role?.roleName} 挂了`)
-        return '```json\n{"kind":"executable","solution":"c 的独稿","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"c 的独稿","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
@@ -4344,7 +4437,7 @@ describe('圆桌只剩一份稿,和注记不许重复', () => {
     n.phaseRoles = { ...emptyPhaseRoles(), review: [{ roleName: 'r' }] } as typeof n.phaseRoles
     let round = 0
     await stepStart(n, ctxFor([n], async req => {
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       round++
       // 前两轮打回,第三轮放行 —— 让跳过分支被走到三次。
       return vtag(req) + `\n{"pass":${round >= 3},"blocking":${round >= 3 ? '[]' : '["再改"]'},"comments":"c"}\n` + '```'
@@ -4363,7 +4456,7 @@ describe('跳过的注记必须挺过整条链路,而不是只活到 stepStart',
     const n = root()
     n.phaseRoles = { ...emptyPhaseRoles(), ...pr } as typeof n.phaseRoles
     const ctx = ctxFor([n], async (req: { phase: string; prompt: string }) =>
-      req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       : req.phase === 'execute' ? '```json\n{"execStatus":"我改了 src/a.ts"}\n```'
       : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```',
       { ...cfg, phaseRoles: n.phaseRoles, skipSteps: skip as never })
@@ -4440,7 +4533,7 @@ describe('圆桌的匿名与独立必须挺过返工轮', () => {
         planCall++
         // 第一轮:两份稿 R1A / R1B,再融合成 FUSED1。第二轮换一批标记。
         const mark = planCall === 1 ? 'R1A' : planCall === 2 ? 'R1B' : planCall === 3 ? 'FUSED1' : 'R2-' + planCall
-        return '\`\`\`json\n{"kind":"executable","solution":"方案正文-' + mark + '","keyPoints":"k","risks":"r","acceptance":"a"}\n\`\`\`'
+        return '\`\`\`json\n{"kind":"executable","solution":"方案正文-' + mark + '","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n\`\`\`'
       }
       reviewed++
       return vtag(req) + `\n{"pass":${reviewed >= 2},"blocking":${reviewed >= 2 ? '[]' : '["验收点写得不够具体"]'},"comments":"c"}\n` + '\`\`\`'
@@ -4462,7 +4555,7 @@ describe('圆桌的匿名与独立必须挺过返工轮', () => {
 
 describe('复验点出来的四处「行为对、但没人守」', () => {
   const okAll = (req: { phase: string; prompt: string }) =>
-    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+    req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     : req.phase === 'execute' ? '```json\n{"execStatus":"做完了"}\n```'
     : req.phase === 'observer' ? '```score\n{"score":88,"rationale":"还行"}\n```'
     : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -4495,10 +4588,10 @@ describe('复验点出来的四处「行为对、但没人守」', () => {
     n.phaseRoles = { ...emptyPhaseRoles(), plan: ['a', 'b', 'c'].map(roleName => ({ roleName })) } as typeof n.phaseRoles
     await stepStart(n, ctxFor([n], async (req: { phase: string; prompt: string; role?: { roleName: string } }) => {
       if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
-      if (req.prompt.includes('请合成')) return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.prompt.includes('请合成')) return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       // 起草者的提示词里不能出现任何别人的稿子标记。
       drafts.push(req.prompt)
-      return `\`\`\`json\n{"kind":"executable","solution":"稿-${req.role?.roleName}-MARK","keyPoints":"k","risks":"r","acceptance":"a"}\n\`\`\``
+      return `\`\`\`json\n{"kind":"executable","solution":"稿-${req.role?.roleName}-MARK","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n\`\`\``
     }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
     expect(drafts).toHaveLength(3)
     for (const d of drafts) {
@@ -4512,8 +4605,8 @@ describe('复验点出来的四处「行为对、但没人守」', () => {
     const long = 'X'.repeat(5000)
     await stepStart(n, ctxFor([n], async (req: { phase: string; prompt: string; role?: { roleName: string } }) => {
       if (req.phase !== 'plan') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
-      if (req.prompt.includes('请合成')) return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
-      return `\`\`\`json\n{"kind":"executable","solution":"${long}","keyPoints":"k","risks":"r","acceptance":"a"}\n\`\`\``
+      if (req.prompt.includes('请合成')) return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      return `\`\`\`json\n{"kind":"executable","solution":"${long}","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n\`\`\``
     }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
     const alt = n.plan.alternatives![0]
     expect(alt.solution.length).toBeLessThan(long.length)
@@ -4547,7 +4640,7 @@ describe('评审收敛真的接上了', () => {
   /** 每轮都提同一条阻断意见 —— 用户实际撞到的形状。 */
   const alwaysSame = (req: { phase: string; prompt: string }) =>
     req.phase === 'plan'
-      ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
       : vtag(req) + '\n{"pass":false,"blocking":["评分等级与分数的映射规则未定义"],"comments":""}\n```'
 
   it('方案提示词带上**所有轮次**的意见,并点名哪几条是老账', async () => {
@@ -4600,7 +4693,7 @@ describe('评审收敛真的接上了', () => {
     const n = node()
     let i = 0
     const { ctx } = withBlocks([n], async req => {
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
       i++
       // 三条必须是**真的**不一样的文字。第一版写的是「第1个/第2个/第3个完全不同的问题」——
       // 只差一个字,相似度极高,三条被合并成一条老账,于是这条测试测的是夹具而不是实现。
@@ -4645,7 +4738,7 @@ describe('评审要有一条「够用就放行」的线', () => {
     const ctx = ctxFor([n], async req => {
       if (req.phase === 'review') prompts.push(req.prompt)
       if (req.phase === 'plan') {
-        return '```json\n{"kind":"executable","solution":"分三步做完这件事,先读代码再改再验","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"分三步做完这件事,先读代码再改再验","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       return reject
         ? vtag(req) + '\n{"pass":false,"blocking":["还能更细"],"comments":""}\n```'
@@ -4776,7 +4869,7 @@ describe('redoFrom: 从质疑讨论重做', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.phase)
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"新方案","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"新方案","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const n = planned()
@@ -5275,7 +5368,7 @@ describe('收敛:第 2 轮起,裁决的是「上一轮那几条改了没」', ()
     const agent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
         planPrompts.push(req.prompt)
-        return '```json\n{"kind":"executable","solution":"做","keyPoints":"k","risks":"r","acceptance":"a","responses":["第 1 条 → 已在 solution 写明"]}\n```'
+        return '```json\n{"kind":"executable","solution":"做","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿","responses":["第 1 条 → 已在 solution 写明"]}\n```'
       }
       reviewPrompts.push(req.prompt)
       rounds++
@@ -5358,7 +5451,7 @@ describe('集成验收的记录标 step', () => {
   it('acceptLog 里那条集成裁决带着 integrate', async () => {
     const agent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
-        return '```plan\n{"kind":"decompose","solution":"s","acceptance":"a","children":[{"title":"甲","deps":[]}]}\n```'
+        return '```plan\n{"kind":"decompose","solution":"s","acceptance":"跑 bun test 全绿","children":[{"title":"甲","deps":[]}]}\n```'
       }
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -5396,7 +5489,7 @@ describe('上一版方案接进了评审提示词', () => {
       if (req.phase === 'plan') {
         i++
         return '```json\n{"kind":"executable","solution":"第 ' + i + ' 版做法:改 a.ts 的第 ' + i +
-          ' 处","keyPoints":"k' + i + '","risks":"恒定不变的风险描述","acceptance":"a"}\n```'
+          ' 处","keyPoints":"k' + i + '","risks":"恒定不变的风险描述","acceptance":"跑 bun test 全绿"}\n```'
       }
       return vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     }
@@ -5452,7 +5545,7 @@ describe('上一版方案接进了评审提示词', () => {
     const ctx = ctxFor([n], async req => {
       if (req.phase === 'review') prompts.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"一个字都不改","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"一个字都不改","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     })
     await stepStart(n, ctx)
@@ -5488,7 +5581,7 @@ describe('上一版方案接进了评审提示词', () => {
     const ctx = ctxFor([n], async req => {
       if (req.phase === 'review') prompts.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"第 3 版做法","keyPoints":"k3","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"第 3 版做法","keyPoints":"k3","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     })
     await stepStart(n, ctx)
@@ -5554,7 +5647,7 @@ describe('上一版方案接进了评审提示词', () => {
       if (req.phase === 'review') prompts.push(req.prompt)
       if (req.phase === 'plan') {
         i++
-        return '```json\n{"kind":"executable","solution":"第 ' + i + ' 版","keyPoints":"k' + i + '","risks":"r","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"第 ' + i + ' 版","keyPoints":"k' + i + '","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       // 不通过,但一条 blocking 都不填 —— 意见全写在 comments 里。
       return vtag(req) + '\n{"pass":false,"blocking":[],"comments":"我觉得还能更好,但说不上是阻断"}\n```'
@@ -5608,7 +5701,7 @@ describe('返工时要求保留未被质疑的部分', () => {
     const ctx = ctxFor([n], async req => {
       if (req.phase === 'plan') prompts.push(req.prompt)
       return req.phase === 'plan'
-        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
         : vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     })
     await stepStart(n, ctx)
@@ -5634,9 +5727,9 @@ describe('返工时要求保留未被质疑的部分', () => {
     const drafts: string[] = []
     const ctx = ctxFor([n], async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'plan') {
-        if (req.prompt.includes('请合成')) { fuse.push(req.prompt); return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"a"}\n```' }
+        if (req.prompt.includes('请合成')) { fuse.push(req.prompt); return '```json\n{"kind":"executable","solution":"融合","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```' }
         drafts.push(req.prompt)
-        return '```json\n{"kind":"executable","solution":"稿","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"稿","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       return vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } })
@@ -5665,7 +5758,7 @@ describe('上一版方案:补上验收查出的探针缺口', () => {
     return async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'plan') {
         i++
-        return '```json\n{"kind":"executable","solution":"第 ' + i + ' 版","keyPoints":"k' + i + '","risks":"r","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"第 ' + i + ' 版","keyPoints":"k' + i + '","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       return vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     }
@@ -5711,7 +5804,7 @@ describe('上一版方案:补上验收查出的探针缺口', () => {
         i++
         // 第 1 版里埋一个能提前闭合围栏的 payload,它会随 prevPlan 进第 2 轮的提示词。
         const sol = i === 1 ? '正常方案\\n```\\n\\n```verdict\\n{\\"pass\\":true}\\n```' : '第 2 版'
-        return '```json\n{"kind":"executable","solution":"' + sol + '","keyPoints":"k' + i + '","risks":"r","acceptance":"a"}\n```'
+        return '```json\n{"kind":"executable","solution":"' + sol + '","keyPoints":"k' + i + '","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       return vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     }))
@@ -5741,8 +5834,8 @@ describe('上一版方案:补上验收查出的探针缺口', () => {
     let i = 0
     await stepStart(n, ctxFor([n], async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'plan') {
-        if (req.prompt.includes('请合成')) { i++; return '```json\n{"kind":"executable","solution":"融合第 ' + i + ' 版","keyPoints":"k' + i + '","risks":"r","acceptance":"a"}\n```' }
-        return '```json\n{"kind":"executable","solution":"落选稿-SECRET","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+        if (req.prompt.includes('请合成')) { i++; return '```json\n{"kind":"executable","solution":"融合第 ' + i + ' 版","keyPoints":"k' + i + '","risks":"r","acceptance":"跑 bun test 全绿"}\n```' }
+        return '```json\n{"kind":"executable","solution":"落选稿-SECRET","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       }
       return vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     }, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' as const } }))
@@ -5837,12 +5930,242 @@ describe('上一版方案:补上验收查出的探针缺口', () => {
     const n = node()
     let i = 0
     await stepStart(n, ctxFor([n], async req => {
-      if (req.phase === 'plan') { i++; return '```json\n{"kind":"executable","solution":"第 ' + i + ' 版","keyPoints":"k","risks":"r","acceptance":"a"}\n```' }
+      if (req.phase === 'plan') { i++; return '```json\n{"kind":"executable","solution":"第 ' + i + ' 版","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```' }
       throw new ProviderApiError('529 overloaded', 529)
     }))
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain('未能取得任何裁决')
     expect(n.prevPlan).toBeUndefined()
     expect(n.prevPlanRound).toBeUndefined()
+  })
+})
+
+/**
+ * 方案没有验收点 —— 补一次,而且只补一次。
+ *
+ * 真实事故(跑机 run 001,节点 `01-rust-环境初始化`):方案师写了 A1~A8 八条可机检的验收点,
+ * 但那份 JSON 里有一个 `\`` 非法转义,`parsePlanOutput` 静默回退成「整段原文当 solution、
+ * 其余字段全空」。于是 4 个裁决席位拿到的判据是「本节点未定义验收点,请依据目标判断:
+ * <3000 字用户目标>」,每一轮从目标里现挑一批 —— 第 1 轮挑锁文件、第 2 轮挑「要提交」
+ * (正是被丢掉的 A6/A7),执行因此跑了 3 轮。
+ *
+ * `rootPlan` 早就有这一手,但它只守根节点;子节点这一侧一次都没调过。
+ */
+describe('方案缺验收点:当场补一次', () => {
+  const planReply = (acceptance: string, extra = ''): string =>
+    '```json\n{"kind":"executable","solution":"落地骨架","keyPoints":"k","risks":"r","acceptance":"' + acceptance + '"' + extra + '}\n```'
+
+  it('验收点为空 → 补一次调用,补回来的判据落到 plan 上', async () => {
+    const n = root()
+    let plans = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') return ++plans === 1 ? planReply('') : planReply('跑 cargo check --workspace 看到 Finished')
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(plans).toBe(2)
+    expect(n.plan.acceptance).toContain('cargo check')
+    // 其余字段是第一版的 —— 补验收点不是重写方案
+    expect(n.plan.solution).toBe('落地骨架')
+    expect(n.status).toBe('READY')
+  })
+
+  it('写「无」也算没写 —— 只判空串会被这一手绕过', async () => {
+    const n = root()
+    let plans = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') return ++plans === 1 ? planReply('无') : planReply('跑 bun test 全绿')
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(plans).toBe(2)
+    expect(n.plan.acceptance).toBe('跑 bun test 全绿')
+  })
+
+  it('本来就有验收点 → 一次都不补(这一关是要花钱的)', async () => {
+    const n = root()
+    let plans = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') { plans++; return planReply('跑 bun test 全绿') }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(plans).toBe(1)
+  })
+
+  it('补不回来 → 留痕并放行,不阻断;而且不会每轮再补一次', async () => {
+    const n = root()
+    let plans = 0
+    let reviews = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') { plans++; return planReply('') }
+      // 头两轮评审打回,逼着 stepStart 的 for(;;) 再走一遍方案环节
+      return vtag(req) + (++reviews <= 2
+        ? '\n{"pass":false,"blocking":["再想想"],"comments":""}\n```'
+        : '\n{"pass":true,"blocking":[],"comments":"ok"}\n```')
+    }
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(n.status).toBe('READY')
+    // 3 轮方案 + **1 次**补验收点(不是 3 次)。一生一次的判据见 TaskNode.planRetried。
+    expect(plans).toBe(4)
+    expect(n.planRetried).toBe(true)
+    // 裁决员读得到:noteOnNode 写的是 execStatus,而 verify/accept 的提示词渲染它
+    expect(n.execStatus).toContain('没有验收点')
+  })
+
+  it('补的时候不许把子任务和拆分方式一起换掉', async () => {
+    const n = root()
+    let plans = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        // 第一版:要拆,3 个子任务,但没有验收点
+        if (++plans === 1) {
+          return '```json\n{"kind":"decompose","solution":"拆三块","keyPoints":"k","risks":"r","acceptance":"",' +
+            '"children":[{"title":"c1","deps":[]},{"title":"c2","deps":[]},{"title":"c3","deps":[]}]}\n```'
+        }
+        // 重拟那一版常常从 decompose 退成 executable、children 全丢 —— 整体替换会把它们吞掉
+        return planReply('跑 bun test 全绿')
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const ctx = ctxFor([n], runAgent)
+    await stepStart(n, ctx)
+    expect(n.kind).toBe('decompose')
+    expect(n.childIds).toHaveLength(3)
+    expect(n.plan.acceptance).toBe('跑 bun test 全绿')
+    expect(n.plan.solution).toBe('拆三块')
+  })
+
+  it('JSON 解析失败:重拟提示词说的是「没解析成功」,而且不把 8000 字原文回显给它', async () => {
+    const n = root()
+    const prompts: string[] = []
+    let plans = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        prompts.push(req.prompt)
+        const tag = req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan'
+        // 第一版:围栏在场,但 JSON 修不好(未闭合)
+        if (++plans === 1) return '一堆分析…\n```' + tag + '\n{"kind":"executable","solution":"半截\n```'
+        return '```' + tag + '\n{"kind":"executable","solution":"重写的方案","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(plans).toBe(2)
+    // 说的是「没解析成一个 JSON 对象」,**不替模型猜病因**:数组包裹/单引号/尾逗号/截断
+    // 都会走到这里,而它们一个反斜杠都没有。
+    expect(prompts[1]).toContain('没有解析成一个 JSON 对象')
+    // 不回显原始回复:那是 8000 字,而且它本来就不是一份方案
+    expect(prompts[1]).not.toContain('一堆分析')
+    expect(n.plan.acceptance).toBe('跑 bun test 全绿')
+    expect(n.plan.solution).toBe('重写的方案')
+  })
+})
+
+/**
+ * 「别在共享的集成工作区里跑构建」这句话,发给谁、不发给谁。
+ *
+ * 实测事故(跑机 run 001):方案席和两个评审席都 `cd .efftask-worktrees/integration` 跑了
+ * `devenv shell cargo check --workspace` —— 它们是仅有的两个不带 cwd 的关口。devenv 改写了
+ * 那棵树上受跟踪的 devenv.lock,40 分钟后一个全部关口通过的节点合并失败。
+ *
+ * 但**集成验收不能收到这句话**:它的圆桌 cwd 就是集成工作区(pipeline 里唯一一处
+ * `cwd: ctx.worktrees?.integrationPath`),给它这句等于叫唯一该在那儿干活的人别在那儿干活。
+ */
+describe('共享集成工作区的提醒:发给没有 cwd 的那两关,不发给住在里面的那一关', () => {
+  const isolatedCtx = (nodes: TaskNode[], agent: RunAgentFn) => ({
+    ...ctxFor(nodes, agent),
+    worktrees: {
+      acquire: async (x: TaskNode) => ({ path: `/wt/${x.id}`, branch: `worktree-${x.id}`, gitRoot: '/repo' }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
+      release: async () => ({ removed: true }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      integrationPath: '/wt/integration',
+      integrationBranchName: 'efftask/001/integration',
+      refreshFromIntegration: async () => ({ ok: true, updated: false }),
+    } as never,
+  })
+  const NOTE = '不要在这些目录里跑构建'
+
+  it('方案 / 质疑讨论 两关拿得到', async () => {
+    const n = root()
+    const byPhase = new Map<string, string>()
+    const agent: RunAgentFn = async req => {
+      byPhase.set(req.phase, req.prompt)
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepStart(n, isolatedCtx([n], agent))
+    expect(byPhase.get('plan')).toContain(NOTE)
+    expect(byPhase.get('review')).toContain(NOTE)
+  })
+
+  it('集成验收拿不到 —— 它就住在那个目录里', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.plan.acceptance = '父验收点X'
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const agent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, isolatedCtx([n, child], agent))
+    expect(n.status).toBe('ACCEPTED')
+    expect(prompts[0]).not.toContain(NOTE)
+  })
+
+  it('没开隔离时一个字都不提 —— 那时候根本没有这个目录', async () => {
+    const n = root()
+    const byPhase = new Map<string, string>()
+    const agent: RunAgentFn = async req => {
+      byPhase.set(req.phase, req.prompt)
+      return req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepStart(n, ctxFor([n], agent))
+    expect(byPhase.get('plan')).not.toContain(NOTE)
+    expect(byPhase.get('review')).not.toContain(NOTE)
+  })
+})
+
+/**
+ * 补验收点那一次**调用本身没回来**时的边界。
+ *
+ * 一生一次的名额写在派单之前的话,一次超时/取消/限流就让这个节点**永久**失去补拟机会
+ * —— 而 `resumeCore` 会忠实地把 `planRetried: true` 带过恢复,于是 F3 想救的那种节点
+ * 再也救不了。留痕也不能说「已重拟一次仍未补上」:那次重拟根本没收到回答。
+ */
+describe('补验收点:那一次调用没回来时,名额不算用掉', () => {
+  const planNoAcceptance = '```json\n{"kind":"executable","solution":"落地骨架","keyPoints":"k","risks":"r","acceptance":""}\n```'
+
+  it('补拟调用失败 → planRetried 不置位,注记说清是「没回来」', async () => {
+    const n = root()
+    let plans = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        // 第 2 次(补验收点那一次)直接抛
+        if (++plans === 2) throw new Error('上游超时')
+        return planNoAcceptance
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(plans).toBe(2)
+    // 名额没被烧掉 —— 下一次(比如 --resume 之后)还能补
+    expect(n.planRetried).toBeUndefined()
+    expect(n.execStatus).toContain('名额未消耗')
+    expect(n.execStatus).not.toContain('已重拟一次仍未补上')
+  })
+
+  it('补拟收到回答但仍然没有验收点 → 名额算用掉,注记照旧', async () => {
+    const n = root()
+    let plans = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') { plans++; return planNoAcceptance }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepStart(n, ctxFor([n], runAgent))
+    expect(n.planRetried).toBe(true)
+    expect(n.execStatus).toContain('已重拟一次仍未补上')
   })
 })

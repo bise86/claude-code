@@ -4,7 +4,7 @@ import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { crossSeatNotice, exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, retractedCount, reviewRepeatNotice } from './reviewConvergence.js'
-import { ANSWER_TAGS, answerTag, capText, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
@@ -673,6 +673,28 @@ function rateLimitRemedy(): string {
  * a shared tree the execute phase is serialised, so that advice would be describing a hazard
  * the run cannot have.
  */
+/**
+ * 「别在共享的集成工作区里跑构建」。**只发给不在那儿干活的关口。**
+ *
+ * 实测事故(跑机 run 001):方案席和两个评审席都 `cd .efftask-worktrees/integration` 跑了
+ * `devenv shell cargo check --workspace` —— 它们没有 cwd(执行/测试验证/验收有,指向节点
+ * 自己的工作区),于是哪儿都能去。devenv 改写了那棵树上受跟踪的 `devenv.lock` 并留在那儿,
+ * 40 分钟后一个全部关口通过的节点合并失败,9 个兄弟连带阻断。
+ *
+ * **集成验收不能收到这句话** —— 它的圆桌 cwd 就是集成工作区(唯一合法住在那儿的环节),
+ * 给它这句等于叫唯一该在那儿干活的人别在那儿干活。所以这句话由 planPrompt / reviewPrompt
+ * 各自注入,不进共用的 `seatPreamble`。
+ *
+ * 隔离没开时不说:那时候根本没有这个目录,凭空提一个不存在的路径是另一种说假话。
+ */
+function sharedTreeNote(isolated: boolean): string {
+  return isolated
+    ? '注意:仓库下的 `.efftask-worktrees/` 是本次运行的隔离工作区,其中 `integration` 是**所有节点共享**的集成工作区。' +
+      '不要在这些目录里跑构建/测试或任何会改动文件的命令(例如 devenv/cargo/npm 会改写锁文件)——' +
+      '留在那里的未提交改动会让别的节点合并失败。要验证请在主工作树或你自己的工作区里跑。\n'
+    : ''
+}
+
 export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId' | 'worktrees'> & {
   /**
    * 方案环节看到的工作目录。
@@ -979,6 +1001,7 @@ export function planPrompt(
     // 「在哪」和「可以看」。这两句缺席时,方案作者只能照着标题写一句正确的废话。
     (ctx.cwd ? `工作目录:${quote(ctx.cwd)}\n` : '') +
     `你有 Read / Glob / Grep,**先真的去看代码,再定方案** —— 不要只凭任务标题推测。\n` +
+    sharedTreeNote(isolated) +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
     // The depth budget lives IN THE PROMPT so the model self-limits, instead of us
@@ -1301,13 +1324,16 @@ function prevPlanSection(node: TaskNode, round: number, notice: string): string 
  * 一个量级,而 O(n²) 还在。所以这条规矩保留,只是它现在防的是浪费,不是卡死。)
  */
 function reviewPrompt(
-  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>,
+  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control' | 'worktrees'>,
   tag: string, brief = '', notice = '', round = 1, maxRounds = 3,
   /** 本轮的严格度快照。由调用点算一次,和 quorum、`RoundtableRecord.strictness` 同源。 */
   strict: Strictness | undefined = effectiveStrictness(ctx),
 ): string {
   return brief +
     judgeGuidance(ctx) +
+    // 评审席和方案席一样没有 cwd,可以走到任何目录去核实 —— 实测两个架构师都进了共享的
+    // 集成工作区跑构建。见 sharedTreeNote。
+    sharedTreeNote(ctx.worktrees !== undefined) +
     `请评审以下方案是否**足以开始执行**。方案:\n${quote(JSON.stringify(node.plan))}\n` +
     (notice ? notice + '\n' : '') +
     /**
@@ -1448,6 +1474,25 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
  * 这两个数原来一个都没有,而它们各带一条本关缺失的约束(见 `roundStakes` 与
  * `repeatRule`):裁决员既不知道自己手上握着什么,也没被告知第 2 轮起该按什么判。
  */
+/**
+ * 没有验收点时给裁决员的那一段 —— 说的是「**这是方案缺陷**」,不是「请自己想一个」。
+ *
+ * 原来两关的兜底都是「请依据目标判断」,而 verify 那一版还把整段用户目标当判据塞进去。
+ * 实测后果(跑机 run 001):3000 字目标里能挑出的判据太多,裁决员**每一轮挑一批不同的**
+ * —— 第 1 轮挑锁文件不许变、第 2 轮挑「产出要提交」,执行因此跑了 3 轮。而 `repeatRule`
+ * 那条「不许提上一轮没提过的新要求」挡不住:从目标里新挑出来的一条,在它眼里确实是
+ * 「这一版新发现的缺陷」。
+ *
+ * 换成一条**恒定的**缺陷声明之后,每一轮的第一条 blocking 都是同一句话 —— 于是它变成
+ * 「老账」,`repeatRule` 重新可用,而节点缺验收点这件事也终于有人说出口。
+ */
+function noAcceptanceFallback(goal?: string): string {
+  return '(本节点**没有验收点**,这是方案环节的缺陷。请把「方案未定义验收点」作为 blocking 的第一条写出来;' +
+    '判断范围只取目标中与本节点标题直接对应的那部分,**不要每一轮从目标里另挑一批新判据** ——' +
+    '那会让执行者每轮都在改上一轮没人提过的东西。' +
+    (goal ? '目标:' + quote(goal) : '') + ')'
+}
+
 function verifyPrompt(
   node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '', notice = '',
   /** 本轮的严格度快照。理由同 reviewPrompt。 */
@@ -1461,7 +1506,7 @@ function verifyPrompt(
     judgeGuidance(ctx) +
     `请**实际运行**验证这次改动,不要只读执行者的自述。\n` +
     (notice ? notice + '\n' : '') +
-    `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据目标判断:' + quote(ctxGoal(node)) + ')'}\n` +
+    `验收点:${quote(node.plan.acceptance) || noAcceptanceFallback(ctxGoal(node))}\n` +
     `执行者的自述(仅供参考,不能作为通过依据):${quote(node.execStatus) || '(没有报告任何产出)'}\n` +
     execResponsesSection(node) +
     /**
@@ -1632,7 +1677,8 @@ function acceptPrompt(
      * (它渲染「父目标」),这是把同一份东西补给叶子验收。
      */
     `目标:${quote(ctxGoal(node))}\n` +
-    `验收点:${quote(node.plan.acceptance) || '(本节点未定义验收点,请依据上面的目标判断)'}\n` +
+    // 目标在这一关是**无条件**渲染的(见上面那段),所以兜底不用再把它塞一遍。
+    `验收点:${quote(node.plan.acceptance) || noAcceptanceFallback()}\n` +
     `执行状态:${quote(node.execStatus) || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
     execResponsesSection(node) +
     roundStakes(round, maxRounds, '验收', spent) +
@@ -1903,8 +1949,119 @@ async function runPlanPhase(
   node: TaskNode, ctx: PipelineCtx, feedback: string,
 ): Promise<PlanPhaseResult> {
   const seats = node.phaseRoles.plan ?? []
-  if (ctx.config.caps.planConverge === '圆桌' && seats.length > 1) return runPlanRoundtable(node, ctx, feedback)
-  return runPlanRefinement(node, ctx, feedback)
+  const res = (ctx.config.caps.planConverge === '圆桌' && seats.length > 1)
+    ? await runPlanRoundtable(node, ctx, feedback)
+    : await runPlanRefinement(node, ctx, feedback)
+  if (!res.ok) return res
+  return { ok: true, parsed: await fillMissingAcceptance(node, ctx, res.parsed) }
+}
+
+/**
+ * 没有验收点的方案要**当场补一次**,而不是让它一路走到裁决关口。
+ *
+ * `rootPlan.ts` 早就有这一手(`planGaps` + 自动重拟),而它**只守根节点** —— 子节点这一侧
+ * 一次都没调过。实测代价是整棵树:跑机 run 001 的第一个节点,方案师写了 8 条可机检的验收点,
+ * 但那份 JSON 里有一个 `` \` `` 非法转义,`parsePlanOutput` 静默回退成「整段原文当 solution、
+ * 其余字段全空」;于是 4 个裁决席位拿到的是
+ * 「验收点:(本节点未定义验收点,请依据目标判断:<3000 字用户目标>)」,每一轮从目标里
+ * **现挑**一批判据 —— 第 1 轮挑锁文件、第 2 轮挑「要提交」,执行因此跑了 3 轮。
+ * 而那两条判据正是被丢掉的 A6 / A7。
+ *
+ * 三条边界都是评审拿证据换来的:
+ *
+ * 1. **判据用 `hollow`,不是 `=== ''`。** 模型写「无」也是没有验收点(`parseOutput.ts` 的
+ *    `hollow` 记着这次实测:填 `'无'/'无'/'无'` 时 planGaps 一条都不报)。
+ * 2. **只回填字段,不整体替换 `parsed`。** `rootPlan.ts:isBetterDraft` 记着实测:整体替换会把
+ *    **子任务一起吞掉**(重拟版常常从 decompose 退成 executable),产出「第一层(0 个)」;
+ *    圆桌路还会连 `alternatives` 一起丢(那一段明写「不静默截断」)。
+ * 3. **重拟是单席一次调用**,不能再调一次 `runPlanPhase` —— 那是 N 席 + 融合的分派器。
+ */
+async function fillMissingAcceptance(
+  node: TaskNode, ctx: PipelineCtx, parsed: ReturnType<typeof parsePlanOutput>,
+): Promise<ReturnType<typeof parsePlanOutput>> {
+  if (!hollow(parsed.plan.acceptance)) return parsed
+  // 一生一次。判据见 TaskNode.planRetried。
+  if (node.planRetried === true) { noteMissingAcceptance(node, parsed, true); return parsed }
+  const seat = firstRole(node, 'plan')
+  const tag = answerTag(ANSWER_TAGS.plan)
+  /**
+   * 刚写出来的那一版要**跟着 feedback 一起给**,不能指望 `planPrompt` 的「上一版方案」段 ——
+   * 那一段渲染的是 `node.plan`,而 `node.plan = parsed.plan` 要等 `runPlanPhase` 返回之后
+   * 才发生。不带的话模型看到的「上一版」是一份空方案,于是它会**重写**而不是**补**,
+   * 重拟出来的东西比第一版更浅(`rootPlan.ts` 为同一件事记过一次)。
+   *
+   * **`parseFailed` 那一支不回显**:那时候 `plan.solution` 是 8000 字的原始回复,
+   * 喂回去纯属烧钱,而且它本来就不是一份方案。
+   */
+  /**
+   * **别替模型猜病因。** 上一版这句写死成「JSON 字符串里出现了非法转义」,而验收实测:
+   * 数组包裹、字符串字面量、空块、尾逗号、单引号、被截断 —— 六种输入里五种连一个反斜杠
+   * 都没有,却都会走到这里。`taggedBlockBroken` 的布尔是准的(「解析不出一个对象」),
+   * **假的是从它推出的原因**;而模型会拿着那句话去修一个不存在的问题。
+   */
+  const why = parsed.parseFailed
+    ? '你上一轮的回答里,带标记的那个代码块**没有解析成一个 JSON 对象** —— 常见原因:' +
+      '外面套了数组、用了单引号、有尾逗号、非法转义(JSON 只认 \\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX),' +
+      '或者整段被截断了。请重新输出一份完整的方案 JSON(顶层必须是对象),' +
+      '尤其要有 acceptance:**可检验**的完成标准(跑什么命令、看到什么结果、改了哪些文件)。'
+    : '你刚输出的这一版方案没有写验收点(acceptance 是空的,或只填了「无」这类占位):\n' +
+      quote(JSON.stringify(parsed.plan)) + '\n' +
+      '**在它的基础上补 acceptance,其余部分原样保留。** 验收环节拿 acceptance 当唯一判据,' +
+      '空的话裁决员只能每轮从任务目标里另挑一批标准,执行会被反复打回 —— 实测过三轮返工都在改' +
+      '「这一轮才被想起来」的要求。acceptance 要写成**可检验**的完成标准(跑什么命令、看到什么结果、改了哪些文件)。'
+  const re = await runPhase(ctx, {
+    phase: 'plan', node, role: seat, system: 'plan',
+    // parseFailed 时不把原始回复当「上一版」喂回去,所以 feedback 只带要求本身。
+    prompt: planPrompt(node, ctx, tag, why, seatPreamble(ctx, seat, 'plan', node)),
+    signal: ctx.signal,
+  }, { phaseLabel: '方案补验收点', round: node.iteration.planReview + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model })
+  /**
+   * **名额在拿到回答之后才算用掉。**
+   *
+   * 写在派单之前(上一版就是)的后果是验收实测出来的:那一次调用超时 / 被用户取消 /
+   * 限流耗尽时,`planRetried` 已经是 true 且没人回滚,而 `resumeCore` 会忠实地把它带过
+   * 恢复 —— 于是**这个节点从此再也补不上验收点**,而 F3 想救的恰恰就是这种节点。
+   * 「用户按了取消 ⇒ 该节点终身失去补拟机会」尤其不该成立。
+   */
+  if (re.ok) {
+    node.planRetried = true
+    const again = parsePlanOutput(re.text, tag)
+    if (!hollow(again.plan.acceptance)) {
+      parsed.plan.acceptance = again.plan.acceptance
+      // 解析失败那一支:补回来的方案正文比一整段原始回复有用得多,而 children/kind 一律不碰。
+      if (parsed.parseFailed && !hollow(again.plan.solution)) parsed.plan.solution = again.plan.solution
+      return parsed
+    }
+  }
+  noteMissingAcceptance(node, parsed, re.ok, re.ok ? undefined : re.reason)
+  return parsed
+}
+
+/**
+ * 补不回来时**留痕**,而且要留在裁决员读得到的地方。
+ *
+ * `noteOnNode` 写的是 `execStatus`,而 verify / accept 的提示词都渲染 execStatus ——
+ * 所以这条注记会跟着产出一起被看到。解析失败那一支还要在 solution 前面钉一句:
+ * 否则评审员看到的是一份长得像方案的散文,而「node.md 上看不出解析失败过」只解决了一半。
+ */
+/**
+ * @param answered 那一次补拟**收到回答了吗**。没收到就不能写「已重拟一次仍未补上」——
+ *   那句话会进 node.md 和裁决提示词,而事实是那次调用根本没回来(超时/取消/限流)。
+ *   同一批修复里刚治过一条假的开跑提示,这里不能新造一条。
+ * @param failure 没收到回答时,原因原文。
+ */
+function noteMissingAcceptance(
+  node: TaskNode, parsed: ReturnType<typeof parsePlanOutput>, answered = true, failure?: string,
+): void {
+  const tail = answered
+    ? '已重拟一次仍未补上'
+    : `补验收点那次调用未完成(${failure || '原因不详'}),名额未消耗`
+  noteOnNode(node, parsed.parseFailed
+    ? `本节点的方案 JSON 未能解析成一个对象,${tail}:下面的「完整方案」是原始回复原文`
+    : `本节点的方案没有验收点,${tail}:测试验证/验收将没有稳定判据`)
+  if (parsed.parseFailed) {
+    parsed.plan.solution = capText(`⚠ 本节点方案 JSON 未解析成功,以下为模型原始回复:\n${parsed.plan.solution}`)
+  }
 }
 
 /**
@@ -3054,6 +3211,22 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
   }
   if (!ctx.worktrees || !node.worktree) return true
   const res = await ctx.worktrees.commitAndMerge(node)
+  /**
+   * 集成工作区里被抹掉的东西要留痕 —— **成功和失败的每一条出口都要**。
+   *
+   * 验收实测:上一版只在 `ok:true` 那条写,而失败那两条恰恰是用户最需要知道
+   * 「我刚才丢了什么」的时刻(一个未跟踪的用户文件被 clean -fd 抹掉、重试又撞冲突,
+   * node.md / 阻断卡 / run.md 里一个字都没有)。所以在分叉**之前**统一写一次。
+   *
+   * `capText`:这一段拼的是 `git status --porcelain` 的行,数量无上限,而 node.md 每次
+   * commit 全量重写。邻居那几条 execStatus 追加都夹了,这条没有理由不夹。
+   */
+  if (res.cleaned && res.cleaned.length > 0) {
+    node.execStatus = `${node.execStatus}\n` + capText(
+      `(注:合并前集成工作区有未提交改动,已清理后重试合并;被清理的:${res.cleaned.join('、')})`,
+      MAX_SUMMARY_CHARS,
+    )
+  }
   if (!res.ok) {
     if (res.kind === 'conflict') {
       // A cancel must never page a human. The user is standing at the keyboard; the node is
@@ -3085,7 +3258,13 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
         node.iteration.mergeResolve += 1
         const scene = await conflictScene(node, ctx, priorAttempts === 0)
         if (!scene.ok) {
-          await blockWithReason(node, `合并失败(基础设施):无法在节点工作区重现冲突: ${scene.message}`, ctx)
+          // 和下面那条合并 infra 阻断同一条规矩:**必须带 category**,否则 capBlocked=false、
+          // 而 mergeConflict 要到几十行之后才置,reseat 的三个复活开关全灭 —— 节点就此永久
+          // 躺平。这一路比那条更容易被漏掉:它长在解冲突循环里面。
+          await blockWithReason(
+            node, `合并失败(基础设施):无法在节点工作区重现冲突: ${scene.message}`, ctx, 'infra',
+            `节点工作区在 ${node.worktree.path};确认它还在、且没有被别的进程占用后,用 /et --resume --retry-blocked 重试。`,
+          )
           return false
         }
         if (scene.kind === 'clean') {
@@ -3256,7 +3435,33 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
       await blockWithReason(node, detail, ctx)
       return false
     }
-    await blockWithReason(node, `合并失败(基础设施): ${res.message}`, ctx)
+    /**
+     * **必须带 category。** 不带的话 `capBlocked` 是 false、`capCategory` 是 undefined
+     * (见 blockWithReason),而 `reseat` 的三个复活开关(interrupted / mergeConflict /
+     * capBlocked)于是全为 false —— 节点**永远**不被归位:`--resume` 跳过它,
+     * `--retry-blocked` 也只认 `capBlocked === true`。
+     *
+     * 这条实测过,代价是整棵树:一个所有关口都通过、只是合并撞上脏工作区的节点,阻断之后
+     * 9 个兄弟全部「依赖阻断」,而用户手上没有任何恢复手段(run 001)。
+     *
+     * 补救语要说清**产出在哪**:这一路不 release 工作区,提交还在节点分支上。
+     */
+    await blockWithReason(
+      node, `合并失败(基础设施): ${res.message}`, ctx, 'infra',
+      /**
+       * 说准产出**将来在哪**,不是它现在在哪。
+       *
+       * 上一版写的是「产出仍在分支 X 上」,而按下面那条命令做完之后这句就不成立了:
+       * `resumeCore` 会清掉 worktree 引用(只有 mergeConflict 那一路保留),重新 `acquire`
+       * 时 `checkout -B <branch> <集成分支>` 把 X 重置,这一版被挪到 salvage ref 上。
+       * 一句在用户照做之后才变假的话,和这批一起修的那条假开跑提示是同一类病。
+       */
+      (node.worktree
+        ? `本节点的产出已提交在分支 ${node.worktree.branch}(${node.worktree.path});` +
+          `重试会重建工作区并把这一版移到 efftask/${ctx.runId}/salvage/ 下,不会丢失。`
+        : '') +
+      '排除掉集成工作区里的占用/残留后,用 /et --resume --retry-blocked 重试合并。',
+    )
     return false
   }
   // The pool is the ONLY component that knows whether this node contributed a commit.
@@ -3266,6 +3471,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
   if (!res.merged) {
     node.execStatus = `${node.execStatus}\n(注:该节点没有向集成分支贡献任何改动)`
   }
+  // 清理留痕已经在函数开头统一写过了(成功/失败共用一条),这里不再写第二遍。
   const rel = await ctx.worktrees.release(node)
   // A kept worktree is NOT a failure — release refuses to delete anything holding real work.
   // Record it so the user can find it rather than discovering a stray directory later.
@@ -3583,8 +3789,11 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         // that work, and the refusal is the new information. So the refusals are capped on
         // their own and the report is trimmed to fit around them.
         const refusalText = capText(`(注:以下加子节点请求被拒绝)\n${refusals.map(r => '- ' + r).join('\n')}`, 2000)
-        const room = Math.max(500, MAX_FIELD_CHARS - Array.from(refusalText).length - 1)
-        node.execStatus = `${capText(reported, room)}\n${refusalText}`
+        // 编排器注记同样要留住。正常那条路径专门保了 `keptNotes`,这条支路把它们连同
+        // 上一行一起冲掉 —— 而「本节点的方案没有验收点」这类注记正是靠它活到裁决关口。
+        const notes = node.execStatus.split('\n').filter(l => l.startsWith(ORCHESTRATOR_NOTE))
+        const room = Math.max(500, MAX_FIELD_CHARS - Array.from(refusalText).length - Array.from(notes.join('\n')).length - 2)
+        node.execStatus = [capText(reported, room), ...notes, refusalText].join('\n')
       }
       // If the EXECUTING node itself grew children it is now WAITING_CHILDREN, and its own
       // acceptance must wait for them. Returning here is what the spec's "恢复" means: the
@@ -3682,7 +3891,8 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node, 'verify', strict), verifyNotice, strict, verifyRound, caps.maxIterations, node.iteration.acceptance),
         ctx, cwd: node.worktree?.path, strictness: strict,
       })
-      node.acceptLog.push({ ...v.rec, step: 'verify' })
+      const verifyRec: RoundtableRecord = { ...v.rec, step: 'verify' }
+      node.acceptLog.push(verifyRec)
       const after = await verifySnapshot(node, ctx)
       if (before !== undefined && after !== undefined && before !== after) {
         // 它动了工作区。这一轮裁决作废:一个「跑完测试顺手把它改绿」的验证等于没有验证。
@@ -3690,14 +3900,29 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         // 改动,必须让下一轮把它们纳入正常流程。
         node.iteration.acceptance++
         const why = '测试验证环节改动了工作区,该轮裁决作废(验证者只应验证,不应修复)'
+        /**
+         * **作废的那条记录要自报家门。** 它和一条真裁决在 acceptLog 里长得一模一样,
+         * 而 node.md 的「## 验收记录」是用户事后追责的依据 —— 读的人分不清哪一轮的结论
+         * 已经不算数了。
+         */
+        verifyRec.voided = why
         if (node.iteration.acceptance >= caps.maxIterations) {
           await blockWithReason(node, `${why};迭代已用尽(${caps.maxIterations})`, ctx, 'rework')
           return
         }
         node.execStatus = appendOrchestratorNote(node.execStatus, why)
-        // 同样要进 feedback:execStatus 里的注记只在 feedback 非空时才被渲染进提示词,
-        // 只写 execStatus 等于写给没人看的地方。
-        feedback = why
+        /**
+         * 同样要进 feedback:execStatus 里的注记只在 feedback 非空时才被渲染进提示词,
+         * 只写 execStatus 等于写给没人看的地方。
+         *
+         * **但不能只写这一句。** 原来 `feedback = why` 把这一轮**真正的阻断意见整个换掉**了
+         * —— 验证者可能刚指出「锁文件被改写」这类真问题,而执行者收到的只有一句
+         * 「验证者改了工作区」,于是它既不知道要修什么,下一轮又会被同样的问题挡回来。
+         * 裁决作废的是**这一轮的判决效力**,不是它看到的事实。
+         */
+        feedback = v.rec.synthesized.blockingSummary
+          ? `${why}\n该轮验证者提出的问题仍需处理(判决虽已作废,但问题本身要看):\n${v.rec.synthesized.blockingSummary}`
+          : why
         if (!(await commit(node, 'REWORK', ctx))) return
         continue
       }

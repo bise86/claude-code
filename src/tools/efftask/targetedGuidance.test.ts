@@ -230,7 +230,7 @@ describe('真的进了那次调用的提示词', () => {
     const seen: { phase: string; prompt: string }[] = []
     const fn = (async (req: { phase: string; prompt: string }) => {
       seen.push({ phase: req.phase, prompt: req.prompt })
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as unknown as RunAgentFn
@@ -275,7 +275,7 @@ describe('真的进了那次调用的提示词', () => {
       roleGuidance: [{ name: '架构师', text: '给出回滚方案' }],
     })
     const runAgent = (async (req: { phase: string; prompt: string; role?: { roleName?: string } }) => {
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       seen.push({ label: req.role?.roleName ?? '?', prompt: req.prompt })
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as unknown as RunAgentFn
@@ -295,7 +295,7 @@ describe('真的进了那次调用的提示词', () => {
     roles.review = [{ roleName: 'GPT5-方案' }]
     const config = cfg({ phaseRoles: roles, roleGuidance: [{ name: 'gpt5-方案', text: '写清回滚步骤' }] })
     const runAgent = (async (req: { phase: string; prompt: string }) => {
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       seen.push(req.prompt)
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as unknown as RunAgentFn
@@ -365,7 +365,7 @@ describe('评审查出来的注入面', () => {
     const roles = emptyPhaseRoles()
     roles.review = [{ roleName: FORGED_NAME }]
     const runAgent = (async (req: { phase: string; prompt: string }) => {
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       seen.push(req.prompt)
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as unknown as RunAgentFn
@@ -513,7 +513,7 @@ describe('成本评审查出来的那几条', () => {
     const seen: { phase: string; prompt: string }[] = []
     const runAgent = (async (req: { phase: string; prompt: string }) => {
       seen.push({ phase: req.phase, prompt: req.prompt })
-      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
       if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as unknown as RunAgentFn

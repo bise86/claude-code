@@ -432,6 +432,25 @@ describe('验收记录要说清哪一轮是哪一关', () => {
     expect(body).toContain('- round 1')
   })
 
+  /**
+   * 作废的那一轮要在 body 里读得出来。判据是**渲染**,不是内存里的字段:
+   * `pipeline` 那侧的用例断的是 `node.acceptLog[].voided`,碰不到这一行 ——
+   * 实测把这段渲染整个删掉,全量测试一条不红。
+   */
+  it('作废的那一轮标出来,而且排在 PASS/FAIL 之前', () => {
+    const n = createNode({ id: 'n', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'NOW' })
+    n.acceptLog = [rec({ step: 'verify', voided: '测试验证环节改动了工作区,该轮裁决作废' })] as never
+    const line = serializeNode(n).split('\n').find(l => l.startsWith('- [测试验证]'))!
+    expect(line).toContain('[已作废:')
+    expect(line.indexOf('[已作废:')).toBeLessThan(line.indexOf('PASS'))
+  })
+
+  it('没有 voided 的记录逐字不变 —— 老 node.md 的形状不许动', () => {
+    const n = createNode({ id: 'n', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'NOW' })
+    n.acceptLog = [rec()] as never
+    expect(serializeNode(n)).not.toContain('已作废')
+  })
+
   it('没有 step 的老记录照旧渲染', () => {
     const n = createNode({ id: 'n', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'NOW' })
     n.acceptLog = [rec()] as never

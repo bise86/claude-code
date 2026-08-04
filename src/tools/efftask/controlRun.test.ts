@@ -24,7 +24,7 @@ const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
 })
 
 const allPass: RunAgentFn = async req => {
-  if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+  if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
   if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
   return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
 }
@@ -36,8 +36,8 @@ function splitThenLeaves(): RunAgentFn {
     if (req.phase === 'plan') {
       planCalls++
       return planCalls === 1
-        ? '```plan\n{"kind":"decompose","solution":"s","acceptance":"a","children":[{"title":"甲","deps":[]},{"title":"乙","deps":[]}]}\n```'
-        : '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+        ? '```plan\n{"kind":"decompose","solution":"s","acceptance":"跑 bun test 全绿","children":[{"title":"甲","deps":[]},{"title":"乙","deps":[]}]}\n```'
+        : '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
     }
     return allPass(req)
   }
@@ -275,7 +275,7 @@ describe('取消在**每一个**环节都是取消', () => {
       }
       if (req.phase === 'plan' && !planned) {
         planned = true
-        return '\u0060\u0060\u0060plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n\u0060\u0060\u0060'
+        return '\u0060\u0060\u0060plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       }
       return allPass(req)
     }
@@ -314,7 +314,7 @@ describe('取消在**每一个**环节都是取消', () => {
       }
       if (req.phase === 'plan' && !planned) {
         planned = true
-        return '\u0060\u0060\u0060plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n\u0060\u0060\u0060'
+        return '\u0060\u0060\u0060plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       }
       return allPass(req)
     }
@@ -343,7 +343,7 @@ describe('取消不能把已经干的活抹掉', () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan' && !planned) {
         planned = true
-        return '```plan\n{"kind":"executable","solution":"s","acceptance":"a"}\n```'
+        return '```plan\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
       }
       if (req.phase === 'execute') {
         control.cancelNode(req.node.id)

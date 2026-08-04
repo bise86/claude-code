@@ -391,11 +391,11 @@ describe('子 agent 实时窗口:五跳都要接上', () => {
     // 分析圆桌 N 席、方案融合席、方案精化 N 席、观察评分 N 席全都走 runPhase,不走圆桌。
     // 少给一个署名,这些席位就退回「几个人的话并成一坨、看不出谁说的」——正是要治的病。
     const calls = PIPE.split('runPhase(ctx,').length - 1
-    expect(`runPhase 调用点: ${calls}`).toBe('runPhase 调用点: 6')
+    expect(`runPhase 调用点: ${calls}`).toBe('runPhase 调用点: 7')
     // 每一处都得带 phaseLabel;数量对不上说明有人加了调用点却没给窗口。
     const labeled = PIPE.split('phaseLabel:').length - 1
-    expect(`带 phaseLabel 的位置: ${labeled >= 7}`).toBe('带 phaseLabel 的位置: true')
-    for (const one of ['解决合并冲突', '方案融合', '方案精化']) {
+    expect(`带 phaseLabel 的位置: ${labeled >= 8}`).toBe('带 phaseLabel 的位置: true')
+    for (const one of ['解决合并冲突', '方案融合', '方案精化', '方案补验收点']) {
       expect(`${one} 有自己的表头: ${PIPE.includes(`'${one}'`)}`).toBe(`${one} 有自己的表头: true`)
     }
   })

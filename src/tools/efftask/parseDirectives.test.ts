@@ -519,3 +519,38 @@ describe('parseDirectives:planConverge', () => {
     expect(cfg.notices.join('\n')).toContain('planConverge')
   })
 })
+
+/**
+ * 「这段话不会生效」的提示本身说了假话。
+ *
+ * 实测(跑机 run 001 的 run.md):notices 里印着「你对『测试验证』提的那段要求不会生效:
+ * 没给这个环节配角色,它这次不会发生」,而同一份 run.md 的 `phaseRoles.verify` 挂着测试官,
+ * 测试验证这一关实跑了 3 轮。原因是这条判断跑在 `applyDefs` **之前** —— 那时候席位还只在
+ * roleDefs 里(`stage: verify`),还没被落到名册上。
+ */
+describe('parseDirectives:「没配角色」这条提示要在名册定下来之后才判', () => {
+  const known = ['gpt-测试']
+  const json = (o: unknown) => async () => '```json\n' + JSON.stringify(o) + '\n```'
+  const tester = (): RoleDef =>
+    ({ name: '测试官', stage: 'verify', output: '命令与原始输出', purpose: '真的把测试跑起来', staff: ['gpt-测试'] }) as RoleDef
+
+  it('roleDefs 里有 verify 角色时,不许再说「没给这个环节配角色」', async () => {
+    const cfg = await parseDirectives('测试验证时主要看能不能编译过', {
+      knownRoles: known,
+      baseRoleDefs: [tester()],
+      modelJson: json({ phaseGuidance: { verify: '主要看能不能编译过' } }),
+    })
+    expect(cfg.phaseRoles.verify.length).toBeGreaterThan(0)
+    expect(cfg.phaseGuidance?.verify).toContain('编译')
+    expect(cfg.notices.join('\n')).not.toContain('没给这个环节配角色')
+  })
+
+  it('真的没人配 verify 时,照旧要说出来 —— 这条提示不是被删掉了', async () => {
+    const cfg = await parseDirectives('测试验证时跑 bun test', {
+      knownRoles: known,
+      modelJson: json({ phaseGuidance: { verify: '跑 bun test' } }),
+    })
+    expect(cfg.phaseRoles.verify).toEqual([])
+    expect(cfg.notices.join('\n')).toContain('没给这个环节配角色')
+  })
+})
