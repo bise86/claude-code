@@ -9,10 +9,39 @@
  * 这条链是用户报过**两次**的:没有 rg → Grep/Glob 失败 → 子 agent 列不出文件 →
  * 猜文件名 → 一连串「File does not exist. Note: your current working directory is …」。
  */
-import { describe, expect, it } from 'bun:test'
+import { afterAll, describe, expect, it } from 'bun:test'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 
 const PROBE = new URL('../../scripts/probes/noRipgrep.ts', import.meta.url).pathname
 const REPO = new URL('../..', import.meta.url).pathname
+
+/**
+ * 一个**自带的** `rg` 桩子,以及一个空目录。
+ *
+ * 为什么不用这台机器上真的 rg:那样这两条用例的前提就变成「跑机装了 ripgrep」,而
+ * `vendor/ripgrep` 不在 git 里、裸的 CI 跑机也没有 rg —— 于是「PATH 正常时搜索能用」那条
+ * 在 CI 上必红,而它红的原因和被测代码毫无关系。给 CI 装 rg 只治得了这一个 workflow,
+ * 治不了别人的 fork、也治不了 apt 抽风。桩子让这两条用例**在任何机器上结论都一样**。
+ *
+ * 桩子仿真的是 `mode: 'system'` 那一支:`resolveRipgrepConfig` 在找不到 vendor 目录时会
+ * 走 `systemRg()`(即 `findExecutable('rg')`,查 PATH),拿到的命令就是裸的 `rg`。
+ * 所以只要 PATH 上有一个可执行的 `rg`,链路就完整跑通;它输出几行文件名,`ripGrep` 就
+ * 解析出几个 hit。这条链上真正被测的是**失败翻译**,不是 ripgrep 自己的搜索能力。
+ */
+const TMP = mkdtempSync(path.join(tmpdir(), 'rg-probe-'))
+const WITH_RG = path.join(TMP, 'with-rg')
+const WITHOUT_RG = path.join(TMP, 'without-rg')
+mkdirSync(WITH_RG, { recursive: true })
+mkdirSync(WITHOUT_RG, { recursive: true })
+{
+  const stub = path.join(WITH_RG, 'rg')
+  // 输出两行「文件名」。真 rg 在 -l 模式下就是一行一个路径。
+  writeFileSync(stub, '#!/bin/sh\nprintf \'%s\\n\' stub-hit-a.ts stub-hit-b.ts\n')
+  chmodSync(stub, 0o755)
+}
+afterAll(() => { rmSync(TMP, { recursive: true, force: true }) })
 
 /** 用给定的 PATH 跑一次探针,拿它那行 JSON。 */
 function runProbe(path: string): { ok: boolean; message?: string; code?: string; hits?: number } {
@@ -33,22 +62,20 @@ function runProbe(path: string): { ok: boolean; message?: string; code?: string;
 }
 
 describe('机器上没有 ripgrep 时', () => {
-  it('先自检:PATH 正常时搜索是能用的', () => {
+  it('先自检:PATH 上有 rg 时搜索是能用的', () => {
     // 没有这条,下面那条即使因为**别的原因**失败也看不出来 —— 那正是「探针坏了被
     // 记成覆盖」的形状:机器上压根没有 rg 时,下面那条期望的失败会因为错误的原因发生。
     //
-    // **这条用例有一个前提:这台机器能搜索。** `ripGrep` 先找 `vendor/ripgrep`,找不到就退到
-    // 系统 PATH 上的 `rg`。而 `vendor/ripgrep` 不在 git 里,所以裸跑机上只剩后一条路 ——
-    // CI 因此专门装了 ripgrep(见 .github/workflows/ci.yml)。红在这一行时先查这个,
-    // 别去改下面那条用例。
-    const r = runProbe(process.env.PATH ?? '')
+    // 用自带的桩子,不用这台机器上的 rg —— 见文件头。这条用例因此在任何机器上结论都一样,
+    // 它证明的是「rg 找得到时这条链是通的」,而那正是下面那条用例需要的前提。
+    const r = runProbe(WITH_RG)
     expect(`搜索可用: ${r.ok}(${r.message ?? '无错误'})`).toBe('搜索可用: true(无错误)')
     expect(r.hits ?? 0).toBeGreaterThan(0)
   })
 
   it('模型收到的是一句能照做的话,不是裸的 spawn ENOENT', () => {
-    // 只留 bun 自己的目录,系统 rg 够不着。
-    const r = runProbe(`${process.env.HOME}/.bun/bin`)
+    // 空目录:PATH 上没有任何东西,rg 够不着。
+    const r = runProbe(WITHOUT_RG)
     expect(r.ok).toBe(false)
     // 裸错误是 `spawn rg ENOENT` —— 模型不知道这意味着「搜索整个不可用」,于是猜文件名。
     expect(r.message ?? '').toContain('装一个 ripgrep')
