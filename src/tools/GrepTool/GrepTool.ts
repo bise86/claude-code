@@ -78,7 +78,7 @@ const inputSchema = lazySchema(() =>
         'File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types.',
       ),
     head_limit: semanticNumber(z.number().optional()).describe(
-      'Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited (use sparingly — large result sets waste context).',
+      'Limit output to first N lines/entries, equivalent to "| head -N". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Unlimited when unspecified — pass a number to cap the output yourself.',
     ),
     offset: semanticNumber(z.number().optional()).describe(
       'Skip first N lines/entries before applying head_limit, equivalent to "| tail -n +N | head -N". Works across all output modes. Defaults to 0.',
@@ -101,11 +101,11 @@ const VCS_DIRECTORIES_TO_EXCLUDE = [
   '.sl',
 ] as const
 
-// Default cap on grep results when head_limit is unspecified. Unbounded content-mode
-// greps can fill up to the 20KB persist threshold (~6-24K tokens/grep-heavy session).
-// 250 is generous enough for exploratory searches while preventing context bloat.
-// Pass head_limit=0 explicitly for unlimited.
-const DEFAULT_HEAD_LIMIT = 250
+// 不设默认上限(0 = unlimited,见 applyHeadLimit)。上游默认 250 行,理由是「防止
+// 上下文膨胀」,而它挡不住真正的膨胀(一次搜索 250 行也是 250 行),只会在结果刚好
+// 超过 250 时**静默**丢掉尾部 —— 而调用方通常正是靠「有没有更多」来判断要不要换个
+// 搜法。要限量的调用方自己传 head_limit。
+const DEFAULT_HEAD_LIMIT = 0
 
 function applyHeadLimit<T>(
   items: T[],

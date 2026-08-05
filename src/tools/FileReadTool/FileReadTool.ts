@@ -75,7 +75,7 @@ import { readFileInRange } from '../../utils/readFileInRange.js'
 import { semanticNumber } from '../../utils/semanticNumber.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { BASH_TOOL_NAME } from '../BashTool/toolName.js'
-import { getDefaultFileReadingLimits } from './limits.js'
+import { getDefaultFileReadingLimits, IMAGE_TOKEN_BUDGET } from './limits.js'
 import {
   DESCRIPTION,
   FILE_READ_TOOL_NAME,
@@ -869,7 +869,16 @@ async function callInner(
   if (IMAGE_EXTENSIONS.has(ext)) {
     // Images have their own size limits (token budget + compression) —
     // don't apply the text maxSizeBytes cap.
-    const data = await readImageWithTokenBudget(resolvedFilePath, maxTokens)
+    //
+    // **图片是这次「去掉全部上限」里唯一保留的一条**,而且它不是我们编的上限:
+    // 文本的 token 闸门去掉之后 `maxTokens` 是 `Infinity`,`estimatedTokens > maxTokens`
+    // 恒假 → 大图再也不会被压缩 → 直接撞上游自己的单张图上限(5MB)拿一个 400。
+    // 也就是说去掉这一条换不来任何东西:同一张图从「本地压一次照样看得见」变成
+    // 「整次调用失败」。所以这一路在拿不到有限预算时退回原来的默认值。
+    const data = await readImageWithTokenBudget(
+      resolvedFilePath,
+      Number.isFinite(maxTokens) ? maxTokens : IMAGE_TOKEN_BUDGET,
+    )
     context.nestedMemoryAttachmentTriggers?.add(fullFilePath)
 
     logFileOperation({

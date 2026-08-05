@@ -74,7 +74,19 @@ export function getPersistenceThreshold(
   ) {
     return override
   }
-  return Math.min(declaredMaxResultSizeChars, DEFAULT_MAX_RESULT_SIZE_CHARS)
+  /**
+   * **工具自己声明的上限也不再生效。**
+   *
+   * 上游这里是 `Math.min(declared, DEFAULT_MAX_RESULT_SIZE_CHARS)`。把那个全局常量
+   * 改成 `Infinity` 只去掉了一半:绝大多数工具在自己文件里写着 `maxResultSizeChars:
+   * 100_000`,`Math.min` 之后仍然是 100_000,于是「去掉了上限」在最常见的工具上一次
+   * 都不成立(要真去掉就得改 47 个工具文件,而那 47 个数没有一个是各自量出来的)。
+   *
+   * 参数留着:签名是调用点(`toolExecution.ts`)按工具传进来的,而 GrowthBook 覆盖
+   * 那一支仍然能按工具名重新压回一个有限值。
+   */
+  void declaredMaxResultSizeChars
+  return Number.POSITIVE_INFINITY
 }
 
 // Result of persisting a tool result to disk

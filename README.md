@@ -584,6 +584,25 @@ bun --env-file=<REPO>\.env --preload <REPO>\preload.ts <REPO>\src\localRecoveryC
 
 还嫌频繁的话，两个旋钮都在关口上：把并行数调小（运行中按 `←`/`→` 也能调），或者把每环节席位上限调小。
 
+### 第三方网关上的 `400 Stream must be set to true`
+
+症状：某个员工（`openai` / `openai-responses` 协议）已经连续跑通了几十上百次调用，某一轮**突然**死在一个 400 上，节点日志里是这样一行：
+
+```
+API Error: 400 员工「研发」(openai-responses 协议)调用失败 · POST http://.../v1/responses → 400 Bad Request
+· 上游原文:{"error":{"message":"Stream must be set to true", ...}}
+```
+
+这**不是** model 名写错，也不是网关不认 `/responses`——那两条是错误消息里的通用猜测，在这个症状下都是假的（同一个员工在这之前刚成功过几十次）。真因是引擎的**非流式回退**：一次流式请求失败后（流中断、空闲看门狗、连接被掐），引擎会静默地把同一轮改成非流式重发一次，而发给第三方网关的那个请求体里就没有 `stream` 了。要求 `stream: true` 的网关直接回 400；而 400 是不可重试的，于是整个席位当场死掉，那一轮已经跑了上百条消息的对话全部作废。
+
+对翻译型协议来说这条回退路**永远走不通**（宽容的网关会回一个非流式 JSON，我们这边同样判失败）。所以第三方网关下建议直接关掉它：
+
+```bash
+export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+```
+
+关掉之后，流式失败会按正常的重试判据重试（可重试的错误照样重试），而不是换成一个必死的形态。用 Anthropic 官方端点时不需要设。
+
 ### 常见坑
 
 - **`roles[]` 是严格校验的**：写入未声明的字段会让**整条员工被跳过**（表现为「这个员工不存在」），而不只是该字段失效。原因会显示在 `/et` 启动关口的「你的请求中有以下部分不会生效」那一块里（非交互 `--print` 模式下才走终端）——**交互式会话里终端上看不到它**：ink 的 `patchConsole` 把 `console.error` 改写成了只进 debug 日志。
@@ -1187,6 +1206,7 @@ codex / gemini / 自研程序认不认 `CLAUDE.md` 完全是它自己的事（`A
 | `API_TIMEOUT_MS` | 否 | API 请求超时，默认 600000 (10min) |
 | `DISABLE_TELEMETRY` | 否 | 设为 `1` 禁用遥测 |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | 否 | 设为 `1` 禁用非必要网络请求 |
+| `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` | 否 | 设为 `1` 关闭「流式失败后改用非流式重发」的回退。第三方网关（`openai` / `openai-responses` 协议的员工）建议打开，否则会撞上 `400 Stream must be set to true`，见「第三方网关上的 `400 Stream must be set to true`」 |
 
 ---
 

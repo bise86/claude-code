@@ -34,7 +34,7 @@ Assume this tool is able to read all files on the machine. If the User provides 
 
 Usage:
 - The file_path parameter must be an absolute path, not a relative path
-- By default, it reads up to ${MAX_LINES_TO_READ} lines starting from the beginning of the file${maxSizeInstruction}
+- By default, it reads the ENTIRE file — there is no line cap and no file-size cap${maxSizeInstruction}
 ${offsetInstruction}
 ${lineFormat}
 - This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.${

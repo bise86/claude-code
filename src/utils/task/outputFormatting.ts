@@ -1,8 +1,14 @@
 import { validateBoundedIntEnvVar } from '../envValidation.js'
 import { getTaskOutputPath } from './diskOutput.js'
 
-export const TASK_MAX_OUTPUT_UPPER_LIMIT = 160_000
-export const TASK_MAX_OUTPUT_DEFAULT = 32_000
+/**
+ * 子 agent(Task)回传产出的截断长度。**这个 fork 里不截断。**
+ *
+ * 上游默认 32_000 字符,超了只保留**末尾**那一段并在开头贴一行文件路径。子 agent 的
+ * 产出正是最不该截的一类:它已经是一份压缩过的结论,截掉开头就是截掉结论本身。
+ */
+export const TASK_MAX_OUTPUT_UPPER_LIMIT = Number.POSITIVE_INFINITY
+export const TASK_MAX_OUTPUT_DEFAULT = Number.POSITIVE_INFINITY
 
 export function getMaxTaskOutputLength(): number {
   const result = validateBoundedIntEnvVar(

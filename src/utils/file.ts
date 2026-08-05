@@ -45,7 +45,17 @@ export async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-export const MAX_OUTPUT_SIZE = 0.25 * 1024 * 1024 // 0.25MB in bytes
+/**
+ * Read 的文件大小上限。**这个 fork 里没有上限。**
+ *
+ * 上游是 0.25MB,超过就整次读取报错(`File content (…) exceeds maximum allowed size`),
+ * 让人改用 offset/limit 分片读。分片读对一份 800KB 的日志/清单没有任何意义:读的人
+ * 事先并不知道要的那一段在第几行,于是变成来回试探好几次,总代价比一次读完还高。
+ *
+ * 保持 `Infinity` 而不是删掉这个常量:它是 `getDefaultFileReadingLimits` 的缺省值,
+ * 而 GrowthBook 覆盖那一支仍然可以按需重新压回一个有限值。
+ */
+export const MAX_OUTPUT_SIZE = Number.POSITIVE_INFINITY
 
 export function readFileSafe(filepath: string): string | null {
   try {

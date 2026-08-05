@@ -13,7 +13,16 @@ import { logError } from './log.js'
 
 export const MCP_TOKEN_COUNT_THRESHOLD_FACTOR = 0.5
 export const IMAGE_TOKEN_ESTIMATE = 1600
-const DEFAULT_MAX_MCP_OUTPUT_TOKENS = 25000
+/**
+ * MCP 工具产出的 token 上限。**这个 fork 里没有上限。**
+ *
+ * 上游 25000,超了从**尾部**切掉并贴一段「OUTPUT TRUNCATED」。切掉的是尾部,而
+ * gitnexus / rules 这类查询型 MCP 的结果恰恰是列表 —— 被切掉的那几条和留下的那几条
+ * 没有重要性差别,模型却读不出少了什么。
+ *
+ * `MAX_MCP_OUTPUT_TOKENS` 环境变量仍然可以按需压回一个有限值。
+ */
+const DEFAULT_MAX_MCP_OUTPUT_TOKENS = Number.POSITIVE_INFINITY
 
 /**
  * Resolve the MCP output token cap. Precedence:

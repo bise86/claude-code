@@ -154,7 +154,8 @@ export const GlobTool = buildTool({
   async call(input, { abortController, getAppState, globLimits }) {
     const start = Date.now()
     const appState = getAppState()
-    const limit = globLimits?.maxResults ?? 100
+    // 默认不截断(上游是 100 个文件)。调用方可以用 globLimits.maxResults 自己限量。
+    const limit = globLimits?.maxResults ?? Number.POSITIVE_INFINITY
     const { files, truncated } = await glob(
       input.pattern,
       GlobTool.getPath(input),

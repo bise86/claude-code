@@ -73,14 +73,20 @@ export const PDF_MAX_EXTRACT_SIZE = 100 * 1024 * 1024 // 100 MB
 
 /**
  * Max pages the Read tool will extract in a single call with the pages parameter.
+ *
+ * **顶到 API 自己的上限。** 原来是 20 —— 那是我们自己加的一道,不是上游的。这个 fork
+ * 去掉自己造的上限,但**不去掉上游真有的那条**(`API_PDF_MAX_PAGES`):越过它换来的
+ * 不是「读到更多」,是一次 400。
  */
-export const PDF_MAX_PAGES_PER_READ = 20
+export const PDF_MAX_PAGES_PER_READ = API_PDF_MAX_PAGES
 
 /**
  * PDFs with more pages than this get the reference treatment on @ mention
  * instead of being inlined into context.
+ *
+ * 同上:原来是 10,现在跟着 API 的真上限走。
  */
-export const PDF_AT_MENTION_INLINE_THRESHOLD = 10
+export const PDF_AT_MENTION_INLINE_THRESHOLD = API_PDF_MAX_PAGES
 
 // =============================================================================
 // MEDIA LIMITS

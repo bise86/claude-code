@@ -15,7 +15,26 @@
 import memoize from 'lodash-es/memoize.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js'
 import { MAX_OUTPUT_SIZE } from 'src/utils/file.js'
-export const DEFAULT_MAX_OUTPUT_TOKENS = 25000
+/**
+ * Read 单次输出的 token 上限。**这个 fork 里没有上限。**
+ *
+ * 上游是 25000,超过同样是整次读取报错而不是截断。和 maxSizeBytes 一起去掉 ——
+ * 只去掉字节闸门的话,一份 800KB 的文本会先过了 stat 那一关,再死在这一关上,
+ * 报错文案还换了一个(「exceeds maximum allowed tokens」),看着像另一个毛病。
+ *
+ * 环境变量 `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` 仍然可以按需压回一个有限值。
+ */
+export const DEFAULT_MAX_OUTPUT_TOKENS = Number.POSITIVE_INFINITY
+
+/**
+ * 图片单独的 token 预算(= 上游原来的 25000)。
+ *
+ * 文本那条闸门去掉之后 `maxTokens` 是 `Infinity`,图片路径上的
+ * `estimatedTokens > maxTokens` 就恒假,大图再也不会被压缩 —— 而图片有**上游自己的**
+ * 单张 5MB 限制,压缩不发生的结果不是「读到更多」,是整次调用 400。见 FileReadTool
+ * 里那一处的注释。
+ */
+export const IMAGE_TOKEN_BUDGET = 25000
 
 /**
  * Env var override for max output tokens. Returns undefined when unset/invalid
