@@ -1,10 +1,10 @@
 import { parse as yamlParse } from 'yaml'
-import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
-import type { Caps, EffTaskConfig, NodeKind, NodePlan, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
+import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEGRADABLE_PHASES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
+import type { Caps, DegradeRecord, EffTaskConfig, NodeKind, NodePlan, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
 import { isStrictness } from './strictness.js'
-import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS, MAX_FIELD_CHARS } from './parseOutput.js'
+import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS } from './parseOutput.js'
 import { sanitizeUsage } from './usage.js'
 
 // Exported because they ARE the post-condition: whatever this module hands back, every reader
@@ -218,6 +218,17 @@ function verdictArray(v: unknown, onDrop?: () => void): RoundtableRecord['verdic
         ...(Array.isArray(x.retracted) && strArray(x.retracted).length > 0
           ? { retracted: capBlockingList(strArray(x.retracted), '撤回项') }
           : {}),
+        /**
+         * `advice` —— **修改建议**,和 `retracted` 死在同一行上的那一类,一并在这里读回来。
+         *
+         * 它是「触顶不失败,把意见带给下一个环节」这整套东西唯一有价值的载荷:降级记录里的
+         * `advice`、执行/验收提示词里的「累积修改建议」都从它取。逐字段重建里漏掉它,
+         * 一次 `--resume` 之后所有降级节点带下去的建议全部变空,而 node.md 上看不出来 ——
+         * 提示词还在照常渲染那一段标题,底下什么都没有。
+         */
+        ...(Array.isArray(x.advice) && strArray(x.advice).length > 0
+          ? { advice: capBlockingList(strArray(x.advice), '修改建议') }
+          : {}),
         ...(x.timeoutKind === 'human' || x.timeoutKind === 'stall' || x.timeoutKind === 'total'
           ? { timeoutKind: x.timeoutKind }
           : {}),
@@ -376,6 +387,9 @@ export function validateLoadedNodes(
     n.iteration = {
       planReview: count(it.planReview),
       acceptance: count(it.acceptance),
+      // 测试验证有了自己的一维(理由见 TaskNode.iteration)。老 node.md 里没有这个键,
+      // `count(undefined)` 读成 0 —— 那正是「这个节点还没跑过测试验证」的正确含义。
+      verification: count(it.verification),
       integration: count(it.integration),
       scoring: count(it.scoring),
       mergeResolve: count(it.mergeResolve),
@@ -553,6 +567,36 @@ export function validateLoadedNodes(
     n.score = {
       ...(scoreRecord(rawScore.plan) ? { plan: scoreRecord(rawScore.plan) } : {}),
       ...(scoreRecord(rawScore.exec) ? { exec: scoreRecord(rawScore.exec) } : {}),
+    }
+    /**
+     * 降级放行记录,**逐字段校验**,理由和 `roundArray` / `scoreRecord` 逐字相同。
+     *
+     * `serializeNode` 是 `{...node}` 全量倾倒,所以 `degraded` 本身**能**穿过 --resume ——
+     * 但它是**未经校验**地穿过去的。node.md 按设计可以手工编辑,崩在半路也会留下半份记录,
+     * 而下游会 `d.advice.join()`、`degraded.length`:一个 `degraded: 'boom'` 或者一条缺
+     * `advice` 的记录会在 `commit()` 里抛 TypeError,把节点以一句原始 TypeError 阻断 ——
+     * 而且每一次 resume 都重演一遍。这正是 roundArray 当年被写出来的那个失败。
+     *
+     * 形状不对的**整条丢掉**并计进修复清单(§17.2 要把校验结果讲给用户听),不静默留半条:
+     * 半条降级记录会让渲染层说「这个节点降级放行过」却给不出降级的是哪一关。
+     */
+    if (n.degraded !== undefined) {
+      const before = Array.isArray(n.degraded) ? n.degraded.length : 1
+      const kept = (Array.isArray(n.degraded) ? n.degraded : [])
+        .filter((d): d is DegradeRecord =>
+          !!d && typeof d === 'object'
+          && (DEGRADABLE_PHASES as readonly string[]).includes((d as DegradeRecord).phase)
+          && Array.isArray((d as DegradeRecord).advice))
+        .map(d => ({
+          phase: d.phase,
+          round: Number.isFinite(d.round) ? Math.max(0, Math.trunc(d.round)) : 0,
+          reason: typeof d.reason === 'string' ? capText(d.reason, MAX_SUMMARY_CHARS) : '',
+          advice: capBlockingList(strArray(d.advice), '修改建议'),
+          at: typeof d.at === 'string' ? d.at : '',
+        }))
+      if (kept.length > 0) n.degraded = kept
+      else delete n.degraded
+      if (before !== kept.length) repairs.push(`节点 ${n.id}:${before - kept.length} 条降级放行记录已损坏,已丢弃`)
     }
     // The same `!== true → false` discipline capBlocked already had. A truthy non-boolean
     // `interrupted: "yes"` matches neither reseat's `=== true` nor --retry-blocked's
@@ -1079,6 +1123,10 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
         salvage: Array.isArray(o.salvage) ? o.salvage.filter((x): x is string => typeof x === 'string') : [],
         outcome: o.outcome === 'blocked' ? 'blocked' : 'completed',
         ...(typeof o.reason === 'string' && o.reason.length > 0 ? { reason: o.reason } : {}),
+        // 必须读回来:`writeRunManifest` 整份重写 run.md,而这个字段是「别自动合并」的
+        // 唯一判据 —— 写得出去读不回来的话,`--resume` 之后那道门就消失了。
+        ...(Number.isFinite(o.degradedNodes) && (o.degradedNodes as number) > 0
+          ? { degradedNodes: Math.trunc(o.degradedNodes as number) } : {}),
       }
     } else {
       degraded.push('run.md 里的待收口记录缺少分支名,已忽略:集成分支需要你自己处置')

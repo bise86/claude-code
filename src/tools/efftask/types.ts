@@ -67,8 +67,64 @@ export type BlockCategory =
   // generic non-stopping body text that says the grow request was refused. One card, three
   // contradictions.
   | 'revise'
+  /**
+   * 迭代用尽,但**节点没停** —— 带着累积的修改建议降级放行,交给下一个环节继续推进。
+   *
+   * 和 `revise` 同一类(非阀门、不停节点),但必须是**自己一档**:`escalation.ts` 的正文
+   * 按 category 分支,`cap-iteration` 那一档的标题是「安全阀 · 方案评审迭代超限」、建议是
+   * 「提高 caps.maxIterations 后再重试」—— 对一个刚刚继续往下跑的节点,这两句都是假的;
+   * 而落进兜底那一支会告诉用户「这次加子节点的请求被拒绝了」,和事实完全无关。
+   * 一张卡三处自相矛盾,`revise` 当初就是为同一个毛病单独立的档。
+   */
+  | 'degrade'
 export const BLOCK_CATEGORIES: ReadonlySet<string> =
-  new Set(['cap-iteration', 'cap-nodes', 'rework', 'timeout', 'infra', 'cap-depth', 'revise'])
+  new Set(['cap-iteration', 'cap-nodes', 'rework', 'timeout', 'infra', 'cap-depth', 'revise', 'degrade'])
+
+/**
+ * 降级放行可以发生在哪几关 = **四个裁决关口**。执行不在内:那不是判决,零产出就是零产出。
+ *
+ * `integrate`(集成验收)必须在内,而它差点被漏掉。漏掉的后果是「不失败」这句承诺对
+ * **每一个拆分型节点**都不成立 —— 包括根:子任务全部降级放行、全部 ACCEPTED 之后,
+ * 根的集成验收照样会在第 3 轮把整个 run 判死。run 001 死的正是根节点。
+ */
+export const DEGRADABLE_PHASES = ['review', 'verify', 'accept', 'integrate'] as const
+export type DegradePhase = (typeof DEGRADABLE_PHASES)[number]
+
+/**
+ * 一次**降级放行**:这一关的迭代额度用完了,判决没通过,但节点带着意见继续往下跑。
+ *
+ * 用户原话:「如果达到三次,也不要失败,将方案和修改建议传递给执行阶段……反正,就是不失败了。
+ * 这些轮数,只是不停找问题,来迭代优化。」跑机 run 001 是这条需求的出处:root 节点烧了
+ * 13.5 分钟评审、拿到 13 条**带 grep 实测输出**的具体意见(gitnexus 参数该怎么写、验收
+ * worktree 已被占用要用 --detach、contrib 漏了哪个包),然后整棵树以 `cap-iteration` 死掉,
+ * 那 13 条只剩在一个字符串里,**没有任何下游环节读它们**。
+ *
+ * ## 它不是一次性标记,所以不受「处处记得清」那条约束
+ *
+ * 这是**追加式审计记录**:一个节点这辈子在哪几关被降级放行过,是事后追责的依据,
+ * 不能在下一次 commit 里被消费掉。只有 `redo`(用户显式重做这个节点)才清。
+ *
+ * ## 但它**同时**是一个闩,而那一半是 load-bearing
+ *
+ * `stepExecute` 是无界 `for(;;)`。降级如果只记账不闩住,那一关下一轮又会跑、又会触顶、
+ * 又降级 —— 无限次真实模型调用。所以「这一关有没有降级过」必须能被判:
+ * `degraded.some(d => d.phase === x)` = 这个节点余生不再进这一关的判决。
+ *
+ * 同理 `reseat` 的「恢复时该阶段预算已耗尽」那条早退:降级过的节点计数器**本来就**停在
+ * 上限上,不告诉 reseat 的话,下一次 `--resume` 会把一个正在正常往下跑的节点直接判死,
+ * 而它既没有 `capBlocked`(没走 blockWithReason)也就不被 `--retry-blocked` 认领 ——
+ * 永久死节点,而且降级带下去的那些建议一起没了。
+ */
+export interface DegradeRecord {
+  phase: DegradePhase
+  /** 触顶时是第几轮。和 `iteration.*` 同源。 */
+  round: number
+  /** 最后一轮的阻断摘要 —— 「为什么没通过」。 */
+  reason: string
+  /** 累积的**修改建议** —— 「接下来该怎么改」。这是降级真正要传下去的东西。 */
+  advice: string[]
+  at: string
+}
 
 export type NodeStatus =
   | 'CREATED' | 'PLANNING' | 'PLAN_REVIEW'
@@ -242,6 +298,23 @@ export interface Verdict {
    * 省略 = 什么都没撤回 = 与引入本字段之前逐字相同。老 node.md 里全是这个形状。
    */
   retracted?: string[]
+  /**
+   * 这一席给出的**修改建议** —— 「接下来该怎么改」,和 `blocking` 的「哪里不对」分开存。
+   *
+   * 用户原话:「每次质疑不能给出修改建议吗?然后一起传给下面的阶段去。」
+   *
+   * **它不是 blocking 的换个说法。** 跑机 run 001 的评审员本来就在 blocking 里写修复方式
+   * (「修复方式:在方案 JSON 中实际给出 children 数组」「应改为 `git worktree add --detach`」),
+   * 而它们一条都没传到下一轮 —— 因为 `planFeedbackPrompt` 按条数均分预算,13 条时每条
+   * 261 字,修复方式全写在被 `…(已截断,原文 518 字)` 吃掉的那一半里。单独成字段,
+   * 是为了让「怎么改」有一个**定位得到、能单独保预算**的位置(见 `adviceOf`),
+   * 而不是和证据正文抢同一个字符数。
+   *
+   * 只在**不通过**时存(和 `remedy` 同因);省略 = 这一席没给建议 = 老 node.md 逐字不变。
+   * 必须被 `resumeCore.verdictArray` 读回来 —— 那是逐字段重建的,漏一个就是
+   * 「写得出去读不回来」,`--resume` 一次全没。
+   */
+  advice?: string[]
   /**
    * 集成验收不通过时,这位角色提出的**补救子任务** —— spec §4.1 的
    * `INTEGRATION_ACCEPT ──fail──▶ (回到 decompose 修订)`。
@@ -609,6 +682,14 @@ export interface TaskNode {
    */
   revised?: boolean
   /**
+   * 这个节点在哪几关被**降级放行**过。见 `DegradeRecord` —— 既是审计记录,也是闩。
+   *
+   * 缺席 / 空数组 = 从来没降级过 = 今天的行为逐字不变。渲染层必须把它当成
+   * 「ACCEPTED 但没通过判决」:画成普通的 🟢、run.md 写 completed、`/tasks` 计进
+   * 「已完成」,都是谎报完成 —— 这个仓库为谎报完成付过三次学费。
+   */
+  degraded?: DegradeRecord[]
+  /**
    * 各阶段耗时 (spec §10.2) — accumulated milliseconds per ACTIVE status.
    *
    * The detail pane showed one aggregate number, which cannot answer the question someone
@@ -675,7 +756,18 @@ export interface TaskNode {
   // Separate budgets. `acceptance` belongs to an executable node's accept loop and
   // `integration` to a decompose node's integrate loop; sharing one counter means a
   // resumed node could arrive at integration with its budget already spent elsewhere.
-  iteration: { planReview: number; acceptance: number; integration: number; scoring: number; mergeResolve: number }
+  /**
+   * `verification` 是**后加的一维**,理由是降级放行把两关拆开了。
+   *
+   * 原来测试验证和验收共用 `acceptance`(注释写着「不新增预算维度」),那在「触顶即阻断」
+   * 的世界里是对的:两关加起来一共 3 轮,谁先烧完都一样是死。但用户要的是
+   * 「三轮到测试验证还是有问题,就把修改建议给验收,让验收来修改」—— 共用一个计数器时,
+   * 测试验证烧完 3 轮之后验收**一轮都不剩**,第一次不通过就立刻降级盖章。
+   * 「交给验收」当场坍缩成「验收只看一眼然后放行」,和这句需求正好相反。
+   *
+   * 缺席读成 0(见 `resumeCore` 的 `count`)—— 老 node.md 照常读得回来。
+   */
+  iteration: { planReview: number; acceptance: number; verification?: number; integration: number; scoring: number; mergeResolve: number }
   depth: number
   createdAt: string
   updatedAt: string
@@ -991,6 +1083,15 @@ export interface PendingHandoff {
   /** run 是正常跑完还是被阻断/取消 —— 别邀请用户合并一棵没做完的树。 */
   outcome: 'completed' | 'blocked'
   reason?: string
+  /**
+   * 有几个节点是**降级放行**的 —— 跑完了,但那几个没有通过判决。
+   *
+   * 为什么它必须单独存在,而不能靠 `outcome` 兜住:降级放行的 run **就是** `completed`
+   * (树推完了、根 ACCEPTED),于是 `planFinish` 会直接 `{action:'merge'}` ——
+   * **把一份没人判通过的代码自动 merge 进用户的检出**,不弹确认、不按任何键。
+   * 自动合并当初被认定安全的前提逐字是「一次干净跑完的运行」,而这条路把那个前提改掉了。
+   */
+  degradedNodes?: number
 }
 
 export interface ResumeRecord {

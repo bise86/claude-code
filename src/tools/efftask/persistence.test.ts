@@ -629,3 +629,26 @@ describe('上一版方案要能原样躺过一次落盘', () => {
     expect(back.prevPlan).not.toBe(back.plan)
   })
 })
+
+
+/**
+ * `Verdict.advice` 只落 frontmatter 的话,一条真的提出过、真的被送到下游的建议,
+ * 在 node.md 上和「这一席什么都没说」长得一模一样 —— 而 node.md 是事后追责唯一读得到的
+ * 东西。这个文件自己的规矩写过三遍:「body 才是人读的那一半」。
+ * (降级那一节只渲染**降级发生时**收拢的那一份;一轮提了建议、下一轮就通过了的节点
+ * 根本没有降级记录,那条建议就此无处可读。)
+ */
+describe('修改建议要出现在 node.md 的正文里', () => {
+  it('评审记录那一行带上「修改建议 N 条」和原文', () => {
+    const n = createNode({ id: 'root', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    n.reviewLog = [{
+      round: 1,
+      verdicts: [{ role: '总监', pass: false, blocking: ['参数不可执行'], comments: '', advice: ['把 repo 值改成 etcd'] }],
+      synthesized: { pass: false, blockingSummary: '参数不可执行' },
+    }]
+    const md = serializeNode(n)
+    const body = md.slice(md.indexOf('## 评审记录'))
+    expect(body).toContain('修改建议')
+    expect(body).toContain('把 repo 值改成 etcd')
+  })
+})

@@ -32,7 +32,7 @@ function cooperative(plan: string): RunAgentFn {
     // Read the tag out of the answer rule itself. Scanning the whole prompt for
     // `(plan|verdict|exec)[a-z]{8}` also matches text quoted INTO the prompt, and answering
     // with the wrong tag is indistinguishable from not answering at all (fail-closed).
-    const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+    const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
     const body =
       req.phase === 'plan' ? plan
       : req.phase === 'execute' ? '{"execStatus":"改完并通过测试"}'
@@ -94,7 +94,7 @@ describe('人工解决合并冲突后,--resume 真的接手', () => {
     let merges = 0
     const agent = (async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'execute') executes++
-      const tag = req.prompt.match(/必须是一个 \`\`\`([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
       const body = req.phase === 'plan' ? EXECUTABLE_PLAN
         : req.phase === 'execute' ? '{"execStatus":"改完"}'
         : '{"pass":true,"blocking":[],"comments":"ok"}'
@@ -145,7 +145,7 @@ describe('人工解决合并冲突后,--resume 真的接手', () => {
 
     let merges = 0
     const agent = (async (req: { phase: string; prompt: string }) => {
-      const tag = req.prompt.match(/必须是一个 \`\`\`([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
       const body = req.phase === 'plan' ? EXECUTABLE_PLAN
         : req.phase === 'execute' ? '{"execStatus":"改完"}'
         : '{"pass":false,"blocking":["人工解决时删掉了退款分支"],"comments":""}'
@@ -246,7 +246,7 @@ describe('the resume guidance and the earned blockers both reach the model', () 
   const seen: { phase: string; prompt: string }[] = []
   const recorder: RunAgentFn = (async (req: { phase: string; prompt: string }) => {
     seen.push({ phase: req.phase, prompt: req.prompt })
-    const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+    const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
     const body =
       req.phase === 'plan' ? EXECUTABLE_PLAN
       : req.phase === 'execute' ? '{"execStatus":"改完"}'
@@ -355,7 +355,7 @@ describe('spec §4.1 补救拆分:在真实调度器下端到端跑通', () => {
     // 下面那两条 not.toContain 是廉价的兜底断言,不是覆盖。
     let integrations = 0
     const runAgent = (async (req: { phase: string; prompt: string }) => {
-      const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
       if (req.phase === 'plan') {
         // root 先拆一个子任务;补救出来的子节点自己是可执行叶子。
         return `\`\`\`${tag}\n${req.prompt.includes('补救') || req.prompt.includes('AA')

@@ -21,11 +21,11 @@ const cfg: EffTaskConfig = {
   goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: DEFAULT_CAPS, notices: [],
 }
 const vtag = (req: { prompt: string }): string =>
-  '```' + (req.prompt.match(/必须是一个 ```(verdict[a-z0-9]+) 代码块/)?.[1] ?? 'verdict')
+  '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z0-9]+)/)?.[1] ?? 'verdict')
 const ptag = (req: { prompt: string }): string =>
-  '```' + (req.prompt.match(/必须是一个 ```(plan[a-z0-9]+) 代码块/)?.[1] ?? 'plan')
+  '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z0-9]+)/)?.[1] ?? 'plan')
 const etag = (req: { prompt: string }): string =>
-  '```' + (req.prompt.match(/必须是一个 ```(exec[a-z0-9]+) 代码块/)?.[1] ?? 'exec')
+  '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z0-9]+)/)?.[1] ?? 'exec')
 
 const ctxFor = (nodes: TaskNode[], runAgent: RunAgentFn, over: Partial<PipelineCtx> = {}): PipelineCtx => ({
   config: cfg,

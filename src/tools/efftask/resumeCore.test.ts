@@ -37,7 +37,9 @@ describe('validateLoadedNodes keeps illegal disk state out of the state machine'
     expect(got.depth).toBe(0)
     // A missing counter reads as 0, never as "no limit" — undefined + 1 is NaN, which never
     // satisfies >= maxIterations and turns a bounded retry loop into an unbounded one.
-    expect(got.iteration).toEqual({ planReview: 2, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 })
+    // `verification` 是后加的一维(测试验证不再和验收共用预算,理由见 TaskNode.iteration)。
+    // 老 node.md 里没有这个键,读成 0 —— 那正是「这个节点还没跑过测试验证」的意思。
+    expect(got.iteration).toEqual({ planReview: 2, acceptance: 0, verification: 0, integration: 0, scoring: 0, mergeResolve: 0 })
     expect(got.execStatus).toBe('')
     expect(got.plan.solution).toBe('')
     expect(got.reviewLog).toEqual([])
@@ -1439,5 +1441,36 @@ describe('上一版方案从盘上读回来时要校验', () => {
     expect(n.prevPlan!.keyPoints).toBe('k')
     expect(n.prevPlan!.alternatives).toBeUndefined()
     expect(n.prevPlan!.responses).toBeUndefined()
+  })
+})
+
+
+/**
+ * 「写得出去读不回来」是这个仓库的固定失败模式:`serializeNode` 是 `{...node}` 整份倾倒,
+ * 而 `Verdict` / `RoundtableRecord` / `iteration` 是**逐字段重建**的 —— 漏一个,
+ * 一次 `--resume` 之后它就永远消失,而盘上看不出来。
+ */
+describe('降级放行相关的字段必须读得回来', () => {
+  it('Verdict.advice 逐字还在 —— 它是「触顶不失败」唯一的载荷', () => {
+    const raw = [{
+      ...mk({ id: 'a' }),
+      acceptLog: [{
+        round: 1, step: 'verify',
+        verdicts: [{ role: 'tester', pass: false, blocking: ['没过'], comments: '', advice: ['把 X 改成 Y'] }],
+        synthesized: { pass: false, blockingSummary: '没过' },
+      }],
+    }] as unknown as TaskNode[]
+    const out1 = validateLoadedNodes(raw, OPTS)
+    expect(out1.nodes[0]!.acceptLog[0]!.verdicts[0]!.advice).toEqual(['把 X 改成 Y'])
+  })
+
+  it('iteration.verification 读的是盘上那个数,不是恒 0', () => {
+    const raw = [{
+      ...mk({ id: 'b' }),
+      iteration: { planReview: 0, acceptance: 1, verification: 2, integration: 0, scoring: 0, mergeResolve: 0 },
+    }] as unknown as TaskNode[]
+    const out2 = validateLoadedNodes(raw, OPTS)
+    // 读成 0 = 恢复回来的节点白拿一整份测试验证预算,而它其实只剩一轮。
+    expect(out2.nodes[0]!.iteration.verification).toBe(2)
   })
 })

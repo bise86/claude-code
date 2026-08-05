@@ -8,7 +8,7 @@ import type { RunAgentFn } from './roundtable.js'
 
 // Verdict prompts carry a per-call random tag; a cooperative reviewer answers under THAT tag.
 // Anything else in the reply is quoted context, which parseVerdict deliberately refuses.
-const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
+const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
 const NOW = '2026-07-25T00:00:00Z'
 const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({ goalPrompt: '构建功能', parallelism: DEFAULT_PARALLELISM, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, ...over })
 const deps = (runAgent: RunAgentFn) => ({ runAgent, persist: async () => {}, now: () => NOW, onUpdate: () => {} })
@@ -67,7 +67,17 @@ describe('EffTaskOrchestrator (serial)', () => {
     expect((await orch.run()).status).toBe('blocked')
   })
 
-  it('BLOCKED propagates: a child that always fails acceptance => root ends BLOCKED, run returns blocked', async () => {
+  /**
+   * 验收永远不过 —— 用户明确要的行为:**不失败**,带着意见降级放行。
+   *
+   * 用户原话:「反正,就是不失败了。这些轮数,只是不停找问题,来迭代优化。」
+   * 出处是跑机 run 001:三轮评审拿到 13 条带实测输出的意见,然后整棵树以 cap-iteration
+   * 死掉,那 13 条只剩在一个字符串里,没有任何下游环节读它们。
+   *
+   * 但「不失败」**不等于**「判通过」,所以这条用例同时钉住另一半:降级记录要在,
+   * 建议要被带走 —— 否则这就只是把阻断换成了谎报完成。
+   */
+  it('验收永远不过 => 降级放行、run 完成,而不是整棵树死掉', async () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
         if (req.node.id === 'root') return '```json\n{"kind":"decompose","solution":"s","children":[{"title":"only","deps":[]}]}\n```'
@@ -75,13 +85,44 @@ describe('EffTaskOrchestrator (serial)', () => {
       }
       if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' // plans pass review
       if (req.phase === 'execute') return '```json\n{"execStatus":"did"}\n```'
-      return vtag(req) + '\n{"pass":false,"blocking":["永远不过"],"comments":""}\n```' // child acceptance always fails → BLOCKED after maxIterations
+      return vtag(req) + '\n{"pass":false,"blocking":["永远不过"],"advice":["把 repo 参数写成 etcd,branch 写成 main"],"comments":""}\n```'
+    }
+    const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
+    const result = await orch.run()
+    expect(result.status).toBe('completed')
+    const child = orch.nodes().find(n => n.id === 'root/01-only')!
+    expect(child.status).toBe('ACCEPTED')
+    // 而且**没有假装是干净的完成**:降级留了痕,建议真的被收走了。
+    expect(child.degraded ?? []).not.toHaveLength(0)
+    expect(child.degraded!.map(d => d.phase)).toContain('accept')
+    expect(child.degraded!.flatMap(d => d.advice).join()).toContain('branch 写成 main')
+  })
+
+  /**
+   * 而 BLOCKED 的**上传**仍然要工作 —— 降级不能把这条路一起吃掉。
+   *
+   * 走的是刻意保留的那条硬边界:方案连一个可用的结构都没解析出来(没有验收点),
+   * 评审轮数烧完时**没有任何可以交给执行者的东西**。这一支和 infra 耗尽同类:
+   * 没有人产出过可判的东西,轮数再多也变不出来,所以它照旧阻断。
+   */
+  it('方案始终不可用(没有验收点)=> 仍然 BLOCKED,并沿树上传', async () => {
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        if (req.node.id === 'root') return '```json\n{"kind":"decompose","solution":"s","children":[{"title":"only","deps":[]}]}\n```'
+        // 叶子:一份没有验收点的方案 —— 降级放行时无判据可交,必须停。
+        return '```json\n{"kind":"executable","solution":"leaf","acceptance":""}\n```'
+      }
+      if (req.phase === 'review' && req.node.id === 'root') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":false,"blocking":["没有验收点"],"comments":""}\n```'
+      if (req.phase === 'execute') return '```json\n{"execStatus":"did"}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     const result = await orch.run()
     expect(result.status).toBe('blocked')
     const child = orch.nodes().find(n => n.id === 'root/01-only')!
     expect(child.status).toBe('BLOCKED')
+    expect(child.degraded ?? []).toHaveLength(0) // 没有降级过 —— 它是真的停了
     const root = orch.nodes().find(n => n.id === 'root')!
     expect(root.status).toBe('BLOCKED') // propagated up from the BLOCKED child
   })
@@ -188,8 +229,12 @@ describe('EffTaskOrchestrator (serial)', () => {
       if (req.phase === 'plan' && req.node.id === 'root') {
         return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"A","deps":[]},{"title":"B","deps":[]}]}\n```'
       }
-      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"leaf","acceptance":"跑 bun test 全绿"}\n```'
-      if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      // 叶子的方案**没有验收点** —— 走的是降级放行刻意保留的那条硬边界:评审轮数烧完时
+      // 手上没有任何可以交给执行者的东西,所以照旧阻断(见 stepPlan 的 lastPlanUsable)。
+      // 用它而不是「验收永远不过」,因为后者现在会降级放行,不再产生 BLOCKED 子树。
+      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"leaf","acceptance":""}\n```'
+      if (req.phase === 'review' && req.node.id === 'root') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":false,"blocking":["没有验收点"],"comments":""}\n```'
       if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
       return vtag(req) + '\n{"pass":false,"blocking":["不过"],"comments":""}\n```'
     }
@@ -212,9 +257,22 @@ describe('EffTaskOrchestrator (serial)', () => {
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     const result = await orch.run()
-    expect(result.status).toBe('blocked')
-    expect(result.reason).toContain('超限')
+    /**
+     * **终止性 + 每关至多降级一次。**
+     *
+     * 这个夹具**没有配测试验证席位**,所以它走不到 `degradedAt(node,'verify')` 那个闩 ——
+     * 闩的专门探针在 pipeline.test.ts(「降级过的关口不再开会」),而无界循环的绝对兜底
+     * 探针在同一个文件(「执行循环有绝对上限」)。这里钉的是端到端那一层:
+     * 一个「验收永远不过」的 run 仍然在有限次调用内收敛,且降级记录不重复。
+     */
+    expect(result.status).toBe('completed')
     expect(calls).toBeLessThan(200)
+    const n = orch.nodes()[0]!
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.degraded ?? []).not.toHaveLength(0)
+    // 每一关最多降级**一次** —— 重复记录就是闩没闩住(而闩没闩住 = 上面那条上限迟早会炸)。
+    const phases = n.degraded!.map(d => d.phase)
+    expect(phases.length).toBe(new Set(phases).size)
   })
 })
 
@@ -377,11 +435,16 @@ describe('运行中重做:别的任务照跑,失败的那个当场重开', () =>
           req.signal.addEventListener('abort', () => reject(new Error('已中断')), { once: true })
         })
       }
-      // **只让验收不过**,不碰质疑讨论:方案环节被打回的节点重开时要回 CREATED 重新拟方案
-      // (planRedo 的 'plan' 入口),而这一组测的是「执行/验收那一档」的重开 —— 把两件事
-      // 混在一个夹具里,重开之后节点会带着一份从没被批准过的方案进执行。
+      // **只在验收这一关制造失败**,不碰质疑讨论:方案环节被打回的节点重开时要回 CREATED
+      // 重新拟方案(planRedo 的 'plan' 入口),而这一组测的是「执行/验收那一档」的重开 ——
+      // 把两件事混在一个夹具里,重开之后节点会带着一份从没被批准过的方案进执行。
+      //
+      // 用**调用失败**而不是「裁决不通过」:验收连着不通过现在会**降级放行**(带着意见
+      // 继续跑),不再产生 BLOCKED 节点,而这一组用例要的就是一个失败的节点。
+      // 圆桌一个裁决都没取到 = 没有人对工作做出过判断,轮数再多也变不出来 —— 那一支
+      // 是刻意保留的阻断路径,而且它落在验收这一关,和本组要测的那一档正好对上。
       if (req.phase === 'accept' && req.node.title === '快' && opts.passQuickAfter?.() !== true) {
-        return vtag(req) + '\n{"pass":false,"blocking":["还不行"],"comments":""}\n```'
+        throw new Error('连接失败')
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as RunAgentFn
@@ -533,8 +596,10 @@ describe('运行中重做:别的任务照跑,失败的那个当场重开', () =>
     const runAgent = (async req => {
       if (req.phase === 'plan') return leafPlan
       if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
-      // 验收不通过 → 返工额度用尽 → 节点阻断,树上再没有可推进的东西。
-      return vtag(req) + '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+      // 验收**一个裁决都取不到** → 节点阻断,树上再没有可推进的东西。
+      // 用调用失败而不是「不通过」:后者现在会降级放行,节点继续跑到 ACCEPTED。
+      throw new Error('连接失败')
     }) as RunAgentFn
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), ac.signal)
     const done = orch.run()

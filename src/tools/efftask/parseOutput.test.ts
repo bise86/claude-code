@@ -510,3 +510,99 @@ describe('answer tag 的大小写:两边都要 lower,否则静默降级到 gener
     expect(parsePlanOutput(one, 'PlanABCD').plan.acceptance).toContain('全绿')
   })
 })
+
+/**
+ * 跑机 run 001 的真实死因之一。**固定装置是那次运行的真实回复原文所展示的形状**,
+ * 不是想象出来的输入 —— 五个方案席位里有两个逐字栽在这上面。
+ *
+ * 链条:`answerRule` 曾经在提示词里写着「必须是一个 ```planXXXX 代码块」→ 第 1 轮评审
+ * 提「未按要求输出裁决代码块」→ 方案师在 `responses` 这个 **JSON 字符串字面量**里回一句
+ * 「本次输出严格为单个 ```planXXXX 代码块」→ 那三个反引号把它自己的答案劈开 →
+ * body 在中途截断、`Unterminated string` → `sliceTopLevelObject` 找不到配平的 `}` 返回 null
+ * (连 `fixEscapes` 都没被调到)→ 整份方案回退成散文,`acceptance` 空、`children` 全丢 →
+ * 评审再提一次「没解析成 JSON」→ **引用动作本身就是病因**,自激成死循环,`maxIterations`
+ * 烧穿、一行代码没写。
+ *
+ * 修法是结构性的:收尾围栏必须落在**行首或行尾**。JSON 不允许字符串字面量里有裸换行,
+ * 所以待在字符串里的 ``` 前面同一行必有开引号(不在行首)、后面同一行必有闭引号(不在行尾)。
+ */
+describe('JSON 字符串里的裸三反引号,不能劈开它自己的代码块(run 001 实测)', () => {
+  const F = '```'
+  const planWith = (responses: string): string =>
+    F + 'planfbqrkley\n' + JSON.stringify({
+      kind: 'decompose',
+      solution: '把 Go etcd 翻译成 Rust',
+      keyPoints: 'k', risks: 'r',
+      acceptance: '跑 devenv shell -- cargo check --workspace 退出码 0',
+      responses: [responses],
+      children: [{ title: 'Rust 环境初始化', deps: [] }, { title: 'api 模块翻译', deps: ['Rust 环境初始化'] }],
+    }, null, 2) + '\n' + F
+
+  it('方案师引用自己的围栏标记时,方案照样完整解析出来', () => {
+    // 真实回复里那句话的形状(a4975bcdefd903b06 / abcee3c17678f6c08 两席逐字同因)。
+    const r = parsePlanOutput(planWith('第 1 条(代码块没解析成 JSON 对象)→ 本次输出严格为单个 ' + F + 'planfbqrkley 代码块,顶层是一个 JSON 对象'), 'planfbqrkley')
+    expect(r.parseFailed).toBe(false)
+    expect(r.kind).toBe('decompose')
+    expect(r.children.map(c => c.title)).toEqual(['Rust 环境初始化', 'api 模块翻译'])
+    expect(r.plan.acceptance).toContain('cargo check')
+    // 回退成散文时 solution 会是整段原始回复 —— 钉一下它没有发生。
+    expect(r.plan.solution).toBe('把 Go etcd 翻译成 Rust')
+  })
+
+  it('裁决侧同因:它是 requireTag 失败关闭的,劈开 = 自动判不通过', () => {
+    // 评审员写 `git worktree add --detach` 这类命令时最容易带围栏,而 parseVerdict 没有兜底:
+    // 解析不出来就是「未按要求输出本轮的裁决代码块;按不通过处理」—— 一次假的 FAIL 进下一轮。
+    const v = parseVerdict(
+      F + 'verdictqxrtplbz\n' + JSON.stringify({
+        pass: true, blocking: [],
+        comments: '我跑了 ' + F + 'bash\ncargo check\n' + F + ' 里的命令,退出码 0',
+      }) + '\n' + F, '总监', 'verdictqxrtplbz')
+    expect(v.pass).toBe(true)
+    expect(v.blocking).toEqual([])
+  })
+
+  /**
+   * 反向锁:收尾围栏**不许**被放宽成「贪婪匹配到最后一个 ```」。
+   * 那样会把「先引一段证据、再给裁决」这两种最常见的协作形态吞成一整块,pass 直接读错。
+   */
+  it('先引一段 ```json 证据、再给裁决 —— 裁决仍然是被采信的那一个', () => {
+    const text = '我核对的证据:\n' + F + 'json\n{"pass":false,"blocking":["旧的"]}\n' + F +
+      '\n\n我的裁决:\n' + F + 'verdictaaaa\n{"pass":true,"blocking":[],"comments":"ok"}\n' + F
+    expect(parseVerdict(text, 'r', 'verdictaaaa').pass).toBe(true)
+  })
+})
+
+/**
+ * 收尾围栏两侧都有字的那一档 —— 严格锚点的代价,以及它的回退。
+ *
+ * 严格版(治 run 001 的 JSON 内裸围栏)会拒绝 ```` {"pass":true}``` 以上是我的裁决。````
+ * 这种写法。它在 CommonMark 里也不合法,但模型确实会这么写,而裁决关口失败关闭 ——
+ * 一次就是一轮假的「未按要求输出裁决代码块」。
+ */
+describe('收尾围栏写在行中间时,带标记的答案仍然收得到', () => {
+  const F = '```'
+  it('裁决:{"pass":true}``` 后面还跟着一句话', () => {
+    const v = parseVerdict(F + 'verdictabcd\n{"pass":true,"blocking":[],"comments":"ok"}' + F + ' 以上是我的裁决。', 'r', 'verdictabcd')
+    expect(v.pass).toBe(true)
+  })
+
+  it('但回退**只收带标记的**,不给 generic 兜底 —— 那正是当年被骗的那一层', () => {
+    // 一个没打标记的、写在行中间收尾的裁决块:严格版收不到,回退也不收它。
+    const v = parseVerdict('证据:\n' + F + 'json\n{"pass":true,"blocking":[]}' + F + ' 就这样。', 'r', 'verdictzzzz')
+    expect(v.pass).toBe(false)
+  })
+
+  it('回退救不回 run 001 那个 bug —— 截断的 body 照旧 parse 不出对象', () => {
+    // 宽松版在这里捕到的 body 到 `responses` 中途就断了(Unterminated string),
+    // 而回退**不降低**「必须 parse 成一个对象」这条要求。所以严格锚点仍然是那个 bug 的解。
+    const truncated = F + 'planqqqq\n' + JSON.stringify({
+      kind: 'decompose', solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a',
+      responses: ['本次输出严格为单个 ' + F + 'planqqqq 代码块'],
+      children: [{ title: 'A', deps: [] }],
+    }, null, 2) + '\n' + F
+    const r = parsePlanOutput(truncated, 'planqqqq')
+    // 严格锚点让它完整解析出来(这才是修复);回退在这条路上根本不会被触发。
+    expect(r.parseFailed).toBe(false)
+    expect(r.children).toHaveLength(1)
+  })
+})

@@ -421,8 +421,8 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(src).toContain('feedback && out.responses.length > 0')
     expect(src).toContain('if (!feedback) delete node.plan.responses')
     // 预算和轮次是两个数,README 说了会分开讲
-    expect(README).toContain(norm('把节点打死的那份返工预算是两关共用的'))
-    expect(src).toContain('测试验证与验收**共用**这一份')
+    expect(README).toContain(norm('返工预算也各记各的'))
+    expect(src).toContain('测试验证与验收各记各的')
   })
 
   it('README 说集成验收是例外,那 repeatRule 就得真的收得下这个例外', () => {
@@ -1197,7 +1197,7 @@ describe('README 的强制通过一节说的和代码干的是同一件事', () 
         phases.push(req.phase)
         return req.phase === 'execute'
           ? '```json\n{"execStatus":"改了 foo.ts"}\n```'
-          : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+          : '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":true,"blocking":[],"comments":""}\n```'
       },
     }
     await stepExecute(n, ctx as never)

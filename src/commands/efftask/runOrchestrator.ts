@@ -200,10 +200,15 @@ export async function runOrchestrator(
       // commits === 0 时不留 —— 没有任何改动就没什么可收口的,留下它只会让下次 --resume
       // 弹一个四选一去处置一条空分支。
       if (h.commits > 0) {
+        // 降级放行的节点数一起带上 —— `planFinish` 靠它决定「跑完了但没通过判决,
+        // 不自动合进用户的检出」。少了它,一次全靠降级放行推完的运行会以 completed
+        // 的身份触发自动 merge(见 PendingHandoff.degradedNodes)。
+        const degradedNodes = nodes.filter(n => (n.degraded ?? []).length > 0).length
         args.config.pendingHandoff = {
           branch: h.branch, commits: h.commits, integrationPath: h.integrationPath,
           kept: h.kept, salvage: h.salvage,
           outcome: pendingOutcome.status, ...(pendingOutcome.reason ? { reason: pendingOutcome.reason } : {}),
+          ...(degradedNodes > 0 ? { degradedNodes } : {}),
         }
       }
     } catch (e) {

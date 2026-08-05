@@ -26,7 +26,7 @@ const deps = (runAgent: RunAgentFn) => ({
 // Every phase prompt ends with a per-call nonce tag; a reply that omits it is rejected
 // fail-closed, so a stub must echo it back or nothing ever passes.
 const reply = (req: { prompt: string }, body: string): string => {
-  const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+  const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
   return '```' + tag + '\n' + body + '\n```'
 }
 const THREE_LEAVES = '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿",' +
@@ -389,7 +389,7 @@ describe('全局并发池必须同时约束"步"和"圆桌里的角色" (spec §
       if (req.phase === 'execute') {
         return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
       }
-      const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict'
       return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'
     }
     const orch = new EffTaskOrchestrator(cfg2, {
@@ -420,7 +420,7 @@ describe('全局并发池必须同时约束"步"和"圆桌里的角色" (spec §
         return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       }
       if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
-      const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict'
       return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'
     }
     const orch = new EffTaskOrchestrator(cfg1, {
@@ -445,7 +445,7 @@ describe('全局并发池必须同时约束"步"和"圆桌里的角色" (spec §
         return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       }
       if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"做完了"}\n\u0060\u0060\u0060'
-      const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict'
       return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'
     }
     const orch = new EffTaskOrchestrator(cfg3, {
@@ -479,7 +479,7 @@ describe('slotUsage:状态条读的那个数', () => {
       await new Promise(r => setTimeout(r, 3))
       if (req.phase === 'plan') return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"done"}\n\u0060\u0060\u0060'
-      const tag = req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict'
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict'
       return '\u0060\u0060\u0060' + tag + '\n{"pass":true,"blocking":[],"comments":""}\n\u0060\u0060\u0060'
     }
     orch = new EffTaskOrchestrator(cfg2, {

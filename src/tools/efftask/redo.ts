@@ -925,6 +925,15 @@ export function reopenPropagatedBlocks(
      * 所以「被中止扫到」= 中断标记在、而它自己没有失败点、也没有触阀。两个字段都是
      * 结构化的、两个方向都写、都有读回校验 —— 比一个共享的中文串可靠得多。
      */
+    /**
+     * 降级放行过的节点**不算被连累的**。
+     *
+     * 它没走过 `blockWithReason`,所以既没有 `failedAt` 也没有 `capBlocked` ——
+     * 只看那两个字段的话,一个「判决没通过、被降级放行、后来又因为别的原因阻断」的节点
+     * 会被判成 collateral damage 而重开,连同把它的 `blockedReason`/证据一起抹掉。
+     * 而这个谓词存在的全部理由,就是别抹掉一个真的出过问题的节点的证据。
+     */
+    if ((n.degraded ?? []).length > 0) return false
     return n.failedAt === undefined && n.capBlocked !== true
   }
   /** 盘上引用不全的节点永远推不动 —— 当种子,不当候选。 */
@@ -1231,7 +1240,16 @@ export function planRedo(
     target.confirmedDraft = undefined
     // 补救拆分的一次性额度,重做后应该重新给。
     target.revised = undefined
-    target.iteration = { planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 }
+    /**
+     * 降级放行记录**跟着预算一起清**。
+     *
+     * 它是审计记录(所以别处一律不清),但它**同时是闩**:`degradedAt(n, 'verify')` 为真时
+     * 那一关永远不再开会。任务重做把 `iteration` 归零、发回一整套新预算,留着闩就等于
+     * 「预算发了,但那几关一次都不会跑」—— 重做出来的节点从此没有测试验证、没有验收,
+     * 而屏幕上说的是「已重开」。两个字段必须同生共死。
+     */
+    target.degraded = undefined
+    target.iteration = { planReview: 0, acceptance: 0, verification: 0, integration: 0, scoring: 0, mergeResolve: 0 }
     if (target.worktree) {
       worktreesToRelease.push({ nodeId: target.id, branch: target.worktree.branch, path: target.worktree.path })
       target.worktree = undefined

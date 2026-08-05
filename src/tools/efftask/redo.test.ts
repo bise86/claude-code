@@ -245,6 +245,24 @@ describe('planRedo:方案重做', () => {
     expect(r.worktreesToRelease).toEqual([{ nodeId: 'a1', branch: 'br-a1', path: '/wt/a1' }])
   })
 
+  /**
+   * **降级放行的闩跟着预算一起清。**
+   *
+   * `degraded` 平时是审计记录(所以别处一律不清),但它**同时是闩**:
+   * `degradedAt(n,'verify')` 为真时那一关这辈子不再开会。任务重做把 `iteration` 归零、
+   * 发回一整套新预算,留着闩就等于「预算发了,但那几关一次都不会跑」——
+   * 重做出来的节点从此没有测试验证、没有验收,而屏幕上说的是「已重开」。
+   */
+  it('降级放行的记录要清掉,否则重做出来的节点那几关一次都不会跑', () => {
+    const t = tree()
+    t[1]!.degraded = [
+      { phase: 'verify', round: 3, reason: '测试验证迭代超限(3)', advice: ['修 X'], at: '2026-08-04T00:00:00Z' },
+      { phase: 'accept', round: 3, reason: '验收迭代超限(3)', advice: [], at: '2026-08-04T00:00:00Z' },
+    ]
+    const r = ok(planRedo(t, 'a', 'plan', 'T1'))
+    expect(r.nodes.find(n => n.id === 'a')!.degraded).toBeUndefined()
+  })
+
   it('上一轮确认过的子任务清单必须清掉,否则重新拆分会照抄它', () => {
     const t = tree()
     t[1]!.confirmedDraft = { children: [{ title: '老子任务', deps: [] }] }
@@ -257,7 +275,9 @@ describe('planRedo:方案重做', () => {
     t[1]!.iteration = { planReview: 3, acceptance: 3, integration: 3, scoring: 3, mergeResolve: 3 }
     const r = ok(planRedo(t, 'a', 'plan', 'T1'))
     expect(r.nodes.find(n => n.id === 'a')!.iteration)
-      .toEqual({ planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 })
+      // verification 是测试验证自己那一维(理由见 TaskNode.iteration)—— 一起清,
+      // 否则重做出来的节点带着一份用尽的预算,第一次测试验证不通过就直接降级放行。
+      .toEqual({ planReview: 0, acceptance: 0, verification: 0, integration: 0, scoring: 0, mergeResolve: 0 })
   })
 
   it('目标节点自己依赖某个后代时,那条依赖是删掉而不是变成自依赖', () => {

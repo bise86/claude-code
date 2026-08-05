@@ -161,7 +161,20 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
         ? `\n    ↩ 本轮撤回 ${(v.retracted ?? []).length} 条历史意见: ` +
           clipBody(stripControl((v.retracted ?? []).join('; ')))
         : ''
-      return `  - [${stripControl(String(v?.role ?? 'unknown'))}] ${mark}${detail ? ': ' + clipBody(stripControl(detail)) : ''}${gone}`
+      /**
+       * **修改建议也要人读得见**,和上面 `retracted` 逐字同源。
+       *
+       * `Verdict.advice` 是「触顶不失败」整套东西的载荷:它会被 `adviceOf` 收进降级记录、
+       * 铺进执行者和验收员的提示词。只落 frontmatter 的话,一条真的提出过、真的被送下去的
+       * 建议在 node.md 上和「这一席什么都没说」长得一模一样 —— 而 node.md 是事后追责唯一
+       * 读得到的东西。降级那一节只渲染**降级发生时**收拢的那一份;一轮提了建议、下一轮就
+       * 通过了的节点根本不会有降级记录,那条建议就此无处可读。
+       */
+      const tips = (v?.advice ?? []).length > 0
+        ? `\n    → 修改建议 ${(v.advice ?? []).length} 条: ` +
+          clipBody(stripControl((v.advice ?? []).join('; ')))
+        : ''
+      return `  - [${stripControl(String(v?.role ?? 'unknown'))}] ${mark}${detail ? ': ' + clipBody(stripControl(detail)) : ''}${gone}${tips}`
     })
     return [head, ...roles].join('\n')
   }).join('\n')
@@ -217,6 +230,22 @@ export function serializeNode(node: TaskNode): string {
     `## 执行状态\n${c(node.execStatus)}\n\n` +
     responsesBody('## 执行:对上一轮测试验证/验收意见的逐条处置', node.execResponses) +
     (node.blockedReason ? `## 阻断原因\n${c(node.blockedReason)}\n\n` : '') +
+    /**
+     * 降级放行的账,**写进人读的那一半**。
+     *
+     * frontmatter 里已经有 `degraded`,但这个文件自己的规矩是「只落 frontmatter 等于
+     * 只做到机器可读那一半」(见上面 alternatives 和 responses 的两处)。而这一段恰恰是
+     * 用户最需要读到的:这个节点**没有通过判决**,是按迭代上限放行的,而当初提的意见
+     * 一条不少地在这里。少了它,node.md 上一个 ACCEPTED 的节点读起来和真通过的完全一样。
+     */
+    ((node.degraded ?? []).length > 0
+      ? `## 降级放行(未通过判决,按迭代上限放行)\n${(node.degraded ?? []).map(d =>
+          `### ${PHASE_LABEL[d.phase]} · 第 ${d.round} 轮 · ${stripControl(d.at)}\n` +
+          `${c(d.reason)}\n` +
+          (d.advice.length > 0
+            ? `修改建议(已随节点交给后续环节):\n${d.advice.map((a, i) => `  ${i + 1}. ${c(a)}`).join('\n')}\n`
+            : '(这几轮没有留下可执行的修改建议)\n')).join('\n')}\n`
+      : '') +
     // 落选稿。只落进 frontmatter 而 body 不渲染的话,「不静默截断」只做到了机器可读那一半
     // —— body 才是人读的那一半。
     (node.plan.alternatives && node.plan.alternatives.length > 0
@@ -383,7 +412,23 @@ export function renderTreeSnapshot(nodes: TaskNode[]): string {
     // and "[failed] 某任务 (BLOCKED)" with the reason only in a nested node.md leaves a
     // human unable to see why the run stopped without hunting through the directory.
     const why = n.status === 'BLOCKED' && n.blockedReason ? ` — ${stripControl(n.blockedReason)}` : ''
-    lines.push(`${'  '.repeat(depth)}- [${uiStatus(n.status)}] ${stripControl(n.title)} (${n.status})${why}`)
+    /**
+     * **降级放行的节点不许画成一次干净的完成。**
+     *
+     * 它是 ACCEPTED,但它**没有通过判决** —— 轮数用尽之后带着意见被放行的。
+     * 一行 `- [done] 某任务 (ACCEPTED)` 和一个真的过了三席验收的节点逐字相同,
+     * 而 run.md 正是用户事后追责时唯一会读的那份文件。这个仓库为「谎报完成」
+     * 付过三次学费(工作树已丢时拒绝跳过验收、半合并状态、finishedAt 缺席当状态),
+     * 每一次的教训都是同一句:**终态相同不等于结论相同,渲染必须说得出差别**。
+     *
+     * 挂在同一行、而不是另起一段:和 `why` 同因 —— run.md 是脚本指过来的那份文件,
+     * 把差别藏进嵌套的 node.md 等于没说。
+     */
+    const dg = (n.degraded ?? [])
+    const degradeMark = dg.length > 0
+      ? ` ⚠ 降级放行(${dg.map(d => PHASE_LABEL[d.phase]).join('、')}未通过,按迭代上限放行)`
+      : ''
+    lines.push(`${'  '.repeat(depth)}- [${uiStatus(n.status)}] ${stripControl(n.title)} (${n.status})${degradeMark}${why}`)
     for (const cid of n.childIds) {
       const child = byId.get(cid)
       if (child) emit(child, depth + 1)

@@ -51,7 +51,30 @@ type Candidate = { obj: Record<string, unknown>; tagged: boolean }
 // The ANCHOR is the load-bearing part. The surrounding newlines stay OPTIONAL: requiring
 // them rejects single-line fences and fences opened after a colon, which are normal
 // markdown and which the prompt no longer discourages either way.
-const FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)\n?[ \t]*```/g
+/**
+ * The CLOSING fence is anchored too — to a line start OR an end of line.
+ *
+ * 只锚开头是不够的,而漏掉的那一半打死过一整棵树。实测事故(跑机 run 001 的 root):
+ * `answerRule` 发给模型的原话里带着 ```` ```planfbqrkley ````,第 1 轮评审又提了
+ * 「未按要求输出裁决代码块」,于是方案师在 `responses` 这个 **JSON 字符串字面量**里
+ * 回了一句「本次输出严格为单个 ```planfbqrkley 代码块」—— 那三个反引号把它自己的代码块
+ * 当场关掉。捕获到的 body 在 3994 字处断开,`Unterminated string`;
+ * `sliceTopLevelObject` 在没配平的 body 上返回 null,所以连 `fixEscapes` 都没被调到,
+ * 整份方案回退成散文:`acceptance` 空、`children` 全丢。评审于是再提一次
+ * 「没解析成 JSON」,方案师再引用一次标记名 —— **引用动作本身就是病因**,轮数越多越出不去。
+ * 五个方案席位里两个逐字同因,`maxIterations` 烧穿,一行代码没写。
+ *
+ * 为什么这一条是**结构性**的、而不是又一个启发式:JSON 不允许字符串字面量里出现裸换行,
+ * 所以一个待在 JSON 字符串里的 ``` **前面**同一物理行上必然还有那个字符串的开引号
+ * (于是不在行首)、**后面**同一行上必然还有闭引号(于是不在行尾)。真正的收尾围栏两者必居其一。
+ *
+ * 两条更省事的写法都被真实数据否掉了:
+ *  - **贪婪匹配到最后一个 ```**:会把「先引一段 ```json/```bash 证据、再给裁决」这两种最常见的
+ *    协作形态吞成一整块(实测 pass 直接读错)。
+ *  - **要求收尾围栏独占一行**:run 001 里 acc50119 的真实收尾行是 ```` ```" ````(尾巴上多了
+ *    一个引号),会静默降级成 untagged —— 对 plan 无害,对每一个 `requireTag` 的裁决都是失败关闭。
+ */
+const FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)(?:\r?\n[ \t]*```|[ \t]*```[ \t]*(?=\r?\n|$))/g
 
 /**
  * First balanced `{...}` that is NOT nested inside an array, or null.
@@ -113,6 +136,28 @@ function fixEscapes(s: string): string {
   )
 }
 
+/**
+ * 收尾围栏**两侧都有字**的那一档 —— 只在严格扫描一个带标记的块都没找到时才用。
+ *
+ * 严格版把收尾围栏锚到行首或行尾,那是治 run 001 那个「JSON 字符串里的裸 ```」的
+ * 结构性判据(见 FENCE_RE)。代价是一种真实存在的写法不再被接受:
+ *
+ *     ```verdictxy
+ *     {"pass":true}``` 以上是我的裁决。
+ *
+ * 它在 CommonMark 里也不是合法的收尾,但模型确实会这么写,而裁决关口是 `requireTag`
+ * **失败关闭**的 —— 一次就是一轮假的「未按要求输出裁决代码块」。
+ *
+ * 所以留一条回退,并且把它夹得很紧:
+ *  - **只在严格扫描的 tagged 组为空时才跑**(严格版找到了就用严格版的);
+ *  - **只收带标记的块**,generic 一概不要 —— 宽松版正是当年被 JSON 里的裸围栏骗到的那个;
+ *  - 收进来的仍然要过 `consider` 那一整套(必须 parse 成对象、不许从数组里挖元素)。
+ *
+ * 它救不回 run 001 那个 bug:那时宽松版捕到的 body 是**截断**的,parse 不出对象,
+ * 照旧被丢掉。也就是说这条回退只可能多认出「本来就完整、只是收尾写在行中间」的答案。
+ */
+const LENIENT_FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)\n?[ \t]*```/g
+
 function collectCandidates(text: string, preferTag?: string): Candidate[] {
   const tagged: string[] = []
   const generic: string[] = []
@@ -123,6 +168,12 @@ function collectCandidates(text: string, preferTag?: string): Candidate[] {
     // 正是 requireTag 要挡的东西。
     if (preferTag && tag === preferTag.toLowerCase()) tagged.push(m[2])
     else generic.push(m[2])
+  }
+  // 严格扫描一个带标记的块都没找到 → 用宽松版**只补带标记的**。见 LENIENT_FENCE_RE。
+  if (preferTag && tagged.length === 0) {
+    for (const m of text.matchAll(LENIENT_FENCE_RE)) {
+      if ((m[1] ?? '').toLowerCase() === preferTag.toLowerCase()) tagged.push(m[2])
+    }
   }
   const out: Candidate[] = []
   const seen = new Set<string>()
@@ -426,10 +477,32 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
     ? (obj.retracted as unknown[]).map(r => (typeof r === 'string' ? r : '')).filter(Boolean)
     : []
   const retracted = rawRetracted.length > 0 ? capBlockingList(rawRetracted, '撤回项') : []
+  /**
+   * **修改建议** (`Verdict.advice`) —— 「接下来该怎么改」,和 `blocking` 的「哪里不对」分开。
+   *
+   * 用户原话:「每次质疑不能给出修改建议吗?然后一起传给下面的阶段去。」
+   *
+   * 为什么值得单独一个字段,而不是「让评审员把修复方式写进 blocking 里就行」——
+   * 后者其实**已经在发生**:跑机 run 001 的评审员逐条写了「修复方式:在方案 JSON 中实际
+   * 给出 children 数组」「应改为 `git worktree add --detach …`」。它们没能传到下一轮,
+   * 病根不在有没有人写,而在 `planFeedbackPrompt` 的**逐条预算**:13 条意见时每条只有
+   * 261 字,而那几条最有价值的意见,修复方式全都写在第 261 字**之后**,被
+   * 「…(已截断,原文 518 字)」整段吃掉。单独成字段的唯一理由,就是让它有一个**结构上
+   * 定位得到、可以单独保预算**的位置(见 reviewConvergence 的 adviceOf)。
+   *
+   * 和 `remedy` 一样只在**不通过**时收:通过了的裁决没有要改的东西,而一条挂在 pass 上的
+   * 建议谁也读不到(`feedbackItems` 只看有 blocking 的裁决),留着只会让人以为它传下去了。
+   * 空数组不落字段 —— 和 `retracted` 同一条:老 node.md 逐字不变。
+   */
+  const rawAdvice = Array.isArray(obj.advice)
+    ? (obj.advice as unknown[]).map(a => (typeof a === 'string' ? a : '')).filter(Boolean)
+    : []
+  const advice = rawAdvice.length > 0 ? capBlockingList(rawAdvice, '修改建议') : []
   const pass = obj.pass === true && blocking.length === 0
   return {
     role, pass, blocking, comments: str(obj.comments),
     ...(retracted.length > 0 ? { retracted } : {}),
+    ...(!pass && advice.length > 0 ? { advice } : {}),
     // 补救子任务 (spec §4.1). Read from the SAME tag-verified object as the verdict itself,
     // which is exactly what makes it safe: `obj` came from a pick that required this call's
     // unguessable tag, so a `remedy` planted in the quoted evidence is unreachable here.

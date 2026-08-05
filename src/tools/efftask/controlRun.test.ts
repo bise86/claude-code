@@ -17,7 +17,7 @@ import { createNode, DEFAULT_CAPS, DEFAULT_PARALLELISM, emptyPhaseRoles, type Ef
 
 const NOW = '2026-07-28T00:00:00Z'
 const vtag = (req: { prompt: string }): string =>
-  '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
+  '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
 const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
   goalPrompt: '构建功能', parallelism: DEFAULT_PARALLELISM,
   phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, ...over,

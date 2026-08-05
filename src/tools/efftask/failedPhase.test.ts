@@ -28,7 +28,7 @@ import type { EffTaskConfig, NodeStatus, PhaseName, TaskNode } from './types.js'
 import type { RunAgentFn } from './roundtable.js'
 
 const NOW = '2026-07-30T00:00:00Z'
-const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
+const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
 const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
   goalPrompt: 'g', parallelism: DEFAULT_PARALLELISM, phaseRoles: emptyPhaseRoles(),
   caps: { ...DEFAULT_CAPS }, notices: [], ...over,
@@ -745,7 +745,7 @@ describe('那条测试验证豁免只活一轮 —— 低分返工是它唯一�
       if (req.phase === 'observer') {
         scores++
         const s = scores === 1 ? 10 : 95
-        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
         return '```' + tag + `\n{"plan":{"score":${s},"rationale":"r"},"exec":{"score":${s},"rationale":"r"}}\n` + '```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'

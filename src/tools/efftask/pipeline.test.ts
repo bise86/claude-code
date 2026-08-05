@@ -5,7 +5,7 @@ import { parseDirectives } from './parseDirectives.js'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap } from './stateMachine.js'
-import { serializeNode, parseNodeFile } from './persistence.js'
+import { serializeNode, parseNodeFile, renderTreeSnapshot } from './persistence.js'
 import { validateLoadedNodes } from './resumeCore.js'
 import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, planPrompt, commitForTest } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
@@ -16,7 +16,7 @@ import type { RoleDef } from './roleDefs.js'
 
 // Verdict prompts carry a per-call random tag; a cooperative reviewer answers under THAT tag.
 // Anything else in the reply is quoted context, which parseVerdict deliberately refuses.
-const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
+const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
 const NOW = '2026-07-25T00:00:00Z'
 const cfg: EffTaskConfig = { goalPrompt: 'g', parallelism: DEFAULT_PARALLELISM, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS } }
 /**
@@ -127,16 +127,18 @@ describe('pipeline', () => {
     expect(n.acceptLog).toHaveLength(1)
   })
 
-  it('stepExecute accept fails until exhausted => BLOCKED, execStatus evidence preserved', async () => {
+  it('stepExecute accept fails until exhausted => 降级放行 ACCEPTED,execStatus 证据不被覆盖', async () => {
     const n = root(); n.kind = 'executable'; n.status = 'READY'
     const runAgent: RunAgentFn = async req =>
       req.phase === 'execute' ? '```json\n{"execStatus":"改了 foo.ts"}\n```' : vtag(req) + '\n{"pass":false,"blocking":["回归失败"],"comments":""}\n```'
     const ctx = ctxFor([n], runAgent)
     await stepExecute(n, ctx)
-    expect(n.status).toBe('BLOCKED')
+    // 触顶不再阻断 —— 但预算真的烧完了,而且降级留了痕、理由留在记录里。
+    expect(n.status).toBe('ACCEPTED')
     expect(n.iteration.acceptance).toBe(DEFAULT_CAPS.maxIterations)
-    expect(n.blockedReason).toContain('验收迭代超限')
-    expect(n.execStatus).toBe('改了 foo.ts') // completed-work evidence NOT clobbered by the block
+    expect(n.degraded?.[0]?.phase).toBe('accept')
+    expect(n.degraded?.[0]?.reason).toContain('验收迭代超限')
+    expect(n.execStatus).toBe('改了 foo.ts') // completed-work evidence NOT clobbered
   })
 
   it('stepStart: runAgent throws in plan phase => node BLOCKED with recorded reason', async () => {
@@ -269,7 +271,7 @@ describe('pipeline', () => {
     expect(prompts[0]).toContain('父验收点X') // …against the parent's acceptance criteria
   })
 
-  it('stepIntegrate: integration acceptance fails until iterations exhausted => BLOCKED', async () => {
+  it('stepIntegrate: integration acceptance fails until iterations exhausted => 降级放行', async () => {
     const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
     const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
     child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
@@ -277,12 +279,13 @@ describe('pipeline', () => {
     const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":false,"blocking":["子结果未达成父目标"],"comments":""}\n```' }
     const ctx = ctxFor([n, child], runAgent)
     await stepIntegrate(n, ctx)
-    expect(n.status).toBe('BLOCKED')
+    expect(n.status).toBe('ACCEPTED')
     // Integration spends its OWN budget, not the executable-path acceptance budget.
     expect(n.iteration.integration).toBe(DEFAULT_CAPS.maxIterations) // retried, not one-shot
     expect(n.iteration.acceptance).toBe(0)
     expect(n.acceptLog).toHaveLength(DEFAULT_CAPS.maxIterations)
-    expect(n.blockedReason).toContain('集成验收迭代超限')
+    expect(n.degraded?.[0]?.phase).toBe('integrate')
+    expect(n.degraded?.[0]?.reason).toContain('集成验收迭代超限')
     expect(prompts[1]).toContain('子结果未达成父目标') // failure feedback appended on retry
   })
 
@@ -485,10 +488,23 @@ describe('pipeline', () => {
     const ctx = ctxFor([n], runAgent)
     await stepStart(n, ctx)
     await stepExecute(n, ctx)
-    expect(seen.plan).toContain('```plan')
-    expect(seen.execute).toContain('```exec')
-    expect(seen.review).toContain('```verdict')
-    expect(seen.accept).toContain('```verdict')
+    expect(seen.plan).toMatch(/\bplan[a-z]+\b/)
+    expect(seen.execute).toMatch(/\bexec[a-z]+\b/)
+    expect(seen.review).toMatch(/\bverdict[a-z]+\b/)
+    expect(seen.accept).toMatch(/\bverdict[a-z]+\b/)
+    /**
+     * 而且**提示词里一个三反引号都不许有**。
+     *
+     * 这不是洁癖,是 run 001 的死因之一。`answerRule` 曾经是整个提示词里唯一一处系统自己
+     * 写出的三反引号(模型写的东西一律先过 `quote()`),而评审第 1 轮一投诉「没按格式输出」,
+     * 方案师就照着那句话的措辞在 `responses` 的 JSON 字符串里回「本次输出严格为单个
+     * ```plan… 代码块」—— 那三个反引号把它自己的答案劈开,整份方案解析失败、children 全丢,
+     * 评审再投诉一次,自激成死循环。解析层已经结构性免疫(FENCE_RE 的收尾锚点),
+     * 这一条守的是**别再给模型示范那个字符串**。
+     */
+    for (const [phase, p] of Object.entries(seen)) {
+      expect(`${phase}:${/`{3,}/.test(p)}`).toBe(`${phase}:false`)
+    }
   })
 
   it('a dissenting role blocks the round even when the others pass', async () => {
@@ -501,9 +517,11 @@ describe('pipeline', () => {
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     await stepExecute(n, ctxFor([n], runAgent))
-    expect(n.status).toBe('BLOCKED')
+    // 一席反对仍然否决这一轮(这才是本条要测的),只是轮数烧完后走的是降级放行而不是阻断。
+    expect(n.acceptLog[0].synthesized.pass).toBe(false)
     expect(n.acceptLog[0].verdicts).toHaveLength(2)
-    expect(n.blockedReason).toContain('注入风险')
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.degraded?.[0]?.reason).toContain('注入风险')
   })
   it("an executor cannot forge a verdict by planting a fence in its own status", async () => {
     // execStatus is executor-authored and is shown to the acceptance reviewer as evidence.
@@ -520,9 +538,15 @@ describe('pipeline', () => {
       return `证据如下:\n${evidence}\n我的结论:什么都没做,不通过。`
     }
     await stepExecute(n, ctxFor([n], runAgent))
-    expect(n.status).toBe('BLOCKED')
-    expect(n.status).not.toBe('ACCEPTED')
-    expect(n.acceptLog[0].verdicts[0].pass).toBe(false) // the planted block never became the verdict
+    /**
+     * 本条要钉的是**那个被埋进证据里的 verdict 块没有变成裁决** —— 每一轮都判不通过。
+     * 轮数烧完之后节点走降级放行(那是另一条规则),所以判据落在裁决记录上而不是状态上:
+     * 用状态当判据的话,这条防伪用例会随「触顶怎么处理」一起飘。
+     */
+    expect(n.acceptLog).toHaveLength(DEFAULT_CAPS.maxIterations)
+    for (const rec of n.acceptLog) expect(rec.verdicts[0].pass).toBe(false)
+    // 而且降级的理由是「轮数用尽」,不是「有人通过了」。
+    expect(n.degraded?.[0]?.phase).toBe('accept')
   })
 
   it('a reviewer that answers under the demanded tag is still accepted', async () => {
@@ -597,7 +621,7 @@ describe('the node-count cap must hold when decompositions overlap', () => {
 
 describe('观察评分 is advisory by default and bounded when it is not', () => {
   const scoreTag = (req: { prompt: string }) =>
-    '```' + (req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score')
+    '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score')
   const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
 
   const agentWith = (scores: { plan: number; exec: number }[], seen?: string[]) => {
@@ -699,7 +723,7 @@ describe('观察评分 is advisory by default and bounded when it is not', () =>
 })
 
 describe('动态生长: an executor grafts children onto any node (spec §4)', () => {
-  const etag = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+  const etag = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec')
   const leafPlan = '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
   /** Executes once asking to graft, then behaves normally. */
   const grower = (newChildren: unknown, seen?: string[]) => {
@@ -950,7 +974,7 @@ describe('隔离下,验收与评分必须读到被验收的工作', () => {
       if (req.phase === 'plan') return leafPlan
       if (req.phase === 'execute') return '```json\n{"execStatus":"改了 api.ts"}\n```'
       if (req.phase === 'observer') {
-        const tag = req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n{"plan":{"score":90,"rationale":"ok"},"exec":{"score":90,"rationale":"ok"}}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -1046,7 +1070,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
       if (req.phase === 'plan') return leafPlan
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完"}\n```'
       if (req.phase === 'observer') {
-        const tag = req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n{"plan":{"score":90,"rationale":"ok"},"exec":{"score":90,"rationale":"ok"}}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -1468,7 +1492,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     const agent = (async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'plan') return leafPlan
       if (req.phase === 'execute') {
-        const tag = req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec'
         return '```' + tag + '\n{"execStatus":"做了一半,还需要先补个子任务","newChildren":[{"title":"先补迁移","deps":[]}]}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
@@ -1544,20 +1568,44 @@ describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
       ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
       : vtag(req) + '\n{"pass":false,"blocking":["还差得远"],"comments":""}\n```'
 
-  it('评审迭代超限 → cap-iteration', async () => {
+  /**
+   * 评审触顶 —— **不再阻断**,降级放行(用户:「如果达到三次,也不要失败」)。
+   * 但仍然要喊人,而且要喊成 `degrade` 那一档:复用 `cap-iteration` 会让卡片标题写
+   * 「安全阀 · 方案评审迭代超限」、建议写「提高 caps.maxIterations 后再重试」,
+   * 对一个正在继续往下跑的节点两句都是假的。
+   */
+  it('评审迭代超限 → degrade:节点继续跑,但留痕、喊人、不谎称停了', async () => {
     const n = root()
     const { ctx, fired } = ctxWithBlocks([n], async req => rejectAll(req))
     await stepStart(n, ctx)
-    expect(n.status).toBe('BLOCKED')
+    expect(n.status).toBe('READY')          // 没停 —— 方案交给执行者了
     expect(fired).toHaveLength(1)
-    expect(fired[0].category).toBe('cap-iteration')
+    expect(fired[0].category).toBe('degrade')
     expect(fired[0].reason).toContain('评审迭代超限')
-    // The structural marker `--retry-blocked` keys on. Without it the card names a command
-    // that reopens nothing.
-    expect(n.capBlocked).toBe(true)
+    // 没走 blockWithReason,所以**不该**挂 --retry-blocked 的那个结构标记:
+    // 一个还在跑的节点不需要「重开」。
+    expect(n.capBlocked).not.toBe(true)
+    expect((n.degraded ?? []).map(d => d.phase)).toEqual(['review'])
   })
 
-  it('验收迭代超限 → rework (spec §9 就叫"连续返工超限")', async () => {
+  /**
+   * 而方案本身不可用时**仍然阻断** —— 降级放行刻意保留的那条硬边界。
+   * 没有验收点的方案交给执行者,等于让人去做一件没有任何判据说得清做完没有的事。
+   */
+  it('评审迭代超限 + 方案没有验收点 → 照旧 cap-iteration 阻断', async () => {
+    const n = root()
+    const { ctx, fired } = ctxWithBlocks([n], async req =>
+      req.phase === 'plan'
+        ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":""}\n```'
+        : vtag(req) + '\n{"pass":false,"blocking":["还差得远"],"comments":""}\n```')
+    await stepStart(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(fired[0].category).toBe('cap-iteration')
+    expect(n.capBlocked).toBe(true)
+    expect(n.degraded ?? []).toHaveLength(0)
+  })
+
+  it('验收迭代超限 → degrade:节点带着意见走完 ACCEPTED,不再阻断', async () => {
     const n = root()
     n.kind = 'executable'
     const { ctx, fired } = ctxWithBlocks([n], async req =>
@@ -1565,10 +1613,15 @@ describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
         ? '```json\n{"execStatus":"改了点东西"}\n```'
         : vtag(req) + '\n{"pass":false,"blocking":["缺测试"],"comments":""}\n```')
     await stepExecute(n, ctx)
-    expect(fired.map(f => f.category)).toEqual(['rework'])
-    expect(n.capBlocked).toBe(true)
+    // 测试验证没配席位,所以只有验收这一关会触顶降级。
+    expect(fired.map(f => f.category)).toEqual(['degrade'])
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.capBlocked).not.toBe(true)
+    expect((n.degraded ?? []).map(d => d.phase)).toEqual(['accept'])
   })
 
+  // 零产出**不是**「有争议的产出」:降级放行的前提是手上有东西可以往下传,
+  // 而执行者什么都没报告时没有。这一条照旧阻断。
   it('执行阶段反复空产出 → rework', async () => {
     const n = root()
     n.kind = 'executable'
@@ -1585,7 +1638,11 @@ describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
     kid.status = 'ACCEPTED'
     const { ctx, fired } = ctxWithBlocks([p, kid], async req => vtag(req) + '\n{"pass":false,"blocking":["没串起来"],"comments":""}\n```')
     await stepIntegrate(p, ctx)
-    expect(fired.map(f => f.category)).toEqual(['rework'])
+    // 集成验收也降级 —— 漏掉这一关,「不失败」对**每一个拆分型节点**(包括根)都不成立,
+    // 而 run 001 死的正是根节点。补救拆分先试过一次,它失败了才轮到降级。
+    expect(fired.map(f => f.category)).toEqual(['degrade'])
+    expect(p.status).toBe('ACCEPTED')
+    expect((p.degraded ?? []).map(d => d.phase)).toEqual(['integrate'])
   })
 
   it('节点数超上限 → cap-nodes,而不是跟磁盘故障混为一谈', async () => {
@@ -1662,8 +1719,10 @@ describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
     const { ctx, fired } = ctxWithBlocks([n], async req => rejectAll(req))
     ctx.onBlocked = () => { fired.push({ id: n.id, category: 'x', reason: 'x' }); throw new Error('飞书炸了') }
     await stepStart(n, ctx)
-    expect(n.status).toBe('BLOCKED')
-    expect(n.blockedReason).toContain('评审迭代超限')
+    // 现在评审触顶走降级放行,所以「回调抛了也不改变裁决」要落在降级记录上。
+    expect(n.status).toBe('READY')
+    expect(n.degraded?.[0]?.reason).toContain('评审迭代超限')
+    expect(fired).toHaveLength(1)
   })
 })
 
@@ -1922,7 +1981,7 @@ describe('触阀升级:被变异测试指出的 4 个没人管的调用点', () 
     const n = root(); n.kind = 'executable'
     // The exec answer must carry the per-call fence tag, exactly as the grower fixtures do:
     // parseExecOutput only reads newChildren out of the block tagged for THIS call.
-    const etag2 = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+    const etag2 = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec')
     const { ctx, fired } = ctxWithBlocks([n], async req =>
       req.phase === 'execute'
         ? etag2(req) + '\n{"execStatus":"做了一半,发现要先建表","newChildren":[{"title":"建表","deps":[]}]}\n```'
@@ -1935,14 +1994,13 @@ describe('触阀升级:被变异测试指出的 4 个没人管的调用点', () 
   it('run.md 里的阻断原因带着处置办法和重试命令', async () => {
     // The escalation limiter drops cards past its cap and tells the user to read run.md.
     // If the remedy lives only on the card, those escalations are unactionable.
+    //
+    // 用**零产出**那条真阻断路径:验收连着不通过现在会降级放行,不再写 blockedReason。
     const n = root(); n.kind = 'executable'
-    const { ctx } = ctxWithBlocks([n], async req =>
-      req.phase === 'execute'
-        ? '```json\n{"execStatus":"改了点东西"}\n```'
-        : vtag(req) + '\n{"pass":false,"blocking":["缺测试"],"comments":""}\n```')
+    const { ctx } = ctxWithBlocks([n], async () => '```json\n{"execStatus":""}\n```')
     ctx.runId = '007'
     await stepExecute(n, ctx)
-    expect(n.blockedReason).toContain('验收迭代超限')
+    expect(n.blockedReason).toContain('未报告任何产出')
     expect(n.blockedReason).toContain('/et --resume 007 --retry-blocked')
   })
 })
@@ -1954,7 +2012,7 @@ describe('升级通知要说清楚"节点停没停"', () => {
     c.onBlocked = info => { fired.push({ category: info.category, stopped: info.stopped }) }
     return { ctx: c, fired }
   }
-  const etag3 = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+  const etag3 = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec')
 
   it('动态生长撞上节点数上限:节点没停,通知也不能说它停了', async () => {
     // Measured: the card said 该节点已停…以「被阻断」收场 for a node whose real state was
@@ -1984,14 +2042,24 @@ describe('升级通知要说清楚"节点停没停"', () => {
   })
 
   it('真正的阻断说"停了"', async () => {
+    // 用**零产出**那条:执行者什么都没报告时没有可以往下传的东西,所以它照旧阻断。
+    // (验收连着不通过现在会降级放行,不再是「真正的阻断」的例子。)
+    const n = root(); n.kind = 'executable'
+    const { ctx, fired } = ctxWithBlocks2([n], async () => '```json\n{"execStatus":""}\n```')
+    await stepExecute(n, ctx)
+    expect(fired).toEqual([{ category: 'rework', stopped: true }])
+    expect(n.status).toBe('BLOCKED')
+  })
+
+  it('降级放行说"没停"', async () => {
     const n = root(); n.kind = 'executable'
     const { ctx, fired } = ctxWithBlocks2([n], async req =>
       req.phase === 'execute'
         ? '```json\n{"execStatus":"改了点东西"}\n```'
         : vtag(req) + '\n{"pass":false,"blocking":["缺测试"],"comments":""}\n```')
     await stepExecute(n, ctx)
-    expect(fired).toEqual([{ category: 'rework', stopped: true }])
-    expect(n.status).toBe('BLOCKED')
+    expect(fired).toEqual([{ category: 'degrade', stopped: false }])
+    expect(n.status).toBe('ACCEPTED')
   })
 })
 
@@ -2088,7 +2156,7 @@ describe('观察评分要覆盖 decompose 节点 —— 包括 root,也就是整
     kid.status = 'ACCEPTED'
     const ctx = ctxFor([p, kid], async req => {
       if (req.phase === 'observer') {
-        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n{"plan":{"score":88,"rationale":"结构清楚"},"exec":{"score":91,"rationale":"子任务齐"}}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
@@ -2160,7 +2228,7 @@ describe('评分和合并是各自独立的阶段,面板不该把它们显示成
     const ctx = ctxFor([n], async req => {
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
       if (req.phase === 'observer') {
-        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n{"plan":{"score":90,"rationale":"ok"},"exec":{"score":90,"rationale":"ok"}}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
@@ -2216,7 +2284,7 @@ describe('MERGE 必须在评分之后', () => {
     const ctx = ctxFor([n], async req => {
       if (req.phase === 'execute') return '```json\n{"execStatus":"done"}\n```'
       if (req.phase === 'observer') {
-        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
         // Low the first time (forces REWORK), high the second.
         const s = seen.filter(x => x === 'SCORING').length <= 1 ? 10 : 95
         return '```' + tag + `\n{"plan":{"score":${s},"rationale":"r"},"exec":{"score":${s},"rationale":"r"}}\n` + '```'
@@ -2260,7 +2328,7 @@ describe('集成路径的评分也要在面板上现身', () => {
     const seen: string[] = []
     const ctx = ctxFor([p, kid], async req => {
       if (req.phase === 'observer') {
-        const tag = req.prompt.match(/```(score[a-z]+)/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n{"plan":{"score":90,"rationale":"r"},"exec":{"score":90,"rationale":"r"}}\n```'
       }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
@@ -2294,7 +2362,7 @@ describe('被拒绝的加子节点请求也不能把节点撑爆', () => {
     // 24 MB node.md.
     const tiny: EffTaskConfig = { ...cfg, caps: { ...DEFAULT_CAPS, maxNodes: 1 } }
     const n = root(); n.kind = 'executable'
-    const etag4 = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+    const etag4 = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec')
     // DISTINCT parents: growTree groups by target, so 30 children with no parent produce ONE
     // refusal, not thirty — a fixture that never reaches the cap it claims to test.
     const kids = [...Array(30)].map((_, i) => ({ parent: 'ghost/' + 'p'.repeat(150) + i, title: 'k'.repeat(150) + i, deps: [] }))
@@ -2354,8 +2422,10 @@ describe('spec §4.1:集成验收失败 → 回到 decompose 修订', () => {
     const [n, c] = withKids({ revised: true })
     const ctx = ctxFor([n, c], rejectWith('[{"title":"再补一个","deps":[]}]'))
     await stepIntegrate(n, ctx)
-    expect(n.status).toBe('BLOCKED')
-    expect(n.blockedReason).toContain('集成验收迭代超限')
+    // 补救拆分没能进行 → 降级放行(不再阻断)。本条要钉的是**没有凭空长树**、
+    // 以及原因没被盖掉 —— 落点从 blockedReason 换成降级记录。
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.degraded?.[0]?.reason).toContain('集成验收迭代超限')
     expect(n.childIds).toHaveLength(1) // 没有新增
   })
 
@@ -2364,7 +2434,10 @@ describe('spec §4.1:集成验收失败 → 回到 decompose 修订', () => {
     const ctx = ctxFor([n, c], (async (req: { prompt: string }) =>
       vtag(req) + '\n{"pass":false,"blocking":["就是做错了"],"comments":""}\n```') as RunAgentFn)
     await stepIntegrate(n, ctx)
-    expect(n.status).toBe('BLOCKED')
+    // 补救拆分没能进行 → 降级放行(不再阻断)。本条要钉的是**没有凭空长树**、
+    // 以及原因没被盖掉 —— 落点从 blockedReason 换成降级记录。
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.degraded?.[0]?.phase).toBe('integrate')
     expect(n.childIds).toHaveLength(1)
   })
 
@@ -2376,7 +2449,9 @@ describe('spec §4.1:集成验收失败 → 回到 decompose 修订', () => {
     const [n, c] = withKids()
     const ctx = ctxFor([n, c], (async () => '我觉得不太行,你再改改吧') as RunAgentFn)
     await stepIntegrate(n, ctx)
-    expect(n.status).toBe('BLOCKED')
+    // 补救拆分没能进行 → 降级放行(不再阻断)。本条要钉的是**没有凭空长树**、
+    // 以及原因没被盖掉 —— 落点从 blockedReason 换成降级记录。
+    expect(n.status).toBe('ACCEPTED')
     expect(n.childIds).toHaveLength(1)
   })
 
@@ -2415,8 +2490,11 @@ describe('spec §4.1:集成验收失败 → 回到 decompose 修订', () => {
     const [n, c] = withKids({ depth: DEFAULT_CAPS.maxDepth })
     const ctx = { ...ctxFor([n, c], rejectWith('[{"title":"补一个","deps":[]}]')), onBlocked: (i: { reason: string }) => { fired.push(i.reason) } }
     await stepIntegrate(n, ctx)
-    expect(n.status).toBe('BLOCKED')
+    // 补救拆分没能进行 → 降级放行(不再阻断)。本条要钉的是**没有凭空长树**、
+    // 以及原因没被盖掉 —— 落点从 blockedReason 换成降级记录。
+    expect(n.status).toBe('ACCEPTED')
     expect(n.childIds).toHaveLength(1)
+    // 「深度到顶所以没能补救」这句话仍然要说出来 —— 它现在折在降级那张卡的理由里。
     expect(fired.some(r => r.includes('深度上限'))).toBe(true)
   })
 
@@ -2477,10 +2555,12 @@ describe('§4.1 补救拆分:验收发现的问题', () => {
       persist: async (x: TaskNode) => { if (x.id !== 'root') throw new Error('EIO 磁盘写入失败') },
     }
     await stepIntegrate(n, ctx)
-    expect(n.status).toBe('BLOCKED')
-    expect(n.blockedReason).toContain('EIO 磁盘写入失败')
+    // 补救拆分失败后节点降级放行,而**真实故障原因不许被"迭代超限"盖掉** —— 这一条
+    // 是本用例的全部要点,只是落点从 blockedReason 换成了降级记录的 reason。
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.degraded?.[0]?.reason).toContain('EIO 磁盘写入失败')
     // …同时保留上下文:这是集成验收走到头之后才发生的。
-    expect(n.blockedReason).toContain('集成验收迭代超限')
+    expect(n.degraded?.[0]?.reason).toContain('集成验收迭代超限')
   })
 
   it('commit 失败时不覆盖它写下的真实理由,也不给它挂 --retry-blocked', async () => {
@@ -2518,17 +2598,20 @@ describe('§4.1 补救拆分:验收发现的问题', () => {
     expect(seen[0].stopped).toBe(false)
   })
 
-  it('深度到顶时把原因折进同一次阻断,不额外发一张"没有停"的卡', async () => {
-    // 那条分支 return 之后下一行就阻断。一张 stopped:false 的蓝卡说"本次运行没有停",
-    // 紧接着一张橙卡说停了,而且蓝卡还声称被拒的子任务"已折进它自己的方案里"——
-    // 那对 stepStart 为真,在这里为假(remedy 是被直接丢弃的)。
-    const fired: string[] = []
+  it('深度到顶时把原因折进同一张卡,不发两张自相矛盾的', async () => {
+    // 原来那条分支 return 之后下一行就阻断,于是会先发一张 stopped:false 的蓝卡说
+    // "本次运行没有停"、紧接着一张橙卡说停了。现在触顶走降级放行,**恰好只有一张卡**,
+    // 而且它说的"没停"是真的 —— 但「深度到顶所以补救不了」这句原因必须折在同一张卡里,
+    // 否则用户只看到"迭代超限",不知道最后那次自救为什么没发生。
+    const fired: { reason: string; stopped?: boolean }[] = []
     const [n, c] = withKids2({ depth: DEFAULT_CAPS.maxDepth })
-    const ctx = { ...ctxFor([n, c], reject('[{"title":"补一个","deps":[]}]')), onBlocked: (i: { reason: string; stopped?: boolean }) => { if (i.stopped === false) fired.push(i.reason) } }
+    const ctx = { ...ctxFor([n, c], reject('[{"title":"补一个","deps":[]}]')), onBlocked: (i: { reason: string; stopped?: boolean }) => { fired.push(i) } }
     await stepIntegrate(n, ctx)
-    expect(n.status).toBe('BLOCKED')
-    expect(n.blockedReason).toContain('深度上限')
-    expect(fired).toEqual([]) // 没有任何 stopped:false 的卡
+    expect(n.status).toBe('ACCEPTED')
+    expect(fired).toHaveLength(1)
+    expect(fired[0].stopped).toBe(false)
+    expect(fired[0].reason).toContain('深度上限')
+    expect(n.degraded?.[0]?.reason).toContain('深度上限')
   })
 
   it('编排器的注记不能被当成"本节点自己的执行产出"喂给最终裁决圆桌', async () => {
@@ -2804,7 +2887,7 @@ describe('各阶段耗时的账目必须和总耗时对得上', () => {
       if (req.phase === 'execute') { bump(100_000); return '```json\n{"execStatus":"做完了"}\n```' }
       if (req.phase === 'observer') {
         bump(50_000)
-        const tag = req.prompt.match(/必须是一个 ```(score[a-z]+) 代码块/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n{"plan":{"score":90,"rationale":"ok"},"exec":{"score":90,"rationale":"ok"}}\n```'
       }
       bump(20_000)
@@ -2993,7 +3076,9 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
     expect(withoutDefs).toContain('TAG')
     expect(withoutDefs.length).toBeGreaterThan(40)
     // 无标签席位拿到的就是**原样**的评审提示词 —— 这条才是「一字不多」。
-    expect(withoutDefs.startsWith('请评审以下方案是否**足以开始执行**。')).toBe(true)
+    // 正文第一段是任务目标(加它的理由见 reviewPrompt:REVIEW_FLOOR 第 1 条要判
+    // 「方案与目标无关」,而这一关原来一个字的目标都不渲染)。
+    expect(withoutDefs.startsWith('任务目标:\n')).toBe(true)
   })
 })
 
@@ -3058,7 +3143,7 @@ describe('简报到达剩下那几个调用点', () => {
     const rdefs: RoleDef[] = [{ name: '架构师', stage: 'review', output: 'o', purpose: 'p', staff: ['a'] }]
     n.phaseRoles = { ...emptyPhaseRoles(), review: [{ roleName: 'a', roleTag: '架构师' }] }
     await stepStart(n, ctxFor([n], runAgent, { ...cfg, roleDefs: rdefs, phaseRoles: n.phaseRoles }))
-    expect(seen).toContain('作答;裁决格式仍按下面的要求。\n\n请评审')
+    expect(seen).toContain('作答;裁决格式仍按下面的要求。\n\n任务目标:')
   })
 })
 
@@ -3080,11 +3165,16 @@ describe('caps.quorum 一路接到节点的评审上', () => {
     expect(n.status).toBe('READY')
   })
 
-  it('同一批裁决在默认全票下回到 PLANNING 返工', async () => {
+  it('同一批裁决在默认全票下每一轮都不通过(而不是像 quorum=60 那样当场放行)', async () => {
     const n = root()
     n.phaseRoles = roster
     await stepStart(n, ctxFor([n], twoOfThree(n), { ...cfg, phaseRoles: roster }))
-    expect(n.status).not.toBe('READY')
+    // 判据落在**裁决**上而不是终态:轮数烧完之后节点会降级放行到 READY(那是另一条规则),
+    // 而本条要钉的是「默认全票下这一批裁决不通过」—— 用终态当判据会让它跟着触顶策略飘。
+    expect(n.reviewLog).toHaveLength(DEFAULT_CAPS.maxIterations)
+    for (const rec of n.reviewLog) expect(rec.synthesized.pass).toBe(false)
+    expect(n.iteration.planReview).toBe(DEFAULT_CAPS.maxIterations)
+    expect((n.degraded ?? []).map(d => d.phase)).toEqual(['review'])
   })
 })
 
@@ -3424,13 +3514,22 @@ describe('测试验证环节(spec §7.1)', () => {
     expect(p).toContain('不能作为通过依据')
   })
 
-  it('验证不通过 → 返工,而且阻断文案说清是哪一关', async () => {
-    // 说成「验收迭代超限」会让升级卡片和 --retry-blocked 拿到错误诊断:其实是测试没跑通。
+  it('验证不通过 → 返工,而且文案说清是哪一关', async () => {
+    // 说成「验收迭代超限」会让升级卡片和后续处置拿到错误诊断:其实是测试没跑通。
+    // 触顶后不再阻断,所以这句话现在落在降级记录里 —— 但**必须还在**。
     const n = ready([{ roleName: 'v' }])
-    await stepExecute(n, ctxFor([n], agent(false), { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, maxIterations: 1 } }))
-    expect(n.status).toBe('BLOCKED')
-    expect(n.blockedReason).toContain('测试验证')
-    expect(n.blockedReason).not.toContain('验收迭代超限')
+    // 同上:闩坏掉时这条会挂起而不是失败。用 maxIterations: 1 已经把轮数压到最小,
+    // 再给一个硬上限,让它在变异跑批里以「失败」而不是「超时」的形态出现。
+    let calls = 0
+    const capped: RunAgentFn = async req => {
+      if (++calls > 20) throw new Error('无界循环:降级放行之后那一关还在开会')
+      return agent(false)(req)
+    }
+    await stepExecute(n, ctxFor([n], capped, { ...cfg, phaseRoles: n.phaseRoles, caps: { ...DEFAULT_CAPS, maxIterations: 1 } }))
+    const verify = (n.degraded ?? []).find(d => d.phase === 'verify')
+    expect(verify).toBeDefined()
+    expect(verify!.reason).toContain('测试验证')
+    expect(verify!.reason).not.toContain('验收迭代超限')
   })
 
   it('验证者动了工作区 → 该轮裁决作废并返工', async () => {
@@ -3476,7 +3575,7 @@ describe('观察多员工:取最低分,其余理由不丢', () => {
       if (req.phase === 'observer') {
         const who = req.role?.roleName ?? 'main'
         const v = byRole[who]
-        const tag = req.prompt.match(/```(score[a-z0-9]+)/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z0-9]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n' + JSON.stringify({
           plan: { score: v.plan, rationale: `${who} 说方案 ${v.plan}` },
           exec: { score: v.exec, rationale: `${who} 说执行 ${v.exec}` },
@@ -3594,8 +3693,15 @@ describe('测试验证判不通过时,原因必须到达能修它的人', () => 
     }
     const node = n()
     await stepExecute(node, ctxFor([node], agent, { ...cfg, phaseRoles: node.phaseRoles }))
-    const last = prompts[prompts.length - 1]
-    expect(last).toContain(BLOCK)
+    /**
+     * 取**紧跟在测试验证失败之后**的那一份执行提示词,不是最后一份。
+     *
+     * 测试验证有了自己的返工预算之后,这个夹具会一直跑到两关各自烧完,而最后一份执行
+     * 提示词是**验收**驱动的返工 —— 它的槽位里装着验收的意见,那是对的。用「最后一份」
+     * 当判据,测的就成了循环长度而不是冒名。
+     */
+    const last = prompts.find(x => x.includes(BLOCK))!
+    expect(last).toBeDefined()
     /**
      * 判据是**位置**,不是「整篇里有没有这句话」。
      *
@@ -3714,7 +3820,7 @@ describe('评分调用失败不该买下一整轮执行(回归)', () => {
     const agent: RunAgentFn = async req => {
       if (req.phase === 'observer') {
         if (req.role?.roleName === 'bad') throw new Error('provider 502')
-        const tag = req.prompt.match(/```(score[a-z0-9]+)/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z0-9]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n{"plan":{"score":95,"rationale":"好"},"exec":{"score":92,"rationale":"好"}}\n```'
       }
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
@@ -3732,7 +3838,7 @@ describe('评分调用失败不该买下一整轮执行(回归)', () => {
   it('真的低分仍然触发返工 —— 别把闸门一起关了', async () => {
     const agent: RunAgentFn = async req => {
       if (req.phase === 'observer') {
-        const tag = req.prompt.match(/```(score[a-z0-9]+)/)?.[1] ?? 'score'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z0-9]+)/)?.[1] ?? 'score'
         return '```' + tag + '\n{"plan":{"score":30,"rationale":"差"},"exec":{"score":90,"rationale":"好"}}\n```'
       }
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
@@ -4208,7 +4314,7 @@ describe('跳过验收 × 合并冲突:三个调用点都不能谎报完成', ()
   })
 
   /** 执行者报告产出,并给自己挂一个补救子任务(动态生长)。 */
-  const etagX = (req: { prompt: string }) => '```' + (req.prompt.match(/必须是一个 ```(exec[a-z]+) 代码块/)?.[1] ?? 'exec')
+  const etagX = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec')
   let grew = false
   const growAgent = (req: { phase: string; prompt: string }) => {
     if (req.phase === 'execute') {
@@ -4680,13 +4786,14 @@ describe('评审收敛真的接上了', () => {
     const n = node()
     const { ctx, fired } = withBlocks([n], async req => alwaysSame(req))
     await stepStart(n, ctx)
-    expect(n.status).toBe('BLOCKED')
-    expect(n.blockedReason).toContain('评审迭代超限')
-    expect(n.blockedReason).toContain('被提过不止一轮')
-    // 静态那句是「若方案本身没问题,可提高…」;按事实分叉之后要说的是「先确认」。
-    expect(n.blockedReason).toContain('先确认')
-    // 卡片走的是同一句,不是静态表。
-    expect(fired[0]!.remedy).toContain('先确认')
+    // 触顶走降级放行,所以这份「点名老账」的诊断落在**降级记录**里 —— 但一个字都不能少:
+    // 它是这一关烧完三轮之后,唯一还告诉用户「卡在同一条上」的东西。
+    expect(n.status).toBe('READY')
+    const why = n.degraded?.[0]?.reason ?? ''
+    expect(why).toContain('评审迭代超限')
+    expect(why).toContain('被提过不止一轮')
+    // 卡片说的是同一件事。
+    expect(fired[0]!.reason).toContain('被提过不止一轮')
   })
 
   it('每轮意见都不一样时,不谎称有老账', async () => {
@@ -4702,9 +4809,10 @@ describe('评审收敛真的接上了', () => {
       return vtag(req) + '\n{"pass":false,"blocking":["' + complaints[(i - 1) % 3] + '"],"comments":""}\n' + '```'
     })
     await stepStart(n, ctx)
-    expect(n.blockedReason).toContain('评审迭代超限')
-    expect(n.blockedReason).not.toContain('被提过不止一轮')
-    expect(n.blockedReason).toContain('扩大范围')
+    const why = n.degraded?.[0]?.reason ?? ''
+    expect(why).toContain('评审迭代超限')
+    expect(why).not.toContain('被提过不止一轮')
+    expect(why).toContain('扩大范围')
   })
 
   it('重复提示一轮只算一次,不是一席算一次(结构闸门)', () => {
@@ -4765,7 +4873,7 @@ describe('评审要有一条「够用就放行」的线', () => {
   it('告诉评审员这是第几轮、以及撞顶的后果', async () => {
     const p = (await grab(false))[0]!
     expect(p).toContain('第 1/3 轮')
-    expect(p).toContain('会被整个中止')
+    expect(p).toContain('降级放行')
   })
 
   it('第 2 轮起禁止提新要求 —— 实测一次运行里三轮提了 12 条互不相同的要求', async () => {
@@ -5115,10 +5223,10 @@ describe('收敛:第 2 轮起,裁决的是「上一轮那几条改了没」', ()
     // 扣住 —— 而它上一轮根本没开过口。护栏本来治「换新理由」,这样一来变成封嘴。
     const v = await rounds('verify', 1)
     expect(v.prompts[0]).toContain('第 1 轮测试验证')
-    expect(v.prompts[0]).toContain('会被整个中止')
+    expect(v.prompts[0]).toContain('降级放行')
     // 预算是另一个数,而且要说明它是共用的,否则「第 1 轮」读起来像「还有 5 轮可用」
     expect(v.prompts[0]).toContain('返工预算已用 0/5')
-    expect(v.prompts[0]).toContain('共用')
+    expect(v.prompts[0]).toContain('各记各的')
     expect(v.prompts[1]).toContain('第 2 轮测试验证')
     expect(v.prompts[1]).toContain('返工预算已用 1/5')
 
@@ -5147,7 +5255,8 @@ describe('收敛:第 2 轮起,裁决的是「上一轮那几条改了没」', ()
     expect(verifyPrompts.length).toBeGreaterThan(0)
     expect(verifyPrompts[0]).toContain('第 1 轮测试验证')
     // 而预算那个数要说真话:空产出确实烧掉了一轮
-    expect(verifyPrompts[0]).toContain('返工预算已用 1/5')
+    // 空产出烧的是 iteration.acceptance;测试验证记自己那份,所以这里仍是 0/5。
+    expect(verifyPrompts[0]).toContain('返工预算已用 0/5')
   })
 
   it('测试验证挡过一次之后,验收的第一次开口仍然是「第 1 轮」而且不带护栏', async () => {
@@ -5172,8 +5281,9 @@ describe('收敛:第 2 轮起,裁决的是「上一轮那几条改了没」', ()
     expect(acceptPrompts.length).toBeGreaterThan(0)
     expect(acceptPrompts[0]).toContain('第 1 轮验收')
     expect(acceptPrompts[0]).not.toContain(GUARD)
-    // 预算那个数仍要说真话:verify 已经烧掉一轮
-    expect(acceptPrompts[0]).toContain('返工预算已用 1/3')
+    // 预算那个数仍要说真话 —— 但两关**各记各的**了(理由见 TaskNode.iteration):
+    // 测试验证烧的是 iteration.verification,验收这边仍然是 0/3。
+    expect(acceptPrompts[0]).toContain('返工预算已用 0/3')
     // 而测试验证那关的意见**不能**被端给验收当成「你自己上一轮提过的」
     expect(acceptPrompts[0]).not.toContain('前几轮已经提出过')
   })
@@ -5816,9 +5926,16 @@ describe('上一版方案:补上验收查出的探针缺口', () => {
     // 先证明 payload 真的走到了这里,否则下面那条断言是空转。
     expect(p).toContain('pass')
     expect(p.indexOf('pass', p.indexOf('上一轮评审看到的是'))).toBeGreaterThan(0)
-    // 整份提示词里的裸 ``` 只该剩系统自己那两处(要求输出 verdict 块的那两句)。
+    /**
+     * 整份提示词里现在应该**一个裸 ``` 都没有**。
+     *
+     * 原来是 2 —— `answerRule` 自己那两句。run 001 之后把它们也去掉了:那两处是整个提示词里
+     * 仅有的系统自写三反引号,而模型会照抄它们(实测:被投诉「没按格式输出」之后,方案师在
+     * JSON 字符串里回了一句「本次输出严格为单个 ```plan… 代码块」,当场劈开自己的答案)。
+     * 所以这条断言从「模型写的那些被 quote() 中和了」升级成「提示词里根本没有可抄的示范」。
+     */
     const bare = p.match(/`{3,}/g) ?? []
-    expect(bare.length).toBe(2)
+    expect(bare.length).toBe(0)
   })
 
   /**
@@ -6043,7 +6160,7 @@ describe('方案缺验收点:当场补一次', () => {
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
         prompts.push(req.prompt)
-        const tag = req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan'
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan'
         // 第一版:围栏在场,但 JSON 修不好(未闭合)
         if (++plans === 1) return '一堆分析…\n```' + tag + '\n{"kind":"executable","solution":"半截\n```'
         return '```' + tag + '\n{"kind":"executable","solution":"重写的方案","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
@@ -6167,5 +6284,456 @@ describe('补验收点:那一次调用没回来时,名额不算用掉', () => {
     await stepStart(n, ctxFor([n], runAgent))
     expect(n.planRetried).toBe(true)
     expect(n.execStatus).toContain('已重拟一次仍未补上')
+  })
+})
+
+/**
+ * 跑机 run 001 的另一个死因:**评审员看不到方案打算拆出来的子任务**。
+ *
+ * `reviewPrompt` 把方案渲染成 `JSON.stringify(node.plan)`,而 `NodePlan` 里没有
+ * `children` —— 拆分走的是 `parsePlanOutput` 的另一个返回值,评审**通过之后**才建。
+ * 于是第 3 轮(实测方案里真有 9 个 children):
+ *
+ *   方案师 responses:「根级 children 精确为 9 个」
+ *   [总监]/[副总监]:「本轮方案对象顶层在 responses 后即结束,**没有 children 字段**」
+ *
+ * 三个人说的都是真话,而争议对象根本不在提示词里 —— 这条分歧**结构上无法被证伪**,
+ * 换任何模型、给任何轮数都出不去。三轮烧穿,一行代码没写。
+ */
+describe('评审员必须看得见这份方案要拆出来的子任务(run 001 实测)', () => {
+  const decomposeReply = (tag: string): string =>
+    '```' + tag + '\n' + JSON.stringify({
+      kind: 'decompose', solution: 's', keyPoints: 'k', risks: 'r',
+      acceptance: '跑 bun test 全绿',
+      children: [
+        { title: 'Rust 环境初始化', deps: [] },
+        { title: 'api 模块翻译', deps: ['Rust 环境初始化'] },
+        { title: 'server 模块翻译', deps: ['api 模块翻译'] },
+      ],
+    }) + '\n```'
+
+  it('子任务标题、兄弟依赖、节点类型都进了评审提示词', async () => {
+    let seen = ''
+    const n = root()
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'review') { seen = req.prompt; return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```' }
+      return decomposeReply(req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan')
+    })
+    await stepStart(n, ctx)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    for (const t of ['Rust 环境初始化', 'api 模块翻译', 'server 模块翻译']) expect(seen).toContain(t)
+    // deps 用兄弟标题互指 —— 少了它「隐藏依赖 / 顺序错了」这类意见无从提起,
+    // 而那正是 run 001 里评审真正想判的东西(mvcc↔lease 双向 import)。
+    expect(seen).toContain('"deps":["Rust 环境初始化"]')
+    expect(seen).toContain('decompose')
+    // 目标也必须在场:REVIEW_FLOOR 第 1 条要判「方案与目标无关」,原来这一关一个字都不渲染。
+    expect(seen).toContain('任务目标:')
+  })
+
+  /**
+   * 反向锁,而且是这次修改**自己最容易造出来的**新 bug。
+   *
+   * `lastChildren` 是本轮方案调用的产物,在 `reviewOnly`(从质疑讨论重做)和「跳过分析」
+   * 两支上是空的 —— 而那两支上节点**已经有子任务**。照 `lastChildren` 渲染就等于拿着
+   * `children: []` 去问一个有 3 个子任务的节点,评审员照实说「没有拆分」,节点当场死:
+   * 和上面那个 bug 是同一个,只是极性反过来。而 `reviewOnly` 是**一次性**的(FAIL 即阻断,
+   * 没有重试),所以它比原 bug 更致命。
+   */
+  it('从质疑讨论重做:方案没重出,子任务要从树上取真值,不能渲染成空', async () => {
+    let seen = ''
+    const n = root()
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'review') { seen = req.prompt; return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```' }
+      return decomposeReply(req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan')
+    })
+    await stepStart(n, ctx)            // 先真的把 3 个子任务建出来
+    expect(n.childIds).toHaveLength(3)
+
+    seen = ''
+    n.redoFrom = 'review'              // 从质疑讨论重做:不重出方案、不动子任务
+    n.status = 'CREATED'
+    await stepStart(n, ctx)
+    expect(seen).toContain('Rust 环境初始化')
+    expect(seen).toContain('server 模块翻译')
+    // 判据要能真的匹配上:上一版把两侧引号和一个字面的两字符 \n 也写进了针,
+    // 于是它对任何输入都为真 —— 一条恒真的断言比没有断言更坏。
+    expect(seen).not.toContain('互指):\n[]')
+    expect(seen).toContain('decompose')
+  })
+})
+
+
+/**
+ * 用户要的那条主线,端到端:**触顶不失败,意见一路传下去**。
+ *
+ * 原话:「如果达到三次,也不要失败,将方案和修改建议传递给执行阶段。执行阶段拿到这些方案
+ * 和修改建议,来执行。然后测试验证有问题,同样给出修改建议,给下一轮的执行……反正,
+ * 就是不失败了。这些轮数,只是不停找问题,来迭代优化。」
+ *
+ * 出处是跑机 run 001:root 烧了 13.5 分钟评审拿到 13 条带 grep 实测输出的意见
+ * (gitnexus 参数该怎么写、验收 worktree 已被占用要用 --detach、contrib 漏了哪个包),
+ * 然后整棵树以 cap-iteration 死掉,那 13 条只剩在一个字符串里,**没有任何下游环节读它们**。
+ */
+describe('触顶降级放行:意见真的到了能用它的人手上', () => {
+  const ADVICE = 'gitnexus 的参数要写成 repo 值 etcd、branch 值 main,不是 etcd:main'
+
+  it('评审三轮不过 → 方案带着修改建议交给执行者', async () => {
+    const n = root(); n.kind = 'executable'
+    const execPrompts: string[] = []
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      if (req.phase === 'execute') { execPrompts.push(req.prompt); return '```json\n{"execStatus":"做完了"}\n```' }
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":false,"blocking":["gitnexus 参数不可执行"],"advice":["' + ADVICE + '"],"comments":""}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    })
+    await stepStart(n, ctx)
+    expect(n.status).toBe('READY')            // 没死
+    expect(n.degraded?.[0]?.advice).toContain(ADVICE)
+
+    await stepExecute(n, ctx)
+    // **这一条是整个特性的兑现点**:建议到了带写工具的那个人手上。
+    expect(execPrompts[0]).toContain(ADVICE)
+    expect(execPrompts[0]).toContain('降级放行')
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  it('测试验证三轮不过 → 建议交给验收,而验收拿到的是自己完整的预算', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    n.phaseRoles.verify = [{ roleName: 'v' }]
+    n.plan.acceptance = 'a'
+    const acceptPrompts: string[] = []
+    let acceptRounds = 0
+    let calls = 0
+    const ctx = ctxFor([n], async req => {
+      // **调用上限即断言。** 闩坏掉时这个循环是无界的,而无界循环在测试里表现为**挂起**,
+      // 不是失败 —— 一个会把整个 suite 挂死的探针等于没有探针(变异跑批只会超时,而超时
+      // 读起来和「这条变异活下来了」一模一样)。所以主动炸,而且炸在前面。
+      if (++calls > 40) throw new Error('无界循环:降级放行之后那一关还在开会')
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      if (req.phase === 'verify') return vtag(req) + '\n{"pass":false,"blocking":["cargo check 退出码 101"],"advice":["' + ADVICE + '"],"comments":""}\n```'
+      acceptRounds++
+      acceptPrompts.push(req.prompt)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }, { ...cfg, phaseRoles: n.phaseRoles })
+    await stepExecute(n, ctx)
+    expect((n.degraded ?? []).map(d => d.phase)).toContain('verify')
+    // 用户原话:「就把修改建议给验收,让验收来修改」。
+    expect(acceptPrompts[0]).toContain(ADVICE)
+    // 而且验收**真的还有预算**:两关共用一个计数器时,这里会是「验收一轮都没剩」。
+    expect(n.iteration.acceptance).toBeLessThan(DEFAULT_CAPS.maxIterations)
+    expect(acceptRounds).toBeGreaterThan(0)
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  /**
+   * 闩:每一关**最多降级一次**。
+   *
+   * `stepExecute` 是无界 `for(;;)`,只记账不闩住的话那一关下一轮又开、又触顶、又降级 ——
+   * 无限次真实模型调用。这条用例是那个死循环唯一的探针。
+   */
+  it('降级过的关口不再开会 —— 否则无界循环', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'
+    n.phaseRoles.verify = [{ roleName: 'v' }]
+    n.plan.acceptance = 'a'
+    let verifyCalls = 0
+    let calls = 0
+    const ctx = ctxFor([n], async req => {
+      // **上限即断言。** 闩没闩住时这个循环是无界的,而无界循环在测试里表现为**挂起**,
+      // 不是失败 —— 一个会把整个 suite 挂死的探针等于没有探针(变异跑批时它只会超时,
+      // 而超时读起来和「这条变异活下来了」一模一样)。所以在这里主动炸,炸得越早越好。
+      if (++calls > 40) throw new Error('无界循环:降级放行之后那一关还在开会')
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      if (req.phase === 'verify') { verifyCalls++; return vtag(req) + '\n{"pass":false,"blocking":["没过"],"comments":""}\n```' }
+      return vtag(req) + '\n{"pass":false,"blocking":["也没过"],"comments":""}\n```'
+    }, { ...cfg, phaseRoles: n.phaseRoles })
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(verifyCalls).toBe(DEFAULT_CAPS.maxIterations)   // 一次都不多
+    const phases = (n.degraded ?? []).map(d => d.phase)
+    expect(phases.length).toBe(new Set(phases).size)        // 每关至多一条
+  })
+
+  /**
+   * 「不失败」不等于「判通过」。降级放行必须在**用户会读的每一处**自报家门,
+   * 否则这次改动只是把阻断换成了谎报完成 —— 而这个仓库为谎报完成付过三次学费。
+   */
+  it('降级放行在 node.md、run.md 树行、和集成验收证据里都说得出口', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'; n.plan.acceptance = 'a'
+    const ctx = ctxFor([n], async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"改了"}\n```'
+        : vtag(req) + '\n{"pass":false,"blocking":["验收点没达成"],"advice":["' + ADVICE + '"],"comments":""}\n```')
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+
+    // node.md:人读的那一半,不能只落 frontmatter。
+    const md = serializeNode(n)
+    expect(md).toContain('## 降级放行')
+    expect(md).toContain(ADVICE)
+
+    // run.md 的树行:一行 [done] … (ACCEPTED) 和真通过的逐字相同,那就是谎报。
+    const snap = renderTreeSnapshot([n])
+    expect(snap).toContain('降级放行')
+
+    // 往返:落盘 → 读回,降级记录和建议一个字不少(写得出去读不回来 = 一次 --resume 全没)。
+    const back = parseNodeFile(md)
+    validateLoadedNodes([back], DEFAULT_CAPS)
+    expect(back.degraded?.[0]?.advice).toContain(ADVICE)
+    expect(back.degraded?.[0]?.phase).toBe('accept')
+  })
+
+  it('集成验收看得见「这个子任务是降级放行的」,不会把它当成通过', async () => {
+    const p = root(); p.kind = 'decompose'; p.status = 'WAITING_CHILDREN'; p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'A', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'; kid.execStatus = '子任务产出'
+    kid.degraded = [{ phase: 'accept', round: 3, reason: '验收迭代超限(3)', advice: [ADVICE], at: NOW }]
+    const prompts: string[] = []
+    const ctx = ctxFor([p, kid], async req => {
+      prompts.push(req.prompt)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    })
+    await stepIntegrate(p, ctx)
+    // 整个 run 对根节点的最终裁决出自这一桌 —— 把降级当通过喂给它,最后一道关就在假前提上判。
+    expect(prompts[0]).toContain('降级放行')
+    expect(prompts[0]).toContain('**不是通过**')
+    expect(prompts[0]).toContain(ADVICE)
+  })
+})
+
+
+/**
+ * 降级放行的**收尾必须和通过那条一模一样**,而这几条是它仅有的探针。
+ *
+ * 通过那条路是五步:`SCORING → scoreNode → MERGE → mergeAndRelease → ACCEPTED`。
+ * 降级图省事直接 `commit('ACCEPTED')` 的后果是:这个节点真写出来的代码**永远不会进
+ * 集成分支**、工作树槽位泄漏,而 run 报「已完成」—— 那正是这次改动自己拿来当理由的
+ * 「谎报完成」,只是换了个方向发生。
+ */
+describe('降级放行走完通过那条尾巴,一步都不少', () => {
+  it('验收降级 → 工作树仍然被合并、被释放', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'; n.plan.acceptance = 'a'
+    n.worktree = { path: '/wt/root', branch: 'efftask/001/root', gitRoot: '/repo' }
+    let merged = false
+    let released = false
+    const ctx = {
+      ...ctxFor([n], async req =>
+        req.phase === 'execute'
+          ? '```json\n{"execStatus":"改了 a.ts"}\n```'
+          : vtag(req) + '\n{"pass":false,"blocking":["没达成"],"comments":""}\n```'),
+      worktrees: {
+        acquire: async () => ({ path: '/wt/root', branch: 'efftask/001/root', gitRoot: '/repo' }),
+        commitAndMerge: async () => { merged = true; return { ok: true, merged: true } },
+        release: async () => { released = true; return { removed: true } },
+        refreshFromIntegration: async () => ({ ok: true }),
+        withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      } as never,
+    }
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    expect(n.degraded?.[0]?.phase).toBe('accept')
+    // 少了这两条,降级节点的产出一行都到不了集成分支,而 run 说它完成了。
+    expect(merged).toBe(true)
+    expect(released).toBe(true)
+  })
+
+  /**
+   * 但**评分返工**那一支要关掉。
+   *
+   * 对一个刚因为「验收轮数用尽」而降级的节点再打回 REWORK,等于绕开刚刚宣布用尽的预算;
+   * 而且回来还会再触顶一次、再记一条降级 —— 同一件事记两遍,轮数也白烧。
+   */
+  it('验收降级之后,低分不再把节点打回返工', async () => {
+    const seen: string[] = []
+    const n = createNode({
+      id: 'root', title: 'r', parentId: null, deps: [], depth: 0,
+      phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] }, now: NOW,
+    })
+    n.kind = 'executable'; n.status = 'READY'; n.plan.acceptance = 'a'
+    const ctx = ctxFor([n], async req => {
+      seen.push(req.phase)
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      if (req.phase === 'observer') {
+        // 必须带**本次调用**那个随机 tag,而且形状要对(plan/exec 各是 {score,rationale})。
+        // 上一版两样都不对,于是 parseScoreOutput 走的是「未按要求输出评分代码块」→ 0 分,
+        // 测到的是解析失败而不是低分 —— 恰好也低于阈值,所以用例照样绿。假绿。
+        const t = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
+        return '```' + t + '\n{"plan":{"score":10,"rationale":"差"},"exec":{"score":10,"rationale":"差"}}\n```'
+      }
+      return vtag(req) + '\n{"pass":false,"blocking":["没达成"],"comments":""}\n```'
+    }, {
+      ...cfg,
+      phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] },
+      caps: { ...DEFAULT_CAPS, scoreThreshold: 60 },
+    })
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('ACCEPTED')
+    // **判据是执行次数**,不是 iteration.scoring:scoreNode 无论如何都会记一次
+    // (它确实评了),真正不能发生的是那个「返工」信号被采纳 —— 那会多出一轮
+    // 带写工具的执行,而预算刚刚才宣布用尽。
+    expect(seen.filter(p => p === 'execute')).toHaveLength(DEFAULT_CAPS.maxIterations)
+  })
+})
+
+
+/**
+ * 验收查出来的一整批「加了字段、加了解析、加了往返、就是没人问过它」。
+ *
+ * 这一组守的是**输入端**:`Verdict.advice` 是「触顶不失败」唯一的载荷,而它一度
+ * 全链路齐备却没有任何一处提示词索要 —— 一个严格照 schema 作答的评审员永远不填,
+ * 三条降级记录的 advice 全是 `[]`,node.md 印三遍「没有留下可执行的修改建议」。
+ * 功能全绿,交付为零。
+ */
+describe('四个裁决关口都要**问**修改建议,不是只会收', () => {
+  it('评审/测试验证/验收/集成验收的 schema 里都有 advice', async () => {
+    const seen: Record<string, string> = {}
+    const p = root(); p.kind = 'decompose'; p.status = 'WAITING_CHILDREN'; p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'A', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'; kid.execStatus = '产出'
+    const n = root(); n.kind = 'executable'; n.status = 'READY'; n.plan.acceptance = 'a'
+    n.phaseRoles.verify = [{ roleName: 'v' }]
+    const capture = async (req: { phase: string; prompt: string }): Promise<string> => {
+      seen[req.phase] = req.prompt
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      return vtag(req as { prompt: string }) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const r = root()
+    await stepStart(r, ctxFor([r], capture as RunAgentFn))
+    await stepExecute(n, ctxFor([n], capture as RunAgentFn, { ...cfg, phaseRoles: n.phaseRoles }))
+    await stepIntegrate(p, ctxFor([p, kid], capture as RunAgentFn))
+    for (const phase of ['review', 'verify', 'accept']) {
+      expect(`${phase}:${(seen[phase] ?? '').includes('"advice"')}`).toBe(`${phase}:true`)
+    }
+    // 集成验收走 phase 'accept' 但用 integratePrompt —— 上面那份被叶子验收覆盖了,单独核一次。
+    expect(seen.accept).toContain('"advice"')
+  })
+
+  it('评审员填的建议真的被收下、并且随降级传给执行者', async () => {
+    const n = root(); n.kind = 'executable'
+    const execPrompts: string[] = []
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      if (req.phase === 'execute') { execPrompts.push(req.prompt); return '```json\n{"execStatus":"做完了"}\n```' }
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":false,"blocking":["参数不可执行"],"advice":["把 repo 值改成 etcd"],"comments":""}\n```'
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    })
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(execPrompts[0]).toContain('把 repo 值改成 etcd')
+  })
+
+  /**
+   * 闩**按关**分。写成「有没有降级过」的话,一个在方案评审触顶的节点会连带把测试验证
+   * 永久关掉 —— 它这辈子一次测试都不跑,而 node.md 上只说它在评审那一关降级过。
+   */
+  it('一关降级不会把另一关也闩掉', async () => {
+    const n = root(); n.kind = 'executable'
+    n.phaseRoles.verify = [{ roleName: 'v' }]
+    let verifyCalls = 0
+    const ctx = ctxFor([n], async req => {
+      if (req.phase === 'plan') return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'review') return vtag(req) + '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+      if (req.phase === 'verify') { verifyCalls++; return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }, { ...cfg, phaseRoles: n.phaseRoles })
+    await stepStart(n, ctx)
+    expect((n.degraded ?? []).map(d => d.phase)).toEqual(['review'])
+    await stepExecute(n, ctx)
+    // 评审降级了,但测试验证**照常开会**。
+    expect(verifyCalls).toBeGreaterThan(0)
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  /**
+   * 集成验收降级也要走 `scoreNode` —— 少了它,所有降级的拆分型节点(包括根)不再被评分,
+   * 整个 run 的最终分会消失。
+   */
+  it('集成验收降级仍然评分', async () => {
+    const p = createNode({
+      id: 'root', title: 'r', parentId: null, deps: [], depth: 0,
+      phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] }, now: NOW,
+    })
+    p.kind = 'decompose'; p.status = 'WAITING_CHILDREN'; p.childIds = ['root/01-a']
+    const kid = createNode({ id: 'root/01-a', title: 'A', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    kid.status = 'ACCEPTED'; kid.execStatus = '产出'
+    const seen: string[] = []
+    const ctx = ctxFor([p, kid], async req => {
+      seen.push(req.phase)
+      if (req.phase === 'observer') {
+        const t = req.prompt.match(/语言标记\(fence info string\)写成 (score[a-z]+)/)?.[1] ?? 'score'
+        return '```' + t + '\n{"plan":{"score":70,"rationale":"还行"},"exec":{"score":70,"rationale":"还行"}}\n```'
+      }
+      return vtag(req) + '\n{"pass":false,"blocking":["没串起来"],"comments":""}\n```'
+    }, { ...cfg, phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'watcher' }] } })
+    await stepIntegrate(p, ctx)
+    expect(p.status).toBe('ACCEPTED')
+    expect(p.degraded?.[0]?.phase).toBe('integrate')
+    expect(seen).toContain('observer')
+    expect(p.score.plan?.score).toBe(70)
+  })
+})
+
+
+/**
+ * 降级交接段里的文字**逐字都是模型写的**:`reason` 来自 `synthesized.blockingSummary`,
+ * `advice` 是评审员填的「怎么改」—— 而后者按定义装命令和路径,写出 `` ```bash …``` ``
+ * 是这个系统里最正常不过的一件事。
+ *
+ * 不中和的话那三个反引号会进一个「回复必须按 tag 解析」的提示词,而裁决关口是
+ * **失败关闭**的:围栏被劈开一次 = 一次假的「未按要求输出裁决代码块」——
+ * run 001 那个自激循环的第一步,原样重演。
+ */
+describe('降级交接段里的模型文本要中和围栏', () => {
+  it('建议里的三反引号不会带进下游提示词', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'; n.plan.acceptance = 'a'
+    n.degraded = [{
+      phase: 'verify', round: 3, at: NOW,
+      reason: '没跑通,见 ```bash\ncargo check\n```',
+      advice: ['改成 ```bash\ngit worktree add --detach\n```'],
+    }]
+    const seen: string[] = []
+    const ctx = ctxFor([n], async req => {
+      seen.push(req.prompt)
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"改了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    })
+    await stepExecute(n, ctx)
+    // 内容要在(不是靠删掉它来"中和"),但裸围栏一个都不许有。
+    for (const p of seen) {
+      expect(p).not.toMatch(/`{3,}(?!\u200b)/)
+    }
+    expect(seen.join('')).toContain('git worktree add --detach')
+  })
+})
+
+/**
+ * 执行循环的绝对上限。**这是纵深防御的探针,不是正常路径的探针** ——
+ * 正常路径永远够不着它(测试验证 ≤3 轮、验收 ≤3 轮、评分返工一次)。
+ *
+ * 它守的是:那几个闩和计数器里任何一个坏掉时,后果是「有限且会说话」而不是
+ * 「无限次带写工具的模型调用」。实测过坏掉的样子:把 `degradedAt` 改成恒 false,
+ * `bun test` 直接挂死 —— 连 bun 自己的单测超时都不触发(循环把事件循环饿死了)。
+ */
+describe('执行循环有绝对上限,不会无限烧钱', () => {
+  it('闩坏掉时以阻断收场,而且说清这是兜底不是预算问题', async () => {
+    const n = root(); n.kind = 'executable'; n.status = 'READY'; n.plan.acceptance = 'a'
+    let calls = 0
+    const ctx = ctxFor([n], async req => {
+      calls++
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了"}\n```'
+      // 永不通过,而且**每一轮都把预算退回去** —— 模拟「计数器/闩失效」。
+      n.iteration.acceptance = 0
+      n.iteration.verification = 0
+      n.degraded = []
+      return vtag(req) + '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+    })
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('绝对上限')
+    expect(n.blockedReason).toContain('不是正常的迭代超限')
+    // 有限:上限是 maxIterations*4+8,一轮至多两次调用,给足余量。
+    expect(calls).toBeLessThan((DEFAULT_CAPS.maxIterations * 4 + 8) * 3)
   })
 })

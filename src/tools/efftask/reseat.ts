@@ -249,7 +249,25 @@ export function reseatTransientNodes(
       target === 'READY' ? n.iteration.acceptance
       : target === 'CREATED' ? n.iteration.planReview
       : n.iteration.integration
-    if (spent >= caps.maxIterations) {
+    /**
+     * **降级放行过的那一关不算「预算耗尽」——它算「这一关已经不再开会了」。**
+     *
+     * 少了这一句是一个 P0,而且是静默的:降级放行的节点**本来就**带着一个停在上限上的
+     * 计数器继续跑(那正是「触顶」的定义)。于是它下一次被中断 + `--resume` 时,
+     * 这条早退分支会把一个正在正常推进的节点直接判死 —— 而它既没有 `capBlocked`
+     * (没走过 `blockWithReason`),就**也不被 `--retry-blocked` 认领**。
+     * 结果是永久死节点,而且降级带下去的那些意见跟着一起没了。
+     *
+     * 判据用 `degraded`(结构化记录)而不是「计数器到顶了」:计数器到顶的节点可能是
+     * 刚被阀门停掉的真失败,也可能是降级放行继续在跑的,两者的下一步相反。
+     * 同一个坑 `reviseDecomposition` 踩过一次(它的解法是把 `iteration.integration`
+     * 清零),这里不清零 —— 清零等于把刚刚宣布用尽的预算又发一次。
+     */
+    const degradedHere =
+      target === 'READY' ? (n.degraded ?? []).some(d => d.phase === 'accept' || d.phase === 'verify')
+      : target === 'CREATED' ? (n.degraded ?? []).some(d => d.phase === 'review')
+      : (n.degraded ?? []).some(d => d.phase === 'integrate')
+    if (spent >= caps.maxIterations && !degradedHere) {
       n.status = 'BLOCKED'
       n.blockedReason = `恢复时该阶段预算已耗尽(${spent}/${caps.maxIterations}),不再重试`
       n.interrupted = false // a later resume must not reopen it again

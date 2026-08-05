@@ -27,7 +27,7 @@ const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
 })
 
 const reply = (req: { prompt: string }, body: string): string => {
-  const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+  const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
   return '```' + tag + '\n' + body + '\n```'
 }
 const THREE_LEAVES = '{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿",' +

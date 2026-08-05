@@ -359,7 +359,7 @@ describe('--retry-blocked 不能让被否掉的方案绕过评审', () => {
         phases.push(req.phase)
         return req.phase === 'plan'
           ? '```json\n{"kind":"executable","solution":"改好的方案","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n```'
-          : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+          : '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":true,"blocking":[],"comments":""}\n```'
       },
     })
     expect(phases[0]).toBe('plan')   // the plan is REDONE
@@ -477,8 +477,10 @@ describe('capCategory:落盘、校验、和旧版本 node.md 的兼容', () => {
       reserveNodes: () => ({ release: () => {} }),
       runAgent: async req =>
         req.phase === 'plan'
-          ? '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
-          : '\u0060\u0060\u0060' + (req.prompt.match(/\u0060\u0060\u0060(verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":false,"blocking":["不行"],"comments":""}\n\u0060\u0060\u0060',
+          // 方案**没有验收点** —— 走的是评审触顶仍然阻断的那条硬边界(降级放行需要有
+          // 可以交给执行者的东西,而一份没有判据的方案不是)。用它才走得到 cap-iteration。
+          ? '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":""}\n\u0060\u0060\u0060'
+          : '\u0060\u0060\u0060' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":false,"blocking":["不行"],"comments":""}\n\u0060\u0060\u0060',
     })
     // The valve tripped on REVIEW, and stepStart had already written kind='executable'.
     expect(n.status).toBe('BLOCKED')
@@ -762,5 +764,50 @@ describe('恢复时预算已耗尽的那条早退分支', () => {
     expect(n.cancelled).toBe(false)
     // 失败点仍然要记(这条分支原来就有,别被顺手改掉)
     expect(n.failedAt).toBe('ACCEPTANCE')
+  })
+})
+
+/**
+ * **降级放行过的节点,不能被 `--resume` 判死。**
+ *
+ * 这是这套东西里最隐蔽的一个 P0:降级放行的节点**按定义**带着一个停在上限上的计数器
+ * 继续跑(那就是「触顶」的意思)。它下一次被中断 + `--resume` 时,「恢复时该阶段预算
+ * 已耗尽」那条早退会把一个正在正常推进的节点直接判死 —— 而它既没有走过
+ * `blockWithReason`、也就没有 `capBlocked`,于是**连 `--retry-blocked` 都不认领它**。
+ * 结果是永久死节点,降级带下去的那些意见一起没了,而屏幕上只说「恢复完成」。
+ */
+describe('降级放行的节点在 --resume 之后还能继续跑', () => {
+  const caps = { ...DEFAULT_CAPS }
+  it('验收降级过 → 归位 READY,而不是「预算已耗尽」', () => {
+    const n = mk({
+      id: 'a', kind: 'executable', status: 'ACCEPTANCE', interrupted: true,
+      iteration: { planReview: 0, acceptance: caps.maxIterations, verification: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+      degraded: [{ phase: 'accept', round: caps.maxIterations, reason: '验收迭代超限(3)', advice: ['把 X 改成 Y'], at: NOW }],
+    })
+    reseatTransientNodes([n], NOW, caps)
+    expect(n.status).toBe('READY')
+    expect(n.blockedReason).not.toContain('预算已耗尽')
+    // 建议不能在恢复路上丢 —— 它是这个节点继续往下跑时唯一的输入。
+    expect(n.degraded?.[0]?.advice).toEqual(['把 X 改成 Y'])
+  })
+
+  it('没降级过的耗尽节点照旧被判死 —— 这道门不是被拆掉,是被加了判据', () => {
+    const n = mk({
+      id: 'b', kind: 'executable', status: 'ACCEPTANCE', interrupted: true,
+      iteration: { planReview: 0, acceptance: caps.maxIterations, verification: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+    })
+    reseatTransientNodes([n], NOW, caps)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('预算已耗尽')
+  })
+
+  it('评审降级过的节点回 CREATED,也不判死', () => {
+    const n = mk({
+      id: 'c', kind: 'unknown', status: 'PLAN_REVIEW', interrupted: true,
+      iteration: { planReview: caps.maxIterations, acceptance: 0, verification: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+      degraded: [{ phase: 'review', round: caps.maxIterations, reason: '评审迭代超限(3)', advice: [], at: NOW }],
+    })
+    reseatTransientNodes([n], NOW, caps)
+    expect(n.status).not.toBe('BLOCKED')
   })
 })

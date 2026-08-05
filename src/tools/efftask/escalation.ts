@@ -75,6 +75,10 @@ const TITLE: Record<BlockCategory, string> = {
   'cap-depth': '安全阀 · 已达最大拆分深度',
   // NOT an 安全阀 heading: nothing tripped and nothing stopped. The node just recovered.
   revise: '集成验收未通过 · 已自动追加补救子任务',
+  // 同样不是 安全阀 抬头,理由和 revise 逐字相同:轮数到顶了,但节点**没有停** ——
+  // 它带着这一关提的意见继续往下跑。写成「安全阀 · 方案评审迭代超限」会让用户去
+  // 抢救一个正在正常工作的运行。
+  degrade: '判决未通过 · 已带着意见降级放行',
 }
 
 /**
@@ -85,6 +89,13 @@ const REMEDY: Record<BlockCategory, string> = {
   'cap-iteration': '若方案本身没问题,可提高 run.md 里 caps.maxIterations 后再重试;否则先按评审意见改需求或补充信息。',
   'cap-nodes': '提高 run.md 里 caps.maxNodes 后再重试,或缩小需求范围。',
   rework: '先看该节点的验收记录,按阻断意见改代码或改验收点;必要时提高 caps.maxIterations。',
+  /**
+   * 降级放行。**不许出现「重试」二字** —— 节点没停,没有什么可重试的;
+   * 而「提高 caps.maxIterations」对一个已经往下跑了的节点也没有意义(除非他想重跑整个节点)。
+   *
+   * 用户此刻真正要做的判断只有一个:这一关没解决的那些问题,他接不接受。
+   */
+  degrade: '节点没有停,已带着这一关的意见继续往下跑。看 node.md 的「降级放行」一节:那几条是判决当时提出、没人落实的问题;不接受就对该节点做一次重做,或收紧验收点后重跑。',
   /**
    * 静默超时。**两个旋钮都要说**,而且第二个此前一个字都没有。
    *
@@ -135,7 +146,8 @@ export function humanTimeoutRemedy(): string {
 }
 
 export function stopsTheNode(category: BlockCategory): boolean {
-  return category !== 'cap-depth' && category !== 'revise'
+  // 'degrade' 和 'cap-depth'/'revise' 同类:阀跳了,但节点继续跑。
+  return category !== 'cap-depth' && category !== 'revise' && category !== 'degrade'
 }
 
 /**
@@ -203,7 +215,12 @@ export function blockEscalationLines(e: BlockEscalation, runId?: string): string
         ? '状态: 该节点不再拆分,planner 要的子任务已折进它自己的方案里,继续执行。本次运行没有停。'
         : e.category === 'revise'
           ? '状态: 该节点没有停,已转为等待这些补救子任务;它们全部验收通过后,该节点会重新做一次集成验收。'
-          : '状态: 这次加子节点的请求被拒绝了,但该节点本身没有停,会带着这条拒绝记录继续执行和验收。',
+          : e.category === 'degrade'
+            // 必须自己一支。落进下面那句兜底的话,一张标题写着「判决未通过 · 已降级放行」的卡
+            // 正文会告诉用户「这次加子节点的请求被拒绝了」—— 和事实毫无关系。
+            // (revise 当初被单独立档,治的就是同一个毛病。)
+            ? '状态: 该节点没有停。这一关的轮数用尽而判决没通过,它带着累积的修改建议继续往下跑;建议已交给后续环节和执行者。'
+            : '状态: 这次加子节点的请求被拒绝了,但该节点本身没有停,会带着这条拒绝记录继续执行和验收。',
       `记录: ${recordPath(e.node, runId)}`,
       `处理方式: ${e.remedy ?? REMEDY[e.category]}`,
     ]

@@ -8,7 +8,7 @@ import type { EffTaskConfig, TaskNode } from './types.js'
 import type { RunAgentFn } from './roundtable.js'
 
 const NOW = '2026-07-25T00:00:00Z'
-const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
+const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
 const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
   goalPrompt: '做一个支付回调', parallelism: DEFAULT_PARALLELISM,
   phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [], ...over,
@@ -448,7 +448,7 @@ describe('第三关起草时要用和 run 一样的隔离规则', () => {
     const prompts: string[] = []
     const runAgent = (async (req: { prompt: string }) => {
       prompts.push(req.prompt)
-      const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
       return '```' + tag + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     }) as never
     const root = makeRootNode(cfg(), NOW)
@@ -463,7 +463,7 @@ describe('第三关起草时要用和 run 一样的隔离规则', () => {
     const prompts: string[] = []
     const runAgent = (async (req: { prompt: string }) => {
       prompts.push(req.prompt)
-      const tag = req.prompt.match(/必须是一个 ```([a-zA-Z]+) 代码块/)?.[1] ?? ''
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 ([a-zA-Z]+)/)?.[1] ?? ''
       return '```' + tag + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     }) as never
     const root = makeRootNode(cfg(), NOW)

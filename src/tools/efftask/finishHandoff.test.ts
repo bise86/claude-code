@@ -309,3 +309,28 @@ describe('自动推送:默认关,开了才推', () => {
     expect(g.ran('push')).toBe(false)
   })
 })
+
+/**
+ * 触顶降级放行之后,run 的 `outcome` **就是** `completed`(树推完了、根 ACCEPTED)——
+ * 于是这一层原本会直接 `{action:'merge'}`,**把一份没人判通过的代码自动 merge 进用户的
+ * 检出**,不弹确认、不按任何键、而且不可逆(merge commit 已经在他的历史里了)。
+ *
+ * 自动合并当初被认定安全,前提逐字是「一次**干净**跑完的运行」。降级放行把那个前提改掉了,
+ * 所以这道门必须跟着改 —— 这是「不失败」这套东西最容易造成真实损害的那一处。
+ */
+describe('降级放行的运行不自动合并', () => {
+  it('有降级节点 → skip,并说清为什么、以及怎么自己合', () => {
+    const p = planFinish(h({ degradedNodes: 2 }), { dirty: false })
+    expect(p.action).toBe('skip')
+    expect(p.why).toContain('降级放行')
+    expect(p.why).toContain('2')
+    // 决定权还给用户,但他得拿得到做决定所需要的那个事实,以及下一步。
+    expect((p.followUps ?? []).join('\n')).toContain('降级放行')
+    expect((p.followUps ?? []).join('\n')).toContain('git merge')
+  })
+
+  it('一个降级节点都没有 → 行为逐字不变,照常自动合', () => {
+    expect(planFinish(h({ degradedNodes: 0 }), { dirty: false })).toEqual({ action: 'merge' })
+    expect(planFinish(h(), { dirty: false })).toEqual({ action: 'merge' })
+  })
+})

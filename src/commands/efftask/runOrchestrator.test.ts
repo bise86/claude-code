@@ -82,11 +82,11 @@ describe('runOrchestrator reports the run it just drove', () => {
     let merges = 0
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
-        return '\`\`\`' + (req.prompt.match(/必须是一个 \`\`\`(plan[a-z]+) 代码块/)?.[1] ?? 'plan') +
+        return '\`\`\`' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
           '\n{"kind":"executable","goal":"g","acceptance":["a"],"children":[]}\n\`\`\`'
       }
       if (req.phase === 'execute') return '\`\`\`json\n{"execStatus":"做完了"}\n\`\`\`'
-      const tag = req.prompt.match(/必须是一个 \`\`\`(verdict[a-z]+) 代码块/)?.[1] ?? 'verdict'
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict'
       return '\`\`\`' + tag + '\n{"pass":true,"blocking":[],"comments":"ok"}\n\`\`\`'
     }
     const pool = {
@@ -197,11 +197,11 @@ describe('runOrchestrator reports the run it just drove', () => {
     }
     const runAgent = (async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'plan') {
-        return '```' + (req.prompt.match(/必须是一个 ```(plan[a-z]+) 代码块/)?.[1] ?? 'plan') +
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
           '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"a"}\n```'
       }
       if (req.phase === 'execute') return '```json\n{"execStatus":"做完了"}\n```'
-      const tag = req.prompt.match(/必须是一个 ```(verdict[a-z]+) 代码块/)?.[1] ?? 'verdict'
+      const tag = req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict'
       return '```' + tag + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as RunAgentFn
     await runOrchestrator(
@@ -549,7 +549,7 @@ describe('触阀升级 (spec §9/§11) 真的被接上', () => {
     const runAgent: RunAgentFn = async req =>
       req.phase === 'plan'
         ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
-        : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+        : '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
           '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
     await runOrchestrator(
       {
@@ -583,13 +583,13 @@ describe('实时计数这条线也得是通的', () => {
     // accept passes → ACCEPTED. The root ends accepted, so counts must move off 0.
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
-        return '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
           '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
       }
       if (req.phase === 'execute') {
-        return '```' + (req.prompt.match(/```(exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
       }
-      return '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+      return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
         '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
     await runOrchestrator(
@@ -614,9 +614,9 @@ describe('实时计数这条线也得是通的', () => {
     const ac = new AbortController()
     const runAgent: RunAgentFn = async req =>
       req.phase === 'plan'
-        ? '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
+        ? '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
           '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
-        : '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+        : '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
           '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
     await runOrchestrator(
       {
@@ -681,13 +681,13 @@ describe('子 agent 实时输出 (spec §10.2) 真的被接上', () => {
       // 真实适配层在 resolve 之前会把每条消息拆成事件推进窗口。
       req.stream?.push({ kind: 'text', text: `${req.phase} 在干活` })
       if (req.phase === 'plan') {
-        return '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
           '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
       }
       if (req.phase === 'execute') {
-        return '```' + (req.prompt.match(/```(exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
       }
-      return '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+      return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
         '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
     await runOrchestrator(
@@ -724,13 +724,13 @@ describe('子 agent 实时输出 (spec §10.2) 真的被接上', () => {
     const ac = new AbortController()
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
-        return '```' + (req.prompt.match(/```(plan[a-z]+)/)?.[1] ?? 'plan') +
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
           '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
       }
       if (req.phase === 'execute') {
-        return '```' + (req.prompt.match(/```(exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') + '\n{"execStatus":"做完了"}\n```'
       }
-      return '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict') +
+      return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
         '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
     await runOrchestrator(

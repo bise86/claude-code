@@ -441,7 +441,7 @@ const cfg = (over: Partial<EffTaskConfig['caps']> = {}): EffTaskConfig => ({
   phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: '' }] },
   caps: { ...DEFAULT_CAPS, ...over },
 })
-const vtag = (req: { prompt: string }): string => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
+const vtag = (req: { prompt: string }): string => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
 const PASS = '\n{"pass":true,"blocking":[],"comments":""}\n```'
 
 /**

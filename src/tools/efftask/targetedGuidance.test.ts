@@ -25,7 +25,7 @@ import type { RunAgentFn } from './roundtable.js'
 import type { PipelineCtx } from './pipeline.js'
 
 const NOW = '2026-07-30T00:00:00Z'
-const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
+const vtag = (req: { prompt: string }) => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
 const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
   goalPrompt: 'g', parallelism: DEFAULT_PARALLELISM, phaseRoles: emptyPhaseRoles(),
   caps: { ...DEFAULT_CAPS }, notices: [], ...over,

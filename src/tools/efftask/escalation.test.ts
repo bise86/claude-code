@@ -353,3 +353,35 @@ describe('两个时钟的默认预算和那句人工建议', () => {
     expect(s).toContain('nodeTimeoutMs')
   })
 })
+
+
+/**
+ * 降级那一档的卡片。四条各自对应一个实测过的自相矛盾:复用 `cap-iteration` 会让标题写
+ * 「安全阀 · 方案评审迭代超限」、建议写「提高 caps.maxIterations 后再重试」,而节点根本没停;
+ * 落进兜底那一支则会告诉用户「这次加子节点的请求被拒绝了」—— 和事实毫无关系。
+ * `revise` 当初被单独立档,治的就是同一个毛病。
+ */
+describe('降级放行的升级卡不许自相矛盾', () => {
+  const card = (): string[] => blockEscalationLines({
+    node: node(), reason: '评审迭代超限(3): 还差得远', category: 'degrade', stopped: false,
+  }, '001')
+
+  it('标题不说「安全阀」,也不说节点停了', () => {
+    const t = card().join('\n')
+    expect(t).not.toContain('安全阀')
+    expect(t).toContain('降级放行')
+    expect(t).toContain('没有停')
+  })
+
+  it('处理方式里不出现「重试」—— 节点没停,没有什么可重试的', () => {
+    expect(card().join('\n')).not.toContain('重试')
+  })
+
+  it('正文不会冒出「加子节点的请求被拒绝了」', () => {
+    expect(card().join('\n')).not.toContain('加子节点的请求被拒绝')
+  })
+
+  it('stopsTheNode 对 degrade 返回 false', () => {
+    expect(stopsTheNode('degrade')).toBe(false)
+  })
+})

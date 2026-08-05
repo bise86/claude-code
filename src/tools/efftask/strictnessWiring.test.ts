@@ -167,7 +167,7 @@ describe('seatPreamble:档位独立成段,不碰 JUDGE_NOTE 的闸门', () => {
 })
 
 describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
-  const vtag = (req: { prompt: string }): string => '```' + (req.prompt.match(/```(verdict[a-z]+)/)?.[1] ?? 'verdict')
+  const vtag = (req: { prompt: string }): string => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
   const ctxFor = (nodes: TaskNode[], runAgent: RunAgentFn, config: EffTaskConfig, control?: ReturnType<typeof createRunControl>): PipelineCtx => ({
     config, byId: byIdMap(nodes), runAgent, persist: async () => {}, now: () => NOW,
     signal: new AbortController().signal, onUpdate: () => {},

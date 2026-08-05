@@ -130,6 +130,13 @@ function richNode(): TaskNode {
   // 补救拆分 already used once — the flag that stops it happening twice, which is the bound
   // the whole cost argument for that feature rests on.
   n.revised = true
+  /**
+   * 降级放行记录。**结构最深的一个持久字段**:数组里是对象,对象里还有一个字符串数组,
+   * 而渲染层会 `d.advice.join()`、`degraded.length`。node.md 按设计可以手工编辑,
+   * 崩在半路也会留下半条记录 —— 敌意值一路走到 commit() 抛 TypeError 就是永久死节点,
+   * 而且每次 resume 重演一遍。这正是 roundArray / scoreRecord 当年被写出来的那个失败。
+   */
+  n.degraded = [{ phase: 'review', round: 3, reason: '评审迭代超限(3)', advice: ['把 repo 参数写成 etcd'], at: '2026-08-04T10:00:00Z' }]
   n.phaseMs = { EXECUTING: 42_000, ACCEPTANCE: 7_000 }
   // 模型用量。和 phaseMs 同一类:一张从盘上读回来的纯数字表,而它会被渲染成
   // `NaN 次 · NaNk`,还会顺着 childIds 被子树合计一路传染到根节点那一行。

@@ -1,10 +1,10 @@
 // src/tools/efftask/pipeline.ts
-import type { EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
+import type { DegradePhase, EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
-import { crossSeatNotice, exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, retractedCount, reviewRepeatNotice } from './reviewConvergence.js'
-import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
+import { adviceOf, crossSeatNotice, degradeCarryPrompt, degradeDiagnosis, exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, retractedCount, reviewRepeatNotice } from './reviewConvergence.js'
+import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
@@ -318,6 +318,66 @@ function notifyValve(node: TaskNode, reason: string, category: BlockCategory, ct
   // current control flow makes very narrow — keep it, but do not claim it is tested.
   if (ctx.signal.aborted) return
   try { ctx.onBlocked?.({ node, reason, category, stopped: false }) } catch { /* a notification failure must not change the run */ }
+}
+
+/**
+ * 这一关**降级放行**过没有 —— 既是「别再开这个会」的闩,也是渲染层的判据。
+ *
+ * 判据只能是这个数组,不能是「计数器到顶了」:计数器到顶的节点可能是刚刚被
+ * `blockWithReason` 停掉的(那是真失败),也可能是降级放行继续在跑的。两者的下一步相反。
+ */
+/**
+ * 这个节点身上所有降级放行的交接段,拼给下游看。没降级过就是空串。
+ *
+ * 每一关**单独一段** —— 合成一段会让「方案评审没通过」和「测试没跑通」的建议混在一起,
+ * 而它们的处理方式不同:前者要在动手前先想清楚,后者是手上这一版的具体缺陷。
+ */
+function degradeSection(node: TaskNode): string {
+  return (node.degraded ?? [])
+    /**
+     * **过 `quote()`。** `reason` 和 `advice` 逐字都是模型写的:前者来自
+     * `synthesized.blockingSummary`,后者是评审员自己填的「怎么改」—— 而后者按定义装的是
+     * 命令和路径,写出 `` ```bash …``` `` 是这个系统里最正常不过的一件事。
+     *
+     * 不中和的话,那三个反引号会进一个「回复必须按 tag 解析」的提示词,而裁决关口是
+     * `requireTag` **失败关闭**的:围栏被劈开一次 = 一次假的「未按要求输出裁决代码块;
+     * 按不通过处理」—— 正是 run 001 那个自激循环的第一步。
+     *
+     * `answerRule` 的注释里写着「模型写的文本一律先过 quote()」,这一处不过就是让那句话变假。
+     */
+    .map(d => degradeCarryPrompt(PHASE_LABEL[d.phase], quote(d.reason), d.advice.map(quote)))
+    .join('')
+}
+
+export function degradedAt(node: TaskNode, phase: DegradePhase): boolean {
+  // `d.phase === phase` 是 load-bearing 的,不是形式:写成「有没有降级过」的话,
+  // 一个在**方案评审**触顶的节点会连带把**测试验证**永久关掉 —— 它这辈子一次测试都不跑,
+  // 而 node.md 上只说它在评审那一关降级过。闩要闩住的是那一关,不是这个节点。
+  return (node.degraded ?? []).some(d => d.phase === phase)
+}
+export function isDegraded(node: TaskNode): boolean { return (node.degraded ?? []).length > 0 }
+
+/**
+ * 记一次降级放行,并且**喊人**(不停节点)。
+ *
+ * 用户原话:「反正,就是不失败了。这些轮数,只是不停找问题,来迭代优化。」
+ *
+ * 三条边界写在这里,因为它们是「不失败」和「谎报完成」之间仅有的那道墙:
+ *
+ * 1. **不清 `blockedReason` 之外的任何东西,也不设 `capBlocked`。** 节点没停,
+ *    `--retry-blocked` 不该认领它;但 `degraded` 本身就是给 `reseat` / `redo` / 渲染层的
+ *    结构化把手,不能只当日志。
+ * 2. **category 是 `degrade` 自己一档。** 复用 `cap-iteration` 会让卡片标题写
+ *    「安全阀 · 方案评审迭代超限」、建议写「提高 caps.maxIterations 后再重试」——
+ *    对一个正在继续往下跑的节点两句都是假的。
+ * 3. **建议要真的带走。** `advice` 是这次降级唯一有价值的产物:run 001 那 13 条
+ *    带实测输出的意见,今天全部随 `blockedReason` 一起烂在字符串里。
+ */
+function recordDegrade(
+  node: TaskNode, ctx: PipelineCtx, phase: DegradePhase, round: number, reason: string, advice: string[],
+): void {
+  ;(node.degraded ??= []).push({ phase, round, reason: capText(reason, MAX_SUMMARY_CHARS), advice, at: ctx.now() })
+  notifyValve(node, `${PHASE_LABEL[phase]}迭代到顶(${round})仍未通过,已带着意见降级放行,节点继续往下跑: ${reason}`, 'degrade', ctx)
 }
 
 /**
@@ -869,10 +929,28 @@ async function roundtableWithInfraRetry(args: {
 
 // Name the tag ONCE. Repeating it invites the model to write a paragraph about the format
 // first, and any stray ``` in that preamble used to swallow the real answer's fence.
+/**
+ * **这句话里一个反引号都不能有。**
+ *
+ * 上一版写的是 `` 回复的最后必须是一个 ```<tag> 代码块 ``,而它是**整个提示词里唯一一处
+ * 系统自己写出来的三反引号**(模型写的文本一律先过 `quote()`)。跑机 run 001 实测:
+ * 评审第 1 轮提「未按要求输出裁决代码块」,方案师就照着这句话的措辞回了一句
+ * 「本次输出严格为单个 ```planfbqrkley 代码块」—— 写在 `responses` 的 JSON 字符串里。
+ * 那三个反引号把它自己的代码块劈开,整份方案解析失败(详见 parseOutput.ts 的 FENCE_RE)。
+ * **模型是在照抄我们给它的示范**,而且是在「被投诉没按格式输出」这个最容易照抄的时刻。
+ *
+ * 解析层已经用「收尾围栏锚到行首或行尾」结构性地免疫了这一类,但示范本身没有存在的必要:
+ * 描述围栏用「语言标记 / info string」讲得同样清楚,而提示词里没有反引号,
+ * 照抄这句话就再也不可能劈开答案。两道锁,便宜的那道也一起上。
+ */
 function answerRule(tag: string): string {
   // Also state the single-block rule: parseVerdict fails closed on two tagged blocks, so
   // leaving it unsaid would reject a reply for a constraint it was never told about.
-  return `\n\n严格要求:回复的最后必须是一个 \`\`\`${tag} 代码块,内含本次回答的 JSON;整条回复中只能有这一个 \`\`\`${tag} 块。`
+  return `\n\n严格要求:回复的最后必须是一个代码块,它的语言标记(fence info string)写成 ${tag},` +
+    `块内是本次回答的 JSON;整条回复里只能有这一个 ${tag} 块。` +
+    // 病因治两遍:上面去掉了示范,这里明说「别把围栏写进 JSON」。实测那次事故里模型
+    // 想说的是「我照做了」,而它表达这件事的方式就是引用围栏。给它一个不带反引号的说法。
+    `JSON 字符串内部不要写三个连续的反引号 —— 要提到代码块就写「代码块」三个字。`
 }
 
 /**
@@ -980,6 +1058,32 @@ const REBUTTAL_RULE =
  * 提示词让它「写进 retracted」,而 schema 里没有这个键。
  */
 const RETRACTED_FIELD = `, "retracted":string[](本轮经核实撤回的历史意见,没有就省略)`
+
+/**
+ * 四个裁决关口共用的**修改建议**字段。和 `RETRACTED_FIELD` 同一条规矩:抽出来是为了让
+ * 四处**同时**改 —— 少给任何一关,那一关的建议永远是空的,而下游一整条链路
+ * (`adviceOf` → `DegradeRecord.advice` → `degradeCarryPrompt` → 执行/验收提示词)
+ * 会安静地搬运空数组。
+ *
+ * ## 这一行是整个「触顶不失败」的输入端,少了它下游全是死代码
+ *
+ * 验收实测(而且是这次改动自己差点犯的错):字段加了、解析加了、往返加了、渲染加了,
+ * **就是没有任何一处提示词问过它**。于是一个严格照 schema 作答的评审员永远不填 advice,
+ * 三条降级记录的 `advice` 全是 `[]`,node.md 上印三遍「(这几轮没有留下可执行的修改建议)」——
+ * 而用户的原话恰恰是「每次质疑不能给出修改建议吗?然后一起传给下面的阶段去」。
+ * 功能看起来全绿,交付的是零。
+ *
+ * ## 措辞:和 blocking 分工,而不是让它复述一遍
+ *
+ * `blocking` 回答「哪里不对」,`advice` 回答「接下来怎么改」。不点明分工的话,模型会把
+ * 同一句话抄两遍,而这个字段存在的全部意义是让「怎么改」有一个**定位得到、能单独保预算**
+ * 的位置(见 reviewConvergence 的 `adviceOf`:13 条意见时逐条预算只有 261 字,修复方式
+ * 全写在被截断的那一半里)。
+ *
+ * **明说「不要写代码块围栏」**:这个字段按定义会装命令和路径,而那正是最容易写出三个
+ * 反引号的地方 —— 裁决关口是 `requireTag` 失败关闭的,一次围栏劈开 = 一次假的判不通过。
+ */
+const ADVICE_FIELD = `, "advice":string[](不通过时**逐条给出怎么改**:改哪个文件/哪一条/换成什么,一条一项;通过则省略。不要写代码块围栏)`
 
 export function planPrompt(
   node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = '', brief = '',
@@ -1323,18 +1427,98 @@ function prevPlanSection(node: TaskNode, round: number, notice: string): string 
  * (那是 `prepare()` 预处理**之前**的数;复测同一份输入现在是 8~92 ms —— 常数被压掉了
  * 一个量级,而 O(n²) 还在。所以这条规矩保留,只是它现在防的是浪费,不是卡死。)
  */
+/**
+ * 这一轮方案**打算拆出来的子任务**,渲染成评审员看得见的形状。
+ *
+ * ## 它治的是什么(跑机 run 001,root 节点,三轮全 FAIL、一行代码没写)
+ *
+ * `reviewPrompt` 把方案渲染成 `JSON.stringify(node.plan)`,而 `NodePlan` 里**没有
+ * `children`** —— 拆分结果走的是 `parsePlanOutput` 的另一个返回值,存在局部变量
+ * `lastChildren` 里,评审**通过之后**才交给 `createChildren`。于是第 3 轮:
+ *
+ *   方案师(实测解析出 9 个 children)responses 第 1/5/6 条:「根级 children 精确为 9 个」
+ *   [总监]   「交给本轮评审的方案 JSON …仅含五字段,**无 children**」
+ *   [副总监] 「直接核对本轮方案对象,顶层在 responses 后即结束,**实际没有 children 字段**」
+ *
+ * **三个人说的都是真话。** 争议对象根本不在提示词里,所以这条分歧结构上无法被证伪 ——
+ * 换任何模型、给任何轮数都出不去,只要节点是 decompose 且评审员较真,`maxIterations`
+ * 一定烧穿。这是那次运行的两个死因之一(另一个见 parseOutput.ts 的 FENCE_RE)。
+ *
+ * ## 为什么取值要**先看树、再看本轮草稿**
+ *
+ * `lastChildren` 是本轮方案调用的产物,而它在两条真实路径上是空的,节点却已经有子任务:
+ *  - `reviewOnly`(从质疑讨论重做):`redo.ts` 那条路**刻意不动方案和子任务**,
+ *    循环里 `lastChildren = []` 的注释写着「它只被 createChildren 读」—— 加了这个渲染点
+ *    之后那句话不再成立。而这一支是**一次性**的(FAIL 即 `blockWithReason`,没有重试),
+ *    照 `lastChildren` 渲染 = 拿着 `children: []` 去问一个有 9 个子任务的节点,
+ *    评审员照实说「没有拆分」,节点当场死 —— 和上面那个 bug 是同一个,只是极性反过来。
+ *  - `跳过分析`:强制 `kind='executable'` + `lastChildren=[]`,而它自己的注释说明子任务
+ *    可能已经被别的节点 graft 上来、评审之后的路由会把它改回 decompose。
+ *
+ * 所以 `node.childIds` 非空时**从树上取真值**(deps 是 id,映射回兄弟标题 —— 评审员和
+ * 方案作者用的都是标题这套坐标),否则才用本轮草稿。
+ *
+ * ## 上限不是装饰
+ *
+ * `parsePlanOutput` 对 `children` **既不限个数也不限单条长度**(只有 `str()` 的 8000
+ * 字/字段),和 `parseNewChildren` / `parseRemedy` 不一样。一份 200 个子任务 × 长标题的
+ * 方案会把几百 KB 塞进**每一席、每一轮**的评审提示词,而 `createChildren` 的 `maxNodes`
+ * 闸门要等评审通过之后才跑。这里按 `MAX_NEW_CHILDREN` + 200 字夹一次,并留丢弃标记。
+ */
+function plannedChildren(
+  node: TaskNode,
+  lastChildren: { title: string; deps: string[] }[],
+  byId?: Map<string, TaskNode>,
+): { children: { title: string; deps: string[] }[]; dropped: number } {
+  const raw = node.childIds.length > 0 && byId
+    ? node.childIds.map(id => {
+        const c = byId.get(id)
+        return {
+          title: c?.title ?? id,
+          // deps 存的是 id,渲染回标题。取不到就退回 id —— 一个陌生 id 读起来像坏数据
+          // (它就是),比悄悄丢掉一条依赖诚实。
+          deps: (c?.deps ?? []).map(d => byId.get(d)?.title ?? d),
+        }
+      })
+    : lastChildren
+  const children = raw.slice(0, MAX_NEW_CHILDREN).map(c => ({
+    title: capText(c.title, 200),
+    deps: c.deps.slice(0, MAX_NEW_CHILDREN).map(d => capText(d, 200)),
+  }))
+  return { children, dropped: Math.max(0, raw.length - children.length) }
+}
+
 function reviewPrompt(
   node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control' | 'worktrees'>,
   tag: string, brief = '', notice = '', round = 1, maxRounds = 3,
   /** 本轮的严格度快照。由调用点算一次,和 quorum、`RoundtableRecord.strictness` 同源。 */
   strict: Strictness | undefined = effectiveStrictness(ctx),
+  /** 本轮拆分。见 `plannedChildren` —— 少了它,decompose 节点的评审无法被证伪。 */
+  planned: { children: { title: string; deps: string[] }[]; dropped: number } = { children: [], dropped: 0 },
 ): string {
   return brief +
     judgeGuidance(ctx) +
     // 评审席和方案席一样没有 cwd,可以走到任何目录去核实 —— 实测两个架构师都进了共享的
     // 集成工作区跑构建。见 sharedTreeNote。
     sharedTreeNote(ctx.worktrees !== undefined) +
+    // 任务目标。原来这一关**一个字的目标都不渲染** —— 于是 `REVIEW_FLOOR` 第 1 条
+    // (「方案是空的、或与目标无关」)在这一席上根本不可判,而「这份拆分盖住目标了吗」
+    // 正是下面那份 children 想让人能判的另一半。验收/集成两关早就渲染目标了。
+    `任务目标:\n${quote(ctxGoal(node))}\n\n` +
     `请评审以下方案是否**足以开始执行**。方案:\n${quote(JSON.stringify(node.plan))}\n` +
+    /**
+     * 拆分**单独一行**渲染,不拼进上面那个方案对象里。
+     *
+     * 两个理由,都是实测出来的:①`fusePrompt` / 精化那两处早就是这么写的
+     * (`子任务拆分:${JSON.stringify(d.children)}`),口径统一;②上面那份「方案 JSON」
+     * 和 `persistence` 落盘的 `node.plan` **必须是同一个形状** —— 掺一个盘上不存在的
+     * 键进去,评审员按它写进 blocking 的意见,方案作者在 node.md 上会找不到对应的东西。
+     *
+     * `kind` 一起给:少了它「这个任务该拆没拆」判不了,而那是这一关的核心问题之一。
+     */
+    `本节点类型:${node.kind === 'decompose' ? 'decompose(拆成子任务)' : 'executable(本节点直接执行)'}\n` +
+    `本方案打算创建的子任务(deps 用兄弟标题互指):\n${quote(JSON.stringify(planned.children))}\n` +
+    (planned.dropped > 0 ? `(还有 ${planned.dropped} 个子任务未列出)\n` : '') +
     (notice ? notice + '\n' : '') +
     /**
      * 指着 `plan.responses` 说一句。
@@ -1379,9 +1563,16 @@ function reviewPrompt(
     // 排在它前面的话这个指代落在空气上。见 prevPlanSection。
     prevPlanSection(node, round, notice) +
     `这是第 ${round}/${maxRounds} 轮评审。` +
-    // 「第 N 轮不过整个任务就中止」不是吓唬,是事实(见 stepStart 的 cap-iteration 分支)。
-    // 评审员不知道自己手上握着什么,就会按「还能更好」的标准打分。
-    `第 ${maxRounds} 轮仍不通过,这个任务会被整个中止,一行代码都不会写。\n` +
+    /**
+     * 「第 N 轮不过整个任务就中止」**曾经**是事实,现在不是了 —— 触顶走的是降级放行
+     * (见 stepPlan 的 recordDegrade)。这个仓库反复在修的缺陷类型就是「提示词里说一件
+     * 数据层不支持的事」,而这句话是同一句谎话的三个副本之一。
+     *
+     * 但也不能反过来说「反正不会怎么样」:紧接着那两句「不要提上一轮没提过的新要求」
+     * 全靠这里的分量撑着,是评审无限抬价唯一的向下压力。换成一句仍然真实的代价。
+     */
+    `第 ${maxRounds} 轮仍不通过,这份方案不会再改了:它会带着你们的意见**降级放行**交给执行者,` +
+    `而那些意见没人会替你们落实。所以只填你确实要求执行者处理的那些。\n` +
     /**
      * 判据本体**按档取值** —— 这几行原来是写死的,而写死的那三条本身就是中级档的内容。
      *
@@ -1397,7 +1588,7 @@ function reviewPrompt(
     // 取证与范围责任。**排在这里而不是 brief 里** —— 见 EVIDENCE_RULE 的注释:一条不该被
     // 覆盖的规则要待在最后一段、紧挨 schema,而不是提示词的第一段。
     EVIDENCE_RULE +
-    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD} }。` +
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD}${ADVICE_FIELD} }。` +
     answerRule(tag)
 }
 /**
@@ -1416,6 +1607,18 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
   return (
     brief +
     `按以下方案执行任务并完成实际改动。方案:\n${quote(JSON.stringify(node.plan))}\n` +
+    /**
+     * **降级放行带下来的那几条,给执行者。**
+     *
+     * 这是「触顶不失败」整套东西的兑现点:方案评审 / 测试验证在自己那一关烧完了轮数、
+     * 没有通过,但拿到的意见是具体的(run 001 实测:gitnexus 的参数该怎么写、验收
+     * worktree 已被占用要改用 --detach、contrib 漏了哪个包)。它们必须落到**能动手的人**
+     * 手上 —— 今天这些话只存在于 `blockedReason` 里,没有任何下游环节读它。
+     *
+     * 排在方案之后、`feedback` 之前:方案是「要做什么」,这一段是「上游已知的坑」,
+     * feedback 是「上一轮你自己哪里没做好」。三者时间顺序不同,别混成一段。
+     */
+    degradeSection(node) +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
     // 跨分支依赖调度: what happened on the integration branch while this node worked. Told to
@@ -1498,7 +1701,7 @@ function verifyPrompt(
   /** 本轮的严格度快照。理由同 reviewPrompt。 */
   strict: Strictness | undefined = effectiveStrictness(ctx),
   round = 0, maxRounds = 0,
-  /** 共用返工预算已用掉多少(`iteration.acceptance`)。见 roundStakes 的 spent。 */
+  /** 本关的返工预算已用掉多少(测试验证 = `iteration.verification`)。见 roundStakes 的 spent。 */
   spent?: number,
 ): string {
   return (
@@ -1543,7 +1746,7 @@ function verifyPrompt(
      */
     (notice ? repeatRule(strict, round) : '') +
     EVIDENCE_RULE +
-    `输出:{ "pass":boolean, "blocking":string[], "comments":"命令与原始输出"${RETRACTED_FIELD} }。` +
+    `输出:{ "pass":boolean, "blocking":string[], "comments":"命令与原始输出"${RETRACTED_FIELD}${ADVICE_FIELD} }。` +
     answerRule(tag)
   )
 }
@@ -1638,17 +1841,29 @@ function roundStakes(round: number, maxRounds: number, label: string, spent?: nu
   /**
    * `spent` 给的时候,轮次和预算是**两个数**,必须分开说。
    *
-   * 测试验证和验收各自数自己的轮次(`gateRound`),而把节点打死的是它们**共用**的那份
-   * `iteration.acceptance` 预算。写成「第 2/3 轮验收」会同时谎报两件事:验收其实是第 1 次
-   * 开口,而剩下的预算也不是 3 减 2。集成验收有自己的 `iteration.integration`,两个数
-   * 相等,所以它不传 `spent`,拿到的是原来那句。
+   * 测试验证和验收各自数自己的轮次(`gateRound`),也各自烧自己的那份预算
+   * (`iteration.verification` / `iteration.acceptance`)。写成「第 2/3 轮验收」会同时
+   * 谎报两件事:验收其实是第 1 次开口,而剩下的预算也不是 3 减 2。
+   * 集成验收的两个数相等,所以它不传 `spent`,拿到的是下面那句。
    */
+  /**
+   * ## 「用尽就中止」这句话已经不再是真的,所以它不许再出现
+   *
+   * 触顶不再阻断,而是**带着意见降级放行**(用户:「反正,就是不失败了」)。
+   * 这个仓库反复在修的缺陷类型就是「提示词里说一件数据层不支持的事」,而这三处
+   * (评审 / 测试验证+验收 / 严格度的 repeatRule)是同一句谎话的三个副本。
+   *
+   * 但也**不能反过来说「反正不会怎么样」** —— 那两句「不要提上一轮没提过的新要求」
+   * 全靠这里的分量撑着,是评审无限抬价唯一的向下压力。所以换成一句仍然真实的代价:
+   * 轮数用完之后**没有人会再为你改一遍**,意见会原样传给下一关和执行者。
+   */
+  const stake = '轮数用完之后不会再返工:本节点会带着你们的意见**降级放行**并留痕,' +
+    '这些意见会原样交给下一关和执行者。所以只填你确实要求对方处理的那些。\n'
   if (spent !== undefined) {
-    return `这是第 ${round} 轮${label}。本节点的返工预算已用 ${spent}/${maxRounds} ` +
-      `—— 测试验证与验收**共用**这一份;用尽仍不通过,这个任务会被整个中止,前面几轮的改动不会有人接着做下去。\n`
+    return `这是第 ${round} 轮${label}。本关的返工预算已用 ${spent}/${maxRounds}` +
+      `(测试验证与验收各记各的)。${stake}`
   }
-  return `这是第 ${round}/${maxRounds} 轮${label}。` +
-    `第 ${maxRounds} 轮仍不通过,这个任务会被整个中止,前面几轮的改动不会有人接着做下去。\n`
+  return `这是第 ${round}/${maxRounds} 轮${label}。${stake}`
 }
 /**
  * @param notice 这一关自己前几轮提过什么。理由同 verifyPrompt 的 notice。
@@ -1660,7 +1875,7 @@ function roundStakes(round: number, maxRounds: number, label: string, spent?: nu
 function acceptPrompt(
   node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '', notice = '',
   strict: Strictness | undefined = effectiveStrictness(ctx), round = 0, maxRounds = 0,
-  /** 同 verifyPrompt 的 spent —— 这两关共用这一份预算。 */
+  /** 同 verifyPrompt 的 spent —— 验收记的是 `iteration.acceptance`,和测试验证各记各的。 */
   spent?: number,
 ): string {
   return (
@@ -1668,6 +1883,10 @@ function acceptPrompt(
     judgeGuidance(ctx) +
     `请验收执行结果是否达成验收点。\n` +
     (notice ? notice + '\n' : '') +
+    // 用户原话:「三轮到测试验证还是有问题,就把修改建议给验收,让验收来修改。」
+    // 这一段就是那个交接点 —— 验收员必须知道测试验证那一关是**降级放行**过来的,
+    // 以及它留下了哪些没解决的东西,否则它会把一份没验过的产出当成验过的来判。
+    degradeSection(node) +
     /**
      * 目标要**无条件**渲染 —— 原来它只出现在「验收点为空」的兜底分支里。
      *
@@ -1685,7 +1904,7 @@ function acceptPrompt(
     // 判据同 verifyPrompt 那一段(有账才立规矩)。
     (notice ? repeatRule(strict, round) : '') +
     EVIDENCE_RULE +
-    `输出:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD} }。` +
+    `输出:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD}${ADVICE_FIELD} }。` +
     answerRule(tag)
   )
 }
@@ -1708,7 +1927,24 @@ function integratePrompt(
     .map(id => {
       const c = ctx.byId.get(id)
       return c
-        ? `### ${quote(c.title)}\n- 状态: ${c.status}\n- 执行状态: ${quote(c.execStatus) || '(无)'}\n- 验收点: ${quote(c.plan.acceptance) || '(无)'}`
+        /**
+         * **降级放行的子任务必须自报家门。**
+         *
+         * 少了这一行,一个「三席验收都点头」的子任务和一个「轮数烧完、判决没过、按上限
+         * 放行」的子任务在这里渲染成**逐字相同**的 `- 状态: ACCEPTED`。而读这份证据的是
+         * 集成验收圆桌 —— 整个 run 对根节点的最终裁决就出自它。把降级当成通过喂给它,
+         * 等于让最后一道关在一个假前提上做判断,而这套东西的全部意义就是别谎报完成。
+         *
+         * 建议也一起给:那几条正是「这个子任务还欠什么」,而集成验收要判的恰恰是
+         * 「这些子任务合起来达成父目标了吗」。
+         */
+        ? `### ${quote(c.title)}\n- 状态: ${c.status}${(c.degraded ?? []).length > 0
+            ? `(⚠ 降级放行:${(c.degraded ?? []).map(d => `${PHASE_LABEL[d.phase]}未通过`).join('、')},按迭代上限放行,**不是通过**)`
+            : ''}\n` +
+          ((c.degraded ?? []).flatMap(d => d.advice).length > 0
+            ? `- 该子任务未落实的修改建议: ${quote((c.degraded ?? []).flatMap(d => d.advice).join(' / '))}\n`
+            : '') +
+          `- 执行状态: ${quote(c.execStatus) || '(无)'}\n- 验收点: ${quote(c.plan.acceptance) || '(无)'}`
         : `### ${quote(id)}\n- 状态: (节点缺失,无法核实其结果)`
     })
     .join('\n')
@@ -1772,7 +2008,7 @@ function integratePrompt(
     // —— 集成验收两轮之间子任务证据逐字节不变,「改了就该判通过」在这一关前提为假。
     (notice ? repeatRule(strict, round, false) : '') +
     EVIDENCE_RULE +
-    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD} }。` +
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD}${ADVICE_FIELD} }。` +
     answerRule(tag)
   )
 }
@@ -2599,6 +2835,14 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
   // retry, it does not instantly kill the run.
   for (;;) {
     let lastChildren: { title: string; deps: string[] }[]
+    /**
+     * 这一轮手上这份方案**够不够格交给执行者**。只有降级放行那一支读它。
+     *
+     * 判据是「解析出了结构」+「有验收点」,而不是「评审通过了」—— 后者按定义为假
+     * (走到降级那一步就是没通过)。见触顶分支里 `!lastPlanUsable` 的那段注释:
+     * 解析失败的方案会伪装成一个 executable 叶子,把整段原始回复当 solution、验收点为空。
+     */
+    let lastPlanUsable = true
     // A confirmed draft is only usable if it can actually BUILD what it promises. Two shapes
     // reach here and neither can:
     //  - decompose with no children: nothing gets created, the node parks at
@@ -2633,6 +2877,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // only read by createChildren, and a node reaching here through 重做 either has its
       // children already (decompose) or legitimately has none (executable leaf).
       lastChildren = []
+      lastPlanUsable = !hollow(node.plan.acceptance)
       // 消费掉。写在 commit **之前**,和 confirmedDraft 同因:commit 是把它写进盘的那一步,
       // 崩在中间的话标记不能留着让下一次恢复再跳过一次分析。
       node.redoFrom = undefined
@@ -2642,6 +2887,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // answered and silently throw their edits away — the gate would render, they would
       // approve a tree, and the run would build a different one.
       lastChildren = confirmed.children
+      lastPlanUsable = !hollow(node.plan.acceptance)
       confirmed = undefined
       // Cleared by the commit below. NOTE the assignment happens BEFORE it: if that write
       // fails the node is BLOCKED having already lost the draft, and neither `interrupted`
@@ -2663,6 +2909,8 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       node.kind = 'executable'
       noteOnNode(node, '分析环节已跳过:本节点不出方案,也不主动拆子任务')
       lastChildren = []
+      // 跳过分析 = 没有方案。降级放行没有可传的东西,所以这一支不许降级。
+      lastPlanUsable = false
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     } else {
       if (!(await commit(node, 'PLANNING', ctx))) return
@@ -2691,6 +2939,7 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
        */
       if (!feedback) delete node.plan.responses
       lastChildren = parsed.children
+      lastPlanUsable = parsed.parseFailed !== true && !hollow(node.plan.acceptance)
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     }
     if (isForcePassed(ctx, 'review', node)) {
@@ -2721,13 +2970,16 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
      * 理由见 `roundtableWithInfraRetry` 的 `strictness` 参数。
      */
     const strict = effectiveStrictness(ctx)
+    // 一轮算一次,和 reviewNotice 同一条规矩。见 plannedChildren:树上有子任务就以树为准,
+    // 否则用本轮草稿 —— reviewOnly / 跳过分析 两支的 lastChildren 是空的而节点有子任务。
+    const planned = plannedChildren(node, lastChildren, ctx.byId)
     const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog), node.iteration.planReview + 1, '评审', '方案', strict)
     const { rec, infraExhausted } = await roundtableWithInfraRetry({
       phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
       system: 'review',
       // 一轮算一次,不是一席算一次:reviewLog 在这一轮之内不变。
       buildPrompt: (tag, seat) =>
-        reviewPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'review', node, 'review', strict), reviewNotice, node.iteration.planReview + 1, caps.maxIterations, strict),
+        reviewPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'review', node, 'review', strict), reviewNotice, node.iteration.planReview + 1, caps.maxIterations, strict, planned),
       ctx, strictness: strict,
     })
     node.reviewLog.push(rec)
@@ -2801,12 +3053,39 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
        */
       feedback = planFeedbackPrompt(items, '评审', crossSeatNotice(node.reviewLog)) || rec.synthesized.blockingSummary
       if (node.iteration.planReview >= caps.maxIterations) {
-        // 触顶时点名**哪几条是连着几轮没解决的**,并按这个事实给下一步 —— 静态的一句
-        // 「可提高 caps.maxIterations」在「同一条连提三轮」的情况下是误导。
-        await blockWithReason(node, exhaustionReason(items, caps.maxIterations, retractedCount(node.reviewLog)), ctx, 'cap-iteration', exhaustionRemedy(items))
-        return
+        // 触顶时点名**哪几条是连着几轮没解决的** —— 静态的一句「可提高 caps.maxIterations」
+        // 在「同一条连提三轮」的情况下是误导。这句话现在进的是降级记录,不是墓志铭。
+        const why = exhaustionReason(items, caps.maxIterations, retractedCount(node.reviewLog))
+        /**
+         * **唯一还会停的那条边界:这一版方案本身不可用。**
+         *
+         * 「不失败」不等于「什么都能往下传」。降级放行的前提是**手上有一份可以交给执行者的
+         * 东西**;而 `parsePlanOutput` 解析失败时 `kind` 回落成 `executable`、`solution`
+         * 变成整段原始回复、`acceptance` 为空、`children` 全丢 —— run 001 五个方案席位里
+         * 有两个正是这个形状。对它降级放行的结果是:一个根节点带着一坨散文和零个验收点被判
+         * READY,一个人去做整个 etcd 的翻译,而且没有任何判据能说它做完没有。
+         * 那不是「迭代优化」,那是把失败伪装成进度 —— 比阻断更坏。
+         *
+         * 这一支和 infra 耗尽同类:**没有人产出过可判的东西**,轮数再多也不会变出来。
+         */
+        if (!lastPlanUsable) {
+          await blockWithReason(
+            node, `${why} · 而且最后一版方案没有可用的结构(解析失败或没有验收点),没有可以交给执行的东西`,
+            ctx, 'cap-iteration', exhaustionRemedy(items),
+          )
+          return
+        }
+        /**
+         * 降级放行:记账 + 喊人,然后**落到下面评审通过后的那段路由**(建子任务 / READY)。
+         *
+         * 意见通过两条路走下去:`node.degraded[].advice` 给执行/验收的提示词,
+         * `feedback` 上面刚算过的那一份留在 `node` 上供渲染。两条都不经过 `blockedReason`
+         * —— run 001 那 13 条带实测输出的意见,今天全部烂在那个字符串里。
+         */
+        recordDegrade(node, ctx, 'review', node.iteration.planReview, `${why} · ${degradeDiagnosis(items)}`, adviceOf(node.reviewLog))
+      } else {
+        continue
       }
-      continue
     }
 
     }
@@ -3638,8 +3917,38 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
   let emptyReports = 0
   let round = 0
   let syncNote = ''
+  /**
+   * **执行循环的绝对上限 —— 纵深防御,不是正常路径上的判据。**
+   *
+   * 这个 `for(;;)` 里装着执行 / 测试验证 / 验收 / 评分 / 返工五件事,而它的每一条出口
+   * 都靠某个计数器或某个闩:`iteration.verification`、`iteration.acceptance`、
+   * `iteration.scoring`、以及降级放行的 `degradedAt`。触顶不再阻断之后,那些闩从
+   * 「少转一圈」变成了「唯一还在封顶的东西」—— 其中任何一个坏掉,后果不是判错,
+   * 是**无限次真实的、带写工具的模型调用**,一直烧到用户自己发现。
+   *
+   * 实测过它长什么样:把 `degradedAt` 改成恒 false,`bun test` 直接挂死 ——
+   * 连 bun 自己的单测超时都不触发(循环把事件循环饿死了)。生产里对应的是一个永远
+   * 不结束、账单一直涨的节点。
+   *
+   * 所以这里再压一道**与那些判据无关**的绝对上限。正常路径远够不着它:
+   * 测试验证 ≤ maxIterations 轮、验收 ≤ maxIterations 轮、评分返工一次、空产出一次,
+   * 撑死 2×maxIterations+几。给到 4 倍 + 8 是留足余量,同时把「无限」变成「有限且会说话」。
+   *
+   * 撞上它**必须阻断**而不是降级放行:走到这里说明某个不变式已经坏了,
+   * 而此时最不该做的事就是把一个状态可疑的节点判成通过。
+   */
+  const LOOP_CEILING = Math.max(1, caps.maxIterations) * 4 + 8
   for (;;) {
     round++
+    if (round > LOOP_CEILING) {
+      await blockWithReason(
+        node,
+        `执行循环超过绝对上限(${LOOP_CEILING} 轮)—— 这是内部不变式被破坏的兜底,不是正常的迭代超限`,
+        ctx, 'rework',
+        '这不是预算问题:某个环节的轮次计数或降级闩没有生效。请把该节点的 node.md(尤其是 iteration 与 degraded 两段)一起反馈。',
+      )
+      return
+    }
     /**
      * **答卷在每一轮开头就作废,由这一轮的执行调用重新写上。**
      *
@@ -3835,7 +4144,16 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     const forceVerify = isForcePassed(ctx, 'verify', node)
     // 强制通过赢:两者路由相同,而留下记录的那一个信息更多。少了这个 `!forceVerify`,
     // 一个既被跳过又被强制通过的节点会把两条互相矛盾的注记同时写进 execStatus。
-    const skipVerify = !forceVerify && (isSkipped(ctx, 'verify', node) || skipVerifyThisRound)
+    /**
+     * `degradedAt(node,'verify')` 是**闩**,不只是日志 —— 这一半 load-bearing。
+     *
+     * `stepExecute` 是无界 `for(;;)`。测试验证降级放行之后如果这一关还开会,它会再触顶、
+     * 再降级、再触顶……每一圈都是真实的模型调用,而 `iteration.verification` 已经在上限上,
+     * 没有任何东西会拦。闩住之后这个节点余生不再进测试验证的判决,由验收接着推进。
+     *
+     * 排在 `forceVerify` **之后**:用户显式按了「强制验证」时,他要的就是再验一次。
+     */
+    const skipVerify = !forceVerify && (isSkipped(ctx, 'verify', node) || skipVerifyThisRound || degradedAt(node, 'verify'))
     if ((node.phaseRoles.verify ?? []).length > 0 && forceVerify) {
       applyForcePass(
         ctx, node, 'verify', node.acceptLog, node.iteration.acceptance + 1,
@@ -3888,7 +4206,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       const v = await roundtableWithInfraRetry({
         phase: 'verify', node, roles: node.phaseRoles.verify, round: node.iteration.acceptance + 1,
         system: 'verify',
-        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node, 'verify', strict), verifyNotice, strict, verifyRound, caps.maxIterations, node.iteration.acceptance),
+        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node, 'verify', strict), verifyNotice, strict, verifyRound, caps.maxIterations, node.iteration.verification ?? 0),
         ctx, cwd: node.worktree?.path, strictness: strict,
       })
       const verifyRec: RoundtableRecord = { ...v.rec, step: 'verify' }
@@ -3932,9 +4250,8 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         return
       }
       if (!v.rec.synthesized.pass) {
-        // 失败走已有的返工路径,和验收失败同一条,共用 iteration.acceptance —— 不新增
-        // 预算维度。但阻断文案要说清是**哪一关**没过,否则升级卡片和 --retry-blocked
-        // 会拿到一句「验收迭代超限」,而其实是测试没跑通。
+        // 失败走已有的返工路径,和验收失败同一条。但阻断文案要说清是**哪一关**没过,
+        // 否则升级卡片和 --retry-blocked 会拿到一句「验收迭代超限」,而其实是测试没跑通。
         //
         // **把原因交给执行者。** 不设 feedback 的后果实测过:第 1 轮和第 2 轮的执行提示词
         // 逐字节相同(只有随机 answer tag 不同),三轮空转后阻断 —— verifyPrompt 花整段
@@ -3942,10 +4259,32 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         // 循环外变量:不覆盖它,执行者会拿到**两轮之前、另一道关口**的意见,还被告知那是
         // 「上一轮」的。
         feedback = v.rec.synthesized.blockingSummary
-        node.iteration.acceptance++
-        if (node.iteration.acceptance >= caps.maxIterations) {
-          await blockWithReason(node, `测试验证迭代超限(${caps.maxIterations}): ${v.rec.synthesized.blockingSummary}`, ctx, 'rework')
-          return
+        /**
+         * 计数走 `iteration.verification`,**不再和验收共用** `iteration.acceptance`。
+         *
+         * 原来共用,注释写的理由是「不新增预算维度」—— 在「触顶即阻断」的世界里那是对的:
+         * 两关加起来 3 轮,谁烧完都一样是死。但用户要的是「三轮到测试验证还是有问题,
+         * 就把修改建议给验收,让验收来修改」,而共用一个计数器时,测试验证烧完 3 轮之后
+         * 验收**一轮都不剩**:第一次不通过立刻降级盖章。「交给验收」当场坍缩成
+         * 「验收看一眼就放行」—— 和这句需求正好相反。
+         */
+        node.iteration.verification = (node.iteration.verification ?? 0) + 1
+        if (node.iteration.verification >= caps.maxIterations) {
+          /**
+           * 降级放行:测试验证这一关不再开会,累积的建议交给**验收**和**下一轮执行**。
+           *
+           * `degradedAt(node,'verify')` 从此为真,而上面那道 `!skipVerify` 判据读它 ——
+           * 那一半是 load-bearing 的:`stepExecute` 是无界 `for(;;)`,只记账不闩住的话
+           * 这一关下一轮照样开、照样触顶、照样降级,无限次真实模型调用。
+           */
+          recordDegrade(
+            node, ctx, 'verify', node.iteration.verification,
+            `测试验证迭代超限(${caps.maxIterations}): ${v.rec.synthesized.blockingSummary}`,
+            adviceOf(node.acceptLog, 'verify'),
+          )
+          // 不 return:照常走下面的 REWORK + continue,让**执行者**先拿着这些建议再做一轮
+          // (用户原话:「执行拿着最开始的方案和这些修改建议开始执行」)。下一圈进来时
+          // 这一关已被闩住,直接落到验收 —— 验收拿的是自己那份没动过的 maxIterations。
         }
         if (!(await commit(node, 'REWORK', ctx))) return
         continue
@@ -4005,14 +4344,46 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       await blockWithReason(node, `验收角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec), exhaustionRemedyFor(rec))
       return
     }
-    if (rec.synthesized.pass) {
+    /**
+     * 验收触顶 —— **最后一道关,也是「不失败」承诺的落点。**
+     *
+     * 用户原话:「如果三轮到测试验证还是有问题,就把修改建议给验收,让验收来修改。
+     * 反正,就是不失败了。」所以这里不阻断:记账、喊人,然后走**和通过完全相同的那条尾巴**。
+     *
+     * ## 尾巴必须逐字相同,不能图省事直接 commit('ACCEPTED')
+     *
+     * 通过那条路是五步:`SCORING → scoreNode → MERGE → mergeAndRelease → ACCEPTED`。
+     * 直接落 ACCEPTED 的后果是:这个节点的工作树**永远不会被合并**、池子里的槽位泄漏,
+     * 而 run 报「已完成」—— 它真写出来的代码一行都没进集成分支。那正是这次改动自己拿来
+     * 当理由的「谎报完成」,只是换了个方向发生。
+     *
+     * ## 但**评分返工**这一支要关掉
+     *
+     * `scoreNode` 可以把节点打回 REWORK。对一个刚刚因为「验收轮数用尽」而降级的节点再
+     * 打回去,等于绕开刚刚宣布用尽的那个预算,而且回来还会再触顶一次、再记一条降级 ——
+     * 同一件事记两遍。降级之后评分只**记录**,不改路由。
+     */
+    let acceptDegraded = false
+    if (!rec.synthesized.pass) {
+      node.iteration.acceptance++
+      if (node.iteration.acceptance >= caps.maxIterations) {
+        recordDegrade(
+          node, ctx, 'accept', node.iteration.acceptance,
+          `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`,
+          adviceOf(node.acceptLog, 'accept'),
+        )
+        acceptDegraded = true
+      }
+    }
+    if (rec.synthesized.pass || acceptDegraded) {
       // 观察评分 runs between acceptance and ACCEPTED (spec §8: 验收 + 评分通过后进入 MERGE).
       // Committed as its own status: scoring and merging are separately slow phases, and the
       // panel rendered both as ACCEPTANCE — a user watching a node sit for minutes could not
       // tell which of the three it was in. SCORING/MERGE were in NodeStatus and never written.
       if (firstRole(node, 'observer') && !(await commit(node, 'SCORING', ctx))) return
       const needsRework = await scoreNode(node, ctx)
-      if (needsRework) {
+      // `&& !acceptDegraded` —— 见上面那段:降级之后评分只记录,不再改路由。
+      if (needsRework && !acceptDegraded) {
         feedback = `观察角色评分低于阈值,请针对性改进后重新提交。\n方案 ${node.score.plan?.score}: ${node.score.plan?.rationale}\n执行 ${node.score.exec?.score}: ${node.score.exec?.rationale}`
         if (!(await commit(node, 'REWORK', ctx))) return
         continue
@@ -4026,11 +4397,7 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       await commit(node, 'ACCEPTED', ctx)
       return
     }
-    node.iteration.acceptance++
-    if (node.iteration.acceptance >= caps.maxIterations) {
-      await blockWithReason(node, `验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}`, ctx, 'rework')
-      return
-    }
+    // 计数在上面那段(和降级判定同一处)已经加过了 —— 这里只剩「还有预算,回去返工」。
     // Keep the REAL blockers: overwriting them with a generic message would send the rework
     // prompt back without the reason the work was actually rejected.
     feedback = rec.synthesized.blockingSummary
@@ -4175,18 +4542,31 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       // `--retry-blocked` for a node whose disk is broken. Every other commit call site in
       // this file returns immediately for exactly this reason.
       if (revise.kind === 'stop') return
-      await blockWithReason(
-        node,
+      /**
+       * 集成验收触顶 —— 也降级放行,而不是把一棵孩子全都做完了的树整个丢掉。
+       *
+       * **这一关最容易被漏掉,而漏掉就等于整套东西没做。** 子任务全部降级放行、全部
+       * ACCEPTED 之后,根节点的集成验收照样会在第 3 轮把整个 run 判死 —— run 001 死的
+       * 正是根节点。「不失败」如果不覆盖这一关,它对每一个拆分型节点都不成立。
+       *
+       * 补救拆分(revise)仍然**排在前面**:它是真的还能推进一步的手段(长出补救子任务、
+       * 节点继续跑),而降级只是带着意见放行。能修就别放行。
+       *
+       * 尾巴和通过那条一致:`SCORING → scoreNode → ACCEPTED`(拆分型节点没有 merge 那一步,
+       * 它的孩子各自合过了)。少了 scoreNode,所有降级的拆分型节点包括根都不再被评分,
+       * 整个 run 的最终分会消失。
+       */
+      recordDegrade(
+        node, ctx, 'integrate', node.iteration.integration,
         `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}` +
-        // WHY the last resort did not fire, folded into the one block rather than announced
-        // on a separate card. A `stopped:false` card saying 本次运行没有停 immediately before
-        // a block that stops the node contradicts itself; and without this line the real
-        // cause (a cycle in the proposed deps, duplicate titles, the node cap, a persist
-        // error) was discarded entirely and the user was told to raise maxIterations.
+        // WHY the last resort did not fire. Without this line the real cause (a cycle in the
+        // proposed deps, duplicate titles, the node cap, a persist error) was discarded.
         (revise.note ? `;补救拆分未能进行: ${revise.note}` : ''),
-        ctx,
-        'rework',
+        adviceOf(node.acceptLog, 'integrate'),
       )
+      if (firstRole(node, 'observer') && !(await commit(node, 'SCORING', ctx))) return
+      await scoreNode(node, ctx)
+      await commit(node, 'ACCEPTED', ctx)
       return
     }
     feedback = rec.synthesized.blockingSummary

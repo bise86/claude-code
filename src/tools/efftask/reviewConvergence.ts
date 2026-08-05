@@ -692,3 +692,87 @@ export function exhaustionRemedy(items: readonly FeedbackItem[]): string {
     '若确实没回应,单纯加轮次大概率还是同样的结论 —— 先把这几条写进需求或补充说明,再用 ' +
     '`/et --resume <运行ID> --retry-blocked <补充说明>` 重试。'
 }
+
+/**
+ * 一份日志里累积的**修改建议**,去重、按提出顺序、可选按环节过滤。
+ *
+ * ## 为什么它必须和 `feedbackItems` 分开走,而不是拼进意见正文里
+ *
+ * 跑机 run 001:root 节点三轮评审拿到 13 条意见,其中至少四条(gitnexus 的参数该写成
+ * `repo:"etcd", branch:"main"`、验收 worktree 已被占用要改用 `--detach`、`contrib/lock/client`
+ * 没人认领、mvcc↔lease 要 trait 倒置破环)**带着可以直接照做的修复方式**。
+ *
+ * 而 `planFeedbackPrompt` 按条数均分 `MAX_SUMMARY_CHARS`:13 条时 `itemBudget` = 261 字,
+ * 那四条的修复方式**全部写在第 261 字之后**,被 `…(已截断,原文 518 字)` 整段吃掉。
+ * 所以「评审给不给建议」从来不是病根 —— 病根是建议和证据正文抢同一个字符数,而证据在前。
+ *
+ * 于是这里给它**自己的预算**:一条建议按 `MAX_BLOCKING_CHARS` 夹,不参与逐条均分。
+ * 加 `Verdict.advice` 这个字段的全部意义就在这一句 —— 让「怎么改」有一个定位得到、
+ * 能单独保预算的位置。
+ *
+ * ## 只收不通过的那几席
+ *
+ * `infra` 那一席什么都没判过;`pass` 的那一席没有要改的东西。两条都和 `feedbackItems` 同源。
+ *
+ * @param step 只要这一关的建议。**只在 `acceptLog` 上传** —— 那一份混着测试验证/验收/
+ *   集成验收三关的记录,每条自带 `step`。`reviewLog` 里只可能是评审记录、而且**从来不写
+ *   `step`**,传了会把它整份滤空(实测:降级放行的评审意见一条都传不下去,而 node.md
+ *   上看不出来 —— 提示词照常渲染那一段标题,底下什么都没有)。
+ */
+export function adviceOf(log: readonly RoundtableRecord[], step?: PhaseName): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const rec of log ?? []) {
+    if (!rec || !Array.isArray(rec.verdicts)) continue
+    if (step !== undefined && rec.step !== step) continue
+    for (const v of rec.verdicts) {
+      if (v?.infra === true || v?.pass === true) continue
+      for (const a of v?.advice ?? []) {
+        const t = (a ?? '').trim()
+        if (!t) continue
+        // 去重按归一化后的文本:同一条建议被两席分别提出、或者连着两轮重复,
+        // 在提示词里出现两遍只是在挤掉别的建议。
+        const key = t.replace(/\s+/g, '').toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(capText(t, MAX_BLOCKING_CHARS))
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * 降级放行时交给下一个环节的那一段。空建议时返回空串 —— **不渲染一个空标题**。
+ *
+ * 判据是「有没有建议」,不是「降级过没有」:一段写着「以下是累积的修改建议:」而底下
+ * 什么都没有的提示词,比不写更糟 —— 它在告诉下游「上面那些意见你已经拿到了」。
+ */
+export function degradeCarryPrompt(label: string, reason: string, advice: readonly string[]): string {
+  if (advice.length === 0 && !reason) return ''
+  return `\n## ${label}未通过,但本节点已降级放行,由你接着推进\n` +
+    `这一关的迭代轮数用完了,判决**没有通过**。工作没有被丢掉,意见也没有 —— 它们在下面。\n` +
+    (reason ? `最后一轮没通过的理由:${capText(reason, MAX_SUMMARY_CHARS)}\n` : '') +
+    (advice.length > 0
+      ? `累积的修改建议(按提出顺序,已去重),请逐条处理:\n` +
+        advice.map((a, i) => `  ${i + 1}. ${a}`).join('\n') + '\n'
+      : '') +
+    `这些是**要求**,不是参考:能做的直接做掉;做不了的,在你的产出里写明哪一条、为什么。\n`
+}
+
+/**
+ * 触顶**降级放行**时的那句诊断 —— `exhaustionRemedy` 的分叉判据,去掉重试建议。
+ *
+ * 两句话必须分开:`exhaustionRemedy` 的后半段全是「提高 caps.maxIterations 后再重试」
+ * 「用 --retry-blocked 重试」,而降级的节点**没有停**,没有什么可重试的。把那半句原样
+ * 贴在一张说「节点继续跑」的卡上,就是这个仓库反复在修的那种自相矛盾。
+ *
+ * 前半段的**诊断**却正是这时候最该说的:卡在同一条上,还是每轮都在换要求?
+ * 前者说明方案真的没回应,后者说明评审在持续扩大范围 —— 用户下一步该做的事完全不同。
+ */
+export function degradeDiagnosis(items: readonly FeedbackItem[]): string {
+  const stuck = stuckItems(items)
+  return stuck.length === 0
+    ? '每一轮的意见都不一样,说明评审在持续扩大范围;这些意见已随节点带到下一关。'
+    : `有 ${stuck.length} 条意见被提过不止一轮,方案始终没有正面回应;它们已随节点带到下一关。`
+}
