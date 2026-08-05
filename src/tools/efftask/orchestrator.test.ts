@@ -378,7 +378,7 @@ describe('自动解冲突的预算按「一次运行」计', () => {
     // 新 Map —— 每一次进 mergeAndRelease 都回满,「一次运行两次」退回成没有上限。上面两条
     // 行为用例挡不住它(单次调用链里那个就地建的 Map 同样有效),所以这一跳只能这么钉。
     const src = readFileSync(new URL('./orchestrator.ts', import.meta.url), 'utf8')
-    expect(src).toContain('private mergeResolveThisRun = new Map<string, number>()')
+    expect(src).toContain('private mergeResolveThisRun = new Map<string, MergeResolveSpend>()')
     expect(src).toContain('mergeResolveThisRun: this.mergeResolveThisRun')
   })
 })

@@ -88,6 +88,22 @@ describe('冲突升级卡', () => {
     expect(text).toContain('未能读出文件列表')
   })
 
+  it('停在链路上时说的是「调用没打通」,而不是「尝试解决了 N 次」', () => {
+    // 两种停法要给两种处置:内容问题(去看那份解决)和链路问题(去看网关/额度)。
+    // 混成一句的后果实测过 —— 一个死在网关 400 上的节点,卡上写着「已自动尝试解决 3 次
+    // 仍未成功」,把人往代码里带,而那份冲突可能一次都还没被真正尝试过。
+    const text = escalationLines({
+      node: node(), branch: 'b', path: '/p', files: ['a.ts'], attempts: 3,
+      state: { markers: true, staged: false }, integrationBranch: 'efftask/007/integration',
+      infra: { streak: 3, reason: 'API Error: 400 Stream must be set to true' },
+    }, '007').join('\n')
+    expect(text).toContain('没打通')
+    expect(text).toContain('400 Stream must be set to true')
+    expect(text).toContain('不是解决方案被否决')
+    // 那句会把人带偏的话必须消失
+    expect(text).not.toContain('次仍未成功')
+  })
+
   it('renders a red-header card whose body is the same lines', () => {
     const e = { node: node(), branch: 'b', path: '/p', files: ['x.ts'], attempts: 1, state: { markers: true, staged: false } }
     const card = buildConflictCard(e, '007') as {

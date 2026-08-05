@@ -35,6 +35,14 @@ export type ConflictEscalation = {
   state: { markers: boolean; staged: boolean; stale?: boolean }
   /** The other side of the merge. Without it the user cannot reproduce the conflict at all. */
   integrationBranch?: string
+  /**
+   * 停下来的原因是**链路**,不是内容:连续几次自动解决的调用根本没打通。
+   *
+   * 只有这一种情形才带这个字段。它换掉的是「已自动尝试解决 N 次仍未成功」那一句 ——
+   * 那句话把人往代码里带,而这条路上那份冲突可能一次都还没被真正尝试过(实测:一个网关
+   * 400 让 6 次预算一次都没用上)。处置也不同:去看模型/网关/额度,不是去看解决方案。
+   */
+  infra?: { streak: number; reason: string }
 }
 
 /**
@@ -51,9 +59,13 @@ export function escalationLines(e: ConflictEscalation, runId?: string): string[]
     `工作区: ${e.path}`,
     // The file list is what turns "there is a conflict" into "open these".
     e.files.length > 0 ? `冲突文件: ${e.files.join('、')}` : '冲突文件: (未能读出文件列表)',
-    e.attempts > 0
-      ? `该节点本次已自动尝试解决 ${e.attempts} 次仍未成功,现已暂停等待人工。`
-      : '本次运行没有再尝试自动解决(该节点在本次运行里的额度已用完),现已暂停等待人工。',
+    e.infra
+      ? `该节点本次自动尝试解决 ${e.attempts} 次,其中最后 ${e.infra.streak} 次**调用根本没打通**` +
+        `(${e.infra.reason})—— 不是解决方案被否决,那份冲突可能一次都还没被真正尝试过。` +
+        '先确认员工模型/网关/额度可用,再恢复。'
+      : e.attempts > 0
+        ? `该节点本次已自动尝试解决 ${e.attempts} 次仍未成功,现已暂停等待人工。`
+        : '本次运行没有再尝试自动解决(该节点在本次运行里的额度已用完),现已暂停等待人工。',
     // Written from the measurement. `staged` in particular must not say "git add 并 commit":
     // what is staged there is the resolution acceptance JUST REJECTED, so that instruction
     // would have the user commit verbatim the code the reviewers refused.

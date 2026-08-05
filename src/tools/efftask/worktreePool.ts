@@ -900,6 +900,20 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       return { ok: false, conflicted, message: merge.stderr.trim() || merge.stdout.trim() || '合并未生效' }
     },
 
+    /**
+     * 集成分支上有没有这个工作区**还没有**的提交。
+     *
+     * 解冲突循环拿它决定「这一轮要不要重新从集成分支同步」。判据必须是 `code === 1`
+     * 而不是 `code !== 0`:`--is-ancestor` 用 1 表示「不是祖先」,用 128 表示自己出错了
+     * (路径没了、仓库坏了、ref 不存在)。把出错当成「有新东西」会让循环在一个已经出问题的
+     * 工作区上再发起一次合并 —— 而这一路的下一步是 `add -A` + `commit`,拿不准的时候
+     * 什么都不做才是对的(退回今天的行为:原地改)。
+     */
+    async integrationAhead(node: TaskNode): Promise<boolean> {
+      const r = await git(['merge-base', '--is-ancestor', intBranch, 'HEAD'], pathFor(node))
+      return r.code === 1
+    },
+
     async conflictState(node: TaskNode): Promise<{ markers: boolean; staged: boolean; stale: boolean; files: string[] }> {
       const path = pathFor(node)
       const u = await git(['diff', '--name-only', '--diff-filter=U'], path)

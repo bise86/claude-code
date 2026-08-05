@@ -3,7 +3,7 @@ import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap, isTerminal } from './stateMachine.js'
 import { createStallTracker, pickBatch, type Advanceable } from './scheduler.js'
 import type { RunControl } from './control.js'
-import { stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipeline.js'
+import { stepExecute, stepIntegrate, stepStart, type MergeResolveSpend, type PipelineCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { WorktreePool } from './worktreePool.js'
 import { makeRootNode } from './rootPlan.js'
@@ -294,7 +294,7 @@ export class EffTaskOrchestrator {
    * 等于每一步都回满,预算形同虚设。一次运行一个 orchestrator,所以「每次运行两次、
    * `--resume` 回满」这句话由这个字段的生命周期直接兑现。
    */
-  private mergeResolveThisRun = new Map<string, number>()
+  private mergeResolveThisRun = new Map<string, MergeResolveSpend>()
 
   private ctx(): PipelineCtx {
     return {

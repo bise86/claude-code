@@ -1040,6 +1040,8 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/a.ts'] }),
     refreshFromIntegration: async () => ({ ok: true, updated: false }),
     mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
+    // 缺省「集成分支没往前走」= 重试轮原地改,和这套用例原来的行为逐字一致。
+    integrationAhead: async () => false,
     integrationBranchName: 'efftask/001/integration',
     ...over,
   })
@@ -1369,11 +1371,13 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     expect(n.blockedReason).toContain('git 挂了')
   })
 
-  it('解冲突的调用本身没打通时,不消耗第二次机会去重打一遍', async () => {
-    // 第二次的价值是「带着否决理由再改一版」,这里没有那样东西可带 —— 重来一次就是同一个
-    // 提示词打同一条失败的链路。runPhase 对执行环节本来也不重试,同一个立场。
+  it('解冲突的调用没打通时会重试,连续三次才交给人 —— 而且一次裁决预算都不吃', async () => {
+    // 上一版这里是「一次就放弃」,判据是「没有否决理由可带,重来就是同一个提示词打同一条
+    // 失败的链路」。那句话对提示词是真的、对链路是假的:限流会过去、网关会恢复。实测代价是
+    // 一个与冲突无关的 400 把 6 次预算全废掉,3 毫秒后节点就挂着等人工。
     const n = root()
     let resolveCalls = 0
+    const escalations: Record<string, unknown>[] = []
     const agent = (async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'plan') return leafPlan
       if (req.phase === 'execute') {
@@ -1384,15 +1388,158 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     }) as RunAgentFn
     const ctx = {
       ...ctxFor([n], agent),
+      onEscalate: (i: Record<string, unknown>) => { escalations.push(i) },
       worktrees: fakePool({
         commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
       }) as never,
     }
     await stepStart(n, ctx)
     await stepExecute(n, ctx)
-    expect(resolveCalls).toBe(1)
+    expect(resolveCalls).toBe(3)                     // 连击上限,不是 1 也不是 6
     expect(n.status).toBe('BLOCKED')
-    expect(n.execStatus).toContain('provider 502')  // 而且说清了是什么失败
+    expect(n.execStatus).toContain('provider 502')   // 说清了是什么失败
+    // 停下来的原因是链路不是内容 —— 卡和阻断理由都必须这么说,否则人会去翻代码。
+    expect(n.blockedReason).toContain('没能打通')
+    expect(escalations[0]!.infra).toEqual({ streak: 3, reason: expect.stringContaining('provider 502') })
+    // 派出去 3 次都记在账上:卡上那句「已自动尝试解决 N 次」读的是它。
+    expect(escalations[0]!.attempts).toBe(3)
+  })
+
+  it('中间打通了就把连击清零 —— 前两次挂掉不该吃掉这个节点的机会', async () => {
+    const n = root()
+    let resolveCalls = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        if (req.prompt.includes('冲突')) {
+          resolveCalls++
+          if (resolveCalls <= 2) throw new Error('provider 502')
+          return '```json\n{"execStatus":"冲突解好了"}\n```'
+        }
+        return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    let merges = 0
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        // 第一次合报冲突,解决之后那次合成功 —— 也就是「不停迭代直到解决」的正常出口。
+        commitAndMerge: async () => (++merges === 1 ? { ok: false, kind: 'conflict', files: ['src/a.ts'] } : { ok: true, merged: true }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(resolveCalls).toBe(3)
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  it('复验圆桌全打不通也算「没打通」:重试,不写「验收未通过」', async () => {
+    // 一桌全 infra = 没有人对这份解决做出过判断。写成「验收未通过」是假的,而按否决处理
+    // 会让下一轮解决者去改一份根本没人挑过毛病的代码。
+    const n = root()
+    let accepts = 0
+    let resolves = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        if (req.prompt.includes('冲突')) resolves++
+        return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      }
+      // 第一次验收(正常那次)必须过 —— 不过的话根本走不到合并,更别说解冲突。
+      // 之后每一次都是「解冲突后的复验」,让它全桌打不通。
+      if (req.phase === 'accept' && ++accepts > 1) throw new Error('gateway 503')
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    // 断言在**轮次**上,不在 accepts 上:圆桌自己还有一层 infra 重派(一轮就能让 accepts
+    // 涨到 3),拿它当判据的话「一次就放弃」照样通过 —— 变异测试当场证明了这一点。
+    expect(resolves).toBe(3)
+    expect(accepts).toBeGreaterThan(2)
+    expect(n.execStatus).toContain('复验没能完成')
+    expect(n.execStatus).not.toContain('冲突解决后验收未通过')
+    expect(n.status).toBe('BLOCKED')
+  })
+
+  it('集成分支往前走了就重新同步,并且把这件事写进提示词', async () => {
+    // 「任务依赖别的任务时要先从主干同步过来」在解冲突循环里的兑现点:一轮就是一次分钟级的
+    // 模型往返,兄弟节点完全可能在这期间又合进去几笔。
+    const n = root()
+    let localMerges = 0
+    const prompts: string[] = []
+    let accepts = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        if (req.prompt.includes('冲突')) prompts.push(req.prompt)
+        return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      }
+      if (req.phase === 'accept' && ++accepts >= 2) {
+        return vtag(req) + '\n{"pass":false,"blocking":["还是不对"],"comments":""}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+        conflictState: async () => ({ markers: false, staged: true, stale: false, files: [] }),
+        integrationAhead: async () => true,
+        mergeIntegrationIntoNode: async () => { localMerges++; return { ok: true, conflicted: false } },
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    // 第一轮造现场 + 之后每一轮同步一次
+    expect(localMerges).toBeGreaterThan(1)
+    expect(prompts.some(p => p.includes('最新状态已经同步进来'))).toBe(true)
+    // 同步之后没有冲突 ≠ 可以合了:那份解决还没人点过头,必须继续走复验。
+    expect(n.status).toBe('BLOCKED')
+  })
+
+  it('同步之后没冲突也不许直接合入 —— 底下压着一份没人点过头的解决', async () => {
+    // clean 那条捷径绕过解决和复验。它只在工作区里没有任何待处理的东西时成立。
+    const n = root()
+    let accepts = 0
+    let resolves = 0
+    let localMerges = 0
+    const agent = (async (req: { phase: string; prompt: string }) => {
+      if (req.phase === 'plan') return leafPlan
+      if (req.phase === 'execute') {
+        if (req.prompt.includes('冲突')) resolves++
+        return '```json\n{"execStatus":"改了 api.ts"}\n```'
+      }
+      // 第一次(正常验收)过,之后每一次复验都否决 —— 于是工作区里始终压着一份被否的解决。
+      if (req.phase === 'accept' && ++accepts >= 2) {
+        return vtag(req) + '\n{"pass":false,"blocking":["解得不对"],"comments":""}\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }) as RunAgentFn
+    const ctx = {
+      ...ctxFor([n], agent),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+        // 重试轮里工作区读起来是干净的(上一轮的解决被解决者自己提交掉了)……
+        conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+        // ……而重新合一次回答 Already up to date。老代码在这里报 clean 并直接合入。
+        mergeIntegrationIntoNode: async () => (++localMerges === 1
+          ? { ok: true, conflicted: true, files: ['src/a.ts'] }
+          : { ok: true, conflicted: false }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    // 被否决之后每一轮都重新解 + 重新复验,而不是「干净了就合」
+    expect(resolves).toBe(DEFAULT_CAPS.mergeResolveAttempts!)
+    expect(n.acceptLog.length).toBeGreaterThan(1)
   })
 
   it('用完 caps.mergeResolveAttempts 次之后带着事实升级人工', async () => {
@@ -4343,6 +4490,8 @@ describe('跳过验收 × 合并冲突:三个调用点都不能谎报完成', ()
     conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/a.ts'] }),
     refreshFromIntegration: async () => ({ ok: true, updated: false }),
     mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
+    // 缺省「集成分支没往前走」= 重试轮原地改,和这套用例原来的行为逐字一致。
+    integrationAhead: async () => false,
     integrationBranchName: 'efftask/001/integration',
     ...over,
   })
@@ -4486,6 +4635,8 @@ describe('跳过验收的另外两个调用点(冲突场景)', () => {
     conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
     refreshFromIntegration: async () => ({ ok: true, updated: false }),
     mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: true, files: ['src/a.ts'] }),
+    // 缺省「集成分支没往前走」= 重试轮原地改,和这套用例原来的行为逐字一致。
+    integrationAhead: async () => false,
     integrationBranchName: 'efftask/001/integration',
     ...over,
   })
