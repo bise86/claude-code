@@ -32,7 +32,12 @@ import {
 export type FinishPlan =
   /** 没有待收口的东西:非隔离运行(产出本来就在当前目录里),或者零提交。 */
   | { action: 'none' }
-  | { action: 'merge' }
+  /**
+   * 合。`warn` 是**合了之后仍然要说的话** —— 目前只有一句:这一趟有降级放行的节点。
+   * 见下面那段注释:它从「拒绝合」降成「合了但要说」,因为拒绝在逐任务合并之后已经
+   * 拦不住任何东西了。
+   */
+  | { action: 'merge'; warn?: string[] }
   /** 不自动合,并且把原因带给用户 —— 屏幕上不说 = 他以为代码已经在手上了。 */
   | { action: 'skip'; why: string; followUps: string[] }
 
@@ -45,7 +50,7 @@ export type FinishPlan =
  */
 export function planFinish(
   h: PendingHandoff | undefined,
-  opts: { dirty: boolean; dirtyDetail?: string; finish?: 'merge' | 'keep' },
+  opts: { dirty: boolean; dirtyDetail?: string },
 ): FinishPlan {
   if (!h || h.commits <= 0) return { action: 'none' }
   /**
@@ -65,51 +70,36 @@ export function planFinish(
     }
   }
   /**
-   * 有节点是降级放行的 —— **不自动合并**。
+   * 降级放行:**从「拒绝合」降成「合了,但要说」。**
    *
-   * 这一趟确实跑完了(`outcome === 'completed'`),所以上面那道门放它过来了;
-   * 但「跑完」和「通过了」不是一回事:降级放行的节点是判决没过、按迭代上限放行的。
-   * 自动 merge 当初被认定安全,前提逐字是「一次**干净**跑完的运行」——
-   * 把没人判通过的代码不声不响地落进用户的分支,是这套东西能造成的最坏后果,
-   * 而且不可逆(merge commit 已经在他的历史里了)。
+   * 原来的理由今天仍然对(它值得原样记下来):这一趟确实跑完了,但「跑完」和「通过了」
+   * 不是一回事 —— 降级放行的节点是判决没过、按迭代上限放行的,而把没人判通过的代码不声
+   * 不响落进用户的分支是这套东西能造成的最坏后果,并且不可逆。
    *
-   * 仍然走 `skip`(= 没合,并说清为什么),并把「怎么自己合」写在 followUps 里:
-   * 决定权还给用户,而他现在拿得到做决定所需要的那个事实。
+   * 但逐任务合并之后,这道闸已经**拦不住任何东西**——降级放行的节点在它通过验收
+   * 的那一刻就已经合进集成分支、并被 `intoTrunk` 送进用户的分支了(`pipeline.ts` 的
+   * `acceptDegraded` → `mergeAndRelease` → `commitAndMerge` → `intoTrunk`)。而集成分支是
+   * **累积**的:想把某个节点排除在用户分支之外,唯一办法是从此再也不合 —— 那等于取消
+   * 这个功能。
    *
-   * **排在「用户选了分支开发」之前**:那一档是「本来就不该合」,措辞里没有一个字提示
-   * 有节点没通过判决 —— 两句都真的时候,要先说更要紧的那句。
+   * 于是「跑得干净就自动合、脏了就拒绝」在这里变成一条**任意**的规则:同一份代码,
+   * 工作区当时干净就已经在用户分支上了,当时脏就被这道闸拦下 —— 拦下的不是风险,只是
+   * 运气。留着它反而更糟:一个已经把产出全收下的用户,会看到一句「没有自动合并」。
+   *
+   * 所以改成合 + 一句必须说出口的话。信息一个字没少(那才是这道闸真正的价值),
+   * 而屏幕不再对着一份已经在用户手上的产出说它没被合进来。
    */
-  if ((h.degradedNodes ?? 0) > 0) {
-    return {
-      action: 'skip',
-      why: `本次运行有 ${h.degradedNodes} 个节点是**降级放行**的(判决未通过,按迭代上限放行),没有自动合并`,
-      followUps: [
-        `产出在分支 ${h.branch}(${h.commits} 个提交),一个都没丢`,
-        '先看 run.md 的「降级放行」那几条:它们是判决当时提出、没人落实的问题',
-        `确认可以接受之后再自己合:git merge ${h.branch}`,
-      ],
-    }
-  }
+  const warn = (h.degradedNodes ?? 0) > 0
+    ? [
+      `⚠ 本次运行有 ${h.degradedNodes} 个节点是**降级放行**的(判决未通过,按迭代上限放行),它们的产出也在这次合并里`,
+      '先看 run.md 的「降级放行」那几条:它们是判决当时提出、没人落实的问题',
+    ]
+    : undefined
   /**
-   * 用户在关口上选了**分支开发** —— 不合,而且这不是一次失败。
-   *
-   * 仍然走 `skip` 那一档(它就是「没合,并且说清为什么」),但措辞必须和「合不了」分得开:
-   * 一句「没有自动合并」后面跟着一串排查步骤,对一个**主动**选了保留分支的人是噪音,
-   * 而且会让他以为出了问题。这里给的是他接下来真正要做的两件事。
-   *
-   * **排在「没跑完」之后**:两句话都是真的,而「这一趟没跑完」更要紧 —— 一个选了保留分支
-   * 的人看到那句话才知道这条分支上是半成品。
+   * 「分支开发」那一档在这里**不存在了**(用户:「不要什么分支开发,只有主干开发」)。
+   * 它和逐任务合并互斥:一个每完成一个子任务就把集成分支合回当前分支的运行,没有办法
+   * 同时承诺「产出留在分支上不动你的目录」。走到这里的一定是「该合但还没合上」。
    */
-  if (opts.finish === 'keep') {
-    return {
-      action: 'skip',
-      why: `按你选的「保留分支」,本次没有合并 —— 产出在分支 ${h.branch}(${h.commits} 个提交)上`,
-      followUps: [
-        `要合进来:git merge ${h.branch}`,
-        `要发 PR:git push -u origin ${h.branch}`,
-      ],
-    }
-  }
   if (opts.dirty) {
     return {
       action: 'skip',
@@ -122,7 +112,7 @@ export function planFinish(
       ],
     }
   }
-  return { action: 'merge' }
+  return warn ? { action: 'merge', warn } : { action: 'merge' }
 }
 
 /**
@@ -187,14 +177,37 @@ export async function finishHandoff(deps: {
    * 刚才发生过一次合并。
    */
   resolveConflict?: ConflictResolver
-  /** 关口上选的收口方式。`undefined` = 默认合回当前分支(见 EffTaskConfig.finish)。 */
-  finish?: 'merge' | 'keep'
   /** 关口上打开的自动推送。默认关 —— 推送是对外动作,必须由人打开。 */
   autoPush?: boolean
+  /**
+   * 这一趟已经落在用户当前分支上的提交数(`worktreePool.handoff().trunkLanded`,从 git 现算)。
+   *
+   * 主干开发的**正常结局**是 `commits === 0`:每个子任务完成时就合过了,收口时已经没有
+   * 待合的提交。少了这个字段,那条早退会顺手把自动推送也吃掉 —— 一个打开了推送开关的人,
+   * 在最常见的那条路径上一次也推不出去。
+   */
+  trunkLanded?: number
+  /**
+   * 这一趟的结局。**只有 `completed` 才允许上面那条早退去推远程。**
+   *
+   * 验收实测:早退原来一个前提都不查,而它恰恰是最常见的那条路径(逐任务合并让
+   * `commits === 0` → 连 `pendingHandoff` 都不挂)。于是一个**被阻断或被取消**的 run
+   * 只要中途合过一次,就会把半成品推到远程 —— 而本文件自己把推送定义为「对外动作、
+   * 不可撤销」,下面那条 skip 分支也逐字写着「合不了的那几档一律不推」。
+   *
+   * 缺省(不传)= 不推:宁可少推一次,也不能替用户做一次他没批准的对外动作。
+   */
+  outcome?: 'completed' | 'blocked' | 'cancelled'
 }): Promise<FinishOutcome> {
   const { handoff: h, git, cwd } = deps
   try {
-    if (!h || h.commits <= 0) return { merged: false }
+    if (!h || h.commits <= 0) {
+      // 没有待收口的东西。但如果产出是逐任务合进去的,推送这件事照样该发生。
+      const push = deps.autoPush === true && (deps.trunkLanded ?? 0) > 0 && deps.outcome === 'completed'
+        ? await pushCurrent(git, cwd)
+        : undefined
+      return { merged: false, ...(push ? { push } : {}) }
+    }
     // **只看被跟踪的改动**,和 runHandoffChoice 用同一个函数 —— 两份判据里最松的那一份
     // 会成为实际生效的那一份,而这里更严的那一份曾经让整个功能一次也没发生过
     // (`/et` 自己写的 `.claude/efftask/` 就是一条 `?? .claude/`)。见 trackedChanges。
@@ -224,20 +237,16 @@ export async function finishHandoff(deps: {
       }
     }
     const dirty = h.outcome === 'completed' ? await trackedChanges(git, cwd) : { dirty: false }
-    const plan = planFinish(h, { dirty: dirty.dirty, dirtyDetail: dirty.detail, finish: deps.finish })
+    const plan = planFinish(h, { dirty: dirty.dirty, dirtyDetail: dirty.detail })
     if (plan.action === 'none') return { merged: false }
     if (plan.action === 'skip') {
       /**
-       * 没合,但**产出仍然是完整的**(用户选了保留分支、而且这一趟正常跑完了)——
-       * 这一档也要推。开关的语义是「把产出送到远程」,而不是「合并成功之后顺便推一下」;
-       * 分支开发的人恰恰是最需要它的那个(推完就能发 PR)。
+       * 合不上的那几档(没跑完、脏树、detached、有降级放行)**一律不推**:那些是
+       * 「有问题,先别动」,而推送是对外的、不可撤销的。
        *
-       * 合不了的那几档(没跑完、脏树、detached)**不推**:那些是「有问题,先别动」。
+       * 这里原来还有一档「用户选了保留分支 → 照样推那条集成分支」—— 随分支开发一起去掉了。
        */
-      const push = deps.autoPush === true && deps.finish === 'keep' && h.outcome === 'completed'
-        ? await pushBranch(git, cwd, h.branch)
-        : undefined
-      return { merged: false, result: { ok: false, message: plan.why, followUps: plan.followUps }, ...(push ? { push } : {}) }
+      return { merged: false, result: { ok: false, message: plan.why, followUps: plan.followUps } }
     }
     // 走**现成的**那一份:脏树复查、失败时如实报告、分支原样保留全在里面,而收口关口
     // 按的也是同一个函数。两份实现迟早给出两种答案。
@@ -245,7 +254,9 @@ export async function finishHandoff(deps: {
     if (res.ok) {
       // 合成功了才推当前分支 —— 没合的话,推上去的是一份不含本次产出的分支。
       const push = deps.autoPush === true ? await pushCurrent(git, cwd) : undefined
-      return { merged: true, result: res, ...(push ? { push } : {}) }
+      // 降级放行那句话跟着**成功**这条路走(它现在是「合了但要说」,不是「不合」)。
+      const withWarn = plan.warn ? { ...res, followUps: [...plan.warn, ...(res.followUps ?? [])] } : res
+      return { merged: true, result: withWarn, ...(push ? { push } : {}) }
     }
     // 失败了 —— 工作区被留在半合并状态了吗?这一问必须由**我们**来问:这一路是自动
     // 发生的,而屏幕上那句「你的工作区未被改动」得按答案改口。

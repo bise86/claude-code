@@ -700,16 +700,17 @@ describe('恢复关口要显示这一趟的 git 开关', () => {
     return { ...t, app }
   }
 
-  it('从 run.md 恢复出来的「保留分支 + 自动推送」要显示出来', async () => {
-    const g = await mountResume({ config: { ...config, finish: 'keep', autoPush: true } })
+  it('从 run.md 恢复出来的「自动推送」要显示出来,收口方式照旧说清会做什么', async () => {
+    const g = await mountResume({ config: { ...config, autoPush: true } })
     const f = g.lastFrame()
     g.app.unmount()
-    expect(f).toContain('保留 efftask 分支')
     expect(f).toContain('自动推送: 开')
+    // 分支开发那一档没有了,但这一行不能消失:它讲的是这一趟会对用户的工作目录做什么。
+    expect(f).toContain('每个子任务完成时')
   })
 
   it('只读 —— 恢复关口不画切换键(这一趟的隔离方式在上一趟就定了)', async () => {
-    const g = await mountResume({ config: { ...config, finish: 'keep' } })
+    const g = await mountResume({ config: { ...config, autoPush: true } })
     const f = g.lastFrame()
     g.app.unmount()
     expect(f).not.toContain('(m 切换)')

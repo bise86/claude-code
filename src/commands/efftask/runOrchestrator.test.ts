@@ -234,7 +234,7 @@ describe('收口:跑完就把产出送回当前目录', () => {
     iteration: { planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
     depth: 0, createdAt: 'T0', updatedAt: 'T0',
   }]
-  const poolWithCommits = (commits: number) => ({
+  const poolWithCommits = (commits: number, trunkLanded = 0) => ({
     init: async () => ({ ok: true }),
     acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b', gitRoot: '/repo' }),
     commitAndMerge: async () => ({ ok: true, merged: true }),
@@ -242,6 +242,9 @@ describe('收口:跑完就把产出送回当前目录', () => {
     dispose: async () => ({ kept: [] }),
     handoff: async () => ({
       branch: 'efftask/004/integration', commits, kept: [], salvage: [], integrationPath: '/wt/integration',
+      // 逐任务合并这一路:`trunkLanded` 是「已经在用户分支上」的提交数,收口那一步靠它
+      // 决定「没有待收口 ≠ 什么都没发生」。桩 pool 不给这个字段的话,那条路一次也跑不到。
+      trunkLanded,
     }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
     integrationPath: '/wt/integration',
@@ -265,6 +268,8 @@ describe('收口:跑完就把产出送回当前目录', () => {
   }
   const run = async (over: {
     commits?: number
+    trunkLanded?: number
+    autoPush?: boolean
     answers?: Record<string, { code?: number; stdout?: string; stderr?: string }>
     withGit?: boolean
     /** 收口撞上冲突时被派去解冲突的那一位。默认什么都不回答(这条路上没人调用它)。 */
@@ -272,8 +277,8 @@ describe('收口:跑完就把产出送回当前目录', () => {
   } = {}) => {
     const fs = memFs()
     const g = git(over.answers)
-    const results: { merged: boolean; result?: { ok: boolean; message: string } }[] = []
-    const config = cfg()
+    const results: { merged: boolean; result?: { ok: boolean; message: string }; push?: { ok: boolean; message: string } }[] = []
+    const config = { ...cfg(), ...(over.autoPush === undefined ? {} : { autoPush: over.autoPush }) }
     const phases: string[] = []
     /**
      * `settle` 那一刻 pendingHandoff 还在不在 —— 顺序的观测口。
@@ -285,7 +290,8 @@ describe('收口:跑完就把产出送回当前目录', () => {
     await runOrchestrator(
       {
         config, runDir: '/run/004', fs, runAgent: over.runAgent ?? ((async () => '') as RunAgentFn),
-        signal: new AbortController().signal, worktrees: poolWithCommits(over.commits ?? 3) as never,
+        signal: new AbortController().signal,
+        worktrees: poolWithCommits(over.commits ?? 3, over.trunkLanded ?? 0) as never,
         seed: doneSeed() as never, cwd: '/repo',
         ...(over.withGit === false ? {} : { git: g.fn as never }),
         onHandoffResult: r => results.push(r as never),
@@ -318,10 +324,58 @@ describe('收口:跑完就把产出送回当前目录', () => {
     expect(r.manifest).toContain('pendingHandoff')
   })
 
+  /**
+   * 中途合成功过、但收口时还剩东西没合(那一刻工作区脏)——**待收口记录必须带上已经落地的
+   * 那几笔**。收口关口和飞书收口卡都拿它决定那句话是「你的工作区未被改动」还是「另有 N 个
+   * 提交已经在你的分支上」;写不出去的话,关口会对着一份已经在用户目录里的产出说没动过。
+   */
+  it('待收口记录带上 trunkLanded,并且落盘', async () => {
+    const r = await run({
+      commits: 2, trunkLanded: 5,
+      answers: { 'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M src/app.ts\n' } },
+    })
+    expect(r.config.pendingHandoff?.trunkLanded).toBe(5)
+    expect(r.manifest).toContain('trunkLanded')
+  })
+
   it('零提交 → 一条 git 都不跑,也不报告', async () => {
     const r = await run({ commits: 0 })
     expect(r.g.calls).toEqual([])
     expect(r.results).toEqual([])
+  })
+
+  /**
+   * **推送的结果必须跨过这道接缝。**
+   *
+   * 逐任务合并之后最常见的结局是 `commits === 0`(每个子任务完成时就合过了),而
+   * `finishHandoff` 在那条早退上返回的是 `{ merged:false, push }` —— **没有 `result`**。
+   * 这里原来的闸是 `if (out.result)`,于是推送发生了、推送失败也发生了,而用户被告知
+   * 零个字;界面里那条专门为它写的 `else if (out.push)` 成了不可达代码。
+   *
+   * 验收是拿真 runOrchestrator + 桩 git 跑出来的:`push 跑过 = true / 报告次数 = 0`。
+   * 两边各自都绿着 —— 桩 pool 的 handoff 当时根本不返回 trunkLanded,这条路一次也没被驱动过。
+   */
+  it('没有待收口但逐任务合过 + 开了推送 → 推,而且结果要真的到达界面', async () => {
+    const r = await run({
+      commits: 0, trunkLanded: 3, autoPush: true,
+      answers: { 'symbolic-ref': { stdout: 'feature/x\n' } },
+    })
+    expect(r.g.ran('push -u origin feature/x')).toBe(true)
+    expect(r.results).toHaveLength(1)
+    expect(r.results[0]?.push?.ok).toBe(true)
+  })
+
+  it('推送失败尤其要说 —— 那正是用户要自己去补的一步', async () => {
+    const r = await run({
+      commits: 0, trunkLanded: 3, autoPush: true,
+      answers: {
+        'symbolic-ref': { stdout: 'feature/x\n' },
+        'push': { code: 1, stderr: "fatal: 'origin' does not appear to be a git repository" },
+      },
+    })
+    expect(r.results).toHaveLength(1)
+    expect(r.results[0]?.push?.ok).toBe(false)
+    expect(r.results[0]?.push?.message).toContain('origin')
   })
 
   it('不注入 git → 行为与这个功能不存在时逐字相同', async () => {

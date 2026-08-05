@@ -100,6 +100,18 @@ describe('收口卡片:不可逆动作不上卡', () => {
   it('分支与提交数如实显示', () => {
     expect(text()).toContain('efftask/001/integration')
     expect(text()).toContain('3 个提交')
+    expect(text()).toContain('你的工作区未被改动')
+  })
+
+  /**
+   * 逐任务合并之后,「你的工作区未被改动」在中途合成功过的运行上逐字为假 —— 那些提交
+   * 早就在用户的目录里了。三处渲染器都印过这句话,这里是飞书那一处。
+   */
+  it('中途合过就不许说「你的工作区未被改动」', () => {
+    const t = text({ ...H, trunkLanded: 5 })
+    expect(t).not.toContain('你的工作区未被改动')
+    expect(t).toContain('5 个提交已在跑的过程中合进了你当前的分支')
+    expect(t).toContain('还有 3 个提交没合进来')
   })
 })
 

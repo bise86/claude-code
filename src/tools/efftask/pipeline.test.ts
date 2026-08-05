@@ -1087,6 +1087,40 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     expect(order.indexOf('observer')).toBeLessThan(order.indexOf('MERGE'))
   })
 
+  /**
+   * 「这个子任务的产出**没有**送进你当前的目录」必须留在**节点**上。
+   *
+   * 原因是逐节点的(合的那一刻你的工作区脏、或这一次撞了冲突),run 级只留一份最后状态
+   * 说不清是谁那一次没合上。而送成了不写:那是正常路径,每个节点都追一句只会把 execStatus
+   * 撑成流水账 —— 而它会被喂进之后每一次验收/集成验收的提示词。
+   */
+  it('逐任务合回主干:没合上的原因写进节点,合上了则一个字不写', async () => {
+    const skipped = root()
+    const ctxSkip = {
+      ...ctxFor([skipped], okAgent()),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({
+          ok: true, merged: true,
+          trunk: { advanced: false, reason: '你的工作区有未提交的改动(已跟踪文件),没有把产出合回你的目录' },
+        }),
+      }) as never,
+    }
+    await stepStart(skipped, ctxSkip)
+    await stepExecute(skipped, ctxSkip)
+    expect(skipped.status).toBe('ACCEPTED')       // 合不回主干**不影响判决**:产出在集成分支上
+    expect(skipped.execStatus).toContain('没有把产出合回你的目录')
+
+    const ok = root()
+    const ctxOk = {
+      ...ctxFor([ok], okAgent()),
+      worktrees: fakePool({ commitAndMerge: async () => ({ ok: true, merged: true, trunk: { advanced: true } }) }) as never,
+    }
+    await stepStart(ok, ctxOk)
+    await stepExecute(ok, ctxOk)
+    expect(ok.status).toBe('ACCEPTED')
+    expect(ok.execStatus).not.toContain('合回')
+  })
+
   it('a merge CONFLICT blocks the node and keeps the worktree findable', async () => {
     const n = root()
     const ctx = {
@@ -6183,13 +6217,17 @@ describe('方案缺验收点:当场补一次', () => {
  * 「别在共享的集成工作区里跑构建」这句话,发给谁、不发给谁。
  *
  * 实测事故(跑机 run 001):方案席和两个评审席都 `cd .efftask-worktrees/integration` 跑了
- * `devenv shell cargo check --workspace` —— 它们是仅有的两个不带 cwd 的关口。devenv 改写了
- * 那棵树上受跟踪的 devenv.lock,40 分钟后一个全部关口通过的节点合并失败。
+ * `devenv shell cargo check --workspace` —— 它们当时是仅有的两个不带 cwd 的关口。devenv
+ * 改写了那棵树上受跟踪的 devenv.lock,40 分钟后一个全部关口通过的节点合并失败。
+ *
+ * 现在这两关有自己的工作区了(`acquirePlanBase`),所以禁令**只剩共享的 integration 那一条**
+ * —— 旧文案里那句「要验证请在主工作树里跑」必须跟着改:主工作树恰恰是唯一看不到本次运行
+ * 任何产出的那棵树。
  *
  * 但**集成验收不能收到这句话**:它的圆桌 cwd 就是集成工作区(pipeline 里唯一一处
  * `cwd: ctx.worktrees?.integrationPath`),给它这句等于叫唯一该在那儿干活的人别在那儿干活。
  */
-describe('共享集成工作区的提醒:发给没有 cwd 的那两关,不发给住在里面的那一关', () => {
+describe('共享集成工作区的提醒:发给在别处干活的那两关,不发给住在里面的那一关', () => {
   const isolatedCtx = (nodes: TaskNode[], agent: RunAgentFn) => ({
     ...ctxFor(nodes, agent),
     worktrees: {
@@ -6202,9 +6240,12 @@ describe('共享集成工作区的提醒:发给没有 cwd 的那两关,不发给
       refreshFromIntegration: async () => ({ ok: true, updated: false }),
     } as never,
   })
-  const NOTE = '不要在这些目录里跑构建'
+  /** 两个版本共有的那半句 —— 集成验收一个字都不该看到。 */
+  const NOTE = '集成工作区'
+  /** 有自己的树时的禁令(只针对共享的 integration)。 */
+  const KEEP_OUT = '不要进去跑任何会改动文件的命令'
 
-  it('方案 / 质疑讨论 两关拿得到', async () => {
+  it('方案 / 质疑讨论 两关拿得到,而且指的是它们自己那棵树', async () => {
     const n = root()
     const byPhase = new Map<string, string>()
     const agent: RunAgentFn = async req => {
@@ -6214,8 +6255,13 @@ describe('共享集成工作区的提醒:发给没有 cwd 的那两关,不发给
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     await stepStart(n, isolatedCtx([n], agent))
-    expect(byPhase.get('plan')).toContain(NOTE)
-    expect(byPhase.get('review')).toContain(NOTE)
+    expect(byPhase.get('plan')).toContain(KEEP_OUT)
+    expect(byPhase.get('review')).toContain(KEEP_OUT)
+    // 自己的工作区,不是主检出 —— 这是「依赖的产出看得见」的全部所在。
+    expect(byPhase.get('plan')).toContain('/wt/root')
+    expect(byPhase.get('review')).toContain('/wt/root')
+    // 而且**不能**再叫他们回主工作树去验证:那棵树里没有本次运行的任何产出。
+    expect(byPhase.get('plan')).not.toContain('请在主工作树')
   })
 
   it('集成验收拿不到 —— 它就住在那个目录里', async () => {

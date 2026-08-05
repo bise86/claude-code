@@ -97,9 +97,12 @@ export function buildHandoffCard(h: PendingHandoff, runId: string, requestId: st
     lines.push('⚠ **本次运行没有正常跑完**(' + (h.reason || '被阻断或已取消') + '),下面的改动可能是半成品', '')
   }
   lines.push('**高效任务 ' + runId + ' · 收口**')
-  lines.push('分支 ' + h.branch + ' 上有 ' + h.commits + ' 个提交,你的工作区未被改动')
+  // 「你的工作区未被改动」只有在真没动过时才能说 —— 见 ConfirmHandoff 里同一句话的注释。
+  lines.push((h.trunkLanded ?? 0) > 0
+    ? '分支 ' + h.branch + ' 上还有 ' + h.commits + ' 个提交没合进来;另有 ' + h.trunkLanded + ' 个提交已在跑的过程中合进了你当前的分支'
+    : '分支 ' + h.branch + ' 上有 ' + h.commits + ' 个提交,你的工作区未被改动')
   if (h.integrationPath) lines.push('集成工作区: ' + h.integrationPath)
-  if (h.salvage.length > 0) lines.push('中断时抢救出的提交: ' + h.salvage.join('、'))
+  if (h.salvage.length > 0) lines.push('抢救出的提交(未合入集成分支的中间产物): ' + h.salvage.join('、'))
   if (h.kept.length > 0) lines.push('保留的工作区: ' + h.kept.length + ' 个')
   lines.push('', '**丢弃**这一项不在卡片上 —— 它不可逆,请在终端确认。')
   return {

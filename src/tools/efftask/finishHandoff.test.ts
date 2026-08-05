@@ -223,35 +223,69 @@ describe('自动收口撞上冲突时,解决者必须被真的传下去', () => 
   })
 })
 
-describe('收口方式:保留分支(分支开发)', () => {
-  it('planFinish:选了 keep 就不合,而且措辞不能读成「出问题了」', () => {
-    const p = planFinish(h(), { dirty: false, finish: 'keep' })
-    expect(p.action).toBe('skip')
-    if (p.action !== 'skip') throw new Error('unreachable')
-    expect(p.why).toContain('保留分支')
-    // 一个主动选了保留分支的人不该看到一串排查步骤 —— 给的是他接下来真正要做的事。
-    expect(p.followUps.join('\n')).toContain('git merge efftask/001/integration')
-    expect(p.followUps.join('\n')).toContain('git push')
-  })
-
-  it('「没跑完」排在它前面 —— 两句都真,而半成品这件事更要紧', () => {
-    const p = planFinish(h({ outcome: 'blocked', reason: '3 个节点被阻断' }), { dirty: false, finish: 'keep' })
-    if (p.action !== 'skip') throw new Error('unreachable')
-    expect(p.why).toContain('3 个节点被阻断')
-  })
-
-  it('finishHandoff:选了 keep 就**一次 merge 都不跑**', async () => {
-    const g = fakeGit()
-    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', finish: 'keep' })
-    expect(g.ran('merge')).toBe(false)
-    expect(out.merged).toBe(false)
-    expect(out.result?.message).toContain('保留分支')
-  })
-
-  it('默认(不传 finish)仍然是合回当前分支 —— 主干开发是默认', async () => {
+/**
+ * 分支开发那一档**没有了**(用户:「不要什么分支开发,只有主干开发」)。
+ *
+ * 它和逐任务合并互斥:一个每完成一个子任务就把集成分支合回当前分支的运行,没有办法同时
+ * 承诺「产出留在分支上、不动你的目录」。所以这里只剩一件要守的事:剩下的每条路都要合。
+ */
+describe('只有主干开发', () => {
+  it('跑完 + 树干净 → 合,没有任何「保留分支」的岔路', async () => {
     const g = fakeGit()
     const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo' })
     expect(out.merged).toBe(true)
+    expect(g.ran('merge --no-edit efftask/001/integration')).toBe(true)
+  })
+
+  it('「没跑完」照旧不合,而且措辞里说清半成品在哪', () => {
+    const p = planFinish(h({ outcome: 'blocked', reason: '3 个节点被阻断' }), { dirty: false })
+    if (p.action !== 'skip') throw new Error('unreachable')
+    expect(p.why).toContain('3 个节点被阻断')
+  })
+})
+
+/**
+ * 主干开发的**正常结局**:每个子任务完成时就合过了,收口时 commits === 0。
+ * 那条早退不能顺手把自动推送也吃掉 —— 打开了开关的人在最常见的路径上一次也推不出去。
+ */
+describe('逐任务合并之后:没有待收口的东西,但推送照发生', () => {
+  it('commits === 0 + 逐任务合过 + 开了推送 → 推当前分支', async () => {
+    const g = fakeGit({ 'symbolic-ref --short': { stdout: 'feature/x\n' } })
+    const out = await finishHandoff({
+      handoff: h({ commits: 0 }), git: g.git, cwd: '/repo', autoPush: true, trunkLanded: 3,
+      outcome: 'completed',
+    })
+    expect(g.ran('merge')).toBe(false)   // 没什么可合的
+    expect(g.ran('push -u origin feature/x')).toBe(true)
+    expect(out.push?.ok).toBe(true)
+  })
+
+  it('真的什么都没发生(trunkLanded 0)→ 不推', async () => {
+    const g = fakeGit()
+    const out = await finishHandoff({ handoff: h({ commits: 0 }), git: g.git, cwd: '/repo', autoPush: true, outcome: 'completed' })
+    expect(g.ran('push')).toBe(false)
+    expect(out.push).toBeUndefined()
+  })
+
+  /**
+   * 这条早退是逐任务合并之后**最常见的那条路径**(commits === 0 → 连 pendingHandoff 都
+   * 不挂),而它原来一个前提都不查。于是一次被阻断的 run 只要中途合过一次,就会把半成品
+   * 推到远程 —— 而推送在本文件里的定义是「对外动作、不可撤销」。
+   */
+  it('run 没跑完 → 即使中途合过也不推(推送是对外的、不可撤销的)', async () => {
+    for (const outcome of ['blocked', 'cancelled'] as const) {
+      const g = fakeGit({ 'symbolic-ref --short': { stdout: 'feature/x\n' } })
+      const out = await finishHandoff({
+        handoff: h({ commits: 0, outcome: 'blocked' }), git: g.git, cwd: '/repo',
+        autoPush: true, trunkLanded: 3, outcome,
+      })
+      expect(g.ran('push')).toBe(false)
+      expect(out.push).toBeUndefined()
+    }
+    // 连 outcome 都没传时同样不推:宁可少推一次,也不替用户做一次他没批准的对外动作。
+    const g = fakeGit({ 'symbolic-ref --short': { stdout: 'feature/x\n' } })
+    await finishHandoff({ handoff: h({ commits: 0 }), git: g.git, cwd: '/repo', autoPush: true, trunkLanded: 3 })
+    expect(g.ran('push')).toBe(false)
   })
 })
 
@@ -273,19 +307,12 @@ describe('自动推送:默认关,开了才推', () => {
     expect(out.push?.ok).toBe(true)
   })
 
-  it('保留分支 + 开了推送 → 推的是**集成分支**(那正是要发 PR 的那条)', async () => {
-    const g = fakeGit()
-    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', finish: 'keep', autoPush: true })
-    expect(g.ran('push -u origin efftask/001/integration')).toBe(true)
-    expect(g.ran('merge')).toBe(false)
-  })
-
   it('合不了的那几档不推 —— 那些是「有问题,先别动」', async () => {
     const dirty = fakeGit({ 'diff --quiet': { code: 1 } })
     expect((await finishHandoff({ handoff: h(), git: dirty.git, cwd: '/repo', autoPush: true })).push).toBeUndefined()
     expect(dirty.ran('push')).toBe(false)
     const blocked = fakeGit()
-    expect((await finishHandoff({ handoff: h({ outcome: 'blocked' }), git: blocked.git, cwd: '/repo', finish: 'keep', autoPush: true })).push).toBeUndefined()
+    expect((await finishHandoff({ handoff: h({ outcome: 'blocked' }), git: blocked.git, cwd: '/repo', autoPush: true })).push).toBeUndefined()
     expect(blocked.ran('push')).toBe(false)
   })
 
@@ -318,15 +345,31 @@ describe('自动推送:默认关,开了才推', () => {
  * 自动合并当初被认定安全,前提逐字是「一次**干净**跑完的运行」。降级放行把那个前提改掉了,
  * 所以这道门必须跟着改 —— 这是「不失败」这套东西最容易造成真实损害的那一处。
  */
-describe('降级放行的运行不自动合并', () => {
-  it('有降级节点 → skip,并说清为什么、以及怎么自己合', () => {
+/**
+ * **这道闸从「拒绝合」降成「合了,但要说」。**
+ *
+ * 逐任务合并之后它已经拦不住任何东西:降级放行的节点在通过验收那一刻就被 `intoTrunk`
+ * 送进用户的分支了,而集成分支是累积的 —— 想把某个节点排除在外,唯一办法是从此不再合。
+ * 于是「干净就合、脏了就拒绝」变成一条任意规则:拦下的不是风险,只是运气;而一个已经
+ * 把产出全收下的用户会看到一句「没有自动合并」。信息不能少,判决要改。
+ */
+describe('降级放行:照样合,但必须说出口', () => {
+  it('有降级节点 → 仍然 merge,而且带着一句必须说出口的话', () => {
     const p = planFinish(h({ degradedNodes: 2 }), { dirty: false })
-    expect(p.action).toBe('skip')
-    expect(p.why).toContain('降级放行')
-    expect(p.why).toContain('2')
-    // 决定权还给用户,但他得拿得到做决定所需要的那个事实,以及下一步。
-    expect((p.followUps ?? []).join('\n')).toContain('降级放行')
-    expect((p.followUps ?? []).join('\n')).toContain('git merge')
+    expect(p.action).toBe('merge')
+    if (p.action !== 'merge') throw new Error('unreachable')
+    expect((p.warn ?? []).join('\n')).toContain('降级放行')
+    expect((p.warn ?? []).join('\n')).toContain('2')
+    // 「它们的产出也在这次合并里」—— 这句是判决改掉之后唯一还能防止误解的东西。
+    expect((p.warn ?? []).join('\n')).toContain('也在这次合并里')
+    expect((p.warn ?? []).join('\n')).toContain('run.md')
+  })
+
+  it('这句话要真的到达用户 —— 并进合并成功那条消息的 followUps', async () => {
+    const g = fakeGit()
+    const out = await finishHandoff({ handoff: h({ degradedNodes: 2 }), git: g.git, cwd: '/repo' })
+    expect(out.merged).toBe(true)
+    expect((out.result?.followUps ?? []).join('\n')).toContain('降级放行')
   })
 
   it('一个降级节点都没有 → 行为逐字不变,照常自动合', () => {

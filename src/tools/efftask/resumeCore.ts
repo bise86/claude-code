@@ -1127,6 +1127,10 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
         // 唯一判据 —— 写得出去读不回来的话,`--resume` 之后那道门就消失了。
         ...(Number.isFinite(o.degradedNodes) && (o.degradedNodes as number) > 0
           ? { degradedNodes: Math.trunc(o.degradedNodes as number) } : {}),
+        // 同上,同一条规矩:收口关口那句「你的工作区未被改动」按它改口。写得出去读不回来
+        // 的话,`--resume` 进来的关口会对着一份已经在用户目录里的产出说没动过他的工作区。
+        ...(Number.isFinite(o.trunkLanded) && (o.trunkLanded as number) > 0
+          ? { trunkLanded: Math.trunc(o.trunkLanded as number) } : {}),
       }
     } else {
       degraded.push('run.md 里的待收口记录缺少分支名,已忽略:集成分支需要你自己处置')
@@ -1147,8 +1151,8 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   }
 
   /**
-   * 三个 git 开关。**必须读回** —— 恢复关口拿读回来的 config 当初值渲染,读不回来的话,
-   * 用户上一趟选的「保留分支」会在恢复时静默变回「合回当前分支」,而他多半是直接回车的。
+   * 两个 git 开关。**必须读回** —— 恢复关口拿读回来的 config 当初值渲染,读不回来的话,
+   * 用户上一趟选的「共享工作树」会在恢复时静默变回「worktree 隔离」,而他多半是直接回车的。
    *
    * 手改 run.md 绕开一切校验,所以取值也要在这里过一遍白名单:一个写成 `isolation: yes`
    * 的值不能被当成 'shared'(那会让整趟运行的执行方式变掉,而屏幕上写的是另一件事)。
@@ -1157,9 +1161,17 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
     if (fm.isolation === 'worktree' || fm.isolation === 'shared') base.isolation = fm.isolation
     else degraded.push(`run.md 里的 isolation「${String(fm.isolation)}」不是合法取值(worktree / shared),已忽略,按 worktree 走`)
   }
+  /**
+   * `finish`(收口方式)这个开关**已经不存在了** —— 只有主干开发。
+   *
+   * 旧 run.md 里还会有它,而恢复一个旧 run 不该因为一个已经取消的开关失败。选了
+   * 「保留分支」的那些尤其要**说一句**:这一趟的行为和上一趟不一样了(现在每个子任务
+   * 完成时就会合回当前分支),静默改掉是这个仓库反复在修的那类事。
+   */
   if (fm.finish !== undefined) {
-    if (fm.finish === 'merge' || fm.finish === 'keep') base.finish = fm.finish
-    else degraded.push(`run.md 里的 finish「${String(fm.finish)}」不是合法取值(merge / keep),已忽略,按 merge 走`)
+    degraded.push(fm.finish === 'keep'
+      ? 'run.md 里的 finish: keep(分支开发)已不再支持:本次按主干开发走 —— 每个子任务完成时就合回你当前的分支'
+      : 'run.md 里的 finish 已不再是一个开关(只有主干开发),已忽略')
   }
   if (fm.autoPush !== undefined) {
     // 只有**真正的 true** 才算开。字符串 'false' 是 truthy,而这个开关的方向是不对称的:

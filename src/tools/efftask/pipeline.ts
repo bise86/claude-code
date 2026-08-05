@@ -746,13 +746,23 @@ function rateLimitRemedy(): string {
  * 各自注入,不进共用的 `seatPreamble`。
  *
  * 隔离没开时不说:那时候根本没有这个目录,凭空提一个不存在的路径是另一种说假话。
+ *
+ * `own` = 本节点自己的隔离工作区(见 `acquirePlanBase`:分析/质疑讨论现在也有 cwd 了)。
+ * 有它的时候这句话必须改口:上一版的「要验证请在**主工作树**里跑」是照着「这两关没有
+ * cwd」写的,而主工作树恰恰是**唯一看不到本次运行任何产出**的那棵树 —— 继续那么说等于
+ * 把人从对的目录赶到错的目录去。禁令只剩共享的 `integration` 那一条,那条的成因没变。
  */
-function sharedTreeNote(isolated: boolean): string {
-  return isolated
-    ? '注意:仓库下的 `.efftask-worktrees/` 是本次运行的隔离工作区,其中 `integration` 是**所有节点共享**的集成工作区。' +
+function sharedTreeNote(isolated: boolean, own?: string): string {
+  if (!isolated) return ''
+  return own
+    ? `注意:你现在在**本节点专属**的隔离工作区 \`${quote(own)}\` 里,它已经落在集成分支的当前状态上 —— ` +
+      '所有已通过验收的任务(包括本节点的依赖)的产出都在这里。读代码、跑构建/测试都请在这个目录里进行。\n' +
+      '仓库下的 `.efftask-worktrees/integration` 是**所有节点共享**的集成工作区,' +
+      '不要进去跑任何会改动文件的命令(例如 devenv/cargo/npm 会改写锁文件)——' +
+      '留在那里的未提交改动会让别的节点合并失败。\n'
+    : '注意:仓库下的 `.efftask-worktrees/` 是本次运行的隔离工作区,其中 `integration` 是**所有节点共享**的集成工作区。' +
       '不要在这些目录里跑构建/测试或任何会改动文件的命令(例如 devenv/cargo/npm 会改写锁文件)——' +
       '留在那里的未提交改动会让别的节点合并失败。要验证请在主工作树或你自己的工作区里跑。\n'
-    : ''
 }
 
 export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId' | 'worktrees'> & {
@@ -1099,13 +1109,19 @@ export function planPrompt(
 ): string {
   const caps = ctx.config.caps
   const isolated = ctx.worktrees !== undefined
+  /**
+   * **节点自己的工作区优先于 `ctx.cwd`。** `ctx.cwd` 是主检出 —— 隔离运行下它从 run 开始
+   * 到结束一个字节都不变(产出全在集成分支上),把它印成「工作目录」是在把方案作者指向
+   * 一棵看不见任何依赖产出的树。见 `stepStart` 的 `acquirePlanBase`。
+   */
+  const where = node.worktree?.path ?? ctx.cwd
   return (
     brief +
     `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
     // 「在哪」和「可以看」。这两句缺席时,方案作者只能照着标题写一句正确的废话。
-    (ctx.cwd ? `工作目录:${quote(ctx.cwd)}\n` : '') +
+    (where ? `工作目录:${quote(where)}\n` : '') +
     `你有 Read / Glob / Grep,**先真的去看代码,再定方案** —— 不要只凭任务标题推测。\n` +
-    sharedTreeNote(isolated) +
+    sharedTreeNote(isolated, node.worktree?.path) +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
     // The depth budget lives IN THE PROMPT so the model self-limits, instead of us
@@ -1498,9 +1514,9 @@ function reviewPrompt(
 ): string {
   return brief +
     judgeGuidance(ctx) +
-    // 评审席和方案席一样没有 cwd,可以走到任何目录去核实 —— 实测两个架构师都进了共享的
-    // 集成工作区跑构建。见 sharedTreeNote。
-    sharedTreeNote(ctx.worktrees !== undefined) +
+    // 评审席和方案席同进同出:两关共用本节点的隔离工作区(`acquirePlanBase`),没拿到时
+    // 才退回主检出。实测两个架构师都进了共享的集成工作区跑构建 —— 见 sharedTreeNote。
+    sharedTreeNote(ctx.worktrees !== undefined, node.worktree?.path) +
     // 任务目标。原来这一关**一个字的目标都不渲染** —— 于是 `REVIEW_FLOOR` 第 1 条
     // (「方案是空的、或与目标无关」)在这一席上根本不可判,而「这份拆分盖住目标了吗」
     // 正是下面那份 children 想让人能判的另一半。验收/集成两关早就渲染目标了。
@@ -2249,7 +2265,7 @@ async function fillMissingAcceptance(
     phase: 'plan', node, role: seat, system: 'plan',
     // parseFailed 时不把原始回复当「上一版」喂回去,所以 feedback 只带要求本身。
     prompt: planPrompt(node, ctx, tag, why, seatPreamble(ctx, seat, 'plan', node)),
-    signal: ctx.signal,
+    signal: ctx.signal, cwd: node.worktree?.path,
   }, { phaseLabel: '方案补验收点', round: node.iteration.planReview + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model })
   /**
    * **名额在拿到回答之后才算用掉。**
@@ -2323,7 +2339,7 @@ async function runPlanRoundtable(
     seat => runPhase(ctx, {
       phase: 'plan', node, role: seat, system: 'plan',
       prompt: planPrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'plan', node)),
-      signal: ctx.signal,
+      signal: ctx.signal, cwd: node.worktree?.path,
     }, { phaseLabel: PHASE_LABEL.plan, round: node.iteration.planReview + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model }),
     ctx.slots,
   )
@@ -2359,7 +2375,7 @@ async function runPlanRoundtable(
   const fused = await runPhase(ctx, {
     phase: 'plan', node, role: fuseSeat, system: 'plan',
     prompt: fusePrompt(node, ctx, fuseTag, feedback, seatPreamble(ctx, fuseSeat, 'plan', node), drafts.map(d => d.parsed)),
-    signal: ctx.signal,
+    signal: ctx.signal, cwd: node.worktree?.path,
   }, { phaseLabel: '方案融合', round: node.iteration.planReview + 1, label: (fuseSeat?.roleName || fuseSeat?.roleTag) || '主模型', model: fuseSeat?.model })
   if (!fused.ok) {
     // 融合那一次失败 → 回落到第一份成功的草稿。比整体阻断诚实:手上确实有可用的稿子。
@@ -2430,7 +2446,7 @@ async function runPlanRefinement(
     const res = await runPhase(ctx, {
       phase: 'plan', node, role: seat, system: 'plan',
       prompt: planPrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'plan', node) + priorDraft),
-      signal: ctx.signal,
+      signal: ctx.signal, cwd: node.worktree?.path,
     }, { phaseLabel: i === 0 ? PHASE_LABEL.plan : '方案精化', round: node.iteration.planReview + 1, label: (seat?.roleName || seat?.roleTag) || '主模型', model: seat?.model })
     if (!res.ok) {
       // 第一位就失败 → 手上没有任何稿子,照旧阻断。后面的人失败 → 已经有一份**解析通过**
@@ -2785,7 +2801,103 @@ function lastFailureFeedback(log: { synthesized: { pass: boolean; blockingSummar
   return ''
 }
 
+/**
+ * 分析与质疑讨论也要站在**集成分支的当前状态**上 —— 跨分支依赖调度的另一半。
+ *
+ * 依赖门控保证一个节点被调度时它的依赖全部 ACCEPTED,而 ACCEPTED 的定义就是「产出已经
+ * 合进集成分支」。隔离运行下那些产出**只**在集成分支上:用户的主检出从 run 开始到结束
+ * 一个字节都不会变。而这两关一直**没有 cwd**(执行/测试验证/验收都有,指向节点自己的
+ * 工作区),于是它们读的是主检出 —— 一个依赖别人的节点,方案是对着「依赖还没做」的代码
+ * 写出来的,评审也对着同一棵陈旧的树判它,直到执行环节 `acquire()` 落基线时才第一次看见
+ * 真实的世界。同一个成因还制造过 run 001 那次事故:没有 cwd 的方案席/评审席自己 `cd`
+ * 进了**共享的**集成工作区跑构建(见 sharedTreeNote),因为那是当时唯一看得见依赖产出的
+ * 目录 —— 给它们各自一棵树,那条捷径也就没有理由了。
+ *
+ * 拿到的工作区在**每一条出口**都要还回去,所以是 try/finally 包一层,而不是在十几个
+ * return 前各写一遍(这个文件里「四个调用点各自记得清一次」的东西已经付过学费)。
+ * 还回去之后执行环节的前置条件与改动前**逐字相同**:它照旧看到 `!node.worktree`、照旧
+ * 自己 `acquire()` 一次,而那一次会把基线重新落到集成分支**那时**的状态,并把这两关留下的
+ * 散落文件先固化到 salvage 分支(见 `worktreePool.acquire` 的复用路径 —— 目录还在,所以
+ * 没有第二次 `git worktree add` 的开销)。
+ *
+ * **边界,说清而不是假装覆盖**:同步发生在节点**开始**的那一刻,方案→评审→重出方案这个
+ * 循环里不再同步。依赖那一侧因此是完整的(依赖门控保证它们在这一刻全部 ACCEPTED,也就是
+ * 全部已合入);漏掉的只是「循环期间某个**兄弟**节点合了东西」——而兄弟按定义不是依赖,
+ * 且执行环节的返工轮有 `refreshFromIntegration` 兜着。循环里再同步要么得 `checkout -B`
+ * (每轮重写一遍工作树),要么得走 refresh(会把方案席留下的散落文件提交进节点分支),
+ * 两条都为一个小得多的窗口付真实代价。
+ *
+ * 反过来「借了就留给执行环节」是不行的,两条都实测得出:①acquire 会被跳过,执行于是从
+ * **分析时**的基线开始 —— 只是把陈旧从「run 开始」推迟到「方案写完」,而方案+评审在真实
+ * 运行里就是几十分钟;②`stepExecute` 顶上那条 `enterAtJudge`(跳过验收/强制通过)判的是
+ * `node.worktree !== undefined`,它要挡的正是「把一个没人执行过的空工作区合进集成分支并
+ * 判 ACCEPTED」,而一个分析时借来的工作区会让那个判据当场失真。
+ */
 export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  // 这两条早退不值得先去 `git worktree add` 一次;core 里原样保留着同样的判断。
+  if (isFinished(node) || ctx.signal.aborted) return stepStartCore(node, ctx)
+  // **只还自己借的那一份。** 带着工作区进 stepStart 的只有一种节点:冲突待人工处理的那种
+  // (`resumeCore` 显式为它保留路径,重做则会先清掉)。把别人的工作区还掉等于把人工解决
+  // 冲突的现场从记录里抹去。
+  const mine = ctx.worktrees !== undefined && node.worktree === undefined
+  if (mine) await acquirePlanBase(node, ctx)
+  try {
+    await stepStartCore(node, ctx)
+  } finally {
+    if (mine) await releasePlanBase(node, ctx)
+  }
+}
+
+/**
+ * 借:基于集成分支当前状态给本节点开一棵树。
+ *
+ * **拿不到不阻断。** 执行环节那条是硬闸(带写工具的执行者绝不能落进用户的检出),而这两关
+ * 拿不到工作区的正确降级是「退回主检出,并说出来它看不到什么」—— 为一次读不到最新代码就
+ * 杀掉整个节点,代价远大于病。注记走 execStatus(带编排器前缀),node.md 上留得住。
+ */
+async function acquirePlanBase(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  if (!ctx.worktrees || node.worktree) return
+  let lease: Awaited<ReturnType<typeof ctx.worktrees.acquire>>
+  try {
+    lease = await ctx.worktrees.acquire(node)
+  } catch (e) {
+    noteOnNode(node, `分析/质疑讨论未能准备隔离工作区(${e instanceof Error ? e.message : String(e)}),这两关读的是主工作树`)
+    return
+  }
+  if ('error' in lease) {
+    noteOnNode(node, `分析/质疑讨论未能准备隔离工作区(${lease.error}),这两关读的是主工作树 —— ` +
+      `其中没有其他任务已合入集成分支的产出`)
+    return
+  }
+  node.worktree = { branch: lease.branch, path: lease.path }
+}
+
+/**
+ * 还:清掉引用,并且**只对不会再用它的节点**去动磁盘。
+ *
+ * executable 节点的执行环节马上要在**同一个目录**上重新 acquire,删了纯属白付一次
+ * `git worktree add`;decompose 节点不会再回执行环节(它走 stepIntegrate,cwd 是集成
+ * 工作区),能收就收。`release` 自己在脏/未合入时会拒绝,所以这里不可能删掉任何工作 ——
+ * 收不回来时目录留着,`dispose` 在收口时会再走一遍并如实报出去。
+ */
+async function releasePlanBase(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  if (!ctx.worktrees || !node.worktree) return
+  node.worktree = undefined
+  /**
+   * 落一次盘,否则 node.md 上会挂着一条**已经被我们放掉**的工作区记录(decompose 那一支
+   * 甚至已经把目录删了),而详情页就照着 node.md 渲染。`commit()` 不合适:它要一个状态,
+   * 而这里的状态刚由 core 自己定过。失败不改判决 —— 这一步只关乎记录准不准。
+   */
+  try {
+    await ctx.persist(node)
+    safeUpdate(ctx)
+  } catch { /* ignore */ }
+  if (node.kind === 'executable') return
+  // 收不回来不改变任何判决:这一步纯粹是省磁盘。
+  try { await ctx.worktrees.release(node) } catch { /* ignore */ }
+}
+
+async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   const caps = ctx.config.caps
@@ -2980,7 +3092,9 @@ export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void>
       // 一轮算一次,不是一席算一次:reviewLog 在这一轮之内不变。
       buildPrompt: (tag, seat) =>
         reviewPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'review', node, 'review', strict), reviewNotice, node.iteration.planReview + 1, caps.maxIterations, strict, planned),
-      ctx, strictness: strict,
+      // 评审要能**去核实**方案里的事实断言(`FACT_EVIDENCE` 就是为这个写的),而可核实的
+      // 那棵树是本节点的隔离工作区 —— 主检出里没有任何依赖的产出。
+      ctx, cwd: node.worktree?.path, strictness: strict,
     })
     node.reviewLog.push(rec)
     // runRoundtable resolves even when the run was cancelled mid-flight (it collects
@@ -3505,6 +3619,17 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
       `(注:合并前集成工作区有未提交改动,已清理后重试合并;被清理的:${res.cleaned.join('、')})`,
       MAX_SUMMARY_CHARS,
     )
+  }
+  /**
+   * 「这个子任务的产出**没有**送进你当前的目录」——只在没送成时写。
+   *
+   * 送成了不写:那是正常路径,每个节点都追一句只会把 execStatus 撑成流水账(而它会被
+   * 喂进之后每一次验收/集成验收的提示词)。没送成必须写,而且写在**节点**上:原因是
+   * 逐节点的(合的那一刻你的工作区脏、或这一次撞了冲突),run 级只留一份最后状态说不清
+   * 是谁那一次没合上。
+   */
+  if (res.ok && res.trunk && res.trunk.advanced === false && res.trunk.reason) {
+    noteOnNode(node, res.trunk.reason)
   }
   if (!res.ok) {
     if (res.kind === 'conflict') {

@@ -259,6 +259,41 @@ describe('handoffLines 告诉用户工作在哪,以及怎么处置', () => {
     expect(text).not.toContain('git merge')
   })
 
+  /**
+   * `commits === 0` 有两种**完全相反**的成因,而主干开发把第二种变成了正常结局:
+   * 每个子任务完成时就合回当前分支了,收口时当然没有待合的提交。对着 20 次真实合并
+   * 印「本次没有产生任何改动」是一句用户会照着做决定的假话。
+   */
+  it('commits === 0 但逐任务合过 → 说的是「已逐一合并回你当前的分支」,不是「什么都没发生」', () => {
+    const text = handoffLines({ branch: 'b', commits: 0, kept: [], salvage: [], trunkLanded: 20 }).join('\n')
+    expect(text).toContain('20 个提交')
+    expect(text).toContain('产出就在当前目录里')
+    expect(text).not.toContain('没有产生任何改动')
+    // 还能查:这一趟的提交都在集成分支上。
+    expect(text).toContain('git log b')
+  })
+
+  it('有东西没送到用户目录时,原因要印出来 —— 否则他的目录和产出对不上而他不知道', () => {
+    const text = handoffLines({
+      branch: 'b', commits: 2, kept: [], salvage: [], trunkLanded: 1,
+      trunkSkips: ['你的工作区有未提交的改动(已跟踪文件),没有把产出合回你的目录 —— 你的改动不该被一次合并卷进来'],
+    }).join('\n')
+    expect(text).toContain('⚠')
+    expect(text).toContain('未提交的改动')
+    /**
+     * 而**第一句**也要跟着改口:「你的工作区未被改动」在中途合成功过的运行上逐字为假 ——
+     * 那 1 个提交早就在他的目录里了。三处渲染器(这里、收口关口、飞书收口卡)都印过这句话。
+     */
+    expect(text).not.toContain('你的工作区未被改动')
+    expect(text).toContain('还有 2 个提交没合进来')
+    expect(text).toContain('1 个提交已在跑的过程中合进了你当前的分支')
+  })
+
+  it('一次都没合过 → 那句「你的工作区未被改动」原样保留(它这时候是真的)', () => {
+    const text = handoffLines({ branch: 'b', commits: 2, kept: [], salvage: [] }).join('\n')
+    expect(text).toContain('你的工作区未被改动')
+  })
+
   it('surfaces kept worktrees and salvage refs — the things nobody would find otherwise', () => {
     const text = handoffLines({
       branch: 'b', commits: 1,
@@ -1345,16 +1380,19 @@ describe('contextWindowNoticeLines —— 自动压缩按哪个窗口触发', ()
   })
 })
 
-describe('git 三个开关 —— 关口上要说出代价', () => {
+describe('git 两个开关 —— 关口上要说出代价(收口方式已不是开关,只有主干开发)', () => {
   const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
     goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
     notices: [], ...over,
   })
 
-  it('默认 = worktree 隔离 + 合回当前分支 + 不推送', () => {
+  it('默认 = worktree 隔离 + 主干开发 + 不推送', () => {
     const l = gitChoiceLines(cfg()).join('\n')
     expect(l).toContain('worktree 隔离')
-    expect(l).toContain('合回当前分支')
+    // 收口那一行现在说的是「会发生什么」,不是「你选了什么」—— 而它要说清是**逐任务**合。
+    expect(l).toContain('主干开发')
+    expect(l).toContain('每个子任务完成时')
+    expect(l).not.toContain('(m 切换)')
     expect(l).toContain('自动推送: 关')
   })
 
@@ -1371,13 +1409,8 @@ describe('git 三个开关 —— 关口上要说出代价', () => {
     expect(l).toContain('不适用')
   })
 
-  it('保留分支要说清后果:产出不会自动出现在工作目录里', () => {
-    expect(gitChoiceLines(cfg({ finish: 'keep' })).join('\n')).toContain('不会自动出现')
-  })
-
-  it('推送开着时要说清推的是哪一条', () => {
+  it('推送开着时要说清推的是哪一条 —— 只有当前分支这一种', () => {
     expect(gitChoiceLines(cfg({ autoPush: true })).join('\n')).toContain('当前分支')
-    expect(gitChoiceLines(cfg({ autoPush: true, finish: 'keep' })).join('\n')).toContain('efftask 分支')
   })
 
   it('隔离根本不可用时说明「不是你选的」,而且不画键位', () => {
@@ -1387,12 +1420,12 @@ describe('git 三个开关 —— 关口上要说出代价', () => {
     expect(l).not.toContain('(w 切换)')
   })
 
-  it('editable: false 时不画键位 —— 编辑名册时 w/m/p 归编辑器', () => {
+  it('editable: false 时不画键位 —— 编辑名册时 w/p 归编辑器', () => {
     expect(gitChoiceLines(cfg(), { editable: false }).join('\n')).not.toContain('切换')
   })
 })
 
-describe('applyStartupDecision 对三个开关的「缺省 = 不变」', () => {
+describe('applyStartupDecision 对两个开关的「缺省 = 不变」', () => {
   const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
     goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
     notices: [], ...over,
@@ -1400,21 +1433,19 @@ describe('applyStartupDecision 对三个开关的「缺省 = 不变」', () => {
 
   it('决策里带了就按决策来', () => {
     const out = applyStartupDecision(cfg(), {
-      parallelism: 3, approved: true, isolation: 'shared', finish: 'keep', autoPush: true,
+      parallelism: 3, approved: true, isolation: 'shared', autoPush: true,
     })
     expect(out.isolation).toBe('shared')
-    expect(out.finish).toBe('keep')
     expect(out.autoPush).toBe(true)
   })
 
   it('决策里没带 → 保留 config 上的值,**不能**读成关掉', () => {
     // 飞书那张卡没有这三个开关,而它能赢下这场竞速 —— 读成默认值等于让一次飞书批准
     // 静默推翻用户刚在终端上按过的选择。
-    const out = applyStartupDecision(cfg({ isolation: 'shared', finish: 'keep', autoPush: true }), {
+    const out = applyStartupDecision(cfg({ isolation: 'shared', autoPush: true }), {
       parallelism: 3, approved: true,
     })
     expect(out.isolation).toBe('shared')
-    expect(out.finish).toBe('keep')
     expect(out.autoPush).toBe(true)
   })
 })

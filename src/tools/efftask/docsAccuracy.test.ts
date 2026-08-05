@@ -569,23 +569,30 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(README).toContain(norm('重试只重发那 1 席'))
   })
 
-  it('说跑完会自动合并回当前分支,那三件事就都得是真的', () => {
+  it('说每完成一个子任务就合回当前分支,那几件事就都得是真的', () => {
     /**
      * README 这一段原来写的是「跑完再弹一个**收口关口**」—— 而那句话**当时就是假的**:
      * 关口只在 `--resume` 那条路上出现,同一次会话里跑完是直接进 done 视图,于是合并
      * 永远不会发生。用户报的正是这个(「要在当前目录下有对应的存在」)。
-     * 所以这一条钉三样:判据在、脏树/未跑完不合、以及启动关口**事先说过**这件事。
+     * 第二轮又改了一次:不等整趟跑完,**每完成一个子任务就合一次**。所以这一条钉四样:
+     * README 说了、判据在、脏树/未跑完不合、启动关口**事先说过**这件事。
      */
-    expect(README).toContain(norm('跑完之后**自动把集成分支合并回你当前的分支**'))
-    expect(README).toContain(norm('工作区不干净、或者这一趟没正常跑完时不会自动合'))
+    expect(README).toContain(norm('**每完成一个子任务，产出就合回你当前的分支**'))
+    expect(README).toContain(norm('不用等整趟跑完'))
+    // 逐任务那条路的实现在 worktreePool.intoTrunk 里,而它必须由 commitAndMerge 调用 ——
+    // 一个没有调用点的实现就是这个仓库反复找到的那种死线。
+    const pool = readFileSync(new URL('src/tools/efftask/worktreePool.ts', ROOT), 'utf8')
+    expect(pool).toContain('async function intoTrunk()')
+    expect(pool.split('await intoTrunk()').length - 1).toBeGreaterThanOrEqual(3)
+    // 跑完那一次仍然在(它补齐前面落下的),三条不合的判据一条不少。
     expect(planFinish(handoffFixture(), { dirty: false })).toEqual({ action: 'merge' })
     expect(planFinish(handoffFixture(), { dirty: true }).action).toBe('skip')
     expect(planFinish(handoffFixture({ outcome: 'blocked' }), { dirty: false }).action).toBe('skip')
-    // 关口必须先说 —— 用户批准的是他看到的东西,而这一趟结束时我们会动他的工作区。
+    // 关口必须先说 —— 用户批准的是他看到的东西,而这一趟**中途就会**动他的工作区。
     expect(parallelismLine(
       { goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(), caps: DEFAULT_CAPS, notices: [] },
       { editable: false, isolation: 'worktree' },
-    )).toContain('跑完自动合并回当前分支')
+    )).toContain('每个子任务完成时自动合并回当前分支')
   })
 
   it('说定向注入的两个字段会写进 run.md 并读回,那两侧就都得有它们', () => {

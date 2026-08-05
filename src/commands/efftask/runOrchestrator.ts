@@ -100,7 +100,13 @@ export async function runOrchestrator(
      */
     git?: GitFn
     /** 收口结果:合成了没有、没合是为什么。UI 拿它写 done 视图那句话。 */
-    onHandoffResult?: (r: { merged: boolean; result?: HandoffResult }) => void
+    /**
+     * 收口结果:合成了没有、没合是为什么、**推送发生了没有**。
+     *
+     * `push` 必须在这个类型里:少了它,接线方(efftask.tsx)里那条把推送结果并进
+     * followUps 的分支在类型上就是死的 —— 而这个仓库没有 typecheck,死的接线不会有人报错。
+     */
+    onHandoffResult?: (r: { merged: boolean; result?: HandoffResult; push?: { ok: boolean; message: string } }) => void
   },
   setNodes: (n: TaskNode[]) => void,
   setOutcome: (o: Outcome) => void,
@@ -183,6 +189,8 @@ export async function runOrchestrator(
   // run 的结局,收口关口要带上它 —— 别邀请用户合并一棵没做完的树。reclaim 可能在
   // orch.run() 返回前(异常路径)就跑,所以默认按「被阻断」算,拿到真结果再覆盖。
   let pendingOutcome: Outcome = { status: 'blocked', reason: '未知' }
+  /** 这一趟已经落在用户当前分支上的提交数(reclaim 里从 handoff 读,handoff 从 git 现算)。 */
+  let trunkLanded = 0
   const reclaim = async (nodes: TaskNode[]): Promise<void> => {
     if (ran || !args.worktrees) return
     ran = true
@@ -192,6 +200,9 @@ export async function runOrchestrator(
       // directories that are about to disappear.
       await args.worktrees.dispose(nodes)
       const h = await args.worktrees.handoff(nodes)
+      // 逐任务合并已经送进用户分支几次 —— 收口那一步靠它决定「没有待收口 ≠ 什么都没发生」
+      // (自动推送在这条正常路径上必须照样发生)。
+      trunkLanded = h.trunkLanded ?? 0
       onHandoff?.(h)
       // 挂到 config 上 → 下一次 queueManifest 把它写进 run.md。**独立于 status**:
       // status 先写下 completed 而集成分支还没处置,用户直接关终端就再也没人管那条分支
@@ -209,6 +220,9 @@ export async function runOrchestrator(
           kept: h.kept, salvage: h.salvage,
           outcome: pendingOutcome.status, ...(pendingOutcome.reason ? { reason: pendingOutcome.reason } : {}),
           ...(degradedNodes > 0 ? { degradedNodes } : {}),
+          // 收口关口/飞书收口卡那句「你的工作区未被改动」按它改口 —— 中途合成功过的
+          // 那些提交早就在用户目录里了。
+          ...(trunkLanded > 0 ? { trunkLanded } : {}),
         }
       }
     } catch (e) {
@@ -254,14 +268,27 @@ export async function runOrchestrator(
       resolveConflict: root
         ? makeHandoffConflictResolver({ runAgent: args.runAgent, node: root, signal: args.signal })
         : undefined,
-      // 关口上选的收口方式和自动推送。**从 config 读**(不是另开一个参数):它已经被
+      // 关口上打开的自动推送。**从 config 读**(不是另开一个参数):它已经被
       // `applyStartupDecision` 写进去、被 run.md 落盘、也被 `--resume` 读回,多一条传递路径
       // 就多一处会漂移的地方。
-      finish: args.config.finish,
       autoPush: args.config.autoPush,
+      // 逐任务合并已经把产出送进用户分支了 → 没有待收口不等于「什么都没发生」,该推还是要推。
+      trunkLanded,
+      // 没跑完就不推:推送是对外的、不可撤销的动作,而「合过一次就推」会让一次
+      // 被阻断的 run 也把半成品推到远程(这条早退是最常见的路径,原来一个前提都不查)。
+      outcome: pendingOutcome.status,
     })
     if (out.merged) args.config.pendingHandoff = undefined
-    if (out.result) {
+    /**
+     * `out.push` 也要能到 UI —— **这道闸原来只认 `out.result`**。
+     *
+     * 逐任务合并之后最常见的结局是「没有待收口的东西」,那条早退返回的正是
+     * `{ merged: false, push }`(没有 `result`)。于是推送**发生了**、推送**失败**也
+     * 发生了,而用户被告知零个字;`efftask.tsx` 里那条专门为它写的 `else if (out.push)`
+     * 成了不可达代码。验收拿真 runOrchestrator + 桩 git 实跑出来的:
+     * `push 跑过吗 = true / onHandoffResult 次数 = 0`。
+     */
+    if (out.result || out.push) {
       try { onHandoffResult?.(out) } catch { /* UI only —— 合并已经发生了,不能被一个 UI 回调带走 */ }
     }
   }

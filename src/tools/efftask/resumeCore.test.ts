@@ -918,6 +918,35 @@ describe('待收口状态必须能从 run.md 读回', () => {
     expect(config.pendingHandoff).toBeUndefined()
     expect(degraded.filter(d => d.includes('收口'))).toEqual([])
   })
+
+  /**
+   * **写得出去、读不回来的字段会死在第一次 `--resume` 上**(`writeRunManifest` 整份重写
+   * run.md)。`trunkLanded` 决定收口关口那句话是「你的工作区未被改动」还是「另有 N 个
+   * 提交已经在你的分支上」—— 读不回来的话,关口会对着一份已经在用户目录里的产出说没动过
+   * 他的工作区,而他正要按着这句话决定要不要合。
+   */
+  it('trunkLanded 必须读回来 —— 收口关口那句话按它改口', async () => {
+    const { config } = await readRunManifest(fsWith({ '/r/run.md': md(
+      '  branch: b\n  commits: 2\n  outcome: completed\n  trunkLanded: 5\n') }), '/r')
+    expect(config.pendingHandoff?.trunkLanded).toBe(5)
+  })
+
+  it('写进去 → 读回来(整条链,不是只测读的那一半)', async () => {
+    const files: Record<string, string> = {}
+    const fs2: FsLike = {
+      ...fsWith(files),
+      readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error('ENOENT'); return v },
+      writeFile: async (p: string, c: string) => { files[p] = c },
+    }
+    await writeRunManifest(fs2, '/r', {
+      goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [],
+      pendingHandoff: {
+        branch: 'b', commits: 2, kept: [], salvage: [], outcome: 'completed', trunkLanded: 5,
+      },
+    } as EffTaskConfig, [])
+    const { config } = await readRunManifest(fs2, '/r')
+    expect(config.pendingHandoff?.trunkLanded).toBe(5)
+  })
 })
 
 describe('LEGAL_STATUS 必须覆盖每一个状态,否则节点会被永久判死', () => {
@@ -1082,32 +1111,40 @@ describe('跳过的环节必须能从 run.md 读回', () => {
   })
 })
 
-describe('git 三个开关必须能从 run.md 读回', () => {
+describe('git 开关必须能从 run.md 读回(收口方式已取消,只剩隔离方式 + 自动推送)', () => {
   const md = (body: string) => `---\ngoalPrompt: g\n${body}---\n\n`
 
-  it('读回三个值', async () => {
+  it('读回两个值', async () => {
     const { config } = await readRunManifest(
-      fsWith({ '/r/run.md': md('isolation: shared\nfinish: keep\nautoPush: true\n') }), '/r')
+      fsWith({ '/r/run.md': md('isolation: shared\nautoPush: true\n') }), '/r')
     expect(config.isolation).toBe('shared')
-    expect(config.finish).toBe('keep')
     expect(config.autoPush).toBe(true)
   })
 
-  it('老 run.md 没有这三个键 → undefined,而且不报噪音', async () => {
+  /**
+   * 老 run.md 上的 finish 不能让恢复失败,**也不能被静默吃掉**:选了「保留分支」的那一趟
+   * 恢复之后行为完全变了(现在每个子任务完成时就合回当前分支),用户有权在恢复关口上
+   * 看到这一句。
+   */
+  it('老 run.md 里的 finish: keep → 不报错,但明说这一趟按主干开发走', async () => {
+    const { degraded } = await readRunManifest(
+      fsWith({ '/r/run.md': md('finish: keep\n') }), '/r')
+    expect(degraded.join(' ')).toContain('主干开发')
+    expect(degraded.join(' ')).toContain('每个子任务完成时')
+  })
+
+  it('老 run.md 没有这些键 → undefined,而且不报噪音', async () => {
     const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': '---\ngoalPrompt: g\n---\n\n' }), '/r')
     expect(config.isolation).toBeUndefined()
-    expect(config.finish).toBeUndefined()
     expect(config.autoPush).toBeUndefined()
     expect(degraded.filter(d => /isolation|finish|autoPush/.test(d))).toEqual([])
   })
 
   it('手改成非法值 → 丢弃并说清按什么走', async () => {
     const { config, degraded } = await readRunManifest(
-      fsWith({ '/r/run.md': md('isolation: yes\nfinish: rebase\n') }), '/r')
+      fsWith({ '/r/run.md': md('isolation: yes\n') }), '/r')
     expect(config.isolation).toBeUndefined()
-    expect(config.finish).toBeUndefined()
     expect(degraded.join(' ')).toContain('worktree')
-    expect(degraded.join(' ')).toContain('merge')
   })
 
   it('autoPush 只认真正的布尔 —— 字符串 "false" 是 truthy,而误开一次就是一次真的对外推送', async () => {
@@ -1117,7 +1154,7 @@ describe('git 三个开关必须能从 run.md 读回', () => {
     expect(degraded.join(' ')).toContain('autoPush')
   })
 
-  it('写进去 → 读回来(writeRunManifest 是白名单;漏了它,恢复关口会把「保留分支」显示成「合回当前分支」)', async () => {
+  it('写进去 → 读回来(writeRunManifest 是白名单;漏了它,恢复关口会把用户选的隔离方式显示成默认值)', async () => {
     const files: Record<string, string> = {}
     const fs2: FsLike = {
       ...fsWith(files),
@@ -1127,11 +1164,12 @@ describe('git 三个开关必须能从 run.md 读回', () => {
     const base = {
       goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [],
     }
-    await writeRunManifest(fs2, '/r', { ...base, isolation: 'shared', finish: 'keep', autoPush: true } as EffTaskConfig, [])
+    await writeRunManifest(fs2, '/r', { ...base, isolation: 'shared', autoPush: true } as EffTaskConfig, [])
     const { config } = await readRunManifest(fs2, '/r')
     expect(config.isolation).toBe('shared')
-    expect(config.finish).toBe('keep')
     expect(config.autoPush).toBe(true)
+    // 收口方式不再落盘 —— 它已经不是一个开关了。
+    expect(files['/r/run.md']).not.toContain('finish')
   })
 
   it('默认值不写进 frontmatter —— 新 run 的 run.md 要和以前逐字一样', async () => {
@@ -1143,7 +1181,7 @@ describe('git 三个开关必须能从 run.md 读回', () => {
     }
     await writeRunManifest(fs2, '/r', {
       goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
-      notices: [], isolation: 'worktree', finish: 'merge', autoPush: false,
+      notices: [], isolation: 'worktree', autoPush: false,
     } as EffTaskConfig, [])
     expect(files['/r/run.md']).not.toContain('isolation')
     expect(files['/r/run.md']).not.toContain('finish')

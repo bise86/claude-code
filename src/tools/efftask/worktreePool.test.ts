@@ -7,7 +7,7 @@
  * measurement it encodes.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -92,7 +92,7 @@ describe('worktreePool against real git', () => {
     await git(['add', '-A'], lease.path)
     await git(['commit', '-qm', 'executor did its own commit'], lease.path)
 
-    expect(await p.commitAndMerge(n)).toEqual({ ok: true, merged: true })
+    expect(await p.commitAndMerge(n)).toMatchObject({ ok: true, merged: true })
     const shown = await git(['show', `efftask/001/integration:api.ts`], gitRoot)
     expect(shown.code).toBe(0)
     expect(shown.stdout).toContain('export const api = 1')
@@ -104,7 +104,7 @@ describe('worktreePool against real git', () => {
     const n = node('root/02-b')
     const lease = await p.acquire(n) as { path: string }
     await writeFile(join(lease.path, 'raw.txt'), 'never committed by the executor\n')
-    expect(await p.commitAndMerge(n)).toEqual({ ok: true, merged: true })
+    expect(await p.commitAndMerge(n)).toMatchObject({ ok: true, merged: true })
     expect((await git(['show', 'efftask/001/integration:raw.txt'], gitRoot)).code).toBe(0)
   })
 
@@ -113,7 +113,7 @@ describe('worktreePool against real git', () => {
     await p.init()
     const n = node('root/03-c')
     await p.acquire(n)
-    expect(await p.commitAndMerge(n)).toEqual({ ok: true, merged: false })
+    expect(await p.commitAndMerge(n)).toMatchObject({ ok: true, merged: false })
   })
 
   it('is idempotent: re-merging an already-merged node is success, not failure', async () => {
@@ -124,8 +124,8 @@ describe('worktreePool against real git', () => {
     const n = node('root/04-d')
     const lease = await p.acquire(n) as { path: string }
     await writeFile(join(lease.path, 'x.txt'), 'x\n')
-    expect(await p.commitAndMerge(n)).toEqual({ ok: true, merged: true })
-    expect(await p.commitAndMerge(n)).toEqual({ ok: true, merged: false })
+    expect(await p.commitAndMerge(n)).toMatchObject({ ok: true, merged: true })
+    expect(await p.commitAndMerge(n)).toMatchObject({ ok: true, merged: false })
   })
 
   it('a pre-commit hook that rejects everything does NOT stop the merge', async () => {
@@ -140,7 +140,7 @@ describe('worktreePool against real git', () => {
     const n = node('root/05-e')
     const lease = await p.acquire(n) as { path: string }
     await writeFile(join(lease.path, 'hooked.txt'), 'work\n')
-    expect(await p.commitAndMerge(n)).toEqual({ ok: true, merged: true })
+    expect(await p.commitAndMerge(n)).toMatchObject({ ok: true, merged: true })
   })
 
   it('a real conflict is reported as a conflict, with the files, and keeps the worktree', async () => {
@@ -194,7 +194,7 @@ describe('worktreePool against real git', () => {
     const c = node('root/10-j')
     const lc = await p.acquire(c) as { path: string }
     await writeFile(join(lc.path, 'unrelated.txt'), 'fine\n')
-    expect(await p.commitAndMerge(c)).toEqual({ ok: true, merged: true })
+    expect(await p.commitAndMerge(c)).toMatchObject({ ok: true, merged: true })
   })
 
   it('concurrent merges are serialised — every node lands, none is lost', async () => {
@@ -265,6 +265,35 @@ describe('worktreePool against real git', () => {
     const show = await git(['show', `${salvageRef}:partial.ts`], gitRoot)
     expect(show.code).toBe(0)
     expect(show.stdout).toContain('half-finished work')
+  })
+
+  it('只有被忽略的构建产物时不留抢救分支 —— 那条分支会是集成分支的逐字副本', async () => {
+    // 脏的判据带 --ignored(它得覆盖「产出就是 dist/」那种节点),于是一个只跑过构建的
+    // 工作区也会走进抢救那一段;而 `add -A` 不暂存被忽略的文件,commit 无事可做,
+    // HEAD 就还是集成分支的 tip。无条件建分支 = 收口报告里多一条「这里抢救出了东西」,
+    // 而那条分支里一个字节的差异都没有。
+    //
+    // 分析/质疑讨论也在节点工作区里跑之后,这条路是每个隔离节点的必经之路。
+    const p = pool()
+    await p.init()
+    await writeFile(join(p.integrationPath, '.gitignore'), 'target/\n')
+    await git(['add', '-A'], p.integrationPath)
+    await git(['commit', '-qm', 'ignore target'], p.integrationPath)
+
+    const n = node('root/23-build')
+    const l1 = await p.acquire(n) as { path: string }
+    await mkdir(join(l1.path, 'target'), { recursive: true })
+    await writeFile(join(l1.path, 'target', 'out.bin'), 'built\n')
+    // 前提:这棵树确实被算成「脏」,否则这个用例什么都没证。
+    const st = await git(['status', '--porcelain', '--ignored'], l1.path)
+    expect(st.stdout.trim().length).toBeGreaterThan(0)
+
+    await p.acquire(n)
+    const refs = await git(['for-each-ref', '--format=%(refname)', 'refs/heads/efftask/001/salvage'], gitRoot)
+    expect(refs.stdout.trim()).toBe('')
+    // 而构建产物本身还在原处 —— 只是没有人假装抢救过它。
+    const still = await readFile(join(l1.path, 'target', 'out.bin'), 'utf-8')
+    expect(still).toContain('built')
   })
 
   it('dispose reports what it kept instead of silently deleting or silently leaking', async () => {
@@ -522,7 +551,7 @@ describe('冲突必须发生在节点自己的工作区(spec §8),且绝不带�
     await git(['add', '-A'], pb)
 
     const res = await p.commitAndMerge(b)
-    expect(res).toEqual({ ok: true, merged: true })
+    expect(res).toMatchObject({ ok: true, merged: true })
     const shared = await git(['show', `${p.integrationBranchName}:shared.txt`], gitRoot)
     expect(shared.stdout).toContain('A 版本 + B 版本')
     // the documentation survives intact — it was never the problem
@@ -550,7 +579,7 @@ describe('冲突必须发生在节点自己的工作区(spec §8),且绝不带�
     ].join('\n'))
 
     const res = await p.commitAndMerge(n)
-    expect(res).toEqual({ ok: true, merged: true })
+    expect(res).toMatchObject({ ok: true, merged: true })
     const shown = await git(['show', `${p.integrationBranchName}:doc.md`], gitRoot)
     expect(shown.stdout).toContain('请手工合并')
   })
@@ -606,6 +635,356 @@ describe('冲突必须发生在节点自己的工作区(spec §8),且绝不带�
   })
 })
 
+/**
+ * **完成一个子任务就合一次**(用户:「不要等所有任务完成再合并。所以也不要什么分支开发,
+ * 只有主干开发」)。
+ *
+ * 在这之前,集成分支只在整趟跑完时由 finishHandoff 合一次 —— 中途用户的目录里什么都没有,
+ * 一个跑三小时的 run 就是三小时的黑箱。这一组用例钉住的是「什么时候合、什么时候不合、
+ * 不合的时候说什么」,全部对着真 git:这条路会**改用户自己的工作区**,假 runner 会对
+ * 每一个关于 git 行为的假设点头。
+ */
+describe('逐任务合回主干', () => {
+  const trunkFile = async (name: string): Promise<string | null> =>
+    readFile(join(gitRoot, name), 'utf-8').catch(() => null)
+
+  it('一个子任务合进集成分支之后,产出**立刻**出现在用户的目录里', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'shipped.ts'), 'the work\n')
+    const res = await p.commitAndMerge(n)
+    expect(res).toMatchObject({ ok: true, merged: true, trunk: { advanced: true } })
+    // 文件真的在用户的检出里,而且 main 真的前进了(不是只有集成分支动了)。
+    expect(await trunkFile('shipped.ts')).toContain('the work')
+    expect((await git(['rev-parse', 'main'], gitRoot)).stdout.trim())
+      .toBe((await git(['rev-parse', 'efftask/001/integration'], gitRoot)).stdout.trim())
+  })
+
+  it('两个子任务 = 两次合并,不是攒到最后一次', async () => {
+    const p = pool()
+    await p.init()
+    for (const id of ['root/01-a', 'root/02-b']) {
+      const n = node(id)
+      const l = await p.acquire(n) as { path: string }
+      await writeFile(join(l.path, `${id.slice(-1)}.ts`), `${id}\n`)
+      expect(await p.commitAndMerge(n)).toMatchObject({ trunk: { advanced: true } })
+      // 每一步之后当前那一份就已经在用户目录里 —— 不必等下一个子任务。
+      expect(await trunkFile(`${id.slice(-1)}.ts`)).toContain(id)
+    }
+    const h = await p.handoff([])
+    // **从 git 现算**:两个子任务各贡献一次提交,全部已经落在 main 上。
+    expect(h.trunkLanded).toBe(2)
+    expect(h.commits).toBe(0)
+  })
+
+  it('用户的工作区有未提交的**已跟踪**改动 → 不合,并说清为什么;产出留在集成分支上', async () => {
+    const p = pool()
+    await p.init()
+    await writeFile(join(gitRoot, 'base.txt'), '用户自己正在改\n')
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'shipped.ts'), 'the work\n')
+    const res = await p.commitAndMerge(n) as { ok: true; merged: boolean; trunk?: { advanced: boolean; reason?: string } }
+    // 节点自己是成功的 —— 产出在集成分支上,判决不受影响。
+    expect(res).toMatchObject({ ok: true, merged: true })
+    expect(res.trunk?.advanced).toBe(false)
+    expect(res.trunk?.reason).toContain('未提交的改动')
+    expect(await trunkFile('shipped.ts')).toBeNull()
+    // 用户自己的改动一个字节都没动。
+    expect(await trunkFile('base.txt')).toContain('用户自己正在改')
+    expect((await p.handoff([])).trunkSkips.join(' ')).toContain('未提交的改动')
+  })
+
+  it('**未跟踪**文件不算脏 —— 按 status --porcelain 判的话这个功能几乎一次都不会发生', async () => {
+    const p = pool()
+    await p.init()
+    // `.claude/efftask/` 由 init() 写进 .git/info/exclude,**证明不了这一条** —— 它在
+    // status 里本来就看不见。要一个真正会出现在 `status --porcelain` 里的未跟踪文件:
+    // 用户目录里那种随手留下的东西才是这条判据每天要面对的输入。
+    await writeFile(join(gitRoot, 'scratch.txt'), '用户随手留下的\n')
+    expect((await git(['status', '--porcelain'], gitRoot)).stdout).toContain('?? scratch.txt')
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'shipped.ts'), 'the work\n')
+    expect(await p.commitAndMerge(n)).toMatchObject({ trunk: { advanced: true } })
+    expect(await trunkFile('shipped.ts')).toContain('the work')
+  })
+
+  it('detached HEAD → 不合(那是唯一「合成功了、代码却不在任何分支上」的路)', async () => {
+    const p = pool()
+    await p.init()
+    await git(['checkout', '-q', '--detach', 'HEAD'], gitRoot)
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'shipped.ts'), 'the work\n')
+    const res = await p.commitAndMerge(n) as { trunk?: { advanced: boolean; reason?: string } }
+    expect(res.trunk?.advanced).toBe(false)
+    expect(res.trunk?.reason).toContain('detached HEAD')
+  })
+
+  it('用户自己就站在集成分支上 → 不对自己 merge,但必须说出来(他的 status 会显示成一串删除)', async () => {
+    const p = pool()
+    await p.init()
+    // 集成工作区占着那条分支,所以主检出要用 --ignore-other-worktrees 才切得过去。
+    await git(['checkout', '-q', '--ignore-other-worktrees', 'efftask/001/integration'], gitRoot)
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'shipped.ts'), 'the work\n')
+    const res = await p.commitAndMerge(n) as { trunk?: { advanced: boolean; reason?: string } }
+    expect(res.trunk?.advanced).toBe(false)
+    /**
+     * **不能沉默。** 分支引用是共享的:集成工作区把它推进之后,他那棵树的 HEAD 跟着走
+     * 而工作区文件没动 —— `git status` 把整批产出显示成一串待提交的删除。验收实测到的
+     * 就是这个形态,而上一版在这一格上一个字都不说。
+     */
+    expect(res.trunk?.reason).toContain('停在集成分支')
+    expect(res.trunk?.reason).toContain('git switch')
+    expect((await p.handoff([])).trunkSkips.join(' ')).toContain('停在集成分支')
+  })
+
+  /**
+   * **merge 失败 ≠ 有冲突文件。** 验收实测到三个各自独立的触发器,全都是「非零退出 +
+   * 零个 unmerged path」:`commit-msg` 钩子拒绝(commitlint/husky)、`pre-merge-commit`
+   * 钩子拒绝、`rerere.autoupdate` 自动暂存了解决。上一版只在有 UU 行时才 abort,于是
+   * 这三条路都把 MERGE_HEAD 和整批产出留在用户的检出里,而收口屏逐字写着
+   * 「你的工作区未被改动」;之后每个子任务还会把这个半合并状态**报成用户的脏改动**。
+   *
+   * 前提只有一个:用户在 run 跑着的时候自己提交过一笔(否则合并是快进,不产生提交,
+   * 也就不走 commit 钩子)—— 而那正是这个功能的卖点场景。
+   */
+  it('commit-msg 钩子拒绝(非零退出但零冲突文件)→ 不许把用户丢在半合并状态', async () => {
+    const p = pool()
+    await p.init()
+    // 用户自己提交一笔 → 下面那次合并是真的合并提交,会走 commit-msg 钩子。
+    // **钩子要装在这一笔之后**:装在前面的话用户这次提交自己就被拒了,树留着脏改动,
+    // 测的就变成脏树那一格了(第一版就是这么写的,而它「通过」得毫无意义)。
+    await writeFile(join(gitRoot, 'user.txt'), '用户自己的\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user'], gitRoot)
+    await mkdir(join(gitRoot, '.git', 'hooks'), { recursive: true })
+    await writeFile(join(gitRoot, '.git', 'hooks', 'commit-msg'),
+      '#!/bin/sh\necho "commitlint: subject may not be empty" >&2\nexit 1\n', { mode: 0o755 })
+
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'a.ts'), 'A\n')
+    const res = await p.commitAndMerge(n) as { trunk?: { advanced: boolean; reason?: string } }
+
+    // `--no-verify` 让它直接合成了(编排器发起的合并必然要发生,钩子拒绝是确定性失败,
+    // 重试永远不会收敛 —— commitAndMerge 早就为同一个理由带着这个开关)。
+    expect(res.trunk?.advanced).toBe(true)
+    // 而无论走哪条路,**绝不能**留下 MERGE_HEAD。
+    expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], gitRoot)).code).not.toBe(0)
+    expect(await trunkFile('a.ts')).toContain('A')
+  })
+
+  it('合并失败但一个冲突文件都没有 → 照样 abort,并且复核过现场真的没了', async () => {
+    // 直接制造「非零退出 + 零 unmerged path」:用户目录里有一个未跟踪文件,而集成分支
+    // 带来同名文件 —— git 在动任何字节之前就拒绝,报错第一行没有宾语(文件名在后面几行)。
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'collide.ts'), '任务这一版\n')
+    await writeFile(join(gitRoot, 'collide.ts'), '用户手里那一版\n')
+    const res = await p.commitAndMerge(n) as { trunk?: { advanced: boolean; reason?: string } }
+
+    expect(res.trunk?.advanced).toBe(false)
+    expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], gitRoot)).code).not.toBe(0)
+    // 用户那个未跟踪文件一个字节都没动 —— git 自己的拒绝比我们猜得准。
+    expect(await trunkFile('collide.ts')).toContain('用户手里那一版')
+    // 原因里要有**宾语**:只取 stderr 第一行的话,用户拿到的是
+    // 「error: The following untracked working tree files would be overwritten by merge:」。
+    expect(res.trunk?.reason).toContain('collide.ts')
+  })
+
+  it('rerere 自动暂存了解决(MERGE_HEAD 在、一个 UU 都没有)→ 照样还原,不留半合并现场', async () => {
+    /**
+     * `--no-verify` 挡掉了钩子那两个触发器,**这一个挡不掉**:开了
+     * `rerere.enabled + rerere.autoupdate` 的用户(相当常见),再次遇到同一个冲突时 git 会
+     * 自动套用上次的解决并 `git add`,然后**非零退出**等人来 commit —— 于是 `status` 里
+     * 只有 `M ` 而没有 `UU`。上一版的 abort 门控在「有没有 UU 行」上,这一格直接漏过去。
+     * 实测(git 2.54):`rc=1` / `MERGE_HEAD present` / `M  f.txt`。
+     */
+    const p = pool()
+    await p.init()
+    await git(['config', 'rerere.enabled', 'true'], gitRoot)
+    await git(['config', 'rerere.autoupdate', 'true'], gitRoot)
+    // 先让 rerere 记住一次解决:同样的两边、同样的基线。
+    await git(['branch', 'rr-src'], gitRoot)
+    await writeFile(join(gitRoot, 'f.txt'), '用户这一版\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user side'], gitRoot)
+    await git(['checkout', '-q', 'rr-src'], gitRoot)
+    await writeFile(join(gitRoot, 'f.txt'), '任务这一版\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'node side'], gitRoot)
+    await git(['checkout', '-q', 'main'], gitRoot)
+    await git(['merge', '--no-edit', 'rr-src'], gitRoot)          // 冲突
+    await writeFile(join(gitRoot, 'f.txt'), '手工解决的\n')
+    await git(['add', 'f.txt'], gitRoot)
+    await git(['commit', '-qm', 'resolved'], gitRoot)             // ← rerere 记下来了
+    await git(['reset', '-q', '--hard', 'HEAD~1'], gitRoot)       // 撤销那次合并,保留记录
+
+    // 现在一个子任务带来**逐字相同**的另一边,于是主干合并时命中那条记录。
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'f.txt'), '任务这一版\n')
+    const res = await p.commitAndMerge(n) as { trunk?: { advanced: boolean; reason?: string } }
+
+    expect(res.trunk?.advanced).toBe(false)
+    // **这一条是整个用例的意义所在**:现场必须被收拾干净。
+    expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], gitRoot)).code).not.toBe(0)
+    expect((await git(['status', '--porcelain'], gitRoot)).stdout.trim()).toBe('')
+    expect(await trunkFile('f.txt')).toContain('用户这一版')
+    expect(res.trunk?.reason).toContain('已还原你的工作区')
+  })
+
+  it('用户回退掉已经合进来的提交 → 不再原样合回去,并说清为什么', async () => {
+    // README 卖的是「合并只发生在你自己的仓库里,随时 git reset 得回来」。不认这件事的话,
+    // 下一个子任务完成时会把他刚扔掉的提交原样合回来 —— 而没有任何提示说它被撤销了。
+    const p = pool()
+    await p.init()
+    const a = node('root/01-a')
+    const la = await p.acquire(a) as { path: string }
+    await writeFile(join(la.path, 'a.ts'), 'A\n')
+    await p.commitAndMerge(a)
+    expect(await trunkFile('a.ts')).toContain('A')
+
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+    expect(await trunkFile('a.ts')).toBeNull()
+
+    const b = node('root/02-b')
+    const lb = await p.acquire(b) as { path: string }
+    await writeFile(join(lb.path, 'b.ts'), 'B\n')
+    const res = await p.commitAndMerge(b) as { trunk?: { advanced: boolean; reason?: string } }
+    expect(res.trunk?.advanced).toBe(false)
+    expect(res.trunk?.reason).toContain('回退过')
+    expect(await trunkFile('a.ts')).toBeNull()   // 他扔掉的东西没有被合回来
+    expect(await trunkFile('b.ts')).toBeNull()
+    // 而产出一个都没丢:全在集成分支上,收口那一屏会告诉他怎么拿。
+    expect((await git(['show', 'efftask/001/integration:b.ts'], gitRoot)).stdout).toContain('B')
+  })
+
+  it('一次成功的合并会把此前「没送到」的警告清掉 —— 集成分支是累积的', async () => {
+    const p = pool()
+    await p.init()
+    await writeFile(join(gitRoot, 'base.txt'), '用户正在改\n')
+    const a = node('root/01-a')
+    const la = await p.acquire(a) as { path: string }
+    await writeFile(join(la.path, 'a.ts'), 'A\n')
+    await p.commitAndMerge(a)
+    expect((await p.handoff([])).trunkSkips.length).toBe(1)
+
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user'], gitRoot)
+    const b = node('root/02-b')
+    const lb = await p.acquire(b) as { path: string }
+    await writeFile(join(lb.path, 'b.ts'), 'B\n')
+    await p.commitAndMerge(b)
+    // 两笔都到了,那句警告在这一刻已经不成立 —— 留着它会和上面那句「已逐一合并回你的
+    // 分支」同时印在收口屏上。
+    expect(await trunkFile('a.ts')).toContain('A')
+    expect((await p.handoff([])).trunkSkips).toEqual([])
+  })
+
+  it('撞冲突 → 还原用户的工作区,如实说,产出留在集成分支上', async () => {
+    const p = pool()
+    await p.init()
+    // 用户在自己的分支上改了同一个文件并提交 —— 于是两边在同一行分叉。
+    await writeFile(join(gitRoot, 'same.txt'), '用户这一版\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user side'], gitRoot)
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'same.txt'), '任务这一版\n')
+    const res = await p.commitAndMerge(n) as { ok: true; trunk?: { advanced: boolean; reason?: string; conflicted?: boolean } }
+    expect(res.ok).toBe(true)
+    expect(res.trunk?.conflicted).toBe(true)
+    expect(res.trunk?.reason).toContain('撞了冲突')
+    expect(res.trunk?.reason).toContain('已还原')
+    // 关键:用户的工作区**没有**被留在半合并状态。
+    const st = await git(['status', '--porcelain'], gitRoot)
+    expect(st.stdout).not.toMatch(/^(UU|AA) /m)
+    expect(await trunkFile('same.txt')).toContain('用户这一版')
+    // 而产出在集成分支上,收口那一次还会再试一遍。
+    expect((await p.handoff([])).commits).toBeGreaterThan(0)
+  })
+
+  it('`--resume` 之后仍然说得出「产出已经在你的分支上」—— 新进程 = 新池子 = 计数器归零', async () => {
+    /**
+     * 这一条是**内存计数器不够用**的证明。验收实测:恢复之后收口屏印的是
+     * 「本次没有产生任何改动;分支与起点相同」,而用户目录里躺着三个子任务的产出;
+     * 打开了自动推送的人在这条路上也一次都推不出去(那个开关的门就是这个数)。
+     *
+     * 所以 `trunkLanded` 必须从 git 现算(起点钉在 `refs/efftask/<runId>/base` 上),
+     * 而不是数这个进程里合成功过几次。
+     */
+    const first = pool()
+    await first.init()
+    for (const id of ['root/01-a', 'root/02-b', 'root/03-c']) {
+      const n = node(id)
+      const l = await first.acquire(n) as { path: string }
+      await writeFile(join(l.path, `${id.slice(-1)}.ts`), `${id}\n`)
+      await first.commitAndMerge(n)
+    }
+    expect((await first.handoff([])).trunkLanded).toBe(3)
+
+    // 新进程:同一个 runId、同一个仓库,一个全新的池子(`--resume` 就是这样)。
+    const resumed = pool()
+    expect(await resumed.init()).toEqual({ ok: true })
+    const h = await resumed.handoff([])
+    expect(h.commits).toBe(0)
+    expect(h.trunkLanded).toBe(3)   // ← 内存计数器在这里是 0
+    expect(await trunkFile('a.ts')).toContain('root/01-a')
+  })
+
+  it('用户在 run 跑着的时候自己提交了 → 那几笔会被带进集成分支,后面的任务看得见', async () => {
+    // 「任务开始就先从主干同步代码」在这种情况下才是真的:acquire 基于集成分支,
+    // 不把主干上多出来的东西带回去,用户自己那几笔对所有后续任务永远不存在。
+    const p = pool()
+    await p.init()
+    await writeFile(join(gitRoot, 'user.txt'), '用户自己提交的\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user commit during the run'], gitRoot)
+
+    const a = node('root/01-a')
+    const la = await p.acquire(a) as { path: string }
+    await writeFile(join(la.path, 'a.ts'), 'A\n')
+    expect(await p.commitAndMerge(a)).toMatchObject({ trunk: { advanced: true } })
+
+    // 集成分支现在也含有用户那一笔 —— 所以下一个节点的工作区里看得到它。
+    expect((await git(['show', 'efftask/001/integration:user.txt'], gitRoot)).stdout).toContain('用户自己提交的')
+    const b = node('root/02-b')
+    const lb = await p.acquire(b) as { path: string }
+    expect(await readFile(join(lb.path, 'user.txt'), 'utf-8')).toContain('用户自己提交的')
+  })
+
+  it('脏树挡掉一次之后,树干净了 → 下一个子任务把两笔一起带过去', async () => {
+    const p = pool()
+    await p.init()
+    await writeFile(join(gitRoot, 'base.txt'), '用户自己正在改\n')
+    const a = node('root/01-a')
+    const la = await p.acquire(a) as { path: string }
+    await writeFile(join(la.path, 'a.ts'), 'A\n')
+    await p.commitAndMerge(a)
+    expect(await trunkFile('a.ts')).toBeNull()
+
+    // 用户提交了自己的改动 —— 树干净了。
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user commit'], gitRoot)
+    const b = node('root/02-b')
+    const lb = await p.acquire(b) as { path: string }
+    await writeFile(join(lb.path, 'b.ts'), 'B\n')
+    expect(await p.commitAndMerge(b)).toMatchObject({ trunk: { advanced: true } })
+    // **两笔**都到了:落下的那一笔不需要等到收口。
+    expect(await trunkFile('a.ts')).toContain('A')
+    expect(await trunkFile('b.ts')).toContain('B')
+  })
+})
+
 describe('收口:用户必须能找到自己的工作(spec §8)', () => {
   it('reports the branch, the commit count and anything left behind', async () => {
     // Without this the run ends having written every change to a branch the user is never
@@ -626,8 +1005,44 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
 
     const h = await p.handoff([done, stuck])
     expect(h.branch).toBe('efftask/001/integration')
-    expect(h.commits).toBeGreaterThan(0)
+    // 逐任务合并已经把它送进 main 了 —— 所以「还没合进你分支的提交数」是 0,而
+    // trunkMerged 是 1。两个数一起才说得清这一趟的产出在哪:少了后者,收口那一屏会
+    // 对着一次真的合并印「本次没有产生任何改动」。
+    expect(h.commits).toBe(0)
+    expect(h.trunkLanded).toBe(1)
+    expect(h.trunkSkips).toEqual([])
+    expect((await git(['show', 'HEAD:shipped.ts'], gitRoot)).stdout).toContain('the work')
     expect(h.kept.map(k => k.path)).toContain(ls.path)
+  })
+
+  /**
+   * 分析/质疑讨论借来的那棵树在 `releasePlanBase` 里被交回(`node.worktree` 清空),而目录
+   * 留给执行环节复用。节点如果在这中间被阻断、或 run 在此刻中止,目录就成了
+   * **保留而不可见**:`handoff().kept` 原来只遍历还挂着 `worktree` 的节点,而 `dispose()`
+   * 收得掉干净的、收不掉被方案席写脏的那些(它的返回值在编排层被丢弃)。
+   *
+   * 「保留而不可见」对用户等同于丢失 —— 这是 spec §8 收口那一节的全部理由。
+   */
+  it('分析阶段借完就交回、但里面还有东西的目录,也要报出去', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, '调研笔记.md'), '方案席留下的\n')
+    // 交回 = 只清引用,不动磁盘(执行环节要复用同一个目录)。
+    expect(n.worktree).toBeUndefined()
+
+    const kept = (await p.handoff([n])).kept
+    expect(kept.map(k => k.path)).toContain(l.path)
+    expect(kept.find(k => k.path === l.path)?.why).toContain('分析/质疑讨论')
+  })
+
+  it('交回之后目录是干净的 → 不报(干净目录出现在收口屏上纯属噪音)', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/02-b')
+    await p.acquire(n)
+    expect((await p.handoff([n])).kept).toEqual([])
   })
 
   it('says plainly when a run produced nothing', async () => {
@@ -699,7 +1114,7 @@ describe('跨分支依赖调度:一个节点看得见依赖合进来的东西吗
     const lease = await p.acquire(dep)
     if ('error' in lease) throw new Error(lease.error)
     await writeFile(join(lease.path, 'schema.sql'), 'CREATE TABLE t;\n')
-    expect(await p.commitAndMerge(dep)).toEqual({ ok: true, merged: true })
+    expect(await p.commitAndMerge(dep)).toMatchObject({ ok: true, merged: true })
 
     const downstream = node('root/02-use', '用 schema')
     const l2 = await p.acquire(downstream)
@@ -815,7 +1230,7 @@ describe('跨分支依赖调度:一个节点看得见依赖合进来的东西吗
     const contains = await git(['merge-base', '--is-ancestor', intTip, 'HEAD'], la.path)
     expect(contains.code).toBe(0)
 
-    expect(await p.commitAndMerge(a)).toEqual({ ok: true, merged: true })
+    expect(await p.commitAndMerge(a)).toMatchObject({ ok: true, merged: true })
     const intFile = await git(['show', `efftask/001/integration:mine.ts`], gitRoot)
     expect(intFile.stdout).toContain('mine')
   })

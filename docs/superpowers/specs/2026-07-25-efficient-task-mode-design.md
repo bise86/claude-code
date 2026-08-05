@@ -372,6 +372,11 @@ run 跑完 → `reclaim()` 照常 → `pendingHandoff` 写进 run.md → **立�
 > **2026-07-30 偏离(已实现,取代上面这一段的一半)。** 用户报的原话:「任务完后,在隔离环境产出的代码和目录,并且提交成功了,要在当前目录下有对应的存在。」
 > 照上面这套做出来的结果是**合并永远不会发生**:关口只在 `--resume` 路径上出现,同一次会话跑完是直接进 done 视图,而 done 视图印的是「你的工作区未被改动」+ 几行要手敲的 git 命令。
 > 现在改成:**跑完就自动把集成分支合并回当前分支**(`finishHandoff.ts`,排在 `reclaim()` 之后、`settle()` 与最后一次 `queueManifest` 之前),合成功就把 `pendingHandoff` 清掉再落盘。三种情形**不**自动合,并在 done 视图上说清原因:run 没正常跑完、工作区有**已跟踪文件**的未提交改动(未跟踪文件不算 —— `/et` 自己就在用户检出里写 `.claude/efftask/`)、detached HEAD。关口原样留在 `--resume` 那条路上。
+> **2026-08-05 偏离(已实现,再取代上面那一段)。** 用户原话:「完成一个单独子任务就要去合并,不要等所有任务完成再合并。所以也不要什么分支开发,只有主干开发。」
+> 现在改成:**每个子任务合进集成分支之后立刻把集成分支合回用户当前的分支**(`worktreePool.intoTrunk`,在 `commitAndMerge` 的 mergeLock 里紧跟成功的那次 merge)。判据与收口那一次同源:脏树(只看**已跟踪**改动)/ detached HEAD 不合;撞冲突 `git merge --abort` 还原用户的工作区;用户自己就站在集成分支上时不对自己 merge。合不上**不影响节点判决**(产出已在集成分支上),原因写进该节点的 `execStatus`,并汇总进 `handoff().trunkSkips` 印在收口那一屏。跑完那一次 `finishHandoff` 照旧跑,补齐中途落下的。
+> 同时**取消收口方式开关**(`EffTaskConfig.finish` / 关口的 `m` 键 / run.md 的 `finish:`):分支开发与逐任务合并互斥。老 run.md 里的 `finish:` 由 `resumeCore` 忽略并留一条降级说明。
+> `handoff().commits`(= `HEAD..集成分支`)在正常路径上因此是 **0**,而那一支原来印「本次没有产生任何改动」—— 所以 `HandoffSummary` 多了 `trunkMerged`/`trunkSkips`,`handoffLines` 与自动推送都按它判(少了它,打开推送开关的人在最常见的路径上一次也推不出去)。
+>
 > 同时推翻下面「**成功才**把待收口划掉」里的一处:`keep` 也划掉。理由是恢复路径在任何节点检查之前就判 `pendingHandoff` 并 return,而关口每个出口都走 done —— 不划掉的话一个「被安全阀挡住 + 有待收口」的 run 会**永久卡在收口关口**,`--retry-blocked` 永远到不了 reseat。`ConfirmHandoff` 的文案已按此改口。
 
 - **`pendingHandoff` 独立于 `status`。** run.md 的 `status` 只在最后一次写入时带上,盘上会先出现 `status: completed` 而集成分支还没处置。用户此时**直接关终端**(不是按 Esc)→ reseat 只捞活动态节点、根节点已 ACCEPTED → 什么都不会重开。所以恢复路径必须在**任何节点检查之前**判定它 —— 「run 里没有可恢复的节点」那句 fatal 会先触发,把用户挡在门外。
@@ -388,10 +393,12 @@ run 跑完 → `reclaim()` 照常 → `pendingHandoff` 写进 run.md → **立�
 
 - Run 启动时创建一条**集成分支** `efftask/<run-id>/integration`(从当前 HEAD 拉)。
 - 每个 `executable` 节点进入 EXECUTING 前:从集成分支当前状态 `git worktree add` 一个分支 `efftask/<run-id>/<node-id>`,执行 agent 的 `cwd` 指向该 worktree(复用 AgentTool 的 `cwd`/`isolation` 能力)。
+- **分析与质疑讨论同样在节点自己的工作区里跑**(节点一进 `stepStart` 就借一棵基于集成分支当前状态的树,这两关跑完**归还**,执行环节照旧自己再 `acquire` 一次 —— 那一次重新落到集成分支**那时**的状态)。理由:依赖门控保证节点被调度时依赖全部 ACCEPTED,而 ACCEPTED 的定义就是「产出已合入集成分支」;这两关原来没有 cwd,读的是用户的主检出,而隔离运行下那棵树整趟运行一个字节都不会变 —— 依赖别人的节点,方案是对着「依赖还没做」的代码写出来的。借不到工作区时**降级**(退回主检出并在 node.md 上写明它看不到什么),不阻断:执行环节那条硬闸挡的是带写工具的执行者落进用户检出,这两关不适用同一条判据。
+- 返工轮之间用 `refreshFromIntegration` 再同步一次(兄弟分支可能在这期间合入);同步冲突 = 留在原基线,由最后那次合并按 §8 的冲突路径处理。
 - 验收 + 评分通过后进入 MERGE:把节点分支合并回集成分支。
   - 无冲突 → 合并,移除该 worktree,节点 ACCEPTED。
   - 冲突 → 触发一次"合并解决"(默认由该节点 execute 角色在 worktree 内解决并重跑验收);仍失败 → **升级人工**(飞书卡片),暂停该节点为 BLOCKED,等人工处理。
-- Run 全部 ACCEPTED 后,集成分支交给用户:复用 `superpowers:finishing-a-development-branch` 让用户选择合回当前分支 / 保留 / 丢弃。**默认不直接改用户当前工作区**。
+- ~~Run 全部 ACCEPTED 后,集成分支交给用户……**默认不直接改用户当前工作区**。~~ **2026-08-05 起不成立**:每个子任务通过验收就把集成分支合回用户当前的分支(见上面那条偏离),跑完那一次只是补齐中途落下的。`--resume` 的四选一关口原样保留 —— 它处置的是「还没合进去的那些」。
 - 非 git 仓库场景:启动时检测,若当前目录非 git 仓库 → 提示用户("需要 git 仓库以隔离并行执行")并允许选择"改用共享工作目录串行执行"降级(或初始化 git)。
 
 ## 9. 确认与飞书集成

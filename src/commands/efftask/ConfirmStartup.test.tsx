@@ -648,14 +648,17 @@ describe('启动关口的 git 三个开关', () => {
     return { ...t, app, decisions }
   }
 
-  it('默认那三行画得出来,而且回车送出的就是默认值', async () => {
+  it('默认那几行画得出来,而且回车送出的就是默认值', async () => {
     const g = await mountGate()
     expect(g.lastFrame()).toContain('worktree 隔离')
-    expect(g.lastFrame()).toContain('合回当前分支')
+    // 收口方式不再是开关,但**必须还在屏幕上** —— 它说的是「每个子任务完成时就合回你的分支」,
+    // 而那是这一趟会对用户的工作目录做的事,关口的全部意义就是先把它说出来。
+    expect(g.lastFrame()).toContain('主干开发')
     g.stdin.press('\r')
     await new Promise(r => setTimeout(r, 20))
     g.app.unmount()
-    expect(g.decisions[0]).toMatchObject({ isolation: 'worktree', finish: 'merge', autoPush: false })
+    expect(g.decisions[0]).toMatchObject({ isolation: 'worktree', autoPush: false })
+    expect(g.decisions[0]).not.toHaveProperty('finish')
   })
 
   it('w 切共享工作树:屏幕改口,决策也跟着改', async () => {
@@ -668,17 +671,19 @@ describe('启动关口的 git 三个开关', () => {
     expect(g.decisions[0]).toMatchObject({ isolation: 'shared' })
   })
 
-  it('m 切保留分支,p 开自动推送', async () => {
+  it('m 是死键(分支开发已取消),p 开自动推送', async () => {
     const g = await mountGate()
     g.stdin.press('m'); await new Promise(r => setTimeout(r, 20))
     g.stdin.press('p'); await new Promise(r => setTimeout(r, 20))
-    expect(g.lastFrame()).toContain('保留 efftask 分支')
+    // 按 m 什么都不该发生 —— 那一档没有了,屏幕上也不该出现它。
+    expect(g.lastFrame()).not.toContain('保留 efftask 分支')
     // 渲染器只写**增量**,所以断言落在改动那一行的独有片段上,不是整行原文。
-    expect(g.lastFrame()).toContain('跑完会 git push efftask 分支')
+    expect(g.lastFrame()).toContain('跑完会 git push 当前分支')
     g.stdin.press('\r')
     await new Promise(r => setTimeout(r, 20))
     g.app.unmount()
-    expect(g.decisions[0]).toMatchObject({ finish: 'keep', autoPush: true })
+    expect(g.decisions[0]).toMatchObject({ autoPush: true })
+    expect(g.decisions[0]).not.toHaveProperty('finish')
   })
 
   it('隔离用不了时 w 是死键 —— 而且键位提示里不写它', async () => {
@@ -694,8 +699,7 @@ describe('启动关口的 git 三个开关', () => {
   })
 
   it('config 上已有的选择要当初值显示 —— --resume 恢复出来的那份不能被显示成默认', async () => {
-    const g = await mountGate({ config: { ...config, finish: 'keep', autoPush: true } })
-    expect(g.lastFrame()).toContain('保留 efftask 分支')
+    const g = await mountGate({ config: { ...config, autoPush: true } })
     expect(g.lastFrame()).toContain('跑完会 git push')
     g.app.unmount()
   })

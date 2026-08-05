@@ -52,11 +52,17 @@ export function ConfirmHandoff(props: {
           注意:本次运行**没有正常跑完**（{h.reason || '被阻断或已取消'}）,下面的改动可能是半成品
         </Text>
       ) : null}
+      {/*
+        「你的工作区未被改动」**只有在真没动过时才能说**。逐任务合并之后,中途合成功过的
+        提交早就在用户目录里了(`trunkLanded`),对着它说没动过是一句他会照着做决定的假话。
+      */}
       <Text>
-        分支 {h.branch} 上有 {h.commits} 个提交,你的工作区未被改动
+        {(h.trunkLanded ?? 0) > 0
+          ? `分支 ${h.branch} 上还有 ${h.commits} 个提交没合进来;另有 ${h.trunkLanded} 个提交已在跑的过程中合进了你当前的分支`
+          : `分支 ${h.branch} 上有 ${h.commits} 个提交,你的工作区未被改动`}
       </Text>
       {h.integrationPath ? <Text dimColor>集成工作区: {h.integrationPath}</Text> : null}
-      {h.salvage.map(s => <Text key={s} dimColor>中断时抢救出的提交: {s}</Text>)}
+      {h.salvage.map(s => <Text key={s} dimColor>抢救出的提交(未合入集成分支的中间产物): {s}</Text>)}
       {h.kept.map(k => <Text key={k.path} dimColor>保留的工作区({k.why}): {k.path}</Text>)}
 
       {confirmingDiscard ? (

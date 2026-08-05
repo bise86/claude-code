@@ -489,15 +489,15 @@ export async function writeRunManifest(
     ...(cfg.phaseGuidance && Object.keys(cfg.phaseGuidance).length > 0 ? { phaseGuidance: cfg.phaseGuidance } : {}),
     ...(cfg.roleGuidance && cfg.roleGuidance.length > 0 ? { roleGuidance: cfg.roleGuidance } : {}),
     /**
-     * 三个 git 开关。同一条白名单规矩,而这三个尤其不能漏:
+     * 两个 git 开关。同一条白名单规矩,而它们尤其不能漏:
      * `--resume` 的关口会拿读回来的 config 当**初值**渲染,读不回来的话,用户上一趟明明
-     * 选了「保留分支」,恢复之后关口显示「合回当前分支」—— 而他多半是直接回车的。
+     * 选了「共享工作树」,恢复之后关口显示「worktree 隔离」—— 而他多半是直接回车的。
+     * (收口方式那一档已经取消,`finish` 不再落盘;老 run.md 里的由 resumeCore 忽略。)
      *
      * **写条件是「不等于默认值」而不是「有值」**:默认那两个不写,新 run 的 frontmatter
      * 才和以前逐字一样(和上面 resumeGuidance 那几条同一条规矩)。
      */
     ...(cfg.isolation && cfg.isolation !== 'worktree' ? { isolation: cfg.isolation } : {}),
-    ...(cfg.finish && cfg.finish !== 'merge' ? { finish: cfg.finish } : {}),
     ...(cfg.autoPush === true ? { autoPush: true } : {}),
     // 独立于 status 落盘 —— 见 EffTaskConfig.pendingHandoff:status 先写下 completed 而
     // 集成分支还没处置,用户直接关终端就再也没人管那条分支了。

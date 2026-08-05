@@ -150,4 +150,20 @@ describe('收口关口', () => {
     const tty = await mount(H, () => {})
     expect(tty.lastFrame()).not.toContain('没有正常跑完')
   })
+
+  /**
+   * 「你的工作区未被改动」**只有在真没动过时才能说**。逐任务合并之后,中途合成功过的提交
+   * 早就在用户的目录里了 —— 而他会照着这句话决定要不要按「合并」。
+   */
+  it('中途合过就不许说「你的工作区未被改动」', async () => {
+    const clean = await mount(H, () => {})
+    expect(clean.lastFrame()).toContain('你的工作区未被改动')
+
+    const tty = await mount({ ...H, trunkLanded: 5 }, () => {})
+    const f = tty.lastFrame()
+    expect(f).not.toContain('你的工作区未被改动')
+    // 断言落在**不跨行**的那一段:渲染器会在框宽处折行并插转义序列,整句原文匹配不上。
+    expect(f).toContain('个提交已在跑的过程中合进了你当前的分支')
+    expect(f).toContain('上还有')
+  })
 })

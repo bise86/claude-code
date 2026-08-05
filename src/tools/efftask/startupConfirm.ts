@@ -42,14 +42,13 @@ export interface StartupDecision {
    */
   viewOnly?: boolean
   /**
-   * 隔离方式 / 收口方式 / 自动推送 —— 关口上的三个开关。
+   * 隔离方式 / 自动推送 —— 关口上的两个开关(收口方式随分支开发一起取消了:只有主干开发)。
    *
    * 和 `phaseRoles`、`skipSteps` 同一条规矩:**缺省 = 不变**,不是「关掉」。飞书那张卡上
-   * 没有这三个开关,而它是能赢下这场竞速的 —— 把缺省读成 false/默认值,等于让一次飞书批准
+   * 没有这两个开关,而它是能赢下这场竞速的 —— 把缺省读成 false/默认值,等于让一次飞书批准
    * 静默推翻用户刚在终端上按过的选择。
    */
   isolation?: 'worktree' | 'shared'
-  finish?: 'merge' | 'keep'
   autoPush?: boolean
 }
 
@@ -227,10 +226,9 @@ export function applyStartupDecision(config: EffTaskConfig, decision: StartupDec
     phaseRoles: decision.phaseRoles ?? config.phaseRoles,
     // 同样的「缺省 = 不变」语义:飞书那条路没有这个开关,不能把它当成「清空跳过」。
     skipSteps: decision.skipSteps ?? config.skipSteps,
-    // 三个开关同上。`autoPush` 尤其不能写成 `decision.autoPush ?? false` ——
+    // 两个开关同上。`autoPush` 尤其不能写成 `decision.autoPush ?? false` ——
     // 那会让一次飞书批准把用户在终端上刚打开的推送悄悄关掉。
     isolation: decision.isolation ?? config.isolation,
-    finish: decision.finish ?? config.finish,
     autoPush: decision.autoPush ?? config.autoPush,
   }
 }
@@ -239,17 +237,14 @@ export function applyStartupDecision(config: EffTaskConfig, decision: StartupDec
 export function isolationChoice(config: EffTaskConfig): 'worktree' | 'shared' {
   return config.isolation ?? 'worktree'
 }
-/** 收口方式的默认值 —— 没选过就是合回当前分支(主干开发)。 */
-export function finishChoice(config: EffTaskConfig): 'merge' | 'keep' {
-  return config.finish ?? 'merge'
-}
 
 /**
- * 关口上那两行开关 + 推送那一行。
+ * 关口上的隔离方式那一行 + 收口那一行 + 推送那一行。
  *
  * **一定要说出代价**,不只说选了什么:共享工作树的代价是执行串行 + 执行者在你的检出里
- * 改代码,保留分支的代价是产出不会自动出现在你手上。这个关口存在的全部意义就是让用户在
- * 花钱之前知道自己批准了什么。
+ * 改代码;而主干开发那一行说的是**这一趟会对用户的工作目录做什么**(每完成一个子任务就
+ * 合一次)—— 它不是一个开关,但恰恰因为不可选才更要先说。这个关口存在的全部意义就是让
+ * 用户在花钱之前知道自己批准了什么。
  *
  * @param unavailable 隔离**根本不可用**时的原因(非 git 仓库等)。给了就说明白:
  *   这一行不是他选的,是环境定的 —— 否则用户会盯着一个按了不动的开关。
@@ -259,7 +254,6 @@ export function gitChoiceLines(
   opts: { editable?: boolean; unavailable?: string } = {},
 ): string[] {
   const iso = isolationChoice(config)
-  const fin = finishChoice(config)
   const key = (k: string): string => (opts.editable === false ? '' : `(${k} 切换)`)
   const out: string[] = []
   out.push(
@@ -269,13 +263,10 @@ export function gitChoiceLines(
         ? `隔离方式: worktree 隔离,可并行执行 ${key('w')}`
         : `隔离方式: 共享工作树 —— 执行者直接改你当前目录,而且执行阶段强制串行 ${key('w')}`,
   )
-  // 非隔离运行压根没有集成分支,收口方式无从谈起 —— 说了就是承诺一件不会发生的事。
+  // 收口方式**不再是一个开关**:只有主干开发(用户:「不要什么分支开发」)。隔离运行下
+  // 每个子任务通过验收就合回当前分支一次,所以这一行说的是「会发生什么」,不是「你选了什么」。
   if (iso === 'worktree' && !opts.unavailable) {
-    out.push(
-      fin === 'merge'
-        ? `收口方式: 跑完合回当前分支(主干开发)${key('m')}`
-        : `收口方式: 保留 efftask 分支不合并(分支开发),产出不会自动出现在你的工作目录里 ${key('m')}`,
-    )
+    out.push('收口方式: 主干开发 —— 每个子任务完成时就把产出合回你当前的分支(工作区脏/冲突时会跳过并说明)')
   }
   /**
    * 共享工作树下**没有推送这回事**:没有池子就没有任何一次提交(pipeline 的
@@ -287,7 +278,7 @@ export function gitChoiceLines(
   } else {
     out.push(
       config.autoPush === true
-        ? `自动推送: 开 —— 跑完会 git push ${fin === 'merge' ? '当前分支' : 'efftask 分支'} ${key('p')}`
+        ? `自动推送: 开 —— 跑完会 git push 当前分支 ${key('p')}`
         : `自动推送: 关(推送要你自己来)${key('p')}`,
     )
   }
@@ -791,7 +782,7 @@ export function parallelismLine(
    * 操作凭空出现。
    */
   const scope = opts.isolation === 'worktree'
-    ? '各阶段并行,执行任务在各自的 git worktree 中隔离;跑完自动合并回当前分支(工作区不干净或未跑完时改为提示手工合并)'
+    ? '各阶段并行,执行任务在各自的 git worktree 中隔离;每个子任务完成时自动合并回当前分支(工作区不干净或撞冲突时跳过并说明,跑完再补一次)'
     : '方案/评审阶段并行;执行与叶子验收串行(未启用隔离)'
   const hint = opts.editable ? ' · ←/→ 调整' : ''
   return `并行数: ${config.parallelism}（${scope}）${hint}`
@@ -1142,6 +1133,16 @@ export interface HandoffSummary {
   kept: { path: string; why: string }[]
   salvage: string[]
   /**
+   * 这一趟已经落在用户当前分支上的提交数(handoff 从 git 现算)。
+   *
+   * 逐任务合并把 `commits`(= `HEAD..集成分支`)在正常路径上打成 0,而 0 那一支印的是
+   * 「本次没有产生任何改动;分支与起点相同」—— 在 20 个子任务已经逐一合进用户分支之后,
+   * 那句话逐字为假。缺省(旧 run / 非隔离)按 0 走,措辞与引入这条之前完全相同。
+   */
+  trunkLanded?: number
+  /** 逐任务合并被跳过的原因(去重)。有它就说明有东西**没**进用户的目录。 */
+  trunkSkips?: string[]
+  /**
    * Where the integration branch is checked out — and why the user has to be told.
    *
    * The integration worktree is deliberately never reclaimed (`dispose()` only walks the
@@ -1224,15 +1225,33 @@ export function handoffLines(
   state?: HandoffState,
 ): string[] {
   const merged = state === 'merged'
+  const alongTheWay = h.trunkLanded ?? 0
   const out = [
     h.commits > 0
       ? merged
         ? `本次改动(${h.commits} 个提交)已合并回你当前的分支 —— 产出就在当前目录里;分支 ${h.branch} 保留着`
         : state === 'conflicted'
           ? `自动合并 ${h.branch}(${h.commits} 个提交)撞了冲突,**你的工作区里留着一次未完成的合并**(见上面)`
-          : `本次改动已合并到分支 ${h.branch}(${h.commits} 个提交),你的工作区未被改动`
-      : `本次没有产生任何改动;分支 ${h.branch} 与起点相同`,
+          /**
+           * 「你的工作区未被改动」**只有在真没动过时才能说**。逐任务合并之后,中途合成功
+           * 过的提交早就在他的目录里了 —— 三处渲染器(这里、收口关口、飞书收口卡)当时
+           * 都还在无条件说这句话,而这正是本轮改动自己列为「可照做的假话」的那一类。
+           */
+          : alongTheWay > 0
+            ? `分支 ${h.branch} 上还有 ${h.commits} 个提交没合进来;另有 ${alongTheWay} 个提交已在跑的过程中合进了你当前的分支`
+            : `本次改动已合并到分支 ${h.branch}(${h.commits} 个提交),你的工作区未被改动`
+      /**
+       * `commits === 0` 有**两种**完全相反的成因,而它们不能共用一句话:
+       * 真的什么都没做,和「每个子任务完成时就已经合进你的分支了」(主干开发的正常结局)。
+       * 后者印「与起点相同」是一句可照做的假话 —— 用户会据此以为这一趟白跑了。
+       */
+      : alongTheWay > 0
+        ? `本次改动(${alongTheWay} 个提交)在各个子任务完成时已逐一合并回你当前的分支 —— 产出就在当前目录里;分支 ${h.branch} 保留着`
+        : `本次没有产生任何改动;分支 ${h.branch} 与起点相同`,
   ]
+  // 有东西没送到 = 用户的目录和这一趟的产出对不上。**必须说**,而且说清为什么。
+  for (const why of h.trunkSkips ?? []) out.push(`⚠ ${why}`)
+  if (h.commits === 0 && alongTheWay > 0) out.push(`查看这一趟的提交: git log ${h.branch}`)
   if (h.commits > 0) {
     // 现在收口是一个**关口**,不是一串要用户自己敲的命令 —— 但那几行命令仍然保留:
     // 用户可能按 Esc 跳过关口,也可能想手工来。关口是新增的路,不是把旧路拆了。
@@ -1255,6 +1274,11 @@ export function handoffLines(
   // user's repo and outlives every run, and nothing else ever mentions it.
   if (h.integrationPath) out.push(`集成工作区(下次运行会复用): ${h.integrationPath}`)
   for (const k of h.kept) out.push(`保留的工作区(${k.why}): ${k.path}`)
-  for (const s of h.salvage) out.push(`中断时抢救出的提交: ${s}`)
+  /**
+   * **不叫「中断时」抢救出来的。** 分析/质疑讨论也在节点自己的工作区里跑之后,执行环节
+   * 重新 `acquire` 是每个隔离节点的必经之路,而那两关拿的是全套工具 —— 方案席随手留下的
+   * 一个未跟踪文件就会走上这条路,一次中断都没发生过。措辞按**内容**说,不按成因说。
+   */
+  for (const s of h.salvage) out.push(`抢救出的提交(未合入集成分支的中间产物): ${s}`)
   return out
 }
