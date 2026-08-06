@@ -278,7 +278,7 @@ describe('node.md 的正文要留下角色意见和评分理由 (spec §7 / §4.
   it('没有记录的节点不会多出空段落里的垃圾', () => {
     const n = createNode({ id: 'root', title: 'r', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'x' })
     const body = serializeNode(n)
-    expect(body).toContain('## 评审记录\n\n')
+    expect(body).toContain('## 质疑修复记录\n\n')
     expect(body).toContain('plan: -')
   })
 
@@ -416,18 +416,18 @@ describe('spec §13:renderTreeSnapshot 的输出必须稳定', () => {
 })
 
 describe('验收记录要说清哪一轮是哪一关', () => {
-  // 测试验证和验收共用 acceptLog、也共用 iteration.acceptance 计数,于是「## 验收记录」
+  // 测试修复和验收共用 acceptLog、也共用 iteration.acceptance 计数,于是「## 验收记录」
   // 里会出现两条 `round 1`,而升级卡片写的正是「先看该节点的验收记录」。
   const rec = (over: object = {}) => ({
     round: 1, verdicts: [{ role: 'r', pass: true, blocking: [], comments: '' }],
     synthesized: { pass: true, blockingSummary: '' }, ...over,
   })
 
-  it('测试验证那一轮被标出来', () => {
+  it('测试修复那一轮被标出来', () => {
     const n = createNode({ id: 'n', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'NOW' })
     n.acceptLog = [rec({ step: 'verify' }), rec()] as never
     const body = serializeNode(n)
-    expect(body).toContain('[测试验证] round 1')
+    expect(body).toContain('[测试修复] round 1')
     // 验收那一轮不加前缀 —— 老 node.md 的形状不变。
     expect(body).toContain('- round 1')
   })
@@ -439,8 +439,10 @@ describe('验收记录要说清哪一轮是哪一关', () => {
    */
   it('作废的那一轮标出来,而且排在 PASS/FAIL 之前', () => {
     const n = createNode({ id: 'n', title: 't', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: 'NOW' })
-    n.acceptLog = [rec({ step: 'verify', voided: '测试验证环节改动了工作区,该轮裁决作废' })] as never
-    const line = serializeNode(n).split('\n').find(l => l.startsWith('- [测试验证]'))!
+    // `voided` 这条路今天由**老 node.md** 提供(测试修复不再作废任何一轮),所以拿一条
+    // 老的验收记录当输入 —— 那才是它现在唯一还会出现的地方。
+    n.acceptLog = [rec({ voided: '该轮裁决作废' })] as never
+    const line = serializeNode(n).split('\n').find(l => l.startsWith('- round'))!
     expect(line).toContain('[已作废:')
     expect(line.indexOf('[已作废:')).toBeLessThan(line.indexOf('PASS'))
   })
@@ -514,9 +516,9 @@ describe('逐条处置要落到 body', () => {
 
   it('两节各自成段,而且分得开是哪一关的账', () => {
     const md = serializeNode(withResponses(['第 1 条 → 方案第 3 步'], ['第 1 条 → 改了 src/a.ts']))
-    expect(md).toContain('## 方案:对上一轮质疑讨论意见的逐条处置')
+    expect(md).toContain('## 方案:对上一轮意见的逐条处置')
     expect(md).toContain('1. 第 1 条 → 方案第 3 步')
-    expect(md).toContain('## 执行:对上一轮测试验证/验收意见的逐条处置')
+    expect(md).toContain('## 执行:对上一轮验收意见的逐条处置')
     expect(md).toContain('1. 第 1 条 → 改了 src/a.ts')
   })
 
@@ -647,7 +649,7 @@ describe('修改建议要出现在 node.md 的正文里', () => {
       synthesized: { pass: false, blockingSummary: '参数不可执行' },
     }]
     const md = serializeNode(n)
-    const body = md.slice(md.indexOf('## 评审记录'))
+    const body = md.slice(md.indexOf('## 质疑修复记录'))
     expect(body).toContain('修改建议')
     expect(body).toContain('把 repo 值改成 etcd')
   })

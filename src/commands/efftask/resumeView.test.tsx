@@ -546,7 +546,7 @@ describe('the gate lets the user CHANGE the parallelism (用户第四句)', () =
       )
       await tick()
       const frame = lastFrame()
-      expect(frame).toContain('方案/评审阶段并行')
+      expect(frame).toContain('方案/质疑修复阶段并行')
       expect(frame).toContain('执行与叶子验收串行')
       expect(frame).not.toContain('P1 串行执行')
       // 读取 is not one of this product's phases; naming it here once put a row on the gate
@@ -672,7 +672,7 @@ describe('续跑关口的编辑器也要认识「被跳过」', () => {
   it('给它勾个人 = 取消跳过,而且决策里带得出去', async () => {
     const m = await mountSkipped()
     m.stdin.press('r'); await tick()
-    m.stdin.press(ESC + '[B' + ' '); await tick()   // 移到质疑讨论并勾上 architect
+    m.stdin.press(ESC + '[B' + ' '); await tick()   // 移到质疑修复并勾上 architect
     m.stdin.press('\r'); await tick()
     // 不能写 `?? []`:缺省语义是「不变」,字段缺席时 run 照样跳过。
     expect(`决策里带 skipSteps: ${m.decisions[0].skipSteps !== undefined}`).toBe('决策里带 skipSteps: true')

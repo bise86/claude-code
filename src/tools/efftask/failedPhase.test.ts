@@ -116,7 +116,7 @@ describe('快速重做:失败环节 → 可重入的入口', () => {
   const tree = (over: Partial<TaskNode> = {}): TaskNode[] => [mk({ kind: 'executable', ...over })]
   const target = (nodes: TaskNode[]) => failedRedoTarget(nodes[0]!, byIdMap(nodes))
 
-  it('评审失败 → 从质疑讨论重做', () => {
+  it('评审失败 → 从质疑修复重做', () => {
     const r = target(tree({
       status: 'BLOCKED', failedAt: 'PLAN_REVIEW',
       plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
@@ -124,7 +124,7 @@ describe('快速重做:失败环节 → 可重入的入口', () => {
     expect(r).toEqual({ entry: 'review', phase: 'review' })
   })
 
-  it('验收 / 测试验证 / 观察失败 → 从执行重做(它们跑在 stepExecute 内部)', () => {
+  it('验收 / 测试修复 / 观察失败 → 从执行重做(它们跑在 stepExecute 内部)', () => {
     for (const [st, phase] of [['ACCEPTANCE', 'accept'], ['VERIFYING', 'verify'], ['SCORING', 'observer']] as const) {
       const r = target(tree({ status: 'BLOCKED', failedAt: st, kind: 'executable' }))
       expect(r).toEqual({ entry: 'execute', phase })
@@ -276,10 +276,10 @@ describe('planSkip 算出来的树', () => {
     expect(t.iteration.planReview).toBe(1)
   })
 
-  it('跳过测试验证:同样清零 —— 它的失败也记在 acceptance 上', () => {
+  it('跳过测试修复:同样清零 —— 它的失败也记在 acceptance 上', () => {
     /**
-     * 测试验证失败走的是 `iteration.acceptance++`(和验收共用一份预算)。不清零的话,
-     * 跳过测试验证之后那一桌验收只要不通过就当场再次阻断,一次返工机会都没有 ——
+     * 测试修复失败走的是 `iteration.acceptance++`(和验收共用一份预算)。不清零的话,
+     * 跳过测试修复之后那一桌验收只要不通过就当场再次阻断,一次返工机会都没有 ——
      * 而用户按这个键的意思是「让它继续往下走」。
      */
     const nodes = [mk({
@@ -344,18 +344,18 @@ describe('planSkip 算出来的树', () => {
   it('摘要照实说「之后会跑什么」——**这一轮真的不跑的一个都不许出现**', () => {
     /**
      * 三份评审各自独立报了同一条:「之后会跑: 执行」紧跟着「执行环节不重跑」,两行同屏
-     * 自相矛盾。而默认配置(测试验证/观察 0 席)下 `rest` **只有** execute,那一行 100% 假。
+     * 自相矛盾。而默认配置(测试修复/观察 0 席)下 `rest` **只有** execute,那一行 100% 假。
      *
-     * 第一版的断言只写了 `not.toContain('测试验证')`,对「执行」一个字没说 —— 验收造了一条
+     * 第一版的断言只写了 `not.toContain('测试修复')`,对「执行」一个字没说 —— 验收造了一条
      * **反向**变异(把 execute 正确剔掉)结果 SURVIVED:对着那条测试,写对和写错是同一件事。
      */
     const nodes = [mk({ status: 'BLOCKED', failedAt: 'VERIFYING', kind: 'executable' })]
     const r = ok(planSkip(nodes, 'root', NOW))
     const lines = skipSummary(r, nodes[0]!, 'verify', { seatCount: { verify: 1 } })
-    expect(lines[0]).toContain('测试验证')
+    expect(lines[0]).toContain('测试修复')
     const after = lines.find(l => l.startsWith('之后会跑'))!
     expect(after).toContain('验收')
-    expect(after).not.toContain('测试验证')
+    expect(after).not.toContain('测试修复')
     // 执行环节这一轮不跑(尾部入口),所以不许写进「之后会跑」。
     expect(after).not.toContain('执行')
     // 这次跳过最容易被误解的地方:它**不重跑执行者**。
@@ -370,11 +370,11 @@ describe('planSkip 算出来的树', () => {
     const lines = skipSummary(r, nodes[0]!, 'accept', {})
     expect(lines.some(l => l.includes('之后没有别的环节了,本节点会直接判为已验收'))).toBe(true)
     expect(lines.some(l => l.startsWith('之后会跑'))).toBe(false)
-    // 而且要说清测试验证也不重跑 —— 否则用户会以为它还会再验一遍。
-    expect(lines.some(l => l.includes('本轮测试验证也不重跑'))).toBe(true)
+    // 而且要说清测试修复也不重跑 —— 否则用户会以为它还会再验一遍。
+    expect(lines.some(l => l.includes('本轮测试修复也不重跑'))).toBe(true)
   })
 
-  it('跳过质疑讨论时**不许**说「返工计数清零」—— 那一支一个计数都没清', () => {
+  it('跳过质疑修复时**不许**说「返工计数清零」—— 那一支一个计数都没清', () => {
     // 评审实测:planSkip 的 review 分支不重置任何 iteration(planReview 3→3, acceptance 3→3),
     // 而这句话原来是无条件印的。关口上一句一半时候为假的承诺。
     const nodes = [mk({
@@ -440,7 +440,7 @@ describe('流水线真的认这个标记', () => {
     expect(n.skipPhase).toBeUndefined()
   })
 
-  it('跳过测试验证:执行者不重跑,但验收照开', async () => {
+  it('跳过测试修复:执行者不重跑,但验收照开', async () => {
     const roles = emptyPhaseRoles()
     roles.verify = [{ roleName: '测试官' }]
     const n = mk({
@@ -454,10 +454,10 @@ describe('流水线真的认这个标记', () => {
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as unknown as RunAgentFn, cfg({ phaseRoles: roles }))
     await stepExecute(n, ctx)
-    // 只有验收那一桌。执行和测试验证都没发生。
+    // 只有验收那一桌。执行和测试修复都没发生。
     expect(phases).toEqual(['accept'])
     expect(n.status).toBe('ACCEPTED')
-    expect(n.execStatus).toContain('测试验证环节被手工跳过')
+    expect(n.execStatus).toContain('测试修复环节被用户手工跳过')
     expect(n.skipPhase).toBeUndefined()
   })
 
@@ -480,7 +480,7 @@ describe('流水线真的认这个标记', () => {
 
   it('返工轮**照常从执行者开始** —— 豁免只作用于第一轮', async () => {
     /**
-     * 跳过测试验证之后那一桌验收如果不通过,节点走返工。那一轮必须真的派执行者去改代码,
+     * 跳过测试修复之后那一桌验收如果不通过,节点走返工。那一轮必须真的派执行者去改代码,
      * 否则它会在同一份产出上反复挨同一个验收判决,烧完预算再阻断 —— 而每一轮都零产出。
      */
     const roles = emptyPhaseRoles()
@@ -509,7 +509,7 @@ describe('流水线真的认这个标记', () => {
     }) as unknown as RunAgentFn, cfg({ phaseRoles: roles }))
     await stepExecute(n, ctx)
     expect(n.status).toBe('ACCEPTED')
-    // 第一轮:只有验收(执行被豁免)。第二轮:执行 → 测试验证 → 验收。
+    // 第一轮:只有验收(执行被豁免)。第二轮:执行 → 测试修复 → 验收。
     expect(phases).toEqual(['accept', 'execute', 'verify', 'accept'])
   })
 
@@ -588,7 +588,7 @@ describe('三份评审查出来的那几条', () => {
 
   it('P0:一次性的手工跳过不许跨过一次阻断活下来', async () => {
     /**
-     * 评审实跑:按 `s` 跳过验收 → 第一轮测试验证打回 → 第二轮执行者在飞时 Esc →
+     * 评审实跑:按 `s` 跳过验收 → 第一轮测试修复打回 → 第二轮执行者在飞时 Esc →
      * 节点 BLOCKED 而 `skipPhase='accept'` 原样留在盘上 → `--resume` 归位 READY →
      * `enterAtJudge` 再一次为真 → **执行环节一次都不跑**,半成品被判「已验收」。
      *
@@ -671,11 +671,11 @@ describe('三份评审查出来的那几条', () => {
     expect(failedPhaseOf(n)).toBe('execute')
   })
 
-  it('跳过验收时**这一轮的测试验证也不跑** —— 它在上一轮已经过了', async () => {
+  it('跳过验收时**这一轮的测试修复也不跑** —— 它在上一轮已经过了', async () => {
     /**
-     * 评审实跑:尾部入口落在判决段**开头**而测试验证在段内,于是「跳过验收」换来的是
-     * 2 次测试验证调用;让它判不通过更糟 —— 5 次调用 + 一个换了环节的阻断
-     * (「测试验证迭代超限」),而关口那张表写的是「之后只有评分」。
+     * 评审实跑:尾部入口落在判决段**开头**而测试修复在段内,于是「跳过验收」换来的是
+     * 2 次测试修复调用;让它判不通过更糟 —— 5 次调用 + 一个换了环节的阻断
+     * (「测试修复迭代超限」),而关口那张表写的是「之后只有评分」。
      */
     const roles = emptyPhaseRoles()
     roles.verify = [{ roleName: '测试官' }]
@@ -689,12 +689,12 @@ describe('三份评审查出来的那几条', () => {
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as unknown as RunAgentFn, cfg({ phaseRoles: roles }))
     await stepExecute(n, ctx)
-    expect(phases).toEqual([])   // 执行、测试验证、验收 —— 一次调用都没有
+    expect(phases).toEqual([])   // 执行、测试修复、验收 —— 一次调用都没有
     expect(n.status).toBe('ACCEPTED')
-    expect(n.execStatus).toContain('本轮测试验证未重跑')
+    expect(n.execStatus).toContain('本轮测试修复未重跑')
   })
 
-  it('但返工轮的测试验证照跑 —— 那时工作区里是新产出', async () => {
+  it('但返工轮的测试修复照跑 —— 那时工作区里是新产出', async () => {
     const roles = emptyPhaseRoles()
     roles.verify = [{ roleName: '测试官' }]
     const n = mk({
@@ -719,15 +719,15 @@ describe('三份评审查出来的那几条', () => {
   })
 })
 
-describe('那条测试验证豁免只活一轮 —— 低分返工是它唯一的可达证明', () => {
-  it('跳过验收 + 观察打低分返工 → 第二轮的测试验证**照跑**', async () => {
+describe('那条测试修复豁免只活一轮 —— 低分返工是它唯一的可达证明', () => {
+  it('跳过验收 + 观察打低分返工 → 第二轮的测试修复**照跑**', async () => {
     /**
      * 「跳过验收」通常一轮就收工(合并 → 已验收),所以那句 `skipVerifyThisRound = false`
      * 唯一的可达路径是**评分触发的返工**:跳过验收之后 `scoreNode` 仍然会跑,低于
      * `caps.scoreThreshold` 时节点回 REWORK 再来一轮 —— 那一轮工作区里是新产出,
-     * 测试验证必须真的再验一遍。
+     * 测试修复必须真的再验一遍。
      *
-     * 不清掉的话第二轮的测试验证也被跳过,而那时的产出**从来没有人验过**。
+     * 不清掉的话第二轮的测试修复也被跳过,而那时的产出**从来没有人验过**。
      * (变异验证:去掉那一行,只有这条用例会红。)
      */
     const roles = emptyPhaseRoles()
@@ -752,8 +752,8 @@ describe('那条测试验证豁免只活一轮 —— 低分返工是它唯一�
     }) as unknown as RunAgentFn, cfg({ phaseRoles: roles, caps: { ...DEFAULT_CAPS, scoreThreshold: 80 } }))
     await stepExecute(n, ctx)
     expect(n.status).toBe('ACCEPTED')
-    // 第一轮:执行/测试验证/验收全跳过,只有观察(打了 10 分)→ 返工。
-    // 第二轮:执行 → 测试验证 → 验收 → 观察(95 分)→ 通过。
+    // 第一轮:执行/测试修复/验收全跳过,只有观察(打了 10 分)→ 返工。
+    // 第二轮:执行 → 测试修复 → 验收 → 观察(95 分)→ 通过。
     expect(phases).toEqual(['observer', 'execute', 'verify', 'accept', 'observer'])
   })
 })
@@ -842,7 +842,7 @@ describe('四跳的 ⚠ 一个都不许空', () => {
   it('每一种跳过都至少有一条 ⚠ 说清换掉了什么质量保证', () => {
     /**
      * 关口用 ⚠ 标「这一跳换掉了什么」,而那些 ⚠ 全部来自 `plan.warnings` —— 验收实测:
-     * 跳过质疑讨论和跳过测试验证的 ⚠ 条数**都是 0**,而这两个恰恰是最明显的两个
+     * 跳过质疑修复和跳过测试修复的 ⚠ 条数**都是 0**,而这两个恰恰是最明显的两个
      * (方案没人质疑就往下走、一个测试都不实跑)。README 承诺这一屏会用 ⚠ 标出来。
      */
     const cases: { phase: PhaseName; nodes: TaskNode[] }[] = [

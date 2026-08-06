@@ -133,7 +133,22 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
      */
     const voided = typeof r?.voided === 'string' && r.voided.length > 0
       ? `[已作废:${clipBody(stripControl(r.voided))}] ` : ''
-    const head = `- ${step}${lv}round ${stripControl(String(r?.round ?? '?'))}: ${voided}${r?.synthesized?.pass ? 'PASS' : 'FAIL'} ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
+    /**
+     * 修复类环节(质疑修复 / 测试修复)**不渲染 PASS/FAIL**。
+     *
+     * 它们不做裁决,记录里的 `synthesized.pass` 恒为 true —— 那是给下游读的「这一关没有
+     * 挡住任何人」,不是一次判决。原样印成 `PASS` 会让 node.md 上出现一次从没发生过的
+     * 通过,而这一节正是用户事后追责唯一读得到的东西(同一条规矩上一次是为
+     * MANUAL-PASS 立的)。
+     *
+     * 判据是**记录自己带的 `step`**,不是「它躺在哪个 log 里」:这个函数两个 log 共用,
+     * 而老 node.md 里的评审记录没有 step —— 那时候 review 真的是一次判决,照旧印
+     * PASS/FAIL 才是对的。
+     */
+    const isFix = r?.step === 'review' || r?.step === 'verify'
+    const head = `- ${step}${lv}round ${stripControl(String(r?.round ?? '?'))}: ${voided}${
+      isFix ? '已完成(本环节直接修复,不做判决)' : r?.synthesized?.pass ? 'PASS' : 'FAIL'
+    } ${stripControl(r?.synthesized?.blockingSummary ?? '')}`
     const roles = (r?.verdicts ?? []).map(v => {
       const detail = (v?.blocking ?? []).length > 0 ? (v.blocking ?? []).join('; ') : (v?.comments ?? '')
       /**
@@ -144,7 +159,9 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
        * 判据是 `manual` 那个布尔,不是 role 里那四个字:role 是显示用的字符串,而
        * node.md 可以手工编辑,拿它当判据等于让改个名字就能伪装成人工放行(反过来也一样)。
        */
-      const mark = v?.infra ? 'CALL-FAILED' : v?.manual ? 'MANUAL-PASS' : v?.pass ? 'pass' : 'FAIL'
+      // 修复类环节同理(见上面 isFix):这一席不是「赞成」,它是**动过手**的那一个。
+      // 印成 pass 会让「改了三段」和「点了个头」在事后追责时长得一样。
+      const mark = v?.infra ? 'CALL-FAILED' : v?.manual ? 'MANUAL-PASS' : isFix ? '已处理' : v?.pass ? 'pass' : 'FAIL'
       /**
        * **撤回要人读得见**,理由和上面 MANUAL-PASS 那条逐字同源。
        *
@@ -226,9 +243,9 @@ export function serializeNode(node: TaskNode): string {
     // 记录,而事后追责问的正是这句话:哪一条是它说改了而其实没改的。只落进 frontmatter
     // 等于只做到机器可读那一半,这个文件自己的规矩是 body 才是人读的那一半(见 alternatives)。
     // 省略 = 没有回应(第 1 轮,或者一条都没答),老 node.md 的形状逐字不变。
-    responsesBody('## 方案:对上一轮质疑讨论意见的逐条处置', node.plan.responses) +
+    responsesBody('## 方案:对上一轮意见的逐条处置', node.plan.responses) +
     `## 执行状态\n${c(node.execStatus)}\n\n` +
-    responsesBody('## 执行:对上一轮测试验证/验收意见的逐条处置', node.execResponses) +
+    responsesBody('## 执行:对上一轮验收意见的逐条处置', node.execResponses) +
     (node.blockedReason ? `## 阻断原因\n${c(node.blockedReason)}\n\n` : '') +
     /**
      * 降级放行的账,**写进人读的那一半**。
@@ -252,7 +269,8 @@ export function serializeNode(node: TaskNode): string {
       ? `## 备选方案(圆桌落选稿)\n${node.plan.alternatives
           .map(alt => `### ${stripControl(alt.staff)}\n${clipBody(stripControl(alt.solution))}`).join('\n')}\n\n`
       : '') +
-    `## 评审记录\n${roundtableBody(node.reviewLog)}\n\n` +
+    // 标题跟着职责改:这一节记的是「谁质疑了什么、改了哪几段」,不再是几张赞成/反对票。
+    `## 质疑修复记录\n${roundtableBody(node.reviewLog)}\n\n` +
     `## 验收记录\n${roundtableBody(node.acceptLog)}\n\n` +
     `## 评分\n${scoreBody(node)}\n`
   return `---\n${yamlStringify(fm)}---\n\n${body}`

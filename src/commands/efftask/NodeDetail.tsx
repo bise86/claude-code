@@ -71,7 +71,7 @@ function scoreBody(n: TaskNode): string {
 function iterationBody(n: TaskNode): string {
   const it = n.iteration
   return [
-    it.planReview > 0 ? `方案评审返工 ${it.planReview}` : '',
+    it.planReview > 0 ? `方案返工 ${it.planReview}` : '',
     it.acceptance > 0 ? `验收返工 ${it.acceptance}` : '',
     it.integration > 0 ? `集成验收返工 ${it.integration}` : '',
     it.scoring > 0 ? `评分触发返工 ${it.scoring}` : '',
@@ -179,8 +179,8 @@ export function timelineBody(n: TaskNode, nowMs = Date.now()): string {
  */
 export function phaseTimeBody(n: TaskNode, nowMs = Date.now()): string {
   const LABEL: Partial<Record<string, string>> = {
-    PLANNING: '分析', PLAN_REVIEW: '质疑讨论', EXECUTING: '执行',
-    VERIFYING: '测试验证', ACCEPTANCE: '验收',
+    PLANNING: '分析', PLAN_REVIEW: '质疑修复', EXECUTING: '执行',
+    VERIFYING: '测试修复', ACCEPTANCE: '验收',
     // NOT 「返工」. The REWORK window holds exactly one thing — `refreshFromIntegration`,
     // pulling sibling merges into this node's worktree — and then commits EXECUTING; the
     // actual rework effort is charged to that next EXECUTING round. A row reading 返工 45s
@@ -326,7 +326,7 @@ function reworkBody(n: TaskNode): string {
   if (!r) return ''
   const carried = r.step === 'review'
     ? '下一轮重拟方案时,这条连同更早几轮的意见会一起交给方案作者(按轮次标注,不只带最后一轮)。'
-    : '下一轮返工时,测试验证和验收两关的累积意见会一起交给执行者。'
+    : '下一轮返工时,验收的累积意见会一起交给执行者。'
   return `第 ${r.rounds} 轮${PHASE_LABEL[r.step]}未通过:\n${r.why}\n\n${carried}`
 }
 
@@ -367,7 +367,16 @@ function roundsBody(log: TaskNode['reviewLog']): string {
        * 界面上和文件里读起来是两回事。
        */
       const manual = r.verdicts.some(v => v.manual === true)
-      const head = manual ? '人工强制通过' : r.synthesized.pass ? '通过' : '未通过'
+      /**
+       * 修复类环节(质疑修复 / 测试修复)不写「通过」。
+       *
+       * 两边口径必须一致:node.md 那侧已经按同一条判据把它们和真裁决分开了
+       * (见 persistence 的 roundtableBody)。这一关不做判决,而 `synthesized.pass` 恒为
+       * true —— 照旧印「通过」会让界面上出现一次从没发生过的放行。
+       * 判据是记录自带的 `step`,老记录(没有 step)照旧按裁决渲染,那对它们是对的。
+       */
+      const isFix = r.step === 'review' || r.step === 'verify'
+      const head = manual ? '人工强制通过' : isFix ? '已修复' : r.synthesized.pass ? '通过' : '未通过'
       // 人工那条的 blockingSummary 是空的(它就是通过),被覆盖的意见在 comments 里 ——
       // 摊到这一行上,否则用户要展开才知道自己当初放行了什么。
       const detail = manual
@@ -468,7 +477,7 @@ export function detailSections(
     { title: '模型用量', body: usageBody(n, resolveNode) },
     // 每轮一行的骨架是我们拼的,但 blockingSummary 是评审员写的散文 —— 上色的收益
     // (「[架构] **缺回滚**」里的重点看得见)大于骨架被解析的风险(骨架里没有记号)。
-    { title: '评审记录', body: roundsBody(n.reviewLog), md: true },
+    { title: '质疑修复记录', body: roundsBody(n.reviewLog), md: true },
     { title: '验收记录', body: roundsBody(n.acceptLog), md: true },
   ]
   if (n.worktree) all.push({ title: '隔离工作区', body: `${n.worktree.branch}\n${n.worktree.path}` })

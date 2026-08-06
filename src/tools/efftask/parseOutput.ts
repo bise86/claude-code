@@ -393,6 +393,18 @@ export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
   kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[]
   /** 本轮 tag 的围栏在场、但解析不出对象。见 `taggedBlockBroken`。 */
   parseFailed: boolean
+  /**
+   * 这次回复里**真的挑出了一个方案对象**吗。
+   *
+   * `parseFailed` 回答不了这个问题:它只在「本轮围栏在场但内容坏了」时为真,而最常见的
+   * 那种退化 —— 回复里**根本没有方案对象**(答非所问、答成了别的环节的 schema)——
+   * 走的是下面那条兜底:`solution` 变成整段回复原文,`parseFailed` 是 false。
+   *
+   * 分析环节可以接受那条兜底(有总比没有强,而且后面有人会质疑它)。**质疑修复不行**:
+   * 那一关手上已经有一份真方案,拿一坨散文去覆盖它是净损失,而且没有任何下游环节能把它
+   * 变回来。所以那一关的判据是这个字段,不是 `parseFailed`。
+   */
+  structured: boolean
 } {
   // A plan carries at least one plan-ish key; a bare echo of the goal has none.
   // Ambiguity is tolerated here: a wrong plan is caught by the review roundtable.
@@ -417,7 +429,7 @@ export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
   const kind: NodeKind = obj?.kind === 'decompose' && children.length > 0 ? 'decompose' : 'executable'
   // 只在**回退发生了**的时候才去扫围栏(obj 非空 = 解析成功,没什么可报告的),省掉
   // 正常路径上每个节点一次的额外正则遍历。
-  return { kind, plan, children, parseFailed: obj === null && taggedBlockBroken(text, tag) }
+  return { kind, plan, children, parseFailed: obj === null && taggedBlockBroken(text, tag), structured: obj !== null }
 }
 
 export function parseVerdict(text: string, role: string, tag?: string): Verdict {

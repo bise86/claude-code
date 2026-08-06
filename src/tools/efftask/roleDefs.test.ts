@@ -425,8 +425,8 @@ describe('环节名可以写中文,写错了要能自己改对', () => {
 
   it('中文环节名归一到内部 phase 名 —— 落盘只有一种写法', () => {
     // 两边都当 canonical 会让 run.md 里出现两种写法,而读回那侧(resumeCore)只认一种。
-    expect(P2([def({ step: '质疑讨论' })]).defs[0].stage).toBe('review')
-    expect(P2([def({ step: '测试验证' })]).defs[0].stage).toBe('verify')
+    expect(P2([def({ step: '质疑修复' })]).defs[0].stage).toBe('review')
+    expect(P2([def({ step: '测试修复' })]).defs[0].stage).toBe('verify')
     expect(P2([def({ step: '集成验收' })]).defs[0].stage).toBe('integrate')
     expect(P2([def({ step: '分析' })]).defs[0].stage).toBe('plan')
   })
@@ -446,12 +446,12 @@ describe('环节名可以写中文,写错了要能自己改对', () => {
 
   it('写错时列**中文**合法值 —— 列内部名等于让用户自己做中英对照', () => {
     const n = P2([def({ step: '测试' })]).notices.join('\n')
-    expect(n).toContain('分析/质疑讨论/执行/测试验证/验收/集成验收/观察')
+    expect(n).toContain('分析/质疑修复/执行/测试修复/验收/集成验收/观察')
     expect(n).not.toContain('plan/review/execute')
   })
 
   it('并且猜一个最接近的', () => {
-    expect(P2([def({ step: '测试' })]).notices.join('\n')).toContain('是不是想写「测试验证」')
+    expect(P2([def({ step: '测试' })]).notices.join('\n')).toContain('是不是想写「测试修复」')
     expect(P2([def({ step: '集成' })]).notices.join('\n')).toContain('是不是想写「集成验收」')
   })
 

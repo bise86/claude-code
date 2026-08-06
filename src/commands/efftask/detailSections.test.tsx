@@ -614,7 +614,7 @@ describe('补充指引(你写的)必须有地方看得见', () => {
     // 「整个任务」覆盖面最大,排最前;其余按 PHASE_NAMES 的次序(和环节耗时、名册一致)。
     expect(g!.body.split('\n')).toEqual([
       '整个任务: 别动 src/legacy',
-      '质疑讨论: 重点看并发',
+      '质疑修复: 重点看并发',
       '执行: 先跑 bun test',
     ])
   })
@@ -629,7 +629,7 @@ describe('补充指引(你写的)必须有地方看得见', () => {
     // 一个有内容 + 一个空白:只画有内容的那一行。
     const mixed = detailSections(mk({ guidance: { execute: '  ', review: '看并发' } }))
       .find(s => s.title === '补充指引(你写的)')!
-    expect(mixed.body).toBe('质疑讨论: 看并发')
+    expect(mixed.body).toBe('质疑修复: 看并发')
   })
 })
 

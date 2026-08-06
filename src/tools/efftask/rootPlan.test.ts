@@ -161,43 +161,46 @@ describe('根方案关口 · 确认后真的生效', () => {
     expect(ctx.byId.get('root/02-实现服务')!.deps).toEqual(['root/01-设计接口'])
   })
 
-  it('the confirmed plan still faces the review roundtable', async () => {
+  /**
+   * 确认过的方案**仍然要过质疑修复** —— 只是那一关现在不投票,它直接改。
+   *
+   * 这两条替换掉的是「still faces the review roundtable」和「a rejected confirmed plan is
+   * REVISED by the plan role」:圆桌和「被打回」都没有了,但这个特性真正的承诺没变 ——
+   * 人的批准是流程的**输入**,不是豁免。
+   */
+  it('the confirmed plan still goes through 质疑修复(而且那一版会被真的改)', async () => {
     const root = makeRootNode(cfg(), NOW)
     applyRootDraft(root, draft, NOW)
     const phases: string[] = []
     const ctx = ctxFor([root], async req => {
       phases.push(req.phase)
-      return vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
+      return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
+        '\n{"kind":"decompose","solution":"质疑修复改过的","keyPoints":"k","risks":"r","acceptance":"跑 bun test",' +
+        '"children":[{"title":"设计接口","deps":[]},{"title":"实现服务","deps":["设计接口"]}]}\n```'
     })
     await stepStart(root, ctx)
-    // 每个方案经多角色圆桌评审 — human approval is an input to the process, not an exemption
-    // from it. The FIRST call after confirmation is the review.
+    // 确认之后的**第一次**调用就是质疑修复 —— 方案席位一次都不派。
     expect(phases[0]).toBe('review')
-    expect(root.reviewLog[0].synthesized.pass).toBe(false)
-    // …and a plan the roundtable keeps blocking still exhausts its budget rather than
-    // riding the user's approval into execution.
-    expect(root.status).toBe('BLOCKED')
-    expect(root.blockedReason).toContain('评审迭代超限')
+    expect(phases).not.toContain('plan')
+    // 而它交回来的那一版真的被采用了。
+    expect(root.plan.solution).toBe('质疑修复改过的')
+    expect(root.status).toBe('WAITING_CHILDREN')
+    // 一次性:草稿被消费掉,不会在下一轮再被应用一次。
+    expect(root.confirmedDraft).toBeUndefined()
   })
 
-  it('a rejected confirmed plan is REVISED by the plan role, not re-confirmed forever', async () => {
+  it('质疑修复席位答非所问时,用户确认的那一版原样往下走', async () => {
     const root = makeRootNode(cfg(), NOW)
     applyRootDraft(root, draft, NOW)
-    let reviews = 0
     const planPrompts: string[] = []
     const ctx = ctxFor([root], async req => {
       if (req.phase === 'plan') { planPrompts.push(req.prompt); return PLAN_REPLY }
-      reviews++
-      return reviews === 1
-        ? vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
-        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+      return vtag(req) + '\n{"pass":false,"blocking":["缺少回滚方案"],"comments":""}\n```'
     })
     await stepStart(root, ctx)
-    // Round 2 DOES call the plan role — the draft is single-use, and the reviewer's blockers
-    // reach it. Re-using the confirmed draft here would loop on a plan nobody can fix.
-    expect(planPrompts).toHaveLength(1)
-    expect(planPrompts[0]).toContain('缺少回滚方案')
-    expect(planPrompts[0]).toContain('用户改过的方案') // revising the user's plan, not ignoring it
+    // 方案席位仍然一次都不派 —— 用户刚刚亲自改过的那一版不该被悄悄换掉。
+    expect(planPrompts).toHaveLength(0)
+    expect(root.plan.solution).toBe('用户改过的方案')
     expect(root.confirmedDraft).toBeUndefined()
     expect(root.status).toBe('WAITING_CHILDREN')
   })
@@ -613,7 +616,7 @@ describe('自动重拟不许把好方案换成坏的', () => {
 
   it('isBetterDraft 三条判据各自都要卡住', () => {
     const prev = { kind: 'decompose' as const, plan: { solution: 's', keyPoints: '', risks: '', acceptance: '' }, children: [{ title: 'a', deps: [] }] }
-    const full = { solution: '分三步做完这件事,先读代码再改再跑测试验证', keyPoints: '别只看命名', risks: '可能漏掉动态加载', acceptance: '产出带行号的清单' }
+    const full = { solution: '分三步做完这件事,先读代码再改再跑测试修复', keyPoints: '别只看命名', risks: '可能漏掉动态加载', acceptance: '产出带行号的清单' }
     // 空字段没少
     expect(isBetterDraft({ kind: 'decompose', plan: prev.plan, children: prev.children }, prev, 3)).toBe(false)
     // 子任务变少

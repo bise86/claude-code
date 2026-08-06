@@ -390,8 +390,11 @@ describe('子 agent 实时窗口:五跳都要接上', () => {
   it('runPhase 的每一个调用点都自报环节名和署名', () => {
     // 分析圆桌 N 席、方案融合席、方案精化 N 席、观察评分 N 席全都走 runPhase,不走圆桌。
     // 少给一个署名,这些席位就退回「几个人的话并成一坨、看不出谁说的」——正是要治的病。
+    // 9 处:分析圆桌 / 方案融合 / 方案精化 / 方案补验收点 / 质疑修复 / 执行 /
+    // 测试修复 / 观察评分 / 解决合并冲突。质疑修复和测试修复是这一轮新进来的两个 ——
+    // 它们从圆桌搬到了顺序接力,于是也走这条路。
     const calls = PIPE.split('runPhase(ctx,').length - 1
-    expect(`runPhase 调用点: ${calls}`).toBe('runPhase 调用点: 7')
+    expect(`runPhase 调用点: ${calls}`).toBe('runPhase 调用点: 9')
     // 每一处都得带 phaseLabel;数量对不上说明有人加了调用点却没给窗口。
     const labeled = PIPE.split('phaseLabel:').length - 1
     expect(`带 phaseLabel 的位置: ${labeled >= 8}`).toBe('带 phaseLabel 的位置: true')

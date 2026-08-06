@@ -8,6 +8,7 @@ import { runWithCwdOverride } from '../../utils/cwd.js'
 import type { RunControl } from './control.js'
 import type { RateLimitGate } from './rateLimitGate.js'
 import { eventsFromMessage, type BriefResolver } from './agentEvents.js'
+import type { StreamHandle } from './agentStream.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { RoleBinding } from './types.js'
 import { addUsage, createUsageMeter, isEmptyUsage } from './usage.js'
@@ -164,6 +165,13 @@ export type ProviderErrorKind =
    * 后立刻阻断 —— 也就是说不分开的话,这次改动在这一类上把事情做得更糟了。
    */
   | 'quota'
+  /**
+   * 提示词超出上游能收的长度(400 / 413,`errors.ts` 统一翻成 "Prompt is too long")。
+   *
+   * **等没有用,换个模型也未必有用,但压一压就能过去** —— 所以它既不是 rate_limit
+   * 也不是 quota,得自己一档:`makeRunAgentFn` 认这一档去压缩重发。
+   */
+  | 'prompt_too_long'
 
 /**
  * 429 走**结构化**字段,529/overloaded 只能认文案 —— 这条不对称是实测的,不是偷懒:
@@ -192,6 +200,18 @@ const RATE_LIMIT_TEXT = /\(429\)|\b429\b|rate.?limit|overloaded_error|\b529\b|Ov
  */
 const QUOTA_TEXT = /hit your .*limit|resets\s|Extra usage is required|No response requested/i
 
+/**
+ * 「提示词太长」,**判在所有分类的最前面**。
+ *
+ * 顺序是判据的一部分,和上面那条同一个理由:`errors.ts` 那条 400/413 分支给的正文是
+ * `Prompt is too long`(Vertex 大写、直连小写,所以不区分大小写),而 SDK 在别的路径上
+ * 会把原始报错整段塞进来 —— 那段里可能同时出现 `rate.?limit` 之类的词。先判它,剩下的
+ * 才轮到限流/额度。
+ *
+ * 认得出它才有得救:这一档在 `makeRunAgentFn` 里换来一次压缩重发,而不是一个死节点。
+ */
+const PROMPT_TOO_LONG_TEXT = /prompt is too long|input length and `max_tokens` exceed|exceeds? the maximum (?:allowed )?(?:context|token)/i
+
 export function providerErrorInfoOf(
   messages: readonly unknown[],
 ): { text: string; kind?: ProviderErrorKind } | undefined {
@@ -199,9 +219,11 @@ export function providerErrorInfoOf(
     if (m?.type !== 'assistant' || m.isApiErrorMessage !== true) continue
     const raw = collectText([m] as never)
     const text = raw.trim() === '' ? '模型服务返回了一条空的错误消息' : raw
-    const kind: ProviderErrorKind | undefined = QUOTA_TEXT.test(text)
-      ? 'quota'
-      : m.error === 'rate_limit' || RATE_LIMIT_TEXT.test(text) ? 'rate_limit' : undefined
+    const kind: ProviderErrorKind | undefined = PROMPT_TOO_LONG_TEXT.test(text)
+      ? 'prompt_too_long'
+      : QUOTA_TEXT.test(text)
+        ? 'quota'
+        : m.error === 'rate_limit' || RATE_LIMIT_TEXT.test(text) ? 'rate_limit' : undefined
     return kind ? { text, kind } : { text }
   }
   return undefined
@@ -347,7 +369,7 @@ export function makeRunAgentFn(deps: {
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
-  return async req => {
+  const once: RunAgentFn = async req => {
     /**
      * 上游还在限流就先等 —— **排在下面那条 abort 早退之前**。
      *
@@ -778,7 +800,101 @@ export function makeRunAgentFn(deps: {
     deps.rateGate?.noteSuccess()
     return collectText(collected)
   }
+  /**
+   * 上游说「Prompt is too long」时**压缩后重发**,而不是让这个节点死在这里。
+   *
+   * 用户报的原话:「有的报 Prompt is too long,这个要处理掉,不能限制这个。」两半都要接住:
+   *
+   *  - **不能靠静态上限**去躲它。这个仓库刚刚把自己造的产出上限全部拿掉,再按一个
+   *    「安全长度」去裁提示词,等于把上限换个地方长回来 —— 而绝大多数调用根本不会超,
+   *    它们会白白丢掉方案正文/历史意见。所以压缩**只在上游真的拒收之后**发生。
+   *  - **不能当成普通调用失败**。今天它落进 `blockWithReason` 的通用分支,阻断理由是一句
+   *    英文报错,建议是「先确认角色模型/网络可用」—— 而上游是通的,提示词太长是我们这边
+   *    的事实,重发一次就能过去。返工/降级那一套也救不了它:下一轮的提示词只会更长
+   *    (历次纪要是累积的)。
+   *
+   * 接在这一层的理由和 `rateGate` 逐字相同:这里是所有 `/et` 模型调用的唯一必经点。
+   * 接在 `runPhase` 上会漏掉圆桌那一整条路(它直接拿 `ctx.runAgent`)。
+   *
+   * **窗口不能在中途收口。** `once` 的 finally 无条件 `end()`,而重试还要往同一个窗口里写;
+   * 收过一次之后 `push` 会被 `state.closed` 挡掉(见 agentStream),用户看到的就是一个停在
+   * 「调用失败」的表头,后面那次成功的重发一个字都不显示。所以这里给 `once` 一个代理句柄:
+   * 把它要说的收口理由记下来,真正的 `end` 由最后一次尝试之后发。
+   */
+  return async req => {
+    let prompt = req.prompt
+    let lastEnd: string | undefined
+    const stream: StreamHandle | undefined = req.stream && {
+      push: e => req.stream!.push(e),
+      end: err => { lastEnd = err },
+    }
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await once({ ...req, prompt, stream })
+        } catch (e) {
+          if (!isPromptTooLongError(e) || attempt >= PROMPT_SHRINK_RATIOS.length) throw e
+          const next = shrinkPrompt(prompt, PROMPT_SHRINK_RATIOS[attempt]!)
+          // 压不动了(已经短到地板)→ 再发一次是同样的拒收。原样抛出去,让阻断理由
+          // 停在真实的那一句上。
+          if (next.length >= prompt.length) throw e
+          prompt = next
+          // 上一次尝试写下的收口理由要作废:它说的是「提示词过长」,而这一趟还没结束。
+          lastEnd = undefined
+          try {
+            req.stream?.push({
+              kind: 'text',
+              text: `\n[上游拒收:提示词过长。已压缩到约 ${Math.round(PROMPT_SHRINK_RATIOS[attempt]! * 100)}% 后重发(第 ${attempt + 1} 次)]\n`,
+            })
+          } catch { /* 提示而已 */ }
+        }
+      }
+    } finally {
+      req.stream?.end(lastEnd)
+    }
+  }
 }
+
+/**
+ * 每一次重发压到原长的多少。三次之后放弃 —— 再压下去剩的就不是一份提示词了。
+ *
+ * 不是等比小步走:上游给的信息只有「太长」(`errors.ts` 把 token 数留在 errorDetails 里,
+ * 而那条字段到不了这一层 —— 我们看得见的只有那句通用文案),所以猜不出差多少。
+ * 大步长换的是**次数**:每一次重试都是一次真实的、可能带写工具的调用。
+ */
+export const PROMPT_SHRINK_RATIOS = [0.55, 0.3, 0.15]
+
+/** 这个错是不是上游在说「提示词太长」。 */
+export function isPromptTooLongError(e: unknown): boolean {
+  return e instanceof ProviderApiError && e.kind === 'prompt_too_long'
+}
+
+/**
+ * 压缩一份提示词:**掐中间,留两头**。
+ *
+ * 头和尾都不能丢,而尾巴尤其不能:输出 schema 和 answer tag(`answerRule`)在最后一段,
+ * 截掉它这次调用的回答会**解析不出来** —— 那比「提示词太长」难查得多,而且它会伪装成
+ * 「模型没按格式答」。头一段是角色简报 + 本次任务是什么。
+ *
+ * 被掐掉的中段是方案正文 / 历次意见 / 执行者自述这些**回顾性**内容,而且必须留一句话说明
+ * 它被掐过 —— 一个不知道自己少看了东西的模型会把「没提到」当成「不需要」。
+ */
+export function shrinkPrompt(prompt: string, ratio: number): string {
+  const cps = Array.from(prompt)
+  const target = Math.max(MIN_SHRUNK_PROMPT_CHARS, Math.floor(cps.length * ratio))
+  if (cps.length <= target) return prompt
+  const tail = Math.min(4000, Math.max(1, Math.floor(target * 0.4)))
+  const head = Math.max(1, target - tail)
+  const dropped = cps.length - head - tail
+  return cps.slice(0, head).join('') +
+    `\n\n…(上游拒收了完整的提示词:太长。这里省略了中间 ${dropped} 个字,` +
+    `省掉的是上一版方案、历次意见、执行自述这类回顾性内容。` +
+    `按上下两段还在的要求作答;确实需要被省掉的那部分时,自己去读文件/跑命令,不要凭空猜。)…\n\n` +
+    cps.slice(cps.length - tail).join('')
+}
+
+/** 压到这个长度就不再往下压了 —— 再短就只剩两段说明,没有任务了。 */
+const MIN_SHRUNK_PROMPT_CHARS = 2000
 
 /**
  * 取消时把已收到的文本抠出来,**永不抛**。

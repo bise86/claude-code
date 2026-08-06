@@ -66,13 +66,13 @@ describe('抽取:哪句话冲着谁说的', () => {
   it('环节名收中文别名,落盘统一成内部名', async () => {
     // 和 skipSteps 同一条规矩:落盘永远是内部 phase 名,中文只是输入别名。两边都当
     // canonical 会让 run.md 里出现两种写法,而读回那侧只认一种。
-    const c = await parse('{"phaseGuidance":{"质疑讨论":"重点看并发安全","执行":"别动 src/legacy"}}')
+    const c = await parse('{"phaseGuidance":{"质疑修复":"重点看并发安全","执行":"别动 src/legacy"}}')
     expect(c.phaseGuidance).toEqual({ review: '重点看并发安全', execute: '别动 src/legacy' })
   })
 
   it('同一个环节被点两次就接起来,不覆盖', async () => {
     // 两条都是用户亲手写的,覆盖会静默丢掉前一条。
-    const c = await parse('{"phaseGuidance":{"review":"看并发","质疑讨论":"也看回滚"}}')
+    const c = await parse('{"phaseGuidance":{"review":"看并发","质疑修复":"也看回滚"}}')
     expect(c.phaseGuidance!.review).toBe('看并发\n也看回滚')
   })
 
@@ -82,18 +82,18 @@ describe('抽取:哪句话冲着谁说的', () => {
     const c = await parse('{"phaseGuidance":{"测试":"跑并发用例"}}')
     expect(c.phaseGuidance).toBeUndefined()
     expect(c.notices.some(n => n.includes('测试') && n.includes('不会进任何提示词'))).toBe(true)
-    expect(c.notices.some(n => n.includes('是不是想写「测试验证」'))).toBe(true)
+    expect(c.notices.some(n => n.includes('是不是想写「测试修复」'))).toBe(true)
   })
 
   it('点给一个**这次不会跑**的环节:说出来', async () => {
     /**
-     * 「测试验证时要跑 bun test」+ 没配 verify 角色 = 这段话永远不会被任何人读到,而用户
+     * 「测试修复时要跑 bun test」+ 没配 verify 角色 = 这段话永远不会被任何人读到,而用户
      * 以为自己已经安排好了。判据和 phaseRuns 一致:只有 verify/observer 是「没配角色就
      * 整个不存在」。
      */
-    const c = await parse('{"phaseGuidance":{"测试验证":"跑 bun test"}}')
+    const c = await parse('{"phaseGuidance":{"测试修复":"跑 bun test"}}')
     expect(c.phaseGuidance!.verify).toBe('跑 bun test')
-    expect(c.notices.some(n => n.includes('测试验证') && n.includes('不会发生'))).toBe(true)
+    expect(c.notices.some(n => n.includes('测试修复') && n.includes('不会发生'))).toBe(true)
   })
 
   it('点给一个被整个跳过的环节:也说出来', async () => {
@@ -176,7 +176,7 @@ describe('落盘与读回', () => {
       'createdAt: x',
       'goalPrompt: g',
       'phaseGuidance:',
-      '  质疑讨论: 看并发',   // 中文别名要归一
+      '  质疑修复: 看并发',   // 中文别名要归一
       '  乱写: 什么',          // 非法环节名
       '  execute: 12',        // 非字符串
       'roleGuidance:',
@@ -215,7 +215,7 @@ describe('关口要把定向去处摊开', () => {
       phaseGuidance: { review: '重点看并发安全' },
       roleGuidance: [{ name: '架构师', text: '给出回滚方案' }],
     }))
-    expect(lines.some(l => l.includes('质疑讨论') && l.includes('并发安全'))).toBe(true)
+    expect(lines.some(l => l.includes('质疑修复') && l.includes('并发安全'))).toBe(true)
     expect(lines.some(l => l.includes('架构师') && l.includes('回滚'))).toBe(true)
   })
 
@@ -245,9 +245,12 @@ describe('真的进了那次调用的提示词', () => {
     await stepStart(n, ctxFor([n], r.fn, config))
     expect(r.promptOf('plan')).toContain('先按文件边界拆')
     expect(r.promptOf('review')).toContain('重点看并发安全')
-    // 分析那一条不该在评审提示词里以「针对质疑讨论」的名义出现 —— 它是执行侧的话。
+    // 分析那一条不该在评审提示词里以「针对质疑修复」的名义出现 —— 它是执行侧的话。
     expect(r.promptOf('review')).toContain('先按文件边界拆')
-    expect(r.promptOf('review')).toContain('都不算未完成')
+    // 「都不算未完成」那句(JUDGE_NOTE)只发给**裁决**席位。质疑修复不再判决,
+    // 那句话对它是空转,更坏的读法是「那就别改了」—— 所以它拿到的是定向注入本身,
+    // 不带那一句。验收侧仍然要有 —— 那一条由下一个用例守(这里只跑了 stepStart)。
+    expect(r.promptOf('review')).not.toContain('都不算未完成')
   })
 
   it('裁决席位看得到给**执行侧**的那几条,并被告知以补充后的意图为准', async () => {
@@ -426,7 +429,7 @@ describe('评审查出来的注入面', () => {
     validateLoadedNodes(real, NOW)
     expect(real[0]!.skipPhase).toBe('accept')
 
-    // 质疑讨论看方案、集成验收看子任务。
+    // 质疑修复看方案、集成验收看子任务。
     const noPlan = [{ ...mk({ id: 'root', status: 'CREATED' }), skipPhase: 'review' as const }]
     validateLoadedNodes(noPlan, NOW)
     expect(noPlan[0]!.skipPhase).toBeUndefined()
@@ -485,7 +488,7 @@ describe('成本评审查出来的那几条', () => {
 
   it('拼接之后再夹 —— 同一个环节被点两次不许把上限翻倍', async () => {
     const half = '甲'.repeat(MAX_GUIDANCE_CHARS)
-    const c = await parse(JSON.stringify({ phaseGuidance: { review: half, 质疑讨论: half } }))
+    const c = await parse(JSON.stringify({ phaseGuidance: { review: half, 质疑修复: half } }))
     expect(Array.from(c.phaseGuidance!.review!).length).toBe(MAX_GUIDANCE_CHARS)
   })
 
@@ -631,7 +634,7 @@ describe('角色定向也要向裁决席位扩散', () => {
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }) as unknown as RunAgentFn, cfg({
       phaseRoles: roles,
-      // 丙 只在质疑讨论那一关有席位,而验收判的是产出 —— 它不该读到给评审员的话。
+      // 丙 只在质疑修复那一关有席位,而验收判的是产出 —— 它不该读到给评审员的话。
       roleGuidance: [{ name: '丙', text: '重点看并发' }],
     })))
     expect(prompts.find(p => p.phase === 'accept')!.prompt).not.toContain('重点看并发')

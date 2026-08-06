@@ -129,7 +129,7 @@ describe('collectSkipSteps:配置文件里指定跳过的环节', () => {
     collectSkipSteps({ read: s => bySource[s] as { efftaskSkipSteps?: unknown } | undefined })
 
   it('中文环节名归一到内部名', () => {
-    expect(C({ userSettings: { efftaskSkipSteps: ['质疑讨论', '观察'] } }).steps).toEqual(['review', 'observer'])
+    expect(C({ userSettings: { efftaskSkipSteps: ['质疑修复', '观察'] } }).steps).toEqual(['review', 'observer'])
   })
 
   it('英文内部名也收', () => {
@@ -137,7 +137,7 @@ describe('collectSkipSteps:配置文件里指定跳过的环节', () => {
   })
 
   it('跨来源合并且去重', () => {
-    const r = C({ userSettings: { efftaskSkipSteps: ['质疑讨论'] }, projectSettings: { efftaskSkipSteps: ['质疑讨论', '验收'] } })
+    const r = C({ userSettings: { efftaskSkipSteps: ['质疑修复'] }, projectSettings: { efftaskSkipSteps: ['质疑修复', '验收'] } })
     expect(r.steps).toEqual(['review', 'accept'])
   })
 
@@ -145,11 +145,11 @@ describe('collectSkipSteps:配置文件里指定跳过的环节', () => {
     // 静默忽略最糟:用户以为跳过了,系统照跑,他为此付了钱还不知道。
     const n = C({ userSettings: { efftaskSkipSteps: ['测试'] } }).notices.join('\n')
     expect(n).toContain('该环节会照常运行')
-    expect(n).toContain('是不是想写「测试验证」')
+    expect(n).toContain('是不是想写「测试修复」')
   })
 
   it('不是数组 → 说明,而不是让整份配置作废', () => {
-    const r = C({ userSettings: { efftaskSkipSteps: '质疑讨论' } })
+    const r = C({ userSettings: { efftaskSkipSteps: '质疑修复' } })
     expect(r.steps).toEqual([])
     expect(r.notices.join('')).toContain('不是数组')
   })

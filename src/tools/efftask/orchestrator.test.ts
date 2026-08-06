@@ -60,9 +60,18 @@ describe('EffTaskOrchestrator (serial)', () => {
     expect(execOrder).toEqual(['root/01-first', 'root/02-second'])
   })
 
-  it('blocked plan (review always fails) => run returns blocked', async () => {
-    const runAgent: RunAgentFn = async req =>
-      req.phase === 'plan' ? '```json\n{"kind":"executable","solution":"weak"}\n```' : vtag(req) + '\n{"pass":false,"blocking":["no"],"comments":""}\n```'
+  /**
+   * 「方案环节永远打不通」=> run 报 blocked。
+   *
+   * 上一版这条靠「评审永远不过」制造阻断,而质疑修复已经**不会**不过了(它直接改)。
+   * 换成方案调用本身失败:那是这条路上仍然真实存在的阻断源,而且它才是 run 级 status
+   * 真正要报出来的那种事。
+   */
+  it('blocked plan (plan call always fails) => run returns blocked', async () => {
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') throw new Error('provider unreachable')
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
+    }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     expect((await orch.run()).status).toBe('blocked')
   })
@@ -112,9 +121,18 @@ describe('EffTaskOrchestrator (serial)', () => {
         // 叶子:一份没有验收点的方案 —— 降级放行时无判据可交,必须停。
         return '```json\n{"kind":"executable","solution":"leaf","acceptance":""}\n```'
       }
-      if (req.phase === 'review' && req.node.id === 'root') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
-      if (req.phase === 'review') return vtag(req) + '\n{"pass":false,"blocking":["没有验收点"],"comments":""}\n```'
+      // 叶子的执行环节打不通 —— 这是「一个子节点真的停了」现在仍然成立的路径。
+      // (方案没有验收点已经不再阻断:质疑修复被点名去补它,补不上也只是留痕往下走。)
+      if (req.phase === 'execute' && req.node.id !== 'root') throw new Error('provider unreachable')
       if (req.phase === 'execute') return '```json\n{"execStatus":"did"}\n```'
+      if (req.phase === 'review') {
+        // 质疑修复交回的是**一份方案**,而且它有权改拆分 —— 所以桩机必须按节点回不同的形状,
+        // 否则 root 会被「修」成 executable,整棵子树凭空消失(实测踩过)。
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan'
+        return req.node.id === 'root'
+          ? '```' + tag + '\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test","children":[{"title":"only","deps":[]}]}\n```'
+          : '```' + tag + '\n{"kind":"executable","solution":"leaf","keyPoints":"k","risks":"r","acceptance":"跑 bun test"}\n```'
+      }
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
@@ -229,13 +247,19 @@ describe('EffTaskOrchestrator (serial)', () => {
       if (req.phase === 'plan' && req.node.id === 'root') {
         return '```plan\n{"kind":"decompose","solution":"s","children":[{"title":"A","deps":[]},{"title":"B","deps":[]}]}\n```'
       }
-      // 叶子的方案**没有验收点** —— 走的是降级放行刻意保留的那条硬边界:评审轮数烧完时
-      // 手上没有任何可以交给执行者的东西,所以照旧阻断(见 stepPlan 的 lastPlanUsable)。
-      // 用它而不是「验收永远不过」,因为后者现在会降级放行,不再产生 BLOCKED 子树。
-      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"leaf","acceptance":""}\n```'
-      if (req.phase === 'review' && req.node.id === 'root') return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
-      if (req.phase === 'review') return vtag(req) + '\n{"pass":false,"blocking":["没有验收点"],"comments":""}\n```'
-      if (req.phase === 'execute') return '```exec\n{"execStatus":"done"}\n```'
+      // 制造一棵**真的死掉**的子树:叶子的执行调用打不通。
+      // 不能用「验收永远不过」(那会降级放行)、也不能再用「方案没有验收点」
+      // (质疑修复会被点名去补它,补不上也只是留痕往下走)。
+      if (req.phase === 'plan') return '```plan\n{"kind":"executable","solution":"leaf","acceptance":"跑 bun test"}\n```'
+      if (req.phase === 'review') {
+        // 同上:按节点回不同的形状,别把 root 修成 executable。
+        const tag = req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan'
+        return req.node.id === 'root'
+          ? '```' + tag + '\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test","children":[{"title":"A","deps":[]},{"title":"B","deps":[]}]}\n```'
+          : '```' + tag + '\n{"kind":"executable","solution":"leaf","keyPoints":"k","risks":"r","acceptance":"跑 bun test"}\n```'
+      }
+      // 叶子的执行打不通 —— 「子树真的死了」现在的制造方式(见上一条)。
+      if (req.phase === 'execute') throw new Error('provider unreachable')
       return vtag(req) + '\n{"pass":false,"blocking":["不过"],"comments":""}\n```'
     }
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
@@ -260,7 +284,7 @@ describe('EffTaskOrchestrator (serial)', () => {
     /**
      * **终止性 + 每关至多降级一次。**
      *
-     * 这个夹具**没有配测试验证席位**,所以它走不到 `degradedAt(node,'verify')` 那个闩 ——
+     * 这个夹具**没有配测试修复席位**,所以它走不到 `degradedAt(node,'verify')` 那个闩 ——
      * 闩的专门探针在 pipeline.test.ts(「降级过的关口不再开会」),而无界循环的绝对兜底
      * 探针在同一个文件(「执行循环有绝对上限」)。这里钉的是端到端那一层:
      * 一个「验收永远不过」的 run 仍然在有限次调用内收敛,且降级记录不重复。
@@ -300,8 +324,9 @@ describe('an interrupted run is distinguishable from a failed one', () => {
   })
 
   it('a node blocked by a real failure is never marked interrupted', async () => {
-    // A node that exhausted its review budget must NOT come back to life on resume.
-    const runAgent = (async () => 'no fence at all, ever') as unknown as RunAgentFn
+    // 一个真的失败过的节点不许在 --resume 之后复活。
+    // 制造方式换成「方案调用打不通」:质疑修复不再判决,「评审预算烧完」这条路已经不存在。
+    const runAgent = (async () => { throw new Error('provider unreachable') }) as unknown as RunAgentFn
     const orch = new EffTaskOrchestrator(cfg(), deps(runAgent), new AbortController().signal)
     const res = await orch.run()
     expect(res.status).toBe('blocked')
@@ -435,7 +460,7 @@ describe('运行中重做:别的任务照跑,失败的那个当场重开', () =>
           req.signal.addEventListener('abort', () => reject(new Error('已中断')), { once: true })
         })
       }
-      // **只在验收这一关制造失败**,不碰质疑讨论:方案环节被打回的节点重开时要回 CREATED
+      // **只在验收这一关制造失败**,不碰质疑修复:方案环节被打回的节点重开时要回 CREATED
       // 重新拟方案(planRedo 的 'plan' 入口),而这一组测的是「执行/验收那一档」的重开 ——
       // 把两件事混在一个夹具里,重开之后节点会带着一份从没被批准过的方案进执行。
       //

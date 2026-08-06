@@ -65,7 +65,7 @@ export interface BlockEscalation {
 }
 
 const TITLE: Record<BlockCategory, string> = {
-  'cap-iteration': '安全阀 · 方案评审迭代超限',
+  'cap-iteration': '安全阀 · 方案拆分迭代超限',
   'cap-nodes': '安全阀 · 任务树节点数超上限',
   rework: '连续返工超限',
   // 「执行超时」教的是「跑太久了 → 把节点拆小」,而这条阀量的是**静默**:一直在吐字就
@@ -86,7 +86,7 @@ const TITLE: Record<BlockCategory, string> = {
  * useless advice for most of these: the same cap trips at the same place.
  */
 const REMEDY: Record<BlockCategory, string> = {
-  'cap-iteration': '若方案本身没问题,可提高 run.md 里 caps.maxIterations 后再重试;否则先按评审意见改需求或补充信息。',
+  'cap-iteration': '方案反复拆不成立(通常是子任务依赖成环)。可提高 run.md 里 caps.maxIterations 后再重试;或者把目标写得更能切分,再重做这个节点。',
   'cap-nodes': '提高 run.md 里 caps.maxNodes 后再重试,或缩小需求范围。',
   rework: '先看该节点的验收记录,按阻断意见改代码或改验收点;必要时提高 caps.maxIterations。',
   /**
@@ -173,7 +173,7 @@ function retryTarget(node: TaskNode, category: BlockCategory): string {
   const plan = `${PHASE_LABEL.plan} → ${PHASE_LABEL.review}`
   if (category === 'cap-iteration') return `${plan}(方案会重新生成)`
   if (node.kind !== 'executable') return plan
-  // 只有真的配了测试验证席位才写它 —— 否则那一步整个不发生,写上去就是多报一步。
+  // 只有真的配了测试修复席位才写它 —— 否则那一步整个不发生,写上去就是多报一步。
   const steps = [PHASE_LABEL.execute,
     ...((node.phaseRoles.verify ?? []).length > 0 ? [PHASE_LABEL.verify] : []),
     PHASE_LABEL.accept]

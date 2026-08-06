@@ -36,8 +36,8 @@ const ACTIVE: ReadonlySet<NodeStatus> = new Set<NodeStatus>([
  * 执行调用,被杀在 `MERGE` 的节点只会重试一次合并。用户在详情页看到的两句话原本一模一样。
  */
 const PHASE_OF: Partial<Record<NodeStatus, string>> = {
-  PLANNING: '方案制定', PLAN_REVIEW: '方案评审', EXECUTING: '执行', EXECUTED: '执行完成待验收',
-  VERIFYING: '测试验证',
+  PLANNING: '方案制定', PLAN_REVIEW: '质疑修复', EXECUTING: '执行', EXECUTED: '执行完成待验收',
+  VERIFYING: '测试修复',
   ACCEPTANCE: '验收', REWORK: '返工', INTEGRATION_ACCEPT: '集成验收', SCORING: '观察评分',
   MERGE: '合并回集成分支',
 }

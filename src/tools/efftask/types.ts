@@ -16,8 +16,22 @@ import type { UsageTotals } from './usage.js'
  * 这个列表**会随版本增长**(这一版就从 5 个长到了 7 个)。承认这点比假装它固定要诚实。
  */
 export type PhaseName =
+  /**
+   * `review` = **质疑修复**(旧名「质疑讨论」)。
+   *
+   * 它**不再是一个裁决关口**。用户的原话:「质疑讨论改成质疑修复,不提出意见,直接在原方案
+   * 的基础上进行修改,最终给出完整的修复方案。多个质疑成员,就顺序执行即可。」
+   * 于是这一关的形状和 `plan` 的精化一模一样:N 席**顺序**接力,每席拿到上一版方案,
+   * 挑得出毛病就自己改掉,产出仍然是一份**完整方案**。没有 pass/blocking,没有打回重出,
+   * 没有降级放行 —— 那三样都是「提意见给别人做」才需要的东西。
+   */
   | 'plan' | 'review' | 'execute'
-  // 测试验证:真的把测试跑起来,而不是读执行者的自述。
+  /**
+   * `verify` = **测试修复**(旧名「测试验证」)。真的把测试跑起来,而且**跑出问题自己修**。
+   *
+   * 同一句需求的执行侧一半:「测试验证也改成测试修复,有问题直接修复,不要提出什么阻塞项。」
+   * 所以这一关也不再判决、不再把节点打回执行者 —— 它自己就在工作区里,自己修完再往下走。
+   */
   | 'verify'
   | 'accept'
   // 集成提交:拆分型节点在子任务全部完成后的那一场裁决(INTEGRATION_ACCEPT)。
@@ -30,8 +44,8 @@ export const PHASE_NAMES: PhaseName[] =
 
 /** 环节的中文名 —— 用户文档、关口、错误信息都用它。内部 phase 名不对用户暴露。 */
 export const PHASE_LABEL: Record<PhaseName, string> = {
-  plan: '分析', review: '质疑讨论', execute: '执行',
-  verify: '测试验证', accept: '验收', integrate: '集成验收', observer: '观察',
+  plan: '分析', review: '质疑修复', execute: '执行',
+  verify: '测试修复', accept: '验收', integrate: '集成验收', observer: '观察',
 }
 
 /**
@@ -45,6 +59,21 @@ export const STEP_ALIASES: Record<string, PhaseName> = {
   ...Object.fromEntries(PHASE_NAMES.map(p => [PHASE_LABEL[p], p])),
   // 常见的另一种说法,收下比让用户猜要好。
   方案: 'plan', 评审: 'review', 打分: 'observer', 评分: 'observer',
+  /**
+   * 「质疑讨论」「测试验证」是这两个环节的**旧名**,继续收。
+   *
+   * 它们改名是因为职责真的变了(不再提意见、直接改),但盘上的 run.md、settings.json 里
+   * 按旧名写好的配置不该一夜作废 —— 和「集成提交」那条同一个理由。
+   * 落盘的永远是内部 phase 名,所以收下旧名不会让磁盘上出现两种写法。
+   */
+  /**
+   * **只收完整的旧名,不收「质疑」「测试」这种简写。**
+   *
+   * 简写看起来友好,实际会吃掉一条更有用的路:`parseRoleDefs` 对认不出的环节名会**猜一个
+   * 最接近的**并把七个合法值列出来(「你写的是『测试』—— 是不是想写『测试修复』?」)。
+   * 把简写也收下,用户就再也收不到那句提示,而他真正想写的可能是别的环节。
+   */
+  质疑讨论: 'review', 测试验证: 'verify',
   // 「集成提交」是这个环节的**旧名**。它不做任何合并 —— 合并早在每个执行型子节点
   // 自己通过验收时就发生了(stepExecute 里的 mergeAndRelease);这一关判的是
   // 「子任务的结果合起来达没达成父目标」。名字改成集成验收,旧名继续收,
@@ -81,11 +110,18 @@ export const BLOCK_CATEGORIES: ReadonlySet<string> =
   new Set(['cap-iteration', 'cap-nodes', 'rework', 'timeout', 'infra', 'cap-depth', 'revise', 'degrade'])
 
 /**
- * 降级放行可以发生在哪几关 = **四个裁决关口**。执行不在内:那不是判决,零产出就是零产出。
+ * 降级放行可以发生在哪几关。执行不在内:那不是判决,零产出就是零产出。
  *
  * `integrate`(集成验收)必须在内,而它差点被漏掉。漏掉的后果是「不失败」这句承诺对
  * **每一个拆分型节点**都不成立 —— 包括根:子任务全部降级放行、全部 ACCEPTED 之后,
  * 根的集成验收照样会在第 3 轮把整个 run 判死。run 001 死的正是根节点。
+ *
+ * ## `review` / `verify` 还留在这张表里,但**不再产生**新的降级记录
+ *
+ * 降级放行是「判不通过 + 轮数用尽」的产物,而这两关已经不判决了(见 PhaseName)。
+ * 留着它们是为了**读回**:老 node.md 上真实发生过的那些记录仍然要读得进来、渲染得出来、
+ * 并且把当初那几条建议带给执行者。删掉的话 `validateLoadedNodes` 会把它们当非法值丢弃,
+ * 而那是一次静默的历史篡改。
  */
 export const DEGRADABLE_PHASES = ['review', 'verify', 'accept', 'integrate'] as const
 export type DegradePhase = (typeof DEGRADABLE_PHASES)[number]
@@ -766,6 +802,10 @@ export interface TaskNode {
    * 「交给验收」当场坍缩成「验收只看一眼然后放行」,和这句需求正好相反。
    *
    * 缺席读成 0(见 `resumeCore` 的 `count`)—— 老 node.md 照常读得回来。
+   *
+   * **今天它不再增长。** 测试修复不判决,也就没有「这一关第几轮没过」这回事;字段留着是
+   * 为了读回老 node.md(那里的数字是真的烧过的),以及给 `reseat` 判「这一关的预算在
+   * 上一趟是不是已经用尽」。
    */
   iteration: { planReview: number; acceptance: number; verification?: number; integration: number; scoring: number; mergeResolve: number }
   depth: number

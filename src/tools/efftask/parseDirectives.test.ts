@@ -436,7 +436,7 @@ describe('抽取提示词必须覆盖全部环节', () => {
 
   it('中文环节名的对应关系也给了模型', async () => {
     const t = await promptText()
-    for (const label of ['测试验证', '集成验收', '质疑讨论']) {
+    for (const label of ['测试修复', '集成验收', '质疑修复']) {
       expect(`${label}:${t.includes(label)}`).toBe(`${label}:true`)
     }
   })
@@ -477,7 +477,7 @@ describe('parseDirectives:跳过环节(唯一的提示词入口)', () => {
   it('环节名写错 → 不跳,给 notice 并猜一个最接近的', async () => {
     const cfg = await P(['测试'])
     expect(cfg.skipSteps).toBeUndefined()
-    expect(cfg.notices.join('\n')).toContain('是不是想写「测试验证」')
+    expect(cfg.notices.join('\n')).toContain('是不是想写「测试修复」')
   })
   it('没说跳过时 skipSteps 不出现,也不报噪音', async () => {
     const cfg = await parseDirectives('干活', { knownRoles: [], modelJson: async () => '{"parallelism":3}' })

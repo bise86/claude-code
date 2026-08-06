@@ -388,10 +388,13 @@ describe('追加指令送得到裁判席', () => {
       expect(`${phase} 里有那句指令: ${ps.every(p => p.includes('别动 src/legacy'))}`)
         .toBe(`${phase} 里有那句指令: true`)
     }
-    // 裁判席还要多一句「以它为准」—— 否则他们会因为执行者听了用户的话而判它没做完。
-    for (const phase of ['review', 'accept']) {
-      expect((byPhase.get(phase) ?? []).every(p => p.includes('优先于原方案的枝节'))).toBe(true)
-    }
+    /**
+     * 裁判席还要多一句「以它为准」—— 否则他们会因为执行者听了用户的话而判它没做完。
+     *
+     * 只剩验收这一侧了:质疑修复不做裁决(它那一关一行代码都还没写,谈不上「判它没做完」),
+     * 所以那句话对它是空转。
+     */
+    expect((byPhase.get('accept') ?? []).every(p => p.includes('优先于原方案的枝节'))).toBe(true)
     // 执行侧不需要那句(它本来就照着做)。
     expect((byPhase.get('execute') ?? []).some(p => p.includes('都不算未完成'))).toBe(false)
   })

@@ -521,14 +521,19 @@ describe('spec §7:圆桌的多个角色是在同一个节点内并行的', () =
     return reply(req, '{"pass":true,"blocking":[],"comments":"ok"}')
   }) as unknown as RunAgentFn
 
-  it('单个节点的评审圆桌:三个角色同时在跑', async () => {
+  /**
+   * 质疑修复**刻意是串行的** —— 峰值必须是 1。
+   *
+   * 用户原话:「多个质疑成员,就顺序执行即可。」而这不只是省事:并行的话 N 份修订版之间
+   * 还要再融合一次,而融合出来的那一版没有任何人质疑过。这条用例是那句需求唯一的探针。
+   */
+  it('单个节点的质疑修复:三个角色**依次**上手,不并行', async () => {
     const m = phaseMeter()
     const orch = new EffTaskOrchestrator(
       cfg({ parallelism: 5, phaseRoles: { ...emptyPhaseRoles(), review: roles } }),
       deps(m.wrap(single())), new AbortController().signal)
     expect((await orch.run()).status).toBe('completed')
-    // 树里只有一个节点,所以这个峰值除了圆桌扇出没有别的来源。
-    expect(m.peak.review).toBe(3)
+    expect(m.peak.review).toBe(1)
   })
 
   it('单个节点的验收圆桌同样并行', async () => {
@@ -544,7 +549,7 @@ describe('spec §7:圆桌的多个角色是在同一个节点内并行的', () =
     // mapWithinPool 的第一项蹭调用方的槽位、其余 try-lease,正是为了这里不死锁。
     const m = phaseMeter()
     const orch = new EffTaskOrchestrator(
-      cfg({ parallelism: 1, phaseRoles: { ...emptyPhaseRoles(), review: roles } }),
+      cfg({ parallelism: 1, phaseRoles: { ...emptyPhaseRoles(), accept: roles } }),
       deps(m.wrap(single())), new AbortController().signal)
     expect((await orch.run()).status).toBe('completed')
     expect(m.peak.review).toBe(1)

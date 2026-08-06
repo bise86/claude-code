@@ -110,7 +110,7 @@ describe('redoOptions', () => {
       .toEqual(['review', 'execute', 'verify', 'accept', 'integrate', 'observer'])
   })
 
-  it('测试验证 / 验收 / 观察永远禁用,而且给出能照做的下一步', () => {
+  it('测试修复 / 验收 / 观察永远禁用,而且给出能照做的下一步', () => {
     // 它们跑在别的 step 内部,没有自己的入口。只说「不可用」是半句话 ——
     // 用户想重跑的那件事通常还是做得到的,只是入口在别处。
     const n = node('x', { kind: 'executable', childIds: [] })
@@ -143,7 +143,7 @@ describe('redoOptions', () => {
     }
   })
 
-  it('质疑讨论重做:没有方案就按不动', () => {
+  it('质疑修复重做:没有方案就按不动', () => {
     // 空方案上重跑评审 = 让评审员对着空白发表意见。
     const empty = node('x', { kind: 'executable' })
     expect(redoOptions(empty, new Map([['x', empty]])).find(o => o.entry === 'review')!.disabled)
@@ -155,13 +155,13 @@ describe('redoOptions', () => {
 
   it('入口环节自己被跳过时,从它重做按不动', () => {
     /**
-     * 只看「整条链是不是空的」不够:跳过质疑讨论之后,「从质疑讨论重做」的链上还剩
+     * 只看「整条链是不是空的」不够:跳过质疑修复之后,「从质疑修复重做」的链上还剩
      * 执行那一段 —— 链非空、条目可用,而用户按下去得到的是一次执行重做。
      * 条目叫什么名字,那个环节就必须发生。
      */
     const planned = node('y', { kind: 'executable', plan: { solution: '这么干', keyPoints: '', risks: '', acceptance: '' } })
     const o = redoOptions(planned, new Map([['y', planned]]), { skipSteps: ['review'] }).find(x => x.entry === 'review')!
-    expect(o.disabled).toContain('本次配置跳过了质疑讨论')
+    expect(o.disabled).toContain('本次配置跳过了质疑修复')
   })
 
   it('拆分任务不给「执行重做」—— 它自己没有执行环节', () => {
@@ -251,12 +251,12 @@ describe('planRedo:方案重做', () => {
    * `degraded` 平时是审计记录(所以别处一律不清),但它**同时是闩**:
    * `degradedAt(n,'verify')` 为真时那一关这辈子不再开会。任务重做把 `iteration` 归零、
    * 发回一整套新预算,留着闩就等于「预算发了,但那几关一次都不会跑」——
-   * 重做出来的节点从此没有测试验证、没有验收,而屏幕上说的是「已重开」。
+   * 重做出来的节点从此没有测试修复、没有验收,而屏幕上说的是「已重开」。
    */
   it('降级放行的记录要清掉,否则重做出来的节点那几关一次都不会跑', () => {
     const t = tree()
     t[1]!.degraded = [
-      { phase: 'verify', round: 3, reason: '测试验证迭代超限(3)', advice: ['修 X'], at: '2026-08-04T00:00:00Z' },
+      { phase: 'verify', round: 3, reason: '测试修复迭代超限(3)', advice: ['修 X'], at: '2026-08-04T00:00:00Z' },
       { phase: 'accept', round: 3, reason: '验收迭代超限(3)', advice: [], at: '2026-08-04T00:00:00Z' },
     ]
     const r = ok(planRedo(t, 'a', 'plan', 'T1'))
@@ -275,8 +275,8 @@ describe('planRedo:方案重做', () => {
     t[1]!.iteration = { planReview: 3, acceptance: 3, integration: 3, scoring: 3, mergeResolve: 3 }
     const r = ok(planRedo(t, 'a', 'plan', 'T1'))
     expect(r.nodes.find(n => n.id === 'a')!.iteration)
-      // verification 是测试验证自己那一维(理由见 TaskNode.iteration)—— 一起清,
-      // 否则重做出来的节点带着一份用尽的预算,第一次测试验证不通过就直接降级放行。
+      // verification 是测试修复自己那一维(理由见 TaskNode.iteration)—— 一起清,
+      // 否则重做出来的节点带着一份用尽的预算,第一次测试修复不通过就直接降级放行。
       .toEqual({ planReview: 0, acceptance: 0, verification: 0, integration: 0, scoring: 0, mergeResolve: 0 })
   })
 
@@ -637,15 +637,15 @@ describe('验收查出来的计数与判据', () => {
 })
 
 describe('环节实况:屏幕上那句话必须是真的', () => {
-  it('默认配置(没配验证角色)下,测试验证根本不跑 —— 就不能写它会跑', () => {
-    // 测试验证是 opt-in(phaseRoles.verify.length > 0),而 emptyPhaseRoles() 给的默认是
-    // 0 席。大多数用户不配角色,所以原来那句无条件的「执行 → 测试验证 → 验收」
+  it('默认配置(没配验证角色)下,测试修复根本不跑 —— 就不能写它会跑', () => {
+    // 测试修复是 opt-in(phaseRoles.verify.length > 0),而 emptyPhaseRoles() 给的默认是
+    // 0 席。大多数用户不配角色,所以原来那句无条件的「执行 → 测试修复 → 验收」
     // 对大多数用户就是假的。
-    expect(phaseChainText('execute', {})).toBe('执行 → 验收;不跑:测试验证、观察(未配置角色,这些环节不存在)')
+    expect(phaseChainText('execute', {})).toBe('执行 → 验收;不跑:测试修复、观察(未配置角色,这些环节不存在)')
   })
 
   it('配了验证角色就三步都写', () => {
-    expect(phaseChainText('execute', { seatCount: { verify: 2, observer: 1 } })).toBe('执行 → 测试验证 → 验收 → 观察')
+    expect(phaseChainText('execute', { seatCount: { verify: 2, observer: 1 } })).toBe('执行 → 测试修复 → 验收 → 观察')
   })
 
   it('skipSteps 跳过的环节,原因和「没配角色」要分开说', () => {
@@ -663,7 +663,7 @@ describe('环节实况:屏幕上那句话必须是真的', () => {
   it('accept 没配席位不算不存在 —— 它会回落到别的席位,照样发生', () => {
     // 把「0 席 = 不发生」写成通用规则的话,没配验收角色的 run 会被告知不做验收,
     // 而它其实是做的。只有 verify 有「没配就整个不存在」这个性质。
-    expect(phaseChainText('execute', { seatCount: { accept: 0, verify: 1, observer: 1 } })).toBe('执行 → 测试验证 → 验收 → 观察')
+    expect(phaseChainText('execute', { seatCount: { accept: 0, verify: 1, observer: 1 } })).toBe('执行 → 测试修复 → 验收 → 观察')
   })
 
   it('方案重做的链条也照实算', () => {
@@ -676,7 +676,7 @@ describe('环节实况:屏幕上那句话必须是真的', () => {
     expect(phasesOf('integrate', {})).toEqual(['integrate'])
   })
 
-  it('观察和测试验证一样是 opt-in —— 没配席位就整个不存在', () => {
+  it('观察和测试修复一样是 opt-in —— 没配席位就整个不存在', () => {
     // scoreNode 的第一句判据就是 seats.length === 0 → return false。把「0 席 = 不发生」
     // 写成通用规则的话,没配验收角色的 run 会被告知不做验收,而它其实是做的。
     expect(phaseRuns('observer', {})).toBe(false)
@@ -687,15 +687,15 @@ describe('环节实况:屏幕上那句话必须是真的', () => {
   it('两种「不跑」的理由分组写,不是一个环节一个括号', () => {
     // 链从 3 条长到 6 条之后逐条写就是同一句理由印两遍,而这一行本来就已经在 80 列上折行。
     const t = phaseChainText('plan', { skipSteps: ['review'] })
-    expect(t).toContain('质疑讨论(本次配置跳过)')
-    expect(t).toContain('测试验证、观察(未配置角色,这些环节不存在)')
+    expect(t).toContain('质疑修复(本次配置跳过)')
+    expect(t).toContain('测试修复、观察(未配置角色,这些环节不存在)')
   })
 
-  it('质疑讨论重做**不止**跑一个环节 —— 通过之后还会往下走', () => {
+  it('质疑修复重做**不止**跑一个环节 —— 通过之后还会往下走', () => {
     /**
      * 第一版把这条链写成 `['review']`,而那是一句假话:stepStart 的 reviewOnly 分支
      * 通过之后走的是普通路由 —— 执行型节点 commit(READY),调度器接着分派 stepExecute。
-     * 实测真实链条是质疑讨论 → 执行 → 验收(→ 测试验证/观察,配了席位的话)。
+     * 实测真实链条是质疑修复 → 执行 → 验收(→ 测试修复/观察,配了席位的话)。
      * 代价少报一个数量级。
      */
     const leaf = node('x', { kind: 'executable' })
@@ -749,7 +749,7 @@ describe('redoSummary', () => {
     const t = tree()
     const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
     const lines = redoSummary(r, t[2]!, 'execute', { seatCount: { verify: 1 } }).join('\n')
-    expect(lines).toContain('执行 → 测试验证 → 验收')
+    expect(lines).toContain('执行 → 测试修复 → 验收')
     // 执行重做不删任何东西、不改写任何依赖 —— 摘要里就不该出现这两句。
     expect(lines).not.toContain('删除')
     expect(lines).not.toContain('依赖被改写')
@@ -776,7 +776,7 @@ describe('redoContextOf', () => {
   it('席位从**目标节点**上取,不是从 run 配置上取', () => {
     /**
      * applyRosterToNodes 的第一句是 `if (n.status === 'ACCEPTED') continue`,而重做目标
-     * 绝大多数正是 ACCEPTED 节点。resume 时新加一个测试验证席位:run 配置上有了,
+     * 绝大多数正是 ACCEPTED 节点。resume 时新加一个测试修复席位:run 配置上有了,
      * 那个节点上没有 —— 而真正决定环节跑不跑的是 pipeline 里读的 node.phaseRoles.verify。
      * 拿 config 去算的话,关口会承诺一个这个节点上根本不存在的环节。
      */
@@ -785,7 +785,7 @@ describe('redoContextOf', () => {
       phaseRoles: { ...Object.fromEntries(PHASE_NAMES.map(p => [p, []])), verify: [] } as TaskNode['phaseRoles'],
     })
     expect(redoContextOf(n).seatCount?.verify).toBe(0)
-    expect(phaseChainText('execute', redoContextOf(n))).toContain('测试验证')
+    expect(phaseChainText('execute', redoContextOf(n))).toContain('测试修复')
     expect(phaseChainText('execute', redoContextOf(n))).toContain('未配置角色')
   })
 
@@ -795,7 +795,7 @@ describe('redoContextOf', () => {
       phaseRoles: { ...Object.fromEntries(PHASE_NAMES.map(p => [p, []])), verify: [seat] } as TaskNode['phaseRoles'],
     })
     expect(redoContextOf(n).seatCount?.verify).toBe(1)
-    expect(phaseChainText('execute', redoContextOf(n))).toContain('执行 → 测试验证 → 验收')
+    expect(phaseChainText('execute', redoContextOf(n))).toContain('执行 → 测试修复 → 验收')
   })
 
   it('skipSteps 从 run 配置来 —— 那本来就是 run 级的', () => {
@@ -809,7 +809,7 @@ describe('redoContextOf', () => {
   })
 })
 
-describe('从「质疑讨论」重做', () => {
+describe('从「质疑修复」重做', () => {
   const planned = (over: Partial<TaskNode> = {}): TaskNode => node('x', {
     plan: { solution: '这么干', keyPoints: '', risks: '', acceptance: '' },
     status: 'ACCEPTED', ...over,

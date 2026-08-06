@@ -86,7 +86,7 @@ describe('startupConfirm racer', () => {
     const lines = rosterLines(cfg)
     // 一个环节一行 —— 用 PHASE_NAMES.length 而不是写死的数字,这个列表会增长。
     expect(lines).toHaveLength(PHASE_NAMES.length)
-    expect(lines).toContain('质疑讨论: arch、sec(opus)') // the bound model is visible on the gate
+    expect(lines).toContain('质疑修复: arch、sec(opus)') // the bound model is visible on the gate
     expect(lines).toContain('分析: 主模型')
   })
 
@@ -225,7 +225,7 @@ describe('parallelismLine 必须描述 THIS run,而不是一句固定话', () =>
   }
   it('un-isolated: says execute and leaf acceptance are serial', () => {
     const line = parallelismLine(base, { editable: false, isolation: 'none' })
-    expect(line).toContain('方案/评审阶段并行')
+    expect(line).toContain('方案/质疑修复阶段并行')
     expect(line).toContain('执行与叶子验收串行')
     expect(line).toContain('未启用隔离')
   })
@@ -569,7 +569,7 @@ describe('名册可编辑 (spec §2 第一关)', () => {
     // 按标签找,不按下标 —— 环节列表会增长,下标断言到时会静默错位到别的行。
     const row = (label: string) => lines.find(l => l.includes(label))!
     expect(row('分析')).not.toContain('(单选)')     // 顺序精化,可多员工
-    expect(row('质疑讨论')).not.toContain('(单选)') // 圆桌
+    expect(row('质疑修复')).not.toContain('(单选)') // 圆桌
     expect(row('执行')).toContain('(单选)')         // 物理约束,只能一个
     expect(row('观察')).not.toContain('(单选)')     // 圆桌:取最低分收敛
   })
@@ -706,7 +706,7 @@ describe('spec §8:非 git 仓库要给用户一个选择,而不是自动降级'
     expect(text).toContain('当前目录不是 git 仓库')
     expect(text).toContain('共享')
     expect(text).toContain('串行')     // 这是真的:orchestrator 的 serialiseExecute
-    expect(text).toContain('方案/评审') // 而这些阶段仍然并行 —— 别把降级说得比实际严重
+    expect(text).toContain('方案/质疑修复') // 而这些阶段仍然并行 —— 别把降级说得比实际严重
   })
 
   it('能初始化 git 时才提 g 键', () => {
@@ -785,7 +785,7 @@ describe('关口名册要如实说出角色与员工', () => {
 
   it('带角色标签的席位:角色和员工都说出来', () => {
     const line = rosterLines(cfg({ review: [{ roleName: 'opus-架构', model: 'claude-opus-4-8', roleTag: '架构师' }] }))
-      .find(l => l.startsWith('质疑讨论'))!
+      .find(l => l.startsWith('质疑修复'))!
     expect(line).toContain('架构师')
     expect(line).toContain('opus-架构')
     expect(line).toContain('claude-opus-4-8')
@@ -803,8 +803,8 @@ describe('关口名册要如实说出角色与员工', () => {
   })
 
   it('没有角色标签的席位照旧只显示员工与模型', () => {
-    const line = rosterLines(cfg({ review: [{ roleName: 'opus-架构', model: 'm' }] })).find(l => l.startsWith('质疑讨论'))!
-    expect(line).toBe('质疑讨论: opus-架构(m)')
+    const line = rosterLines(cfg({ review: [{ roleName: 'opus-架构', model: 'm' }] })).find(l => l.startsWith('质疑修复'))!
+    expect(line).toBe('质疑修复: opus-架构(m)')
   })
 
   it('同一员工兼两角 → 名册上两席都点名各自的角色', () => {
@@ -813,7 +813,7 @@ describe('关口名册要如实说出角色与员工', () => {
         { roleName: 'ds-安全', model: 'm', roleTag: '架构师' },
         { roleName: 'ds-安全', model: 'm', roleTag: '安全' },
       ],
-    })).find(l => l.startsWith('质疑讨论'))!
+    })).find(l => l.startsWith('质疑修复'))!
     // 不点名角色的话用户会看到两个一模一样的 `ds-安全(m)`,分不清是配置生效了还是 bug。
     expect(line).toContain('架构师')
     expect(line).toContain('安全')
@@ -889,7 +889,7 @@ describe('关口编辑器与角色席位', () => {
       R({ review: [{ roleName: 'opus-架构', roleTag: '架构师' }, { roleName: 'ds-安全' }] }),
       ['opus-架构', 'ds-安全'], 1, 0,
     )
-    const line = lines.find(l => l.includes('质疑讨论'))!
+    const line = lines.find(l => l.includes('质疑修复'))!
     expect(line).toContain('[ ]opus-架构')
     expect(line).toContain('[x]ds-安全')
     expect(line).toContain('架构师')
@@ -968,7 +968,7 @@ describe('成本预估必须对得上真实调用数', () => {
     // 承诺 15 次。低估比高估糟 —— 用户按一个偏小的数批准。
     // 精确值,不用比值:比值断言会被**另一个**阶段的平方项满足 —— 实测把方案阶段的
     // 平方拆掉,验收阶段的平方仍让比值达标,测试照旧全绿。
-    // 默认 It=3,方案/评审/验收各 1 席,观察 0 席,单点调用的限流重试 T=3:
+    // 默认 It=3,方案/质疑修复/验收各 1 席,观察 0 席,单点调用的限流重试 T=3:
     //   方案阶段 = 3 × (1×T + 3×1) = 18;执行阶段 = 3 × (1 + 3×1 + 0) = 12;合计 30。
     // 任一处平方被拆成一次方都会掉下来;T 漏掉会掉到 24。
     expect(n(costLine(mk()))).toBe(30)
@@ -1037,7 +1037,7 @@ describe('新环节的成本必须计入,而默认配置的数字不能动', () 
     expect(n(costLine(mk()))).toBe(30)
   })
 
-  it('配了测试验证 → 数字涨,而且带 infra 重试层(平方项)', () => {
+  it('配了测试修复 → 数字涨,而且带 infra 重试层(平方项)', () => {
     const one = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }] } })))
     const two = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }, { roleName: 'w' }] } })))
     expect(one).toBeGreaterThan(30)
@@ -1065,11 +1065,11 @@ describe('关口不能对没配角色的环节撒谎', () => {
   })
   const row = (c: EffTaskConfig, label: string) => rosterLines(c).find(l => l.startsWith(label))!
 
-  it('测试验证 0 席 → 说这一步不发生,不说「主模型」', () => {
+  it('测试修复 0 席 → 说这一步不发生,不说「主模型」', () => {
     // 它是 opt-in:0 席 = 一次调用都不会有。说「主模型」就是承诺一件不会发生的事。
-    const line = row(mk(), '测试验证')
+    const line = row(mk(), '测试修复')
     expect(line).not.toContain('主模型')
-    expect(line).toContain('不做验证')
+    expect(line).toContain('不跑测试也不修')
   })
 
   it('集成验收 0 席 → 说它回落到验收席位,不说「主模型」', () => {
@@ -1084,13 +1084,13 @@ describe('关口不能对没配角色的环节撒谎', () => {
   })
 
   it('配了席位就照常显示那些人', () => {
-    const line = row(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'tester', model: 'm2' }] } }), '测试验证')
+    const line = row(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'tester', model: 'm2' }] } }), '测试修复')
     expect(line).toContain('tester')
     expect(line).not.toContain('不做验证')
   })
 
   it('其余环节 0 席照旧回落主模型 —— 那三条特判不能扩大化', () => {
-    for (const label of ['分析', '质疑讨论', '执行', '验收']) {
+    for (const label of ['分析', '质疑修复', '执行', '验收']) {
       expect(`${label}:${row(mk(), label).includes('主模型')}`).toBe(`${label}:true`)
     }
   })
@@ -1105,8 +1105,8 @@ describe('关口:跳过要说出后果,组合要拦住', () => {
 
   it('每个被跳过的环节都写出后果,不是只写「已跳过」', () => {
     for (const [ph, label, must] of [
-      ['plan', '分析', '不主动拆子任务'], ['review', '质疑讨论', '不会在这里被拦下'],
-      ['execute', '执行', '不会产生任何提交'], ['verify', '测试验证', '读执行者的自述'],
+      ['plan', '分析', '不主动拆子任务'], ['review', '质疑修复', '不会在这里被拦下'],
+      ['execute', '执行', '不会产生任何提交'], ['verify', '测试修复', '读执行者的自述'],
       ['accept', '验收', '未经判断就合进集成分支'], ['integrate', '集成验收', '拆漏了'],
       ['observer', '观察', '不打分'],
     ] as const) {
@@ -1135,8 +1135,8 @@ describe('关口:跳过要说出后果,组合要拦住', () => {
     expect(lines.join('\n')).not.toContain('验收根本跑不到')
   })
 
-  it('跳过分析不跳质疑讨论 → 拦住', () => {
-    expect(skipConflictLines(mk({ skipSteps: ['plan'] as never })).join('\n')).toContain('评一份空方案')
+  it('跳过分析不跳质疑修复 → 拦住', () => {
+    expect(skipConflictLines(mk({ skipSteps: ['plan'] as never })).join('\n')).toContain('拿到一份空方案')
   })
 
   it('七个全跳 → 说清是空跑', () => {
@@ -1207,7 +1207,7 @@ describe('编辑器要标出被跳过的环节', () => {
   it('被跳过的那一行说明勾选即恢复', () => {
     // 不标的话那一行的复选框就是「配得进去、永远不生效」:用户勾了人,什么都不会发生。
     const lines = rosterEditorLines(emptyPhaseRoles() as never, ['a'], 0, 0, undefined, ['review'])
-    const row = lines.find(l => l.includes('质疑讨论'))!
+    const row = lines.find(l => l.includes('质疑修复'))!
     expect(row).toContain('已跳过')
     expect(row).toContain('勾选任一员工即恢复')
   })

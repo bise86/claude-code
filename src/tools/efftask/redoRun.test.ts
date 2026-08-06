@@ -188,7 +188,7 @@ describe('预演与执行用同一份环节实况', () => {
   })
 
   it('ctx 真的被传到 planRedo —— 不传的话链条文案会变', async () => {
-    // 判据挑的是**看得见的产出差异**:配了测试验证席位时链里有它,不配就没有。
+    // 判据挑的是**看得见的产出差异**:配了测试修复席位时链里有它,不配就没有。
     // ctx 丢在半路的话,执行出来的树和关口预演的那次算的不是一回事。
     const seen: string[][] = []
     const deps = (): RedoRunDeps => ({
@@ -208,7 +208,7 @@ describe('预演与执行用同一份环节实况', () => {
   it('ctx 决定的 disabled 判据,planRedo 也照着拒绝 —— 不是只有屏幕拒绝', async () => {
     /**
      * 这才是「同一份 ctx」真正要防的东西:屏幕上禁用而 planRedo 放行 = 两个真相源。
-     * 跳过质疑讨论之后,「从质疑讨论重做」在菜单上是禁用的;planRedo 必须也拒绝。
+     * 跳过质疑修复之后,「从质疑修复重做」在菜单上是禁用的;planRedo 必须也拒绝。
      */
     const problems: string[][] = []
     const deps: RedoRunDeps = {
@@ -217,7 +217,7 @@ describe('预演与执行用同一份环节实况', () => {
     }
     await runRedo([leaf()], 'x', 'review', 'T1', deps, { skipSteps: ['review'] })
     expect(problems.flat().join()).toContain('重做未执行')
-    expect(problems.flat().join()).toContain('本次配置跳过了质疑讨论')
+    expect(problems.flat().join()).toContain('本次配置跳过了质疑修复')
   })
 
   it('不传 ctx 时同一次重做是放行的 —— 排除「这条恒拒绝」', async () => {

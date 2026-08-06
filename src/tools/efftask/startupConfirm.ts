@@ -301,9 +301,9 @@ export function dispatchableRoles(known: string[], unsupported: string[]): strin
 /** 每个环节被跳过之后**实际会发生什么**。写后果,不写「已跳过」。 */
 const SKIP_CONSEQUENCE: Record<PhaseName, string> = {
   plan: '(已跳过 —— 不出方案、不主动拆子任务,节点直接照目标开工)',
-  review: '(已跳过 —— 方案没人质疑就进执行,漏项和隐藏依赖不会在这里被拦下)',
+  review: '(已跳过 —— 方案没人质疑、也没人改就进执行,漏项和隐藏依赖不会在这里被拦下)',
   execute: '(已跳过 —— 没有人改代码,本次不会产生任何提交)',
-  verify: '(已跳过 —— 不实跑测试,验收只能读执行者的自述)',
+  verify: '(已跳过 —— 不实跑测试、也没人修,验收只能读执行者的自述)',
   accept: '(已跳过 —— 没人核对验收点,产出未经判断就合进集成分支)',
   integrate: '(已跳过 —— 子任务各自通过就算父任务达成,当初拆漏了不会再有人发现)',
   observer: '(已跳过 —— 不打分,低分触发的那一轮返工不会发生)',
@@ -329,7 +329,7 @@ export function skipConflictLines(config: EffTaskConfig): string[] {
       + '要么一并跳过验收,要么别跳执行。')
   }
   if (skip.has('plan') && !skip.has('review')) {
-    out.push('跳过了分析但没跳质疑讨论:评审席位会去评一份空方案,大概率判不通过并烧完迭代。建议一并跳过质疑讨论。')
+    out.push('跳过了分析但没跳质疑修复:质疑修复席位会拿到一份空方案,它只能自己从零写一份 —— 那是分析该干的活,而且没人再质疑它。建议一并跳过质疑修复,或者别跳分析。')
   }
   if (skip.size >= PHASE_NAMES.length) {
     out.push('七个环节全部跳过:本次不会有任何模型调用,也不会有任何代码改动。确认要空跑吗?')
@@ -399,7 +399,7 @@ export function mcpNoticeLines(
     }
   }
   if (mcpToolNames.length > 0) {
-    lines.push('各环节现在一律拿到**全部工具**(含 Edit/Write/Bash)和**全部 MCP** —— 给评审/验收席位配的角色可以自己改完再判通过。测试验证环节仍有工作区前后比对:它改了盘,该轮裁决作废。')
+    lines.push('各环节现在一律拿到**全部工具**(含 Edit/Write/Bash)和**全部 MCP** —— 质疑修复会直接改方案、测试修复会直接改代码,这是它们的职责;验收席位配的角色同样能自己改完再判通过。')
   }
   return lines
 }
@@ -493,7 +493,7 @@ export function rosterLines(config: EffTaskConfig): string[] {
     if ((config.phaseRoles[p] ?? []).length === 0) {
       if (p === 'observer') return `${PHASE_LABEL[p]}: (未配置,不评分)`
       // 测试验证是 opt-in:0 席 = 这一步整个不发生,一次调用都不会有。
-      if (p === 'verify') return `${PHASE_LABEL[p]}: (未配置,本次不做验证;验收只能读执行者的自述)`
+      if (p === 'verify') return `${PHASE_LABEL[p]}: (未配置,本次不跑测试也不修;验收只能读执行者的自述)`
       // 集成提交 0 席时回落到验收席位 —— 说「主模型」会让用户以为是另一批人在跑。
       if (p === 'integrate') {
         const fallback = (config.phaseRoles.accept ?? []).length > 0 ? '由验收席位承担' : '由验收席位承担(即主模型)'
@@ -783,7 +783,7 @@ export function parallelismLine(
    */
   const scope = opts.isolation === 'worktree'
     ? '各阶段并行,执行任务在各自的 git worktree 中隔离;每个子任务完成时自动合并回当前分支(工作区不干净或撞冲突时跳过并说明,跑完再补一次)'
-    : '方案/评审阶段并行;执行与叶子验收串行(未启用隔离)'
+    : '方案/质疑修复阶段并行;执行与叶子验收串行(未启用隔离)'
   const hint = opts.editable ? ' · ←/→ 调整' : ''
   return `并行数: ${config.parallelism}（${scope}）${hint}`
 }
@@ -834,7 +834,10 @@ export function capsLine(config: EffTaskConfig): string {
      *
      * 只列**真的放宽了**的那几关;一关都没放宽时说整句「与全票同义」。
      */
-    const per = (['review', 'verify', 'accept', 'integrate'] as const)
+    // 只剩验收/集成验收两关:质疑修复与测试修复不再有圆桌,也就没有「几席赞成」这回事
+    // (它们的档位体现在「该改到什么程度」上,见 strictness.ts 的 STRICTNESS_JUDGING)。
+    // 列上它们的话,关口会印一个这次运行里不存在的门槛。
+    const per = (['accept', 'integrate'] as const)
       .map(p => ({ p, m: (config.phaseRoles?.[p] ?? []).length }))
       .filter(x => x.m > 0)
       .map(x => ({ ...x, need: quorumSeatsNeeded(q, x.m) }))
@@ -1045,7 +1048,7 @@ export function isolationChoiceLines(reason: string, canInitGit: boolean): strin
   return [
     `隔离不可用:${reason}`,
     '继续的话,执行阶段会共享你当前的工作目录,并被强制串行(一次只有一个节点在改代码)。',
-    '方案/评审阶段仍然并行;不会出现两个执行 agent 同时改同一份文件。',
+    '方案/质疑修复阶段仍然并行;不会出现两个执行 agent 同时改同一份文件。',
     // The `g` offer appears ONLY when the directory is not a repo at all. Every other pool
     // failure happens after that check passed — no commits yet, a branch-name clash, a
     // worktree already checked out — so the directory IS a repo, and `git init` there would

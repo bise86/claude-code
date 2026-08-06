@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import { subAgentToolPool } from '../../commands/efftask/efftask.js'
-import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs, providerErrorOf, ProviderApiError } from './runAgentAdapter.js'
+import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs, providerErrorOf, providerErrorInfoOf, shrinkPrompt, PROMPT_SHRINK_RATIOS, ProviderApiError } from './runAgentAdapter.js'
 import { createAssistantAPIErrorMessage } from '../../utils/messages.js'
 import { createRunControl } from './control.js'
 import { pwd } from '../../utils/cwd.js'
@@ -1338,5 +1338,106 @@ describe('节点结账之后不再收账', () => {
     const before = { ...node.usage }
     await fired
     expect(node.usage).toEqual(before)
+  })
+})
+
+/**
+ * 「Prompt is too long」不再是一个死节点 —— 压缩之后重发。
+ *
+ * 用户报的原话:「有的报 Prompt is too long,这个要处理掉,不能限制这个。」
+ * 两半分别由这几条钉住:**不靠静态上限**(没超的调用一个字都不动)、**真的重发**、
+ * **窗口不能在中途收口**、以及压完还是收不下时**建议要对症**。
+ */
+describe('提示词过长 → 压缩重发', () => {
+  const ptl = (): unknown => createAssistantAPIErrorMessage({
+    // errors.ts 那条 400/413 分支给的就是这句通用文案(token 数留在 errorDetails 里,
+    // 到不了这一层)。用真构造器造,理由同上面那条:手捏的形状正好绕过要测的判据。
+    content: 'Prompt is too long',
+    error: 'invalid_request',
+  })
+
+  it('分类成 prompt_too_long,而不是限流/额度', () => {
+    expect(providerErrorInfoOf([ptl()] as never)?.kind).toBe('prompt_too_long')
+    // 不许误伤:一句正常回答里出现「too long」三个字不算。
+    expect(providerErrorInfoOf([
+      { type: 'assistant', message: { content: [{ type: 'text', text: '这个函数 too long' }] } },
+    ] as never)).toBeUndefined()
+  })
+
+  it('shrinkPrompt 掐中间留两头 —— 尾巴(输出 schema)必须原样活着', () => {
+    const head = 'HEAD'.repeat(500)
+    const tail = '输出 json:{"pass":boolean} <<TAIL>>'
+    const long = head + 'X'.repeat(40_000) + tail
+    const small = shrinkPrompt(long, 0.55)
+    expect(small.length).toBeLessThan(long.length)
+    expect(small.startsWith('HEAD')).toBe(true)
+    expect(small.endsWith('<<TAIL>>')).toBe(true)
+    // 掐过要说出来 —— 一个不知道自己少看了东西的模型会把「没提到」当成「不需要」。
+    expect(small).toContain('省略了中间')
+    // 已经短到地板的提示词不动它:压缩只发生在上游真的拒收之后,不是一条静态上限。
+    expect(shrinkPrompt('短', 0.5)).toBe('短')
+  })
+
+  it('第一次被拒 → 压缩后重发 → 拿到真回答,窗口全程不收口', async () => {
+    const prompts: string[] = []
+    const long = 'A'.repeat(60_000) + '\n输出 json。<<TAIL>>'
+    async function* fake(args: { promptMessages?: any[] }): AsyncGenerator<any> {
+      const text = String(args.promptMessages?.[0]?.message?.content?.[0]?.text ?? '')
+      prompts.push(text)
+      // 短了就答得上来 —— 「压缩确实起作用」这件事必须由重发的**内容**决定,
+      // 而不是「第二次总是成功」那种和压缩无关的桩。
+      if (text.length > 40_000) { yield ptl() as never; return }
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } }
+    }
+    const pushed: string[] = []
+    const ends: (string | undefined)[] = []
+    const out = await makeRunAgentFn({
+      toolUseContext: {} as never,
+      canUseTool: (async () => ({ behavior: 'allow' })) as never,
+      availableTools: [] as never,
+      activeAgents: [] as never,
+      mainModelDefault: { agentType: 'main' } as never,
+      runAgentImpl: fake as never,
+    })({
+      phase: 'plan', node: { id: 'n1' } as never, role: null, system: 's', prompt: long,
+      signal: new AbortController().signal,
+      stream: {
+        push: (e: any) => { if (e.kind === 'text') pushed.push(String(e.text)) },
+        end: (err?: string) => ends.push(err),
+      } as never,
+    })
+    expect(out).toBe('ok')
+    expect(prompts.length).toBe(2)
+    // 尾巴(输出 schema)在重发的那一份里还在。丢了它,这次调用会以「模型没按格式答」
+    // 的面目失败 —— 比提示词太长难查得多。
+    expect(prompts[1]!.endsWith('<<TAIL>>')).toBe(true)
+    expect(pushed.some(t => t.includes('提示词过长'))).toBe(true)
+    // 窗口**只收一次**,而且收在成功上:中途收口的话 agentStream 会挡掉后面所有 push,
+    // 用户看到的是一个停在「调用失败」的表头,而那次成功的重发一个字都不显示。
+    expect(ends).toEqual([undefined])
+  })
+
+  it('压到底还是被拒 → 阻断,而建议说的是窗口/节点大小,不是「查网络」', async () => {
+    let calls = 0
+    async function* alwaysTooLong(): AsyncGenerator<any> { calls++; yield ptl() as never }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as never,
+      canUseTool: (async () => ({ behavior: 'allow' })) as never,
+      availableTools: [] as never,
+      activeAgents: [] as never,
+      mainModelDefault: { agentType: 'main' } as never,
+      runAgentImpl: alwaysTooLong as never,
+    })
+    let err: unknown
+    try {
+      await fn({
+        phase: 'plan', node: { id: 'n1' } as never, role: null, system: 's',
+        prompt: 'B'.repeat(60_000), signal: new AbortController().signal,
+      })
+    } catch (e) { err = e }
+    expect(err instanceof ProviderApiError).toBe(true)
+    expect((err as ProviderApiError).kind).toBe('prompt_too_long')
+    // 首发 + 三档压缩 = 4 次,不许无限重发。
+    expect(calls).toBe(1 + PROMPT_SHRINK_RATIOS.length)
   })
 })

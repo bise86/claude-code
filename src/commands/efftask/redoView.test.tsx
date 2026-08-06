@@ -221,9 +221,9 @@ describe('重做关口', () => {
     await tick()
     const f = t.lastFrame()
     app.unmount()
-    expect(f).toContain('从「质疑讨论」重做')
+    expect(f).toContain('从「质疑修复」重做')
     expect(f).toContain('从「执行」重做')
-    expect(f).toContain('从「测试验证」重做')
+    expect(f).toContain('从「测试修复」重做')
     expect(f).toContain('从「验收」重做')
     expect(f).toContain('从「集成验收」重做')
     expect(f).toContain('从「观察」重做')
@@ -231,7 +231,7 @@ describe('重做关口', () => {
     expect(f).toContain('拆分任务')
   })
 
-  it('测试验证 / 验收 / 观察在屏幕上按不动,而且写着去哪儿重跑', async () => {
+  it('测试修复 / 验收 / 观察在屏幕上按不动,而且写着去哪儿重跑', async () => {
     // 这三个跑在别的 step 内部,没有自己的入口。只写「不可用」是半句话 ——
     // 用户想重跑的那件事通常还是做得到的,只是入口在别处。
     const { t, app } = await mount(
@@ -249,8 +249,8 @@ describe('重做关口', () => {
     app.unmount()
     expect(seen).toContain('跑在执行环节内部')
     // 默认配置下 verify/observer 都是 0 席,理由说的是「这次压根不跑它」——
-    // 而不是把用户指到一条同屏可见、却写着「不跑测试验证」的条目上。
-    expect(seen).toContain('本次运行没有测试验证环节')
+    // 而不是把用户指到一条同屏可见、却写着「不跑测试修复」的条目上。
+    expect(seen).toContain('本次运行没有测试修复环节')
     expect(seen).toContain('本次运行没有观察环节')
   })
 
@@ -284,13 +284,13 @@ describe('重做关口', () => {
     await tick()
     t.stdin.press('[B') // ↓ 到「阶段重做」
     await tick()
-    t.stdin.press('\r')       // 进环节清单,光标落在「质疑讨论」(root 没有方案,不可用)
+    t.stdin.press('\r')       // 进环节清单,光标落在「质疑修复」(root 没有方案,不可用)
     await tick()
     t.stdin.press('\r')
     await tick()
     // 不可用的条目按不动 —— 按下去什么都不该发生,更不该确认成别的环节。
     expect(got).toEqual([])
-    // ↓×4:质疑讨论 → 执行 → 测试验证 → 验收 → 集成验收
+    // ↓×4:质疑修复 → 执行 → 测试修复 → 验收 → 集成验收
     for (let i = 0; i < 4; i++) { t.stdin.press('[B'); await tick() }
     t.stdin.press('\r')
     await tick()
@@ -316,7 +316,7 @@ describe('重做关口', () => {
     expect(cancels).toBe(1)
   })
 
-  it('默认配置下关口不许承诺一个不存在的测试验证环节', async () => {
+  it('默认配置下关口不许承诺一个不存在的测试修复环节', async () => {
     const { t, app } = await mount(
       <ConfirmRedo
         nodes={TREE()} targetId="root/00-a" now={NOW}
@@ -327,7 +327,7 @@ describe('重做关口', () => {
     await tick()
     const f = t.lastFrame()
     app.unmount()
-    // 测试验证是 opt-in,没配角色就整个不存在。写死「执行 → 测试验证 → 验收」
+    // 测试修复是 opt-in,没配角色就整个不存在。写死「执行 → 测试修复 → 验收」
     // 对大多数用户(不配角色的)就是假话。
     expect(f).toContain('未配置角色')
   })
@@ -349,7 +349,7 @@ describe('重做关口', () => {
     await tick()
     const f = t.lastFrame()
     app.unmount()
-    expect(f).toContain('执行 → 测试验证 → 验收 → 观察')
+    expect(f).toContain('执行 → 测试修复 → 验收 → 观察')
     expect(f).not.toContain('未配置角色')
   })
 
@@ -514,7 +514,7 @@ describe('菜单画出来的样子', () => {
     await tick()
     t.stdin.press('[B'); await tick()
     t.stdin.press('\r'); await tick()
-    // 光标停在「质疑讨论」(root 没有方案 → 禁用)。逐条往下按,凡是禁用的都不该确认。
+    // 光标停在「质疑修复」(root 没有方案 → 禁用)。逐条往下按,凡是禁用的都不该确认。
     for (let i = 0; i < 4; i++) {
       t.stdin.press('\r'); await tick()
       expect(`第 ${i} 行按下之后确认了几次: ${got.length}`).toBe(`第 ${i} 行按下之后确认了几次: 0`)

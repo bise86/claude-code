@@ -1,30 +1,41 @@
 import { describe, expect, test } from 'bun:test'
 import {
-  adjustStrictness, isStrictness, quorumSeatsNeeded, resolvedQuorum, reviewRubric,
-  strictnessBlock, STRICTNESS_JUDGING, STRICTNESS_LEVELS, STRICTNESS_QUORUM, verifyRequirement,
+  adjustStrictness, isStrictness, quorumSeatsNeeded, resolvedQuorum, reviewFixRubric,
+  strictnessBlock, STRICTNESS_JUDGING, STRICTNESS_LEVELS, STRICTNESS_QUORUM, verifyFixRequirement,
 } from './strictness.js'
 import { synthesizeVerdicts } from './roundtable.js'
 import { DEFAULT_CAPS, type Caps, type Verdict } from './types.js'
 
 const caps = (over: Partial<Caps> = {}): Caps => ({ ...DEFAULT_CAPS, ...over })
 
-describe('不设档 = 逐字节相同', () => {
-  // 这是整个特性对老用户的**全部**承诺。三个判据类函数各有一条,因为它们各自有一份
-  // 「缺省文本」常量,而缺省那份和中级档那份是**刻意分开写**的(见 strictness.ts):
-  // 合并的话下一个人改中级档会静默改掉这条承诺。
-  test('reviewRubric 缺省档含现状那三条判据,且不含任何档位字样', () => {
-    const r = reviewRubric(undefined, 1)
-    expect(r).toContain('blocking 只填**会让执行失败、或让产出没法验收**的问题')
-    expect(r).toContain('方案不需要完美')
-    expect(r).toContain('可以更好但不阻塞的,写进 comments')
-    expect(r).not.toContain('严格度')
+describe('不设档 = 缺省那一份', () => {
+  /**
+   * 「不设档 = 逐字节相同」这条承诺**对两个修复关口已经不成立了** —— 它们的职责整个换了
+   * (不再判决,直接改),缺省文本也就跟着换了。承诺仍然对**验收 / 集成验收**成立,
+   * 那两关由下面「地板与档位无关」和 strictnessWiring 的端到端用例守着。
+   *
+   * 这里守的是另一件事:缺省档的文本是**它自己那一份**,不带任何档位字样 ——
+   * 合并成一份的话,下一个人改中级档会静默改掉缺省行为。
+   */
+  test('reviewFixRubric 缺省档讲「该改什么」,且不含任何档位字样', () => {
+    const r = reviewFixRubric(undefined)
+    expect(r).toContain('一定要改')
+    expect(r).toContain('会让执行失败、或让产出没法验收')
+    expect(r).toContain('别动')
+    expect(r).not.toContain('本次严格度')
   })
-  test('reviewRubric 缺省档第 2 轮起带原来那条「不要提新要求」', () => {
-    expect(reviewRubric(undefined, 1)).not.toContain('不要提出上一轮没有提过的新要求')
-    expect(reviewRubric(undefined, 2)).toContain('不要提出上一轮没有提过的新要求')
+  test('reviewFixRubric 不再谈轮次 —— 这一关没有「上一轮」', () => {
+    for (const s of [...STRICTNESS_LEVELS, undefined]) {
+      expect(reviewFixRubric(s)).not.toContain('上一轮')
+      expect(reviewFixRubric(s)).not.toContain('不要提出上一轮没有提过的新要求')
+    }
   })
-  test('verifyRequirement 缺省档仍然是「没有可跑的验证手段就判不通过」', () => {
-    expect(verifyRequirement(undefined)).toContain('没有可跑的验证手段,如实说明并判不通过')
+  test('verifyFixRequirement 缺省档要求实跑 + 自己改到对', () => {
+    const v = verifyFixRequirement(undefined)
+    expect(v).toContain('实际执行的命令与原始输出')
+    expect(v).toContain('自己改到对')
+    // 而且**不再**有那句「判不通过」—— 它没有票可以投。
+    expect(v).not.toContain('判不通过')
   })
   test('strictnessBlock 不设档时对每个环节都是空串', () => {
     for (const p of ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer'] as const) {
@@ -41,61 +52,63 @@ describe('判据是替换不是叠加', () => {
    * 三份独立评审都指出的那条 P0:`brief` 在提示词最前、写死的判据在最后,追加注入会让
    * 同一命题的 P 和 ¬P 同时在场而 ¬P 在后。所以档位文本必须**替换**那几行。
    *
-   * 这两条断言就是防回归的探针:任何一天有人把 `reviewRubric` 改回「在原文后面追加」,
-   * 缺省那三条就会重新出现在初级/专家档里。
+   * 这两条断言就是防回归的探针:任何一天有人把它改回「在原文后面追加」,缺省那几条就会
+   * 重新出现在初级/专家档里。
    */
-  test('初级档不含现状那句「blocking 只填会让执行失败…」', () => {
-    expect(reviewRubric('初级', 1)).not.toContain('会让执行失败、或让产出没法验收')
+  test('初级档不含缺省那句「会让执行失败…」', () => {
+    expect(reviewFixRubric('初级')).not.toContain('会让执行失败、或让产出没法验收的地方')
   })
-  test('专家档不含「方案不需要完美…能达到这条就判通过」', () => {
-    // 这一句带着「blocking 等同于否决」的放行压力,和专家档正面冲突。
-    expect(reviewRubric('专家', 1)).not.toContain('能达到这条就判通过')
-    expect(reviewRubric('专家', 1)).toContain('「能开始干」不构成通过的理由')
+  test('专家档不含「已经达到这条的,原样交回去」那种放行压力', () => {
+    expect(reviewFixRubric('专家')).not.toContain('已经达到这条的,原样交回去')
+    expect(reviewFixRubric('专家')).toContain('「能开始干」不构成不改的理由')
   })
-  test('初级/中级档不含「没有可跑的验证手段…判不通过」,而是给出带留痕的豁免', () => {
+  test('初级/中级档只要求「能跑的跑起来」,不要求既有测试不回归', () => {
     for (const s of ['初级', '中级'] as const) {
-      const v = verifyRequirement(s)
-      expect(v).not.toContain('没有可跑的验证手段,如实说明并判不通过')
-      expect(v).toContain('不因缺手段本身判不通过')
+      const v = verifyFixRequirement(s)
+      expect(v).not.toContain('没有引入回归')
       // 豁免必须带留痕义务:降档可以降标准,不能降留痕。
       expect(v).toContain('本节点无可执行验证手段')
     }
   })
-  test('高级/专家档保留「没有可跑的验证手段 = 不通过」并要求跑既有测试', () => {
+  test('高级/专家档要求跑既有测试确认没有回归', () => {
     for (const s of ['高级', '专家'] as const) {
-      expect(verifyRequirement(s)).toContain('没有可跑的验证手段,如实说明并判不通过')
-      // 「跑既有测试证明没有回归」从专家下放到高级 —— 否则高级档下执行侧被要求做的事
-      // 没有任何一关会去核(草案内部的一处不自洽,评审查出)。
-      expect(verifyRequirement(s)).toContain('没有引入回归')
+      expect(verifyFixRequirement(s)).toContain('没有引入回归')
     }
+    // 那句「回归是你这一关的责任」只在高级档说 —— 专家档紧接着还要核对断言本身,
+    // 两句叠在一起会把重点冲掉。
+    expect(verifyFixRequirement('高级')).toContain('回归是你这一关的责任')
   })
-  test('专家档不含「跑起来但失败的判不通过」这种初级措辞', () => {
-    expect(verifyRequirement('专家')).not.toContain('不因缺手段本身判不通过')
+  test('专家档还要核对验证手段本身证明了什么', () => {
+    expect(verifyFixRequirement('专家')).toContain('把断言补上')
   })
 })
 
-describe('提新要求那条护栏:专家档是举证责任,不是「不限」', () => {
-  test('初级/中级/高级第 2 轮起沿用原来那条禁止', () => {
-    for (const s of ['初级', '中级', '高级'] as const) {
-      expect(reviewRubric(s, 2)).toContain('不要提出上一轮没有提过的新要求')
+describe('修复类两关的地板:讲职责,不讲通过', () => {
+  test('质疑修复的地板三条,每一档都在', () => {
+    for (const s of [...STRICTNESS_LEVELS, undefined]) {
+      const r = reviewFixRubric(s)
+      expect(r).toContain('交回一份空的、或与目标无关的方案')
+      expect(r).toContain('动它之前先去看一眼')
+      expect(r).toContain('只写「建议怎么改」而不改方案本身')
+      // 它不出裁决,所以一个字都不许提 pass。
+      expect(r).not.toContain('pass')
     }
   })
-  test('专家档允许提新的,但必须写明为什么上一轮没提', () => {
-    const r = reviewRubric('专家', 2)
-    expect(r).not.toContain('不要提出上一轮没有提过的新要求')
-    expect(r).toContain('写明为什么上一轮没提')
-  })
-  test('无论哪一档,第 1 轮都不谈「上一轮」', () => {
+  test('测试修复的地板挡住「把测试改绿」,并给出「修不动」这条出路', () => {
     for (const s of [...STRICTNESS_LEVELS, undefined]) {
-      expect(reviewRubric(s, 1)).not.toContain('上一轮')
+      const v = verifyFixRequirement(s)
+      expect(v).toContain('删测试、放宽断言、加 skip/xfail')
+      expect(v).toContain('没有第二次实跑的输出作证')
+      // 不给出路的禁令等于逼它去绕。
+      expect(v).toContain('修不动是允许的')
     }
   })
 })
 
 describe('地板与档位无关', () => {
-  test('产出侧三关每一档都带那三条不放行', () => {
+  test('产出侧两关每一档都带那三条不放行', () => {
     for (const s of STRICTNESS_LEVELS) {
-      for (const p of ['verify', 'accept', 'integrate'] as const) {
+      for (const p of ['accept', 'integrate'] as const) {
         const b = strictnessBlock(s, p)
         expect(b).toContain('执行者没有报告任何产出')
         expect(b).toContain('找不到它做过的任何痕迹')
@@ -104,18 +117,23 @@ describe('地板与档位无关', () => {
     }
   })
   /**
-   * review 用**自己那份**地板 —— 验收查出的 P0:产出侧那三条在评审时恒真(那时一行代码
-   * 都没写),而结论是「pass 一律为 false」。后果的方向和这个特性的目的正好相反:
-   * 只要设了任何一档,评审就比不设档更难过。
+   * 修复类两关**一条裁决地板都不收**。
+   *
+   * 上一版 review 有自己那份地板(产出侧那三条在评审时恒真,结论会是「pass 一律为
+   * false」——设了档反而更难过)。现在它连裁决都不做了:讲「什么情况不放行」的地板对它
+   * 完全不适用,而它自己的地板(不许交空方案 / 不许不核实 / 不许只提建议)在
+   * `reviewFixRubric` 里,由上面那组守。
    */
-  test('质疑讨论关拿到的是讲方案的地板,不是讲产出的那份', () => {
+  test('质疑修复 / 测试修复拿的是干活侧的档位文本,不带裁决地板', () => {
     for (const s of STRICTNESS_LEVELS) {
-      const b = strictnessBlock(s, 'review')
-      expect(b).not.toContain('执行者没有报告任何产出')
-      expect(b).not.toContain('没有看过任何产出(代码、diff、命令输出)')
-      expect(b).toContain('方案是空的、或与目标无关')
-      expect(b).toContain('没有真的读过这份方案')
-      expect(b).toContain('降档降的是「方案要写多细」,不降「到底有没有方案」')
+      for (const p of ['review', 'verify'] as const) {
+        const b = strictnessBlock(s, p)
+        expect(b).not.toContain('pass 一律为 false')
+        expect(b).not.toContain('执行者没有报告任何产出')
+      }
+      // 质疑修复跟着**方案侧**走(它的产物是一份方案),测试修复跟着**执行侧**走。
+      expect(strictnessBlock(s, 'review')).toBe(strictnessBlock(s, 'plan'))
+      expect(strictnessBlock(s, 'verify')).toBe(strictnessBlock(s, 'execute'))
     }
   })
   test('地板不出现在执行侧 —— 那是给裁决者的判据,不是给执行者的', () => {
@@ -133,8 +151,8 @@ describe('observer 不收档位文本', () => {
    * 讲 blocking 的判据送进 `scorePrompt` —— 而那个提示词根本没有 blocking 字段,输出是
    * 0-100 的分数,而 `caps.scoreThreshold` 一旦设了,低分能换一轮真实的返工。
    */
-  test('STRICTNESS_JUDGING 恰好是四个,不含 observer', () => {
-    expect([...STRICTNESS_JUDGING].sort()).toEqual(['accept', 'integrate', 'review', 'verify'])
+  test('STRICTNESS_JUDGING 恰好是两个,不含 observer,也不含两个修复关口', () => {
+    expect([...STRICTNESS_JUDGING].sort()).toEqual(['accept', 'integrate'])
     expect(STRICTNESS_JUDGING.has('observer')).toBe(false)
   })
   test('每一档下 observer 都拿到空串', () => {

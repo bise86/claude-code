@@ -222,9 +222,12 @@ describe('interrupt → validate → reseat → resume actually continues the wo
 
   it('a genuinely failed node stays failed across a resume', async () => {
     // The counterpart to the first test: reseat must reopen interrupted work WITHOUT
-    // resurrecting work that a roundtable actually rejected until its budget ran out.
+    // resurrecting work that genuinely failed.
+    //
+    // 制造方式换成「模型调用打不通」:质疑修复不再判决,「圆桌一直否决到预算用尽」
+    // 那条路已经不存在了。
     const orch = new EffTaskOrchestrator(
-      cfg(), deps((async () => 'garbage, no fence, ever') as unknown as RunAgentFn), new AbortController().signal,
+      cfg(), deps((async () => { throw new Error('provider unreachable') }) as unknown as RunAgentFn), new AbortController().signal,
     )
     const res = await orch.run()
     expect(res.status).toBe('blocked')
@@ -233,7 +236,7 @@ describe('interrupt → validate → reseat → resume actually continues the wo
     expect(reseated.reseated).toEqual([])
     const root = reseated.nodes.find(n => n.id === 'root')!
     expect(root.status).toBe('BLOCKED')
-    expect(root.blockedReason).toContain('评审迭代超限')
+    expect(root.blockedReason).toContain('provider unreachable')
   })
 
   it('an empty seed is refused rather than silently starting a new run in the old directory', () => {

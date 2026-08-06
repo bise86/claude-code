@@ -5,6 +5,7 @@ import { DEFAULT_CAPS, emptyPhaseRoles, type EffTaskConfig } from '../../tools/e
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import type { AppState } from '../../state/AppState.js'
 import { createRunControl } from '../../tools/efftask/control.js'
+import { PhaseTimeoutError } from '../../tools/efftask/runAgentAdapter.js'
 import type { EffTaskTaskState } from '../../tasks/EffTaskTask/EffTaskTask.js'
 
 function memFs(): FsLike & { files: Map<string, string> } {
@@ -599,12 +600,15 @@ describe('触阀升级 (spec §9/§11) 真的被接上', () => {
     // that owns it.
     const fired: { category: string; reason: string }[] = []
     const ac = new AbortController()
-    // A reviewer that always blocks: the run drives the root to 评审迭代超限.
+    // 验收永远不过:run 把根节点推到「验收迭代超限」的降级放行 —— 这一档同样要喊人。
+    // (换掉的是「评审迭代超限」:质疑修复不再判决,那一档已经不会发生。)
     const runAgent: RunAgentFn = async req =>
       req.phase === 'plan'
         ? '```json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
-        : '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
-          '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+        : req.phase === 'execute'
+          ? '```json\n{"execStatus":"改了 foo.ts"}\n```'
+          : '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
+            '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
     await runOrchestrator(
       {
         config: cfg(), runDir: '/r', fs: memFs(), runAgent, signal: ac.signal,
@@ -613,8 +617,8 @@ describe('触阀升级 (spec §9/§11) 真的被接上', () => {
       () => {}, () => {}, () => {},
     )
     expect(fired).toHaveLength(1)
-    expect(fired[0].category).toBe('cap-iteration')
-    expect(fired[0].reason).toContain('评审迭代超限')
+    expect(fired[0].category).toBe('degrade')
+    expect(fired[0].reason).toContain('验收迭代超限')
   })
 })
 
@@ -666,12 +670,18 @@ describe('实时计数这条线也得是通的', () => {
     // name the command that really works. The id reaches the pipeline through this wire.
     const fs2 = memFs()
     const ac = new AbortController()
-    const runAgent: RunAgentFn = async req =>
-      req.phase === 'plan'
-        ? '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
+    // 真的阻断一个节点:执行调用打不通(「评审一直不过」那条路已经不存在了)。
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
           '\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"a"}\n```'
-        : '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
-          '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+      }
+      // 超时:它带 category(timeout),而 `--retry-blocked` 那句提示只挂在**带分类**的
+      // 阻断上 —— 一个没有分类的裸错误捞不回节点,也就不该给这句话。
+      if (req.phase === 'execute') throw new PhaseTimeoutError(600_000)
+      return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
+        '\n{"pass":false,"blocking":["不行"],"comments":""}\n```'
+    }
     await runOrchestrator(
       {
         config: cfg(), runDir: '/r', fs: fs2, runAgent, signal: ac.signal,
@@ -794,7 +804,7 @@ describe('子 agent 实时输出 (spec §10.2) 真的被接上', () => {
       },
       () => {}, () => {}, () => {},
     )
-    // 分析、质疑讨论、执行、验收 —— 一个环节一条(或多条),不是一条包打天下。
+    // 分析、质疑修复、执行、验收 —— 一个环节一条(或多条),不是一条包打天下。
     expect(opened.length).toBeGreaterThanOrEqual(4)
     expect(new Set(opened.map(o => o.phaseLabel)).size).toBeGreaterThanOrEqual(4)
   })

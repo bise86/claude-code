@@ -152,16 +152,17 @@ describe('总时长超限:一直有输出但太慢', () => {
   })
 
   it('多角色圆桌:同一句建议,不能退回「先确认角色模型/网络可用」', async () => {
-    const roster = { ...emptyPhaseRoles(), review: [{ roleName: 'a' }, { roleName: 'b' }] }
+    // 圆桌只剩验收 / 集成验收了(质疑修复不开圆桌,它那一席超时也不阻断),所以探针在验收关。
+    const roster = { ...emptyPhaseRoles(), accept: [{ roleName: 'a' }, { roleName: 'b' }] }
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') {
-        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
-      }
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 foo.ts"}\n```'
       totalTimeout()
     }
     const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
     n.phaseRoles = roster as never
-    await stepStart(n, ctxFor([n], runAgent, { config: { ...cfg, phaseRoles: roster as never } }))
+    await stepExecute(n, ctxFor([n], runAgent, { config: { ...cfg, phaseRoles: roster as never } }))
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain('一直有输出')
     expect(n.blockedReason).not.toContain('网络可用')
@@ -179,17 +180,17 @@ describe('多角色圆桌耗尽在限流上 —— 用户报的正是这个场�
      * 根因在更下面一层:`runRoundtable` 把 rejection 合成 infra 裁决时只带 `timeout`,
      * `ProviderApiError.kind` 被丢掉 —— 所以下游没有任何字段能知道这一席是被限流的。
      */
-    const roster = { ...emptyPhaseRoles(), review: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
+    const roster = { ...emptyPhaseRoles(), accept: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') {
-        return ptag(req) + '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
-      }
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 foo.ts"}\n```'
       if (req.role?.roleName === 'b') rateLimit()
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
     n.phaseRoles = roster as never
-    await stepStart(n, ctxFor([n], runAgent, { config: { ...cfg, phaseRoles: roster as never } }))
+    await stepExecute(n, ctxFor([n], runAgent, { config: { ...cfg, phaseRoles: roster as never } }))
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain('上游在限流')
     expect(n.blockedReason).not.toContain('网络可用')

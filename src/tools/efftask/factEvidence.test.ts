@@ -59,7 +59,7 @@ describe('crossSeatNotice —— 「这几席没经过统一」', () => {
   /**
    * 这一条是回归探针,钉的是评审查出来的那个假冲突。
    *
-   * 测试验证与验收**共用 `acceptLog`**,而两关各自计数(`gateRound` 按 step 过滤后 +1),
+   * 测试修复与验收**共用 `acceptLog`**,而两关各自计数(`gateRound` 按 step 过滤后 +1),
    * 所以同一个 round 数会同时出现在两关的记录上。只按 `round` 分组的话,verify 第 2 轮和
    * accept 第 2 轮会被当成同一场圆桌 —— 而它们是两个关口、两批席位,两边的要求本来就都该做。
    * 那会凭空对执行者说一句「本轮有 2 个席位各自提了意见,它们没有经过统一」,而这句话是假的。
@@ -183,7 +183,7 @@ describe('Verdict.retracted —— 让「作废」落到数据上', () => {
 
   /**
    * 撤回的轮次比较必须按 **(step, round)** 分组,理由与 `crossSeatNotice` 逐字相同:
-   * verify 与 accept 共用 `acceptLog` 而各自计数。只比 round 时,一个测试验证席位能撤掉
+   * verify 与 accept 共用 `acceptLog` 而各自计数。只比 round 时,一个测试修复席位能撤掉
    * 验收关的账,而它从来没看过那一关的判据。
    */
   it('撤回不跨关口:verify 第 2 轮撤不掉 accept 第 1 轮的意见', () => {
@@ -424,7 +424,7 @@ describe('reviewRepeatNotice —— 两条限定语与跨席位提醒的顺序',
     expect(s.indexOf('来自**不同席位**')).toBeGreaterThan(s.indexOf('先按**本轮**判据重新掂量'))
   })
 
-  it('执行侧的主语跟着 subject 换 —— 测试验证员手上没有「作者」', () => {
+  it('执行侧的主语跟着 subject 换 —— 测试修复员手上没有「作者」', () => {
     expect(reviewRepeatNotice(单席, 2, '验收', '这一版产出')).toContain('执行者举证说')
     expect(reviewRepeatNotice(单席, 2)).toContain('作者举证说')
   })
@@ -457,6 +457,10 @@ async function promptsFromRun(): Promise<{ review: string; judged: string[] }> {
     seen.push({ phase: req.phase, prompt: req.prompt })
     if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     if (req.phase === 'execute') return '```exec\n{"execStatus":"做完了"}\n```'
+    if (req.phase === 'verify') {
+      return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+        '\n{"execStatus":"跑过了"}\n```'
+    }
     return vtag(req) + PASS
   }
   const judging = { verify: [{ roleName: '' }], accept: [{ roleName: '' }], integrate: [{ roleName: '' }] }
@@ -481,72 +485,71 @@ async function promptsFromRun(): Promise<{ review: string; judged: string[] }> {
   await stepIntegrate(parent, ctxFor([parent, child], runAgent, cfg()))
   const review = seen.find(s => s.phase === 'review')!
   expect(review, 'review 没被派出去').toBeDefined()
-  const judged = seen.filter(s => s.phase !== 'plan' && s.phase !== 'execute').map(s => s.prompt)
+  // **裁决**关口只剩 accept / integrate(集成验收走的也是 phase 'accept')。
+  // plan / execute / review / verify 四个都不出裁决,收进来会让下面的循环断言一件假事。
+  const judged = seen.filter(s => s.phase === 'accept').map(s => s.prompt)
   return { review: review.prompt, judged }
 }
 
-describe('端到端:取证责任进了四个裁决关口', () => {
+describe('端到端:取证责任进了两个裁决关口', () => {
   const 取证句 = '结论不能超出你核过的范围'
 
-  it('质疑讨论:取证段在场,且 schema 里有 retracted', async () => {
-    const seen: string[] = []
+  /**
+   * **反面探针,而且它现在比正面那条更要紧。**
+   *
+   * 取证段(EVIDENCE_RULE)和 `retracted` 字段讲的都是「怎么写一条站得住的 blocking」——
+   * 而质疑修复 / 测试修复的输出里**没有 blocking**。发给它们的最好结果是白付 token,
+   * 最坏结果是模型努力去理解一个它这一关根本产不出的字段,并自己编一个格式交回来。
+   *
+   * 这条替换掉的是原来那两条「质疑修复:取证段在场」——它们守的是同一根线,只是方向反了。
+   */
+  it('两个**修复**关口都不带取证段与 retracted', async () => {
+    const seen: { phase: string; prompt: string }[] = []
     const runAgent: RunAgentFn = async req => {
-      seen.push(req.prompt)
-      return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
-        : vtag(req) + PASS
+      seen.push({ phase: req.phase, prompt: req.prompt })
+      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      if (req.phase === 'execute') return '```exec\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'verify') {
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+          '\n{"execStatus":"跑过了"}\n```'
+      }
+      return vtag(req) + PASS
     }
     const n = mk({ kind: 'executable', status: 'PLANNING' })
     await stepStart(n, ctxFor([n], runAgent, cfg()))
-    const review = seen.find(p => p.includes('请评审'))!
-    expect(review).toContain(取证句)
-    expect(review).toContain('"retracted"')
-    // 取证段必须**排在判据之后**(紧挨 schema),不能落在提示词第一段 —— 一条不该被覆盖的
-    // 规则待在开头,就会被后面那些「能达到这条就判通过」压掉。
-    expect(review.indexOf(取证句)).toBeGreaterThan(review.indexOf('判据:'))
-    expect(review.indexOf(取证句)).toBeLessThan(review.indexOf('输出 json'))
-  })
-
-  /**
-   * 事故里那位评审的 blocking 逐字就是 `REVIEW_FLOOR` 第 2 条(方案说 `api/v3rpc` 下有
-   * .proto,而那里确实没有)。所以取证段**绝不能**写成「取不到证的就别放进 blocking」——
-   * 那会把 floor 第 2 条(一条拿 P0 换来的闸门)拆掉。这条用例钉的就是两者并存。
-   */
-  it('取证段与 REVIEW_FLOOR 第 2 条并存,没有把 floor 拆掉', async () => {
-    const seen: string[] = []
-    const runAgent: RunAgentFn = async req => {
-      seen.push(req.prompt)
-      return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
-        : vtag(req) + PASS
+    const roles = { ...emptyPhaseRoles(), verify: [{ roleName: '' }] }
+    const n2 = mk({
+      kind: 'executable', status: 'READY', phaseRoles: roles,
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: '跑 x 看到 y' },
+    } as Partial<TaskNode>)
+    const config = cfg()
+    config.phaseRoles.verify = [{ roleName: '' }]
+    await stepExecute(n2, ctxFor([n2], runAgent, config))
+    for (const phase of ['review', 'verify']) {
+      const p = seen.find(x => x.phase === phase)
+      expect(p, `${phase} 这一关没有被派出去,断言落空了`).toBeDefined()
+      expect(p!.prompt).not.toContain(取证句)
+      expect(p!.prompt).not.toContain('"retracted"')
     }
-    const n = mk({ kind: 'executable', status: 'PLANNING' })
-    await stepStart(n, ctxFor([n], runAgent, cfg({ strictness: '中级' })))
-    const review = seen.find(p => p.includes('请评审'))!
-    expect(review).toContain('你在它给出的落点(文件/函数/命令)上找不到对应的东西')
-    expect(review).toContain('pass 一律为 false')
-    expect(review).toContain(取证句)
-    // 而且取证段自己保住了那条:「找不到某个东西」照样能提,只是要说清找过哪里。
-    expect(review).toContain('这不是要你放过它,是要你说准')
   })
 
   /**
    * **四关都要有探针。** 验收实测:删掉 `integratePrompt` 里的 `EVIDENCE_RULE` 或它的
    * retracted 字段,全仓 2171 条测试一条都不红 —— 那一关此前是零覆盖的。
    */
-  it('四个裁决关口(含集成验收)都拿到取证段与 retracted,且都排在 schema 之前', async () => {
-    const { review, judged } = await promptsFromRun()
-    expect(judged.length, '裁决关口一个都没跑起来').toBeGreaterThanOrEqual(3)
-    for (const p of [review, ...judged]) {
+  it('两个裁决关口(叶子验收 + 集成验收)都拿到取证段与 retracted,且都排在 schema 之前', async () => {
+    const { judged } = await promptsFromRun()
+    expect(judged.length, '裁决关口一个都没跑起来').toBeGreaterThanOrEqual(2)
+    for (const p of judged) {
       expect(p).toContain(取证句)
       expect(p).toContain('"retracted"')
       expect(p.indexOf(取证句)).toBeLessThan(p.indexOf('"retracted"'))
     }
-    // 集成验收那一关**确实**在这批里 —— 否则上面的循环可能只覆盖了三关。
-    expect(judged.some(p => p.includes('父目标')), '集成验收没被派出去,四关只测到三关').toBe(true)
+    // 集成验收那一关**确实**在这批里 —— 否则上面的循环可能只覆盖了叶子验收。
+    expect(judged.some(p => p.includes('父目标')), '集成验收没被派出去,两关只测到一关').toBe(true)
   })
 
-  it('测试验证 / 验收:取证段与 retracted 都在场', async () => {
+  it('验收:取证段与 retracted 都在场', async () => {
     const seen: { phase: string; prompt: string }[] = []
     const runAgent: RunAgentFn = async req => {
       seen.push({ phase: req.phase, prompt: req.prompt })
@@ -563,12 +566,10 @@ describe('端到端:取证责任进了四个裁决关口', () => {
     config.phaseRoles.verify = [{ roleName: '' }]
     config.phaseRoles.accept = [{ roleName: '' }]
     await stepExecute(n, ctxFor([n], runAgent, config))
-    for (const phase of ['verify', 'accept']) {
-      const p = seen.find(s => s.phase === phase)
-      expect(p, `${phase} 这一关没有被派出去,断言落空了`).toBeDefined()
-      expect(p!.prompt).toContain(取证句)
-      expect(p!.prompt).toContain('"retracted"')
-    }
+    const p = seen.find(s => s.phase === 'accept')
+    expect(p, '验收这一关没有被派出去,断言落空了').toBeDefined()
+    expect(p!.prompt).toContain(取证句)
+    expect(p!.prompt).toContain('"retracted"')
   })
 })
 
@@ -581,6 +582,11 @@ describe('端到端:「前提有误」的接盘规则', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push({ phase: req.phase, prompt: req.prompt })
       if (req.phase === 'execute') return '```exec\n{"execStatus":"做完了","responses":["第 1 条 → 前提有误:我跑了 X"]}\n```'
+      if (req.phase === 'verify') {
+        // 测试修复交的是实跑报告,不是票 —— 而且它**不占**下面那个轮次计数。
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+          '\n{"execStatus":"跑过了"}\n```'
+      }
       round++
       // 第一轮验收挡一次,好让第二轮的提示词里出现「上一轮的答卷」。
       return round === 1
@@ -607,6 +613,11 @@ describe('端到端:「前提有误」的接盘规则', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       if (req.phase === 'execute') return '```exec\n{"execStatus":"做完了"}\n```'
+      if (req.phase === 'verify') {
+        // 测试修复交的是实跑报告,不是票 —— 而且它**不占**下面那个轮次计数。
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+          '\n{"execStatus":"跑过了"}\n```'
+      }
       round++
       return round === 1
         ? vtag(req) + '\n{"pass":false,"blocking":["缺回滚方案"],"comments":""}\n```'
@@ -627,7 +638,7 @@ describe('端到端:「前提有误」的接盘规则', () => {
     expect(rework[0]).toContain('它覆盖的范围是')
   })
 
-  it('评审侧:没有答卷时接盘规则不在场 —— 对着一份不存在的答卷立规矩是这道门要挡的事', async () => {
+  it('质疑修复侧:接盘规则整个不在场 —— 它不判决,也没有答卷可核', async () => {
     const seen: string[] = []
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
@@ -637,8 +648,9 @@ describe('端到端:「前提有误」的接盘规则', () => {
     }
     const n = mk({ kind: 'executable', status: 'PLANNING' })
     await stepStart(n, ctxFor([n], runAgent, cfg()))
-    const review = seen.find(p => p.includes('请评审'))!
-    expect(review).not.toContain(判据句)
+    const review = seen.find(p => p.includes('**质疑修复**席位'))
+    expect(review, '质疑修复没被派出去,断言落空了').toBeDefined()
+    expect(review!).not.toContain(判据句)
   })
 
   /**
@@ -664,6 +676,11 @@ describe('端到端:「前提有误」的接盘规则', () => {
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       if (req.phase === 'execute') return '```exec\n{"execStatus":"做完了","responses":["第 1 条 → 前提有误:我跑了 X"]}\n```'
+      if (req.phase === 'verify') {
+        // 测试修复交的是实跑报告,不是票 —— 而且它**不占**下面那个轮次计数。
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+          '\n{"execStatus":"跑过了"}\n```'
+      }
       round++
       return round === 1
         ? vtag(req) + '\n{"pass":false,"blocking":["缺回滚方案"],"comments":""}\n```'
@@ -684,27 +701,13 @@ describe('端到端:「前提有误」的接盘规则', () => {
     expect(withRule!).not.toContain('不要再提')
   })
 
-  it('评审侧:有答卷时接盘规则在场(正向探针 —— 反向那条在规则整段删掉时反而更容易过)', async () => {
-    const seen: string[] = []
-    let round = 0
-    const runAgent: RunAgentFn = async req => {
-      seen.push(req.prompt)
-      if (req.phase === 'plan') {
-        return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿",' +
-          '"responses":["第 1 条 → 前提有误:我跑了 find api/"]}\n```'
-      }
-      round++
-      return round === 1
-        ? vtag(req) + '\n{"pass":false,"blocking":["proto 总数应改为 13"],"comments":""}\n```'
-        : vtag(req) + PASS
-    }
-    const n = mk({ kind: 'executable', status: 'PLANNING' })
-    await stepStart(n, ctxFor([n], runAgent, cfg()))
-    const withAnswers = seen.filter(p => p.includes('方案里的 responses 是作者对上一轮意见的逐条处置'))
-    expect(withAnswers.length, '第 2 轮评审没拿到作者的答卷').toBeGreaterThan(0)
-    for (const p of withAnswers) expect(p).toContain(判据句)
-  })
-
+  /**
+   * 这里原来还有一条「评审侧:有答卷时接盘规则在场」。
+   *
+   * 那条通道整个不存在了:质疑修复不判决,作者也不再向它交答卷(`reviewFixPrompt` 把
+   * `responses` 从渲染里剥掉了 —— 一份「我已经改好了」的自我表扬只会让这一席少改)。
+   * 上面那条反向探针替它守着同一根线。
+   */
   /**
    * `--resume` 之后的**第一轮**也要拿到累积反馈与跨席位提醒。
    *
@@ -739,16 +742,22 @@ describe('端到端:「前提有误」的接盘规则', () => {
 
   it('作者侧(planPrompt)的 responses 格式给了三种写法,第三种要范围', async () => {
     const seen: string[] = []
-    let round = 0
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
       if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
-      round++
-      return round === 1
-        ? vtag(req) + '\n{"pass":false,"blocking":["proto 总数应改为 13"],"comments":""}\n```'
-        : vtag(req) + PASS
+      return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
+        '\n{"kind":"executable","solution":"s2","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
     }
-    const n = mk({ kind: 'executable', status: 'PLANNING' })
+    // 方案返工现在只从**恢复路径**来(质疑修复不再打回方案),所以拿一条老账当输入 ——
+    // 那正是 `--resume` 回来时的形状。
+    const n = mk({
+      kind: 'executable', status: 'PLANNING',
+      reviewLog: [rec({
+        round: 1,
+        verdicts: [v({ role: '架构', blocking: ['proto 总数应改为 13'] })],
+        synthesized: { pass: false, blockingSummary: '[架构] proto 总数应改为 13' },
+      })],
+    })
     await stepStart(n, ctxFor([n], runAgent, cfg()))
     const revise = seen.filter(p => p.includes('上一版方案(就是它需要被修订)'))
     expect(revise.length, '没有发生方案返工,断言落空了').toBeGreaterThan(0)

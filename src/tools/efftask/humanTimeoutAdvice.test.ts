@@ -1,7 +1,7 @@
 /**
  * 等人超时的**补救建议**,在每一个环节上都必须是等人那一版。
  *
- * 这一档是测试验证员逼出来的,而它逼出来的东西正是 371fd01 那个提交自己承诺修掉的:
+ * 这一档是测试修复员逼出来的,而它逼出来的东西正是 371fd01 那个提交自己承诺修掉的:
  * 「两种超时给相反的补救建议 —— 合成一句话的话,一半用户会被指去调一个和病因无关的
  * 旋钮」。实测下来四个环节里**三个**给反了:
  *
@@ -88,19 +88,17 @@ describe('等人超时:每个环节给的都必须是等人那一版建议', () 
     expect(n.blockedReason).not.toContain(STALL_ADVICE)
   })
 
-  it('评审圆桌(方案通过之后那一场)', async () => {
-    // 方案调用成功、评审席位全部等人超时 —— 这条路走的是 exhaustionCategory 那一支,
-    // 和分析环节的死分支是**两个不同的根因**。
-    let planned = false
+  it('验收圆桌(执行完之后那一场)', async () => {
+    // 执行调用成功、验收席位全部等人超时 —— 这条路走的是 exhaustionCategory 那一支,
+    // 和单点调用的死分支是**两个不同的根因**。
+    //
+    // 探针从评审关挪到验收关:质疑修复不开圆桌,它那一席超时时也不阻断(手上已经有方案)。
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan' && !planned) {
-        planned = true
-        return '```json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
-      }
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 foo.ts"}\n```'
       throw new PhaseTimeoutError(7 * 24 * 60 * 60 * 1000, 'human')
     }
-    const n = node({ kind: 'unknown', phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: '评审甲' }] } as TaskNode['phaseRoles'] })
-    await stepStart(n, ctxFor([n], runAgent))
+    const n = node({ kind: 'executable', status: 'READY', phaseRoles: { ...emptyPhaseRoles(), accept: [{ roleName: '验收甲' }] } as TaskNode['phaseRoles'] })
+    await stepExecute(n, ctxFor([n], runAgent))
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain(HUMAN_ADVICE)
   })
@@ -120,16 +118,12 @@ describe('等人超时:每个环节给的都必须是等人那一版建议', () 
     // 上面那条对照组走的是**直接调用**那条路(stepExecute 自己判 kind),碰不到
     // exhaustionRemedyFor。少了这条,把圆桌那支改成「恒给等人建议」全套照绿 ——
     // 那不是修好,是把错误方向倒了个个儿。
-    let planned = false
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan' && !planned) {
-        planned = true
-        return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
-      }
+      if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"改了 foo.ts"}\n\u0060\u0060\u0060'
       throw new PhaseTimeoutError(600_000, 'stall')
     }
-    const n = node({ kind: 'unknown', phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: '评审甲' }] } as TaskNode['phaseRoles'] })
-    await stepStart(n, ctxFor([n], runAgent))
+    const n = node({ kind: 'executable', status: 'READY', phaseRoles: { ...emptyPhaseRoles(), accept: [{ roleName: '验收甲' }] } as TaskNode['phaseRoles'] })
+    await stepExecute(n, ctxFor([n], runAgent))
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain(STALL_ADVICE)
     expect(n.blockedReason).not.toContain(HUMAN_ADVICE)

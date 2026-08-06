@@ -98,7 +98,7 @@ describe('触阀升级卡 (spec §9/§11)', () => {
 
   it('says WHICH phase a retry re-runs, so the cost is visible before spending it', () => {
     expect(lines('rework', 'r', { kind: 'executable' })).toContain('执行 → 验收')
-    expect(lines('cap-iteration', 'r', { kind: 'unknown' })).toContain('分析 → 质疑讨论')
+    expect(lines('cap-iteration', 'r', { kind: 'unknown' })).toContain('分析 → 质疑修复')
     expect(lines('rework', 'r', { childIds: ['a'] })).toContain('集成验收')
   })
 
@@ -109,7 +109,7 @@ describe('触阀升级卡 (spec §9/§11)', () => {
     // 「执行 → 验收」 — a card headed 安全阀 · 方案评审迭代超限 telling the user the retry
     // would KEEP the plan and only re-run execution. Exactly backwards.
     const t = lines('cap-iteration', '评审迭代超限(3)', { kind: 'executable' })
-    expect(t).toContain('分析 → 质疑讨论(方案会重新生成)')
+    expect(t).toContain('分析 → 质疑修复(方案会重新生成)')
     expect(t).not.toContain('本节点将重跑「执行 → 验收」')
   })
 
@@ -320,14 +320,14 @@ describe('重试提示要说全会重跑哪几个环节', () => {
   const seats = (verify: { roleName: string }[]) =>
     ({ phaseRoles: { ...emptyPhaseRoles(), verify } })
 
-  it('配了测试验证 → 三步都列出来', () => {
-    expect(lines('rework', 'r', seats([{ roleName: 'tester' }]))).toContain('执行 → 测试验证 → 验收')
+  it('配了测试修复 → 三步都列出来', () => {
+    expect(lines('rework', 'r', seats([{ roleName: 'tester' }]))).toContain('执行 → 测试修复 → 验收')
   })
 
   it('没配 → 不多报一步(那一步整个不发生)', () => {
     const t = lines('rework', 'r', seats([]))
     expect(t).toContain('执行 → 验收')
-    expect(t).not.toContain('测试验证')
+    expect(t).not.toContain('测试修复')
   })
 })
 

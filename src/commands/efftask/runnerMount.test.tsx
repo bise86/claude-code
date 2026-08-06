@@ -175,11 +175,11 @@ describe('/et 真的能挂起来(整命令的存活闸门)', () => {
   it('settings.json 的 efftaskSkipSteps 一路走到关口上', async () => {
     // 这条走的是完整链路:settings → collectSkipSteps → baseSkipSteps prop → cfg.skipSteps
     // → rosterLines。链路上任何一环断掉(包括「函数写好了但没人调」)这里都会红。
-    const { tty, app } = await mount('把 README 翻译成英文', { efftaskSkipSteps: ['质疑讨论'] })
+    const { tty, app } = await mount('把 README 翻译成英文', { efftaskSkipSteps: ['质疑修复'] })
     await tick(10)
     const f = tty.frames()
     // 关口说的是**后果**,不是「已跳过」——所以断言后果那句话。
-    expect(`关口显示跳过后果: ${f.includes('方案没人质疑就进执行')}`).toBe('关口显示跳过后果: true')
+    expect(`关口显示跳过后果: ${f.includes('方案没人质疑、也没人改就进执行')}`).toBe('关口显示跳过后果: true')
     app.unmount()
   })
 
@@ -187,7 +187,7 @@ describe('/et 真的能挂起来(整命令的存活闸门)', () => {
     const { tty, app } = await mount('把 README 翻译成英文', {})
     await tick(10)
     const f = tty.frames()
-    expect(`误报跳过: ${f.includes('方案没人质疑就进执行')}`).toBe('误报跳过: false')
+    expect(`误报跳过: ${f.includes('方案没人质疑、也没人改就进执行')}`).toBe('误报跳过: false')
     app.unmount()
   })
 

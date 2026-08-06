@@ -30,7 +30,7 @@ describe('reworkReason', () => {
     expect(reworkReason(n)).toEqual({ step: 'accept', rounds: 2, why: '缺回滚方案' })
   })
 
-  it('方案侧读 reviewLog —— 重拟是被质疑讨论打回来的', () => {
+  it('方案侧读 reviewLog —— 重拟是被质疑修复打回来的', () => {
     const n = node({ status: 'PLANNING' as NodeStatus, reviewLog: [rec(1, false, '没有拆分依据')] })
     expect(reworkReason(n)).toEqual({ step: 'review', rounds: 1, why: '没有拆分依据' })
   })
@@ -55,7 +55,7 @@ describe('reworkReason', () => {
     expect(reworkReason(execFail)?.why).toBe('测试没跑')
   })
 
-  it('老记录没有 step 时,验收侧按验收、方案侧按质疑讨论', () => {
+  it('老记录没有 step 时,验收侧按验收、方案侧按质疑修复', () => {
     expect(reworkReason(node({ acceptLog: [rec(1, false, 'x')] }))?.step).toBe('accept')
     expect(reworkReason(node({ status: 'PLANNING' as NodeStatus, reviewLog: [rec(1, false, 'x')] }))?.step).toBe('review')
   })
@@ -90,7 +90,7 @@ describe('reworkLine', () => {
   })
 
   it('测试验收两关分得开 —— 用户要照着修的东西不一样', () => {
-    expect(reworkLine(node({ acceptLog: [rec(1, false, 'x', 'verify')] }))).toContain('测试验证')
+    expect(reworkLine(node({ acceptLog: [rec(1, false, 'x', 'verify')] }))).toContain('测试修复')
   })
 
   it('长意见按码点截,而且不许把换行原样带进树行', () => {

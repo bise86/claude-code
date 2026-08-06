@@ -840,11 +840,11 @@ describe('spec §10.2:详情页要显示各阶段耗时', () => {
     // 分钟以上给 `2m0s` 而不是 `120s`:加上时间点之后这一列要和时刻并排读,而一个
     // 45 分钟的执行环节原来印的是 `2700s`。
     expect(f).toContain('执行 2m0s')
-    expect(f).toContain('质疑讨论 45s')
-    // 顺序:**没有时间点**的老数据仍然按耗时倒序 —— 执行(120)排在质疑讨论(45)前面,
-    // 质疑讨论又在验收(8)前面。读的人是来找"时间花哪了"的。
-    expect(f.indexOf('执行 2m0s')).toBeLessThan(f.indexOf('质疑讨论 45s'))
-    expect(f.indexOf('质疑讨论 45s')).toBeLessThan(f.indexOf('验收 8s'))
+    expect(f).toContain('质疑修复 45s')
+    // 顺序:**没有时间点**的老数据仍然按耗时倒序 —— 执行(120)排在质疑修复(45)前面,
+    // 质疑修复又在验收(8)前面。读的人是来找"时间花哪了"的。
+    expect(f.indexOf('执行 2m0s')).toBeLessThan(f.indexOf('质疑修复 45s'))
+    expect(f.indexOf('质疑修复 45s')).toBeLessThan(f.indexOf('验收 8s'))
   })
 
   it('不足一秒、又没有时间点的阶段不列 —— 一行 0s 只会让人以为那里出了问题', async () => {
@@ -853,8 +853,8 @@ describe('spec §10.2:详情页要显示各阶段耗时', () => {
     const f = await mountDetail({ node: mk({ id: 'n', phaseMs: { EXECUTING: 60_000, PLAN_REVIEW: 300 } }) })
     expect(f).toContain('执行 1m0s')
     // 断言的是**这个状态的中文标签**。上一版写的是 `not.toContain('方案评审')`,而
-    // PLAN_REVIEW 的标签是「质疑讨论」—— 那条断言恒真,把整条过滤删掉照样绿。
-    expect(f).not.toContain('质疑讨论')
+    // PLAN_REVIEW 的标签是「质疑修复」—— 那条断言恒真,把整条过滤删掉照样绿。
+    expect(f).not.toContain('质疑修复')
   })
 
   /**
@@ -952,7 +952,7 @@ describe('各阶段耗时不能把内部枚举名漏给用户', () => {
                       'REWORK', 'INTEGRATION_ACCEPT', 'SCORING', 'MERGE']) {
       expect(`${st}:${body.includes(st)}`).toBe(`${st}:false`)
     }
-    expect(body).toContain('测试验证')
+    expect(body).toContain('测试修复')
   })
 })
 
@@ -1194,7 +1194,7 @@ describe('返工要在树上看得见(真渲染器)', () => {
     expect(frame).toContain('退款回调的重试丢了')
   })
 
-  it('测试验证和验收要分得开 —— 用户要照着修的东西不一样', async () => {
+  it('测试修复和验收要分得开 —— 用户要照着修的东西不一样', async () => {
     const nodes = [mk({
       id: 'root', title: '在返工的', status: 'EXECUTING',
       acceptLog: [failedRound(1, '两个用例没跑', 'verify')],
@@ -1202,7 +1202,7 @@ describe('返工要在树上看得见(真渲染器)', () => {
     const { lastFrame, app } = await mount({ nodes })
     const frame = lastFrame()
     app.unmount()
-    expect(frame).toContain('测试验证未通过')
+    expect(frame).toContain('测试修复未通过')
   })
 })
 

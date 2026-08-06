@@ -475,16 +475,19 @@ describe('capCategory:落盘、校验、和旧版本 node.md 的兼容', () => {
       byId: byIdMap([n]), persist: async () => {}, now: () => NOW,
       signal: new AbortController().signal, onUpdate: () => {},
       reserveNodes: () => ({ release: () => {} }),
+      /**
+       * 走**拆分反复不成立**那条路:方案每轮都拆出一对成环的子任务。
+       *
+       * 这是 `cap-iteration` 今天仅剩的来源 —— 质疑修复不再判决,「评审三轮不过」那条路
+       * 已经不存在了(见 escalation.ts 里这一档的标题也跟着改成了「方案拆分迭代超限」)。
+       */
       runAgent: async req =>
         req.phase === 'plan'
-          // 方案**没有验收点** —— 走的是评审触顶仍然阻断的那条硬边界(降级放行需要有
-          // 可以交给执行者的东西,而一份没有判据的方案不是)。用它才走得到 cap-iteration。
-          ? '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":""}\n\u0060\u0060\u0060'
-          : '\u0060\u0060\u0060' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') + '\n{"pass":false,"blocking":["不行"],"comments":""}\n\u0060\u0060\u0060',
+          ? '\u0060\u0060\u0060json\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test","children":[{"title":"A","deps":["B"]},{"title":"B","deps":["A"]}]}\n\u0060\u0060\u0060'
+          : '\u0060\u0060\u0060' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') + '\n{"kind":"decompose","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test","children":[{"title":"A","deps":["B"]},{"title":"B","deps":["A"]}]}\n\u0060\u0060\u0060',
     })
-    // The valve tripped on REVIEW, and stepStart had already written kind='executable'.
+    // 阀门跳在**拆分**上,而 stepStart 已经写下了 kind。
     expect(n.status).toBe('BLOCKED')
-    expect(n.kind).toBe('executable')
     expect(n.capCategory).toBe('cap-iteration')
     // …so the retry must send it back to re-plan, not to the executor.
     reseatTransientNodes([n], NOW, DEFAULT_CAPS, { retryBlocked: true })
@@ -611,7 +614,7 @@ describe('spec §17.2:归位注记要说清中断在哪个阶段', () => {
   const cases: [string, string][] = [
     ['EXECUTING', '执行'],
     ['MERGE', '合并回集成分支'],
-    ['PLAN_REVIEW', '方案评审'],
+    ['PLAN_REVIEW', '质疑修复'],
     ['SCORING', '观察评分'],
   ]
   for (const [status, phase] of cases) {

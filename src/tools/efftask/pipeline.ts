@@ -1,9 +1,9 @@
 // src/tools/efftask/pipeline.ts
-import type { DegradePhase, EffTaskConfig, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
+import type { DegradePhase, EffTaskConfig, NodePlan, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
-import { adviceOf, crossSeatNotice, degradeCarryPrompt, degradeDiagnosis, exhaustionReason, exhaustionRemedy, feedbackItems, planFeedbackPrompt, retractedCount, reviewRepeatNotice } from './reviewConvergence.js'
+import { adviceOf, crossSeatNotice, degradeCarryPrompt, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
 import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
@@ -13,7 +13,7 @@ import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, humanTimeoutRemedy, totalTimeoutRemedy, type BlockCategory } from './escalation.js'
 import { NodeCancelledError, PhaseTimeoutError, ProviderApiError, type TimeoutKind } from './runAgentAdapter.js'
 import type { RunControl } from './control.js'
-import { repeatRule, resolvedQuorum, reviewRubric, strictnessBlock, verifyRequirement, type Strictness } from './strictness.js'
+import { repeatRule, resolvedQuorum, reviewFixRubric, strictnessBlock, verifyFixRequirement, type Strictness } from './strictness.js'
 
 /** A claim on node-count budget. Single-shot by construction — see reserveNodes. */
 export type NodeSlots = { release: () => void }
@@ -442,6 +442,12 @@ type PhaseResult =
       cancelled?: boolean; rateLimited?: boolean
       // 额度/权限用尽:**不重试**(等没有用),但要带分类和它自己那一句建议。
       quotaExhausted?: boolean
+      /**
+       * 提示词超长,而且**压缩重发三次之后仍然被拒**(适配层已经替我们试过了,见
+       * `makeRunAgentFn` 的重试壳)。走到这里说明这个员工的窗口小到连压过的提示词都收不下,
+       * 建议要说的是「怎么把窗口或节点调对」,不是「先查网络」。
+       */
+      promptTooLong?: boolean
     }
 
 /**
@@ -460,6 +466,8 @@ type PlanPhaseResult =
   | {
       ok: false; reason: string; timeout?: boolean; timeoutKind?: TimeoutKind; cancelled?: boolean
       rateLimited?: boolean; quotaExhausted?: boolean
+      // 和 rateLimited 逐字同因:调用方读它决定分类与建议,漏一个字段就是一条死分支。
+      promptTooLong?: boolean
     }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
@@ -494,9 +502,12 @@ const RATE_LIMIT_ATTEMPTS = 3
  * 这一整套,而分类名对用户是不可见的 —— 可见的是标题和补救建议,后者由 remedyOf 换掉。
  */
 function blockCategoryOf(res: {
-  timeout?: boolean; rateLimited?: boolean; quotaExhausted?: boolean
+  timeout?: boolean; rateLimited?: boolean; quotaExhausted?: boolean; promptTooLong?: boolean
 }): BlockCategory | undefined {
   if (res.timeout === true) return 'timeout'
+  // 提示词超长也算 infra:它和「上游不可用」一样**不是这个节点干得好不好**的问题,而且
+  // 用户改完窗口/员工之后要靠 `--retry-blocked` 把节点捞回来 —— 那条路只认带分类的阻断。
+  if (res.promptTooLong === true) return 'infra'
   // 限流和额度用尽都**必须**带分类:不带的话 `capBlocked` 是 false、`capCategory` 是
   // undefined —— 阻断卡给不出任何对症建议,而 `--retry-blocked` 也捞不回这个节点。
   if (res.rateLimited === true || res.quotaExhausted === true) return 'infra'
@@ -505,9 +516,14 @@ function blockCategoryOf(res: {
 
 /** 对症的那一句。省略 = 用 category 的默认那版。 */
 function remedyOf(res: {
-  timeoutKind?: TimeoutKind; rateLimited?: boolean; quotaExhausted?: boolean
+  timeoutKind?: TimeoutKind; rateLimited?: boolean; quotaExhausted?: boolean; promptTooLong?: boolean
 }): string | undefined {
   if (res.timeoutKind === 'human') return humanTimeoutRemedy()
+  /**
+   * 提示词太长,而且**已经压缩重发过三次**。默认那句「先确认角色模型/网络可用」在这里
+   * 是纯误导:上游是通的,收不下的是我们发过去的字数。
+   */
+  if (res.promptTooLong === true) return promptTooLongRemedy()
   if (res.timeoutKind === 'total') return totalTimeoutRemedy()
   /**
    * 额度用尽和限流**必须给两句不同的话**。上游自己说的是「resets 3pm」,而限流那一版
@@ -578,6 +594,8 @@ async function runPhaseOnce(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], me
       // provider 想怎么改就怎么改。判据在适配层(结构化字段 + 529 的文案兜底)。
       rateLimited: e instanceof ProviderApiError && e.kind === 'rate_limit',
       quotaExhausted: e instanceof ProviderApiError && e.kind === 'quota',
+      // 适配层已经压缩重发过了(PROMPT_SHRINK_RATIOS 三档),还到这里就是真收不下。
+      promptTooLong: e instanceof ProviderApiError && e.kind === 'prompt_too_long',
       // 取消带回来的那部分产出。别的失败路径没有它(runPhase 的 text 只在
       // 「成功之后才发现 abort」那条路上才有),所以这里是取消**独有**的一份。
       text: e instanceof NodeCancelledError ? e.partialText : undefined,
@@ -747,6 +765,19 @@ function exhaustionRemedyFor(rec: RoundtableRecord): string | undefined {
 function rateLimitRemedy(): string {
   return '上游在限流(429/529),不是网络不通。等几分钟再 /et --resume 继续;'
     + '要更稳的话把并行数调小(运行中可以按 ←/→ 调),或把每个环节的席位数调小(caps.maxSeatsPerPhase)。'
+}
+
+/**
+ * 提示词超长、而且压缩重发三次仍被拒时该给的那一句。
+ *
+ * 说的是**这一层能动的三个旋钮**,而不是「等一等」或「查网络」:上游是通的,拒收的是字数。
+ * 压缩本身已经在 `makeRunAgentFn` 里发生过(见 PROMPT_SHRINK_RATIOS),所以走到这里意味着
+ * 这个员工的窗口小到连压过的提示词都收不下 —— 最可能的是它根本不是一个大窗口的模型。
+ */
+function promptTooLongRemedy(): string {
+  return '上游拒收的是**提示词长度**(不是限流、也不是网络):这一次已经自动压缩重发过 3 次仍被拒。'
+    + '可做的三件事:给这个员工声明真实的上下文窗口(.claude/settings.json 的角色配置里写 contextWindow),'
+    + '换一个窗口更大的员工模型,或者把这个节点拆小(方案正文/执行自述/历次意见越攒越长,越往后越容易撞)。'
 }
 
 /**
@@ -1305,158 +1336,26 @@ function graftTargets(node: TaskNode, ctx: PipelineCtx): string {
 // otherwise the goal drifts every time the plan is re-emitted during review iterations.
 function ctxGoal(node: TaskNode): string { return node.goal }
 
-/** 方案的四个正文字段。prevPlan 只比这四个 —— alternatives/responses 在存进去时就剥掉了。 */
+/**
+ * 方案的四个正文字段。`prevPlan` 只比这四个 —— alternatives/responses 在存进去时就剥掉了。
+ *
+ * 现在的唯一消费者是 `planChangeSummary`(质疑修复那一关算「这一席改了哪几段」)。
+ * 一份清单、一处标签:两处各写一份的话,node.md 上的字段名和 body 的小标题会各叫各的。
+ */
 const PLAN_FIELDS = ['solution', 'keyPoints', 'risks', 'acceptance'] as const
 const PLAN_FIELD_LABEL: Record<(typeof PLAN_FIELDS)[number], string> = {
   solution: '完整方案', keyPoints: '重点', risks: '风险点', acceptance: '验收点',
 }
 
 /**
- * 「上一版方案」那一段 —— 让 `repeatRule` 的 `除非那是这一版新引入的缺陷` 第一次变成**可判定**的。
+ * 这里原来住着 `prevPlanSection`:给评审员渲染「上一版方案 vs 这一版」的逐字对照,
+ * 好让「不要提上一轮没提过的新要求」那条护栏有据可依。
  *
- * ## 门是结构性的,不借 `notice` 的判据
- *
- * 判据是「本轮方案**到底重出过没有**」,而它只能由 `prevPlan !== plan` 来回答。用 `notice`
- * 非空当门是错的,两个方向都不蕴含:
- *
- *  - **notice 非空、方案没重出**:跳过分析那一支(`isSkipped(ctx,'plan')`)每轮都判、不消费,
- *    `node.plan` 永不变而 reviewLog 照样累积;「从质疑讨论重做 → 不通过 → 按 s 跳过 → Esc →
- *    resume」那条路还会留下一份**落后两代**的 prevPlan。渲染出来是一份空 diff,而提示词正
- *    指着它要「新引入的缺陷」—— 那是在请评审员随便写点什么。
- *  - **方案重出了、notice 为空**:`pass:false` 但 `blocking` 为空(只写 comments)是真实形态
- *    (`synthesizeVerdicts` 专门处理过),此时 `feedbackItems` 收不到东西 → notice 恒空 →
- *    本段整个静默失效,而那恰恰是最需要收敛的一类运行。
- *
- * ## 字段级 diff 在**代码里**算,不让模型去推断
- *
- * 三个好处,都是拿评审意见换来的:
- *  1. 未改动的字段一个字都不渲染 —— 这一段是 per-seat 的,N 席付 N 份;
- *  2. 「哪些没变」从模型的判断变成代码算出的**事实**,不需要提示词去断言一件可能为假的事;
- *  3. **不必截断**。给 prevPlan 上字符预算是错的:`node.plan` 那边渲染时不夹
- *     (`JSON.stringify` 全文),上一轮评审员看到的就是未夹全文;这边一夹,「上一版」就和
- *     真正被判过的不是同一份,而下面还写着「未变动的段落上一轮已经判过」。体积控在源头
- *     (`MAX_FIELD_CHARS`),不在这里二次夹。
- *
- * ## 措辞:举证责任,不是豁免;加法,不是排他
- *
- * 两条都是评审拿具体后果换来的:
- *
- *  - **不写「本轮只判两件事」。** 那是排他句式,而 `REVIEW_FLOOR`(「三条一律不放行」)在
- *    提示词第一段、这里在几千字之后 —— 正是 `strictness.ts` 反复警告的「P 和 ¬P 同在且 ¬P
- *    在后」,那个坑这个仓库已经踩过两次。更糟的是紧跟地板的 `YIELD_NOTE` 说「以上是本轮的
- *    **默认**判据」,等于亲手给后面的覆盖发许可证。改成「务必**判到**」,想要的效果一个字
- *    不损失,却不与地板和任何一档判据互斥。
- *  - **不写「未变动的段落上一轮已经判过,不要重新挑」。** 那句话既下了结论又给了行动指令,
- *    而它的前提在四种真实情形下为假:infra 失败的席位根本没判过、第 2 轮可能坐进一个没看过
- *    第 1 轮的新席位、运行中可以升档、以及 `REVIEW_FLOOR` 第 3 条本身就是「评审员会不读就
- *    盖章」的反证。它和 `planPrompt` 那句「未被质疑的部分原样保留」复合起来更是一台洗白机:
- *    第 1 轮没被认真看的缺陷从第 2 轮起永久免疫。所以这里给的是**举证责任** —— 和专家档
- *    `repeatRule` 同形(那一档就是这么写的),于是四档共用一份、一处都不用分叉,顺带覆盖
- *    升档方向而不依赖 `reviewRepeatNotice` 里 `crossed` 那道条件门。
+ * 质疑修复没有「上一轮」——挑出毛病的人当场就改了,不存在把意见提给下一轮的循环。
+ * 留着它就是一段永远不会被渲染的提示词,而这个仓库把死配置当缺陷。
+ * `node.prevPlan` 本身留着(`runReviewFix` 仍然写它):它是 node.md 上「改之前长什么样」
+ * 的唯一来源。
  */
-function prevPlanSection(node: TaskNode, round: number, notice: string): string {
-  const prev = node.prevPlan
-  /**
-   * 这一行的三个判据里有两个是**纵深防御**,变异测试证明过:单独去掉 `round <= 1` 或
-   * `Array.isArray(prev)`,2138 条用例一条都不红 —— 它们各自被下面更强的那道门吸收了。
-   *
-   *  - `round <= 1`:`prevPlanRound` 恒 ≥ 1(它是 `planReview + 1`),所以 round=1 时下面那个
-   *    等式要求 `prevPlanRound === 0`,恒不成立。
-   *  - `Array.isArray(prev)`:`typeof [] === 'object'`,数组能穿过这里,但它取四个字段全是
-   *    `undefined` → 全被 `str()` 兜成空串 → 被 `usable` 那道门挡下。
-   *
-   * **保留**:两条都是 O(1) 的早退,而它们各自要挡的东西(轮次错位、盘上的数组)本来就该在
-   * 入口处说清楚。写下来是为了让下一个跑变异测试的人知道这两发存活不是探针假,是冗余。
-   */
-  if (round <= 1 || !prev || typeof prev !== 'object' || Array.isArray(prev)) return ''
-  /**
-   * 这一版是不是**紧邻的上一轮**判过的。
-   *
-   * `round` 由 `iteration.planReview + 1` 算出,而 prevPlan 的写入原本和这个计数器没有任何
-   * 绑定。三处会把计数器归零而不动 prevPlan(`redo.ts` 的任务重做与从质疑讨论重做、
-   * `reseat.ts` 的 `--retry-blocked`),于是**上一次运行**的方案会被当成本次上一轮的对照物
-   * 铺进每一席的提示词,标题还写着「上一轮评审看到的就是它」。
-   *
-   * 逐点补 `delete n.prevPlan` 是三行,但它要求后人每新增一处清 `planReview` 的代码都记得
-   * 跟上。绑定轮次号则不依赖任何调用点:计数器一归零,这个等式当场为假。人工强制通过占掉
-   * 一个 round 号的情形也被它顺带盖住 —— 那一轮没有评审员坐下,自然没有写入。
-   */
-  if (node.prevPlanRound !== round - 1) return ''
-  // 只比四个正文字段。`typeof` 兜底:node.md 手工可编辑,而 validateLoadedNodes 之外还有
-  // 直接读盘的路径 —— 一个非字符串字段在这里当成空串比较,不抛。
-  const str = (p: NodePlan | undefined, k: (typeof PLAN_FIELDS)[number]): string =>
-    typeof p?.[k] === 'string' ? p[k] : ''
-  const changed = PLAN_FIELDS.filter(k => str(prev, k) !== str(node.plan, k))
-  // 逐字未变 = 方案这一轮压根没重出(跳过分析、从质疑讨论重做、复用已确认草稿)。
-  // 那时渲染出来是一份空 diff,而下面要问「改跑偏了没有」—— 不如整段不说话。
-  if (changed.length === 0) return ''
-  /**
-   * **上一版那一侧为空的字段,不构成对照物。**
-   *
-   * 验收实测出的形态:盘上手写一个 `prevPlan: {}`,`validateLoadedNodes` 的逐字段兜底会把它
-   * 补成四个空串(它确实没走 `emptyPlan()`,但结果逐字相同),于是四个字段全被判成「改动过」、
-   * 「逐字未变」那一行整个不出现,评审员收到的是「上一版是空白的,请找出这一版新引入的缺陷」
-   * —— **整份方案都成了新引入,重复率被推到 100%**,方向和这个特性要治的病正相反。
-   *
-   * 判据落在「有没有可对照的原文」上,而不是「上一版存不存在」:一个字都拿不出来时,诚实的
-   * 做法是不说话,而不是渲染一份 `{"solution":""}` 冒充原文。
-   */
-  const usable = changed.filter(k => str(prev, k) !== '')
-  if (usable.length === 0) return ''
-  const same = PLAN_FIELDS.filter(k => !changed.includes(k))
-  return (
-    `上一轮评审看到的是**上一版**方案,它和这一版的差别如下。\n` +
-    (same.length > 0
-      ? `逐字未变的字段:${same.map(k => PLAN_FIELD_LABEL[k]).join('、')}(不再重复渲染)。\n`
-      : '') +
-    `改动过的字段,上一版原文:\n` +
-    // quote(JSON.stringify(...)) —— 和渲染 node.plan 那一处同款。JSON.stringify 不转义反引号,
-    // 一份方案正文里埋一个 ``` 就能提前关掉本次的答案围栏。**这是第二把锁,不是唯一那把**:
-    // 验收实测确认 `parseVerdict` 本身 fail-closed 且认的是本次随机标签,埋进去的 ```verdict
-    // 对不上 ```verdictxxxx,两边都判「未按要求输出裁决块」。两把锁都要,但别把功劳记错。
-    // **整份 stringify,不解引用 prev.solution** —— 盘上一个 `prevPlan: 'boom'` 才不会
-    // 在评审这一刻抛(hostileDisk 的恢复链路里没有 reviewPrompt,它兜不住这个)。
-    `${quote(JSON.stringify(Object.fromEntries(usable.map(k => [k, str(prev, k)]))))}\n` +
-    `本轮**务必判到**:\n` +
-    /**
-     * 第一条**单独按 `notice` 门控**,而不是跟着结构门走。
-     *
-     * 结构门是刻意和 `notice` 解耦的(理由见上),而这句话的所指恰恰是 `notice` 里那份编号
-     * 清单。`pass:false` 且 `blocking` 为空(只写 comments)是真实形态,那时 notice 缺席、
-     * responses 提示也被同一道门挡掉,于是这句「上面列出的那几条意见」上方一条意见都没有 ——
-     * 验收把提示词打出来才看见。排序治不了一个根本不存在的所指。
-     */
-    (notice ? `- 上面列出的那几条意见,这一版有没有真的回应;\n` : '') +
-    /**
-     * 第二条**挂在本轮判据上**,不是无限定的「有没有引入新的问题」。
-     *
-     * 原来那句是祈使句形式的新挑刺维度,靶心正是作者刚按意见改过的地方,而判据(高级档
-     * 「可预见的边界/错误路径没交代就挡」)会照单全收 —— 一次重写的 solution 必然提供新的
-     * 可挑面。**专家档下方向是反的**:那一档 `repeatRule` 本来就允许提新要求,印出来的 diff
-     * 于是从闸门变成弹药(「这是这一版新引入的」从说不出口变成有原文佐证)。挂到判据上之后,
-     * 够不够 blocking 由本轮档位说了算,而不是由「它变过」说了算。
-     */
-    `- 改动过的地方有没有把上一轮的意见改跑偏;改动带来的新问题按本轮判据够不够 blocking,\n` +
-    `  不够就写进 comments。\n`
-    /**
-     * **这里原来还有第三句**(「对没有改动的部分:该挡的照挡,但每提一条都要写明为什么上一轮
-     * 没被提出来」),验收把它否掉了,理由值得留下:
-     *
-     * 它和 `repeatRule` 非专家分支的**例外集合不相交**。那一支说「不要提上一轮没提过的新要求,
-     * 除非那是**这一版新引入的缺陷**」——没改动的字段按定义承载不了「新引入」,所以那里给的
-     * 例外是空集,即「不许提」;而这一句说「可以提,写明理由即可」,给的还是 `repeatRule` 在
-     * 这一档**不接受**的理由(「上一轮漏看的」)。P 与 ¬P 同在,而 ¬P 在前。
-     *
-     * 当初写它的论证是「和专家档 `repeatRule` 同形,于是四档共用一份、一处都不用分叉」——
-     * 那正是病因:重复策略本来就是分档的(`strictness.ts` 里集成验收那一支单独写了「除非那是
-     * 上一轮漏看的」就是证据),把专家档那份无条件发给四档,等于在三档上把闸门拆掉。
-     *
-     * 删掉不亏:专家档的 `repeatRule` 逐字就是同一套举证责任,非专家档回到它本来该有的
-     * 「不许提」。而上一轮提示词评审要防的「免死金牌」也不会回来 —— 那条禁的是**断言一件
-     * 可能为假的事**(「上一轮已经判过」),不说话不构成断言。
-     */
-  )
-}
 
 /**
  * 评审提示词。
@@ -1536,109 +1435,91 @@ function plannedChildren(
   return { children, dropped: Math.max(0, raw.length - children.length) }
 }
 
-function reviewPrompt(
-  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control' | 'worktrees'>,
-  tag: string, brief = '', notice = '', round = 1, maxRounds = 3,
-  /** 本轮的严格度快照。由调用点算一次,和 quorum、`RoundtableRecord.strictness` 同源。 */
+/**
+ * **质疑修复**的提示词。这一关的产出是**一份方案**,不是一份裁决。
+ *
+ * ## 它替换掉了什么
+ *
+ * 上一版这里是 `reviewPrompt`:输出 `{pass, blocking[], comments}`,不通过就把方案打回
+ * 分析环节重出,最多 maxIterations 轮,烧完降级放行。用户把这一关整个换掉了:
+ * 「不提出意见,直接在原方案的基础上进行修改,最终给出完整的修复方案。」
+ *
+ * 于是三样东西一起消失,而它们是同一件事的三个面:
+ *  - `pass`/`blocking` —— 没有裁决,也就没有「阻断项」这个概念;
+ *  - 打回重出的循环 —— 挑出毛病的人自己就把它改了,没有第二个人要被说服;
+ *  - `repeatRule`(「不要提上一轮没提过的新要求」)—— 那条护栏是为「提了没人落实」的
+ *    循环写的。留着它反而变成封嘴:对一个正在改方案的席位说「别提新要求」,读起来就是
+ *    「别改」。
+ *
+ * ## 结构:自己那几段 + `planPrompt`
+ *
+ * 和 `fusePrompt` 逐字同一个写法,而且是同一个理由:这一关的输出**必须**是一份能被
+ * `parsePlanOutput` 解析的方案,那就只能由 `planPrompt` 来说 schema。自己再写一份 schema
+ * 意味着两份会各自漂移,而漂移的表现是「模型答了、解析成一段散文」——
+ * 这个仓库为 `parseFailed` 那条路付过一次全树的学费(见 `fillMissingAcceptance`)。
+ *
+ * 目标 / 工作目录 / 依赖 / 深度上限 / 拆分建议也全部由 `planPrompt` 渲染,这里不再重复
+ * 一遍:重复的两份迟早会说出两句不一样的话。
+ */
+function reviewFixPrompt(
+  node: TaskNode, ctx: PlanPromptCtx & Pick<PipelineCtx, 'control'>,
+  tag: string, brief = '',
+  /** 这是第几位质疑修复席位、一共几位。顺序接力,所以两个数都要说。 */
+  seatNo = 1, seatCount = 1,
+  /** 本轮的严格度快照。由调用点算一次传进来,和记录上的戳同源。 */
   strict: Strictness | undefined = effectiveStrictness(ctx),
-  /** 本轮拆分。见 `plannedChildren` —— 少了它,decompose 节点的评审无法被证伪。 */
+  /** 本轮拆分。见 `plannedChildren` —— 少了它,decompose 节点的子任务无从质疑。 */
   planned: { children: { title: string; deps: string[] }[]; dropped: number } = { children: [], dropped: 0 },
+  /**
+   * 上一关**已知没写好**的那几处(目前只有一种:方案没有验收点)。
+   *
+   * 这是 `lastPlanUsable` 唯一的去处。老代码拿它当降级放行的闸门(「手上这份能不能交给
+   * 执行者」),而降级放行已经不存在了 —— 但那个判断本身还是真的,只是该换成一句
+   * **给能动手的人**的话,而不是一个停下来的理由。
+   */
+  gaps = '',
 ): string {
   return brief +
-    judgeGuidance(ctx) +
-    // 评审席和方案席同进同出:两关共用本节点的隔离工作区(`acquirePlanBase`),没拿到时
-    // 才退回主检出。实测两个架构师都进了共享的集成工作区跑构建 —— 见 sharedTreeNote。
-    sharedTreeNote(ctx.worktrees !== undefined, node.worktree?.path) +
-    // 任务目标。原来这一关**一个字的目标都不渲染** —— 于是 `REVIEW_FLOOR` 第 1 条
-    // (「方案是空的、或与目标无关」)在这一席上根本不可判,而「这份拆分盖住目标了吗」
-    // 正是下面那份 children 想让人能判的另一半。验收/集成两关早就渲染目标了。
-    `任务目标:\n${quote(ctxGoal(node))}\n\n` +
-    `请评审以下方案是否**足以开始执行**。方案:\n${quote(JSON.stringify(node.plan))}\n` +
-    /**
-     * 拆分**单独一行**渲染,不拼进上面那个方案对象里。
-     *
-     * 两个理由,都是实测出来的:①`fusePrompt` / 精化那两处早就是这么写的
-     * (`子任务拆分:${JSON.stringify(d.children)}`),口径统一;②上面那份「方案 JSON」
-     * 和 `persistence` 落盘的 `node.plan` **必须是同一个形状** —— 掺一个盘上不存在的
-     * 键进去,评审员按它写进 blocking 的意见,方案作者在 node.md 上会找不到对应的东西。
-     *
-     * `kind` 一起给:少了它「这个任务该拆没拆」判不了,而那是这一关的核心问题之一。
-     */
+    `你是本任务的**质疑修复**席位(第 ${seatNo}/${seatCount} 位)。\n` +
+    `职责:先质疑下面这份方案,再**自己动手把问题改掉**,交回一份完整的修订版方案。\n` +
+    `这一关**没有裁决**:没有通过/不通过,也没有下一个人来落实你的意见 —— ` +
+    `你交出去的这一版,就是执行者接下来照着干的那一版。\n` +
+    `待修复的方案(${seatNo > 1 ? '上一位同伴刚改过的那一版' : '分析环节的产出'}):\n` +
+    // alternatives / responses 剥掉,理由与 planPrompt 里那一处逐字相同:前者带着落选稿的
+    // 真名(而圆桌承诺过匿名),后者答的是别的轮次的问题,留着只会诱发照抄。
+    `${quote(JSON.stringify({ ...node.plan, alternatives: undefined, responses: undefined }))}\n` +
     `本节点类型:${node.kind === 'decompose' ? 'decompose(拆成子任务)' : 'executable(本节点直接执行)'}\n` +
+    // 拆分**单独一行**渲染,不拼进上面那个方案对象里:上面那份 JSON 和 persistence 落盘的
+    // `node.plan` 必须是同一个形状,掺一个盘上不存在的键进去,读 node.md 的人会对不上。
     `本方案打算创建的子任务(deps 用兄弟标题互指):\n${quote(JSON.stringify(planned.children))}\n` +
     (planned.dropped > 0 ? `(还有 ${planned.dropped} 个子任务未列出)\n` : '') +
-    (notice ? notice + '\n' : '') +
-    /**
-     * 指着 `plan.responses` 说一句。
-     *
-     * 那个字段本来就在上面那份 JSON 里(整份方案是 stringify 进来的),但**在场不等于
-     * 被用**:紧接着的 `notice` 要求评审员「指出是方案的哪一处回应了它」,而作者的答卷
-     * 就摆在旁边一个叫 responses 的键里 —— 不点名的话,评审员照样会去 solution 里翻。
-     * 这一句把「去哪儿找」和「找到了怎么办」接上。
-     *
-     * 措辞和 `reviewRepeatNotice` 同一条规矩:**不推着它放行**。说的是「核对是否属实」,
-     * 不是「作者说改了就算改了」—— 后者会把这个字段变成一句免死金牌。
-     */
-    /**
-     * **有问卷才发答卷** —— 判据是 `notice` 非空,和执行侧的 `hasReworkHistory` 同一条规矩。
-     *
-     * 光看 `plan.responses` 非空是不够的,验收查出了一条真实路径:「从质疑讨论重做」
-     * (`redoFrom === 'review'`)不重出方案、而且把 `planReview` 清零,于是评审员拿到的是
-     * **上一次运行**的答卷 + 一句「请逐条核对是否属实」+ 「这是第 1/3 轮评审」,而它要核对的
-     * 那几条意见一条都不在提示词里(`reviewRepeatNotice` 按轮次门控,第 1 轮返空)。
-     * 跳过分析、以及复用已确认草稿那两支同理:方案没重出,答卷也就没换。
-     *
-     * 一句无从核对的自我表扬,带着一句「找不到就填进 blocking」—— 那是在请评审员随便写点
-     * 什么。README 里「第 1 轮不受影响」那句承诺,靠的就是这道门。
-     */
-    (notice && node.plan.responses && node.plan.responses.length > 0
-      ? `方案里的 responses 是作者对上一轮意见的逐条处置。请**逐条核对是否属实**:` +
-        `它说在某处解决了,就去方案里找那一处;找不到、或找到的东西答非所问,` +
-        `照旧填进 blocking 并写明是哪一条对不上。作者说了不等于做了。\n` +
-        /**
-         * 第三个出口的接盘规则,**放在同一道门里面**(草案要求放外面,这里没照办)。
-         *
-         * 评审提的理由是「写在三元内部,会在方案没重出、答卷没换的那几条路径上一起消失」。
-         * 核过之后判定那个担心不成立:这道门是 `notice && responses.length > 0`,而
-         * `REBUTTAL_RULE` 讲的正是「怎么核 responses 里的某一条」—— 门关着的时候,上面那段
-         * 「请逐条核对是否属实」本身也(正确地)不在场,此时再挂一条讲 responses 怎么核的
-         * 规则,就是对着一份不存在的答卷立规矩,而那恰恰是这道门当初存在的理由
-         * (见上面那段关于「一句无从核对的自我表扬」的注释)。
-         */
-        REBUTTAL_RULE
+    gaps +
+    reviewFixRubric(strict) +
+    `怎么改:\n` +
+    `- **认可的部分原样保留** —— 照抄,不要换措辞、不要为了重写而重写。改动面越小,` +
+    `执行越容易收敛。\n` +
+    `- 要改的地方直接改成你认为对的样子,并在 keyPoints 里留一句「原来 X → 改成 Y,因为 Z」:` +
+    `那是事后唯一读得出你动过什么的地方。\n` +
+    `- 一个字都不用改也是一个合法结论 —— 那就把它**原样完整**交回来,并在 keyPoints 里` +
+    `写明你核实过哪几处。\n` +
+    // 这一关拿得到 Read/Glob/Grep/Bash(七个环节共用一份工具池,见 makeRunAgentFn),
+    // 而它要改的正是一份可能建立在错误事实上的方案。不点这一句,它只会在文字层面润色。
+    `- 方案里的事实断言(某个文件里有什么、某条命令怎么写、某个依赖装没装)**去核实**:` +
+    `你有 Read / Glob / Grep / Bash。核不实的判断不要写进方案,更不要照着它改。\n` +
+    `- 拆分本身也在质疑范围内:该拆没拆、拆错了边界、依赖串错了,都直接改掉` +
+    `(改 kind 与 children)。\n` +
+    (seatCount > seatNo
+      ? `- 你后面还有 ${seatCount - seatNo} 位同伴会在**你这一版**上继续改。` +
+        `所以别把话留给他们,也别指望他们替你收尾。\n`
       : '') +
-    // 上一版方案。**排在 notice 之后**:下面那句「上面列出的那几条意见」指的就是 notice,
-    // 排在它前面的话这个指代落在空气上。见 prevPlanSection。
-    prevPlanSection(node, round, notice) +
-    `这是第 ${round}/${maxRounds} 轮评审。` +
-    /**
-     * 「第 N 轮不过整个任务就中止」**曾经**是事实,现在不是了 —— 触顶走的是降级放行
-     * (见 stepPlan 的 recordDegrade)。这个仓库反复在修的缺陷类型就是「提示词里说一件
-     * 数据层不支持的事」,而这句话是同一句谎话的三个副本之一。
-     *
-     * 但也不能反过来说「反正不会怎么样」:紧接着那两句「不要提上一轮没提过的新要求」
-     * 全靠这里的分量撑着,是评审无限抬价唯一的向下压力。换成一句仍然真实的代价。
-     */
-    `第 ${maxRounds} 轮仍不通过,这份方案不会再改了:它会带着你们的意见**降级放行**交给执行者,` +
-    `而那些意见没人会替你们落实。所以只填你确实要求执行者处理的那些。\n` +
-    /**
-     * 判据本体**按档取值** —— 这几行原来是写死的,而写死的那三条本身就是中级档的内容。
-     *
-     * 为什么不能改成「在 seatPreamble 里追加一段」:`brief` 是提示词的**第一段**,而这里
-     * 是**最后一段**、紧挨输出 schema。追加的话专家档的抬头要隔着整份方案去压一句
-     * 「方案不需要完美…能达到这条就判通过」,而后者还带着「blocking 等同于否决」的代价
-     * 标签。三份独立评审各自推出同一个结论:四档在这一关会坍缩成一档,而且是现状那一档。
-     *
-     * `round > 1` 那条护栏也进了 `reviewRubric` —— 它是为一次实测事故加的(三轮提了 12 条
-     * 互不相同的要求,全部只出现过一轮),所以最严的那一档拿到的不是「不限」而是举证责任。
-     */
-    reviewRubric(strict, round) +
-    // 取证与范围责任。**排在这里而不是 brief 里** —— 见 EVIDENCE_RULE 的注释:一条不该被
-    // 覆盖的规则要待在最后一段、紧挨 schema,而不是提示词的第一段。
-    EVIDENCE_RULE +
-    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD}${ADVICE_FIELD} }。` +
-    answerRule(tag)
+    `- 整份方案要**完整**交回:四个字段和子任务一个都不能少 —— 少写一个字段等于把它删掉,` +
+    `而删掉的那一份正是执行者要读的。\n` +
+    // schema / 目标 / 工作目录 / 依赖 / 深度上限,全部由 planPrompt 说一遍。
+    // keepUnchallenged=false:「原样保留」这句上面已经用自己的措辞说过了,让 planPrompt
+    // 再说一遍会变成两条措辞不同的同类指令(而它那一条挂在 feedback 上,这里 feedback 为空)。
+    planPrompt(node, ctx, tag, '', '', false)
 }
+
 /**
  * @param history 历次未通过的**累积**纪要(去重、按轮次标注),由调用方**一轮算一次**传进来。
  *
@@ -1744,60 +1625,236 @@ function noAcceptanceFallback(goal?: string): string {
     (goal ? '目标:' + quote(goal) : '') + ')'
 }
 
-function verifyPrompt(
-  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '', notice = '',
-  /** 本轮的严格度快照。理由同 reviewPrompt。 */
+/**
+ * 验收点缺席时的兜底 —— **修复侧那一份**。
+ *
+ * 和裁决侧那份(`noAcceptanceFallback`)分开写,因为那份的第一句是「把『方案未定义验收点』
+ * 作为 blocking 的第一条写出来」,而测试修复席位**没有 blocking 这个字段**:一句指向不存在
+ * 字段的指令,最好的结果是被忽略,最坏的结果是它自己造一个格式出来交回来。
+ */
+function noAcceptanceFallbackForFix(goal?: string): string {
+  return '(本节点**没有验收点**,这是方案环节的缺陷。请按下面的目标里与本节点标题直接对应的' +
+    '那一部分去验,并在报告的第一行写明「本节点没有验收点,以下验证依据的是任务目标」——' +
+    '不要每一轮自己另挑一批判据,那会让后面的验收无从对照。' +
+    (goal ? '目标:' + quote(goal) : '') + ')'
+}
+
+/**
+ * **测试修复**的提示词。这一关的产出是**一份修好的工作区 + 一份实跑报告**,不是一份裁决。
+ *
+ * ## 它替换掉了什么
+ *
+ * 上一版是 `verifyPrompt`:输出 `{pass, blocking[], comments}`,里面写死一句
+ * 「**不要修改代码** —— 你的职责是验证,不是修复」,而 `stepExecute` 用工作区前后指纹比对
+ * 来兑现它:动了就把该轮裁决作废并返工。用户把这条反过来了 ——
+ * 「测试验证也改成测试修复,有问题直接修复,不要提出什么阻塞项。」
+ *
+ * 于是那句禁令、那次作废、以及「不通过 → 打回执行者」的整条返工路径一起消失。指纹比对
+ * 本身留着,但换了用途:它现在只用来在记录里说清「这一席到底动没动工作区」。
+ *
+ * ## 为什么不渲染整份方案
+ *
+ * 只给验收点 + 执行者自述,和上一版逐字相同。这一关拿得到工作区和全部工具,方案里的细节
+ * 它自己读得到;而这个提示词每一轮、每一席各发一遍,把整份方案塞进去正是用户报的
+ * 「Prompt is too long」那条路上最肥的一段。
+ */
+function verifyFixPrompt(
+  node: TaskNode, ctx: Pick<PipelineCtx, 'config' | 'control'>, tag: string, brief = '',
+  /** 这是第几位测试修复席位、一共几位。顺序接力,所以两个数都要说。 */
+  seatNo = 1, seatCount = 1,
+  /** 本轮的严格度快照。由调用点算一次传进来,和记录上的戳同源。 */
   strict: Strictness | undefined = effectiveStrictness(ctx),
-  round = 0, maxRounds = 0,
-  /** 本关的返工预算已用掉多少(测试验证 = `iteration.verification`)。见 roundStakes 的 spent。 */
-  spent?: number,
 ): string {
   return (
     brief +
+    // judgeGuidance 而不是 guidanceSection:那一句「用户补充的约束优先于原方案的枝节」是
+    // 说给**拿着旧验收点去对照产出**的人听的,而这一席正是这种人 —— 它要按补充后的意图
+    // 决定「这算不算问题、要不要动手改」。少了它,实测过的那条死循环换个环节重演一遍。
     judgeGuidance(ctx) +
-    `请**实际运行**验证这次改动,不要只读执行者的自述。\n` +
-    (notice ? notice + '\n' : '') +
-    `验收点:${quote(node.plan.acceptance) || noAcceptanceFallback(ctxGoal(node))}\n` +
-    `执行者的自述(仅供参考,不能作为通过依据):${quote(node.execStatus) || '(没有报告任何产出)'}\n` +
-    execResponsesSection(node) +
-    /**
-     * 证据要求**按档取值**。这一行原来写死的是「没有可跑的验证手段,如实说明并判不通过」,
-     * 而初级/中级档要说的是同一个谓词的**反面** —— 追加注入会让 P 和 ¬P 出现在同一份
-     * 提示词里,而 ¬P 在后(紧挨 schema)。那个豁免一次都不会发生。
-     *
-     * 豁免一律带**留痕**义务(见 `strictness.ts` 的 NO_MEANS_NOTE):降档可以降标准,
-     * 不能降留痕 —— node.md 上必须永远读得出「这个节点是在没有验证的情况下通过的」。
-     */
-    verifyRequirement(strict) +
-    `**不要修改代码** —— 你的职责是验证,不是修复。发现问题填进 blocking 交回执行者。\n` +
-    roundStakes(round, maxRounds, '测试验证', spent) +
-    /**
-     * **护栏跟着 notice 走,不跟着轮次走。**
-     *
-     * 三份独立验收都撞到这一处,而它是个**反向失败** —— 护栏本来治「每轮换一批新理由」,
-     * 接错了地方就变成封嘴。原因:`repeatRule` 原本只挂在 `reviewPrompt` 上,而那里
-     * 「轮次 > 1」**蕴含**「本关自己失败过、纪要必然非空」;挪到执行侧之后这个蕴含断了,
-     * 因为测试验证和验收是**两个关口**,一个失败会让另一个的轮次也往前走。实测三条路径:
-     *
-     *   - 配了 verify 席位,第 1 轮 verify 挡下 → **验收第一次开口**就被扣上「不要提上一轮
-     *     没提过的新要求」,而它上一轮压根没开过口,能提的每一条按定义都是新的;
-     *   - 镜像:verify 第 1 轮放行、accept 挡下 → 第 2 轮 verify 同样被封嘴,而返工改出来的
-     *     代码正是它这一轮第一次看到;
-     *   - 评分(observer)低分返工 → verify/accept 上一遍**都通过了**,纪要为空。
-     *
-     * 后果比「多跑一轮」重得多:护栏在场、旧账不在场,而执行者自己写的答卷在场 —— 于是
-     * 提示词里唯一一份「上一轮提了什么」的叙述由**被审的那一方**提供,旁边还跟着一句
-     * 「上一轮要求改的地方改了,就该判通过」。攻击实测已经把节点一路推到 ACCEPTED。
-     *
-     * 判据用 `notice` 而不是轮次:它就是「本关自己前几轮提过什么」,由 `judgeNotice`
-     * 按 `stepOfRound` 过滤而来。**有账才立规矩**,这样那条蕴含关系重新成立。
-     */
-    (notice ? repeatRule(strict, round) : '') +
-    EVIDENCE_RULE +
-    `输出:{ "pass":boolean, "blocking":string[], "comments":"命令与原始输出"${RETRACTED_FIELD}${ADVICE_FIELD} }。` +
+    `你是本任务的**测试修复**席位(第 ${seatNo}/${seatCount} 位)。\n` +
+    `职责:**实际把验证跑起来**,跑出问题就**自己改到对** —— 不要只报告问题,` +
+    `也没有别人可以把问题交回去。\n` +
+    `这一关**没有裁决**:没有通过/不通过,也不会因为你说不行就打回重做。` +
+    `你改完是什么样,后面的验收看到的就是什么样。\n` +
+    `验收点:${quote(node.plan.acceptance) || noAcceptanceFallbackForFix(ctxGoal(node))}\n` +
+    `执行者的自述(仅供参考,**以你实跑的结果为准**):${quote(node.execStatus) || '(没有报告任何产出)'}\n` +
+    verifyFixRequirement(strict) +
+    (seatCount > seatNo
+      ? `你后面还有 ${seatCount - seatNo} 位同伴会在**你改完的这个工作区**上接着跑,` +
+        `所以别把半截状态留在盘上(改一半的文件、临时脚本、跑挂的进程)。\n`
+      : '') +
+    `报告写进 execStatus:跑了哪些命令、原始输出、你改了哪些文件为什么改、` +
+    `还剩什么没解决(没解决的要说清卡在哪)。这段会原样交给验收席位,` +
+    `它对不上你改的东西时会被当场发现。\n` +
+    `输出:{ "execStatus":"实跑与修复报告" }。` +
     answerRule(tag)
   )
 }
+
+
+/**
+ * 一席**没答上来**时留下的那条记录 —— 两个修复关口共用。
+ *
+ * 抽出来有两个理由,而且第二个才是主要的:
+ *
+ *  1. 质疑修复和测试修复在这一支上要构造的东西逐字段相同(署名、`infra: true`、
+ *     跟着走的 timeout/rateLimited),只有那句人话不同。两份拷贝迟早会漂移,而漂移的
+ *     方向必然是「有一处忘了带 `timeoutKind`」—— 这个仓库为那一个字段付过一次学费
+ *     (等人超时拿到了静默超时那一版建议)。
+ *  2. **失败分支的类型收窄在这个仓库里是坏的**:tsconfig 没开 `strictNullChecks`,
+ *     于是 `if (!res.ok)` 之后 `res` 仍然是整个联合类型,读 `res.reason` 会报
+ *     TS2339(全仓 25 处同款,四行的探针即可复现)。集中在这一个函数里做一次收窄,
+ *     比在每个调用点各写一次强转要少得多,也让「为什么要强转」有地方写。
+ */
+/**
+ * 「这一席**因为某一类故障**倒下了吗」—— 给圆桌那两处 `every()` 用。
+ *
+ * 收窄一次,理由同 `seatCallFailed`。写成助手而不是在两处各强转一次,是因为这两处判的是
+ * **同一个命题的两个实例**(全席位都限流 / 全席位都提示词过长),而它们必须一起改:
+ * 少改一处,阻断建议就会在其中一种故障上退回「先查网络」。
+ */
+function failedWith(
+  r: PromiseSettledResult<PhaseResult>,
+  kind: 'rateLimited' | 'promptTooLong',
+): boolean {
+  if (r.status !== 'fulfilled' || r.value.ok) return false
+  return (r.value as Extract<PhaseResult, { ok: false }>)[kind] === true
+}
+
+function seatCallFailed(
+  who: string, tagged: { roleTag?: string }, res: PhaseResult, what: string,
+): { verdict: Verdict; reason: string; cancelled: boolean } {
+  const f = res as Extract<PhaseResult, { ok: false }>
+  return {
+    reason: f.reason,
+    cancelled: f.cancelled === true,
+    verdict: {
+      role: who, ...tagged, pass: true, blocking: [],
+      comments: `调用失败,${what}: ${f.reason}`, infra: true,
+      ...(f.timeout === true ? { timeout: true, timeoutKind: f.timeoutKind } : {}),
+      ...(f.rateLimited === true ? { rateLimited: true } : {}),
+    },
+  }
+}
+
+/**
+ * 一轮测试修复的实跑报告在 execStatus 里的分隔线。
+ *
+ * 追加而不是新开字段:验收/集成验收的提示词渲染的就是 `execStatus`,新开一个字段等于要在
+ * 三处提示词、持久化、读回、详情页各接一次线 —— 这个仓库为「写得出去读不回来」的字段付过
+ * 三次学费(见 `TaskNode.reviewLog` 那几段)。
+ *
+ * 每一轮**先剥掉上一轮的**再追加:正常路径上 `node.execStatus` 每轮被执行者的自述整段覆盖,
+ * 但跳过执行、以及从判决段入场(`enterAtJudge`)那两条路不覆盖 —— 不剥的话报告会一轮一轮
+ * 叠上去,而它是最肥的一段,直接喂给「提示词太长」。
+ */
+const VERIFY_REPORT_MARK = '───── 测试修复:本轮实跑与修复 ─────'
+
+function stripVerifyReport(s: string): string {
+  const i = s.indexOf(VERIFY_REPORT_MARK)
+  return i < 0 ? s : s.slice(0, i).trimEnd()
+}
+
+/**
+ * 测试修复:N 席顺序接力,每席**实跑 + 直接改**,报告并进 execStatus。
+ *
+ * ## 顺序,和质疑修复同一个理由
+ *
+ * 而且这一关比那一关更不能并行:N 席共享**同一个工作区**,并行意味着两个带写工具的 agent
+ * 同时改同一棵树。那不是收敛不收敛的问题,是互相覆盖。
+ *
+ * ## 不阻断,一席都没答上来也不阻断
+ *
+ * 「不要提出什么阻塞项」是这一关的定义。这里手上已经有执行者交出来的产出,继续走到验收
+ * 比把节点判死诚实 —— 而验收是真的会挡的那一关,它读得到这里写下的每一句报告。
+ * 唯一会停下来的是「用户点名取消了这个节点」:那是决定,不是故障。
+ *
+ * ## 指纹比对留着,但换了用途
+ *
+ * 上一版拿它作废「验证者动了代码」的那一轮。现在动代码正是它的职责,所以它只回答一个
+ * 事实问题:这一席到底动没动盘。两种答案在事后追责时是两件完全不同的事 ——
+ * 「跑完全绿、什么都没改」和「改了三个文件」不能在记录里长得一样。
+ */
+async function runVerifyFix(
+  node: TaskNode, ctx: PipelineCtx, strict: Strictness | undefined,
+): Promise<{ cancelled?: boolean }> {
+  const seats: (RoleBinding | null)[] = node.phaseRoles.verify.length > 0 ? node.phaseRoles.verify : [null]
+  const round = gateRound(node, 'verify')
+  const verdicts: Verdict[] = []
+  const reports: string[] = []
+  let cancelled = false
+  for (let i = 0; i < seats.length; i++) {
+    const seat = seats[i] ?? null
+    const who = (seat?.roleName || seat?.roleTag) || '主模型'
+    const tagged = seat?.roleTag ? { roleTag: seat.roleTag } : {}
+    const tag = answerTag(ANSWER_TAGS.exec)
+    const before = await verifySnapshot(node, ctx)
+    const res = await runPhase(ctx, {
+      phase: 'verify', node, role: seat, system: 'verify',
+      prompt: verifyFixPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node, 'verify', strict), i + 1, seats.length, strict),
+      signal: ctx.signal, cwd: node.worktree?.path,
+    }, {
+      phaseLabel: PHASE_LABEL.verify,
+      // 席位序号当轮次:接力的每一席是一次独立派发,合成一条流会看不出是谁跑的、谁改的。
+      round: i + 1, label: who, model: seat?.model,
+    })
+    if (!res.ok) {
+      const f = seatCallFailed(who, tagged, res, '本席没有跑任何验证')
+      verdicts.push(f.verdict)
+      if (f.cancelled) { cancelled = true; break }
+      noteOnNode(node, `测试修复第 ${i + 1} 位(${who})调用失败,本轮没有实跑: ${f.reason}`)
+      continue
+    }
+    const out = parseExecOutput(res.text, tag)
+    /**
+     * 加子节点的请求在这一关**不受理**,但不能静默丢掉。
+     *
+     * 动态生长只由执行环节承担(`growTree` 的调用点在那儿,它还要负责把自己的工作区合掉、
+     * 转成 WAITING_CHILDREN)。这里收下会让一个正在验收路上的节点突然长出子树而没人等它。
+     * 说出来是因为提出者会以为那份工作已经排进去了 —— 这个仓库把「静默丢弃」当缺陷。
+     */
+    if (out.newChildren.length > 0) {
+      noteOnNode(node, `测试修复第 ${i + 1} 位(${who})请求新增 ${out.newChildren.length} 个子任务,` +
+        `本环节不受理(只有执行环节能改变树的形状),已忽略:${out.newChildren.map(c => c.title).join('、')}`)
+    }
+    const after = await verifySnapshot(node, ctx)
+    // 指纹取不到时(非隔离运行、或者 git 调用失败)不猜:说「未知」比说「没改」诚实。
+    const touched = before === undefined || after === undefined
+      ? '(是否改动工作区:未知)'
+      : before === after ? '(本席未改动工作区)' : '(本席改动了工作区)'
+    const report = out.execStatus.trim()
+    if (report === '') {
+      verdicts.push({
+        role: who, ...tagged, pass: true, blocking: [],
+        comments: `没有报告任何实跑内容 ${touched}`,
+      })
+      noteOnNode(node, `测试修复第 ${i + 1} 位(${who})没有报告任何实跑内容`)
+      continue
+    }
+    reports.push(`第 ${i + 1} 位(${who})${touched}\n${capText(report, MAX_SUMMARY_CHARS)}`)
+    verdicts.push({
+      role: who, ...tagged, pass: true, blocking: [],
+      comments: `${touched} ${capText(report, MAX_SUMMARY_CHARS)}`,
+    })
+    // 每一席跑完就落一次盘:接力可能跑很久,中间崩掉的话前面几席的报告不该一起没。
+    await ctx.persist(node)
+    safeUpdate(ctx)
+  }
+  if (reports.length > 0) {
+    const kept = stripVerifyReport(node.execStatus)
+    node.execStatus = `${kept}${kept ? '\n' : ''}${VERIFY_REPORT_MARK}\n${reports.join('\n\n')}`
+  }
+  /**
+   * 记录进 `acceptLog` 并**显式标 `step: 'verify'`**。
+   *
+   * `synthesized.pass` 恒 true 且 blockingSummary 恒空 —— 这一关不做裁决,而 pass 是下游
+   * 唯一读得懂的「这一关没有挡住任何人」。真正的内容在每一席的 comments 里(实跑报告 +
+   * 动没动盘)。持久化那侧按 `step` 认出修复类记录,不会把它渲染成一次「判决通过」。
+   */
+  node.acceptLog.push({ round, step: 'verify', verdicts, synthesized: { pass: true, blockingSummary: '' } })
+  return { cancelled }
+}
+
 /**
  * 「这是第几轮 / 第几轮不过会怎样」。
  *
@@ -1909,7 +1966,7 @@ function roundStakes(round: number, maxRounds: number, label: string, spent?: nu
     '这些意见会原样交给下一关和执行者。所以只填你确实要求对方处理的那些。\n'
   if (spent !== undefined) {
     return `这是第 ${round} 轮${label}。本关的返工预算已用 ${spent}/${maxRounds}` +
-      `(测试验证与验收各记各的)。${stake}`
+      `(测试修复与验收各记各的)。${stake}`
   }
   return `这是第 ${round}/${maxRounds} 轮${label}。${stake}`
 }
@@ -2392,9 +2449,9 @@ async function runPlanRoundtable(
       reason: `全部方案席位调用失败: ${failures.join('; ')}`,
       // 全席位都因为限流倒下时,阻断要按限流报 —— 而不是「先确认角色模型/网络可用」。
       // 判据是「每一席都是限流」:混着别的故障时那才是真正需要查的东西。
-      rateLimited: settled.length > 0 && settled.every(
-        r => r.status === 'fulfilled' && !r.value.ok && r.value.rateLimited === true,
-      ),
+      rateLimited: settled.length > 0 && settled.every(r => failedWith(r, 'rateLimited')),
+      // 同一条规矩:全席位都因为「提示词太长」倒下时,建议要说的是窗口和节点大小。
+      promptTooLong: settled.length > 0 && settled.every(r => failedWith(r, 'promptTooLong')),
     }
   }
   // 只剩一份 → 没什么可融合的,直接用它(还省下融合那一次调用)。
@@ -2487,21 +2544,191 @@ async function runPlanRefinement(
       // timeoutKind 必须跟着走。少了它,1046 行那句 `res.timeoutKind === 'human'` 就是
       // 一条**永远为 undefined 的死分支**(返回类型里根本没这个字段,而本仓库没有
       // typecheck 会说)—— 于是分析环节的等人超时拿到的是静默超时那一版建议。
+      // 一次收窄,理由见 `seatCallFailed`:这个仓库的 tsconfig 没开 strictNullChecks,
+      // `if (!res.ok)` 之后 res 仍然是整个联合类型,逐字段读会报 TS2339。
+      const f = res as Extract<PhaseResult, { ok: false }>
       if (i === 0) {
         return {
-          ok: false, reason: res.reason, timeout: res.timeout, timeoutKind: res.timeoutKind,
-          cancelled: res.cancelled, rateLimited: res.rateLimited, quotaExhausted: res.quotaExhausted,
+          ok: false, reason: f.reason, timeout: f.timeout, timeoutKind: f.timeoutKind,
+          cancelled: f.cancelled, rateLimited: f.rateLimited, quotaExhausted: f.quotaExhausted,
+          promptTooLong: f.promptTooLong,
         }
       }
       node.execStatus = (node.execStatus ? node.execStatus + '\n' : '') +
         ORCHESTRATOR_NOTE + '方案精化第 ' + (i + 1) + ' 位(' + (seat?.roleName || '主模型') +
-        ')调用失败,采用前一稿: ' + res.reason + ')'
+        ')调用失败,采用前一稿: ' + f.reason + ')'
       break
     }
     parsed = parsePlanOutput(res.text, tag)
   }
   return { ok: true, parsed }
 }
+/**
+ * 这一关到底改了什么 —— **从两版方案算出来,不问模型**。
+ *
+ * `parsePlanOutput` 的 schema 里没有「你改了什么」这个字段,而给它加一个的代价这个仓库
+ * 付过:字段加了、解析加了、往返加了,就是没有任何一处提示词问过它(见 `ADVICE_FIELD`
+ * 那段注释)。更要紧的是,**模型自述改了什么和它真的改了什么是两件事** —— 而这条记录会
+ * 进 node.md 当追责依据。逐字段比对是唯一不会说谎的那一份。
+ */
+function planChangeSummary(
+  before: NodePlan, after: NodePlan,
+  beforeChildren: number, afterChildren: number,
+): string {
+  const changed = PLAN_FIELDS
+    .filter(k => String(before[k] ?? '') !== String(after[k] ?? ''))
+    .map(k => PLAN_FIELD_LABEL[k])
+  if (beforeChildren !== afterChildren) changed.push(`子任务 ${beforeChildren} 个→${afterChildren} 个`)
+  // 「一个字没改」是一个合法结论(提示词里明写着),所以它要被说出来,而不是渲染成空白 ——
+  // 空白读起来像记录丢了,而这两件事在事后追责时必须分得开。
+  return changed.length === 0 ? '核对后未作改动' : `改动:${changed.join('、')}`
+}
+
+/** 一次质疑修复的结果。**没有 pass** —— 这一关不做裁决。 */
+type ReviewFixResult = {
+  /**
+   * 修订之后这一版的子任务。`undefined` = 这一关没有决定子任务(树上已经有子节点了,
+   * 那时子任务的真相在树上,不在方案里 —— 见 `plannedChildren` 同一条规矩)。
+   */
+  children?: { title: string; deps: string[] }[]
+  /** 用户点名取消了这个节点。**唯一**会让调用方停下来的结果。 */
+  cancelled?: boolean
+}
+
+/**
+ * 质疑修复:N 席顺序接力,每席在上一版方案上**直接改**,产出仍然是一份完整方案。
+ *
+ * ## 为什么是顺序,不是圆桌
+ *
+ * 用户原话:「多个质疑成员,就顺序执行即可。」而这不只是省事:并行的话 N 份修订版之间还要
+ * 再融合一次,而融合出来的那一版**没有任何人质疑过**。接力则每一席都站在上一席的成果上,
+ * 最后一席交出来的就是最终版 —— 与 `runPlanRefinement` 同一个不变式。
+ *
+ * ## 三条「不采用」的闸门,每一条都会把好方案换成坏方案
+ *
+ *  1. **解析失败不采用。** `parsePlanOutput` 解析不出对象时会把整段原始回复塞进 `solution`
+ *     并清空其余字段(run 001 五份方案里两份是这个形状)。采用它 = 用一坨散文换掉一份真
+ *     方案,而下游没有任何一关能把它变回来。
+ *  2. **验收点被改空就补回上一版的。** 只回填这一个字段,不整体回退 —— 整体回退会把这一席
+ *     真正修对的东西一起丢掉(`fillMissingAcceptance` 记着同一条教训的另一半)。
+ *  3. **树上已有子节点时不动 kind/children。** 那时子任务的真相在树上;按一份新方案去改
+ *     `kind` 会让一个已经长出子树的节点变成 executable,子树当场被孤儿化。
+ *
+ * ## 一席都没答上来也不阻断
+ *
+ * 「不要提出什么阻塞项」是这一关的定义。手上已经有一份分析环节产出的方案,拿它继续走比
+ * 把节点判死诚实 —— 老代码在这里阻断,是因为那时「没人评审过」等于「没人放行过」,
+ * 而现在没有放行这回事。失败逐席记进 reviewLog(带 `infra`)+ execStatus,读得出来。
+ */
+async function runReviewFix(
+  node: TaskNode, ctx: PipelineCtx,
+  opts: {
+    planned: { children: { title: string; deps: string[] }[]; dropped: number }
+    strict: Strictness | undefined
+    gaps: string
+  },
+): Promise<ReviewFixResult> {
+  // 空名册 = 主模型一席。和圆桌时代的 `roster.length > 0 ? roster : [null]` 逐字同规矩:
+  // 没配质疑修复角色的运行,行为退回「主模型自己再看一遍方案」,而不是整关消失。
+  const seats: (RoleBinding | null)[] = node.phaseRoles.review.length > 0 ? node.phaseRoles.review : [null]
+  const round = node.iteration.planReview + 1
+  const verdicts: Verdict[] = []
+  let children: ReviewFixResult['children']
+  let cancelled = false
+  /**
+   * 进这一关之前的那一版 —— 事后 node.md 上「改之前长什么样」唯一的来源。
+   *
+   * 展开而不是同引用:同引用会让 yamlStringify 输出锚点/别名(`plan: &a1` / `prevPlan: *a1`),
+   * 读回来两者是同一个对象,于是后面任何一次 `delete node.plan.responses` 会把 prevPlan 的
+   * 一起删掉。这条坑上一版就踩过(见 `TaskNode.prevPlan`)。
+   */
+  const original = { ...node.plan, alternatives: undefined, responses: undefined }
+  node.prevPlan = original
+  node.prevPlanRound = round
+  for (let i = 0; i < seats.length; i++) {
+    const seat = seats[i] ?? null
+    const who = (seat?.roleName || seat?.roleTag) || '主模型'
+    const tag = answerTag(ANSWER_TAGS.plan)
+    const before = node.plan
+    const beforeChildren = node.childIds.length > 0 ? node.childIds.length : opts.planned.children.length
+    const res = await runPhase(ctx, {
+      phase: 'review', node, role: seat, system: 'review',
+      prompt: reviewFixPrompt(
+        node, ctx, tag, seatPreamble(ctx, seat, 'review', node, 'review', opts.strict),
+        i + 1, seats.length, opts.strict, opts.planned, opts.gaps,
+      ),
+      signal: ctx.signal,
+      // 要能**去核实**方案里的事实断言,而可核实的那棵树是本节点的隔离工作区 ——
+      // 主检出里没有任何依赖的产出(见 acquirePlanBase)。
+      cwd: node.worktree?.path,
+    }, {
+      phaseLabel: PHASE_LABEL.review,
+      // 席位序号当轮次:接力的每一席是一次独立派发,合成一条流会看不出是谁改的。
+      round: i + 1, label: who, model: seat?.model,
+    })
+    if (!res.ok) {
+      const f = seatCallFailed(who, seat?.roleTag ? { roleTag: seat.roleTag } : {}, res, '本席未作修订')
+      verdicts.push(f.verdict)
+      // 取消是**决定**,不是故障:立刻停,别再派下一席。
+      if (f.cancelled) { cancelled = true; break }
+      noteOnNode(node, `质疑修复第 ${i + 1} 位(${who})调用失败,沿用上一版方案: ${f.reason}`)
+      continue
+    }
+    const parsed = parsePlanOutput(res.text, tag)
+    const tagged = seat?.roleTag ? { roleTag: seat.roleTag } : {}
+    /**
+     * 判据是 `structured`,**不是 `parseFailed`** —— 见 `parsePlanOutput.structured`。
+     *
+     * `parseFailed` 只认「围栏在场但内容坏了」。而这一关最常见的退化是回复里**根本没有
+     * 方案对象**(答成了散文、或者答成了别的环节的 schema),那条路上 `parseFailed` 是
+     * false 而 `solution` 已经被换成整段回复原文 —— 采用它等于用一坨散文换掉一份真方案。
+     */
+    if (!parsed.structured) {
+      verdicts.push({
+        role: who, ...tagged, pass: true, blocking: [],
+        comments: '回复里没有一份能解析的方案 JSON,本席的修订未采用(沿用上一版方案)',
+      })
+      noteOnNode(node, `质疑修复第 ${i + 1} 位(${who})的回复没有解析成方案 JSON,已沿用上一版方案`)
+      continue
+    }
+    const keptAlternatives = node.plan.alternatives
+    node.plan = parsed.plan
+    // 这一关不问答卷(提示词里没有 responses 这个字段),解析层却收得无条件 —— 一个主动
+    // 填它的模型能凭空造出一次不存在的返工。要什么就只收什么,和 stepStartCore 那一处同规矩。
+    delete node.plan.responses
+    // 落选稿要留住:它记的是方案圆桌里没被采用的那几份,而这一关一个字都不会重写它。
+    // 不接回去 = 一次静默截断,而 README 承诺过「不静默丢弃任何一稿」。
+    if (keptAlternatives !== undefined) node.plan.alternatives = keptAlternatives
+    if (hollow(node.plan.acceptance) && !hollow(before.acceptance)) {
+      // 只回填这一个字段。整体回退会把这一席真正修对的东西一起丢掉。
+      node.plan.acceptance = before.acceptance
+      noteOnNode(node, `质疑修复第 ${i + 1} 位(${who})交回的方案没有验收点,已保留上一版的验收点`)
+    }
+    if (node.childIds.length === 0) {
+      node.kind = parsed.kind
+      children = parsed.children
+      opts = { ...opts, planned: plannedChildren(node, parsed.children, ctx.byId) }
+    }
+    verdicts.push({
+      role: who, ...tagged, pass: true, blocking: [],
+      comments: planChangeSummary(before, node.plan, beforeChildren, children?.length ?? beforeChildren),
+    })
+    // 每一席改完就落一次盘:接力可能跑几分钟,中间崩掉的话前面几席的修订不该一起没。
+    await ctx.persist(node)
+    safeUpdate(ctx)
+  }
+  /**
+   * 一条记录一次接力,`verdicts` 一席一条。
+   *
+   * `synthesized.pass` 恒 `true` 且 `blockingSummary` 恒空,这不是「假装通过」:这一关
+   * **没有裁决**,而 `pass` 是下游唯一读得懂的「这一关没有挡住任何人」的说法
+   * (`redo.ts` 的 `pastPlanGate`、`reworkReason` 的方案侧都读它)。真正的内容在每一席的
+   * `comments` 里 —— 那是逐字段算出来的改动清单。
+   */
+  node.reviewLog.push({ round, step: 'review', verdicts, synthesized: { pass: true, blockingSummary: '' } })
+  return { children, cancelled }
+}
+
 
 /**
  * 这一席的角色简报,已带好尾部空行 —— 角色的「产出什么、起什么作用」到达模型的唯一通道。
@@ -2518,8 +2745,13 @@ function seatBrief(ctx: { config: EffTaskConfig }, seat: RoleBinding | null, pha
  *
  * 定向注入要按这条线分流:一句「别动 src/legacy」给了执行者却没给验收员,后果是实测过的
  * 那条死循环(见 JUDGE_NOTE)。所以裁决席位看得到**全部**指引,而不只是点名给它自己的那条。
+ *
+ * **质疑修复和测试修复已经不在这里面了。** 它们不判决,而 `JUDGE_NOTE` 那句
+ * 「执行者按它做了而原方案里没有…都不算未完成」是说给**判别人有没有做完**的人听的 ——
+ * 发给一个自己动手改的席位是空转,更坏的读法是「那就别改了」。它们照样收得到定向注入
+ * (上面那张 CROSS 表还在),只是不再多这一句。
  */
-const JUDGING_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['review', 'verify', 'accept', 'integrate', 'observer'])
+const JUDGING_PHASES: ReadonlySet<PhaseName> = new Set<PhaseName>(['accept', 'integrate', 'observer'])
 
 /** 一段指引,带标题。空内容返回空串 —— 空槽会让模型努力去理解一个不存在的要求。 */
 function guidanceBlock(title: string, text: string | undefined): string {
@@ -2961,18 +3193,20 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
    */
   let confirmed = node.confirmedDraft
   /**
-   * 「从质疑讨论重做」的一次性入口(`node.redoFrom`,由重做关口写下)。
+   * 「从质疑修复重做」的一次性入口(`node.redoFrom`,由重做关口写下)。
    *
-   * CREATED 这一个座位对应本函数里的**两个**起点,光靠 status 分不开:分析 → 质疑讨论,
-   * 还是保留现有方案只重判一次。这个标志就是那一个字。
+   * CREATED 这一个座位对应本函数里的**两个**起点,光靠 status 分不开:分析 → 质疑修复,
+   * 还是**保留现有方案再让质疑修复席位过一遍**。这个标志就是那一个字。
    *
-   * **一次性,而且不返工。** 判据不是偷懒:失败走 `continue` 的话会回到循环顶部重新出方案,
-   * 而对一个已经有子任务的拆分型节点,新方案里的子任务规格会被下面 `childIds.length > 0`
-   * 那条守卫丢掉 —— 结果是方案改了、子任务没改,树上两者互相矛盾。菜单上写的也正是这一条:
-   * 不通过就阻断并附评审意见,要按意见重出方案请用「任务重做」。
+   * 这条路上不重出方案。判据不是偷懒:重出的话,对一个已经有子任务的拆分型节点,新方案里的
+   * 子任务规格会被下面 `childIds.length > 0` 那条守卫丢掉 —— 结果是方案改了、子任务没改,
+   * 树上两者互相矛盾。要连子任务一起重来,菜单上写的是「任务重做」。
+   *
+   * 质疑修复不再有「不通过」这个出口,所以这条路也不再会以「重做未通过」阻断:它跑一遍
+   * 修订,然后照常往下走。
    */
   const reviewOnly = node.redoFrom === 'review'
-  // 上一轮启动关口批准过的首层拆分在这条路上没有意义 —— 用户要重判的是**现在这份**方案。
+  // 上一轮启动关口批准过的首层拆分在这条路上没有意义 —— 用户要重来的是**现在这份**方案。
   if (reviewOnly) confirmed = undefined
   // plan → review loop. A rejected child GROUP (dependency cycle) re-enters this same
   // loop, so replanning is bounded by the SAME maxIterations budget — a cycle costs a
@@ -3060,12 +3294,14 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
       if (!(await commit(node, 'PLANNING', ctx))) return
       const res = await runPlanPhase(node, ctx, feedback)
       if (!res.ok) {
+        // 一次收窄,理由见 `seatCallFailed`(tsconfig 没开 strictNullChecks,失败分支读不出字段)。
+        const f = res as Extract<PlanPhaseResult, { ok: false }>
         // 用户点名取消 ≠ 出了故障。走单独一条:不带 category(免得阻断卡去劝他提高超时),
         // 并保持 interrupted 好让 --resume 重新排队。
-        if (res.cancelled === true) { await blockAsCancelled(node, ctx); return }
+        if (f.cancelled === true) { await blockAsCancelled(node, ctx); return }
         await blockWithReason(
-          node, res.reason, ctx, blockCategoryOf(res),
-          remedyOf(res),
+          node, f.reason, ctx, blockCategoryOf(f),
+          remedyOf(f),
         )
         return
       }
@@ -3086,157 +3322,93 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
       lastPlanUsable = parsed.parseFailed !== true && !hollow(node.plan.acceptance)
       if (!(await commit(node, 'PLAN_REVIEW', ctx))) return
     }
-    if (isForcePassed(ctx, 'review', node)) {
-      // 强制通过和跳过在这里**路由完全相同**,差的只是下面那条记录 —— 见 applyForcePass。
-      applyForcePass(
-        ctx, node, 'review', node.reviewLog, node.iteration.planReview + 1,
-        '质疑讨论环节被人工强制通过:圆桌没有放行这份方案,由用户拍板继续',
-      )
+    if (isForcePassed(ctx, 'review', node) || isSkipped(ctx, 'review', node)) {
       /**
-       * 手工跳过的标记**也一并消费掉**,即使这一支走的是强制通过。
+       * 跳过和「强制通过」在这一关**合并成同一条路**,而这是职责变化的直接后果。
        *
-       * 一个手工编辑过的 node.md 可以把两个字段同时写上。强制通过赢(它留记录),而剩下
-       * 那个 skipPhase 不是死数据 —— 它会在下一次返工进入本环节时让评审整个不开会,
-       * 而屏幕上没有任何东西说过还会再跳一次。四个环节里另外三个的 consumeSkip 本来就在
-       * 分支外面无条件跑,只有这一支需要自己补;`resumeCore` 因此不必再判一次两者互斥。
+       * 质疑修复不做裁决,所以「强制通过」在这里已经没有可通过的东西了 —— 它唯一还剩的
+       * 意思就是「这一关别跑」,和跳过逐字相同。上一版在这里调 `applyForcePass`,往
+       * reviewLog 里写一条「圆桌没有放行这份方案,由用户拍板继续」—— 现在没有圆桌、也没有
+       * 放行,那条记录会是一句凭空捏造的往事,而 node.md 是用户事后追责的依据。
+       *
+       * **不写 reviewLog**:没跑就是没跑。留痕落在 execStatus 的注记上(裁决关口读得到它)。
+       *
+       * 两个标记都要消费掉:一个手工编辑过的 node.md 可以把两个字段同时写上,而剩下那个
+       * `skipPhase` 不是死数据 —— 它会在下一次进入本环节时再跳一次,而屏幕上没有任何东西
+       * 说过还会再跳。
        */
+      const byHand = node.skipPhase === 'review' || node.forcePass === 'review'
+      noteOnNode(node, byHand
+        ? '质疑修复环节被用户手工跳过:这份方案没有经过任何质疑与修订'
+        : '质疑修复环节已跳过:这份方案没有经过任何质疑与修订')
       consumeSkip(node, 'review')
-    } else if (isSkipped(ctx, 'review', node)) {
-      // 名册上还挂着评审员,记录却一片空白 —— 不写一行的话,这在 node.md 上读起来像
-      // 「跑了但记录丢了」。写「已跳过」是为了让这两件事在事后追责时分得开。
-      noteOnNode(node, node.skipPhase === 'review'
-        ? '质疑讨论环节被手工跳过(用户在阻断后按了跳过):本节点的方案没有经过任何评审'
-        : '质疑讨论环节已跳过:本节点的方案没有经过任何评审')
-      consumeSkip(node, 'review')
+      consumeForcePass(ctx, node, 'review')
     } else {
     /**
-     * 这一场认哪一档。**取一次**,判据文本 / quorum / 记录上的戳三处共用 ——
-     * 理由见 `roundtableWithInfraRetry` 的 `strictness` 参数。
+     * 质疑修复:N 席**顺序**接力,每席在上一版方案上直接改,产出仍然是一份完整方案。
+     *
+     * 用户原话:「质疑讨论改成质疑修复,不提出意见,直接在原方案的基础上进行修改,最终给出
+     * 完整的修复方案。多个质疑成员,就顺序执行即可。」以及「方案要多角色进行评审修复」。
+     *
+     * 顺序而不是并行,是**这句需求自带的约束**,不是实现偷懒:并行的话 N 份修订版之间要再
+     * 融合一次(方案圆桌那条路),而融合本身会引入一个没人质疑过的新版本。接力则每一席都
+     * 站在上一席的成果上,最后一席交出来的就是最终版 —— 和 `runPlanRefinement` 同一个
+     * 不变式(「本环节的最终产出来自最后一席」),两处的 costLine 含义因此也一致。
      */
     const strict = effectiveStrictness(ctx)
-    // 一轮算一次,和 reviewNotice 同一条规矩。见 plannedChildren:树上有子任务就以树为准,
-    // 否则用本轮草稿 —— reviewOnly / 跳过分析 两支的 lastChildren 是空的而节点有子任务。
+    // 一轮算一次。见 plannedChildren:树上有子任务就以树为准,否则用本轮草稿 ——
+    // reviewOnly / 跳过分析 两支的 lastChildren 是空的而节点有子任务。
     const planned = plannedChildren(node, lastChildren, ctx.byId)
-    const reviewNotice = reviewRepeatNotice(feedbackItems(node.reviewLog), node.iteration.planReview + 1, '评审', '方案', strict)
-    const { rec, infraExhausted } = await roundtableWithInfraRetry({
-      phase: 'review', node, roles: node.phaseRoles.review, round: node.iteration.planReview + 1,
-      system: 'review',
-      // 一轮算一次,不是一席算一次:reviewLog 在这一轮之内不变。
-      buildPrompt: (tag, seat) =>
-        reviewPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'review', node, 'review', strict), reviewNotice, node.iteration.planReview + 1, caps.maxIterations, strict, planned),
-      // 评审要能**去核实**方案里的事实断言(`FACT_EVIDENCE` 就是为这个写的),而可核实的
-      // 那棵树是本节点的隔离工作区 —— 主检出里没有任何依赖的产出。
-      ctx, cwd: node.worktree?.path, strictness: strict,
-    })
-    node.reviewLog.push(rec)
-    // runRoundtable resolves even when the run was cancelled mid-flight (it collects
-    // whatever settled). Without this the node would go on to commit READY/WAITING_CHILDREN
-    // after the user already cancelled.
+    /**
+     * 分析环节已知没做好的那几处,**转成一句给能动手的人的话**。
+     *
+     * `lastPlanUsable` 原来的去处是降级放行的闸门(「手上这份能不能交给执行者」),而降级
+     * 放行随着裁决一起没了。判断本身仍然成立:一份解析失败、或者没有验收点的方案,交到
+     * 执行者手上就是 run 001 那个形状(一坨散文 + 零个验收点 + 没人能说它做完没有)。
+     * 差别在于现在有人能当场把它补上 —— 这一关就是干这个的。
+     */
+    const gaps = lastPlanUsable ? '' :
+      '**注意:上面这份方案没有可用的验收点**(空的,或者整段是模型的原始回复没解析成结构)。' +
+      '这一关必须把它补出来:acceptance 要写成可检验的完成标准(跑什么命令、看到什么结果、' +
+      '改了哪些文件)。没有验收点,后面的验收只能每轮从任务目标里另挑一批标准,执行会被反复打回。\n'
+    const fixed = await runReviewFix(node, ctx, { planned, strict, gaps })
     if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
-    if (infraExhausted) {
-      // Nobody judged the plan — say that rather than blaming the plan.
-      await blockWithReason(node, `评审角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(rec), exhaustionRemedyFor(rec))
-      return
+    if (fixed.cancelled === true) { await blockAsCancelled(node, ctx); return }
+    /**
+     * 这一关**不阻断**,一席都没答上来也不阻断。
+     *
+     * 「有问题直接修复,不要提出什么阻塞项」是用户对这一关下的定义。而这里手上已经有一份
+     * 分析环节产出的方案 —— 席位调用失败时,继续拿它往下走比把整个节点判死诚实得多
+     * (老代码在这一支阻断,是因为那时「没人评审过」等于「没人放行过」;现在没有放行这回事)。
+     * 唯一的例外是上面那两条:整个 run 被中止、或者用户点名取消了这个节点 —— 那是决定,
+     * 不是故障。
+     *
+     * 失败留痕在 `runReviewFix` 里写进 execStatus + reviewLog(带 infra 标记),
+     * node.md 上读得出「这一席没答上来」。
+     */
+    if (fixed.children !== undefined) lastChildren = fixed.children
+    lastPlanUsable = !hollow(node.plan.acceptance)
+    if (!lastPlanUsable) {
+      // 补了一轮还是没有验收点 —— 说出来。它会跟着 execStatus 进后面每一关的提示词,
+      // 而那正是「这个节点凭什么算做完了」唯一还能被追问的地方。
+      noteOnNode(node, '质疑修复之后本节点仍然没有验收点:测试修复/验收将没有稳定判据')
     }
     /**
-     * 这一版**刚刚真的被判过** —— 记下来,给下一轮的评审员当对照物(见 `TaskNode.prevPlan`)。
+     * 落盘,但**不再 commit 一次 PLAN_REVIEW**。
      *
-     * ## 位置:在两道守卫**之下**,而不是紧跟 `push`
+     * 状态本来就已经是 PLAN_REVIEW(上面每一条出方案的支路都 commit 过),而 `commit` 在
+     * 「新旧状态相同」时不记阶段耗时、却照样重刷 `updatedAt` —— 于是这一关花掉的时间会
+     * 从账上凭空消失:实测走完整生命周期时各阶段之和比墙钟少 20 秒,而详情页把这两个数
+     * 上下并排印着(`phaseMs` 那一节的注释记着同一个病的上一次)。
      *
-     * 第一版钉在 `push(rec)` 之后就收手,理由是「那一行才是这一版被判过的定义点」。**那个
-     * 理由只对了一半,而验收把另一半打出来了**:`push` 无条件执行,紧接着的 abort / infra
-     * 两道守卫才是「到底有没有人判」的判据 —— 下面那行既有注释逐字写着 "Nobody judged the
-     * plan"。写在守卫上面,等于把「评审角色连续三次调用失败」和「Esc 打在圆桌飞行中」这两种
-     * **一个裁决都没有**的情形,记成了「上一轮评审看到的就是它」。实测三条路径全部复现:
-     * 恢复之后 v1→v2 那批没人看过的改动被归进「逐字未变 = 上一轮已经判过」,方向朝着放行。
-     * 那正是这个字段的注释里写的「把架空护栏换成伪造护栏」。
-     *
-     * ## `some(v => v.infra !== true)` 不能省,挪位置不够
-     *
-     * 两道守卫都漏:**部分** infra(3 席里 1 席打不通)时 `infraExhausted` 为 false,而剩下
-     * 两席真判过 —— 那一版该记;反过来全 infra 且被 abort 早退时 `infraExhausted` 也是 false。
-     * 判据只能落在「这一桌到底有没有一席真的做出过判断」上,而那正是 `feedbackItems` 用来
-     * 滤掉 infra 的同一条判据。
-     *
-     * ## 轮次号一起记
-     *
-     * 见 `prevPlanSection` 里 `prevPlanRound` 那一段:光有方案而不绑轮次,`--retry-blocked`
-     * 和两种重做把 `planReview` 归零之后,上一次运行的方案会冒充本次的上一轮。
-     *
-     * ## 展开是 load-bearing
-     *
-     * 别「简化」成 `node.prevPlan = node.plan`:同引用会让 yamlStringify 输出锚点/别名
-     * (`plan: &a1` / `prevPlan: *a1`),读回来两者是同一个对象,于是上面那句
-     * `delete node.plan.responses` 会把 prevPlan 的一起删掉。
-     * 剥 alternatives / responses 的理由见 planPrompt 里同款的那一处。
+     * 取消检查不靠这一行:紧接着的路由(READY / WAITING_CHILDREN)每一条都要过 `commit`。
      */
-    if (rec.verdicts.some(v => v.infra !== true)) {
-      node.prevPlan = { ...node.plan, alternatives: undefined, responses: undefined }
-      node.prevPlanRound = node.iteration.planReview + 1
+    await ctx.persist(node)
+    safeUpdate(ctx)
     }
-    if (!rec.synthesized.pass) {
-      node.iteration.planReview++
-      if (reviewOnly) {
-        // 一次性,不返工 —— 见循环上方 reviewOnly 的说明,以及菜单上那一行
-        // 「不通过则本节点阻断并附评审意见」。这里要和它逐字对得上。
-        await blockWithReason(
-          node, `质疑讨论重做未通过: ${rec.synthesized.blockingSummary}`, ctx, 'rework',
-          '要按这些意见重新出方案,请对本节点做一次「任务重做」(方案会重出;有子任务的会先删子树)',
-        )
-        return
-      }
-      // **累积**反馈,不是只带最后一轮。
-      //
-      // 此前是 `feedback = rec.synthesized.blockingSummary`,每轮覆盖 —— 方案作者从来
-      // 没同时看到过三轮意见,它每次都在打地鼠:第 1 轮的意见在第 2 轮被改跑偏,第 3 轮
-      // 又提回来,三轮烧完,说的其实是同一件事。
-      const items = feedbackItems(node.reviewLog)
-      /**
-       * 「本轮几席各自提了意见,它们没经过统一」—— 一轮算一次,和 `feedbackItems` 同一条规矩。
-       *
-       * 这是那次事故里唯一能在**第 2 轮**就止血的东西:第 1 轮两席要求把同一个数字分别改成
-       * 7 和 13(正确值 14),而作者手上没有任何一句话提示它「这两条互斥、都可能是错的」。
-       */
-      feedback = planFeedbackPrompt(items, '评审', crossSeatNotice(node.reviewLog)) || rec.synthesized.blockingSummary
-      if (node.iteration.planReview >= caps.maxIterations) {
-        // 触顶时点名**哪几条是连着几轮没解决的** —— 静态的一句「可提高 caps.maxIterations」
-        // 在「同一条连提三轮」的情况下是误导。这句话现在进的是降级记录,不是墓志铭。
-        const why = exhaustionReason(items, caps.maxIterations, retractedCount(node.reviewLog))
-        /**
-         * **唯一还会停的那条边界:这一版方案本身不可用。**
-         *
-         * 「不失败」不等于「什么都能往下传」。降级放行的前提是**手上有一份可以交给执行者的
-         * 东西**;而 `parsePlanOutput` 解析失败时 `kind` 回落成 `executable`、`solution`
-         * 变成整段原始回复、`acceptance` 为空、`children` 全丢 —— run 001 五个方案席位里
-         * 有两个正是这个形状。对它降级放行的结果是:一个根节点带着一坨散文和零个验收点被判
-         * READY,一个人去做整个 etcd 的翻译,而且没有任何判据能说它做完没有。
-         * 那不是「迭代优化」,那是把失败伪装成进度 —— 比阻断更坏。
-         *
-         * 这一支和 infra 耗尽同类:**没有人产出过可判的东西**,轮数再多也不会变出来。
-         */
-        if (!lastPlanUsable) {
-          await blockWithReason(
-            node, `${why} · 而且最后一版方案没有可用的结构(解析失败或没有验收点),没有可以交给执行的东西`,
-            ctx, 'cap-iteration', exhaustionRemedy(items),
-          )
-          return
-        }
-        /**
-         * 降级放行:记账 + 喊人,然后**落到下面评审通过后的那段路由**(建子任务 / READY)。
-         *
-         * 意见通过两条路走下去:`node.degraded[].advice` 给执行/验收的提示词,
-         * `feedback` 上面刚算过的那一份留在 `node` 上供渲染。两条都不经过 `blockedReason`
-         * —— run 001 那 13 条带实测输出的意见,今天全部烂在那个字符串里。
-         */
-        recordDegrade(node, ctx, 'review', node.iteration.planReview, `${why} · ${degradeDiagnosis(items)}`, adviceOf(node.reviewLog))
-      } else {
-        continue
-      }
-    }
+    // 跳过质疑修复时**不写 reviewLog** —— 一条记录 = 谎报有人质疑过、改过,而 node.md 是
+    // 用户事后追责的依据。之后的路由(深度上限 / 建子节点)原样跑。
 
-    }
-    // 跳过评审时**不写 reviewLog** —— 一条 PASS 记录 = 谎报有人评审过,而 node.md 是
-    // 用户事后追责的依据。跳过 ≠ 通过。评审之后的路由(深度上限/建子节点)原样跑。
     // Re-check before committing READY. Read-only phases run CONCURRENTLY, so another node's
     // growTree can have grafted children onto THIS one while its plan call was in flight.
     // Overwriting that WAITING_CHILDREN with READY orphaned the new subtree: nothing waited
@@ -4353,16 +4525,19 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     const execTag = answerTag(ANSWER_TAGS.exec)
     const execSeat = firstRole(node, 'execute')
     /**
-     * 历次未通过的累积纪要 —— 测试验证和验收**两关一起**给执行者。
+     * 历次未通过的累积纪要 —— **现在只可能来自验收**。
      *
-     * 两关合看是对的:打回它的是这两关,而它要修的是同一份产出。分开给反而会让它以为
-     * 那是两批互不相干的要求。一轮算一次(执行只有一席,但 feedbackItems 是 O(n²),
-     * 而返工轮次越多这份日志越长)。
+     * 过滤器仍然收 `verify`:老 node.md 里那些记录是真的裁决过的,恢复回来时它们的意见
+     * 照样该交给执行者。但**新**的测试修复记录进不来 —— 它们的 `blocking` 恒为空
+     * (那一关不判决),`feedbackItems` 拿不到任何条目。
+     *
+     * 所以标签只写「验收」:写「测试修复/验收」会让执行者以为手上这几条里有一部分来自
+     * 测试修复,而那一关从来不给它提要求(它自己动手改)。
      */
     const execRework = node.acceptLog.filter(r => stepOfRound(r) === 'verify' || stepOfRound(r) === 'accept')
     const execHistory = planFeedbackPrompt(
       feedbackItems(execRework),
-      '测试验证/验收',
+      '验收',
       // 跨席位互斥提醒。`crossSeatNotice` 自己按 (step, round) 分组 —— 这里传进去的是
       // verify 和 accept 的**合并**日志,而两关各自计数,同一个 round 数会同时出现在两边。
       crossSeatNotice(execRework),
@@ -4372,16 +4547,18 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // 会让「第三轮才修好」读起来像「一直在改同一件事」。
       { phaseLabel: PHASE_LABEL.execute, round, label: (execSeat?.roleName || execSeat?.roleTag) || '主模型', model: execSeat?.model })
     if (!res.ok) {
+      // 一次收窄,理由见 `seatCallFailed`。
+      const f = res as Extract<PhaseResult, { ok: false }>
       // Keep whatever the executor managed to report before the interruption. It ran with
       // write tools, so discarding this can leave the repo changed with no record of it.
-      const partial = res.text ? parseExecOutput(res.text, execTag).execStatus.trim() : ''
+      const partial = f.text ? parseExecOutput(f.text, execTag).execStatus.trim() : ''
       if (partial) node.execStatus = `${partial}\n(注:本轮在完成前被中断,以上为中断时已报告的产出)`
       // 同上。而且这一处**尤其**要分开:执行环节被取消时工作区里可能已经有改动了,
       // 上面那句「以上为中断时已报告的产出」正是给用户看的,不该被一句「调用失败」盖过去。
-      if (res.cancelled === true) { await blockAsCancelled(node, ctx); return }
+      if (f.cancelled === true) { await blockAsCancelled(node, ctx); return }
       await blockWithReason(
-        node, res.reason, ctx, blockCategoryOf(res),
-        remedyOf(res),
+        node, f.reason, ctx, blockCategoryOf(f),
+        remedyOf(f),
       )
       return
     }
@@ -4463,56 +4640,47 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // `if (!enterAtJudge)` 的注释。
     enterAtJudge = false
 
-    // 测试验证(spec §7.1)。**只在配了这个环节的角色时存在** —— 没配就整个不发生,
+    // 测试修复(spec §7.1 的继任者)。**只在配了这个环节的角色时存在** —— 没配就整个不发生,
     // 行为与引入它之前逐字节相同。
     //
     // 它和执行是不同的动机:执行者有动机说「做完了」;它和验收是不同的证据:验收判
-    // 「达没达成验收点」读的是产出描述,测试验证判「跑起来对不对」要真的执行命令。
+    // 「达没达成验收点」读的是产出描述,测试修复要真的把命令跑起来 —— 而且跑出问题**自己改**。
     // 没有这一步,验收员只能给执行者的散文盖章。
-    // 配了席位却被跳过时要留痕 —— 名册上挂着 tester、验证记录空白、没有解释,
-    // 和跳过质疑讨论时是同一种歧义。没配席位就不写:那本来就是 opt-in,不算「跳过了」。
+    // 配了席位却被跳过时要留痕 —— 名册上挂着 tester、记录一片空白、没有解释,
+    // 和跳过质疑修复时是同一种歧义。没配席位就不写:那本来就是 opt-in,不算「跳过了」。
     /**
      * 跳过判据**只求值一次**,而且在消费之前。
      *
      * 两个 `if` 读同一个判据,而中间那次 `consumeSkip` 会把手工标记清掉 —— 分别求值的话
-     * 第二个 `if` 当场变成「没跳过」,测试验证照跑,而用户以为自己跳过了它。实测过
+     * 第二个 `if` 当场变成「没跳过」,测试修复照跑,而用户以为自己跳过了它。实测过
      * (phases 里多出一个 verify),而 `consumeSkip` 自己的注释正是在说这件事。
-     */
-    // 强制通过同样**只求值一次、在消费之前**,理由和上面那段逐字相同。
-    const forceVerify = isForcePassed(ctx, 'verify', node)
-    // 强制通过赢:两者路由相同,而留下记录的那一个信息更多。少了这个 `!forceVerify`,
-    // 一个既被跳过又被强制通过的节点会把两条互相矛盾的注记同时写进 execStatus。
-    /**
-     * `degradedAt(node,'verify')` 是**闩**,不只是日志 —— 这一半 load-bearing。
      *
-     * `stepExecute` 是无界 `for(;;)`。测试验证降级放行之后如果这一关还开会,它会再触顶、
-     * 再降级、再触顶……每一圈都是真实的模型调用,而 `iteration.verification` 已经在上限上,
-     * 没有任何东西会拦。闩住之后这个节点余生不再进测试验证的判决,由验收接着推进。
+     * **强制通过在这一关并进跳过**,和质疑修复那一处同一个理由:测试修复不做裁决,
+     * 「强制通过」已经没有可通过的东西了,它唯一还剩的意思就是「这一关别跑」。
+     * 上一版在这里写一条「测试验证环节被人工强制通过:没有实跑过任何测试,由用户拍板放行」
+     * 进 acceptLog —— 那条记录会声称有过一次判决,而现在没有判决这回事。
      *
-     * 排在 `forceVerify` **之后**:用户显式按了「强制验证」时,他要的就是再验一次。
+     * `degradedAt(node,'verify')` 那一项也去掉了:降级放行是「判不通过但轮数用尽」的产物,
+     * 这一关不再判决,也就不会降级。老 node.md 上留下的 verify 降级记录只当历史读
+     * (`DEGRADABLE_PHASES` 仍然收它),不再当闩用 —— 当闩用会让一个从旧运行恢复过来的
+     * 节点**永远跑不了**测试修复,而那正是它现在最需要的那一关。
      */
-    const skipVerify = !forceVerify && (isSkipped(ctx, 'verify', node) || skipVerifyThisRound || degradedAt(node, 'verify'))
-    if ((node.phaseRoles.verify ?? []).length > 0 && forceVerify) {
-      applyForcePass(
-        ctx, node, 'verify', node.acceptLog, node.iteration.acceptance + 1,
-        '测试验证环节被人工强制通过:没有实跑过任何测试,由用户拍板放行',
-      )
-    } else if ((node.phaseRoles.verify ?? []).length > 0 && skipVerify) {
-      noteOnNode(node, node.skipPhase === 'verify'
-        ? '测试验证环节被手工跳过(用户在阻断后按了跳过):没有实跑过任何测试'
+    const skipVerify = isSkipped(ctx, 'verify', node) || isForcePassed(ctx, 'verify', node) || skipVerifyThisRound
+    if ((node.phaseRoles.verify ?? []).length > 0 && skipVerify) {
+      noteOnNode(node, node.skipPhase === 'verify' || node.forcePass === 'verify'
+        ? '测试修复环节被用户手工跳过:没有实跑过任何测试,也没有人修过'
         : skipVerifyThisRound
-          // 说清是**这一轮**,而且说清为什么 —— 否则 node.md 上读起来像「测试验证从此不做了」。
-          ? '本轮测试验证未重跑(跳过验收时它在上一轮已经通过);返工轮会照常再验'
-          : '测试验证环节已跳过:没有实跑过任何测试')
+          // 说清是**这一轮**,而且说清为什么 —— 否则 node.md 上读起来像「测试修复从此不做了」。
+          ? '本轮测试修复未重跑(跳过验收时它在上一轮已经跑过);返工轮会照常再跑'
+          : '测试修复环节已跳过:没有实跑过任何测试')
     }
     // 和 enterAtJudge 同寿:只豁免这一轮。
     skipVerifyThisRound = false
     /**
      * 和 `consumeSkip` 同一处、同一个理由:**无条件**消费,不管席位数。
      *
-     * 0 席的节点上 `applyForcePass` 不会被调到(上面那个分支带着席位数判据),标记就会
-     * 一直留着 —— 而一条留着的预先批准会在返工循环里每一轮都重新为真。重复调用无害:
-     * 这个函数是幂等的。
+     * 0 席的节点上上面那条留痕不会触发(它带着席位数判据),标记就会一直留着 ——
+     * 而一条留着的预先批准会在返工循环里每一轮都重新为真。重复调用无害:它是幂等的。
      */
     consumeForcePass(ctx, node, 'verify')
     /**
@@ -4523,110 +4691,30 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
      * 而它的第二个作用是让下一次 stepExecute 也从判决那一段进来 —— 于是**永远不再执行**。
      */
     consumeSkip(node, 'verify')
-    if ((node.phaseRoles.verify ?? []).length > 0 && !skipVerify && !forceVerify) {
+    if ((node.phaseRoles.verify ?? []).length > 0 && !skipVerify) {
       if (!(await commit(node, 'VERIFYING', ctx))) return
-      // 验证者**不该改代码**,而工具清单挡不住这件事:Bash 本身就能写(echo >、sed -i、
-      // git apply)。所以真正的探针是前后比对工作区 —— 断言它的工具集里没有 Edit/Write
-      // 与「它会不会改代码」毫无关系。
-      const before = await verifySnapshot(node, ctx)
-      // 这一关自己前几轮提过什么。**一轮算一次**(圆桌之外),见 judgeNotice。
       /**
-       * 每一场圆桌**之前重新求值一次** —— 不是「下一次进入环节时」。
+       * 严格度**每一次进这一关之前重新求值** —— 不是「下次进入环节时」。
        *
-       * `stepExecute` 是一次函数调用里的一个无界 `for(;;)`:执行 / 测试验证 / 验收 / 评分 /
+       * `stepExecute` 是一次函数调用里的一个无界 `for(;;)`:执行 / 测试修复 / 验收 / 评分 /
        * 返工全在这一个循环里。一个跑第 2 轮返工的节点**从来没有**「下一次进入验收环节」
        * 那个时刻,它一直在环节里面。按入口快照的话,用户降档对这个节点永不生效 —— 而他
        * 去调档的时刻,恰恰是看着这个节点第 3 轮还没过的时候。
        */
-      const strict = effectiveStrictness(ctx)
-      const verifyRound = gateRound(node, 'verify')
-      const verifyNotice = judgeNotice(node, 'verify', verifyRound, '测试验证', '这一版产出', strict)
-      const v = await roundtableWithInfraRetry({
-        phase: 'verify', node, roles: node.phaseRoles.verify, round: node.iteration.acceptance + 1,
-        system: 'verify',
-        buildPrompt: (tag, seat) => verifyPrompt(node, ctx, tag, seatPreamble(ctx, seat, 'verify', node, 'verify', strict), verifyNotice, strict, verifyRound, caps.maxIterations, node.iteration.verification ?? 0),
-        ctx, cwd: node.worktree?.path, strictness: strict,
-      })
-      const verifyRec: RoundtableRecord = { ...v.rec, step: 'verify' }
-      node.acceptLog.push(verifyRec)
-      const after = await verifySnapshot(node, ctx)
-      if (before !== undefined && after !== undefined && before !== after) {
-        // 它动了工作区。这一轮裁决作废:一个「跑完测试顺手把它改绿」的验证等于没有验证。
-        // 走返工而不是直接阻断 —— 执行者还有预算,而且现在工作区里多了一些没人评审过的
-        // 改动,必须让下一轮把它们纳入正常流程。
-        node.iteration.acceptance++
-        const why = '测试验证环节改动了工作区,该轮裁决作废(验证者只应验证,不应修复)'
-        /**
-         * **作废的那条记录要自报家门。** 它和一条真裁决在 acceptLog 里长得一模一样,
-         * 而 node.md 的「## 验收记录」是用户事后追责的依据 —— 读的人分不清哪一轮的结论
-         * 已经不算数了。
-         */
-        verifyRec.voided = why
-        if (node.iteration.acceptance >= caps.maxIterations) {
-          await blockWithReason(node, `${why};迭代已用尽(${caps.maxIterations})`, ctx, 'rework')
-          return
-        }
-        node.execStatus = appendOrchestratorNote(node.execStatus, why)
-        /**
-         * 同样要进 feedback:execStatus 里的注记只在 feedback 非空时才被渲染进提示词,
-         * 只写 execStatus 等于写给没人看的地方。
-         *
-         * **但不能只写这一句。** 原来 `feedback = why` 把这一轮**真正的阻断意见整个换掉**了
-         * —— 验证者可能刚指出「锁文件被改写」这类真问题,而执行者收到的只有一句
-         * 「验证者改了工作区」,于是它既不知道要修什么,下一轮又会被同样的问题挡回来。
-         * 裁决作废的是**这一轮的判决效力**,不是它看到的事实。
-         */
-        feedback = v.rec.synthesized.blockingSummary
-          ? `${why}\n该轮验证者提出的问题仍需处理(判决虽已作废,但问题本身要看):\n${v.rec.synthesized.blockingSummary}`
-          : why
-        if (!(await commit(node, 'REWORK', ctx))) return
-        continue
-      }
+      const v = await runVerifyFix(node, ctx, effectiveStrictness(ctx))
       if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
-      if (v.infraExhausted) {
-        await blockWithReason(node, `测试验证角色连续 ${caps.maxIterations} 次调用失败,未能取得任何裁决: ${v.rec.synthesized.blockingSummary}`, ctx, exhaustionCategory(v.rec), exhaustionRemedyFor(v.rec))
-        return
-      }
-      if (!v.rec.synthesized.pass) {
-        // 失败走已有的返工路径,和验收失败同一条。但阻断文案要说清是**哪一关**没过,
-        // 否则升级卡片和 --retry-blocked 会拿到一句「验收迭代超限」,而其实是测试没跑通。
-        //
-        // **把原因交给执行者。** 不设 feedback 的后果实测过:第 1 轮和第 2 轮的执行提示词
-        // 逐字节相同(只有随机 answer tag 不同),三轮空转后阻断 —— verifyPrompt 花整段
-        // 要来的「实际执行的命令与原始输出」一次也到不了能修它的人。更糟的是 feedback 是
-        // 循环外变量:不覆盖它,执行者会拿到**两轮之前、另一道关口**的意见,还被告知那是
-        // 「上一轮」的。
-        feedback = v.rec.synthesized.blockingSummary
-        /**
-         * 计数走 `iteration.verification`,**不再和验收共用** `iteration.acceptance`。
-         *
-         * 原来共用,注释写的理由是「不新增预算维度」—— 在「触顶即阻断」的世界里那是对的:
-         * 两关加起来 3 轮,谁烧完都一样是死。但用户要的是「三轮到测试验证还是有问题,
-         * 就把修改建议给验收,让验收来修改」,而共用一个计数器时,测试验证烧完 3 轮之后
-         * 验收**一轮都不剩**:第一次不通过立刻降级盖章。「交给验收」当场坍缩成
-         * 「验收看一眼就放行」—— 和这句需求正好相反。
-         */
-        node.iteration.verification = (node.iteration.verification ?? 0) + 1
-        if (node.iteration.verification >= caps.maxIterations) {
-          /**
-           * 降级放行:测试验证这一关不再开会,累积的建议交给**验收**和**下一轮执行**。
-           *
-           * `degradedAt(node,'verify')` 从此为真,而上面那道 `!skipVerify` 判据读它 ——
-           * 那一半是 load-bearing 的:`stepExecute` 是无界 `for(;;)`,只记账不闩住的话
-           * 这一关下一轮照样开、照样触顶、照样降级,无限次真实模型调用。
-           */
-          recordDegrade(
-            node, ctx, 'verify', node.iteration.verification,
-            `测试验证迭代超限(${caps.maxIterations}): ${v.rec.synthesized.blockingSummary}`,
-            adviceOf(node.acceptLog, 'verify'),
-          )
-          // 不 return:照常走下面的 REWORK + continue,让**执行者**先拿着这些建议再做一轮
-          // (用户原话:「执行拿着最开始的方案和这些修改建议开始执行」)。下一圈进来时
-          // 这一关已被闩住,直接落到验收 —— 验收拿的是自己那份没动过的 maxIterations。
-        }
-        if (!(await commit(node, 'REWORK', ctx))) return
-        continue
-      }
+      // 用户点名取消 ≠ 出了故障:走单独一条,保持 interrupted 好让 --resume 重新排队。
+      if (v.cancelled === true) { await blockAsCancelled(node, ctx); return }
+      /**
+       * **这一关没有出口。** 不判决、不返工、不降级、不阻断 —— 修完就往验收走。
+       *
+       * 上一版这里有三条出口(工作区被改动 → 作废该轮并返工;判不通过 → 返工;轮数用尽 →
+       * 降级放行),三条都建立在「它只验不修」之上。用户把那个前提换掉了,三条一起作废:
+       * 「有问题直接修复,不要提出什么阻塞项。」
+       *
+       * 兜底不是没有:改完的产出仍然要过**验收**那一关,而验收读得到这里写下的实跑报告
+       * (它就在 execStatus 里)。真正的判决留在真正的判决关口上。
+       */
     }
 
     // Acceptance. Reviewer-CALL failures retry the roundtable on their own budget (see

@@ -1,5 +1,5 @@
 /**
- * 跨分支依赖调度的另一半:**分析与质疑讨论也要站在集成分支的当前状态上。**
+ * 跨分支依赖调度的另一半:**分析与质疑修复也要站在集成分支的当前状态上。**
  *
  * 用户报的问题:「某个任务依赖另外一个任务时,要先从主干同步过来」。执行环节一直是对的
  * (`acquire` 基于集成分支 tip 落基线,返工轮再 `refreshFromIntegration`),漏掉的是它
@@ -60,7 +60,7 @@ function spyPool(over: Record<string, unknown> = {}) {
   }
 }
 
-describe('分析/质疑讨论的基线', () => {
+describe('分析/质疑修复的基线', () => {
   it('两关都在节点自己的隔离工作区里跑,而不是用户的主检出', async () => {
     const n = node()
     const cwds = new Map<string, string | undefined>()
@@ -155,7 +155,9 @@ describe('分析/质疑讨论的基线', () => {
     expect(n.status).toBe('READY')
     expect(cwds.get('plan')).toBeUndefined()
     expect(cwds.get('review')).toBeUndefined()
-    expect(n.execStatus).toBe('')
+    // execStatus 里只允许有编排器注记(这份桩机让质疑修复答成了裁决形状,它会留一句
+    // 「未采用」)—— 判据是**没有执行者写的东西**,不是空串。
+    expect(n.execStatus.split('\n').filter(Boolean).every(l => l.startsWith('(注:'))).toBe(true)
   })
 
   it('别人的工作区不还 —— 冲突待人工处理的节点带着现场进来', async () => {

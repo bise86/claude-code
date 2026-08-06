@@ -7,7 +7,7 @@ import { validateLoadedNodes, readRunManifest } from './resumeCore.js'
 import type { FsLike } from './persistence.js'
 import { serializeNode } from './persistence.js'
 import { parseDirectives } from './parseDirectives.js'
-import { seatPreamble, stepStart, type PipelineCtx } from './pipeline.js'
+import { seatPreamble, stepExecute, stepStart, type PipelineCtx } from './pipeline.js'
 import { createRunControl } from './control.js'
 import { capsLine } from './startupConfirm.js'
 import { feedbackItems, reviewRepeatNotice } from './reviewConvergence.js'
@@ -45,7 +45,7 @@ describe('圆桌记录读得回来 —— step 今天就在被丢,strictness 会
    *
    * `step` 丢掉的连带后果不是「少一个字段」:`stepOfRound()` 对每条记录返回 undefined,
    * 于是 `judgeNotice` 的 `filter(r => stepOfRound(r) === step)` 恒为空 —— 每一次
-   * `--resume` 之后,测试验证/验收/集成验收三关的「你前几轮提过什么」**全部失效**。
+   * `--resume` 之后,测试修复/验收/集成验收三关的「你前几轮提过什么」**全部失效**。
    */
   it('step 与 strictness 都活过一次落盘+读回', () => {
     const n = mk({ acceptLog: [rec({ step: 'verify', strictness: '专家' })] })
@@ -75,7 +75,7 @@ describe('圆桌记录读得回来 —— step 今天就在被丢,strictness 会
    * `--resume`。step / strictness 各自死在这里过一次,这条是替第三个字段站岗的。
    */
   it('voided 也活过一次落盘+读回,非法值照旧丢掉', () => {
-    const why = '测试验证环节改动了工作区,该轮裁决作废'
+    const why = '测试修复环节改动了工作区,该轮裁决作废'
     const n = mk({ acceptLog: [rec({ step: 'verify', voided: why })] })
     const disk = JSON.parse(JSON.stringify(n)) as TaskNode
     expect(serializeNode(disk)).toContain('已作废')
@@ -166,6 +166,14 @@ describe('seatPreamble:档位独立成段,不碰 JUDGE_NOTE 的闸门', () => {
   })
 })
 
+/**
+ * 端到端:档位真的到达模型调用,并盖在记录上。
+ *
+ * **探针整组从评审关挪到了验收关。** 质疑修复 / 测试修复不再开圆桌、也不出裁决,于是
+ * 「按档取判据 + 按档合成门槛 + 在记录上盖戳」这三件事在那两关上都不存在了 ——
+ * 留在那儿测的是一条不存在的接线。它们的档位改由 `reviewFixRubric` /
+ * `verifyFixRequirement` 承载,那部分由 strictness.test.ts 和 pipeline.test.ts 守。
+ */
 describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
   const vtag = (req: { prompt: string }): string => '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict')
   const ctxFor = (nodes: TaskNode[], runAgent: RunAgentFn, config: EffTaskConfig, control?: ReturnType<typeof createRunControl>): PipelineCtx => ({
@@ -175,43 +183,48 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
     ...(control ? { control } : {}),
   })
   const cfg = (over: Partial<EffTaskConfig['caps']> = {}): EffTaskConfig => ({
-    goalPrompt: 'g', parallelism: DEFAULT_PARALLELISM,
-    phaseRoles: { ...emptyPhaseRoles(), review: [{ roleName: '' }] },
+    goalPrompt: 'g', parallelism: DEFAULT_PARALLELISM, notices: [],
+    phaseRoles: { ...emptyPhaseRoles(), accept: [{ roleName: '' }] },
     caps: { ...DEFAULT_CAPS, ...over },
   })
+  const leaf = (roster: { roleName: string }[] = [{ roleName: '' }]): TaskNode =>
+    mk({
+      kind: 'executable', status: 'READY',
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: '跑 bun test 全绿' },
+      phaseRoles: { ...emptyPhaseRoles(), accept: roster },
+    })
 
-  it('评审提示词按档取值,而 reviewLog 上盖着同一档', async () => {
+  it('验收提示词按档取值,而 acceptLog 上盖着同一档', async () => {
     const seen: string[] = []
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
-      return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"改了 foo.ts"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
-    const n = mk({ kind: 'executable', status: 'PLANNING' })
-    await stepStart(n, ctxFor([n], runAgent, cfg({ strictness: '专家' })))
-    const review = seen.find(p => p.includes('请评审'))!
-    expect(review).toContain('本次严格度:专家')
-    expect(review).toContain('将来会咬人')
-    // 现状那三条**不该**同时在场 —— 那正是「四档坍缩成一档」的形态。
-    expect(review).not.toContain('能达到这条就判通过')
-    expect(n.reviewLog[0]!.strictness).toBe('专家')
+    const n = leaf()
+    await stepExecute(n, ctxFor([n], runAgent, cfg({ strictness: '专家' })))
+    const accept = seen.find(p => p.includes('本次运行的严格度'))!
+    expect(accept).toContain('严格度:**专家**')
+    expect(accept).toContain('按**目标**判')
+    // 初级那条**不该**同时在场 —— 那正是「四档坍缩成一档」的形态。
+    expect(accept).not.toContain('验收点里没写的不要求')
+    expect(n.acceptLog[0]!.strictness).toBe('专家')
   })
 
-  it('不设档时:提示词回到现状那三条,记录上不多任何键', async () => {
+  it('不设档时:提示词一个字都不提档位,记录上不多任何键', async () => {
     const seen: string[] = []
     const runAgent: RunAgentFn = async req => {
       seen.push(req.prompt)
-      return req.phase === 'plan'
-        ? '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"改了 foo.ts"}\n```'
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":""}\n```'
     }
-    const n = mk({ kind: 'executable', status: 'PLANNING' })
-    await stepStart(n, ctxFor([n], runAgent, cfg()))
-    const review = seen.find(p => p.includes('请评审'))!
-    expect(review).toContain('能达到这条就判通过')
-    expect(review).not.toContain('严格度')
-    expect(Object.keys(n.reviewLog[0]!)).not.toContain('strictness')
+    const n = leaf()
+    await stepExecute(n, ctxFor([n], runAgent, cfg()))
+    const accept = seen[seen.length - 1]!
+    expect(accept).not.toContain('严格度')
+    expect(Object.keys(n.acceptLog[0]!)).not.toContain('strictness')
   })
 
   /**
@@ -221,22 +234,22 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
   const threeSeatsOneReject = async (strictness?: '初级'): Promise<TaskNode> => {
     let i = 0
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 foo.ts"}\n```'
       const reject = i++ === 0
       return vtag(req) + `\n{"pass":${!reject},"blocking":${reject ? '["小问题"]' : '[]'},"comments":""}\n` + '```'
     }
     const roster = [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }]
     const config = cfg(strictness ? { strictness } : {})
-    config.phaseRoles.review = roster
-    const n = mk({ kind: 'executable', status: 'PLANNING', phaseRoles: { ...emptyPhaseRoles(), review: roster } })
-    await stepStart(n, ctxFor([n], runAgent, config))
+    config.phaseRoles.accept = roster
+    const n = leaf(roster)
+    await stepExecute(n, ctxFor([n], runAgent, config))
     return n
   }
   it('初级档:3 席里 1 席反对仍然通过(2/3 过半),一轮就出门', async () => {
     const n = await threeSeatsOneReject('初级')
-    expect(n.reviewLog[0]!.synthesized.pass).toBe(true)
-    expect(n.reviewLog).toHaveLength(1)
-    expect(n.status).toBe('READY')
+    expect(n.acceptLog[0]!.synthesized.pass).toBe(true)
+    expect(n.acceptLog).toHaveLength(1)
+    expect(n.status).toBe('ACCEPTED')
   })
   /**
    * infra 重试的**合并分支**。变异测试实测:把重新合成那一行改回现读 `ctx.config.caps`、
@@ -265,7 +278,7 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
      */
     const failedOnce = new Set<string>()
     const runAgent: RunAgentFn = async req => {
-      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 foo.ts"}\n```'
       const who = req.role?.roleName ?? 'main'
       if (!failedOnce.has(who)) { failedOnce.add(who); throw new Error('provider unreachable') }
       return who === 'b'
@@ -273,10 +286,10 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
         : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     const config = cfg({ strictness: '初级' })
-    config.phaseRoles.review = roster
-    const n = mk({ kind: 'executable', status: 'PLANNING', phaseRoles: { ...emptyPhaseRoles(), review: roster } })
-    await stepStart(n, ctxFor([n], runAgent, config))
-    const last = n.reviewLog[0]!
+    config.phaseRoles.accept = roster
+    const n = leaf(roster)
+    await stepExecute(n, ctxFor([n], runAgent, config))
+    const last = n.acceptLog[0]!
     expect(last.verdicts.map(v => v.role)).toEqual(['a', 'b', 'c'])
     expect(last.synthesized.pass).toBe(true)
     expect(last.strictness).toBe('初级')
@@ -295,47 +308,46 @@ describe('端到端:档位真的到达模型调用,并盖在记录上', () => {
   it('运行中改档:在飞那一轮认旧档,下一轮认新档', async () => {
     const seen: { phase: string; prompt: string }[] = []
     const control = createRunControl()
-    let reviewRound = 0
+    let acceptSeat = 0
     const runAgent: RunAgentFn = async req => {
       seen.push({ phase: req.phase, prompt: req.prompt })
-      if (req.phase === 'plan') return '```json\n{"solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test 全绿"}\n```'
-      reviewRound++
+      if (req.phase === 'execute') return '```json\n{"execStatus":"改了 foo.ts"}\n```'
+      acceptSeat++
       // 第一轮:两席赞成一席反对 → 专家(全票)不通过。此刻用户降档。
-      if (reviewRound <= 3) {
-        if (reviewRound === 3) control.setStrictness('初级')
-        return vtag(req) + `\n{"pass":${reviewRound !== 1},"blocking":${reviewRound === 1 ? '["小问题"]' : '[]'},"comments":""}\n` + '```'
+      if (acceptSeat <= 3) {
+        if (acceptSeat === 3) control.setStrictness('初级')
+        return vtag(req) + `\n{"pass":${acceptSeat !== 1},"blocking":${acceptSeat === 1 ? '["小问题"]' : '[]'},"comments":""}\n` + '```'
       }
       // 第二轮:同样两席赞成一席反对 —— 初级(34)通过。
-      return vtag(req) + `\n{"pass":${reviewRound !== 4},"blocking":${reviewRound === 4 ? '["小问题"]' : '[]'},"comments":""}\n` + '```'
+      return vtag(req) + `\n{"pass":${acceptSeat !== 4},"blocking":${acceptSeat === 4 ? '["小问题"]' : '[]'},"comments":""}\n` + '```'
     }
     const roster = [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }]
     const config = cfg({ strictness: '专家' })
-    config.phaseRoles.review = roster
-    const n = mk({ kind: 'executable', status: 'PLANNING', phaseRoles: { ...emptyPhaseRoles(), review: roster } })
-    await stepStart(n, ctxFor([n], runAgent, config, control))
+    config.phaseRoles.accept = roster
+    const n = leaf(roster)
+    await stepExecute(n, ctxFor([n], runAgent, config, control))
 
-    expect(n.reviewLog).toHaveLength(2)
+    expect(n.acceptLog).toHaveLength(2)
     // 在飞那一轮:戳 = 专家,而且是按全票合成的(2/3 赞成仍然不通过)。
-    expect(n.reviewLog[0]!.strictness).toBe('专家')
-    expect(n.reviewLog[0]!.synthesized.pass).toBe(false)
+    expect(n.acceptLog[0]!.strictness).toBe('专家')
+    expect(n.acceptLog[0]!.synthesized.pass).toBe(false)
     // 下一轮:戳 = 初级,同样的 2/3 赞成通过了。
-    expect(n.reviewLog[1]!.strictness).toBe('初级')
-    expect(n.reviewLog[1]!.synthesized.pass).toBe(true)
+    expect(n.acceptLog[1]!.strictness).toBe('初级')
+    expect(n.acceptLog[1]!.synthesized.pass).toBe(true)
     // 提示词也跟着换了 —— 门槛换了而判据文本没换的话,两者会打架。
-    const reviews = seen.filter(s => s.phase === 'review').map(s => s.prompt)
-    expect(reviews[0]).toContain('严格度:**专家**')
-    expect(reviews[reviews.length - 1]).toContain('严格度:**初级**')
+    const accepts = seen.filter(s => s.phase === 'accept').map(s => s.prompt)
+    expect(accepts[0]).toContain('严格度:**专家**')
+    expect(accepts[accepts.length - 1]).toContain('严格度:**初级**')
   })
 
   it('不设档:同一批裁决第一轮**不通过**(全票),要多烧一轮 —— 反向探针', async () => {
     // 「多跑一轮」正是用户报的那个症状,而这两条用例合起来就是它的因果:
     // 同一批席位、同一批意见,唯一的变量是门槛。
     const n = await threeSeatsOneReject()
-    expect(n.reviewLog[0]!.synthesized.pass).toBe(false)
-    expect(n.reviewLog.length).toBeGreaterThan(1)
+    expect(n.acceptLog[0]!.synthesized.pass).toBe(false)
+    expect(n.acceptLog.length).toBeGreaterThan(1)
   })
 })
-
 describe('control:档位是持续状态,不进 clearAll* 那一批', () => {
   /**
    * redo 走 `applyRedo → startRun → runOrchestrator`,用的是同一个 RunControl,而那条路上
@@ -386,19 +398,35 @@ describe('关口印的是绝对门槛,不是百分比', () => {
   })
   it('各关席位数不同时按关分组印 —— 取 Math.max 等于把骗人换个形式', () => {
     /**
-     * review 5 席 / accept 2 席、高级档:review 真实门槛 4/5,accept 是 2/2 全票。
-     * 上一版取最大值印「4/5」,而用户读到的是「一票反对也能过」—— 对 accept 关是假的。
+     * accept 5 席 / integrate 2 席、高级档:accept 真实门槛 4/5,集成验收是 2/2 全票。
+     * 上一版取最大值印「4/5」,而用户读到的是「一票反对也能过」—— 对集成验收是假的。
+     *
+     * 席位换成了这两关:圆桌只剩它们俩(质疑修复/测试修复不再开圆桌),而给一个不开圆桌
+     * 的环节印「几席赞成即通过」本身就是一句假话。
      */
     const line = capsLine(cfg({
       caps: { ...DEFAULT_CAPS, strictness: '高级' },
       phaseRoles: {
         ...emptyPhaseRoles(),
-        review: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }, { roleName: 'd' }, { roleName: 'e' }],
-        accept: [{ roleName: 'x' }, { roleName: 'y' }],
+        accept: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }, { roleName: 'd' }, { roleName: 'e' }],
+        integrate: [{ roleName: 'x' }, { roleName: 'y' }],
       },
     }))
-    expect(line).toContain('质疑讨论 4/5')
+    expect(line).toContain('验收 4/5')
     expect(line).toContain('其余各关仍需全票')
+  })
+
+  it('质疑修复 / 测试修复的席位数不进这一行 —— 它们不开圆桌', () => {
+    const line = capsLine(cfg({
+      caps: { ...DEFAULT_CAPS, strictness: '初级' },
+      phaseRoles: {
+        ...emptyPhaseRoles(),
+        review: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }],
+        verify: [{ roleName: 'v1' }, { roleName: 'v2' }, { roleName: 'v3' }],
+      },
+    }))
+    expect(line).not.toContain('质疑修复')
+    expect(line).not.toContain('测试修复')
   })
   it('真的放宽时印 N/M 席', () => {
     const line = capsLine(cfg({

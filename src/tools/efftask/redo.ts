@@ -114,13 +114,13 @@ function entryBlockedReason(phase: PhaseName, decomposed: boolean, ctx?: RedoCon
   // 拆分任务自己不跑执行那一段,所以「从执行重做」在它上面也是灰的 —— 不能指过去。
   if (decomposed) {
     return phase === 'verify'
-      ? '这是拆分任务,测试验证由子任务各自完成 —— 要重跑某一个,请到那个子任务上重做'
+      ? '这是拆分任务,测试修复由子任务各自完成 —— 要重跑某一个,请到那个子任务上重做'
       : phase === 'accept'
         ? '拆分任务自己的裁决是集成验收 —— 请选「从集成验收重做」'
         : '观察评分跟在集成验收通过之后跑,没有自己的入口 —— 要重新评分请选「从集成验收重做」'
   }
   return phase === 'verify'
-    ? '测试验证跑在执行环节内部,没有自己的入口 —— 要重跑它请选「从执行重做」'
+    ? '测试修复跑在执行环节内部,没有自己的入口 —— 要重跑它请选「从执行重做」'
     : phase === 'accept'
       ? '验收跑在执行环节内部,没有自己的入口 —— 要重跑它请选「从执行重做」'
       : '观察评分跟在验收通过之后跑,没有自己的入口 —— 要重新评分请选「从执行重做」'
@@ -191,7 +191,7 @@ export function phasesOf(entry: RedoEntry, ctx?: RedoContext, node?: TaskNode): 
   return redoChain(entry, node).filter(p => phaseRuns(p, ctx))
 }
 
-/** 「执行 → 测试验证 → 验收」这样一句**照实**的描述,以及被跳过的部分。 */
+/** 「执行 → 测试修复 → 验收」这样一句**照实**的描述,以及被跳过的部分。 */
 export function phaseChainText(entry: RedoEntry, ctx?: RedoContext, node?: TaskNode): string {
   const runs = phasesOf(entry, ctx, node)
   const missing = redoChain(entry, node).filter(p => !runs.includes(p))
@@ -502,7 +502,7 @@ function isDecomposed(n: TaskNode): boolean {
   return n.childIds.length > 0 || n.kind === 'decompose'
 }
 
-/** 这个节点有没有可评审的方案。空方案上重跑质疑讨论 = 让评审员对着空白发表意见。 */
+/** 这个节点有没有可质疑的方案。空方案上重跑质疑修复 = 让人对着空白「修订」。 */
 function hasPlan(n: TaskNode): boolean {
   return `${n.plan?.solution ?? ''}${n.plan?.keyPoints ?? ''}${n.plan?.acceptance ?? ''}`.trim().length > 0
 }
@@ -529,7 +529,7 @@ export function redoOptions(
     /**
      * **入口环节自己必须真的会跑。**
      *
-     * 只看「整条链是不是空的」不够:跳过质疑讨论之后,「从质疑讨论重做」的链上还剩
+     * 只看「整条链是不是空的」不够:跳过质疑修复之后,「从质疑修复重做」的链上还剩
      * 执行那一段 —— 链非空,条目可用,而用户按下去得到的是一次执行重做。
      * 条目叫什么名字,那个环节就必须发生。
      */
@@ -555,7 +555,7 @@ export function redoOptions(
     {
       entry: 'review',
       scope: 'phase',
-      label: '从「质疑讨论」重做',
+      label: '从「质疑修复」重做',
       /**
        * **通过之后会继续往下跑**,这一条必须写在最前面。
        *
@@ -563,9 +563,9 @@ export function redoOptions(
        * 普通路由:执行型节点 commit(READY) → 调度器分派 stepExecute。实测真实链条是
        * 质疑讨论 → 执行 → 测试验证 → 验收 → 观察 → 合并,而用户按的是菜单上最便宜那一条。
        */
-      detail: `保留现有方案,先重跑一次质疑讨论;通过后继续跑:${phaseChainText('review', ctx, node)}。不通过则本节点阻断并附评审意见 —— 要按意见重出方案请用「任务重做」`,
+      detail: `保留现有方案,让质疑修复席位再过一遍(它们会**直接改**这份方案);之后继续跑:${phaseChainText('review', ctx, node)}。这一关不做判决,不会因为「没通过」而阻断 —— 要连子任务一起重来请用「任务重做」`,
       disabled: runsNothing('review')
-        ?? (hasPlan(node) ? undefined : '本节点还没有方案,没有可评审的东西 —— 请用「任务重做」'),
+        ?? (hasPlan(node) ? undefined : '本节点还没有方案,没有可质疑修复的东西 —— 请用「任务重做」'),
     },
     {
       entry: 'execute',
@@ -1414,9 +1414,9 @@ function planPastFailedPhase(
      * **都是 0**,而这两个恰恰是「换掉了质量保证」最明显的两个(方案没人质疑就往下走、
      * 一个测试都不实跑)。README 承诺这一屏会用 ⚠ 标出来,那就得真的标。
      */
-    warnings.push(forced
-      ? '评审员提出的意见**一条都没有被处理**,由你放行 —— 它们原样留在评审记录里,而方案一个字没改'
-      : '这份方案**没有任何人质疑过**就进入下一步 —— 漏项和隐藏依赖不会在这里被拦下')
+    // 两条路现在**做的事一模一样**(修复类环节没有判决可以强制通过,见 pastPhaseSummary),
+    // 所以 ⚠ 也只有一句:换掉的质量保证就是「没人质疑、没人改」。
+    warnings.push('这份方案**没有任何人质疑过、也没有人改过**就进入下一步 —— 漏项和隐藏依赖不会在这里被拦下')
     seatedAt = 'CREATED'
   } else if (phase === 'verify' || phase === 'accept') {
     /**
@@ -1499,8 +1499,22 @@ function pastPhaseSummary(
 ): string[] {
   const forced = mode === 'forcePass'
   const lines: string[] = []
+  /**
+   * 修复类环节(质疑修复 / 测试修复)**没有「通过」可以强制**。
+   *
+   * 它们不做裁决:没有圆桌、没有 pass。所以在这两关上按下强制通过,实际发生的事和跳过
+   * **逐字相同**(见 `stepStartCore` / `stepExecute` 里那两处合并的分支),而记录里不会、
+   * 也不该出现一条署名「人工强制通过」的裁决 —— 那会是一次凭空捏造的往事。
+   *
+   * 屏幕上必须说实话:上一版这一行承诺的「会留下一条署名的通过」在这两关上已经是假的,
+   * 而用户正是照着这一行按下确认的。
+   */
+  const isFix = phase === 'review' || phase === 'verify'
   lines.push(forced
-    ? `强制通过「${PHASE_LABEL[phase]}」—— 这个环节这次**不会开会**,但会在记录里留下一条**署名「${MANUAL_PASS_ROLE}」的通过**`
+    ? isFix
+      ? `放行「${PHASE_LABEL[phase]}」—— 这是**修复类**环节,没有判决可以强制通过,` +
+        `所以这一下等同于跳过:这个环节这次**不会发生**,记录里只留一句「被用户手工跳过」`
+      : `强制通过「${PHASE_LABEL[phase]}」—— 这个环节这次**不会开会**,但会在记录里留下一条**署名「${MANUAL_PASS_ROLE}」的通过**`
     : `跳过「${PHASE_LABEL[phase]}」—— 这个环节这次**不会发生**,也不会在记录里留一条通过`)
   /**
    * 跳过之后还会跑什么,**照实算**。
@@ -1531,15 +1545,14 @@ function pastPhaseSummary(
     lines.push('执行环节不重跑 —— 你刚看过的那份产出原样往下走(执行者不会再改一遍代码)')
   }
   if (phase === 'accept') {
-    lines.push('本轮测试验证也不重跑 —— 它在上一轮(节点走到验收之前)已经通过了')
+    lines.push('本轮测试修复也不重跑 —— 它在上一轮(节点走到验收之前)已经跑过了')
   }
   if (phase === 'review') {
-    lines.push(forced
-      // 「没有任何人质疑它」在强制通过这条路上是**假话** —— 有人质疑了,而且判了不通过。
-      ? '现有方案原样保留(一个字都不会改),评审员提的那些意见留在记录里但没人去处理'
-      : '现有方案原样保留,没有任何人质疑它就进入下一步')
+    // 强制通过和跳过在这一关是同一件事(修复类环节没有判决),所以只有一句话可说。
+    lines.push('现有方案原样保留(一个字都不会改),没有任何人质疑它就进入下一步')
   }
-  if (forced) {
+  // 修复类环节不留这条:它们没有 PASS 可留(见上面 isFix 那段)。
+  if (forced && !isFix) {
     lines.push(`记录里会多一条 round 的 PASS,署名「${MANUAL_PASS_ROLE}」,并附上被你覆盖掉的那些阻断意见`)
   }
   if (target.status === 'BLOCKED') lines.push('本节点从「已阻断」回到可推进状态')

@@ -194,6 +194,8 @@ describe('编排器每一轮现读上限', () => {
   })
 
   it('圆桌的席位也跟着新上限走 —— 池子是同一个,不能只有调度器听话', async () => {
+    // 席位换成**验收**圆桌:质疑修复现在是顺序接力(见 concurrency.test 那条),
+    // 它的峰值恒为 1,拿它量池子等于量了个常数。
     /**
      * 「受同一全局池约束,避免总并发爆炸」那一条的另一半。评审席位不走调度器,它们走
      * `mapWithinPool` → `pool.tryTake()`,而池子的上限是一个闭包 —— 那个闭包读的是
@@ -206,17 +208,17 @@ describe('编排器每一轮现读上限', () => {
      * 峰值同时数。池子现读的话是 3,读旧值的话恒为 1。
      */
     const control = createRunControl()
-    let curReview = 0
-    let peakReview = 0
+    let curJudge = 0
+    let peakJudge = 0
     const runAgent = (async (req: { phase: string; prompt: string }) => {
       if (req.phase === 'plan') {
         control.setParallelism(5)
         return reply(req, LEAF)
       }
-      if (req.phase === 'review') {
-        curReview++
-        peakReview = Math.max(peakReview, curReview)
-        try { await tick(20) } finally { curReview-- }
+      if (req.phase === 'accept') {
+        curJudge++
+        peakJudge = Math.max(peakJudge, curJudge)
+        try { await tick(20) } finally { curJudge-- }
         return reply(req, '{"pass":true,"blocking":[],"comments":"ok"}')
       }
       if (req.phase === 'execute') return reply(req, '{"execStatus":"done"}')
@@ -224,14 +226,14 @@ describe('编排器每一轮现读上限', () => {
     }) as unknown as RunAgentFn
 
     const roles = emptyPhaseRoles()
-    roles.review = [{ roleName: '甲' }, { roleName: '乙' }, { roleName: '丙' }]
+    roles.accept = [{ roleName: '甲' }, { roleName: '乙' }, { roleName: '丙' }]
     const orch = new EffTaskOrchestrator(
       cfg({ parallelism: 1, phaseRoles: roles }),
       { runAgent, persist: async () => {}, now: () => new Date().toISOString(), onUpdate: () => {}, control },
       new AbortController().signal,
     )
     expect((await orch.run()).status).toBe('completed')
-    expect(peakReview).toBeGreaterThan(1)
+    expect(peakJudge).toBeGreaterThan(1)
   })
 
   it('表头那个上限跟着走 —— 屏幕上的数字不许和调度器用的那个不是一个', async () => {
@@ -256,7 +258,7 @@ describe('编排器每一轮现读上限', () => {
      *  - 收紧**之后**才被派出去的节点,同时最多 1 个。
      *
      * 数的是**节点**而不是调用:一个已经拿到槽位的节点会在这个槽位里依次跑完
-     * 分析 → 质疑讨论 → 执行 → 验收,那些调用当然会和别的节点的调用重叠 —— 那正是
+     * 分析 → 质疑修复 → 执行 → 验收,那些调用当然会和别的节点的调用重叠 —— 那正是
      * 「在跑的不受影响」的表现,不是超额。第一版按调用数,量到 2 就红了,而 2 是对的。
      *
      * 五个叶子而不是三个:只有三个的话,收紧之后**没有任何**节点还需要派发,那条断言

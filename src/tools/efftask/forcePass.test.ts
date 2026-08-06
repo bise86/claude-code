@@ -59,7 +59,14 @@ const PLAN = '```json\n{"kind":"executable","solution":"做它","keyPoints":"k",
 const manualOf = (log: TaskNode['reviewLog']) => log.find(r => r.verdicts.some(v => v.manual === true))
 
 describe('强制通过:四个环节都不开会,但都留下一条署名的人工裁决', () => {
-  it('质疑讨论 —— 评审一次都不派,reviewLog 里多一条 MANUAL', async () => {
+  /**
+   * 修复类两关**没有「通过」可以强制** —— 它们不做裁决。
+   *
+   * 所以按下这一下,实际发生的事和跳过逐字相同:环节不跑、**不写记录**。写一条署名
+   * 「人工强制通过」的裁决会是一次凭空捏造的往事(没有圆桌被绕过,因为根本没有圆桌),
+   * 而 node.md 是用户事后追责的依据。留痕落在 execStatus 上。
+   */
+  it('质疑修复 —— 一次都不派,而且**不写**假裁决', async () => {
     const n = root()
     n.forcePass = 'review'
     const { calls, runAgent } = counting(req => (req.phase === 'plan' ? PLAN : PASS(req)))
@@ -71,11 +78,9 @@ describe('强制通过:四个环节都不开会,但都留下一条署名的人�
     expect(calls.filter(p => p === 'plan')).toHaveLength(1)
     expect(n.status).toBe('READY')
 
-    const rec = manualOf(n.reviewLog)
-    expect(rec).toBeDefined()
-    expect(rec!.synthesized.pass).toBe(true)
-    expect(rec!.verdicts[0].role).toBe(MANUAL_PASS_ROLE)
-    expect(rec!.step).toBe('review')
+    expect(n.reviewLog).toEqual([])
+    // 但也不是一片空白 —— 谁按的、跳过了什么,execStatus 上读得出来。
+    expect(n.execStatus).toContain('质疑修复环节被用户手工跳过')
     // 一次性:用掉就没了。留着的话下一次返工进来会再放行一次,而屏幕上没说过还有第二次。
     expect(n.forcePass).toBeUndefined()
   })
@@ -101,7 +106,7 @@ describe('强制通过:四个环节都不开会,但都留下一条署名的人�
     expect(n.forcePass).toBeUndefined()
   })
 
-  it('测试验证 —— 一个测试都不实跑,而验收照常开', async () => {
+  it('测试修复 —— 一个测试都不实跑、不写假裁决,而验收照常开', async () => {
     const n = root()
     n.kind = 'executable'; n.status = 'READY'
     n.execStatus = '上一轮改的 foo.ts'
@@ -114,8 +119,9 @@ describe('强制通过:四个环节都不开会,但都留下一条署名的人�
     // 验收**照常开** —— 强制通过的粒度是一个环节,不是「后面都别判了」。
     expect(calls.filter(p => p === 'accept')).toHaveLength(1)
     expect(n.status).toBe('ACCEPTED')
-    const rec = manualOf(n.acceptLog)
-    expect(rec?.step).toBe('verify')
+    // 同上:没有判决可以强制,所以不留 MANUAL 记录,只留一句人读得懂的注记。
+    expect(n.acceptLog.some(r => r.step === 'verify')).toBe(false)
+    expect(n.execStatus).toContain('测试修复环节被用户手工跳过')
   })
 
   it('集成验收 —— 根节点的最终裁决由人给出,子任务一个不动', async () => {
@@ -348,7 +354,7 @@ describe('闸门:和跳过一字不差,而这条尤其不能漏', () => {
     const by = new Map(opts.map(o => [o.phase, o]))
     expect(by.get('accept')?.disabled).toBeUndefined()
     expect(by.get('review')?.disabled).toBeUndefined()
-    // 没配席位的测试验证整个不存在 —— 摆一个按下去什么都不变的选项比没有更糟。
+    // 没配席位的测试修复整个不存在 —— 摆一个按下去什么都不变的选项比没有更糟。
     expect(by.get('verify')?.disabled).toContain('没有配置')
     // 叶子节点不走集成验收。
     expect(by.get('integrate')?.disabled).toContain('没有子任务')
@@ -389,7 +395,7 @@ describe('读回:手写的 forcePass 比手写的 skipPhase 更危险', () => {
   it('盘上两个都写着:强制通过赢,而跳过那个标记**也被消费掉**,不留残留', async () => {
     /**
      * 这条组合只可能来自手工编辑。`resumeCore` 刻意不判它(见那里的注释:别造第二份
-     * 判据),所以兜底必须在消费点 —— 而质疑讨论那一支是四个里唯一需要自己补
+     * 判据),所以兜底必须在消费点 —— 而质疑修复那一支是四个里唯一需要自己补
      * consumeSkip 的:另外三个的 consumeSkip 本来就在分支外面无条件跑。
      */
     const n = root()
@@ -399,7 +405,9 @@ describe('读回:手写的 forcePass 比手写的 skipPhase 更危险', () => {
     await stepStart(n, ctxFor([n], runAgent))
 
     expect(calls.filter(p => p === 'review')).toHaveLength(0)
-    expect(manualOf(n.reviewLog)).toBeDefined()  // 强制通过赢:记录留下了
+    // 两个标记做的是同一件事(这一关没有判决可强制),所以只有一条注记,没有假裁决。
+    expect(n.reviewLog).toEqual([])
+    expect(n.execStatus).toContain('质疑修复环节被用户手工跳过')
     expect(n.forcePass).toBeUndefined()
     expect(n.skipPhase).toBeUndefined()          // 残留会让下一轮静默不开会
   })
