@@ -839,6 +839,28 @@ export function makeRunAgentFn(deps: {
           return await once({ ...req, prompt, stream })
         } catch (e) {
           if (!isPromptTooLongError(e) || attempt >= PROMPT_SHRINK_RATIOS.length) throw e
+          /**
+           * **提示词本来就不长时,压它一点用都没有 —— 而且很贵。**
+           *
+           * 跑机实测(qianbase-xtp,2026-08-06 18:54):我们发出去的提示词 **3 KB**,而那次
+           * 调用的整段对话 **4.5 MB** —— 两条 Glob 的结果分别是 1.4 MB 和 3.2 MB
+           * (一条全仓通配打在一个大仓库上)。上游说的「prompt is too long」指的是**整段对话**,
+           * 不是我们那 3 KB。把 3 KB 压到 1.6 KB 省下的是窗口的千分之几,救不回任何东西;
+           * 而每一次重试都是一次**完整重跑**,那两个 Glob 会再跑一遍、再灌 4.6 MB 进去。
+           *
+           * 所以这里先问一句「我们这一份到底占不占分量」——不占就原样抛出去,由
+           * `promptTooLongRemedy` 去指真正该看的地方。屏幕上也要说清,否则用户读到的是
+           * 一句「已压缩重发」,而那句话在这条路上是**误导**。
+           */
+          if (Array.from(prompt).length < PROMPT_SHRINK_WORTH_IT) {
+            try {
+              req.stream?.push({
+                kind: 'text',
+                text: `\n[上游拒收:提示词过长。但**这次发出去的提示词只有 ${Math.round(Array.from(prompt).length / 1024)} KB**,超长的不是它 —— 多半是这次调用里某个工具一次返回了几 MB(例如 Glob 打全仓通配)。不重试:重跑会把那几 MB 再灌一遍]\n`,
+              })
+            } catch { /* 提示而已 */ }
+            throw e
+          }
           const next = shrinkPrompt(prompt, PROMPT_SHRINK_RATIOS[attempt]!)
           // 压不动了(已经短到地板)→ 再发一次是同样的拒收。原样抛出去,让阻断理由
           // 停在真实的那一句上。
@@ -868,6 +890,19 @@ export function makeRunAgentFn(deps: {
  * 大步长换的是**次数**:每一次重试都是一次真实的、可能带写工具的调用。
  */
 export const PROMPT_SHRINK_RATIOS = [0.55, 0.3, 0.15]
+
+/**
+ * 提示词短于这个长度时**不压缩、不重试**,直接把上游那句话抛出去。
+ *
+ * 算术:窗口最小的员工是 128k token(翻译型协议那一档,见 runAgent 的 contextWindow),
+ * 中英混排大约 40 万字符。2 万字符的提示词占它 5% —— 压到 55% 省下 2%,救不回任何东西,
+ * 而代价是三次**完整重跑**(每一次都会把子 agent 那些几 MB 的工具结果重新灌一遍)。
+ *
+ * 定成一个常数而不是「按窗口比例算」,是因为我们这一层**看不到**这次调用真实的窗口:
+ * 员工可以声明 contextWindow、也可以什么都不声明,而上游那条错误消息里的 token 数
+ * (errors.ts 把它留在 errorDetails 里)到不了这一层。宁可用一个说得清的数。
+ */
+export const PROMPT_SHRINK_WORTH_IT = 20_000
 
 /** 这个错是不是上游在说「提示词太长」。 */
 export function isPromptTooLongError(e: unknown): boolean {

@@ -1417,7 +1417,7 @@ describe('提示词过长 → 压缩重发', () => {
     expect(ends).toEqual([undefined])
   })
 
-  it('压到底还是被拒 → 阻断,而建议说的是窗口/节点大小,不是「查网络」', async () => {
+  it('压到底还是被拒 → 阻断,不许无限重发', async () => {
     let calls = 0
     async function* alwaysTooLong(): AsyncGenerator<any> { calls++; yield ptl() as never }
     const fn = makeRunAgentFn({
@@ -1432,7 +1432,10 @@ describe('提示词过长 → 压缩重发', () => {
     try {
       await fn({
         phase: 'plan', node: { id: 'n1' } as never, role: null, system: 's',
-        prompt: 'B'.repeat(60_000), signal: new AbortController().signal,
+        // 20 万字符:三档压下来(55%/30%/15%)最短也还有 3 万,始终在
+        // PROMPT_SHRINK_WORTH_IT 之上 —— 否则中途就会走「压它没用」那条早退,
+        // 而这一条要钉的是「三档用完就停」。
+        prompt: 'B'.repeat(200_000), signal: new AbortController().signal,
       })
     } catch (e) { err = e }
     expect(err instanceof ProviderApiError).toBe(true)
@@ -1440,6 +1443,43 @@ describe('提示词过长 → 压缩重发', () => {
     // 首发 + 三档压缩 = 4 次,不许无限重发。
     expect(calls).toBe(1 + PROMPT_SHRINK_RATIOS.length)
   })
+
+  /**
+   * **提示词本来就不长时,一次都不重试。**
+   *
+   * 跑机实测:我们发出去的提示词 3 KB,而那次调用的整段对话 4.5 MB —— 超长的是子 agent
+   * 自己灌进去的工具结果(两条 Glob 各 1.4 MB / 3.2 MB)。压缩那 3 KB 救不回任何东西,
+   * 而每一次重试都是一次完整重跑,会把那几 MB 再灌一遍。
+   */
+  it('短提示词:一次都不压、不重试,而且屏幕上说清超长的不是它', async () => {
+    let calls = 0
+    async function* alwaysTooLong(): AsyncGenerator<any> { calls++; yield ptl() as never }
+    const pushed: string[] = []
+    let err: unknown
+    try {
+      await makeRunAgentFn({
+        toolUseContext: {} as never,
+        canUseTool: (async () => ({ behavior: 'allow' })) as never,
+        availableTools: [] as never,
+        activeAgents: [] as never,
+        mainModelDefault: { agentType: 'main' } as never,
+        runAgentImpl: alwaysTooLong as never,
+      })({
+        phase: 'plan', node: { id: 'n1' } as never, role: null, system: 's',
+        // 3 KB —— 和跑机上那次一个量级,远在 PROMPT_SHRINK_WORTH_IT 之下。
+        prompt: 'C'.repeat(3_000), signal: new AbortController().signal,
+        stream: {
+          push: (e: any) => { if (e.kind === 'text') pushed.push(String(e.text)) },
+          end: () => {},
+        } as never,
+      })
+    } catch (e) { err = e }
+    expect(err instanceof ProviderApiError).toBe(true)
+    expect(calls).toBe(1)                                   // 一次都不重试
+    expect(pushed.join('')).toContain('超长的不是它')
+    expect(pushed.join('')).not.toContain('已压缩')
+  })
+
 })
 
 /**
