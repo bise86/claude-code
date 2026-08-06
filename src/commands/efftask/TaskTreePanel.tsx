@@ -270,6 +270,14 @@ export function TaskTreePanel(props: {
    */
   onForcePass?: (node: TaskNode) => void
   /**
+   * 一键回收这棵子树里已完成任务的隔离工作区(`c`)。给了才有这个键。
+   *
+   * **只挂在详情页上**,和上面那四个不同。用户要的就是详情页那个位置(「在任务详情页
+   * 下面有个控制键」),而树的页脚已经排到边界了 —— 那一行是 truncate-end,再加一句
+   * 会把「怎么退出去」挤出屏幕(重做那三个键为同一件事量过一次)。
+   */
+  onCleanupWorktrees?: (node: TaskNode) => void
+  /**
    * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
    * 活存储而不是 React state:事件流对每个在飞的节点每条消息都要触发一次,镜像进 state
@@ -409,6 +417,9 @@ export function TaskTreePanel(props: {
       if (k === 's' && props.onSkipFailed) { setDetailId(null); props.onSkipFailed(detail); return }
       if (k === 'f' && props.onForcePass) { setDetailId(null); props.onForcePass(detail); return }
       if (k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
+      // 一键回收已完成子任务的工作区。关口自己会先扫一遍再让用户确认,所以这里不判
+      // 「有没有东西可清」—— 那需要跑 git,而按键处理里不能等。
+      if (k === 'c' && props.onCleanupWorktrees) { setDetailId(null); props.onCleanupWorktrees(detail); return }
       // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
       // Esc / q 任何时候都是返回 —— 返回这条路不许有死角。
       if (key.return && detailZone.current === 'tabs') return
@@ -490,6 +501,9 @@ export function TaskTreePanel(props: {
         // 同一条规矩:只在这个节点真的失败了时才写这两个键(见页脚那一行的注释)。
         canRedoFailed={props.onRedoFailed !== undefined && detail.status === 'BLOCKED'}
         canSkipFailed={props.onSkipFailed !== undefined && detail.status === 'BLOCKED'}
+        // 这个键**不看节点状态**:清的是整棵子树里已验收的那些,而一个还在跑的父节点
+        // 底下完全可以已经躺着十个跑完的子任务 —— 那正是长跑途中最想按它的时刻。
+        canCleanup={props.onCleanupWorktrees !== undefined}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
         maxRows={detailRows}

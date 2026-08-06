@@ -38,6 +38,8 @@ import { AddDirective } from './AddDirective.js'
 import { ConfirmRedo } from './ConfirmRedo.js'
 import { ConfirmSkip } from './ConfirmSkip.js'
 import { ConfirmForcePass } from './ConfirmForcePass.js'
+import { ConfirmCleanup } from './ConfirmCleanup.js'
+import { runCleanup, scanCleanup, type CleanupDeps } from '../../tools/efftask/cleanupWorktrees.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
@@ -581,6 +583,30 @@ const gitRunner: GitRunner = (args, cwd) =>
   })
 
 /**
+ * 一个目录占多少空间(KB)。**量不到就返回 undefined,绝不猜。**
+ *
+ * 这个功能的全部卖点是「腾出多少空间」,而一个编出来的数字会直接决定用户按不按下那个
+ * 不可逆的确认。`du` 在 Windows / 精简容器里可能根本不存在,那时确认屏改口说「量不到
+ * 大小」——比一个 0 诚实得多。
+ *
+ * `-sk` 而不是 `-sh`:要的是能相加的数,人读的格式由 `formatSize` 统一给(`du -h` 的
+ * 单位还随 locale 变)。
+ */
+const duKb = (path: string): Promise<number | undefined> =>
+  new Promise(resolve => {
+    const p = spawn('du', ['-sk', path])
+    let stdout = ''
+    p.stdout.on('data', d => { stdout += String(d) })
+    // stderr 要吞掉但不能当失败:`du` 对一个跑着的目录会抱怨某个文件没了,而总数照样是对的。
+    p.stderr.on('data', () => {})
+    p.on('close', code => {
+      const n = Number.parseInt(stdout.trim().split(/\s+/)[0] ?? '', 10)
+      resolve(code === 0 && Number.isFinite(n) ? n : undefined)
+    })
+    p.on('error', () => resolve(undefined))
+  })
+
+/**
  * Build the isolation pool, or report why the run has to share the working tree.
  *
  * Availability is decided ONCE, here, and never re-decided mid-run: a per-node fallback would
@@ -781,6 +807,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 在别的节点还跑着的时候另起一个编排器,同一批节点被派两遍。
    */
   const [redoFrom, setRedoFrom] = React.useState<Phase>('done')
+  /**
+   * 正在被「清理已完成工作区」的那个节点,以及关口开之前是哪一屏。
+   *
+   * `cleanupFrom` 和 `forcePassFrom` 逐字同因:这个关口也能从 running 进来(长跑到一半、
+   * 前十个子任务的 `target/` 已经把盘吃满,那正是要按它的时刻),而写死 'done' 会让一次
+   * 取消把还在跑的 run 的界面换成结束屏。
+   */
+  const [cleanupTarget, setCleanupTarget] = React.useState<TaskNode | null>(null)
+  const [cleanupFrom, setCleanupFrom] = React.useState<Phase>('done')
   /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
   const [redoProblems, setRedoProblems] = React.useState<string[]>([])
   /**
@@ -1397,6 +1432,32 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     [control],
   )
 
+  /**
+   * 一次「回收已完成工作区」要用的那几样东西 —— **只有池子在的时候才存在**。
+   *
+   * 路径和分支名一律问池子要(`worktreePathOf` / `worktreeBranchOf`):它们是
+   * `hash(nodeId)` 算出来的,在这里重算一份的话,`worktreeSlug` 规则改动的那一天这个
+   * 键会开始 `rm -rf` 另一个目录,而它是不可逆的。
+   *
+   * `persist` 给了 run 目录:删掉目录之后 node.md 里那条 `worktree` 记录要跟着抹掉,
+   * 否则详情页会一直指着一个不存在的路径。**只抹这一个字段**,状态/方案/评审记录不动。
+   */
+  const cleanupDeps = React.useCallback((): CleanupDeps | undefined => {
+    const pool = poolRef.current
+    if (!pool || !runDir) return undefined
+    return {
+      git: gitRunner,
+      gitRoot: pool.gitRoot,
+      integrationBranch: pool.integrationBranchName,
+      pathFor: n => pool.worktreePathOf(n),
+      branchFor: n => pool.worktreeBranchOf(n),
+      dirSizeKb: duKb,
+      persist: { fs: props.fs, runDir },
+      onError: e => logError(e),
+    }
+    // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for a mount
+  }, [runDir, props.fs])
+
   const applyRedo = React.useCallback((
     target: TaskNode, entry: RedoEntry, guidance?: { scope: PhaseName | 'all'; text: string },
   ): void => {
@@ -1925,6 +1986,38 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  if (phase === 'confirmCleanup' && cleanupTarget) {
+    /**
+     * 回收已完成任务的隔离工作区。**这一屏不重启编排、不改任务树** —— 它唯一改变的是
+     * 磁盘上那些目录还在不在,所以确认完原样回到来时那一屏(运行中按的就回运行视图)。
+     *
+     * 判据和动作全在 `cleanupWorktrees.ts`(那里能被真 git 测出来);这里只接线。
+     * 池子缺席时**在扫描里如实报错**,而不是渲染一屏空清单 —— 后者会让用户以为
+     * 「已经没有可清的了」,而真相是这一趟根本没用隔离工作区。
+     */
+    const deps = cleanupDeps()
+    const noPool = (): never => {
+      throw new Error(poolRef.current
+        ? '这次运行的记录目录还没建立,拿不到要写回的 node.md'
+        : '这一趟没有使用隔离工作区(共享工作目录运行),没有可以回收的目录')
+    }
+    return (
+      <ConfirmCleanup
+        target={cleanupTarget}
+        onScan={() => (deps ? scanCleanup(deps, nodes, cleanupTarget.id) : noPool())}
+        onRun={async plan => {
+          if (!deps) return noPool()
+          const out = await runCleanup(deps, plan, nodes)
+          // `runCleanup` 是**就地**清掉 node.worktree 的(界面和编排器持有的是同一批
+          // 节点对象),所以这里只要推一份新数组让 React 重画。
+          if (out.removed.length > 0) setNodes([...nodes])
+          return out
+        }}
+        onDone={() => { setCleanupTarget(null); setPhase(cleanupFrom) }}
+        onCancel={() => { setCleanupTarget(null); setPhase(cleanupFrom) }}
+      />
+    )
+  }
   if (phase === 'running' && directiveOpen) {
     return (
       <AddDirective
@@ -1984,6 +2077,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         if (blocked) { setRedoProblems([blocked]); return }
         setSkipTarget(node); setRedoFrom('running'); setPhase('confirmSkip')
       }}
+      /**
+       * 运行中也能清 —— 而且这正是最需要它的时刻:一棵跑三小时的树,前十个子任务的
+       * `target/` 早就把盘吃满了,而它们全都已经验收完、产出也早已合进集成分支。
+       *
+       * 这里**不挡任何东西**:范围只认 ACCEPTED,而在飞的节点按定义不是终态,关口自己
+       * 会把「跳过 N 个还没验收的任务」写在屏幕上。
+       */
+      onCleanupWorktrees={poolRef.current ? node => {
+        setCleanupTarget(node); setCleanupFrom('running'); setPhase('confirmCleanup')
+      } : undefined}
       runControl={{
         paused,
         // 真相在 control 里,state 只是让提示行重绘 —— 两边分开的话它们迟早不一致,
@@ -2072,6 +2175,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         if (blocked) { setRedoProblems([blocked]); return }
         setForcePassTarget(node); setForcePassFrom('done'); setPhase('confirmForcePass')
       }}
+      /**
+       * 回收已完成任务的隔离工作区(`c`)。
+       *
+       * **`viewOnly` 也给** —— 和上面那四个键不同。它们都会重开一次编排(而用户刚刚明确
+       * 选了不跑这个 run),这一个不动任务树、不派任何模型调用,只是删掉一堆已经没用的
+       * 目录。「只查看」进来的人恰恰是来收拾旧 run 的那个人。
+       */
+      onCleanupWorktrees={poolRef.current ? node => {
+        setCleanupTarget(node); setCleanupFrom('done'); setPhase('confirmCleanup')
+      } : undefined}
     />
   )
 }
@@ -2146,6 +2259,12 @@ export function RunningView(props: {
   onRedo?: (node: TaskNode) => void
   onRedoFailed?: (node: TaskNode) => void
   onSkipFailed?: (node: TaskNode) => void
+  /**
+   * 详情页的 `c` 键:回收这棵子树里已验收任务的隔离工作区。
+   *
+   * 给了才有这个键 —— 共享工作树运行时没有池子,也就没有任何目录可清。
+   */
+  onCleanupWorktrees?: (node: TaskNode) => void
 }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
@@ -2153,7 +2272,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
@@ -2188,6 +2307,8 @@ export function DoneView(props: {
   onSkipFailed?: (node: TaskNode) => void
   /** 给了才有 f 键(强制通过失败的那个环节,并留下一条人工裁决)。 */
   onForcePass?: (node: TaskNode) => void
+  /** 给了才有 c 键(回收这棵子树里已验收任务的隔离工作区)。 */
+  onCleanupWorktrees?: (node: TaskNode) => void
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -2219,6 +2340,7 @@ export function DoneView(props: {
         onRedoFailed={props.onRedoFailed}
         onSkipFailed={props.onSkipFailed}
         onForcePass={props.onForcePass}
+        onCleanupWorktrees={props.onCleanupWorktrees}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">

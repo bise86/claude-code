@@ -820,3 +820,42 @@ describe('收口关口的合并也带着解冲突的人', () => {
     expect(SRC).toMatch(/runHandoffChoice\(\s*choice, h, gitRunner, getCwd\(\),\s*\n\s*root \? makeHandoffConflictResolver/)
   })
 })
+
+/**
+ * 一键回收已完成工作区的三跳接线。
+ *
+ * 这个功能有两处组件级用例(cleanupView.test.tsx 钉住键和关口,cleanupWorktrees.test.ts
+ * 对着真 git 钉住判据),而中间这一跳 —— 「运行视图/结束屏把回调交出去、关口拿到真的
+ * 池子和 run 目录」 —— 只住在 `EffTaskRunner` 的 JSX 里,挂不起来。剪断任意一处的后果都是
+ * 用户按 `c` 什么都不会发生,或者更糟:关口开了、清单是空的,而它读的是一个空池子 ——
+ * 屏幕会把「这一趟没隔离」说成「已经没有可清的了」。
+ */
+describe('清理已完成工作区的接线不能被静默剪断', () => {
+  it('两条路径都把回调交给了树面板,并且都只在有池子时才给', () => {
+    // 计数:running 和 done 各一处,逐字相同 —— 只查存在会被另一处满足(这个文件为
+    // 同一个陷阱写过两次注释)。
+    expect(occurrences('onCleanupWorktrees={poolRef.current ? node => {')).toBe(2)
+    expect(occurrences("setCleanupTarget(node); setCleanupFrom('running'); setPhase('confirmCleanup')")).toBe(1)
+    expect(occurrences("setCleanupTarget(node); setCleanupFrom('done'); setPhase('confirmCleanup')")).toBe(1)
+    // 两个视图组件也要真的把它往下传,否则上面两处赋值只是喂给了一个没人读的 prop。
+    expect(SRC).toContain('onCleanupWorktrees={props.onCleanupWorktrees}')
+    expect(occurrences('onCleanupWorktrees={props.onCleanupWorktrees}')).toBe(2)
+  })
+
+  it('关口拿到的是真的池子路径、真的集成分支、以及要写回的 run 目录', () => {
+    // 路径必须问池子要:它是 hash(nodeId) 算出来的,在这里重算一份的话,slug 规则改动的
+    // 那一天这个键会开始删另一个目录 —— 而它不可逆。
+    expect(SRC).toContain('pathFor: n => pool.worktreePathOf(n)')
+    expect(SRC).toContain('branchFor: n => pool.worktreeBranchOf(n)')
+    expect(SRC).toContain('integrationBranch: pool.integrationBranchName')
+    // 少了 persist,目录删了而 node.md 还指着它 —— 下次 --resume 读回一条指向空气的记录。
+    expect(SRC).toContain('persist: { fs: props.fs, runDir }')
+  })
+
+  it('确认之后真的会去扫、去删,并把结果推回界面', () => {
+    expect(element('ConfirmCleanup')).toContain('scanCleanup(deps, nodes, cleanupTarget.id)')
+    expect(element('ConfirmCleanup')).toContain('runCleanup(deps, plan, nodes)')
+    // 剪断这一句:工作区没了,而详情页的「隔离工作区」那一段还画着那条路径。
+    expect(element('ConfirmCleanup')).toContain('setNodes([...nodes])')
+  })
+})

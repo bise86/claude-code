@@ -566,6 +566,13 @@ export function NodeDetail(props: {
   canRedoFailed?: boolean
   /** 能不能按 s 跳过失败的那个环节。 */
   canSkipFailed?: boolean
+  /**
+   * 能不能按 c 一键回收这棵子树里已完成任务的隔离工作区。
+   *
+   * 只有这一趟真的在用隔离工作区时才给 —— 没有池子就没有目录可清,而一个按了什么都不会
+   * 发生的键比没有这个键更糟(这一行上面那两个键为同一条规矩写过注释)。
+   */
+  canCleanup?: boolean
   /** 可用列宽。省略则跟着终端/模态槽走。 */
   columns?: number
   /** Resolves a dependency id to its node, so 依赖 renders as titles and statuses. */
@@ -851,6 +858,9 @@ export function NodeDetail(props: {
   const redoHint = (props.canRedo ? ' · r 重做本任务' : '')
     + (props.canRedoFailed ? ' · R 重做失败环节' : '')
     + (props.canSkipFailed ? ' · s 跳过它' : '')
+    // 排在最后:它是这几个键里最不紧急的一个(腾空间,不影响这一趟跑不跑得下去),
+    // 而这一行是 truncate-end —— 窄终端上被吃掉的必须是最不重要的那一头。
+    + (props.canCleanup ? ' · c 清理已完成工作区' : '')
   const footer = ((): string => {
     if (zone === 'tabs') return `Esc/q 返回任务树 · ←→ 选页卡 · 回车/空格 进入 · Tab 回内容${redoHint}`
     if (tab === 'log') {

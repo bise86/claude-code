@@ -970,5 +970,20 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
 
     integrationPath: intPath,
     integrationBranchName: intBranch,
+    /**
+     * 一个节点的工作区目录/分支,以及这一趟的仓库根。
+     *
+     * 交出去是给**一键回收已完成工作区**(cleanupWorktrees)用的:那条路要按自己的判据
+     * 探盘、然后 `worktree remove --force`,而路径是 `hash(nodeId)` 算出来的 —— 池子外面
+     * 谁都猜不到。第二份实现会在 runId 或 slug 规则改动的那一天悄悄指向别的目录,
+     * 而那条路的动作是不可逆的。
+     *
+     * 刻意**不**在这里提供「删掉它」:`release()` 的判据(干净 + 已合入)是这个池子对
+     * 「什么时候可以动用户的目录」的承诺,回收那条路是用户逐个确认过的另一套判据,
+     * 两者不该共用一个函数名。
+     */
+    gitRoot,
+    worktreePathOf: (node: TaskNode): string => pathFor(node),
+    worktreeBranchOf: (node: TaskNode): string => branchFor(node),
   }
 }

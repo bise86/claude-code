@@ -38,6 +38,10 @@ export type Phase =
   // 「人工强制通过」的裁决**。和上面两个不同的是它**也能从 running 进来** —— 运行中的
   // 预先批准不重启编排,只往 RunControl 上记一笔,确认完直接回运行视图。
   | 'confirmForcePass'
+  // 'confirmCleanup' 是详情页的 `c` 键:回收这棵子树里**已验收**任务的隔离工作区。
+  // 和上面几条一样是一条岔路而不是运行阶段,但它**既不重启编排、也不动任务树** ——
+  // 它唯一改变的是磁盘上那些目录还在不在,所以确认之后原样回到来时那一屏。
+  | 'confirmCleanup'
 
 /**
  * Drive one run to completion and report it.
