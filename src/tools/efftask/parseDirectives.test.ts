@@ -1,5 +1,6 @@
 // src/tools/efftask/parseDirectives.test.ts
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { parseDirectives } from './parseDirectives.js'
 import type { RoleDef } from './roleDefs.js'
 import { PHASE_NAMES } from './types.js'
@@ -596,5 +597,53 @@ describe('需求解析失败要说出来,不能静默退回默认配置', () => 
     })
     expect(cfg.notices.join('\n')).not.toContain('需求解析')
     expect(cfg.skipSteps).toEqual(['accept'])
+  })
+})
+
+/**
+ * 安全阀那几个数:**夹动了要说出来**,而且用户说得出口的写法要真的抽得到。
+ *
+ * 用户问的原话:「在模型里说了,节点上限,为什么不生效,是写死了吗?」——不是写死的
+ * (上限 20 层 / 5000 节点,他要的正好是这两个边界值),但两件事让它看起来像写死:
+ * 抽取提示词里这两个字段只在 schema 里露过名字、没有一句话讲用户会怎么说;而超出范围时
+ * `clampInt` 静默改数,关口那一行照样印得像模像样。
+ */
+describe('安全阀:上限不是写死的,但夹动了必须说', () => {
+  const opts = { knownRoles: [] as string[] }
+  const withCaps = (caps: Record<string, unknown>) => ({
+    ...opts,
+    modelJson: async () => '```json\n' + JSON.stringify({ caps }) + '\n```',
+  })
+
+  it('20 层 / 5000 节点是**收得下**的 —— 那是上限本身,不是被夹掉的值', async () => {
+    const cfg = await parseDirectives('安全阀允许最多 20 层,最多 5000 个节点', withCaps({ maxDepth: 20, maxNodes: 5000 }))
+    expect(cfg.caps.maxDepth).toBe(20)
+    expect(cfg.caps.maxNodes).toBe(5000)
+    // 没被夹动就一个字都不说。
+    expect(cfg.notices.join('\n')).not.toContain('取值范围')
+  })
+
+  it('超出上限 → 夹到边界,并且说清「你要的是多少、实际按多少跑」', async () => {
+    const cfg = await parseDirectives('最多 10000 个节点,拆 30 层', withCaps({ maxDepth: 30, maxNodes: 10000 }))
+    expect(cfg.caps.maxNodes).toBe(5000)
+    expect(cfg.caps.maxDepth).toBe(20)
+    const n = cfg.notices.join('\n')
+    expect(n).toContain('任务节点上限:你要的是 10000')
+    expect(n).toContain('本次按 5000 跑')
+    expect(n).toContain('树的最大深度:你要的是 30')
+  })
+
+  it('认不出是个数 → 回落默认值,同样要说', async () => {
+    const cfg = await parseDirectives('冲突多试几次', withCaps({ mergeResolveAttempts: '六次' }))
+    expect(cfg.caps.mergeResolveAttempts).toBe(6)
+    expect(cfg.notices.join('\n')).toContain('认不出是个数')
+  })
+
+  it('抽取提示词里真的讲了这两个字段该怎么填 —— 只在 schema 里露个名字等于没讲', () => {
+    const SRC = readFileSync(new URL('./parseDirectives.ts', import.meta.url), 'utf8')
+    expect(SRC).toContain('caps.maxDepth 是**任务树最多分几层**')
+    expect(SRC).toContain('caps.maxNodes 是**整棵树最多几个任务**')
+    // 用户真会说的那几句,至少有一句在提示词里当例子。
+    expect(SRC).toContain('最多 5000 个节点')
   })
 })

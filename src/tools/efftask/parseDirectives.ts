@@ -19,6 +19,7 @@ phaseRoles 的值是**员工名**数组(可派发的身份)。
 圆桌通过门槛有两个字段,按用户的说法二选一:
 - 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
 - 用户说**人数**(「至少 2 个人通过」「要 3 票」)→ caps.quorumSeats,就是那个人数。**不要**把人数写进 quorum:「至少 2 人」写成 quorum=2 的含义是 2%,等于 1 票就放行,和用户的意思正好相反。
+caps.maxDepth 是**任务树最多分几层**,caps.maxNodes 是**整棵树最多几个任务**。用户说「安全阀里允许最多 20 层、最多 5000 个节点」「别拆太深,三层就够」「任务别超过 200 个」→ 填这两个。取值范围分别是 1~20 和 1~5000,超出会被夹到边界(关口会说)。
 caps.maxSeatsPerPhase 是每个阶段最多几席。
 caps.mergeResolveAttempts 是**一个节点的合并冲突最多让模型自动解几次**(每次解完都会重跑验收)。用户说「冲突多试几次」「解冲突给 10 次机会」「冲突别自动解、直接叫我」→ 填这里(最后那句 = 0)。默认 6。
 caps.nodeTimeoutMs 是**一次调用最多可以多久没有任何输出**(毫秒)。用户说「阶段超时 20 分钟」「每步最多等半小时」「模型慢,超时给久一点」→ 换算成毫秒填这里(20 分钟 = 1200000)。他说的是「多久没动静算卡死」,不是「一个节点最多跑多久」—— 一直在吐字就永远不算超时。
@@ -42,6 +43,27 @@ phaseGuidance / roleGuidance 是**定向注入**:指令里凡是「某个环节�
 function clampInt(v: unknown, min: number, max: number, fallback: number): number {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback
   return Math.min(max, Math.max(min, n))
+}
+
+/**
+ * 夹一个数值上限,**夹动了就说一声**。
+ *
+ * `clampInt` 是静默的,而这些数全都是用户在提示词里**明确说过**的:「安全阀 20 层、
+ * 最多 5000 个节点」「返工给 10 轮」。要的数超出范围时静默改掉,屏幕上只剩一个他没说过
+ * 的数字,而关口那一行(安全阀: 深度X / 节点Y)看起来完全正常 —— 他唯一能得出的结论是
+ * 「我说了,没生效」。这个仓库把静默降级当缺陷,这一处是同一类。
+ *
+ * 认不出的写法(`"六次"`)也要说:回落到默认值本身是对的,但不说就等于替他做了决定。
+ */
+function clampNoted(
+  raw: unknown, min: number, max: number, fallback: number, label: string, notices: string[],
+): number {
+  const ok = typeof raw === 'number' && Number.isFinite(raw)
+  const n = ok ? Math.round(raw) : fallback
+  const v = Math.min(max, Math.max(min, n))
+  if (!ok) notices.push(`${label}「${String(raw)}」认不出是个数,本次按默认 ${fallback} 跑`)
+  else if (v !== n) notices.push(`${label}你要的是 ${n},而它的取值范围是 ${min}~${max},本次按 ${v} 跑`)
+  return v
 }
 
 export async function parseDirectives(
@@ -282,25 +304,25 @@ export async function parseDirectives(
 
   const caps = (obj.caps ?? {}) as Record<string, unknown>
   const c: Caps = { ...base.caps }
-  if (caps.maxDepth !== undefined) c.maxDepth = clampInt(caps.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth)
-  if (caps.maxNodes !== undefined) c.maxNodes = clampInt(caps.maxNodes, 1, 5000, DEFAULT_CAPS.maxNodes)
-  if (caps.maxIterations !== undefined) c.maxIterations = clampInt(caps.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations)
+  if (caps.maxDepth !== undefined) c.maxDepth = clampNoted(caps.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth, '树的最大深度:', base.notices)
+  if (caps.maxNodes !== undefined) c.maxNodes = clampNoted(caps.maxNodes, 1, 5000, DEFAULT_CAPS.maxNodes, '任务节点上限:', base.notices)
+  if (caps.maxIterations !== undefined) c.maxIterations = clampNoted(caps.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations, '每一关的返工轮数:', base.notices)
   // Without an entry point here the THRESHOLD had none at all: only readRunManifest read it
   // back, so the "低分触发一次返工" half of 观察评分 was dead code on the normal path —
   // reachable only by hand-editing run.md and resuming.
   if (caps.scoreThreshold !== undefined) c.scoreThreshold = clampInt(caps.scoreThreshold, 0, 100, 0)
   // 这两条同样需要入口:只有 readRunManifest 读回而没人写进去的话,它们只能靠手改
   // run.md 再 --resume 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
-  if (caps.maxSeatsPerPhase !== undefined) c.maxSeatsPerPhase = clampInt(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE)
+  if (caps.maxSeatsPerPhase !== undefined) c.maxSeatsPerPhase = clampNoted(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE, '每个环节的席位数:', base.notices)
   /**
    * 自动解冲突的次数。**下限是 0**,而 0 在这里是一个真实的意思(「别自动解,直接叫我」)——
    * 所以 clampInt 的 fallback 不能是 0:那样一个写坏的值(`"六次"`)会被静默解释成关掉功能,
    * 而用户写它的意图恰恰相反。回落到默认 6。
    */
   if (caps.mergeResolveAttempts !== undefined) {
-    c.mergeResolveAttempts = clampInt(
+    c.mergeResolveAttempts = clampNoted(
       caps.mergeResolveAttempts, MIN_MERGE_RESOLVE, MAX_MERGE_RESOLVE,
-      DEFAULT_CAPS.mergeResolveAttempts ?? 6,
+      DEFAULT_CAPS.mergeResolveAttempts ?? 6, '自动解冲突的次数:', base.notices,
     )
   }
   /**
