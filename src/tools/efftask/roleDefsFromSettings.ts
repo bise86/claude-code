@@ -6,7 +6,8 @@
 // 都能不搭环境地测。这里只做「去哪儿拿原始数据」。
 import { getSettingsForSource } from '../../utils/settings/settings.js'
 import { applyStaffDeclarations, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
-import { PHASE_LABEL, PHASE_NAMES, STEP_ALIASES, type PhaseName } from './types.js'
+import { applyCapsPatch } from './parseDirectives.js'
+import { DEFAULT_CAPS, PHASE_LABEL, PHASE_NAMES, STEP_ALIASES, type Caps, type PhaseName } from './types.js'
 
 /** 和 collectRoleAgents 用同一组来源、同一个优先级顺序。 */
 const SOURCES = ['userSettings', 'projectSettings', 'localSettings'] as const
@@ -147,4 +148,38 @@ export function mergeSkipSteps(fromSettings: PhaseName[], fromPrompt: PhaseName[
   // 一个都没有时返回 undefined 而不是 []:下游用 `?? []` 判缺省,空数组会让
   // 「没说过跳过」和「说了但一个都不合法」在 run.md 上长得不一样。
   return all.length > 0 ? all : undefined
+}
+
+/**
+ * settings.json 里配的**安全阀**(`efftaskCaps`)——「我根据项目来设置」的那条路。
+ *
+ * 用户原话:「把上限改成 20000,至于我用多少,我根据项目来设置。」在这个字段之前,caps 只有
+ * 两个入口:每次在提示词里说一遍,或者手改 run.md 再 `--resume`。一个翻译项目要 20000 个
+ * 节点、一个文档项目要 50 个,而这件事**每次运行都不会变** —— 让用户每次重打一遍,他迟早
+ * 有一次忘了打,而忘了的那次不会有任何提示(默认值本身是合法的)。
+ *
+ * 和 `collectRoleDefs` / `collectSkipSteps` 同一批来源、同一个优先级:后一个来源覆盖前一个,
+ * **逐字段**覆盖(项目配置只写 maxNodes 时,用户配置里的 maxIterations 留着)。
+ *
+ * 校验共用 `applyCapsPatch` —— 范围表只有一份。各写一份的话,同一个数会在两条录入口上被
+ * 解释成两个值,而那正是 `maxNodes` 上限刚刚踩过的那个坑。
+ */
+export function collectCaps(opts?: {
+  read?: (source: (typeof SOURCES)[number]) => { efftaskCaps?: unknown } | undefined
+}): { caps: Caps; notices: string[] } {
+  const read = opts?.read ?? ((s: (typeof SOURCES)[number]) =>
+    getSettingsForSource(s) as { efftaskCaps?: unknown } | undefined)
+  const notices: string[] = []
+  let caps: Caps = { ...DEFAULT_CAPS }
+  for (const src of SOURCES) {
+    let raw: unknown
+    try { raw = read(src)?.efftaskCaps } catch { continue }
+    if (raw === undefined || raw === null) continue
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+      notices.push(`${SOURCE_LABEL[src]}:efftaskCaps 不是一个对象,已忽略(本次按默认安全阀跑)`)
+      continue
+    }
+    caps = applyCapsPatch(caps, raw as Record<string, unknown>, `${SOURCE_LABEL[src]}:`, notices)
+  }
+  return { caps, notices }
 }

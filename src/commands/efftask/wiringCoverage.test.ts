@@ -149,15 +149,15 @@ describe('角色定义的接线', () => {
     // 锚点不再钉 `modelJson: extractJson` 的字面量:抽取那一次现在还要把自己的实时窗口
     // 递进去(那一屏是用户敲完 /et 看到的第一屏,背后跑着一次真实模型调用)。钉住的是
     // 「正常那条路径确实带了 baseRoleDefs 且确实传了 modelJson」。
-    expect(occurrences('baseRoleDefs, modelJson:')).toBe(1)
-    expect(occurrences('unsupportedRoles, baseRoleDefs }')).toBe(1)
+    expect(occurrences('baseRoleDefs, baseCaps, modelJson:')).toBe(1)
+    expect(occurrences('unsupportedRoles, baseRoleDefs, baseCaps }')).toBe(1)
   })
 
   it('baseRoleDefs 在 effect 依赖里 —— 否则它变了也不会重新解析', () => {
     // 钉整串依赖的字面量会让「往数组里再加一项」变成一次假红。改成逐项断言:
     // 每个进解析的 prop 都必须在依赖里,加新 prop 时这条会诚实地要求你也加进去。
     const deps = SRC.match(/\}, \[args, knownRoles[^\]]*\]\)/)?.[0] ?? ''
-    for (const d of ['baseRoleDefs', 'baseRoleNotices', 'baseSkipSteps', 'extractJson', 'agentModels', 'mainModel']) {
+    for (const d of ['baseRoleDefs', 'baseCaps', 'baseRoleNotices', 'baseSkipSteps', 'extractJson', 'agentModels', 'mainModel']) {
       expect(`${d} 在依赖里: ${deps.includes(d)}`).toBe(`${d} 在依赖里: true`)
     }
   })
@@ -168,9 +168,9 @@ describe('角色定义的接线', () => {
     // 不对称,而这一条是静默的那一条。
     // 两条录入口的诊断都要接住:角色定义的,和跳过环节的。
     const el = element('EffTaskRunner')
-    // 三条录入口的诊断都要接住:角色定义的、跳过环节的,和**员工载入失败**的。
-    // 最后那条另有一条挂载级的真探针(runnerMount.test.tsx),这里只守接线不掉。
-    expect(el).toContain('baseRoleNotices={[...roleLoadNotices(), ...collectedRoles.notices, ...collectedSkip.notices]}')
+    // 四条录入口的诊断都要接住:角色定义的、跳过环节的、**安全阀**的,和员工载入失败的。
+    // 员工载入那条另有一条挂载级的真探针(runnerMount.test.tsx),这里只守接线不掉。
+    expect(el).toContain('baseRoleNotices={[...roleLoadNotices(), ...collectedRoles.notices, ...collectedSkip.notices, ...collectedCaps.notices]}')
     expect(SRC).toContain('cfg.notices.unshift(...baseRoleNotices)')
   })
 })

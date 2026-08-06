@@ -517,7 +517,8 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(README).toContain(norm('直接说「阶段超时 20 分钟」就能调'))
     const src = readFileSync(new URL('src/tools/efftask/parseDirectives.ts', ROOT), 'utf8')
     expect(src).toContain('"nodeTimeoutMs"?: number')
-    expect(src).toContain('c.nodeTimeoutMs = clampInt(caps.nodeTimeoutMs, 1000, 7_200_000, DEFAULT_CAPS.nodeTimeoutMs)')
+    // 夹取那一句现在住在 applyCapsPatch 里(提示词和 settings.json 两条录入口共用一份范围表)。
+    expect(src).toContain('out.nodeTimeoutMs = clampInt(patch.nodeTimeoutMs, 1000, 7_200_000, DEFAULT_CAPS.nodeTimeoutMs)')
   })
 
   it('说员工端点的首字节等待落在 API_TIMEOUT_MS 上,那阻断建议就得点名它', () => {

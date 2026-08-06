@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
-import { collectRoleDefs, collectSkipSteps, mergeSkipSteps } from './roleDefsFromSettings.js'
+import { DEFAULT_CAPS, MAX_NODES_CEILING } from './types.js'
+import { collectCaps, collectRoleDefs, collectSkipSteps, mergeSkipSteps } from './roleDefsFromSettings.js'
 
 const KNOWN = new Set(['opus-架构', 'ds-安全', 'gpt-前端'])
 const arch = { name: '架构师', stage: 'review', output: '裁决与阻断项', purpose: '把关可维护性' }
@@ -179,5 +180,53 @@ describe('mergeSkipSteps:两条录入口取并集', () => {
     // run.md 上长得不一样,而它们该是同一件事。
     expect(mergeSkipSteps([], undefined)).toBeUndefined()
     expect(mergeSkipSteps([], [])).toBeUndefined()
+  })
+})
+
+/**
+ * 安全阀的第三条录入口:`settings.json` 的 `efftaskCaps`。
+ *
+ * 用户原话:「把上限改成 20000,至于我用多少,我根据项目来设置。」在这个字段之前,caps
+ * 只能每次在提示词里重说一遍(或者手改 run.md 再 --resume)——而「这个项目要多少节点」
+ * 每次运行都不会变,让人每次重打一遍,他迟早有一次忘了,而忘了的那次不会有任何提示
+ * (默认值本身是合法的)。
+ */
+describe('collectCaps:配置文件里的安全阀', () => {
+  const read = (m: Record<string, unknown>) => (src: string) => m[src] as { efftaskCaps?: unknown } | undefined
+
+  it('项目配置里的 maxNodes 被读进来', () => {
+    const { caps, notices } = collectCaps({ read: read({ projectSettings: { efftaskCaps: { maxNodes: 20000, maxDepth: 20 } } }) })
+    expect(caps.maxNodes).toBe(20000)
+    expect(caps.maxDepth).toBe(20)
+    expect(notices).toEqual([])
+  })
+
+  it('三个来源逐字段覆盖:项目配置只写一个字段,不会把用户配置的另一个抹掉', () => {
+    const { caps } = collectCaps({
+      read: read({
+        userSettings: { efftaskCaps: { maxNodes: 300, maxIterations: 5 } },
+        projectSettings: { efftaskCaps: { maxNodes: 9000 } },
+      }),
+    })
+    expect(caps.maxNodes).toBe(9000)   // 后一个来源赢
+    expect(caps.maxIterations).toBe(5) // 前一个来源留着
+  })
+
+  it('超出范围照样夹,而且说清是**哪一份配置**被夹的', () => {
+    const { caps, notices } = collectCaps({ read: read({ projectSettings: { efftaskCaps: { maxNodes: 999999 } } }) })
+    expect(caps.maxNodes).toBe(MAX_NODES_CEILING)
+    expect(notices.join('\n')).toContain('项目配置:任务节点上限:你要的是 999999')
+  })
+
+  it('写成数组/字符串这类明显写错的形状 → 说一句并忽略,而不是让 /et 起不来', () => {
+    const { caps, notices } = collectCaps({ read: read({ projectSettings: { efftaskCaps: [1, 2] } }) })
+    expect(caps.maxNodes).toBe(DEFAULT_CAPS.maxNodes)
+    expect(notices.join('\n')).toContain('efftaskCaps 不是一个对象')
+  })
+
+  it('一个来源都没配 → 就是默认值,一条 notice 都不多', () => {
+    const { caps, notices } = collectCaps({ read: () => undefined })
+    expect(caps).toEqual(DEFAULT_CAPS)
+    expect(notices).toEqual([])
   })
 })

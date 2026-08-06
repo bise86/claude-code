@@ -66,6 +66,84 @@ function clampNoted(
   return v
 }
 
+
+/**
+ * 把一份 caps 补丁**校验着**并进现有 caps —— 抽取模型给的那一份和 settings.json 里那一份
+ * 共用它。
+ *
+ * 抽出来只有一个理由,而它刚刚被真实地踩过一次:**夹取范围各写一份,同一个数就会在两条
+ * 路上被解释成两个值**。`maxNodes` 的上限在启动侧和恢复侧不一致时,用户会看到自己写的
+ * 20000 在 `--resume` 之后变成别的数,而屏幕上没有任何东西解释它为什么变了。配置文件这条
+ * 新录入口只要自己写一遍范围,同一个坑就会立刻再出现一次。
+ *
+ * @param label 这份补丁**是谁给的**,进 notice 的抬头(''=提示词,'项目配置:'=settings.json)。
+ *   夹动了要说清是哪一份配置被夹的 —— 两条路都能配同一个字段,不说来源就无从改起。
+ */
+export function applyCapsPatch(
+  base: Caps, patch: Record<string, unknown>, label: string, notices: string[],
+): Caps {
+  const out: Caps = { ...base }
+  const tag = (t: string): string => `${label}${t}`
+  if (patch.maxDepth !== undefined) out.maxDepth = clampNoted(patch.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth, tag('树的最大深度:'), notices)
+  if (patch.maxNodes !== undefined) out.maxNodes = clampNoted(patch.maxNodes, 1, MAX_NODES_CEILING, DEFAULT_CAPS.maxNodes, tag('任务节点上限:'), notices)
+  if (patch.maxIterations !== undefined) out.maxIterations = clampNoted(patch.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations, tag('每一关的返工轮数:'), notices)
+  // Without an entry point here the THRESHOLD had none at all: only readRunManifest read it
+  // back, so the "低分触发一次返工" half of 观察评分 was dead code on the normal path —
+  // reachable only by hand-editing run.md and resuming.
+  if (patch.scoreThreshold !== undefined) out.scoreThreshold = clampInt(patch.scoreThreshold, 0, 100, 0)
+  // 这两条同样需要入口:只有 readRunManifest 读回而没人写进去的话,它们只能靠手改
+  // run.md 再 --resume 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
+  if (patch.maxSeatsPerPhase !== undefined) out.maxSeatsPerPhase = clampNoted(patch.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE, tag('每个环节的席位数:'), notices)
+  /**
+   * 自动解冲突的次数。**下限是 0**,而 0 在这里是一个真实的意思(「别自动解,直接叫我」)——
+   * 所以 clampInt 的 fallback 不能是 0:那样一个写坏的值(`"六次"`)会被静默解释成关掉功能,
+   * 而用户写它的意图恰恰相反。回落到默认 6。
+   */
+  if (patch.mergeResolveAttempts !== undefined) {
+    out.mergeResolveAttempts = clampNoted(
+      patch.mergeResolveAttempts, MIN_MERGE_RESOLVE, MAX_MERGE_RESOLVE,
+      DEFAULT_CAPS.mergeResolveAttempts ?? 6, tag('自动解冲突的次数:'), notices,
+    )
+  }
+  /**
+   * 静默超时:此前**只能手改 run.md**。
+   *
+   * 而它恰恰是阻断卡唯一会点名让用户去调的那个旋钮 ——「提高 run.md 里 caps.nodeTimeoutMs」。
+   * 一个只能靠编辑 md 文件再 --resume 才转得动的旋钮,和上面 maxSeatsPerPhase / quorum
+   * 当初的处境逐字相同(「配置得进去、正常路径上到不了」)。
+   *
+   * 夹取范围与 `resumeCore` 读回时那一份**必须相同**(1s–2h):两处不一致的话,同一个数
+   * 在启动时被接受、在恢复时被改写,而屏幕上没有任何东西解释它为什么变了。
+   */
+  if (patch.nodeTimeoutMs !== undefined) {
+    out.nodeTimeoutMs = clampInt(patch.nodeTimeoutMs, 1000, 7_200_000, DEFAULT_CAPS.nodeTimeoutMs)
+  }
+  if (patch.quorum !== undefined) out.quorum = clampInt(patch.quorum, 1, 100, 100)
+  if (patch.quorumSeats !== undefined) out.quorumSeats = clampInt(patch.quorumSeats, 1, 20, 1)
+  // 只收这两个值,别的写法(roundtable/refine/乱写)一律回落默认的精化 —— 但**必须说出来**。
+  // 静默回落是这里最坏的形态:用户说了「分析用 roundtable」,系统跑精化,关口在两种模式下
+  // 逐字相同,notices 是空的,没有任何界面能让他发现自己要的模式没生效。
+  /**
+   * 严格度档位。和 planConverge 逐字同规矩:只收合法值,**回落必须说出来**。
+   *
+   * 静默回落在这里格外坏:用户说了「按最高标准做」,系统按现状跑(全票 + 判据空白),
+   * 而关口在两种情况下印的东西不一样但他不知道该找什么 —— 他会以为那句话生效了。
+   */
+  if (isStrictness(patch.strictness)) out.strictness = patch.strictness
+  else if (patch.strictness !== undefined) {
+    notices.push(
+      tag('') + `严格度档位「${String(patch.strictness)}」不是 ${STRICTNESS_LEVELS.join('/')} 之一,` +
+      `本次不设档位(判据由各评审员自己把握、圆桌全票通过)`,
+    )
+  }
+  if (patch.planConverge === '圆桌' || patch.planConverge === '精化') out.planConverge = patch.planConverge
+  else if (patch.planConverge !== undefined) {
+    notices.push(tag('') + `分析环节的收敛方式(planConverge)「${String(patch.planConverge)}」不是 圆桌/精化 之一,本次按默认的顺序精化跑`)
+  }
+
+  return out
+}
+
 export async function parseDirectives(
   rawPrompt: string,
   opts: {
@@ -79,13 +157,20 @@ export async function parseDirectives(
      * ——「任务需求提示词可更新改变这种配置」。
      */
     baseRoleDefs?: RoleDef[]
+    /**
+     * settings.json(`efftaskCaps`)定下的安全阀 —— 这一次运行的**起点**。
+     *
+     * 提示词里说的那一份逐字段覆盖它:项目配置说「这个项目 20000 个节点」,而某一次
+     * 「这次只跑个小的,200 个节点就行」应该赢。两者都没说的字段留在 DEFAULT_CAPS 上。
+     */
+    baseCaps?: Caps
   },
 ): Promise<EffTaskConfig> {
   const base: EffTaskConfig = {
     goalPrompt: rawPrompt.trim(),
     parallelism: DEFAULT_PARALLELISM,
     phaseRoles: emptyPhaseRoles(),
-    caps: { ...DEFAULT_CAPS },
+    caps: { ...DEFAULT_CAPS, ...(opts.baseCaps ?? {}) },
     notices: [],
   }
   // 没有抽取模型时也要把配置文件里的角色接上 —— 否则「在配置文件里配好角色」这条路
@@ -303,64 +388,7 @@ export async function parseDirectives(
   }
 
   const caps = (obj.caps ?? {}) as Record<string, unknown>
-  const c: Caps = { ...base.caps }
-  if (caps.maxDepth !== undefined) c.maxDepth = clampNoted(caps.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth, '树的最大深度:', base.notices)
-  if (caps.maxNodes !== undefined) c.maxNodes = clampNoted(caps.maxNodes, 1, MAX_NODES_CEILING, DEFAULT_CAPS.maxNodes, '任务节点上限:', base.notices)
-  if (caps.maxIterations !== undefined) c.maxIterations = clampNoted(caps.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations, '每一关的返工轮数:', base.notices)
-  // Without an entry point here the THRESHOLD had none at all: only readRunManifest read it
-  // back, so the "低分触发一次返工" half of 观察评分 was dead code on the normal path —
-  // reachable only by hand-editing run.md and resuming.
-  if (caps.scoreThreshold !== undefined) c.scoreThreshold = clampInt(caps.scoreThreshold, 0, 100, 0)
-  // 这两条同样需要入口:只有 readRunManifest 读回而没人写进去的话,它们只能靠手改
-  // run.md 再 --resume 才生效 —— 那就是又一处「配置得进去、正常路径上到不了」。
-  if (caps.maxSeatsPerPhase !== undefined) c.maxSeatsPerPhase = clampNoted(caps.maxSeatsPerPhase, 1, 20, DEFAULT_MAX_SEATS_PER_PHASE, '每个环节的席位数:', base.notices)
-  /**
-   * 自动解冲突的次数。**下限是 0**,而 0 在这里是一个真实的意思(「别自动解,直接叫我」)——
-   * 所以 clampInt 的 fallback 不能是 0:那样一个写坏的值(`"六次"`)会被静默解释成关掉功能,
-   * 而用户写它的意图恰恰相反。回落到默认 6。
-   */
-  if (caps.mergeResolveAttempts !== undefined) {
-    c.mergeResolveAttempts = clampNoted(
-      caps.mergeResolveAttempts, MIN_MERGE_RESOLVE, MAX_MERGE_RESOLVE,
-      DEFAULT_CAPS.mergeResolveAttempts ?? 6, '自动解冲突的次数:', base.notices,
-    )
-  }
-  /**
-   * 静默超时:此前**只能手改 run.md**。
-   *
-   * 而它恰恰是阻断卡唯一会点名让用户去调的那个旋钮 ——「提高 run.md 里 caps.nodeTimeoutMs」。
-   * 一个只能靠编辑 md 文件再 --resume 才转得动的旋钮,和上面 maxSeatsPerPhase / quorum
-   * 当初的处境逐字相同(「配置得进去、正常路径上到不了」)。
-   *
-   * 夹取范围与 `resumeCore` 读回时那一份**必须相同**(1s–2h):两处不一致的话,同一个数
-   * 在启动时被接受、在恢复时被改写,而屏幕上没有任何东西解释它为什么变了。
-   */
-  if (caps.nodeTimeoutMs !== undefined) {
-    c.nodeTimeoutMs = clampInt(caps.nodeTimeoutMs, 1000, 7_200_000, DEFAULT_CAPS.nodeTimeoutMs)
-  }
-  if (caps.quorum !== undefined) c.quorum = clampInt(caps.quorum, 1, 100, 100)
-  if (caps.quorumSeats !== undefined) c.quorumSeats = clampInt(caps.quorumSeats, 1, 20, 1)
-  // 只收这两个值,别的写法(roundtable/refine/乱写)一律回落默认的精化 —— 但**必须说出来**。
-  // 静默回落是这里最坏的形态:用户说了「分析用 roundtable」,系统跑精化,关口在两种模式下
-  // 逐字相同,notices 是空的,没有任何界面能让他发现自己要的模式没生效。
-  /**
-   * 严格度档位。和 planConverge 逐字同规矩:只收合法值,**回落必须说出来**。
-   *
-   * 静默回落在这里格外坏:用户说了「按最高标准做」,系统按现状跑(全票 + 判据空白),
-   * 而关口在两种情况下印的东西不一样但他不知道该找什么 —— 他会以为那句话生效了。
-   */
-  if (isStrictness(caps.strictness)) c.strictness = caps.strictness
-  else if (caps.strictness !== undefined) {
-    base.notices.push(
-      `严格度档位「${String(caps.strictness)}」不是 ${STRICTNESS_LEVELS.join('/')} 之一,` +
-      `本次不设档位(判据由各评审员自己把握、圆桌全票通过)`,
-    )
-  }
-  if (caps.planConverge === '圆桌' || caps.planConverge === '精化') c.planConverge = caps.planConverge
-  else if (caps.planConverge !== undefined) {
-    base.notices.push(`分析环节的收敛方式(planConverge)「${String(caps.planConverge)}」不是 圆桌/精化 之一,本次按默认的顺序精化跑`)
-  }
-  base.caps = c
+  base.caps = applyCapsPatch(base.caps, caps, '', base.notices)
 
   // 提示词里定义的角色,合并到配置文件那一层之上。放在 phaseRoles 解析**之后**,因为
   // applyRoleDefsToPhases 要在已有名册的基础上并席位、并去掉重复派发的员工。

@@ -1086,6 +1086,10 @@ export const SettingsSchema = lazySchema(() =>
       // 用户把它写成一个字符串会让**整份 settings.json 作废**(schema 失败 → settings: null)。
       // 形状判定交给 efftask 侧,它已经能对任意形状给出中文诊断。
       efftaskSkipSteps: z.unknown().optional(),
+      // 安全阀(深度/节点数/返工轮数/席位数/解冲突次数/超时/门槛/严格度)。
+      // 同样 z.unknown():校验和夹取在 applyCapsPatch 里,那里能给出「你要的是多少、
+      // 实际按多少跑」这种带原因的 notice,而 zod 在这里只能整份拒掉。
+      efftaskCaps: z.unknown().optional(),
     })
     .passthrough(),
 )

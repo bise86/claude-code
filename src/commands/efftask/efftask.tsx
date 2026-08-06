@@ -7,7 +7,7 @@ import type { LocalJSXCommandCall } from '../../types/command.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from '../../Tool.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
-import { collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
+import { collectCaps, collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
 import { collectRoleLoadIssues } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
@@ -43,7 +43,7 @@ import { runCleanup, scanCleanup, type CleanupDeps } from '../../tools/efftask/c
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
-import type { EffTaskConfig, PhaseName, TaskNode } from '../../tools/efftask/types.js'
+import type { Caps, EffTaskConfig, PhaseName, TaskNode } from '../../tools/efftask/types.js'
 import { applyRootDraft, buildRootPlanNoticeCard, draftRootPlan, makeRootNode, type RootDraft } from '../../tools/efftask/rootPlan.js'
 import { ConfirmRootPlan, type RootPlanDecision } from './ConfirmRootPlan.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
@@ -390,6 +390,13 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // 两条录入口之一,而它在生产上一次都没被读过。测试全绿是因为它们直接调函数,没有任何
   // 东西检查函数**被接上了**。
   const collectedSkip = collectSkipSteps()
+  /**
+   * 安全阀的第三条录入口:配置文件。「我根据项目来设置」的那条 —— 见 collectCaps。
+   *
+   * 接线点必须在**这里**,和上面那两条并排:collectSkipSteps 曾经缺过整整一版接线
+   * (函数写好了、六条测试全绿、两份文档都写着它,而生产上一次都没被读过)。
+   */
+  const collectedCaps = collectCaps()
   // Set when the view is torn down rather than exited, so the report can tell the two apart.
   let tornDown = false
   // The handoff, in call()'s OWN scope. onExit runs here, and it used to read `handoffRef` —
@@ -429,8 +436,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       // settings.json 里配好的角色定义。读在这里而不是 parseDirectives 里面,是因为那个
       // 文件是纯函数、不碰全局状态,整套解析/合并/展平才能不搭环境地测。
       baseRoleDefs={collectedRoles.defs}
-      baseRoleNotices={[...roleLoadNotices(), ...collectedRoles.notices, ...collectedSkip.notices]}
+      baseRoleNotices={[...roleLoadNotices(), ...collectedRoles.notices, ...collectedSkip.notices, ...collectedCaps.notices]}
       baseSkipSteps={collectedSkip.steps}
+      baseCaps={collectedCaps.caps}
       mcpToolNames={context.options.tools.filter(t => t.name.startsWith('mcp__')).map(t => t.name)}
       // 服务器状态和工具名是**两件事**:待审批的服务器不连接,于是它一个工具都不贡献,
       // 只看工具名的话「配了但没连上」和「根本没配」长得一模一样 —— 而前者用户报过。
@@ -691,6 +699,8 @@ type RunnerProps = {
   knownRoles: string[]
   /** settings.json 里配好的角色定义;提示词里的同名角色会覆盖它。 */
   baseRoleDefs?: RoleDef[]
+  /** settings.json 的 efftaskCaps 定的安全阀;提示词里说的**逐字段覆盖**它。 */
+  baseCaps?: Caps
   /** 读配置文件时产生的诊断 —— 必须并进 cfg.notices,否则关口对配置文件里的错误一言不发。 */
   baseRoleNotices?: string[]
   /** settings.json 的 efftaskSkipSteps 指定要跳过的环节;和提示词里说的**取并集**。 */
@@ -1069,18 +1079,18 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: run once per phase entry
   }, [phase, runId])
 
-  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs, baseRoleNotices, baseSkipSteps } = props
+  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs, baseRoleNotices, baseSkipSteps, baseCaps } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
   // call(), which would freeze the terminal with no UI while spending tokens.
   React.useEffect(() => {
     if (isResume) return // resume recovers its config from run.md; no model call, no roster overwrite
     let cancelled = false
     const preStream = streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '需求解析', label: '主模型', pinned: true })
-    void parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, modelJson: p => extractJson(p, preStream) })
+    void parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, baseCaps, modelJson: p => extractJson(p, preStream) })
       // belt & braces: parseDirectives already swallows extraction failures, but a rejection
       // here would otherwise strand the UI on 'parsing' forever. Keep unsupportedRoles here
       // too: dropping it would let a cli-mode role back onto the roster unannounced.
-      .catch(() => parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs }))
+      .catch(() => parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, baseCaps }))
       .then(async cfg => {
         if (cancelled) return
         // parseDirectives only ever sees role NAMES, so the roster it produces cannot say
@@ -1128,7 +1138,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return () => {
       cancelled = true
     }
-  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, baseRoleNotices, baseSkipSteps, extractJson, agentModels, mainModel])
+  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, baseCaps, baseRoleNotices, baseSkipSteps, extractJson, agentModels, mainModel])
 
   /**
    * Hand the confirmed run to the orchestrator. ONE definition, because two gates now reach

@@ -647,3 +647,39 @@ describe('安全阀:上限不是写死的,但夹动了必须说', () => {
     expect(SRC).toContain('最多 20000 个节点')
   })
 })
+
+/**
+ * 配置文件的安全阀是**起点**,提示词逐字段覆盖它。
+ *
+ * 项目配置说「这个项目 20000 个节点」,而某一次「这次只跑个小的,200 个就行」应该赢;
+ * 提示词没提到的字段留在项目配置上。两者都没说的留在 DEFAULT_CAPS 上。
+ */
+describe('baseCaps:配置文件定起点,提示词逐字段覆盖', () => {
+  const opts = { knownRoles: [] as string[] }
+
+  it('提示词没提的字段沿用配置文件那一份', async () => {
+    const cfg = await parseDirectives('随便跑跑', {
+      ...opts,
+      baseCaps: { ...DEFAULT_CAPS, maxNodes: 20000, maxDepth: 12 },
+      modelJson: async () => '```json\n{"caps":{"maxDepth":3}}\n```',
+    })
+    expect(cfg.caps.maxDepth).toBe(3)      // 提示词赢
+    expect(cfg.caps.maxNodes).toBe(20000)  // 没提到的留着
+  })
+
+  it('抽取整个失败时,配置文件那一份仍然生效 —— 那是最常走到的退化路径', async () => {
+    const cfg = await parseDirectives('随便跑跑', {
+      ...opts,
+      baseCaps: { ...DEFAULT_CAPS, maxNodes: 20000 },
+      modelJson: async () => { throw new Error('403') },
+    })
+    expect(cfg.caps.maxNodes).toBe(20000)
+    // 而且照旧要说清提示词那一份没生效。
+    expect(cfg.notices.join('\n')).toContain('一条都没生效')
+  })
+
+  it('没有 baseCaps 时逐字节等于默认值 —— 新参数不许改变老行为', async () => {
+    const cfg = await parseDirectives('随便跑跑', { ...opts, modelJson: async () => '```json\n{}\n```' })
+    expect(cfg.caps).toEqual(DEFAULT_CAPS)
+  })
+})
