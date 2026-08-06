@@ -554,3 +554,47 @@ describe('parseDirectives:「没配角色」这条提示要在名册定下来之
     expect(cfg.notices.join('\n')).toContain('没给这个环节配角色')
   })
 })
+
+/**
+ * 抽取失败**不许静默** —— 这一条是拿一次真实跑机换来的。
+ *
+ * 跑机日志(qianbase-xtp,2026-08-06):用户在提示词里写了「不需要质疑讨论阶段、验收阶段、
+ * 测试验证阶段、观察阶段」「安全阀 20 层 5000 节点」和一整套角色定向,而承载这些的那一次
+ * 抽取调用被上游 403 顶回来(Kimi 账期额度用尽)。老代码 `catch {}` 直接返回默认配置,
+ * **一条 notice 都不留** —— 关口于是显示一份七个环节俱全、什么都没跳过的「正常」配置。
+ * 用户看到的结论是「要求去掉某些阶段,也没有去掉」,而真因一个字都没上屏。
+ */
+describe('需求解析失败要说出来,不能静默退回默认配置', () => {
+  const opts = { knownRoles: [] as string[] }
+
+  it('抽取调用抛错 → notice 说清「一条都没生效」并带上原因', async () => {
+    const cfg = await parseDirectives('把 X 翻译成 Rust。不需要质疑修复阶段、验收阶段。', {
+      ...opts,
+      modelJson: async () => { throw new Error('API Error: 403 permission_error usage limit') },
+    })
+    const n = cfg.notices.join('\n')
+    expect(n).toContain('需求解析那次调用**失败**了')
+    expect(n).toContain('一条都没生效')
+    expect(n).toContain('403')
+    // 而且真的没生效 —— 这半句必须一起断言,否则 notice 可能在说谎。
+    expect(cfg.skipSteps ?? []).toEqual([])
+  })
+
+  it('抽取回了东西但解析不出 JSON → 同样有 notice', async () => {
+    const cfg = await parseDirectives('把 X 翻译成 Rust。跳过验收。', {
+      ...opts,
+      modelJson: async () => '我觉得这个需求挺好的,不过我不打算输出 JSON。',
+    })
+    expect(cfg.notices.join('\n')).toContain('没有返回可解析的 JSON')
+    expect(cfg.skipSteps ?? []).toEqual([])
+  })
+
+  it('抽取成功时一个字都不多说 —— 上面那两条不是恒真的', async () => {
+    const cfg = await parseDirectives('把 X 翻译成 Rust。跳过验收。', {
+      ...opts,
+      modelJson: async () => '```json\n{"skipSteps":["验收"]}\n```',
+    })
+    expect(cfg.notices.join('\n')).not.toContain('需求解析')
+    expect(cfg.skipSteps).toEqual(['accept'])
+  })
+})

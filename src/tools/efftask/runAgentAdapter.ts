@@ -192,13 +192,18 @@ const RATE_LIMIT_TEXT = /\(429\)|\b429\b|rate.?limit|overloaded_error|\b529\b|Ov
  *
  * 三条都对着 `errors.ts` 的原文:
  *  - `hit your … limit` / `resets …`:订阅额度用尽那条卡片文案(errors.ts 的配额分支);
+ *  - `reached your … limit` / `purchase extra usage`:**第三方网关**自己的额度文案。
+ *    跑机实测(Kimi):`403 {"type":"permission_error","message":"You've reached your usage
+ *    limit for this billing cycle … purchase extra usage or upgrade your plan"}` ——
+ *    上面那条 `hit your` 匹配不到它,于是这种「等到下个账期都没用」的故障被归进无分类,
+ *    建议退回「先确认角色模型/网络可用」,而用户照那句去查网络什么都查不出来;
  *  - `Extra usage is required`:1M 上下文没开 extra usage;
  *  - `No response requested`:Opus→Sonnet 静默回落时那条哑消息(它连正文都不是给人看的)。
  *
  * 判文案是**没得选**:这三种和真限流共用同一个结构化字段 `error: 'rate_limit'`。
  * 所以顺序是判据的一部分 —— 先排除「等没有用」的,剩下的才当容量限流退避。
  */
-const QUOTA_TEXT = /hit your .*limit|resets\s|Extra usage is required|No response requested/i
+const QUOTA_TEXT = /hit your .*limit|reached your .*limit|resets\s|Extra usage is required|purchase extra usage|No response requested/i
 
 /**
  * 「提示词太长」,**判在所有分类的最前面**。

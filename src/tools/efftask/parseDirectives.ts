@@ -80,12 +80,36 @@ export async function parseDirectives(
   }
   if (!opts.modelJson) return applyDefs(base, opts.baseRoleDefs ?? [])
   let obj: Record<string, unknown> | null = null
+  /**
+   * **抽取失败必须说出来。**
+   *
+   * 这两条早退原来都是静默的:`catch {}` 直接返回默认配置,一条 notice 都不留。而这一次
+   * 调用承载的是提示词里**全部**的配置 —— 跳过哪些环节、并行数、安全阀、角色定义、定向
+   * 注入。它一失败,用户写的那一整段就整个蒸发,而关口显示的是一份「看起来正常」的默认
+   * 配置:七个环节都在、没有任何环节被跳过。
+   *
+   * 用户报的正是这个形状:「要求去掉某些阶段,也没有去掉。」跑机上那次的真因是上游
+   * 403(额度用尽),而屏幕上没有任何一个字提到过它 —— 于是它看起来像编排器的 bug。
+   *
+   * 静默降级是这个仓库反复在修的那一类缺陷:**行为退化了,而屏幕上的一切照旧**。
+   */
   try {
     obj = extractJsonBlock(await opts.modelJson(EXTRACT_PROMPT + rawPrompt)) as Record<string, unknown> | null
-  } catch {
+  } catch (e) {
+    base.notices.push(
+      '需求解析那次调用**失败**了:提示词里写的配置(跳过哪些环节、并行数、安全阀、' +
+      '角色、定向注入)这次**一条都没生效**,本次按默认配置跑。原因: ' +
+      (e instanceof Error ? e.message : String(e)),
+    )
     return applyDefs(base, opts.baseRoleDefs ?? [])
   }
-  if (!obj) return applyDefs(base, opts.baseRoleDefs ?? [])
+  if (!obj) {
+    base.notices.push(
+      '需求解析没有返回可解析的 JSON:提示词里写的配置(跳过哪些环节、并行数、安全阀、' +
+      '角色、定向注入)这次**一条都没生效**,本次按默认配置跑。',
+    )
+    return applyDefs(base, opts.baseRoleDefs ?? [])
+  }
 
   if (obj.parallelism !== undefined) base.parallelism = clampParallelism(obj.parallelism)
 

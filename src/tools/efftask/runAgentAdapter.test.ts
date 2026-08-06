@@ -1441,3 +1441,32 @@ describe('提示词过长 → 压缩重发', () => {
     expect(calls).toBe(1 + PROMPT_SHRINK_RATIOS.length)
   })
 })
+
+/**
+ * 第三方网关的额度用尽要认得出来 —— 拿一次真实跑机换来的。
+ *
+ * Kimi 的 403 原文:`{"type":"permission_error","message":"You've reached your usage limit
+ * for this billing cycle … purchase extra usage or upgrade your plan"}`。老判据只认
+ * `hit your … limit`(Anthropic 那版文案),于是这种「等到下个账期都没用」的故障落进
+ * 无分类,阻断建议退回「先确认角色模型/网络可用」—— 而用户照那句去查网络查不出任何东西。
+ */
+describe('额度用尽:认得出第三方网关那版文案', () => {
+  const errMsg = (text: string): unknown =>
+    createAssistantAPIErrorMessage({ content: text, error: 'invalid_request' })
+
+  it('Kimi 的 403 账期额度文案 → quota,不是无分类,也不是限流', () => {
+    const raw = 'Please run /login · API Error: 403 {"error":{"type":"permission_error",'
+      + '"message":"You\'ve reached your usage limit for this billing cycle. Your quota will be '
+      + 'refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan"}}'
+    expect(providerErrorInfoOf([errMsg(raw)] as never)?.kind).toBe('quota')
+  })
+
+  it('Anthropic 那版文案照旧是 quota —— 新判据不能把老的挤掉', () => {
+    expect(providerErrorInfoOf([errMsg("You've hit your session limit · resets 3pm")] as never)?.kind).toBe('quota')
+  })
+
+  it('真限流仍然是 rate_limit —— 两者的处置办法相反,不许混', () => {
+    expect(providerErrorInfoOf([errMsg('API Error: Request rejected (429) · overloaded_error')] as never)?.kind)
+      .toBe('rate_limit')
+  })
+})
