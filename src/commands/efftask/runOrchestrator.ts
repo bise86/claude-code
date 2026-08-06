@@ -117,10 +117,37 @@ export async function runOrchestrator(
   setPhase: (p: Phase) => void,
   onHandoff?: (h: HandoffSummary) => void,
 ): Promise<void> {
-  // Serialize run.md writes. onUpdate fires on EVERY state transition; firing writeFile
-  // unawaited each time lets concurrent writes to the same path interleave into a corrupt
-  // manifest. One promise queue ⇒ strictly ordered, last-write-wins.
+  /**
+   * run.md 的写入队列 —— **串行 + 合并**。
+   *
+   * 串行是为了不写坏文件:`onUpdate` 每一次状态迁移都会来一次,不排队的话并发 writeFile
+   * 会把同一个路径写成交错的半份 manifest。
+   *
+   * **合并**是为了让大树跑得动,而这一条是量出来的:`renderTreeSnapshot` 整棵树重画一遍,
+   * 5000 个节点 ≈ 390 KB / 3.5 ms,20000 个节点 ≈ 1.5 MB / 13 ms(实测)。一个节点一生
+   * 至少六次状态迁移,于是「每次迁移都完整写一遍」在 20000 节点上是 12 万次 × 1.5 MB
+   * ≈ 180 GB 的写入和二十几分钟的纯渲染 —— 而其中除了最后一次,每一份都在下一次迁移
+   * 到来时就作废了。
+   *
+   * 合并规则:排队时只保留**最新那一份**。一次写入在飞的时候来了 100 次更新,落盘的是
+   * 第 100 份,而不是 100 次写。这不丢信息 —— run.md 是一份**快照**,不是日志。
+   *
+   * `result` 是**粘性**的:最终那一次带着 {status, reason} 进来,而它之后可能还有普通更新
+   * (收口那条路就会再写一次)。不粘住的话,那些后续写入会把状态抹回空 —— 而 run.md 的
+   * 状态行正是 `--resume` 和事后追责第一眼要看的东西。
+   */
   let manifestQueue: Promise<void> = Promise.resolve()
+  let pendingSnapshot: TaskNode[] | null = null
+  let stickyResult: Outcome | undefined
+  let flushing = false
+  const flushManifest = async (): Promise<void> => {
+    while (pendingSnapshot !== null) {
+      const nodes = pendingSnapshot
+      pendingSnapshot = null
+      await writeRunManifest(args.fs, args.runDir, args.config, nodes, stickyResult).catch(logError)
+    }
+    flushing = false
+  }
   const queueManifest = (nodes: TaskNode[], result?: Outcome): Promise<void> => {
     /**
      * 运行中调过的并发度要落进 run.md。
@@ -141,9 +168,12 @@ export async function runOrchestrator(
      */
     const liveStrictness = args.control?.strictness()
     if (liveStrictness !== undefined) args.config.caps.strictness = liveStrictness
-    manifestQueue = manifestQueue
-      .then(() => writeRunManifest(args.fs, args.runDir, args.config, nodes, result))
-      .catch(logError)
+    pendingSnapshot = nodes
+    if (result !== undefined) stickyResult = result
+    if (!flushing) {
+      flushing = true
+      manifestQueue = manifestQueue.then(flushManifest).catch(logError)
+    }
     return manifestQueue
   }
   const entry = args.taskEntry

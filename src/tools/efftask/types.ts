@@ -923,6 +923,24 @@ export const MIN_MERGE_RESOLVE = 0
  * 越改越脏的树上 —— 每一次都从上一次改过的状态开始,而且每一次都要再开一场验收圆桌。
  */
 export const MAX_MERGE_RESOLVE = 20
+/**
+ * 一棵树最多几个节点 —— **两处夹取共用的那一个数**(`parseDirectives` 抽取时、
+ * `resumeCore` 读回时)。各写一份的话,同一个数会在启动时被接受、在 `--resume` 时被
+ * 改写,而屏幕上没有任何东西解释它为什么变了。
+ *
+ * 从 5000 抬到 20000 是用户要的(「提示词要求 20000 个节点」),而抬它之前先量了真正的
+ * 代价:整棵树的 run.md 快照在 20000 节点上是 **1.5 MB / 13 ms**(5000 节点是 390 KB /
+ * 3.5 ms)。而 `onUpdate` 每一次状态迁移都写一次 run.md —— 也就是说这个数是**乘在
+ * 落盘量上**的,不是只占内存。所以抬上限的同一批改动里,run.md 的写入改成了**合并**
+ * (只写最新那一份,见 runOrchestrator 的 flushManifest);少了那一半,20000 节点是
+ * 十几万次 × 1.5 MB。
+ *
+ * 另一条不受它影响、但值得一起记住的:实时窗口的内存上限是**全局**的
+ * (`agentStream` 的 MAX_TOTAL_EVENTS),按事件总数封顶,与节点数无关 —— 那正是它当初
+ * 被设计成全局上限的理由。
+ */
+export const MAX_NODES_CEILING = 20000
+
 export const DEFAULT_CAPS: Caps = {
   maxDepth: 5, maxNodes: 100, maxIterations: 3,
   // 6 次自动解冲突。理由见 Caps.mergeResolveAttempts —— 关键是「叫醒人」的代价。

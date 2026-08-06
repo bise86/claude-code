@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { parseDirectives } from './parseDirectives.js'
 import type { RoleDef } from './roleDefs.js'
 import { PHASE_NAMES } from './types.js'
-import { DEFAULT_CAPS } from './types.js'
+import { DEFAULT_CAPS, MAX_NODES_CEILING } from './types.js'
 
 describe('parseDirectives', () => {
   it('no modelJson => all defaults', async () => {
@@ -49,7 +49,7 @@ describe('parseDirectives', () => {
     const low = await withModel({ caps: { maxDepth: 0, maxNodes: -1, maxIterations: 0 } })
     expect(low.caps).toMatchObject({ maxDepth: 1, maxNodes: 1, maxIterations: 1 })
     const high = await withModel({ caps: { maxDepth: 9999, maxNodes: 1e9, maxIterations: 999 } })
-    expect(high.caps).toMatchObject({ maxDepth: 20, maxNodes: 5000, maxIterations: 20 })
+    expect(high.caps).toMatchObject({ maxDepth: 20, maxNodes: MAX_NODES_CEILING, maxIterations: 20 })
     const junk = await withModel({ caps: { maxDepth: 'deep', maxNodes: null, maxIterations: 'many' } })
     expect(junk.caps).toMatchObject({ maxDepth: 5, maxNodes: 100, maxIterations: 3 }) // untouched defaults
   })
@@ -615,21 +615,21 @@ describe('安全阀:上限不是写死的,但夹动了必须说', () => {
     modelJson: async () => '```json\n' + JSON.stringify({ caps }) + '\n```',
   })
 
-  it('20 层 / 5000 节点是**收得下**的 —— 那是上限本身,不是被夹掉的值', async () => {
-    const cfg = await parseDirectives('安全阀允许最多 20 层,最多 5000 个节点', withCaps({ maxDepth: 20, maxNodes: 5000 }))
+  it('20 层 / 20000 节点是**收得下**的 —— 那是上限本身,不是被夹掉的值', async () => {
+    const cfg = await parseDirectives('安全阀允许最多 20 层,最多 20000 个节点', withCaps({ maxDepth: 20, maxNodes: 20000 }))
     expect(cfg.caps.maxDepth).toBe(20)
-    expect(cfg.caps.maxNodes).toBe(5000)
+    expect(cfg.caps.maxNodes).toBe(20000)
     // 没被夹动就一个字都不说。
     expect(cfg.notices.join('\n')).not.toContain('取值范围')
   })
 
   it('超出上限 → 夹到边界,并且说清「你要的是多少、实际按多少跑」', async () => {
-    const cfg = await parseDirectives('最多 10000 个节点,拆 30 层', withCaps({ maxDepth: 30, maxNodes: 10000 }))
-    expect(cfg.caps.maxNodes).toBe(5000)
+    const cfg = await parseDirectives('最多 50000 个节点,拆 30 层', withCaps({ maxDepth: 30, maxNodes: 50000 }))
+    expect(cfg.caps.maxNodes).toBe(MAX_NODES_CEILING)
     expect(cfg.caps.maxDepth).toBe(20)
     const n = cfg.notices.join('\n')
-    expect(n).toContain('任务节点上限:你要的是 10000')
-    expect(n).toContain('本次按 5000 跑')
+    expect(n).toContain('任务节点上限:你要的是 50000')
+    expect(n).toContain(`本次按 ${MAX_NODES_CEILING} 跑`)
     expect(n).toContain('树的最大深度:你要的是 30')
   })
 
@@ -644,6 +644,6 @@ describe('安全阀:上限不是写死的,但夹动了必须说', () => {
     expect(SRC).toContain('caps.maxDepth 是**任务树最多分几层**')
     expect(SRC).toContain('caps.maxNodes 是**整棵树最多几个任务**')
     // 用户真会说的那几句,至少有一句在提示词里当例子。
-    expect(SRC).toContain('最多 5000 个节点')
+    expect(SRC).toContain('最多 20000 个节点')
   })
 })

@@ -1031,3 +1031,57 @@ describe('收口撞上冲突:模型先解一次(用户要求的那件事)', () =
     expect(results[0]?.result?.message).toContain('已自动解决')
   })
 })
+
+/**
+ * run.md 的写入要**合并**,否则大树跑不动。
+ *
+ * `onUpdate` 每一次状态迁移都来一次,而每一次都把整棵树重画进 run.md。实测:
+ * 5000 节点 ≈ 390 KB / 3.5 ms,20000 节点 ≈ 1.5 MB / 13 ms。一个节点一生至少六次迁移,
+ * 于是「每次都完整写一遍」在 20000 节点上是十几万次 × 1.5 MB —— 而其中除了最后一次,
+ * 每一份都在下一次迁移到来时就作废了。
+ *
+ * 合并不丢信息:run.md 是**快照**,不是日志。
+ */
+describe('run.md 写入合并:只落最新那一份', () => {
+  it('一次写入在飞时来的多次更新,合并成一次,而且落的是最后那一份', async () => {
+    const fs2 = memFs()
+    const ac = new AbortController()
+    let writes = 0
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    const slowFs: FsLike = {
+      ...fs2,
+      writeFile: async (p, d) => {
+        if (p.endsWith('run.md')) { writes++; await gate }
+        await fs2.writeFile(p, d)
+      },
+    }
+    let seen = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'plan') {
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
+          '\n{"kind":"executable","solution":"s","keyPoints":"k","risks":"r","acceptance":"跑 bun test"}\n```'
+      }
+      if (req.phase === 'execute') { seen++; return '```json\n{"execStatus":"改了 foo.ts"}\n```' }
+      if (req.phase === 'review') {
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (plan[a-z]+)/)?.[1] ?? 'plan') +
+          '\n{"kind":"executable","solution":"s2","keyPoints":"k","risks":"r","acceptance":"跑 bun test"}\n```'
+      }
+      return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (verdict[a-z]+)/)?.[1] ?? 'verdict') +
+        '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    // 第一次写卡住 → 期间的每一次状态迁移都只更新「待写的那一份」。
+    setTimeout(release, 30)
+    await runOrchestrator(
+      { config: cfg(), runDir: '/r', fs: slowFs, runAgent, signal: ac.signal },
+      () => {}, () => {}, () => {},
+    )
+    expect(seen).toBe(1)
+    // 一个节点一生六次以上迁移,而写入次数必须**远少于**它。
+    expect(writes).toBeLessThan(5)
+    // 而最终那一份是完整的:状态行和树都在。
+    const md = fs2.files.get('/r/run.md') ?? ''
+    expect(md).toContain('status: completed')
+    expect(md).toContain('(ACCEPTED)')
+  })
+})

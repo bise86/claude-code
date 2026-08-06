@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEGRADABLE_PHASES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
+import { MAX_NODES_CEILING, clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEGRADABLE_PHASES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
 import type { Caps, DegradeRecord, EffTaskConfig, NodeKind, NodePlan, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
@@ -1008,7 +1008,7 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   const caps = (fm.caps ?? {}) as Record<string, unknown>
   const rebuilt: Caps = {
     maxDepth: clampInt(caps.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth),
-    maxNodes: clampInt(caps.maxNodes, 1, 5000, DEFAULT_CAPS.maxNodes),
+    maxNodes: clampInt(caps.maxNodes, 1, MAX_NODES_CEILING, DEFAULT_CAPS.maxNodes),
     maxIterations: clampInt(caps.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations),
     // 上限 2 小时。原来是 1 小时,而这条阀量的已经是**静默时长**不是总时长了 ——
     // 「两个小时一条消息都没吐」在任何 provider 上都只可能是挂死,所以让它可配到 2 小时

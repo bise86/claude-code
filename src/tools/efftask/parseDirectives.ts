@@ -1,5 +1,5 @@
 // src/tools/efftask/parseDirectives.ts
-import { clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, DEFAULT_PARALLELISM, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_ROLE_GUIDANCE, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
+import { MAX_NODES_CEILING, clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, DEFAULT_PARALLELISM, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_ROLE_GUIDANCE, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { isStrictness, STRICTNESS_LEVELS } from './strictness.js'
 import { extractJsonBlock } from './parseOutput.js'
@@ -19,7 +19,7 @@ phaseRoles 的值是**员工名**数组(可派发的身份)。
 圆桌通过门槛有两个字段,按用户的说法二选一:
 - 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
 - 用户说**人数**(「至少 2 个人通过」「要 3 票」)→ caps.quorumSeats,就是那个人数。**不要**把人数写进 quorum:「至少 2 人」写成 quorum=2 的含义是 2%,等于 1 票就放行,和用户的意思正好相反。
-caps.maxDepth 是**任务树最多分几层**,caps.maxNodes 是**整棵树最多几个任务**。用户说「安全阀里允许最多 20 层、最多 5000 个节点」「别拆太深,三层就够」「任务别超过 200 个」→ 填这两个。取值范围分别是 1~20 和 1~5000,超出会被夹到边界(关口会说)。
+caps.maxDepth 是**任务树最多分几层**,caps.maxNodes 是**整棵树最多几个任务**。用户说「安全阀里允许最多 20 层、最多 20000 个节点」「别拆太深,三层就够」「任务别超过 200 个」→ 填这两个。取值范围分别是 1~20 和 1~20000,超出会被夹到边界(关口会说)。
 caps.maxSeatsPerPhase 是每个阶段最多几席。
 caps.mergeResolveAttempts 是**一个节点的合并冲突最多让模型自动解几次**(每次解完都会重跑验收)。用户说「冲突多试几次」「解冲突给 10 次机会」「冲突别自动解、直接叫我」→ 填这里(最后那句 = 0)。默认 6。
 caps.nodeTimeoutMs 是**一次调用最多可以多久没有任何输出**(毫秒)。用户说「阶段超时 20 分钟」「每步最多等半小时」「模型慢,超时给久一点」→ 换算成毫秒填这里(20 分钟 = 1200000)。他说的是「多久没动静算卡死」,不是「一个节点最多跑多久」—— 一直在吐字就永远不算超时。
@@ -305,7 +305,7 @@ export async function parseDirectives(
   const caps = (obj.caps ?? {}) as Record<string, unknown>
   const c: Caps = { ...base.caps }
   if (caps.maxDepth !== undefined) c.maxDepth = clampNoted(caps.maxDepth, 1, 20, DEFAULT_CAPS.maxDepth, '树的最大深度:', base.notices)
-  if (caps.maxNodes !== undefined) c.maxNodes = clampNoted(caps.maxNodes, 1, 5000, DEFAULT_CAPS.maxNodes, '任务节点上限:', base.notices)
+  if (caps.maxNodes !== undefined) c.maxNodes = clampNoted(caps.maxNodes, 1, MAX_NODES_CEILING, DEFAULT_CAPS.maxNodes, '任务节点上限:', base.notices)
   if (caps.maxIterations !== undefined) c.maxIterations = clampNoted(caps.maxIterations, 1, 20, DEFAULT_CAPS.maxIterations, '每一关的返工轮数:', base.notices)
   // Without an entry point here the THRESHOLD had none at all: only readRunManifest read it
   // back, so the "低分触发一次返工" half of 观察评分 was dead code on the normal path —
