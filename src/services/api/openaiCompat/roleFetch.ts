@@ -70,6 +70,27 @@ function failureResponse(status: number, message: string): Response {
   )
 }
 
+/**
+ * 「这条 fetch **只走流式**」的标记。
+ *
+ * 翻译分支上的每一步都假定回来的是 SSE:`sniffSSE` 判不是 SSE 就 502,
+ * `toAnthropicEvents` 吃的是帧,返回的响应写死 `content-type: text/event-stream`。
+ * 也就是说**非流式请求在这条路上没有一个能走通的结局** —— 严格网关直接 400
+ * (`Stream must be set to true`,而 `toResponsesRequest`/`toOpenAIRequest` 在
+ * `body.stream` 缺席时确实不发这个字段),宽容网关回一个非流式 JSON,我们这边同样判失败。
+ *
+ * 而引擎在流式失败后会**静默地**把同一轮改成非流式重发一次(claude.ts 的非流式回退)。
+ * 于是一次本可重试的流中断,变成一个**不可重试**的 400:那一席当场死掉,已经跑了上百条
+ * 消息的对话全部作废,而屏幕上那句 400 还在建议用户「先查 model 写得对不对」。
+ * 用 Symbol.for 而不是普通属性:跨模块实例安全,且不会撞上 fetch 上任何真实字段。
+ */
+const STREAM_ONLY = Symbol.for('claude-code.roleFetch.streamOnly')
+
+/** 这条 fetch 是不是「只走流式」的翻译层。非函数、普通 fetch 一律 false。 */
+export function isStreamOnlyFetch(fn: unknown): boolean {
+  return typeof fn === 'function' && (fn as Record<symbol, unknown>)[STREAM_ONLY] === true
+}
+
 export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetch): typeof fetch {
   const target = new URL(cfg.apiUrl)
   /**
@@ -82,7 +103,7 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
    * 放在构造期而不是请求期:构造只发生一次,请求发生几百次,而 `NO_PROXY` 是进程级的。
    */
   registerDirectHosts([cfg.apiUrl])
-  return (async (url: any, init: any = {}) => {
+  const roleFetch = (async (url: any, init: any = {}) => {
     // Normalize via the WHATWG Headers API (case-insensitive) so we don't
     // silently drop SDK-set headers passed as a `Headers` instance — spreading
     // a `Headers` instance (`{ ...init.headers }`) yields `{}`, since its
@@ -242,4 +263,12 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
       headers: { 'content-type': 'text/event-stream', 'request-id': requestId },
     })
   }) as typeof fetch
+  /**
+   * 只有**翻译**分支只走流式。`anthropic` 是原样转发,非流式请求在那条路上一切正常
+   * (它连 body 都不看),打上标记反而会白白关掉一条真能救场的回退。
+   */
+  if (cfg.apiProtocol !== 'anthropic') {
+    Object.defineProperty(roleFetch, STREAM_ONLY, { value: true })
+  }
+  return roleFetch
 }

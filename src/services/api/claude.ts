@@ -229,6 +229,7 @@ import { getInitializationStatus } from '../lsp/manager.js'
 import { isToolFromMcpServer } from '../mcp/utils.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { CLIENT_REQUEST_ID_HEADER, getAnthropicClient } from './client.js'
+import { isStreamOnlyFetch } from './openaiCompat/roleFetch.js'
 import { reportApiUsage } from './usageSink.js'
 import {
   API_ERROR_MESSAGE_PREFIX,
@@ -2478,17 +2479,9 @@ async function* queryModel(
         }
       }
 
-      // When the flag is enabled, skip the non-streaming fallback and let the
-      // error propagate to withRetry. The mid-stream fallback causes double tool
-      // execution when streaming tool execution is active: the partial stream
-      // starts a tool, then the non-streaming retry produces the same tool_use
-      // and runs it again. See inc-4258.
-      const disableFallback =
-        isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK) ||
-        getFeatureValue_CACHED_MAY_BE_STALE(
-          'tengu_disable_streaming_to_non_streaming_fallback',
-          false,
-        )
+      const disableFallback = shouldDisableNonStreamingFallback(
+        options.fetchOverride,
+      )
 
       if (disableFallback) {
         logForDebugging(
@@ -2632,6 +2625,10 @@ async function* queryModel(
     // with raw streams, 404s are thrown during creation (caught here).
     const is404StreamCreationError =
       !didFallBackToNonStreaming &&
+      // 翻译层不区分流式/非流式路由:两者 POST 的是**同一个** URL(`proto.route`)。
+      // 也就是说这里的「换成非流式说不定就通了」在那条路上不成立 —— 同一个 404 会原样
+      // 再来一次,而真正被替掉的是那句带员工名/协议/URL 的诊断。
+      !isStreamOnlyFetch(options.fetchOverride) &&
       errorFromRetry instanceof CannotRetryError &&
       errorFromRetry.originalError instanceof APIError &&
       errorFromRetry.originalError.status === 404
@@ -3385,6 +3382,38 @@ export async function queryWithModel({
 // The SDK's 21333-token cap is derived from 10min × 128k tokens/hour, but we
 // bypass it by setting a client-level timeout, so we can cap higher.
 export const MAX_NON_STREAMING_TOKENS = 64_000
+
+/**
+ * 一次流式失败之后,该不该把同一轮改成**非流式**重发。
+ *
+ * 三条关掉它的理由,任意一条成立就不发:
+ *
+ * 1. `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` —— 用户自己关的。
+ * 2. `tengu_disable_streaming_to_non_streaming_fallback` —— 流中执行工具时,半截的流
+ *    已经起了一个工具,非流式重发又产出同一个 tool_use,于是跑两遍(inc-4258)。
+ * 3. **这条链路只走流式**(翻译型员工:`openai` / `openai-responses`)。那边的非流式
+ *    请求没有一个能走通的结局:严格网关回 `400 Stream must be set to true`
+ *    (`toResponsesRequest`/`toOpenAIRequest` 在 `body.stream` 缺席时确实不发这个字段),
+ *    宽容网关回一个非流式 JSON,而翻译层认死 SSE、同样判失败。
+ *
+ *    第 3 条的代价不是「少一次挽救」,是**倒赔**:400 不可重试,于是一次本可重试的
+ *    流中断被换成一个必死的形态 —— 那一席当场死掉,已经跑了上百条消息的对话全部作废,
+ *    而屏幕上那句 400 还在建议用户「先查 model 写得对不对」(它此前已经成功过几十次)。
+ *    这是真实跑机上量到的:同一条 400 在一次 run 的 5 份 transcript 里各出现一次,
+ *    每一次都落在那份 transcript 的**最后一行**。
+ */
+export function shouldDisableNonStreamingFallback(
+  fetchOverride: unknown,
+): boolean {
+  return (
+    isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK) ||
+    getFeatureValue_CACHED_MAY_BE_STALE(
+      'tengu_disable_streaming_to_non_streaming_fallback',
+      false,
+    ) ||
+    isStreamOnlyFetch(fetchOverride)
+  )
+}
 
 /**
  * Adjusts thinking budget when max_tokens is capped for non-streaming fallback.
