@@ -45,6 +45,13 @@ import {
   tokenStatsToStatsigMetrics,
 } from '../../utils/contextAnalysis.js'
 import { logForDebugging } from '../../utils/debug.js'
+import { BYTES_PER_TOKEN } from '../../constants/toolLimits.js'
+import { formatFileSize } from '../../utils/format.js'
+import { reportContextNotice } from '../api/contextNoticeSink.js'
+import {
+  replaceToolResultContents,
+  shrinkLargestToolResults,
+} from '../../utils/toolResultStorage.js'
 import { hasExactErrorMessage } from '../../utils/errors.js'
 import { cacheToObject } from '../../utils/fileStateCache.js'
 import {
@@ -290,6 +297,78 @@ export function truncateHeadForPTLRetry(
   return sliced
 }
 
+/**
+ * 体积抢救这一次要甩掉多少字符。
+ *
+ * 上游那句报错里带着 `N tokens > M maximum` 时(`getPromptTooLongTokenGap` 解析出来的
+ * 就是 N−M),按缺口算并**乘一个余量**:缺口是上一次的,而落盘换预览本身还要占几百字符,
+ * 刚好卡着缺口甩会再撞一次,而每一次「再撞」都是一趟完整的压缩调用。
+ *
+ * 解析不出来时(第三方网关基本不给这个数)退回「甩掉当前总量的一半」——
+ * 和 `truncateHeadForPTLRetry` 在同样情况下退回 20% 是同一个思路:上游只说了「太长」,
+ * 猜不出差多少,那就用大步长换次数。
+ */
+export function ptlShrinkTarget(
+  ptlResponse: AssistantMessage,
+  messages: Message[],
+): number {
+  const gapTokens = getPromptTooLongTokenGap(ptlResponse)
+  if (gapTokens !== undefined && gapTokens > 0) {
+    return Math.ceil(gapTokens * BYTES_PER_TOKEN * 1.5)
+  }
+  return Math.ceil(roughTokenCountEstimationForMessages(messages) * BYTES_PER_TOKEN * 0.5)
+}
+
+/**
+ * 把「压缩靠丢体积才活下来」这件事报出去。
+ *
+ * **不能靠消息里的标记兑现。** 规范席指出:替换写进 messages 的那个 `PERSISTED_OUTPUT_TAG`
+ * 结构上活不过这次压缩 —— 下一次重试会把整组丢掉,压缩一旦成功整段输入又被 summary 取代。
+ * 也就是说标记和它描述的内容同生共死,最后没有任何痕迹。所以出口必须在压缩流程**之外**。
+ */
+function notePtlVolumeShrink(
+  context: { addNotification?: (n: { key: string; priority: 'low' | 'medium' | 'high' | 'immediate'; timeoutMs?: number; text: string }) => void },
+  replaced: number,
+  freedChars: number,
+): void {
+  const text =
+    `上下文超限:压缩本身也被拒了,已把 ${replaced} 条最大的工具产出存到文件` +
+    `(约 ${formatFileSize(freedChars)})后重试。这一步会作废提示词缓存。`
+  logForDebugging(text, { level: 'warn' })
+  /**
+   * 子 agent 那条路上 `context.addNotification` 恒为 undefined(见 contextNoticeSink
+   * 的文件头),而**这个功能存在的全部理由就是员工那一席**。所以先走旁路 sink,
+   * 收不到才退回通知 —— 主循环那条路上通知是活的。
+   */
+  if (!reportContextNotice({ kind: 'ptl-volume-shrink', text })) {
+    try {
+      context.addNotification?.({
+        key: 'ptl-volume-shrink',
+        priority: 'high',
+        timeoutMs: 12_000,
+        text,
+      })
+    } catch {
+      /* 报一声而已,失败不能让压缩挂掉 */
+    }
+  }
+}
+
+/**
+ * 声明了「不许落盘」的工具(`maxResultSizeChars` 非有限,今天只有 Read)。
+ *
+ * 和 `query.ts` 组装 skipToolNames 用的是**同一条判据**,理由也同一条:把 Read 的产出
+ * 落盘换成路径,模型唯一能做的是再 Read 那个路径 —— 循环。抢救路径漏传这个集合的话,
+ * 常规预算永远不碰的那批产出会在压缩兜底里被换掉,而两处判据的分歧没有任何地方写着。
+ */
+export function persistExemptToolNames(context: ToolUseContext): ReadonlySet<string> {
+  return new Set(
+    context.options.tools
+      .filter(t => !Number.isFinite(t.maxResultSizeChars))
+      .map(t => t.name),
+  )
+}
+
 export const ERROR_MESSAGE_PROMPT_TOO_LONG =
   'Conversation too long. Press esc twice to go up a few messages and try again.'
 export const ERROR_MESSAGE_USER_ABORT = 'API Error: Request was aborted.'
@@ -447,6 +526,8 @@ export async function compactConversation(
     let summaryResponse: AssistantMessage
     let summary: string | null
     let ptlAttempts = 0
+    /** 体积抢救只做一次 —— 见下面那个分支里的理由。 */
+    let volumeShrunk = false
     for (;;) {
       summaryResponse = await streamCompactSummary({
         messages: messagesToSummarize,
@@ -467,6 +548,34 @@ export async function compactConversation(
           ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
           : null
       if (!truncated) {
+        /**
+         * 丢头已经无能为力 —— **改成丢体积再试一次**。
+         *
+         * `truncated === null` 是三种情况的**共同漏斗**,这也是它做落点的全部理由:
+         * ①`groups.length < 2`(整段对话只有一轮,`truncateHeadForPTLRetry` 第一句就返回
+         * null)②`dropCount < 1`(丢无可丢)③重试次数用尽。评审指出 v1 把落点选在
+         * `dropCount < 1` 上是错的:单轮那一档在更早的 `groups.length < 2` 就返回了,
+         * 那条新分支一次都不会被执行。
+         *
+         * 只试一次(`volumeShrunk` 闩)。再试就是拿同一批已经变成预览的产出反复落盘。
+         */
+        const shrunk = volumeShrunk
+          ? null
+          : await shrinkLargestToolResults(
+              messagesToSummarize,
+              ptlShrinkTarget(summaryResponse, messagesToSummarize),
+              persistExemptToolNames(context),
+            )
+        if (shrunk && shrunk.replacements.size > 0) {
+          volumeShrunk = true
+          messagesToSummarize = shrunk.messages
+          retryCacheSafeParams = {
+            ...retryCacheSafeParams,
+            forkContextMessages: shrunk.messages,
+          }
+          notePtlVolumeShrink(context, shrunk.replacements.size, shrunk.freedChars)
+          continue
+        }
         logEvent('tengu_compact_failed', {
           reason:
             'prompt_too_long' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -787,7 +896,8 @@ export async function partialCompactConversation(
     // findLastCompactBoundaryIndex's backward scan and drops summary_B.
     // 'from' keeps them: summary_B sits AFTER kept (backward scan still
     // works), and removing an old summary would lose its covered history.
-    const messagesToKeep =
+    // let(不是 const):PTL 体积抢救要把替换同样应用到保留集合上,见下面那个分支。
+    let messagesToKeep =
       direction === 'up_to'
         ? allMessages
             .slice(pivotIndex)
@@ -859,6 +969,8 @@ export async function partialCompactConversation(
     let summaryResponse: AssistantMessage
     let summary: string | null
     let ptlAttempts = 0
+    /** 体积抢救只做一次 —— 同 full compact。 */
+    let volumeShrunk = false
     for (;;) {
       summaryResponse = await streamCompactSummary({
         messages: apiMessages,
@@ -877,6 +989,36 @@ export async function partialCompactConversation(
           ? truncateHeadForPTLRetry(apiMessages, summaryResponse)
           : null
       if (!truncated) {
+        /**
+         * 同 full compact 那条路的落点(见那里的注释)。**但这里多一件事必须做:**
+         *
+         * `messagesToKeep` 在这个循环**之前**就算好了(上面那个三元),循环里从不更新;
+         * 而 direction==='from' 时 `apiMessages = allMessages` **包含** messagesToKeep。
+         * 只把替换应用到 `apiMessages` 的后果是:压缩报成功,而**保留下来**的那份里
+         * 那条几 MB 的产出一个字节都没少 —— 下一轮照样 PTL,用户看到的是「刚压过怎么又满了」。
+         * 集成席就是在这里发现两个调用点不同构的。
+         */
+        const shrunk = volumeShrunk
+          ? null
+          : await shrinkLargestToolResults(
+              apiMessages,
+              ptlShrinkTarget(summaryResponse, apiMessages),
+              persistExemptToolNames(context),
+            )
+        if (shrunk && shrunk.replacements.size > 0) {
+          volumeShrunk = true
+          apiMessages = shrunk.messages
+          messagesToKeep = replaceToolResultContents(
+            messagesToKeep,
+            shrunk.replacements,
+          )
+          retryCacheSafeParams = {
+            ...retryCacheSafeParams,
+            forkContextMessages: shrunk.messages,
+          }
+          notePtlVolumeShrink(context, shrunk.replacements.size, shrunk.freedChars)
+          continue
+        }
         logEvent('tengu_partial_compact_failed', {
           reason:
             'prompt_too_long' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,

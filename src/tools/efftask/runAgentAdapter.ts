@@ -13,6 +13,7 @@ import type { RunAgentFn } from './roundtable.js'
 import type { RoleBinding } from './types.js'
 import { addUsage, createUsageMeter, isEmptyUsage } from './usage.js'
 import { withApiUsageSink } from '../../services/api/usageSink.js'
+import { withContextNoticeSink } from '../../services/api/contextNoticeSink.js'
 
 /**
  * caps.nodeTimeoutMs tripped (spec §11 的第四个阀).
@@ -703,11 +704,30 @@ export function makeRunAgentFn(deps: {
      */
     let settled = false
     const consume = async (): Promise<void> =>
-      withApiUsageSink(r => {
-        if (settled) return
-        meter.observeApi(r)
-        bankUsage()
-      }, consumeMessages)
+      withApiUsageSink(
+        r => {
+          if (settled) return
+          meter.observeApi(r)
+          bankUsage()
+        },
+        () =>
+          /**
+           * 「这一席的上下文被动过手脚」也要上屏 —— **和用量走同一条 ALS 归属**。
+           *
+           * 产出落盘换预览、以及压缩的体积抢救,都发生在 `query.ts`/`compact.ts` 深处,
+           * 而那里唯一的通知通道(`toolUseContext.addNotification`)对子 agent 恒为
+           * undefined(`createSubagentContext` 写死的,理由是子 agent 控制不了父进程 UI)。
+           * 席位的输出流才是用户真的在看的地方 —— 上游拒收那两条提示(`[上游拒收:
+           * 提示词过长…]`)也是从这里出去的,形状一致。
+           */
+          withContextNoticeSink(n => {
+            try {
+              req.stream?.push({ kind: 'text', text: `\n[${n.text}]\n` })
+            } catch {
+              /* 提示而已 */
+            }
+          }, consumeMessages),
+      )
     // Hoisted so the outer finally can clear it on EVERY exit path. It used to be cleared by
     // `void work.finally(...)`, but `.finally()` returns a DERIVED promise: when `work`
     // rejected, that derived promise rejected with nothing attached to it. The caller still

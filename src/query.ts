@@ -98,7 +98,11 @@ import type { RoleClientConfig } from './tools/AgentTool/roles/roleTypes.js'
 import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js'
 import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
-import { applyToolResultBudget } from './utils/toolResultStorage.js'
+import {
+  applyToolResultBudget,
+  roleWindowChars,
+} from './utils/toolResultStorage.js'
+import { reportContextNotice } from './services/api/contextNoticeSink.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
 import { buildQueryConfig } from './query/config.js'
@@ -409,6 +413,36 @@ async function* queryLoop(
           .filter(t => !Number.isFinite(t.maxResultSizeChars))
           .map(t => t.name),
       ),
+      /**
+       * 预算按**这个员工自己的窗口**算。主循环没有 `roleClientConfig`,这里是
+       * `undefined` → `getPerMessageBudgetLimit` 回落 `Infinity` → 整条不生效。
+       * 也就是说用户当初拆掉产出上限的那个决定,在他自己的会话里逐字未变。
+       */
+      roleWindowChars(toolUseContext.options.roleClientConfig?.contextWindow),
+      /**
+       * 落盘要有人看见。这是它唯一的可见出口(见 applyToolResultBudget 的同名参数)。
+       */
+      records => {
+        const text =
+          `已把 ${records.length} 条过大的工具产出存到文件并换成预览` +
+          `(超出该员工窗口的每消息预算)。模型要看全文会自行 Read 那个路径。`
+        /**
+         * **先走旁路 sink,收不到才退回通知。**
+         *
+         * 这条预算只在 `roleClientConfig.contextWindow` 存在时才生效,也就是**只在子
+         * agent 上**;而 `createSubagentContext` 对子 agent 写死 `addNotification:
+         * undefined`(它控制不了父进程的 UI,那个决定是对的)。只接通知的话,
+         * 这个出口在唯一会触发它的那条路上是一次完整的空操作 —— 验收席跑真接缝证过。
+         */
+        if (!reportContextNotice({ kind: 'tool-result-persisted', text })) {
+          toolUseContext.addNotification?.({
+            key: 'tool-result-budget-persisted',
+            priority: 'low',
+            timeoutMs: 8_000,
+            text,
+          })
+        }
+      },
     )
 
     // Apply snip before microcompact (both may run — they are not mutually exclusive).

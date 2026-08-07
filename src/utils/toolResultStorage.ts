@@ -11,6 +11,7 @@ import {
   DEFAULT_MAX_RESULT_SIZE_CHARS,
   MAX_TOOL_RESULT_BYTES,
   MAX_TOOL_RESULTS_PER_MESSAGE_CHARS,
+  PER_MESSAGE_BUDGET_WINDOW_SHARE,
 } from '../constants/toolLimits.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
 import { logEvent } from '../services/analytics/index.js'
@@ -430,7 +431,7 @@ export function cloneContentReplacementState(
  * check: GrowthBook's cache returns `cached !== undefined ? cached : default`,
  * so a flag served as null/string/NaN leaks through.
  */
-export function getPerMessageBudgetLimit(): number {
+export function getPerMessageBudgetLimit(windowChars?: number): number {
   const override = getFeatureValue_CACHED_MAY_BE_STALE<number | null>(
     'tengu_hawthorn_window',
     null,
@@ -442,7 +443,47 @@ export function getPerMessageBudgetLimit(): number {
   ) {
     return override
   }
+  /**
+   * 员工声明了自己的窗口时,预算按窗口比例算;**没声明就回落 `Infinity`**。
+   *
+   * 这个 `undefined` 分支就是「主循环逐字不变」的全部兑现方式 —— 主循环没有
+   * `roleClientConfig`,`query.ts` 传不出窗口,于是这里返回 `Infinity`,
+   * `enforceToolResultBudget` 里 `frozenSize + freshSize > limit` 恒假,一次都不会落盘。
+   * 把这条判据写在**回落**上而不是写在调用点的 if 里,是因为调用点只有一个而回落有三个
+   * (GrowthBook 覆盖、窗口、常量),散在 if 里迟早漏一条。
+   */
+  if (
+    typeof windowChars === 'number' &&
+    Number.isFinite(windowChars) &&
+    windowChars > 0
+  ) {
+    return Math.floor(windowChars * PER_MESSAGE_BUDGET_WINDOW_SHARE)
+  }
   return MAX_TOOL_RESULTS_PER_MESSAGE_CHARS
+}
+
+/**
+ * 这个员工的窗口换算成字符 —— 预算算术的唯一入口。
+ *
+ * `contextWindow` 是 token 数,而预算比的是 `contentSize()` 即字符数,所以必须在这里乘一次
+ * `BYTES_PER_TOKEN`。v1 方案里这一步做在字符域上放了个绝对地板(200_000 字符),四位评审
+ * 各自算出同一个结论:200_000 字符 = 50_000 token,比 32k 员工的**整扇窗口**(128_000 字符)
+ * 还大,于是比例判据对所有 200k 以下的员工一次都不生效。地板因此被整条删掉 —— 需要下界
+ * 保护的是「窗口小到装不下开销本身」,那是关口该报的事,不是预算该兜的。
+ *
+ * @returns `undefined` = 不干预(主循环、以及没声明窗口的员工)
+ */
+export function roleWindowChars(
+  contextWindow: number | undefined,
+): number | undefined {
+  if (
+    typeof contextWindow !== 'number' ||
+    !Number.isFinite(contextWindow) ||
+    contextWindow <= 0
+  ) {
+    return undefined
+  }
+  return contextWindow * BYTES_PER_TOKEN
 }
 
 /**
@@ -695,20 +736,39 @@ function selectFreshToReplace(
   for (const c of sorted) {
     if (remaining <= limit) break
     selected.push(c)
-    // We don't know the replacement size until after persist, but previews
-    // are ~2K and results hitting this path are much larger, so subtracting
-    // the full size is a close approximation for selection purposes.
-    remaining -= c.size
+    /**
+     * **换进去的预览本身也占地方,必须减掉净额。**
+     *
+     * 原来这里减的是 `c.size`(整条原文),注释的理由是「预览约 2K,而走到这条路的产出
+     * 都大得多,当近似够用」。那个近似在大窗口上确实是噪声,在小窗口上会翻船 ——
+     * 验收席用真函数量出来的:8k 员工(预算 16000 字符)10 条各 5000 字符,选中 7 条之后
+     * 账面以为降到了 15000,实际每条还留着约 2.3K 预览,真实总量 **30610** 字符,
+     * 是它自己算出来的预算的 1.9 倍、整扇窗口的 96% —— 正是这个功能要挡的那种死法。
+     *
+     * 用估算值而不是真实长度:真实长度要等 `buildReplacement` 落完盘才知道,而选择必须
+     * 在那之前完成。往**大**了估(取预览上限 + 头部路径行的余量),宁可多换一条 ——
+     * 少换一条的代价是整席死掉,多换一条的代价是多一次 Read。
+     */
+    remaining -= Math.max(0, c.size - REPLACEMENT_SIZE_ESTIMATE)
   }
   return selected
 }
+
+/**
+ * 一条产出被换成预览之后**大约还占多少字符**。
+ *
+ * `buildLargeToolResultMessage` = 两个 tag + 一行「Output too large … saved to: <绝对路径>」
+ * + 一行 Preview 说明 + `PREVIEW_SIZE_BYTES` 的正文。路径长度随会话目录变,所以往大了估
+ * 留 300 字符余量。只用于**选择**,不参与任何对外的数字。
+ */
+const REPLACEMENT_SIZE_ESTIMATE = PREVIEW_SIZE_BYTES + 300
 
 /**
  * Return a new Message[] where each tool_result block whose id appears in
  * replacementMap has its content replaced. Messages and blocks with no
  * replacements are passed through by reference.
  */
-function replaceToolResultContents(
+export function replaceToolResultContents(
   messages: Message[],
   replacementMap: Map<string, string>,
 ): Message[] {
@@ -749,6 +809,75 @@ async function buildReplacement(
 }
 
 /**
+ * **压缩兜底:丢体积,不丢轮次。**
+ *
+ * `truncateHeadForPTLRetry` 只会丢**最老**的组,而且 `compact.ts` 有两道保底
+ * (`groups.length < 2` 直接返回 null、`dropCount = min(dropCount, groups.length - 1)`)
+ * ——**最近一轮永远丢不掉**。而顶穿窗口的那条几 MB 的产出恰恰就在最近一轮:它刚产生,
+ * 正是它把这次请求顶穿的。于是压缩自己也超长、也被拒,三次重试全废,最后原样抛
+ * `ERROR_MESSAGE_PROMPT_TOO_LONG`,那一席直接死掉。
+ *
+ * 这个函数是那条路上的最后一步:把**全局最大的几条** tool_result 落盘换成预览,
+ * 直到甩掉 `targetChars` 个字符,轮次一个都不动。
+ *
+ * 三条判据:
+ *
+ *  1. **全局挑最大,不限定最近一轮。** 走到这里说明「丢头」已经无能为力(返回了 null),
+ *     那就没有理由再把搜索范围限制在某一组里。
+ *  2. **代价要说出口:这会作废 prompt cache。** `enforceToolResultBudget` 的冻结语义
+ *     (见下面那个函数的注释)明写「已看过而未替换的产出不能再替换,否则打断缓存」——
+ *     这个函数干的正是那件被禁止的事。它之所以仍然成立,是因为触发它的前提是**这次请求
+ *     已经被上游拒收了**:缓存前缀已经没有用了,不换就是整席死掉。调用方必须把这件事
+ *     报出来(见 compact.ts 的调用点),不能当成一次纯收益的优化。
+ *  3. **不碰 `ContentReplacementState`。** 那份账本记的是「常规预算做过什么决定」,
+ *     而这里是一次性的抢救。写进去会让抢救结果被当成常规决定,在之后每一轮**重放**,
+ *     于是一次压缩事故会永久改变这个会话的产出形态。
+ */
+export async function shrinkLargestToolResults(
+  messages: Message[],
+  targetChars: number,
+  skipToolNames: ReadonlySet<string> = new Set(),
+): Promise<{
+  messages: Message[]
+  replacements: Map<string, string>
+  freedChars: number
+}> {
+  const nameById = skipToolNames.size > 0 ? buildToolNameMap(messages) : undefined
+  const candidates = collectCandidatesByMessage(messages)
+    .flat()
+    .filter(
+      c =>
+        nameById === undefined ||
+        !skipToolNames.has(nameById.get(c.toolUseId) ?? ''),
+    )
+    .sort((a, b) => b.size - a.size)
+
+  const replacements = new Map<string, string>()
+  let freedChars = 0
+  for (const candidate of candidates) {
+    if (freedChars >= targetChars) break
+    const replacement = await buildReplacement(candidate)
+    // 落盘失败就跳过这一条 —— 原文还在,下一条继续试。
+    if (replacement === null) continue
+    replacements.set(candidate.toolUseId, replacement.content)
+    freedChars += candidate.size - replacement.content.length
+  }
+
+  if (replacements.size === 0) {
+    return { messages, replacements, freedChars: 0 }
+  }
+  logEvent('tengu_compact_ptl_volume_shrink', {
+    replaced: replacements.size,
+    freedChars,
+  })
+  return {
+    messages: replaceToolResultContents(messages, replacements),
+    replacements,
+    freedChars,
+  }
+}
+
+/**
  * Enforce the per-message budget on aggregate tool result size.
  *
  * For each user message whose tool_result blocks together exceed the
@@ -782,6 +911,8 @@ export async function enforceToolResultBudget(
   messages: Message[],
   state: ContentReplacementState,
   skipToolNames: ReadonlySet<string> = new Set(),
+  /** 这个员工的窗口(字符)。`undefined` = 主循环,预算回落 `Infinity`,整条不生效。 */
+  windowChars?: number,
 ): Promise<{
   messages: Message[]
   newlyReplaced: ToolResultReplacementRecord[]
@@ -795,7 +926,7 @@ export async function enforceToolResultBudget(
   // Resolve once per call. A mid-session flag change only affects FRESH
   // messages (prior decisions are frozen via seenIds/replacements), so
   // prompt cache for already-seen content is preserved regardless.
-  const limit = getPerMessageBudgetLimit()
+  const limit = getPerMessageBudgetLimit(windowChars)
 
   // Walk each API-level message group independently. For previously-processed messages
   // (all IDs in seenIds) this just re-applies cached replacements. For the
@@ -938,11 +1069,31 @@ export async function applyToolResultBudget(
   state: ContentReplacementState | undefined,
   writeToTranscript?: (records: ToolResultReplacementRecord[]) => void,
   skipToolNames?: ReadonlySet<string>,
+  /** 这个员工的窗口(字符)。`undefined` = 主循环,整条不生效。 */
+  windowChars?: number,
+  /**
+   * 真的落了盘时叫一声 —— **这是落盘唯一的可见出口**。
+   *
+   * `PERSISTED_OUTPUT_TAG` 全仓没有任何渲染器消费,落盘现在只有 `logForDebugging` 和
+   * `logEvent`,屏幕上一个字都没有。少了这个口子,用户看到的是子 agent 突然「读了又读」
+   * 而没有任何一行解释它的产出被换成了预览 —— 静默截断是这个仓库反复付代价的那一类。
+   */
+  onPersisted?: (records: ToolResultReplacementRecord[]) => void,
 ): Promise<Message[]> {
   if (!state) return messages
-  const result = await enforceToolResultBudget(messages, state, skipToolNames)
+  const result = await enforceToolResultBudget(
+    messages,
+    state,
+    skipToolNames,
+    windowChars,
+  )
   if (result.newlyReplaced.length > 0) {
     writeToTranscript?.(result.newlyReplaced)
+    try {
+      onPersisted?.(result.newlyReplaced)
+    } catch {
+      /* 上屏失败不能让这一轮请求挂掉 */
+    }
   }
   return result.messages
 }

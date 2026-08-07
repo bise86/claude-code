@@ -77,7 +77,10 @@ import {
   registerAgent as registerPerfettoAgent,
   unregisterAgent as unregisterPerfettoAgent,
 } from '../../utils/telemetry/perfettoTracing.js'
-import type { ContentReplacementState } from '../../utils/toolResultStorage.js'
+import {
+  type ContentReplacementState,
+  createContentReplacementState,
+} from '../../utils/toolResultStorage.js'
 import { createAgentId } from '../../utils/uuid.js'
 import { resolveAgentTools } from './agentToolUtils.js'
 import { isTranslatingProtocol } from '../../services/api/openaiCompat/protocols.js'
@@ -244,6 +247,39 @@ function isRecordableMessage(
       'subtype' in msg &&
       msg.subtype === 'compact_boundary')
   )
+}
+
+/**
+ * 这个子 agent 用哪一份「产出替换」账本。
+ *
+ * **少了这个函数,「按员工窗口给每条消息的 tool_result 总量封顶」对 `/et` 一次都不会发生。**
+ * `provisionContentReplacementState` 全仓只有 `REPL.tsx` 一个调用点(而且被
+ * `tengu_hawthorn_steeple` 关着),`runAgentAdapter` 调 `run()` 时不传
+ * `contentReplacementState` —— 于是 `query.ts` 的 `applyToolResultBudget` 第一行
+ * `if (!state) return messages` 直接返回。翻开关 + 改预算值全是空操作,而且**编译通过、
+ * 测试全绿**,只有跑机上才看得出来没生效。
+ *
+ * 两条判据的归属:
+ *
+ *  - **传进来的优先。** 那是 fork 型调用方(agentSummary 等)为了命中 prompt cache
+ *    显式克隆过来的一份,盖掉它就是打断缓存。
+ *  - **自己开一份,不复用父会话那一份。** 预算按**这个员工自己的窗口**算,而父会话的窗口
+ *    通常大一个数量级;更要紧的是 `seenIds` 是「谁看过」的账本,共用会让员工侧读到主会话
+ *    「看过且没替换」的冻结记录,从而**永远不替换** —— 那正是这个功能要修的毛病。
+ *
+ * 抽成具名导出函数而不是写在 `createSubagentContext` 的参数里,是为了让探针打在**真的
+ * 被调用的那个函数**上:内联表达式只能靠在测试里重抄一遍来验,而重抄出来的那份和真身
+ * 漂移的时候,测试仍然是绿的(这个仓库为「测了一个长得像的替身」付过学费)。
+ */
+export function subagentReplacementState(
+  inherited: ContentReplacementState | undefined,
+  agentDefinition: Pick<AgentDefinition, 'execMode' | 'roleClientConfig'>,
+): ContentReplacementState | undefined {
+  if (inherited) return inherited
+  if (agentDefinition.execMode !== 'api') return undefined
+  return agentDefinition.roleClientConfig?.contextWindow === undefined
+    ? undefined
+    : createContentReplacementState()
 }
 
 export async function* runAgent({
@@ -730,7 +766,26 @@ export async function* runAgent({
     shareSetResponseLength: true, // Both sync and async contribute to response metrics
     criticalSystemReminder_EXPERIMENTAL:
       agentDefinition.criticalSystemReminder_EXPERIMENTAL,
-    contentReplacementState,
+    /**
+     * **声明了窗口的 api 员工,自己开一份聚合预算状态。**
+     *
+     * 少了这一句,「按员工窗口给每条消息的 tool_result 总量封顶」这个功能对 `/et`
+     * **一次都不会发生**:`provisionContentReplacementState` 全仓只有 `REPL.tsx:1505`
+     * 一个调用点(而且被 `tengu_hawthorn_steeple` 关着),`runAgentAdapter` 调 `run()` 时
+     * 不传 `contentReplacementState` —— 于是 `query.ts` 的 `applyToolResultBudget`
+     * 第一行 `if (!state) return messages` 直接返回。翻开关 + 改预算值全都是空操作,
+     * 而且**编译通过、测试全绿**,只有跑机上才看得出来没生效。
+     *
+     * 为什么不复用父会话那一份:预算是按**这个员工自己的窗口**算的,而父会话的窗口
+     * 通常大一个数量级;更要紧的是 `seenIds` 是「谁看过」的账本,两个窗口不同的会话
+     * 共用一份,会让员工侧读到主会话「看过且没替换」的冻结记录,从而**永远不替换**。
+     * 传进来的那一份仍然优先 —— 那是 fork 型调用方(agentSummary 等)为了命中
+     * prompt cache 显式克隆过来的,盖掉它会打断缓存。
+     */
+    contentReplacementState: subagentReplacementState(
+      contentReplacementState,
+      agentDefinition,
+    ),
   })
 
   // Preserve tool use results for subagents with viewable transcripts (in-process teammates)
