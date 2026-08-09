@@ -66,10 +66,12 @@ export type Advanceable = { node: TaskNode; kind: 'start' | 'execute' | 'integra
 export function notSchedulableReason(
   node: TaskNode,
   byId: Map<string, TaskNode>,
-  opts?: { inFlight?: ReadonlySet<string>; held?: ReadonlySet<string> },
+  // `held` 不单独收:编排器把被扣住的节点**折进了同一个集合**
+  // (`pickBatch(…, new Set([...inFlight.keys(), ...this.held]), …)`),再开一个形参
+  // 只会得到一个永远没有实参的分支 —— 而这个仓库刚为「不可达分支」付过一轮验收。
+  opts?: { inFlight?: ReadonlySet<string> },
 ): string | undefined {
-  if (opts?.inFlight?.has(node.id) === true) return '此刻正在运行'
-  if (opts?.held?.has(node.id) === true) return '此刻被另一次操作扣住'
+  if (opts?.inFlight?.has(node.id) === true) return '此刻正在运行(或被另一次操作扣住)'
   if (isTerminal(node.status)) return `已经是终态(${node.status})`
   if (hasBlockedAncestor(node, byId)) return '上级任务已阻断 —— 它的整棵子树都不会再被调度'
   if (advanceableKind(node, byId) === null) {

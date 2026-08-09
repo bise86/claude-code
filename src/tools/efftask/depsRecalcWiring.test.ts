@@ -192,7 +192,7 @@ describe('恢复边界', () => {
     expect(out.repairs.join('')).toContain('依赖重算记录已损坏')
   })
 
-  it('孤零零的 dropped 计数不许留着(会让 run.md 印 ⟲ 而 node.md 一条都没有)', () => {
+  it('垃圾值的 dropped 计数被清掉(合法正数留着 —— 见 recalcFollowup 那条)', () => {
     const n = mk('root')
     ;(n as { depsRecalcDropped?: unknown }).depsRecalcDropped = '七'
     const out = validateLoadedNodes([n], { goal: 'g', phaseRoles: roles(), now: NOW })
@@ -205,5 +205,51 @@ describe('恢复边界', () => {
     const r = out.nodes[0].depsRecalc![0]
     expect(r.from[0].length).toBeLessThan(50_000)
     expect((r.note ?? '').length).toBeLessThan(50_000)
+  })
+})
+
+// ════════════════════════════════════════════════ 与重做的交互
+
+describe('redoCommit 的悬空依赖诊断', () => {
+  /**
+   * 这段话点名的是一条**不可恢复**的路:子树已从盘上删掉、而依赖方的 node.md 没写回去 →
+   * 下次 `--resume` 走 `block(A, '依赖节点缺失')`,而 `block()` 把 interrupted /
+   * capBlocked / mergeConflict 三个复活开关**全部清零** —— `--retry-blocked` 和重做都
+   * 救不回来,只能手改 node.md。所以这句话必须**点名到 id**,而且自带修法。
+   *
+   * 它此前零覆盖:提交信息里强调过,而剪掉整段没有任何测试会红。
+   */
+  it('写失败 + 盘上还指着被删节点 → 点名到 id,并给出改成什么', async () => {
+    const { commitRedo } = await import('./redoCommit.js')
+    const before = [
+      mk('root', { kind: 'decompose', childIds: ['root/00-a', 'root/01-b'] }),
+      mk('root/00-a', { parentId: 'root', deps: ['root/01-b/00-x'] }),
+      mk('root/01-b', { parentId: 'root', childIds: ['root/01-b/00-x'] }),
+      mk('root/01-b/00-x', { parentId: 'root/01-b' }),
+    ]
+    const after = before.filter(n => n.id !== 'root/01-b/00-x').map(n => ({ ...n }))
+    after.find(n => n.id === 'root/00-a')!.deps = ['root/01-b']
+    const problems = await commitRedo(
+      {
+        fs: {
+          writeFile: async () => { throw new Error('磁盘满') },
+          mkdir: async () => {}, readFile: async () => '', readdir: async () => [],
+          exists: async () => true, mkdirExclusive: async () => true,
+          unlink: async () => {}, rmdir: async () => {},
+        } as never,
+        runDir: '/run/001', config: cfg(), before,
+      },
+      {
+        nodes: after, deleted: ['root/01-b/00-x'],
+        dependencyRewrites: [{ nodeId: 'root/00-a', from: 'root/01-b/00-x', to: 'root/01-b' }],
+        worktreesToRelease: [], seatedAt: 'CREATED', reopenedAncestors: [], warnings: [],
+      },
+    )
+    const text = problems.problems.join('\n')
+    expect(text).toContain('root/00-a')
+    expect(text).toContain('root/01-b/00-x')      // 指着哪个被删的节点
+    expect(text).toContain('依赖节点缺失')          // 下次 resume 会怎么死
+    expect(text).toContain('--retry-blocked')      // 而且救不回来
+    expect(text).toContain('root/01-b')            // 该改成什么
   })
 })

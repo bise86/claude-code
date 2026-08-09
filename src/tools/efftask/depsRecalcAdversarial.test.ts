@@ -514,10 +514,11 @@ describe('notSchedulableReason', () => {
     expect(why).toContain('上级任务已阻断')
   })
 
-  it('在飞 / 被扣住 / 终态各说各的', () => {
+  it('在飞 / 终态各说各的(被扣住的节点由编排器折进同一个集合)', () => {
     const m = tree()
+    // 编排器传的是 `new Set([...inFlight.keys(), ...this.held])` —— 两者同一个入口,
+    // 所以这里不该有第二个形参(那会是一个永远拿不到实参的分支)。
     expect(notSchedulableReason(m.get(A)!, m, { inFlight: new Set([A]) })).toContain('正在运行')
-    expect(notSchedulableReason(m.get(A)!, m, { held: new Set([A]) })).toContain('扣住')
     const acc = tree({ [A]: { status: 'ACCEPTED' } })
     expect(notSchedulableReason(acc.get(A)!, acc)).toContain('终态')
   })

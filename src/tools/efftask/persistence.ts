@@ -222,9 +222,12 @@ function depsRecalcBody(node: TaskNode): string {
   const lines = list.map(r =>
     `- ${stripControl(String(r?.at ?? '?'))}: ${clipBody(ids(r?.from))} → ${clipBody(ids(r?.to))}` +
     (r?.note ? `(${clipBody(stripControl(String(r.note)))})` : ''))
-  const note = dropped > 0
-    ? `\n(另有 ${dropped} 次重算在恢复时未逐条保留 —— 保留的是最早一条和最近几条)`
-    : ''
+  // 零记录时不许写「**另有** N 次」—— 那句话暗示还有别的可以读,而这一节是空的。
+  // 这个态是可达的:更早的恢复边界夹掉过、或整批记录坏掉被丢弃,而计数是真信息(留着)。
+  const note = dropped <= 0 ? ''
+    : lines.length === 0
+      ? `\n(共 ${dropped} 次重算,逐条记录均未保留)`
+      : `\n(另有 ${dropped} 次重算在恢复时未逐条保留 —— 保留的是最早一条和最近几条)`
   return `## 依赖重算\n${lines.join('\n')}${note}\n\n`
 }
 

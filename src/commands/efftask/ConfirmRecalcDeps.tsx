@@ -48,6 +48,13 @@ export function ConfirmRecalcDeps(props: {
    */
   streams?: readonly StreamState[]
   columns?: number
+  /**
+   * 改完之后**本任务当场跑得起来吗** —— 方案把它叫做「这个功能唯一的成功指标」。
+   *
+   * 由调用方走 `notSchedulableReason`(和 `pickBatch` 同一份判据)回答:只判
+   * `depsSatisfied` 会在**祖先阻断**上说谎 —— 那种节点依赖全满足也永远不会被调度。
+   */
+  schedulableNow?: () => boolean
 }): React.ReactElement {
   const term = useTerminalSize()
   const { rows, columns } = useModalOrTerminalSize(term)
@@ -117,7 +124,19 @@ export function ConfirmRecalcDeps(props: {
       void props.onApply(p).then(
         r => {
           if (r.ok === true) {
-            setResult(`依赖已更新:${p.before.length} 条 → ${p.after.length} 条。`)
+            /**
+             * **和 ready 屏同一个口径:before 去重。**
+             *
+             * `node.deps` 可以含重复,而 `after` 是去重的。只改一处的后果是同一次重算的
+             * 两屏互相矛盾:ready 说「从 1 条变成 1 条」,done 说「2 条 → 1 条」。
+             */
+            const kept = new Set(p.before).size
+            setResult(
+              `依赖已更新:${kept} 条 → ${p.after.length} 条。` +
+              (props.schedulableNow?.() === true
+                ? '本任务的依赖现在全部满足,马上就会被调度。'
+                : '本任务仍在等依赖 —— 只是这次等的是更小的那几项。'),
+            )
             setMode('done')
           } else {
             setError(r.diskChanged

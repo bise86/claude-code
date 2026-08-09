@@ -663,8 +663,15 @@ export function validateLoadedNodes(
         }
       } else delete n.depsRecalcDropped
     } else if (n.depsRecalcDropped !== undefined) {
-      // 没有记录就没有「被夹掉的记录」。留着一个孤零零的计数会让 run.md 印出
-      // 「⟲ 依赖重算 ×7」而 node.md 那一节一条都没有。
+      /**
+       * **计数**在没有记录时仍然留着 —— 它是真信息:这个节点确实被手工重算过 N 次,
+       * 只是那些记录已经在更早的恢复边界上被夹掉了(或整批坏掉被丢弃)。删掉它等于
+       * 抹掉「有人动过这个节点的依赖」这件事本身,而那正是 run.md 上 ⟲ 存在的理由。
+       *
+       * 代价是「⟲ ×7 而一条记录都读不到」这个态是可达的,所以 **node.md 那一节必须
+       * 自己说清楚**(见 persistence 的 depsRecalcBody:零记录时不许写「另有 N 次」,
+       * 那句话暗示还有别的可读)。这里只把垃圾值归一化。
+       */
       const d = Number.isFinite(n.depsRecalcDropped) ? Math.max(0, Math.trunc(n.depsRecalcDropped as number)) : 0
       if (d > 0) n.depsRecalcDropped = d
       else delete n.depsRecalcDropped

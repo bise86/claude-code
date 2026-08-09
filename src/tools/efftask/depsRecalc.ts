@@ -165,8 +165,8 @@ export function recalcScope(
   node: TaskNode,
   byId: Map<string, TaskNode>,
   opts: {
+    /** 此刻在飞的节点(编排器把被扣住的也折在这一个集合里)。 */
     running?: ReadonlySet<string>
-    held?: ReadonlySet<string>
     /** `control.wasCancelled(node.id)`。 */
     cancelled?: boolean
     /** 编排器已经跑完了吗。 */
@@ -179,7 +179,7 @@ export function recalcScope(
     return no('本次编排已经结束,依赖重算需要编排器还在跑。' +
       '`/et --resume` 继续这一趟之后,这个键就回来了。')
   }
-  if (opts.running?.has(node.id) === true || opts.held?.has(node.id) === true) {
+  if (opts.running?.has(node.id) === true) {
     // 不许复用下面那条「已经开始分析」的文案:`CREATED` + 正在运行写成
     // 「已经开始分析(当前 CREATED)」是一句当场自相矛盾的话。
     return no('这个任务此刻正在被调度器执行 —— 先在树上选中它按 x 取消,再来重算。')
@@ -593,6 +593,8 @@ export interface NormalizeOpts {
   perDep?: number
   /** 总上限。默认 `MAX_DEPS_TOTAL`。 */
   total?: number
+  /** 因为子树太大而**没被列进清单**的依赖 —— 它们不是「模型没答」,是我们没问。 */
+  notAsked?: readonly string[]
 }
 
 /**
@@ -645,7 +647,18 @@ export function normalizeRecalc(
     }
     if (sel.size === 0) {
       // 兜底:每个依赖至少一项。**规则 4 在代码里成立,不在提示词里成立。**
-      perDep.push({ dep: g.dep, needs: [{ id: g.dep, why: '' }], dropped, rolledUp: [], keptCoarse: needs.length > 0 ? '模型给的项一条都没对上' : '模型没有给出这一条依赖' })
+      perDep.push({
+        dep: g.dep, needs: [{ id: g.dep, why: '' }], dropped, rolledUp: [],
+        /**
+         * 三种成因,三句话。**「没问过」不许说成「它没答」** —— 子树装不下预算时这条依赖
+         * 根本没进清单(见 buildRecalcListing 的 tooBig),而模型对一个它从没见过的依赖
+         * 当然给不出项;报成「模型没有给出」是把我们自己的限制记在它头上,而用户据此
+         * 得出的结论(「再按一次说不定就好了」)是错的。
+         */
+        keptCoarse: opts.notAsked?.includes(g.dep) === true
+          ? '子树太大,没能列进这次调用 —— 模型没被问过这一条'
+          : needs.length > 0 ? '模型给的项一条都没对上' : '模型没有给出这一条依赖',
+      })
       continue
     }
     if (!(sel.size === 1 && sel.has(g.dep))) anyModelFiner = true

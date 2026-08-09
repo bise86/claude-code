@@ -78,7 +78,9 @@ export async function askRecalc(
     }
     if (signal.aborted) return { aborted: true }
     const parsed = parseDepsRecalc(text, tag)
-    const plan = normalizeRecalc(node, deps.byId(), scope, parsed.answer)
+    // 部分依赖装不下时**照样发这次调用**(其余的仍然值得细化),但要把「没问过」这件事
+    // 带进计划里 —— 不带的话它们会被报成「模型没有给出这一条依赖」,一句假话。
+    const plan = normalizeRecalc(node, deps.byId(), scope, parsed.answer, { notAsked: listing.tooBig })
     if (parsed.truncated > 0) {
       plan.warnings.push(`⚠ 模型给的项超过解析上限,有 ${parsed.truncated} 项没被读进来。`)
     }

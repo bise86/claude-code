@@ -41,6 +41,7 @@ import { ConfirmForcePass } from './ConfirmForcePass.js'
 import { ConfirmCleanup } from './ConfirmCleanup.js'
 import { ConfirmRecalcDeps } from './ConfirmRecalcDeps.js'
 import { recalcScope, type RecalcPlan } from '../../tools/efftask/depsRecalc.js'
+import { notSchedulableReason } from '../../tools/efftask/scheduler.js'
 import { applyRecalc, askRecalc, type RecalcApply, type RecalcAsk } from '../../tools/efftask/depsRecalcRun.js'
 import { runCleanup, scanCleanup, type CleanupDeps } from '../../tools/efftask/cleanupWorktrees.js'
 import { ConfirmResume } from './ConfirmResume.js'
@@ -2162,6 +2163,18 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           })
           if (out.ok) setNodes([...nodes])
           return out
+        }}
+        /**
+         * 改完之后**当场跑得起来吗** —— 走 `notSchedulableReason`,和 `pickBatch` 同一份判据。
+         * 只判 `depsSatisfied` 会在祖先阻断上说谎:那种节点依赖全满足也永远不会被调度,
+         * 而这一句是这个功能唯一的成功指标。
+         */
+        schedulableNow={() => {
+          const m = byId()
+          const n = m.get(target.id)
+          return n !== undefined && notSchedulableReason(n, m, {
+            inFlight: new Set(orchRef.current?.runningNodeIds() ?? []),
+          }) === undefined
         }}
         onCancelAsk={() => {
           /**
