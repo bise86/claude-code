@@ -8,6 +8,8 @@ import { useModalOrTerminalSize } from '../../context/modalContext.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { useLiveState } from './useLiveState.js'
 import { redoSummaryLines, isWarningLine } from './ConfirmRedo.js'
+import { AgentLogPane } from './AgentLogPane.js'
+import type { StreamState } from '../../tools/efftask/agentStream.js'
 
 /**
  * 「依赖重算」关口 —— 一屏,五态。
@@ -38,6 +40,14 @@ export function ConfirmRecalcDeps(props: {
   /** 取消这一次在飞的模型调用。**只 abort per-call controller** —— 见下面那段注释。 */
   onCancelAsk: () => void
   onDone: () => void
+  /**
+   * 这一次调用的实时输出。
+   *
+   * **不是装饰**:这一屏会停几分钟,而少了它「模型卡住了」和「正常在读」在屏幕上
+   * 长得一模一样 —— 用户唯一的信息是一个在跳的秒数。这个仓库为「没看到日志」改过一轮。
+   */
+  streams?: readonly StreamState[]
+  columns?: number
 }): React.ReactElement {
   const term = useTerminalSize()
   const { rows, columns } = useModalOrTerminalSize(term)
@@ -128,6 +138,11 @@ export function ConfirmRecalcDeps(props: {
         <Text bold color="warning">{title}</Text>
         <Text dimColor>正在让主模型按已拆出的子任务重新判断依赖…(已等待 {secs}s)</Text>
         <Text dimColor>别的任务仍在照常运行 —— 这一屏只挡住了任务树,没有暂停调度。</Text>
+        {props.streams && props.streams.length > 0 ? (
+          // isActive={false}:这一屏的键盘归本组件。窗口自己的 useInput 会把 `n` 认成
+          // 「下一条流」,而这里只有一条流、`n` 也不该有第二种含义。
+          <AgentLogPane streams={props.streams} height={12} width={props.columns ?? columns} isActive={false} />
+        ) : null}
         <Text dimColor>q / Esc 取消这次重算(要中止整个运行,请先按 Esc 退出这一屏)</Text>
       </Box>
     )

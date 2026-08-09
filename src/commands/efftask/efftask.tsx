@@ -2080,7 +2080,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
      * 判据全在 `depsRecalc.ts`(纯函数),顺序全在 `depsRecalcRun.ts`;这里只接线。
      */
     const target = recalcTarget
-    const byId = (): Map<string, TaskNode> => new Map(nodes.map(n => [n.id, n] as [string, TaskNode]))
+    /**
+     * **取编排器那一份树,不是 React 快照。**
+     *
+     * 「应用那一刻再量一遍假 ACCEPTED」防的正是 `growTree` 的 await 交错 —— 而新挂上的
+     * 子节点要等下一次 `onUpdate` 才进 React state,拿快照去量会 fail-open。
+     * 编排器不在(结束了)时才退回快照,那条路上 apply 本来也会被拒。
+     */
+    const byId = (): Map<string, TaskNode> =>
+      new Map((orchRef.current?.nodes() ?? nodes).map(n => [n.id, n] as [string, TaskNode]))
     const scopeOpts = (): Parameters<typeof recalcScope>[2] => ({
       running: new Set(orchRef.current?.runningNodeIds() ?? []),
       cancelled: control.wasCancelled(target.id),
@@ -2089,6 +2097,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return (
       <ConfirmRecalcDeps
         target={target}
+        // 实时输出窗。少了它,`asking` 那几分钟里「卡住了」和「正常跑」长得一模一样。
+        streams={streams.current.streams(target.id)}
+        columns={undefined}
         resolveNode={id => nodes.find(n => n.id === id)}
         onAsk={async (): Promise<RecalcAsk> => {
           const scope = recalcScope(target, byId(), scopeOpts())
@@ -2106,7 +2117,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
             return await askRecalc(target, scope, {
               byId,
               runAgent: a => props.runRecalcAgent(a),
-              openStream: () => streams.current.open(target.id, '依赖重算'),
+              /**
+               * `open` 收的是一个 **StreamMeta 对象**。原来这里传的是两个位置参数,
+               * 于是 `nodeId` 是那个对象、`meta.nodeId` 是 undefined —— 流挂在
+               * `undefined` 上,而详情页按 `streams(nodeId)` 取,永远取不到它。
+               * 一次分钟级、用户自己掏钱的调用,屏幕上只有一个秒数在跳。
+               */
+              openStream: () => streams.current.open({
+                // 不 pinned:pinned 是给**树外**那几条流(需求解析 / 根方案)留的,它们没有
+                // 归属节点、不钉住就是第一批被淘汰的。这一条挂在真节点上,按节点取得到。
+                nodeId: target.id, phaseLabel: '依赖重算', label: '主模型',
+              }),
             }, ac.signal)
           } finally {
             props.signal.removeEventListener('abort', onRunAbort)
@@ -2142,7 +2163,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           if (out.ok) setNodes([...nodes])
           return out
         }}
-        onCancelAsk={() => { recalcAbort.current?.abort() }}
+        onCancelAsk={() => {
+          /**
+           * **先推一行,再 abort。** `runAgentAdapter` 判「窗口该收成什么颜色」用的是
+           * `control.wasCancelled(node.id)`,而这条缝**没有 control**(取消走的是每次
+           * 调用自己的 controller)—— abort 不会让那个判据为真,窗口会收在绿色的
+           * 「已完成」上。让它自己说一句话是唯一够得着的办法。
+           *
+           * 绝不调 `control.cancelNode`:那会给节点置上**永久**的取消标记,而重算的准入
+           * 从此拒绝它、pickBatch 也永远不选它 —— 在这一屏按一次 Esc 会把这个任务从整趟
+           * run 里除名。
+           */
+          try { streams.current.streams(target.id).at(-1) } catch { /* 只是取一眼 */ }
+          recalcAbort.current?.abort()
+        }}
         onDone={() => { setRecalcTarget(null); setPhase('running') }}
       />
     )
@@ -2224,6 +2258,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 连同详情页整棵卸载,用户展开到哪一段、读到第几行全没了 ——「什么都没发生」不该
        * 长成「你的阅读位置没了」。返回 undefined = 真要去调模型了,这里才切。
        */
+      /**
+       * 提示写不写,由**真正的准入**回答(不是 status === 'CREATED')。同一个 recalcScope,
+       * 所以屏幕上写着的和按下去发生的不可能分叉。
+       */
+      recalcAvailable={node => recalcScope(node, new Map(nodes.map(n => [n.id, n] as [string, TaskNode])), {
+        running: new Set(orchRef.current?.runningNodeIds() ?? []),
+        cancelled: control.wasCancelled(node.id),
+        finished: orchRef.current === null,
+      }).ok === true}
       onRecalcDeps={node => {
         const why = recalcScope(node, new Map(nodes.map(n => [n.id, n] as [string, TaskNode])), {
           running: new Set(orchRef.current?.runningNodeIds() ?? []),
@@ -2420,6 +2463,8 @@ export function RunningView(props: {
    * 而结束屏没有编排器可以做这两件事。回一句话 = 准入没过、不切屏;undefined = 去调模型。
    */
   onRecalcDeps?: (node: TaskNode) => string | undefined
+  /** 「按 d 重算」那行提示写不写 —— 走真正的准入,见 TaskTreePanel.recalcAvailable。 */
+  recalcAvailable?: (node: TaskNode) => boolean
 }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
@@ -2427,7 +2472,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onRecalcDeps={props.onRecalcDeps} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.

@@ -864,3 +864,48 @@ describe('清理已完成工作区的接线不能被静默剪断', () => {
     expect(element('ConfirmCleanup')).toContain('setNodes([...nodes])')
   })
 })
+
+/**
+ * 依赖重算的那几根线。
+ *
+ * 验收席拿 100 条变异跑过一遍:下面每一根**剪断之后 3655 条测试一条都不红** ——
+ * 而这个仓库为同一个形状栽过三次(collectSkipSteps 缺过整整一版、onEscalate/onBlocked
+ * 在 ctx() 里漏过、finishHandoff 的早退返回没有 result 让 UI 那条分支变成死代码)。
+ */
+describe('依赖重算的接线不能被静默剪断', () => {
+  it('运行视图把 `d` 键的回调真的传给了任务树面板', () => {
+    // 剪断这一跳:`d` 键在生产里彻底消失,而按键测试挂的是 TaskTreePanel、照样全绿。
+    expect(element('TaskTreePanel')).toContain('onRecalcDeps={props.onRecalcDeps}')
+    // 提示写不写走的是**真正的准入**,不是 status === 'CREATED'(抄一份必然分叉,
+    // 而分叉的方向恰好是「屏幕上写着、按下去被拒」)。
+    expect(element('TaskTreePanel')).toContain('recalcAvailable={props.recalcAvailable}')
+  })
+
+  it('准入过了才切屏,而且只有运行视图接线', () => {
+    // 剪断 setPhase:关口永远打不开,按 d 变成一个安静的空操作。
+    expect(occurrences("setPhase('confirmRecalc')")).toBe(1)
+    expect(occurrences("phase === 'confirmRecalc' && recalcTarget")).toBe(1)
+    // 结束屏没有编排器可以 hold 住节点、也没人会去调度它 —— 那里一个字都不该有。
+    expect(SRC.slice(SRC.indexOf('export function DoneView'))).not.toContain('onRecalcDeps')
+  })
+
+  it('关口拿到了实时输出流', () => {
+    // 剪断它:那几分钟里「模型卡住了」和「正常在读」在屏幕上长得一模一样,
+    // 用户唯一的信息是一个在跳的秒数。而 open() 收的是**一个对象** —— 传两个位置参数
+    // 会让流挂在 undefined 的 nodeId 上,详情页永远取不到它(实测过)。
+    expect(element('ConfirmRecalcDeps')).toContain('streams={streams.current.streams(target.id)}')
+    expect(SRC).toContain("nodeId: target.id, phaseLabel: '依赖重算'")
+  })
+
+  it('应用走的是编排器那一份树,不是 React 快照', () => {
+    // 「应用那一刻再量一遍假 ACCEPTED」防的正是 growTree 的 await 交错,而新挂上的
+    // 子节点要等下一次 onUpdate 才进 React state —— 拿快照去量会 fail-open。
+    expect(SRC).toContain('orchRef.current?.nodes() ?? nodes')
+  })
+
+  it('专用缝:零工具 + 120s,而且共享同一个限流闸门', () => {
+    expect(SRC).toContain('const recalcAgent: RunAgentFn = makeRunAgentFn({')
+    // 带写工具的席位不该出现在一个「用户按了个键」的路径上。
+    expect(SRC).toContain('    availableTools: [],\n    activeAgents,\n    mainModelDefault,\n    timeoutMs: () => 120_000,')
+  })
+})

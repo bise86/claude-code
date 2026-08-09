@@ -50,6 +50,22 @@ export const RECALC_CHROME_BUDGET = 3000
 
 const cp = (s: string): number => Array.from(s).length
 
+/**
+ * **围栏中和** —— 和 `pipeline.ts` 的 `quote()` 同因、同写法。
+ *
+ * 这一节铺进提示词的每一个字段(节点标题、本任务目标、上级方案要点)都是**别的 agent
+ * 写的**,而它们和我们自己的 schema 代码块共处一份提示词。一个三反引号就能当场把那个
+ * 代码块关掉:run 001 上一次 `` ` `` 的非法转义让整份方案回退成散文、验收点变空,
+ * 五个席位里两个逐字同因烧穿了迭代上限,一行代码没写。
+ *
+ * 这个函数**掉过一次**:`recalcPrompt` 的注释和方案里都写着「过 quote()」,而落地时
+ * 三处都只过了 `capText`。验收席用一个标题为三反引号的子任务复现:提示词里的围栏数
+ * 从 2 变成 3。
+ */
+function quoteField(s: string): string {
+  return s.replace(/`/g, "'")
+}
+
 // ---------------------------------------------------------------- 血缘工具
 
 /** `id` 是不是 `ancestorId` 或它的后代。顺 parentId 上溯,带环保护(childIds/parentId 可手工编辑)。 */
@@ -263,12 +279,12 @@ const statusOf = (n: TaskNode): string => STATUS_WORD[n.status] ?? n.status
  */
 function listLine(n: TaskNode): string {
   const kids = n.childIds.length > 0 ? `已拆 ${n.childIds.length} 个子任务` : '叶子'
-  return `- ${n.id} | ${capText(n.title, 200)} | ${statusOf(n)} | ${kids}`
+  return `- ${n.id} | ${quoteField(capText(n.title, 200))} | ${statusOf(n)} | ${kids}`
 }
 
 function summaryLine(n: TaskNode): string {
-  const k = capText((n.plan.keyPoints || '').trim(), 300)
-  const a = capText((n.plan.acceptance || '').trim(), 300)
+  const k = quoteField(capText((n.plan.keyPoints || '').trim(), 300))
+  const a = quoteField(capText((n.plan.acceptance || '').trim(), 300))
   if (!k && !a) return ''
   return `    ${[k && `要点:${k}`, a && `验收:${a}`].filter(Boolean).join(' / ')}`
 }
@@ -379,9 +395,9 @@ export function recalcPrompt(args: {
   return (
     '你在做一次**依赖细化**。下面这个任务原本依赖若干个粗粒度的任务,而那些任务现在已经\n' +
     '拆出了自己的子任务。请判断:它到底要用到哪几个更小的任务的产出。\n\n' +
-    `本任务:${capText(node.title, 200)}\n` +
-    `本任务的目标:\n${capText(node.goal, 1200)}\n` +
-    (args.parentPlan ? `上级方案要点:\n${capText(args.parentPlan, 800)}\n` : '') +
+    `本任务:${quoteField(capText(node.title, 200))}\n` +
+    `本任务的目标:\n${quoteField(capText(node.goal, 1200))}\n` +
+    (args.parentPlan ? `上级方案要点:\n${quoteField(capText(args.parentPlan, 800))}\n` : '') +
     '\n以下是每个依赖任务的子树。\n\n' +
     args.listing +
     '\n\n判断规则:\n' +
@@ -391,7 +407,7 @@ export function recalcPrompt(args: {
     '但确实需要更多就都写出来,**不要为了少写几项而改写成它们的父任务**。\n' +
     '4. 拿不准就写那个依赖任务自己的 id(意思是保持原样)。每个依赖**至少给出一项**。\n' +
     '5. 每一项都要写一句 why(不超过 40 字):本任务的哪一步要用到它。\n' +
-    (args.feedback ? `\n上一轮的问题:\n${args.feedback}\n` : '') +
+    (args.feedback ? `\n上一轮的问题:\n${quoteField(args.feedback)}\n` : '') +
     '\n输出(只输出一个代码块,最外层是一个对象;id 从上面清单里**逐字复制**):\n' +
     `\`\`\`${args.tag}\n` +
     '{"deps":[{"dep":"<上面某个依赖任务的 id>","needs":[' +
@@ -519,6 +535,20 @@ function hasSelectedAncestor(id: string, set: ReadonlySet<string>, byId: Readonl
  */
 function collapseOnce(
   sel: Set<string>, scopeRoot: string, byId: ReadonlyMap<string, TaskNode>,
+  /**
+   * 这一步最多允许**减少**几条。`undefined` = 不限。
+   *
+   * 存在的理由是验收席实测出来的一道悬崖:一个有 12 个子任务的依赖,模型要 8 项 →
+   * 保住 8 条;要 **9** 项 → 唯一的候选组是父节点本身(9 个被选中的孩子 ≥2),一步卷回
+   * 粗依赖,屏幕上写「依赖**没有变化**」。而同样是 9 项,如果它们分属不同父节点就卷不动,
+   * 代码保留 9 项只发警告 —— **同一个数字两种结果**,而且坏的那一种恰好落在并发收益
+   * 最大的那类节点上(拆分型任务常常拆出 8 个以上子任务)。
+   *
+   * 所以非全覆盖的组只有在「卷完不会掉到上限以下」时才允许卷;卷不动就停下来发警告,
+   * 和「没有任何可卷的组」那条出口合流。**全覆盖的组不受这条限制** —— 那是用户点名的
+   * 规则,而且它不会让本任务多等任何一个用不上的兄弟。
+   */
+  maxReduction?: number,
 ): { parent: string; children: string[] } | undefined {
   // 候选:选中项的父节点,且父节点仍在这个依赖的子树里(不许卷到子树外面去 ——
   // 那可能是本节点的祖先,会让整次重算被最终安全闸判废,而用户只看到一句莫名其妙的放弃)
@@ -547,6 +577,8 @@ function collapseOnce(
     // **严格减少条数**才算一次上卷:一个只有独生子的父节点卷完还是 1 项,
     // 而外层是 `while (超限)` —— 那就是一个不推进的循环,跑在按键处理里等于终端卡死。
     .filter(([, kids]) => kids.length >= 2)
+    // 非全覆盖的组不许**过度**上卷(见 maxReduction)。全覆盖的不受限。
+    .filter(([p, kids]) => covered(p) || maxReduction === undefined || kids.length - 1 <= maxReduction)
     .sort((a, b) =>
       (Number(covered(b[0])) - Number(covered(a[0])))
       || (b[1].length - a[1].length)
@@ -637,7 +669,7 @@ export function normalizeRecalc(
     // ---- 单依赖数量闸:按需上卷 ----
     const rolledUp: string[] = []
     while (sel.size > perDepCap) {
-      const c = collapseOnce(sel, g.dep, byId)
+      const c = collapseOnce(sel, g.dep, byId, sel.size - perDepCap)
       if (!c) break
       for (const k of c.children) sel.delete(k)
       sel.add(c.parent)
@@ -700,7 +732,7 @@ function applyCountGates(
     let progressed = false
     for (const p of ordered) {
       const sel = new Set(p.needs.map(n => n.id))
-      const c = collapseOnce(sel, p.dep, byId)
+      const c = collapseOnce(sel, p.dep, byId, count() - cap)
       if (!c) continue
       for (const k of c.children) sel.delete(k)
       sel.add(c.parent)
@@ -766,29 +798,54 @@ export function finalGuard(
  * 线性增长,更要让它们排在后面。
  */
 export function recalcLines(plan: RecalcPlan, byId: ReadonlyMap<string, TaskNode>, parentId: string | null): string[] {
+  const strip = (s: string): string =>
+    // 这些字符串直接来自模型的回答(why / 被丢弃的 id / 警告里嵌的标题)。node.md、run.md、
+    // 详情页三处都过了 stripControl,唯独关口这一屏没过 —— 一个 ESC[2J 在这里就是清屏。
+    // eslint-disable-next-line no-control-regex -- stripping control bytes is the point
+    s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
   const out: string[] = [
     '这次重算只看任务树上的标题 / 目标 / 方案,**不读代码**。',
     '细化之后,本任务起跑时被依赖任务的其它子任务可能还没合进来 —— 工作区里看不到它们的代码;',
-    '  本任务的产出也会在它们完成之前就合进你当前的分支。',
-    '条数超上限时会把一组子任务卷成它们的父任务,那会多等一次集成验收。',
+    '  本任务的产出也会在它们完成之前就合进你当前的分支;那一层的集成验收也还没开,',
+    '  它可能返工、甚至补救拆分出新的子任务(那些节点此刻还不存在,新依赖不会覆盖它们)。',
+    /**
+     * **「为什么保留了 3 个孙子任务而不是 1 个子任务」必须在这里说。**
+     *
+     * 规范验收席的原话:用户唯一读得到的那一屏,关于上卷只有一句「条数超上限时会卷成
+     * 父任务」—— 描述的正是**没有发生**的那种情况。他看到细项被保留时,屏幕上没有一个字
+     * 说这是故意的、而且它比写父任务解锁得更早。理由只写在 README 和方案里等于没写。
+     */
+    '没超条数上限时**保留更细的那一份**:依赖一组子任务解锁必然不晚于依赖它们的父任务',
+    '  (父任务还要多过一整场集成验收),所以细的严格更优。超了才会卷,并且优先卷',
+    '  「全部子任务都被选中」的那一组。',
     '',
   ]
+  /**
+   * **警告排在明细之前。**
+   *
+   * 关口那套夹取是**从尾部**夹的(`redoSummaryLines`)。最终安全闸触发时,「已整次放弃
+   * (依赖保持原样)」**只存在于这些警告里** —— 排在最后的话,30 行终端上它第一个被吃掉,
+   * 而用户看到的是一屏细化明细加一个「回车 返回」的页脚。
+   */
+  for (const w of plan.warnings) out.push(strip(w))
+  if (plan.warnings.length > 0) out.push('')
   for (const p of plan.perDep) {
     out.push(`依赖:${depLabel(p.dep, byId, parentId)}`)
     if (p.keptCoarse) {
       out.push(`  → 保持原样(${p.keptCoarse})`)
     } else {
       for (const n of p.needs) {
-        out.push(`  → ${depLabel(n.id, byId, parentId)}  ${n.id}`)
-        if (n.why) out.push(`     因为:${n.why}`)
+        out.push(strip(`  → ${depLabel(n.id, byId, parentId)}  ${n.id}`))
+        if (n.why) out.push(strip(`     因为:${n.why}`))
       }
     }
     if (p.rolledUp.length > 0) out.push(`  · 已上卷 ${p.rolledUp.length} 处(条数超上限)`)
-    for (const d of p.dropped) out.push(`  · 丢弃:${d}`)
+    for (const d of p.dropped) out.push(strip(`  · 丢弃:${d}`))
   }
   if (plan.unchanged) out.push('', '结果:依赖**没有变化**。')
-  else out.push('', `结果:依赖从 ${plan.before.length} 条变成 ${plan.after.length} 条。`)
-  for (const w of plan.warnings) out.push(w)
+  // before 去重再数:node.deps 可以含重复,而 after 是去重的 —— 拿没去重的报数,
+  // 一次把 [乙,乙] 细化成一条会被说成「从 2 条变成 1 条」,而真相是从 1 条变成 1 条。
+  else out.push('', `结果:依赖从 ${new Set(plan.before).size} 条变成 ${plan.after.length} 条。`)
   return out
 }
 
@@ -806,8 +863,18 @@ export function revalidateRecalc(
   if (scope.ok !== true) return `树在这期间变了:${scope.reason}`
   if (!sameSet(node.deps, plan.before)) return '树在这期间变了:本任务的依赖已经被别的操作改过,请重新按 d'
   for (const id of plan.after) {
-    if (!byId.has(id)) return `树在这期间变了:${id} 已经不在树里,请重新按 d`
-    if (byId.get(id)!.status === 'ACCEPTED' && !subtreeFullyAccepted(id, byId)) {
+    /**
+     * **本来就悬空的那一条不算「树变了」。**
+     *
+     * `recalcScope` 专门为「依赖在树里找不到」写了一条 kept(措辞是「重算不碰它」),
+     * 于是那个 id 原样进 `after`;而这里再无条件要求每个 id 都在树里,同一个文件里
+     * 两条判据互相否定 —— 树一个字节没变,用户却被告知「树在这期间变了,请重新按 d」,
+     * 而重新按多少次结果都一样。判据改成「**这次新加进来的** id 必须还在」。
+     */
+    if (!byId.has(id) && !plan.before.includes(id)) {
+      return `树在这期间变了:${id} 已经不在树里,请重新按 d`
+    }
+    if (byId.get(id)?.status === 'ACCEPTED' && !subtreeFullyAccepted(id, byId)) {
       return `树在这期间变了:${id} 自称已完成、底下却还有没完成的子任务,请重新按 d`
     }
   }

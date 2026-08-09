@@ -287,6 +287,14 @@ export function TaskTreePanel(props: {
    */
   onRecalcDeps?: (node: TaskNode) => string | undefined
   /**
+   * 这个节点**此刻真的按得动**吗 —— 决定「按 d 重算」那行提示写不写。
+   *
+   * 和 `onRecalcDeps` 分开而不是让面板自己判:准入判据住在 `recalcScope` 里(它要看
+   * 整棵树、要问 RunControl 有没有被取消过),面板手上没有那些东西。抄一份的话,
+   * 提示和真实准入迟早分叉 —— 而分叉的方向恰好是「屏幕上写着、按下去被拒」。
+   */
+  recalcAvailable?: (node: TaskNode) => boolean
+  /**
    * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
    * 活存储而不是 React state:事件流对每个在飞的节点每条消息都要触发一次,镜像进 state
@@ -372,8 +380,14 @@ export function TaskTreePanel(props: {
    * 永远先跑,在 NodeDetail 里调 stopImmediatePropagation 已经来不及了。
    */
   const detailZone = React.useRef<DetailZone>('content')
-  /** 上一次按 d 被拒绝的原因。进 state 才画得出来,而它必须不切屏。 */
-  const [recalcNotice, setRecalcNotice] = React.useState<string | undefined>(undefined)
+  /**
+   * 上一次按 d 被拒绝的原因,**连同它属于哪个节点**。
+   *
+   * 只存字符串是不够的:它只在下一次按 d 时才被覆盖,于是在甲上被拒之后打开乙的详情页,
+   * 乙的「依赖重算」段上写着**甲那一次**的理由 —— 一句关于别的任务的话,印在这个任务的
+   * 详情页上。验收席用真渲染 + 真按键复现过。
+   */
+  const [recalcNotice, setRecalcNotice] = React.useState<{ nodeId: string; text: string } | undefined>(undefined)
 
   const rows = visibleRows(props.nodes, collapsed)
   // Rows of TREE to draw at once; the border, header and key hint live outside it.
@@ -457,7 +471,7 @@ export function TaskTreePanel(props: {
       // 「什么都没发生」。拒绝理由渲染在详情页自己那一段里(见 onRecalcDeps)。
       if (plain && k === 'd' && props.onRecalcDeps) {
         const why = props.onRecalcDeps(detail)
-        setRecalcNotice(why ?? undefined)
+        setRecalcNotice(why === undefined ? undefined : { nodeId: detail.id, text: why })
         return
       }
       // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
@@ -545,8 +559,16 @@ export function TaskTreePanel(props: {
         // 底下完全可以已经躺着十个跑完的子任务 —— 那正是长跑途中最想按它的时刻。
         canCleanup={props.onCleanupWorktrees !== undefined}
         // 判据形状抄上面 canRedoFailed 那一条:回调给了 **且** 这个节点此刻真的能按。
-        canRecalcDeps={props.onRecalcDeps !== undefined && detail.status === 'CREATED'}
-        recalcNotice={recalcNotice}
+        /**
+   * 判据必须是**真的准入**,不是 `status === 'CREATED'`。
+   *
+   * 准入有八条,而 CREATED 只是其中一条:零依赖、依赖还没拆子任务、依赖已全部完成 ——
+   * 这三种最常见的形态下节点都还是 CREATED,提示照写,按下去必被拒。而 `depsBody` 上面
+   * 那行注释自己写着「一个按了必然被拒的提示比没有更糟」。
+   */
+        canRecalcDeps={props.recalcAvailable?.(detail) === true}
+        // 只画属于**这个**节点的那一条。
+        recalcNotice={recalcNotice?.nodeId === detail.id ? recalcNotice.text : undefined}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
         maxRows={detailRows}
