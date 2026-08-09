@@ -278,6 +278,15 @@ export function TaskTreePanel(props: {
    */
   onCleanupWorktrees?: (node: TaskNode) => void
   /**
+   * 依赖重算(详情页 d 键)。给了才有这个键。
+   *
+   * **回调要回一句话或 undefined**:准入判据全是纯内存读,拒绝时**不切屏** ——
+   * 切屏会把本面板连同 NodeDetail 整棵卸载,用户展开到哪一段、读到第几行全没了,
+   * 而「什么都没发生」不该长成「你的阅读位置没了」。返回 undefined = 这次真的要去
+   * 调模型了,由调用方切屏。
+   */
+  onRecalcDeps?: (node: TaskNode) => string | undefined
+  /**
    * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
    * 活存储而不是 React state:事件流对每个在飞的节点每条消息都要触发一次,镜像进 state
@@ -363,6 +372,8 @@ export function TaskTreePanel(props: {
    * 永远先跑,在 NodeDetail 里调 stopImmediatePropagation 已经来不及了。
    */
   const detailZone = React.useRef<DetailZone>('content')
+  /** 上一次按 d 被拒绝的原因。进 state 才画得出来,而它必须不切屏。 */
+  const [recalcNotice, setRecalcNotice] = React.useState<string | undefined>(undefined)
 
   const rows = visibleRows(props.nodes, collapsed)
   // Rows of TREE to draw at once; the border, header and key hint live outside it.
@@ -442,6 +453,13 @@ export function TaskTreePanel(props: {
       // 一键回收已完成子任务的工作区。关口自己会先扫一遍再让用户确认,所以这里不判
       // 「有没有东西可清」—— 那需要跑 git,而按键处理里不能等。
       if (plain && k === 'c' && props.onCleanupWorktrees) { setDetailId(null); props.onCleanupWorktrees(detail); return }
+      // 依赖重算。**被拒时不清 detailId** —— 那是它最常见的结局,而被拒的语义是
+      // 「什么都没发生」。拒绝理由渲染在详情页自己那一段里(见 onRecalcDeps)。
+      if (plain && k === 'd' && props.onRecalcDeps) {
+        const why = props.onRecalcDeps(detail)
+        setRecalcNotice(why ?? undefined)
+        return
+      }
       // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
       // Esc / q 任何时候都是返回 —— 返回这条路不许有死角。
       if (key.return && detailZone.current === 'tabs') return
@@ -526,6 +544,9 @@ export function TaskTreePanel(props: {
         // 这个键**不看节点状态**:清的是整棵子树里已验收的那些,而一个还在跑的父节点
         // 底下完全可以已经躺着十个跑完的子任务 —— 那正是长跑途中最想按它的时刻。
         canCleanup={props.onCleanupWorktrees !== undefined}
+        // 判据形状抄上面 canRedoFailed 那一条:回调给了 **且** 这个节点此刻真的能按。
+        canRecalcDeps={props.onRecalcDeps !== undefined && detail.status === 'CREATED'}
+        recalcNotice={recalcNotice}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
         maxRows={detailRows}

@@ -1,6 +1,6 @@
 import { parse as yamlParse } from 'yaml'
-import { MAX_NODES_CEILING, clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEGRADABLE_PHASES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
-import type { Caps, DegradeRecord, EffTaskConfig, NodeKind, NodePlan, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
+import { MAX_DEPS_RECALC_RECORDS, MAX_NODES_CEILING, clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEGRADABLE_PHASES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
+import type { Caps, DegradeRecord, DepsRecalcRecord, EffTaskConfig, NodeKind, NodePlan, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
 import { isStrictness } from './strictness.js'
@@ -597,6 +597,77 @@ export function validateLoadedNodes(
       if (kept.length > 0) n.degraded = kept
       else delete n.degraded
       if (before !== kept.length) repairs.push(`节点 ${n.id}:${before - kept.length} 条降级放行记录已损坏,已丢弃`)
+    }
+    /**
+     * 依赖重算的账。**逐字段重建**,模板是同一个文件里的 `degraded` —— 四条属性一条不差:
+     * 可选字段、整条丢坏的、内层数组走 `capBlockingList`、丢了记一条带条数的 repair、空了 delete。
+     * (不抄 `roundArray`:那个非可选、恒返回数组、repairs 走一个跨两个 log 共享的计数器。)
+     *
+     * **守卫必须是 `Array.isArray`,不能是 `!== undefined`**:YAML 的 `depsRecalc:`(空值)
+     * 是 `null`,而 `confirmedDraft` 正是栽在这一行上 —— 一个畸形子节点让 `validateLoadedNodes`
+     * 整个抛出,而 efftask.tsx 把它当「恢复失败」,于是一个坏节点赔上了整个 run 的全部节点。
+     *
+     * 逐字段夹长度不是洁癖:这个文件下面那段注释记着实测 —— 盘上 5000 条 × 508 字恢复后
+     * **一条没夹**原样回到内存,再落盘就是 9.5 MB 的 node.md,而 `commit()` 每次状态迁移
+     * 都全量重写它。
+     */
+    if (n.depsRecalc !== undefined) {
+      const raw = n.depsRecalc as unknown
+      const arr = Array.isArray(raw) ? raw : []
+      const kept = arr
+        .filter((r): r is DepsRecalcRecord =>
+          !!r && typeof r === 'object' && !Array.isArray(r)
+          && Array.isArray((r as DepsRecalcRecord).from) && Array.isArray((r as DepsRecalcRecord).to))
+        .map(r => ({
+          at: typeof r.at === 'string' ? r.at : '',
+          from: capBlockingList(strArray(r.from), '依赖'),
+          to: capBlockingList(strArray(r.to), '依赖'),
+          ...(typeof r.note === 'string' && r.note.length > 0
+            ? { note: capText(r.note, MAX_SUMMARY_CHARS) } : {}),
+        }))
+      const badShapes = (Array.isArray(raw) ? arr.length : 1) - kept.length
+      if (badShapes > 0) repairs.push(`节点 ${n.id}:${badShapes} 条依赖重算记录已损坏,已丢弃`)
+      /**
+       * 条数夹取:**保留最老 1 条 + 最新 N-1 条**。
+       *
+       * 最老那一条的 `from` 是这条链的起点 —— 丢了它,剩下的读起来像是从半空中开始的。
+       * 「最老」按**位置**取(`[0]`,插入序),**不按 `at` 排序**:`at` 只做 typeof 校验、
+       * 不解析,拿一个手改过的时间串去排会把锚点排到别处。
+       *
+       * **幂等**:`length <= N` 时原样返回,不重算任何东西(和 `capBlockingList` 同一条
+       * 理由 —— 它幂等正是为了让写侧和恢复侧能共用一份实现)。
+       */
+      let clipped = kept
+      let clippedCount = 0
+      if (kept.length > MAX_DEPS_RECALC_RECORDS) {
+        clippedCount = kept.length - MAX_DEPS_RECALC_RECORDS
+        clipped = [kept[0], ...kept.slice(kept.length - (MAX_DEPS_RECALC_RECORDS - 1))]
+      }
+      if (clipped.length > 0) n.depsRecalc = clipped
+      else delete n.depsRecalc
+      /**
+       * 丢弃计数**落进节点自己**,而且**累加**。
+       *
+       * 只写进 `repairs` 是不够的:那份清单进 run.md 时走 `slice(0, MAX_RECORDED_REPAIRS)`,
+       * 一趟有 ≥5 条别的修复,这行字整条不落盘 —— 截断提示必须活在被截断的东西**之外**。
+       * 而累加(不是覆盖)是因为第二次恢复又丢 3 条时必须是 7+3=10:覆盖写出来的是一个
+       * 「描述本趟而非真实损失」的数字,`capBlockingList` 的注释为同一件事记过一笔。
+       */
+      const prevDropped = Number.isFinite(n.depsRecalcDropped)
+        ? Math.max(0, Math.trunc(n.depsRecalcDropped as number)) : 0
+      const dropped = prevDropped + clippedCount
+      if (dropped > 0) {
+        n.depsRecalcDropped = dropped
+        if (clippedCount > 0) {
+          repairs.push(`节点 ${n.id}:依赖重算记录超过 ${MAX_DEPS_RECALC_RECORDS} 条,已保留最早 1 条和最近 ${MAX_DEPS_RECALC_RECORDS - 1} 条(累计未逐条保留 ${dropped} 次)`)
+        }
+      } else delete n.depsRecalcDropped
+    } else if (n.depsRecalcDropped !== undefined) {
+      // 没有记录就没有「被夹掉的记录」。留着一个孤零零的计数会让 run.md 印出
+      // 「⟲ 依赖重算 ×7」而 node.md 那一节一条都没有。
+      const d = Number.isFinite(n.depsRecalcDropped) ? Math.max(0, Math.trunc(n.depsRecalcDropped as number)) : 0
+      if (d > 0) n.depsRecalcDropped = d
+      else delete n.depsRecalcDropped
     }
     // The same `!== true → false` discipline capBlocked already had. A truthy non-boolean
     // `interrupted: "yes"` matches neither reseat's `=== true` nor --retry-blocked's

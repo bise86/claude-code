@@ -30,7 +30,13 @@ export function createStallTracker(): StallTracker {
   }
 }
 
-function hasBlockedAncestor(node: TaskNode, byId: Map<string, TaskNode>): boolean {
+/**
+ * 祖先里有没有 BLOCKED 的。
+ *
+ * **导出**是因为依赖重算的关口要分辨两件长得很像的事:「它在等依赖」和「它上面已经死了」。
+ * 前者重算有用,后者按多少次 `d` 都不会发生任何事 —— 而屏幕必须说得出差别。
+ */
+export function hasBlockedAncestor(node: TaskNode, byId: Map<string, TaskNode>): boolean {
   // `seen` is not defensive dressing: a parent/child cycle really can come back from disk,
   // and without it this walk never terminates.
   const seen = new Set<string>()
@@ -44,6 +50,36 @@ function hasBlockedAncestor(node: TaskNode, byId: Map<string, TaskNode>): boolea
 }
 
 export type Advanceable = { node: TaskNode; kind: 'start' | 'execute' | 'integrate' }
+
+/**
+ * **这个节点此刻为什么推进不了** —— 一句话,或 `undefined`(= 推得动)。
+ *
+ * 存在的理由是「别造第二份判据」。依赖重算的关口要回答两个问题:「它此刻真的被挡着吗」
+ * (不被挡就没有并发可买)和「改完之后它当场跑得起来吗」(那是这个功能唯一的成功指标)。
+ * 拿 `depsSatisfied` 单独去答,两句话都会在**祖先阻断**上说谎:一个祖先 BLOCKED 的节点
+ * 依赖全满足也永远不会被 `pickBatch` 选中,而屏幕会写着「它马上就会被调度」。
+ * `hasBlockedAncestor` 原本是本模块私有的,于是外面只有「抄一份」这一条路 ——
+ * 而这个仓库为「同一条判据的第二份」反复付过账。
+ *
+ * `pickBatch` 自己也走它,所以两边不可能分叉。
+ */
+export function notSchedulableReason(
+  node: TaskNode,
+  byId: Map<string, TaskNode>,
+  opts?: { inFlight?: ReadonlySet<string>; held?: ReadonlySet<string> },
+): string | undefined {
+  if (opts?.inFlight?.has(node.id) === true) return '此刻正在运行'
+  if (opts?.held?.has(node.id) === true) return '此刻被另一次操作扣住'
+  if (isTerminal(node.status)) return `已经是终态(${node.status})`
+  if (hasBlockedAncestor(node, byId)) return '上级任务已阻断 —— 它的整棵子树都不会再被调度'
+  if (advanceableKind(node, byId) === null) {
+    // 依赖没满足是最常见的那一种,单独说;其余(等子任务、状态本身不可推进)合成一句。
+    const unmet = node.deps.filter(id => byId.get(id)?.status !== 'ACCEPTED')
+    if (unmet.length > 0) return `还在等 ${unmet.length} 个依赖任务完成`
+    return `当前状态(${node.status})还不能推进`
+  }
+  return undefined
+}
 
 /**
  * Everything that can move right now, capped at `limit`.
@@ -68,9 +104,9 @@ export function pickBatch(
   const ordered = [...nodes].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   for (const n of ordered) {
     if (out.length >= limit) break
-    if (inFlight.has(n.id)) continue // one step per node: two would double-spend its budget
-    if (isTerminal(n.status)) continue
-    if (hasBlockedAncestor(n, byId)) continue
+    // 判据走 `notSchedulableReason`(同一份,见那里):one step per node、终态、祖先阻断、
+    // 状态不可推进,四条一字不差,只是把「为什么不行」也算了出来给关口用。
+    if (notSchedulableReason(n, byId, { inFlight }) !== undefined) continue
     const kind = advanceableKind(n, byId)
     if (kind !== null) out.push({ node: n, kind })
   }

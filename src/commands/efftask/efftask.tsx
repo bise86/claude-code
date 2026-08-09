@@ -19,7 +19,7 @@ import type { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
-import { loadRun, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
+import { loadRun, writeNode as writeNodeFile, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
 import { failedRedoTarget, forcePassFailedPhaseReason, redoContextOf, redoUnavailableReason, skipFailedPhaseReason, type RedoEntry, type RedoPlan } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
 import { runForcePass, runRedo, runSkip } from '../../tools/efftask/redoRun.js'
@@ -39,6 +39,9 @@ import { ConfirmRedo } from './ConfirmRedo.js'
 import { ConfirmSkip } from './ConfirmSkip.js'
 import { ConfirmForcePass } from './ConfirmForcePass.js'
 import { ConfirmCleanup } from './ConfirmCleanup.js'
+import { ConfirmRecalcDeps } from './ConfirmRecalcDeps.js'
+import { recalcScope, type RecalcPlan } from '../../tools/efftask/depsRecalc.js'
+import { applyRecalc, askRecalc, type RecalcApply, type RecalcAsk } from '../../tools/efftask/depsRecalcRun.js'
 import { runCleanup, scanCleanup, type CleanupDeps } from '../../tools/efftask/cleanupWorktrees.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
@@ -342,6 +345,27 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     briefResolver: briefResolverFor(context.options.tools),
     rateGate,
   })
+  /**
+   * 依赖重算那一次调用的**专用缝**。和上面两条分开,因为它要改三样:
+   *
+   *  - **超时 120s**:默认 nodeTimeoutMs 是 600s 静默 × TOTAL_LIMIT_FACTOR = 最长一小时,
+   *    对一次零工具、只挑 id 的调用是纯粹浪费用户的时间;
+   *  - **零工具**:它只把一份清单改写成一组 id,读写工具都不需要 —— 而带写工具的席位
+   *    在一个「用户按了个键」的路径上是不该出现的;
+   *  - 不传 control:取消这一次调用走**每次调用自己的 AbortController**,绝不走
+   *    control.cancelNode —— 那会给节点置上永久取消标记,而重算的准入从此拒绝它、
+   *    pickBatch 也永远不选它(在关口上按一次 Esc = 把这个任务从整趟 run 里除名)。
+   */
+  const recalcAgent: RunAgentFn = makeRunAgentFn({
+    toolUseContext: context,
+    canUseTool,
+    availableTools: [],
+    activeAgents,
+    mainModelDefault,
+    timeoutMs: () => 120_000,
+    humanTimeoutMs: () => capsRef.humanTimeoutMs,
+    rateGate,
+  })
   // Separate NO-TOOLS seam for the one-shot config extraction: it only rewrites text into
   // JSON, so it needs neither read nor write tools. This is the ONLY place that passes [].
   const extractAgent: RunAgentFn = makeRunAgentFn({
@@ -451,6 +475,14 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       agentModels={activeAgents}
       mainModel={context.options.mainLoopModel}
       extractJson={(prompt, stream) => extractAgent({ phase: 'plan', node: stubNode(), role: null, system: '', prompt, signal, stream })}
+      /**
+       * 依赖重算那一次调用。`node` 传**真节点**(用量记在它身上 —— run 总用量和详情页
+       * 都只按 nodes 累加,传 stub 会让这次用户手动买单的调用从两处同时蒸发);
+       * `signal` 由调用方按次给(不是 run 级的那个)。
+       * `phase:'plan'` 只是形参 —— 适配层不读它;这**不是**一个环节调用,所以
+       * system 传空、也不挂 seatPreamble(那里面是分析环节的定向注入和严格度)。
+       */
+      runRecalcAgent={(a) => recalcAgent({ phase: 'plan', node: a.node, role: null, system: '', prompt: a.prompt, signal: a.signal, stream: a.stream })}
       resumeArgs={resumeArgs}
       effRoot={effRoot}
       active={active}
@@ -717,6 +749,8 @@ type RunnerProps = {
    * 看到的第一屏,此前背后跑着一次真实调用而界面上一个字都没有。
    */
   extractJson: (prompt: string, stream?: StreamHandle) => Promise<string>
+  /** 依赖重算的专用缝(主模型 / 零工具 / 120s)。见调用点的注释。 */
+  runRecalcAgent: (a: { node: TaskNode; prompt: string; signal: AbortSignal; stream?: StreamHandle }) => Promise<string>
   resumeArgs: ResumeArgs
   effRoot: string
   /** Mutated once the run is identified, so call()'s onExit closure can release the right lock. */
@@ -825,6 +859,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 取消把还在跑的 run 的界面换成结束屏。
    */
   const [cleanupTarget, setCleanupTarget] = React.useState<TaskNode | null>(null)
+  /** 依赖重算的目标。只从运行视图进来(它要 hold 住节点、还要叫醒调度)。 */
+  const [recalcTarget, setRecalcTarget] = React.useState<TaskNode | null>(null)
+  /**
+   * 这一次重算调用自己的 AbortController。
+   *
+   * **必须是每次调用一个**,而且 chain 到 run 级 signal 上:这条缝没有 control,
+   * req.signal 是唯一的取消通道 —— 直接复用 run 级 signal 的话,Esc 要么取消不掉、
+   * 要么 abort 掉整个 run。
+   */
+  const recalcAbort = React.useRef<AbortController | null>(null)
   const [cleanupFrom, setCleanupFrom] = React.useState<Phase>('done')
   /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
   const [redoProblems, setRedoProblems] = React.useState<string[]>([])
@@ -2028,6 +2072,81 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  if (phase === 'confirmRecalc' && recalcTarget) {
+    /**
+     * 依赖重算。**只从运行视图进来**,而且只在准入已经过了、真要发起模型调用的时候 ——
+     * 准入被拒时不切屏(理由渲染在详情页里),因为切屏会把任务树连同详情页整棵卸载。
+     *
+     * 判据全在 `depsRecalc.ts`(纯函数),顺序全在 `depsRecalcRun.ts`;这里只接线。
+     */
+    const target = recalcTarget
+    const byId = (): Map<string, TaskNode> => new Map(nodes.map(n => [n.id, n] as [string, TaskNode]))
+    const scopeOpts = (): Parameters<typeof recalcScope>[2] => ({
+      running: new Set(orchRef.current?.runningNodeIds() ?? []),
+      cancelled: control.wasCancelled(target.id),
+      finished: orchRef.current === null,
+    })
+    return (
+      <ConfirmRecalcDeps
+        target={target}
+        resolveNode={id => nodes.find(n => n.id === id)}
+        onAsk={async (): Promise<RecalcAsk> => {
+          const scope = recalcScope(target, byId(), scopeOpts())
+          // 到这一步还被拒,说明树在按键和这一屏之间变了 —— 如实说,别端一屏空清单。
+          if (scope.ok !== true) return { ok: false, kind: 'call-failed', reason: scope.reason }
+          /**
+           * 每次调用一个 controller,并且 **chain 到 run 级 signal**:run 被中止时这一次
+           * 也要跟着停,而反过来 Esc 只停这一次。
+           */
+          const ac = new AbortController()
+          recalcAbort.current = ac
+          const onRunAbort = (): void => ac.abort()
+          props.signal.addEventListener('abort', onRunAbort, { once: true })
+          try {
+            return await askRecalc(target, scope, {
+              byId,
+              runAgent: a => props.runRecalcAgent(a),
+              openStream: () => streams.current.open(target.id, '依赖重算'),
+            }, ac.signal)
+          } finally {
+            props.signal.removeEventListener('abort', onRunAbort)
+            recalcAbort.current = null
+          }
+        }}
+        onApply={async (plan: RecalcPlan): Promise<RecalcApply> => {
+          const orch = orchRef.current
+          const dir = runDir
+          if (!orch || !dir) {
+            return {
+              ok: false, diskChanged: false,
+              reason: '本次编排已经结束,依赖重算需要编排器还在跑 —— /et --resume 继续之后这个键就回来了。',
+            }
+          }
+          const out = await applyRecalc(target, plan, {
+            byId,
+            now: () => new Date().toISOString(),
+            persist: n => writeNodeFile(props.fs, dir, n),
+            /**
+             * `hold` 的拒绝原文写的是「这次**重做**要走**结束屏**那条路」——
+             * 用户按的是 d,而结束屏根本不提供这个键(字面意义的死胡同)。套一层措辞。
+             */
+            hold: ids => {
+              const h = orch.hold(ids)
+              return h.ok
+                ? h
+                : { ok: false, reason: '这个任务此刻没法被扣住(多半正在运行,或本次编排刚结束)—— 依赖未改动。' }
+            },
+            depsChanged: id => orch.depsChanged(id),
+            scopeOpts,
+          })
+          if (out.ok) setNodes([...nodes])
+          return out
+        }}
+        onCancelAsk={() => { recalcAbort.current?.abort() }}
+        onDone={() => { setRecalcTarget(null); setPhase('running') }}
+      />
+    )
+  }
   if (phase === 'running' && directiveOpen) {
     return (
       <AddDirective
@@ -2097,6 +2216,27 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       onCleanupWorktrees={poolRef.current ? node => {
         setCleanupTarget(node); setCleanupFrom('running'); setPhase('confirmCleanup')
       } : undefined}
+      /**
+       * 依赖重算(`d`)。**只在运行视图接线** —— 它要 hold 住节点、还要叫醒调度,
+       * 而结束屏没有编排器可以做这两件事。
+       *
+       * 返回一句话 = 准入没过,**不切屏**:那五条判据全是同步内存读,而切屏会把这个面板
+       * 连同详情页整棵卸载,用户展开到哪一段、读到第几行全没了 ——「什么都没发生」不该
+       * 长成「你的阅读位置没了」。返回 undefined = 真要去调模型了,这里才切。
+       */
+      onRecalcDeps={node => {
+        const why = recalcScope(node, new Map(nodes.map(n => [n.id, n] as [string, TaskNode])), {
+          running: new Set(orchRef.current?.runningNodeIds() ?? []),
+          cancelled: control.wasCancelled(node.id),
+          finished: orchRef.current === null,
+        })
+        if (why.ok !== true) {
+          return [why.reason, ...why.details.map(d => `· ${d}`)].join('\n')
+        }
+        setRecalcTarget(node)
+        setPhase('confirmRecalc')
+        return undefined
+      }}
       runControl={{
         paused,
         // 真相在 control 里,state 只是让提示行重绘 —— 两边分开的话它们迟早不一致,
@@ -2275,6 +2415,11 @@ export function RunningView(props: {
    * 给了才有这个键 —— 共享工作树运行时没有池子,也就没有任何目录可清。
    */
   onCleanupWorktrees?: (node: TaskNode) => void
+  /**
+   * 依赖重算(详情页 d 键)。**只有运行视图有** —— 它要 hold 住节点、还要叫醒调度,
+   * 而结束屏没有编排器可以做这两件事。回一句话 = 准入没过、不切屏;undefined = 去调模型。
+   */
+  onRecalcDeps?: (node: TaskNode) => string | undefined
 }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
@@ -2282,7 +2427,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onRecalcDeps={props.onRecalcDeps} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.

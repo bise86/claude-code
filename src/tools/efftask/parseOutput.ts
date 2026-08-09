@@ -11,7 +11,7 @@ import type { NodeKind, NodePlan, Verdict } from './types.js'
  * recency both mis-select it, silently turning a fail into a pass. The tag is what
  * actually separates answer from quotation.
  */
-export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec', score: 'score' } as const
+export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec', score: 'score', deps: 'deps' } as const
 export type AnswerTag = (typeof ANSWER_TAGS)[keyof typeof ANSWER_TAGS]
 
 /**
@@ -553,6 +553,84 @@ export function parseRemedy(o: Record<string, unknown>): { title: string; deps: 
         : [],
     }))
     .filter(c => c.title.length > 0)
+}
+
+/**
+ * 依赖重算的回答里,**一个依赖**最多认多少项。
+ *
+ * 这是**解析层的防御上限**,不是发给模型的那个数(提示词里的软上限是 8,见 depsRecalc.ts
+ * 的 `RECALC_SOFT_LIMIT`)。两者必须分开,而且这个数必须**明显高于** `MAX_DEPS_PER_DEP`:
+ * 归一化的「某节点的全部子任务都在集合里 → 可以卷成它」这一判据跑在解析**之后**,
+ * 解析层先 `slice` 掉几项的话,那个判据会恒不成立,按需上卷整个失效 —— 而截断本身
+ * 在屏幕上一个字都没有。照 `parseRemedy` 的 3 抄下来就是这个后果。
+ */
+export const MAX_RECALC_NEEDS = 50
+/**
+ * 一个节点 id 最长认到这里。
+ *
+ * **不能用 `parseRemedy` 的 200**:合法 id 的长度是 `4 + 44 × depth`(`childId` = 父 id +
+ * `/NN-` + 40 码点的 slug),默认 `maxDepth 5` 就已经是 224 —— 按 200 夹会把一个**合法**
+ * id 截成一个不存在的 id,而域约束随后会如实报告「不在子树里」,病因完全看不出来。
+ */
+export const MAX_RECALC_ID_CHARS = 1000
+/** 每一项的理由。短,因为它的作用是**逼模型别滥列**,不是让它写论文。 */
+export const MAX_RECALC_WHY_CHARS = 40
+
+export interface RecalcNeed {
+  id: string
+  /**
+   * 模型自己写的标题。**用来和 id 对账**(见 depsRecalc.ts 的 `resolveNeed`)——
+   * 整个系统对模型说的语言是标题(依赖段、方案 schema、子任务按标题解析),所以
+   * 「答标题而不是 id」是最可能的抄错形态,而两个字段一起要才让「答错」从不可观测
+   * 变成可观测。
+   */
+  title: string
+  why: string
+}
+export interface RecalcAnswer { deps: { dep: string; needs: RecalcNeed[] }[] }
+
+/**
+ * 依赖重算的回答。
+ *
+ * **`requireTag: true`**,和 `parseNewChildren` 走的那次 pick 同级、同因:改一个节点的
+ * `deps` 是**结构性变更**(它直接动调度门),而宽松的 pick 会匹配回复里任何同形对象 ——
+ * 包括被我们自己铺进提示词的、**别的 agent 写的**文本(依赖子树里带着 keyPoints/acceptance,
+ * 而 `planPrompt` 的 schema 行本身就长着 `"deps":[…]`)。
+ *
+ * 三个诊断位都要带出去,因为**它们对应三种完全不同的下一步**(见 §7.3 的关口文案):
+ *  - `ambiguous`:两个带标记的块 → 失败关闭,重拟时说「只输出一个块」;
+ *  - `broken`:本轮围栏在场但内容 parse 不出 → 重拟时可以诚实地说「你的 JSON 没解析成功」;
+ *  - `truncated`:真的截掉了几项 → 必须报出来,不许静默。
+ */
+export function parseDepsRecalc(text: string, tag: string = ANSWER_TAGS.deps): {
+  answer: RecalcAnswer | null
+  ambiguous: boolean
+  broken: boolean
+  truncated: number
+} {
+  const { obj, ambiguous } = pickAnswer(text, tag, o => Array.isArray(o.deps), true)
+  const broken = taggedBlockBroken(text, tag)
+  if (!obj) return { answer: null, ambiguous, broken, truncated: 0 }
+  let truncated = 0
+  const deps = (obj.deps as unknown[])
+    .filter((d): d is Record<string, unknown> => !!d && typeof d === 'object' && !Array.isArray(d))
+    .map(d => {
+      const rawNeeds = Array.isArray(d.needs) ? d.needs : []
+      const kept = rawNeeds
+        .filter((n): n is Record<string, unknown> => !!n && typeof n === 'object' && !Array.isArray(n))
+      truncated += Math.max(0, kept.length - MAX_RECALC_NEEDS)
+      return {
+        dep: typeof d.dep === 'string' ? capText(d.dep.trim(), MAX_RECALC_ID_CHARS) : '',
+        needs: kept.slice(0, MAX_RECALC_NEEDS).map(n => ({
+          id: typeof n.id === 'string' ? capText(n.id.trim(), MAX_RECALC_ID_CHARS) : '',
+          title: typeof n.title === 'string' ? capText(n.title.trim(), 200) : '',
+          why: typeof n.why === 'string' ? capText(n.why.trim(), MAX_RECALC_WHY_CHARS) : '',
+        })),
+      }
+    })
+    // 没有 dep 名的条目挂不到任何原依赖上 —— 丢掉而不是猜。
+    .filter(d => d.dep.length > 0)
+  return { answer: { deps }, ambiguous, broken, truncated }
 }
 
 export interface NewChildSpec { parent?: string; title: string; deps: string[] }

@@ -1289,3 +1289,46 @@ describe('版本对照那一段确实被拆掉了,而 prevPlan 本身留着', ()
     expect(src).toContain('keepUnchallenged = true')
   })
 })
+
+describe('依赖重算(README 的 `d` 那一节)', () => {
+  const src = (): string => readFileSync(new URL('src/tools/efftask/depsRecalc.ts', ROOT), 'utf8')
+
+  it('键表上有它,而且写清了「只在运行中、且还没开始分析时有」', () => {
+    expect(README).toContain(norm('| `d` | **依赖重算**'))
+    expect(README).toContain(norm('只在运行中、且这个任务还没开始分析时有'))
+    // 「只在运行中」由接线兑现:结束视图那一路根本不传这个回调。
+    const ui = readFileSync(new URL('src/commands/efftask/efftask.tsx', ROOT), 'utf8')
+    // 真正的接线只有一处(另一处是 RunningView 往面板的透传)。
+    expect(ui.split('onRecalcDeps={node =>').length - 1).toBe(1)
+    // 结束视图那一路一个字都没有 —— 结束屏没有编排器可以 hold 住节点、也没人会去调度它。
+    const doneView = ui.slice(ui.indexOf('export function DoneView'))
+    expect(doneView).not.toContain('onRecalcDeps')
+  })
+
+  it('「不会删依赖」是代码兑现的,不是提示词兑现的', () => {
+    expect(README).toContain(norm('**不会删依赖**'))
+    // 兜底:模型一项都没对上时,退回原依赖本身。
+    expect(src()).toContain("needs: [{ id: g.dep, why: '' }]")
+  })
+
+  it('「成环 / 指向自己的上级或子任务就整次放弃」', () => {
+    expect(README).toContain(norm('**整次放弃**'))
+    expect(src()).toContain('export function finalGuard')
+    expect(src()).toContain('算出来的依赖里有本任务的上级')
+  })
+
+  it('「没超上限时保留更细的那一份」—— 上卷是按需的,不是能卷就卷', () => {
+    expect(README).toContain(norm('没超上限时保留更细的那一份'))
+    // 上卷只发生在数量闸里,不存在无条件的不动点。
+    expect(src()).toContain('while (sel.size > perDepCap)')
+    expect(src()).not.toContain('do { collapse')
+  })
+
+  it('每次重算都进 node.md 的「依赖重算」一节,run.md 树上挂 ⟲', () => {
+    expect(README).toContain(norm('「依赖重算」一节'))
+    expect(README).toContain(norm('⟲ 依赖重算 ×N'))
+    const persistence = readFileSync(new URL('src/tools/efftask/persistence.ts', ROOT), 'utf8')
+    expect(persistence).toContain('## 依赖重算')
+    expect(persistence).toContain('⟲ 依赖重算 ×')
+  })
+})

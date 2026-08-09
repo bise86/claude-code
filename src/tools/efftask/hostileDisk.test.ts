@@ -137,6 +137,16 @@ function richNode(): TaskNode {
    * 而且每次 resume 重演一遍。这正是 roundArray / scoreRecord 当年被写出来的那个失败。
    */
   n.degraded = [{ phase: 'review', round: 3, reason: '评审迭代超限(3)', advice: ['把 repo 参数写成 etcd'], at: '2026-08-04T10:00:00Z' }]
+  /**
+   * 依赖重算的账。和 `degraded` 同一档结构深度(数组里是对象、对象里还有两个字符串数组),
+   * 而消费者有三处会解引用它:`serializeNode` 的 `## 依赖重算` 那一节、`renderTreeSnapshot`
+   * 的 `⟲ ×N`、详情页那一段。node.md 可手工编辑,一个 `depsRecalc: boom` 上 `.length === 4`
+   * 会让 run.md 印出一个凭空捏造的 ×4。
+   */
+  n.depsRecalc = [{ at: '2026-08-09T00:00:00Z', from: ['root/01-b'], to: ['root/01-b/00-b1'] }]
+  // 被恢复边界夹掉的条数。它和上面那个数组是一对:留着一个孤零零的计数会让 run.md
+  // 印出「⟲ 依赖重算 ×7」而 node.md 那一节一条都没有。
+  n.depsRecalcDropped = 3
   n.phaseMs = { EXECUTING: 42_000, ACCEPTANCE: 7_000 }
   // 模型用量。和 phaseMs 同一类:一张从盘上读回来的纯数字表,而它会被渲染成
   // `NaN 次 · NaNk`,还会顺着 childIds 被子树合计一路传染到根节点那一行。

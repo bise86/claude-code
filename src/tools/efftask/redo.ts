@@ -1221,6 +1221,26 @@ export function planRedo(
         if (!next.includes(targetId)) next.push(targetId)
       }
       if (next.length !== n.deps.length || next.some((d, i) => d !== n.deps[i])) {
+        /**
+         * **手工细化过的依赖被这次重做退回去了 —— 要留痕。**
+         *
+         * 读 node.md 的人一定会假设一条不变式:**`node.deps` 等于 `depsRecalc` 最后一条的
+         * `to`**。不补这一条的话,盘上会并存「deps: [乙]」和「重算成了 乙/02」,而
+         * `乙/02` 的目录已经被 `removeNodeDirs` 删掉 —— 那一节会永远渲染一条指向不存在
+         * 节点的记录,而唯一解释过它的那句话(`RedoPlan.warnings`)只在关口上出现过一帧、
+         * 不落盘。
+         *
+         * 只在**这个节点真的重算过**时补(`depsRecalc` 非空):没重算过的节点被改写依赖是
+         * 既有行为,凭空给它开一份重算账会让「⟲ 依赖重算 ×N」这个标记在 run.md 上说谎。
+         */
+        if (Array.isArray(n.depsRecalc) && n.depsRecalc.length > 0) {
+          n.depsRecalc = [...n.depsRecalc, {
+            at: now,
+            from: [...n.deps],
+            to: [...next],
+            note: `因 ${targetId} 重做,细化出来的依赖已退回`,
+          }]
+        }
         n.deps = next
         n.updatedAt = now
       }
@@ -1230,6 +1250,24 @@ export function planRedo(
       warnings.push(
         `${cycleAvoided.length} 条依赖被**删掉**而不是改指:改指会和本节点自己的依赖成环。` +
         `这些节点可能比预期更早起跑`,
+      )
+    }
+    /**
+     * 手工细化过的依赖被这次重做**退回粗依赖**了 —— 说出来。
+     *
+     * 这是用户亲手做过的一次操作,被另一次操作静默撤销;而重做本身是对的(细化出来的那些
+     * 节点马上就要被删掉)。所以不是拦,是告诉他重做完之后要重新按一次 d。
+     */
+    const recalcUndone = [...new Set(
+      dependencyRewrites
+        .map(r => byId.get(r.nodeId))
+        .filter((n): n is TaskNode => !!n && Array.isArray(n.depsRecalc) && n.depsRecalc.length > 0)
+        .map(n => n.id),
+    )]
+    if (recalcUndone.length > 0) {
+      warnings.push(
+        `${recalcUndone.length} 个任务的依赖是你手工重算细化出来的,这次重做会把它们**退回粗依赖**` +
+        `(细化出来的那些子任务就要被删掉)。重做完成后可以在这些任务的详情页再按一次 d 重新细化`,
       )
     }
     target.childIds = []

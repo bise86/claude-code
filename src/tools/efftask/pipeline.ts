@@ -7,6 +7,7 @@ import { adviceOf, crossSeatNotice, degradeCarryPrompt, exhaustionRemedy, feedba
 import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
+import { depLabel } from './depsRecalc.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
@@ -846,7 +847,12 @@ function depsSection(node: TaskNode, ctx: Pick<PipelineCtx, 'byId'>): string {
   if (node.deps.length === 0) return ''
   const lines = node.deps.map(id => {
     const d = ctx.byId.get(id)
-    return d ? `- ${quote(d.title)}(${d.status}): ${quote(d.execStatus) || '(尚无执行状态)'}` : `- ${quote(id)}: (依赖节点缺失)`
+    // 标签走 `depLabel`:依赖重算之后 deps **可能不是兄弟**,而这一段(以及方案 schema、
+    // 子任务解析)整套都是按「兄弟标题」那个坐标系写的 —— 一个孙节点的裸标题在那套坐标系里
+    // 读起来像「依赖了一个不存在的兄弟」。非兄弟给两级路径。
+    return d
+      ? `- ${quote(depLabel(id, ctx.byId, node.parentId))}(${d.status}): ${quote(d.execStatus) || '(尚无执行状态)'}`
+      : `- ${quote(id)}: (依赖节点缺失)`
   })
   return `已完成的依赖任务及其产出(基于这些结果继续,不要重复它们的工作):\n${lines.join('\n')}\n`
 }
@@ -1425,7 +1431,9 @@ function plannedChildren(
           title: c?.title ?? id,
           // deps 存的是 id,渲染回标题。取不到就退回 id —— 一个陌生 id 读起来像坏数据
           // (它就是),比悄悄丢掉一条依赖诚实。
-          deps: (c?.deps ?? []).map(d => byId.get(d)?.title ?? d),
+          // 非兄弟走两级路径(依赖重算会产生跨层依赖):裸标题在「兄弟标题」这套坐标系里
+          // 会被读成一个并不存在的兄弟。
+          deps: (c?.deps ?? []).map(d => (byId.get(d) ? depLabel(d, byId, c?.parentId ?? null) : d)),
         }
       })
     : lastChildren

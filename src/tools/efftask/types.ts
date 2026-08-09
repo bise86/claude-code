@@ -162,6 +162,30 @@ export interface DegradeRecord {
   at: string
 }
 
+/**
+ * 一次手工**依赖重算**:这个节点的 `deps` 从 `from` 变成了 `to`。
+ *
+ * 读的人一定会假设一条不变式:**`node.deps` 等于最后一条记录的 `to`**。所以任何一处
+ * 把 `deps` 改回去的路径都必须补一条记录(`redo.ts` 的 `dependencyRewrites` 就是),
+ * 否则 node.md 上会并存「deps 指着 B」和「重算成了 B/02」,而 `B/02` 的目录已经被删掉。
+ */
+export interface DepsRecalcRecord {
+  at: string
+  from: string[]
+  to: string[]
+  /** 这一条是怎么来的。缺席 = 用户在详情页手工触发的那一种。 */
+  note?: string
+}
+
+/**
+ * `depsRecalc` 在**恢复边界**上最多留几条。写侧不夹(见 `TaskNode.depsRecalc`)。
+ *
+ * 保留的是**最老 1 条 + 最新 N-1 条**:最老那一条的 `from` 是这条链的起点,丢了它,
+ * 剩下的读起来像是从半空中开始的。「最老」按**位置**取(`[0]`,插入序),**不要按 `at` 排序**
+ * —— `at` 只做 `typeof` 校验、不解析,拿一个手改过的时间串去排会把锚点排到别处。
+ */
+export const MAX_DEPS_RECALC_RECORDS = 20
+
 export type NodeStatus =
   | 'CREATED' | 'PLANNING' | 'PLAN_REVIEW'
   | 'READY' | 'EXECUTING' | 'EXECUTED' | 'ACCEPTANCE' | 'REWORK'
@@ -725,6 +749,32 @@ export interface TaskNode {
    * 「已完成」,都是谎报完成 —— 这个仓库为谎报完成付过三次学费。
    */
   degraded?: DegradeRecord[]
+  /**
+   * 手工**依赖重算**的账 —— 一次一条,按发生顺序。见 `DepsRecalcRecord`。
+   *
+   * 缺席 = 从来没重算过 = 这个节点的 node.md 逐字节不变(`serializeNode` 是 `{...node}`
+   * 全量倾倒,而 `yaml.stringify` 省略 undefined 的键)。
+   *
+   * **不在写侧夹条数**(照 `resumes`:用户手动触发、频率极低、一条几十字节)。夹取只发生在
+   * 恢复边界上,而且必须配 `depsRecalcDropped` —— 理由见那个字段。
+   */
+  depsRecalc?: DepsRecalcRecord[]
+  /**
+   * `depsRecalc` 在恢复边界上被夹掉了多少条 —— **累加**,不是「这一趟丢了几条」。
+   *
+   * 三件事逼出这个字段,少一件它都可以不存在:
+   *  1. 写侧不夹、读侧夹 ⇒ 恢复之后**第一次 `commit()` 就把夹过的那份写回盘**,中间那些
+   *     永久消失(`ScoreRecord.others` 的注释记的正是同一个失败);
+   *  2. 保留的是「最老 1 条 + 最新 N-1 条」,盘上**不连续**:`[0].to` 接不上 `[1].from`,
+   *     而读的人分不清那是截断、还是一次重做把细依赖退回去了(见 `redo.ts` 的退回记录);
+   *  3. 丢弃条数写进恢复报告的 `repairs` 活不下来 —— 那份清单进 run.md 时走
+   *     `slice(0, MAX_RECORDED_REPAIRS)`,一趟有 ≥5 条别的修复,这行字整条不落盘。
+   *     截断提示必须活在被截断的东西**之外**。
+   *
+   * **累加而不是覆盖**:第二次恢复又丢 3 条时必须是 7+3=10。写成覆盖就是
+   * `capBlockingList` 那条注释记下的原话 —— 一个「描述本趟而非真实损失」的数字。
+   */
+  depsRecalcDropped?: number
   /**
    * 各阶段耗时 (spec §10.2) — accumulated milliseconds per ACTIVE status.
    *

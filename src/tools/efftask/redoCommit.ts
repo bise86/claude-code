@@ -65,6 +65,9 @@ export async function commitRedo(deps: RedoCommitDeps, plan: RedoPlan): Promise<
   }
 
   let writeFailed = 0
+  /** 写失败、而且盘上那份还指着**已被删掉的**节点的:见下面那条修法。 */
+  const danglingDeps: { id: string; deps: string[] }[] = []
+  const deletedSet = new Set(plan.deleted)
   for (const n of plan.nodes) {
     try {
       await writeNode(deps.fs, deps.runDir, n)
@@ -73,8 +76,33 @@ export async function commitRedo(deps: RedoCommitDeps, plan: RedoPlan): Promise<
       // 否则这次重做在下一次 --resume 时会整个消失。
       writeFailed++
       problems.push(`${n.id} 没能写回盘上(下次恢复会读到旧状态): ${e instanceof Error ? e.message : String(e)}`)
+      const stale = (deps.before.find(b => b.id === n.id)?.deps ?? []).filter(d => deletedSet.has(d))
+      if (stale.length > 0) danglingDeps.push({ id: n.id, deps: stale })
       deps.onError?.(e instanceof Error ? e : new Error(String(e)))
     }
+  }
+  /**
+   * **写失败 + 盘上那份还指着被删掉的节点 = 永久死节点。** 这条话必须点名到 id。
+   *
+   * 以前这里只讲 `childIds` 那一种,而那时是完备的:`deps` 恒为兄弟,所以「一个活下来的
+   * 节点的 dep 落在被删子树里」结构上不可达。**依赖重算让这条死路第一次通电** —— 甲依赖
+   * 乙的某个子任务,用户重做乙,那个子任务被删,而甲的 node.md 没写回去。
+   *
+   * 后果比「子节点缺失」更硬:下一次 `--resume` 会以「依赖节点缺失」阻断,而
+   * `validateLoadedNodes` 的 `block()` 把 `interrupted` / `capBlocked` / `mergeConflict`
+   * 三个复活开关**全部清零** —— `--retry-blocked` 和重做都救不回来,只能手改 node.md。
+   * 所以这句话必须自带修法(和上面那条同规矩)。
+   */
+  for (const d of danglingDeps) {
+    // 改成什么,由这次重做自己算出来的改写表回答(它把被删的 dep 改指到重做目标)。
+    const to = [...new Set(
+      plan.dependencyRewrites.filter(r => r.nodeId === d.id && d.deps.includes(r.from)).map(r => r.to),
+    )].join('、')
+    problems.push(
+      `${d.id} 没写回去,而盘上那份还依赖着已经被删掉的 ${d.deps.join('、')} —— ` +
+      `下次 --resume 会以「依赖节点缺失」阻断,而且 --retry-blocked 也救不回来(那条路会把复活开关一起清掉)。` +
+      `修法:手工把 ${deps.runDir}/${d.id}/node.md 里 deps 中的这几项改成 ${to || '重做目标本身'}`,
+    )
   }
   if (writeFailed > 0 && plan.deleted.length > 0) {
     /**

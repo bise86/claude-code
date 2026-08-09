@@ -197,6 +197,37 @@ function roundtableBody(log: TaskNode['reviewLog']): string {
   }).join('\n')
 }
 
+/**
+ * 「依赖重算」那一节 —— 人读的那一半。
+ *
+ * 只落 frontmatter 等于只做到机器可读那一半,而这个文件自己的规矩是 body 才是人读的那一半
+ * (alternatives / responses / degraded 三处各写过一遍)。
+ *
+ * **DEFENSIVE**,理由和 `roundtableBody` / `responsesBody` 逐字相同:这段跑在**每一次
+ * commit** 上,而 node.md 按设计可以手工编辑、崩在半路也会留下半条记录 —— 这里抛一次,
+ * 节点就带着一条裸 TypeError 阻断,而且每次 `--resume` 都复演。一节 body 不值一个死掉的 run。
+ *
+ * `clipBody` **逐条**夹,不是整节夹(见 responsesBody 的注释:整节夹会把后面的条目连同
+ * 编号一起顶掉,而读的人看到的是一份看起来完整的短清单)。
+ *
+ * 被恢复边界夹掉的那些条数要一起印出来,否则「这一节」和 run.md 上的 `×N` 会对不上,
+ * 而对不上时读的人无从知道是截断还是数据坏了。
+ */
+function depsRecalcBody(node: TaskNode): string {
+  const list = Array.isArray(node.depsRecalc) ? node.depsRecalc : []
+  const dropped = Number.isFinite(node.depsRecalcDropped) ? Math.max(0, Math.trunc(node.depsRecalcDropped as number)) : 0
+  if (list.length === 0 && dropped === 0) return ''
+  const ids = (v: unknown): string =>
+    Array.isArray(v) ? v.map(x => stripControl(String(x))).join('、') || '(空)' : '(格式不对)'
+  const lines = list.map(r =>
+    `- ${stripControl(String(r?.at ?? '?'))}: ${clipBody(ids(r?.from))} → ${clipBody(ids(r?.to))}` +
+    (r?.note ? `(${clipBody(stripControl(String(r.note)))})` : ''))
+  const note = dropped > 0
+    ? `\n(另有 ${dropped} 次重算在恢复时未逐条保留 —— 保留的是最早一条和最近几条)`
+    : ''
+  return `## 依赖重算\n${lines.join('\n')}${note}\n\n`
+}
+
 /** 评分 with the REASONS. The number alone does not say why, and §4.2 lists rationale. */
 function scoreBody(node: TaskNode): string {
   const line = (label: string, s?: { role: string; score: number; rationale: string }): string =>
@@ -270,6 +301,7 @@ export function serializeNode(node: TaskNode): string {
           .map(alt => `### ${stripControl(alt.staff)}\n${clipBody(stripControl(alt.solution))}`).join('\n')}\n\n`
       : '') +
     // 标题跟着职责改:这一节记的是「谁质疑了什么、改了哪几段」,不再是几张赞成/反对票。
+    depsRecalcBody(node) +
     `## 质疑修复记录\n${roundtableBody(node.reviewLog)}\n\n` +
     `## 验收记录\n${roundtableBody(node.acceptLog)}\n\n` +
     `## 评分\n${scoreBody(node)}\n`
@@ -446,7 +478,25 @@ export function renderTreeSnapshot(nodes: TaskNode[]): string {
     const degradeMark = dg.length > 0
       ? ` ⚠ 降级放行(${dg.map(d => PHASE_LABEL[d.phase]).join('、')}未通过,按迭代上限放行)`
       : ''
-    lines.push(`${'  '.repeat(depth)}- [${uiStatus(n.status)}] ${stripControl(n.title)} (${n.status})${degradeMark}${why}`)
+    /**
+     * **手工改过依赖的节点要在这一行上说出来。**
+     *
+     * 和上面 `degradeMark` 逐字同因:run.md 是脚本指过来的那份文件,把差别藏进嵌套的
+     * node.md 等于没说。一次「用户手工把依赖图改细了、让这个任务提前起跑」和一次全自动
+     * 跑完,在这一行上原本一模一样 —— 而事后追责第一个被打开的正是它。
+     *
+     * 计数用 `length + dropped`:恢复边界会夹掉中间那些条,只印 length 会让一个重算过
+     * 12 次的节点在 resume 之后永远显示 ×5。
+     *
+     * 取长度走 `Array.isArray`,和邻居 `(n.degraded ?? [])` 同一档防御:一个手改的
+     * `depsRecalc: boom` 上 `.length === 4`,会在 run.md 上印出 `×4` —— 不抛、不修复、纯造谣。
+     *
+     * 条件渲染:没重算过的 run 逐字节不变。
+     */
+    const rc = (Array.isArray(n.depsRecalc) ? n.depsRecalc.length : 0)
+      + (Number.isFinite(n.depsRecalcDropped) ? Math.max(0, Math.trunc(n.depsRecalcDropped as number)) : 0)
+    const recalcMark = rc > 0 ? ` ⟲ 依赖重算 ×${rc}` : ''
+    lines.push(`${'  '.repeat(depth)}- [${uiStatus(n.status)}] ${stripControl(n.title)} (${n.status})${degradeMark}${recalcMark}${why}`)
     for (const cid of n.childIds) {
       const child = byId.get(cid)
       if (child) emit(child, depth + 1)

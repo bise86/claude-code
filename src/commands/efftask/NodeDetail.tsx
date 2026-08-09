@@ -401,11 +401,39 @@ function roundsBody(log: TaskNode['reviewLog']): string {
 }
 
 /**
+ * 手工依赖重算的账 —— 一次一行。
+ *
+ * 和 node.md 那一节同一份口径(`persistence.ts` 的 `depsRecalcBody`),包括**把恢复边界
+ * 夹掉的条数一起印出来**:不印的话界面上的条数和 run.md 上的 `⟲ ×N` 会对不上,而对不上时
+ * 读的人无从知道是截断还是数据坏了。
+ *
+ * DEFENSIVE:详情页在 render 里抛,整个 `/et` 界面就黑了(这一段旁边的 `responsesBody`
+ * 为同一件事写过注释)。
+ */
+function depsRecalcBody(n: TaskNode): string {
+  const list = Array.isArray(n.depsRecalc) ? n.depsRecalc : []
+  const dropped = Number.isFinite(n.depsRecalcDropped) ? Math.max(0, Math.trunc(n.depsRecalcDropped as number)) : 0
+  if (list.length === 0 && dropped === 0) return ''
+  const ids = (v: unknown): string =>
+    Array.isArray(v) ? v.map(x => stripControl(String(x))).join('、') || '(空)' : '(格式不对)'
+  const lines = list.map(r =>
+    `${stripControl(String(r?.at ?? '?'))}: ${ids(r?.from)} → ${ids(r?.to)}` +
+    (r?.note ? `(${stripControl(String(r.note))})` : ''))
+  if (dropped > 0) lines.push(`(另有 ${dropped} 次未逐条保留 —— 恢复时只留了最早一条和最近几条)`)
+  return lines.join('\n')
+}
+
+/**
  * 依赖 (spec §10.2). Missing deps are REPORTED, not hidden: a dangling id is why the node is
  * blocked, and silently shrinking the list would hide the cause.
  */
-function depsBody(n: TaskNode, resolveNode?: (id: string) => TaskNode | undefined): string {
-  return n.deps
+function depsBody(
+  n: TaskNode,
+  resolveNode?: (id: string) => TaskNode | undefined,
+  /** 给了才写「按 d 重算」那一行 —— 一个按了必然被拒的提示比没有更糟。 */
+  canRecalc?: boolean,
+): string {
+  const lines = n.deps
     .map(id => {
       // No resolver at all is NOT "the node is missing" — it is "the caller did not wire one".
       // Reporting the first as the second is precisely the class of lie this repo keeps paying
@@ -413,9 +441,34 @@ function depsBody(n: TaskNode, resolveNode?: (id: string) => TaskNode | undefine
       // reports a missing node.
       if (!resolveNode) return id
       const d = resolveNode(id)
-      return d ? `${d.title}(${d.status})` : `${id}(节点缺失)`
+      if (!d) return `${id}(节点缺失)`
+      /**
+       * **真 id 也印出来。**
+       *
+       * 依赖重算之后 deps 可能指向别人子树深处的节点,而「父标题 / 本标题」在同名孙节点上
+       * **仍然不唯一**;这一段本来就是机器生成段(`md: false`,里面是 id、路径、`[STATUS]`),
+       * 多印一个 id 不破坏任何东西,却让「它到底依赖哪一个」变成可判定的。
+       */
+      const label = d.parentId !== null && d.parentId !== n.parentId
+        ? `${resolveNode(d.parentId)?.title ?? d.parentId} / ${d.title}`
+        : d.title
+      return `${label}(${d.status}) — ${id}`
     })
-    .join('\n')
+  /**
+   * 「按 d 重算」的提示放在**这一段的最后一行**,不进段落标题。
+   *
+   * 标题是身份:`expanded` / `secMode` / `anchor` / `selTitle` 四个状态全按标题寻址,
+   * 而这个提示的显示条件是 `status === 'CREATED'` —— 节点离开 CREATED 是**编排器 tick 出来的,
+   * 用户一个键都没按**,而重算成功之后他还停在详情页读结果的那几秒正是概率最高的时刻。
+   * 标题一改:他展开着的那一段自己收起、↑↓ 的语义在他手底下翻面、视口跳回顶部 ——
+   * 逐字就是这个文件为「按标题寻址」付过一次学费的那个事故。
+   *
+   * 放在**最后一行**还有一层:它消失时不会移动它上面任何一行(锚的 delta 是相对段标题算的)。
+   */
+  if (canRecalc === true && lines.length > 0) {
+    lines.push('(依赖太粗?按 d 让主模型按已拆出的子任务重算一次)')
+  }
+  return lines.join('\n')
 }
 
 /**
@@ -430,12 +483,28 @@ function depsBody(n: TaskNode, resolveNode?: (id: string) => TaskNode | undefine
 export function detailSections(
   n: TaskNode,
   resolveNode?: (id: string) => TaskNode | undefined,
+  /** 这一屏能不能按 d 重算依赖。只影响「依赖」段最后那一行提示。 */
+  canRecalcDeps?: boolean,
+  /** 上一次按 d 被拒绝的原因 —— 渲染在详情页里,**不切屏**(见下面那一段)。 */
+  recalcNotice?: string,
 ): SectionSpec[] {
   const all: SectionSpec[] = [
     // 依赖排在最前,和改造之前的版面一致 —— 一个节点停在 READY 不动时,人是为这一段来的。
     // 机器生成的几段(依赖 / 评分 / 迭代 / 耗时 / 用量 / 工作区)**不上 markdown**:
     // 里面是 id、路径、`[STATUS]`、`--flag`,交给 markdown 解析器只会被吃掉记号。
-    { title: '依赖', body: depsBody(n, resolveNode) },
+    { title: '依赖', body: depsBody(n, resolveNode, canRecalcDeps) },
+    /**
+     * 「上一次按 d 为什么什么都没发生」。
+     *
+     * **准入拒绝不切屏**:那五条判据全是纯内存读、零 await,而关口是 phase 级整屏替换 ——
+     * 切过去再回来会把 `TaskTreePanel` 连同 `NodeDetail` 整棵卸载,用户展开到哪一段、
+     * 读到第几行(住在这两个组件自己的 state 里)全没了。「什么都没发生」不该长成
+     * 「你的阅读位置没了」。所以拒绝走这一段,不走关口。
+     *
+     * 排在「依赖」之后:它回答的正是刚才在那一段上按下那个键的结果。
+     */
+    { title: '依赖重算', body: recalcNotice ?? '', color: 'warning' },
+    { title: '依赖重算记录', body: depsRecalcBody(n) },
     // 以下都是模型写的散文,而且模型本来就在写 markdown。
     { title: '目标', body: n.goal, md: true },
     { title: '完整方案', body: n.plan.solution, md: true },
@@ -582,6 +651,13 @@ export function NodeDetail(props: {
    * 发生的键比没有这个键更糟(这一行上面那两个键为同一条规矩写过注释)。
    */
   canCleanup?: boolean
+  /**
+   * 能不能按 d 重算依赖。只影响「依赖」段最后那一行提示 —— **不进段落标题**,
+   * 理由见 depsBody 里那一段(标题是身份,而这个条件会被编排器自己 tick 掉)。
+   */
+  canRecalcDeps?: boolean
+  /** 上一次按 d 被拒绝的原因。渲染在详情页里,不切屏。 */
+  recalcNotice?: string
   /** 可用列宽。省略则跟着终端/模态槽走。 */
   columns?: number
   /** Resolves a dependency id to its node, so 依赖 renders as titles and statuses. */
@@ -656,7 +732,7 @@ export function NodeDetail(props: {
     ),
   )
 
-  const sections = detailSections(n, props.resolveNode)
+  const sections = detailSections(n, props.resolveNode, props.canRecalcDeps, props.recalcNotice)
   /**
    * 未展开的段落各留几行。
    *
@@ -869,6 +945,9 @@ export function NodeDetail(props: {
     + (props.canSkipFailed ? ' · s 跳过它' : '')
     // 排在最后:它是这几个键里最不紧急的一个(腾空间,不影响这一趟跑不跑得下去),
     // 而这一行是 truncate-end —— 窄终端上被吃掉的必须是最不重要的那一头。
+    // 依赖重算排在最后一档:主提示贴在「依赖」段上(见 depsBody),页脚这一句只是
+    // 宽终端上的补充 —— 实测 100 列时这一行连既有的 r/c 都已经在屏幕外。
+    + (props.canRecalcDeps ? ' · d 重算依赖' : '')
     + (props.canCleanup ? ' · c 清理已完成工作区' : '')
   const footer = ((): string => {
     if (zone === 'tabs') return `Esc/q 返回任务树 · ←→ 选页卡 · 回车/空格 进入 · Tab 回内容${redoHint}`

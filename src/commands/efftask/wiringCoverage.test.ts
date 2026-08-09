@@ -249,18 +249,20 @@ describe('收口关口的接线(spec §8)', () => {
 })
 
 describe('上游限流闸门的接线', () => {
-  it('**两个** makeRunAgentFn 实例都拿到了同一个闸门', () => {
+  it('**三个** makeRunAgentFn 实例都拿到了同一个闸门', () => {
     /**
      * 剪断任意一处的后果都完整:
      *  - 主 runAgent 少了它 → 整个退避功能在生产里彻底不接线(七个环节、圆桌每一席),
      *    而全套测试一条都不红(验收实测:2481 pass 0 fail);
      *  - extractAgent(一次性配置抽取)少了它 → 那一次调用绕过冷却,而它恰好是用户敲完
-     *    /et 之后的第一次调用。
+     *    /et 之后的第一次调用;
+     *  - recalcAgent(依赖重算)少了它 → 用户在上游正限流时按下 d,会另开一条打穿冷却的
+     *    通道,而这个键在一棵大树上是可以被连按很多次的。
      *
-     * **必须计数**:这行字在这个文件里有两处,`toContain` 会被另一处满足 —— 这个文件
+     * **必须计数**:这行字在这个文件里有多处,`toContain` 会被别处满足 —— 这个文件
      * 顶部记的就是这类假绿(occurrences 这个辅助函数正是为它写的)。
      */
-    expect(occurrences('rateGate,')).toBe(2)
+    expect(occurrences('rateGate,')).toBe(3)
     // 闸门本身建在 call() 作用域,和 control 同处 —— 建在组件里的话同一次会话按 r 重做
     // 会把退避级数清零,而两个实例也不再共享「上游在限流」这条状态。
     expect(SRC).toContain('const rateGate = createRateLimitGate()')

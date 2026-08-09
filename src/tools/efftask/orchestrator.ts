@@ -219,6 +219,42 @@ export class EffTaskOrchestrator {
   }
 
   /**
+   * **依赖被就地改过了** —— 叫醒调度、上屏。依赖重算走这条,不走 `applyLive`。
+   *
+   * ## 为什么不复用 `applyLive`
+   *
+   * 对这个功能它几乎是空操作(传进去的是 `nodes()`,同一批对象,`byId` 重建是恒等),
+   * 真正起作用的只有 `clearStall` / `clearCancel` / `safeUpdate` / `nudge` —— 而
+   * **`clearCancel` 是有害的**:一个被用户按 `x` 取消过的 CREATED 节点永远不会被
+   * `pickBatch` 选中(它的依赖没满足),于是那个取消标记就一直挂着;`applyLive` 顺手抹掉它,
+   * 节点起跑、跑完、`commitAndMerge` 合进集成分支、`intoTrunk` 再合进用户当前分支 ——
+   * **用户明确拒绝过的任务,产出落进了他自己的分支**,而屏幕上只说「依赖已重算」。
+   *
+   * ## `safeUpdate()` 不只是上屏
+   *
+   * 它走 `onUpdate` → `runOrchestrator` 的 `queueManifest`,也就是 run.md 的**唯一写入点**
+   * (那是一条串行 + 合并的队列)。所以重算的 run.md 标记是白拿的,而且走对了队列 ——
+   * 从按键处理里直调 `writeRunManifest` 会和它并发写同一个文件,还会绕过运行中调过的
+   * 并发度/严格度同步。
+   *
+   * `finished` 这一支**唯一可达的路是 `signal.aborted`**:`runLoop` 保证有 held 节点时不判
+   * 「走不动」,而「root 已 ACCEPTED」与「本节点是它的后代且还是 CREATED」互斥。所以
+   * 调用方的错误文案该说「整个运行已被中止」,不是「没能叫醒调度」。
+   */
+  depsChanged(id: string): { ok: true } | { ok: false; reason: string } {
+    if (this.finished) {
+      return { ok: false, reason: this.signal.aborted ? 'aborted' : 'finished' }
+    }
+    if (this.inFlightIds.has(id)) {
+      return { ok: false, reason: 'running' }
+    }
+    this.clearStall(id)
+    this.safeUpdate()
+    this.nudge()
+    return { ok: true }
+  }
+
+  /**
    * 并行占用 (spec §10.1's 顶部状态条). Live, because it changes many times per second and
    * mirroring it into React state would repaint the tree on every reviewer.
    *
