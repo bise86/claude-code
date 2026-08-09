@@ -407,23 +407,45 @@ export function TaskTreePanel(props: {
     // Detail view owns Esc/q/Enter while it is open; only after it closes do those keys mean
     // "leave the panel" again.
     if (detail) {
+      /**
+       * **带修饰键的那一下不算这里的动作键。**
+       *
+       * 这一段每一条判的都是**裸小写字符**,而 `internal_exitOnCtrlC` 在这个 fork 里是
+       * false(`main.tsx` 的 `getRenderContext(false)`),于是 `use-input.ts` 把 Ctrl+C
+       * **原样派发**给每一个监听者;`input-event.ts` 对带 ctrl 的键给出的 `input` 又正是
+       * 键名本身。两件事合起来的实测后果:
+       *  - **Ctrl+C 打开「清理已完成工作区」关口**(下面那条 `k === 'c'`);
+       *  - **Ctrl+Q 走 `onExitKey` —— 运行视图里那是 abort 整个 run**;
+       *  - Ctrl+R / Ctrl+F / Ctrl+S 各自打开重做 / 强制通过 / 跳过关口。
+       * 而 Ctrl+D / Ctrl+U 本来是 `NodeDetail` 与 `AgentLogPane` 的半页滚动:`useInput` 是
+       * 广播的,这里 `return` 并不阻断它们,所以挡掉之后那两个键逐字不变。
+       *
+       * **只许逐条与,不许写成分支开头的早退。** `key.meta` 对 **Escape 恒为真**
+       * (`input-event.ts` 的 `meta: keypress.meta || keypress.name === 'escape' || …`),
+       * 一句 `if (!plain) return` 会让 Esc 当场变成死键 —— 而下面那句注释立的规矩正是
+       * 「Esc / q 任何时候都是返回,返回这条路不许有死角」。
+       *
+       * 树那一支(下面)不需要这一层:它的动作键走 `runControlAction`,那个函数第一句
+       * 就是 `if (key.ctrl || key.meta) return null`。
+       */
+      const plain = key.ctrl !== true && key.meta !== true
       // 详情页是判断「这个节点到底哪儿错了」的地方 —— 看完就想重做,最不该逼用户先退回
       // 树上再按一次 r。快速重做和跳过同理,而且更是:详情页正是他刚看完阻断原因的地方。
       //
       // **`R` 要排在 `r` 之前**,而且判据要收两种终端写法(见 shiftR):下面那一句用的是
       // `k === 'r'`(已经 toLowerCase 过),所以 Shift+R 会先被它吃掉 —— 用户按 R
       // 拿到的是「自己选环节」那个三屏菜单,而快速重做这个键彻底消失。
-      if (shiftR && props.onRedoFailed) { setDetailId(null); props.onRedoFailed(detail); return }
-      if (k === 's' && props.onSkipFailed) { setDetailId(null); props.onSkipFailed(detail); return }
-      if (k === 'f' && props.onForcePass) { setDetailId(null); props.onForcePass(detail); return }
-      if (k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
+      if (plain && shiftR && props.onRedoFailed) { setDetailId(null); props.onRedoFailed(detail); return }
+      if (plain && k === 's' && props.onSkipFailed) { setDetailId(null); props.onSkipFailed(detail); return }
+      if (plain && k === 'f' && props.onForcePass) { setDetailId(null); props.onForcePass(detail); return }
+      if (plain && k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
       // 一键回收已完成子任务的工作区。关口自己会先扫一遍再让用户确认,所以这里不判
       // 「有没有东西可清」—— 那需要跑 git,而按键处理里不能等。
-      if (k === 'c' && props.onCleanupWorktrees) { setDetailId(null); props.onCleanupWorktrees(detail); return }
+      if (plain && k === 'c' && props.onCleanupWorktrees) { setDetailId(null); props.onCleanupWorktrees(detail); return }
       // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
       // Esc / q 任何时候都是返回 —— 返回这条路不许有死角。
       if (key.return && detailZone.current === 'tabs') return
-      if (key.return || key.escape || k === 'q') setDetailId(null)
+      if (key.return || key.escape || (plain && k === 'q')) setDetailId(null)
       return
     }
     if (key.escape || k === 'q') { props.onExitKey?.(); return }
