@@ -5,7 +5,7 @@ import { isTerminal, uiStatus, type UiStatus } from '../../tools/efftask/stateMa
 import { NodeDetail, type DetailZone } from './NodeDetail.js'
 import type { StreamStore } from '../../tools/efftask/agentStream.js'
 import { useStreamTick } from './AgentLogPane.js'
-import { runControlAction, budgetRows, clipToWidth, lastActivity, detailEntryHint } from './logView.js'
+import { runControlAction, budgetRows, clipToWidth, lastActivity, detailEntryHint, paginateHints } from './logView.js'
 import { currentMouseAvailability } from './mouseEnv.js'
 import { addUsage, EMPTY_USAGE, formatTokens, isEmptyUsage, subtreeUsage, totalTokens, type UsageTotals } from '../../tools/efftask/usage.js'
 import { reworkLine, reworkMarker } from '../../tools/efftask/reworkReason.js'
@@ -250,7 +250,15 @@ export function TaskTreePanel(props: {
    * 传的是节点本身而不是 id:调用方要立刻拿它的标题去渲染关口标题,而它手上那份
    * nodes 可能比这次按键晚一拍(树是一直在长的)。
    */
-  onRedo?: (node: TaskNode) => void
+  /**
+   * 重做入口。给了才有 `r` 键。
+   *
+   * **回一句话 = 这次被拒了**(和 `onRecalcDeps` 同一个形状),`undefined` = 已经切屏了。
+   * 此前这三个回调是 `void`,拒绝时调用方写进一个**只有结束屏读**的 state ——
+   * 运行视图里按 `r` 被拒时屏幕上一个字都没有,而详情页在调回调之前就已经关掉了。
+   * 用户报的原话:「在任务详情页按了 r 其实是没有效果」。
+   */
+  onRedo?: (node: TaskNode) => string | undefined
   /**
    * **快速**重做失败的那个环节(`R`)。给了才有这个键。
    *
@@ -258,9 +266,9 @@ export function TaskTreePanel(props: {
    * 「就那个失败的环节」。而它做不到时(节点没失败、失败点看不出来、失败在一个不能单独
    * 重入的环节)必须**说出原因**,所以调用方拿到的是节点,由它去算并决定显示什么。
    */
-  onRedoFailed?: (node: TaskNode) => void
+  onRedoFailed?: (node: TaskNode) => string | undefined
   /** 跳过失败的那个环节继续往下走(`s`)。给了才有这个键。 */
-  onSkipFailed?: (node: TaskNode) => void
+  onSkipFailed?: (node: TaskNode) => string | undefined
   /**
    * 强制通过一个环节(`f`)。给了才有这个键。
    *
@@ -268,7 +276,7 @@ export function TaskTreePanel(props: {
    * 节点有意义,而强制通过在运行中的节点上也要能按(预先批准)。所以这个键不像 `s`
    * 那样只挂在失败节点上,判断哪条路走得通由关口自己做,并在做不到时说原因。
    */
-  onForcePass?: (node: TaskNode) => void
+  onForcePass?: (node: TaskNode) => string | undefined
   /**
    * 一键回收这棵子树里已完成任务的隔离工作区(`c`)。给了才有这个键。
    *
@@ -380,14 +388,25 @@ export function TaskTreePanel(props: {
    * 永远先跑,在 NodeDetail 里调 stopImmediatePropagation 已经来不及了。
    */
   const detailZone = React.useRef<DetailZone>('content')
+  /** 页脚按键提示翻到第几页。`?` 键 +1,`paginateHints` 自己取模。 */
+  const [hintPage, setHintPage] = React.useState(0)
   /**
-   * 上一次按 d 被拒绝的原因,**连同它属于哪个节点**。
+   * 上一次**动作键**被拒绝的原因,**连同它属于哪个节点**。
    *
    * 只存字符串是不够的:它只在下一次按 d 时才被覆盖,于是在甲上被拒之后打开乙的详情页,
    * 乙的「依赖重算」段上写着**甲那一次**的理由 —— 一句关于别的任务的话,印在这个任务的
    * 详情页上。验收席用真渲染 + 真按键复现过。
    */
-  const [recalcNotice, setRecalcNotice] = React.useState<{ nodeId: string; text: string } | undefined>(undefined)
+  /**
+   * `kind` 决定这句话**画在哪** —— 两处都画就是同一句话说两遍:
+   *  - `recalc`:重算的拒绝理由是**多行**的(逐条依赖各一句),页脚那一行装不下,
+   *    所以它走详情页的「依赖重算」段;
+   *  - `action`:重做/跳过/强制通过的拒绝是一句话,走页脚 —— 用户刚按了键,他只看那儿。
+   */
+  type Notice = { nodeId: string; text: string; kind: 'recalc' | 'action' }
+  const [notice, setNotice] = React.useState<Notice | undefined>(undefined)
+  const noticeRef = React.useRef<Notice | undefined>(undefined)
+  noticeRef.current = notice
 
   const rows = visibleRows(props.nodes, collapsed)
   // Rows of TREE to draw at once; the border, header and key hint live outside it.
@@ -460,10 +479,33 @@ export function TaskTreePanel(props: {
       // **`R` 要排在 `r` 之前**,而且判据要收两种终端写法(见 shiftR):下面那一句用的是
       // `k === 'r'`(已经 toLowerCase 过),所以 Shift+R 会先被它吃掉 —— 用户按 R
       // 拿到的是「自己选环节」那个三屏菜单,而快速重做这个键彻底消失。
-      if (plain && shiftR && props.onRedoFailed) { setDetailId(null); props.onRedoFailed(detail); return }
-      if (plain && k === 's' && props.onSkipFailed) { setDetailId(null); props.onSkipFailed(detail); return }
-      if (plain && k === 'f' && props.onForcePass) { setDetailId(null); props.onForcePass(detail); return }
-      if (plain && k === 'r' && props.onRedo) { setDetailId(null); props.onRedo(detail); return }
+      /**
+       * **被拒时不关详情页,而且要说出来。**
+       *
+       * 这三个键的拒绝路径此前全是静默的:调用方把原因写进一个只有结束屏读的 state,
+       * 而这里在调它之前就已经 `setDetailId(null)`。用户按下去看到的是「详情页关掉了、
+       * 回到树上、什么都没发生」—— 报过来的原话是「按了 r 其实是没有效果」。
+       *
+       * 回一句话 = 被拒:留在详情页、把话画到页脚上。`undefined` = 调用方已经切屏了。
+       */
+      const act = (
+        fn: ((n: TaskNode) => string | undefined) | undefined,
+      ): boolean => {
+        if (!fn) return false
+        const why = fn(detail)
+        if (why === undefined) { setDetailId(null); return true }
+        setNotice({ nodeId: detail.id, text: why, kind: 'action' })
+        return true
+      }
+      // 详情页是判断「这个节点到底哪儿错了」的地方 —— 看完就想重做,最不该逼用户先退回
+      // 树上再按一次 r。快速重做和跳过同理,而且更是:详情页正是他刚看完阻断原因的地方。
+      //
+      // **`R` 要排在 `r` 之前**,而且判据要收两种终端写法(见 shiftR):下面那一句用的是
+      // `k === 'r'`(已经 toLowerCase 过),所以 Shift+R 会先被它吃掉。
+      if (plain && shiftR && props.onRedoFailed) { act(props.onRedoFailed); return }
+      if (plain && k === 's' && props.onSkipFailed) { act(props.onSkipFailed); return }
+      if (plain && k === 'f' && props.onForcePass) { act(props.onForcePass); return }
+      if (plain && k === 'r' && props.onRedo) { act(props.onRedo); return }
       // 一键回收已完成子任务的工作区。关口自己会先扫一遍再让用户确认,所以这里不判
       // 「有没有东西可清」—— 那需要跑 git,而按键处理里不能等。
       if (plain && k === 'c' && props.onCleanupWorktrees) { setDetailId(null); props.onCleanupWorktrees(detail); return }
@@ -471,11 +513,13 @@ export function TaskTreePanel(props: {
       // 「什么都没发生」。拒绝理由渲染在详情页自己那一段里(见 onRecalcDeps)。
       if (plain && k === 'd' && props.onRecalcDeps) {
         const why = props.onRecalcDeps(detail)
-        setRecalcNotice(why === undefined ? undefined : { nodeId: detail.id, text: why })
+        setNotice(why === undefined ? undefined : { nodeId: detail.id, text: why, kind: 'recalc' })
         return
       }
-      // 焦点在页签条上时,这一下回车归详情页(「最下面…回车可选择不同的页卡」)。
-      // Esc / q 任何时候都是返回 —— 返回这条路不许有死角。
+      // 页脚按键提示翻页:一屏放不下的键不再消失,而是等下一页(见 paginateHints)。
+      if (plain && input === '?') { setHintPage(x => x + 1); return }
+      // 任何**别的**键都把上一条提示清掉 —— 它描述的是上一次按键的结果。
+      if (noticeRef.current !== undefined) setNotice(undefined)
       if (key.return && detailZone.current === 'tabs') return
       if (key.return || key.escape || (plain && k === 'q')) setDetailId(null)
       return
@@ -485,10 +529,22 @@ export function TaskTreePanel(props: {
     // 重做。放在方向键**之前**,因为它不依赖 rows 之外的任何东西,而且放后面会被
     // 下面那些 `return` 挡掉一半路径。
     // `R`(快速重做失败环节)排在 `r` 前面,理由见详情页那一支:`k` 已经小写过了。
-    if (shiftR && props.onRedoFailed && current) { props.onRedoFailed(current); return }
-    if (k === 's' && props.onSkipFailed && current) { props.onSkipFailed(current); return }
-    if (k === 'f' && props.onForcePass && current) { props.onForcePass(current); return }
-    if (k === 'r' && props.onRedo && current) { props.onRedo(current); return }
+    /**
+      * 树上按这几个键被拒时**同样不许静默** —— 理由和详情页那一支逐字相同,只是这里
+      * 没有详情页可留,话画在页脚上(下一次按键清掉)。
+      */
+    const actHere = (fn: ((n: TaskNode) => string | undefined) | undefined): boolean => {
+      if (!fn || !current) return false
+      const why = fn(current)
+      if (why !== undefined) setNotice({ nodeId: current.id, text: why, kind: 'action' })
+      return true
+    }
+    if (shiftR && props.onRedoFailed && current) { actHere(props.onRedoFailed); return }
+    if (k === 's' && props.onSkipFailed && current) { actHere(props.onSkipFailed); return }
+    if (k === 'f' && props.onForcePass && current) { actHere(props.onForcePass); return }
+    if (k === 'r' && props.onRedo && current) { actHere(props.onRedo); return }
+    // 页脚提示翻页。放在方向键之前,和上面那几个键同一档。
+    if (input === '?' && key.ctrl !== true && key.meta !== true) { setHintPage(x => x + 1); return }
     // 运行中的人工干预。同样放在方向键之前,同样的理由。
     if (props.runControl) {
       const act = runControlAction(input, key)
@@ -568,7 +624,10 @@ export function TaskTreePanel(props: {
    */
         canRecalcDeps={props.recalcAvailable?.(detail) === true}
         // 只画属于**这个**节点的那一条。
-        recalcNotice={recalcNotice?.nodeId === detail.id ? recalcNotice.text : undefined}
+        recalcNotice={notice?.nodeId === detail.id && notice.kind === 'recalc' ? notice.text : undefined}
+        actionNotice={notice?.nodeId === detail.id && notice.kind === 'action' ? notice.text : undefined}
+        hintPage={hintPage}
+        canForcePass={props.onForcePass !== undefined}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
         maxRows={detailRows}
@@ -756,8 +815,12 @@ export function TaskTreePanel(props: {
         // 图例和按键**同一行**:面板高度 = 边框 2 + 表头 1 + height 20 + 提示,
         // 多一行就是 25 行,而 24 行是极常见的默认 —— 底部的计数和提示会被顶出去。
         // 分隔符不用 '·':「待定」那个字形本身就是 '·',读起来会变成三项。
-        <Text dimColor wrap="truncate-end">
-          {props.suspended === true
+        <Text dimColor wrap="truncate-end" color={notice ? 'warning' : undefined}>
+          {notice !== undefined
+            // 上一次动作键被拒的原因**盖住键位提示** —— 用户刚按了键、什么都没发生,
+            // 而这一行是他唯一会看的地方。下一次按键清掉。
+            ? `⚠ ${notice.text}`
+            : props.suspended === true
             // 不说的话,用户会按着方向键发现树不动,以为界面卡死了。
             ? '⏸ 等你回答上面那个权限确认 —— 这期间按键归它'
             /**
@@ -788,12 +851,22 @@ export function TaskTreePanel(props: {
              * 出口 → 干预/动作键 → 导航 → 图例。图例最先被吃掉是对的 —— 它是三个字形的
              * 说明,不是一件能做的事。
              */
-            : `Esc/q 退出${props.runControl
-              ? ` · ${props.runControl.paused ? '⏸ 已暂停(p 恢复)' : 'p 暂停'} · i 追加指令 · x 取消选中任务`
-                + (props.runControl.onAdjustStrictness ? ' · <> 严格度' : '')
-              : ''}${props.onRedo ? ' · r 重做' : ''}${failedKeysHint}`
-              + ` · ↑↓/jk 移动 · ←/→ 折叠 · 空格切换 · ${detailEntryHint(mouse)}`
-              + `    ${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定`}
+            : paginateHints([
+              'Esc/q 退出',
+              ...(props.runControl
+                ? [
+                  props.runControl.paused ? '⏸ 已暂停(p 恢复)' : 'p 暂停',
+                  'i 追加指令', 'x 取消选中任务',
+                  ...(props.runControl.onAdjustStrictness ? ['<> 严格度'] : []),
+                ]
+                : []),
+              ...(props.onRedo ? ['r 重做'] : []),
+              ...(onFailedNode && props.onRedoFailed ? ['R 重做失败环节'] : []),
+              ...(onFailedNode && props.onSkipFailed ? ['s 跳过它'] : []),
+              ...(forcePassHint ? [forcePassHint.replace(' · ', '')] : []),
+              '↑↓/jk 移动', '←/→ 折叠', '空格切换', detailEntryHint(mouse),
+              `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定`,
+            ], rowWidth, hintPage).text}
         </Text>
       ) : null}
     </Box>

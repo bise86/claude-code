@@ -2212,7 +2212,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 运行中按 f = 预先批准。**不在这里判能不能** —— 关口自己会按节点状态和本次配置
        * 算出可选的环节并逐条说明原因,而在这儿再判一次就是第二份判据。
        */
-      onForcePass={node => { setForcePassTarget(node); setForcePassFrom('running'); setPhase('confirmForcePass') }}
+      onForcePass={node => { setForcePassTarget(node); setForcePassFrom('running'); setPhase('confirmForcePass'); return undefined }}
       /**
        * 运行中的重做三键。**别的任务照常跑** —— 确认之后新树是被并进正在跑的那一棵,
        * 不是另起一个编排器(见 redoDeps 的 `from` 和 orchestrator.applyLive)。
@@ -2221,14 +2221,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 决定「砍掉它正在飞的调用」不是这个键该做的事 —— 说清楚让他按 x。剩下的判断
        * (这个环节能不能重入、会删掉几个子任务)照旧归关口和 failedRedoTarget。
        */
+      /**
+       * **拒绝要 return 出去,不能写进 `redoProblems`** —— 那个 state 只有结束屏读
+       * (`DoneView` 的 props),运行视图里按下去屏幕上一个字都没有,而详情页在调这个
+       * 回调之前就已经关掉了。用户报的原话:「在任务详情页按了 r 其实是没有效果」。
+       */
       onRedo={node => {
         const why = liveRedoUnavailableReason({
           running: orchRef.current !== null,
           nodeRunning: orchRef.current?.runningNodeIds().includes(node.id) === true,
           title: node.title,
         })
-        if (why) { setRedoProblems([why]); return }
+        if (why) return why
         setRedoTarget(node); setRedoEntry(null); setRedoFrom('running'); setPhase('confirmRedo')
+        return undefined
       }}
       onRedoFailed={node => {
         const why = liveRedoUnavailableReason({
@@ -2236,11 +2242,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           nodeRunning: orchRef.current?.runningNodeIds().includes(node.id) === true,
           title: node.title,
         })
-        if (why) { setRedoProblems([why]); return }
-        const byId = new Map(nodes.map(n => [n.id, n]))
+        if (why) return why
+        const byId = new Map(nodes.map(n => [n.id, n] as [string, TaskNode]))
         const found = failedRedoTarget(node, byId, config ? phaseCtxOf(node, config) : undefined)
-        if ('error' in found) { setRedoProblems([found.error]); return }
+        if ('error' in found) return found.error
         setRedoTarget(node); setRedoEntry(found.entry); setRedoFrom('running'); setPhase('confirmRedo')
+        return undefined
       }}
       onSkipFailed={node => {
         const why = liveRedoUnavailableReason({
@@ -2248,10 +2255,11 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           nodeRunning: orchRef.current?.runningNodeIds().includes(node.id) === true,
           title: node.title,
         })
-        if (why) { setRedoProblems([why]); return }
+        if (why) return why
         const blocked = skipFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
-        if (blocked) { setRedoProblems([blocked]); return }
+        if (blocked) return blocked
         setSkipTarget(node); setRedoFrom('running'); setPhase('confirmSkip')
+        return undefined
       }}
       /**
        * 运行中也能清 —— 而且这正是最需要它的时刻:一棵跑三小时的树,前十个子任务的
@@ -2343,7 +2351,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 中断过的 run 在这里重做会立刻再次阻断(见 redoUnavailableReason)。
         // 挡在**按键这一刻**,而不是让他选完环节、看完后果、确认完再看一遍失败。
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
-        if (why) { setRedoProblems([why]); return }
+        if (why) { setRedoProblems([why]); return why }
         setRedoTarget(node); setRedoEntry(null); setRedoFrom('done'); setPhase('confirmRedo')
       }}
       /**
@@ -2355,19 +2363,19 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        */
       onRedoFailed={viewOnly ? undefined : node => {
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
-        if (why) { setRedoProblems([why]); return }
+        if (why) { setRedoProblems([why]); return why }
         const byId = new Map(nodes.map(n => [n.id, n]))
         const found = failedRedoTarget(node, byId, config ? phaseCtxOf(node, config) : undefined)
         // 拿不到就**说原因**,而不是把用户送进一屏什么都按不动的关口。
-        if ('error' in found) { setRedoProblems([found.error]); return }
+        if ('error' in found) { setRedoProblems([found.error]); return found.error }
         setRedoTarget(node); setRedoEntry(found.entry); setRedoFrom('done'); setPhase('confirmRedo')
       }}
       /** 跳过失败的那个环节继续往下走(`s`)。同样两道闸门,同样的顺序。 */
       onSkipFailed={viewOnly ? undefined : node => {
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
-        if (why) { setRedoProblems([why]); return }
+        if (why) { setRedoProblems([why]); return why }
         const blocked = skipFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
-        if (blocked) { setRedoProblems([blocked]); return }
+        if (blocked) { setRedoProblems([blocked]); return blocked }
         setSkipTarget(node); setRedoFrom('done'); setPhase('confirmSkip')
       }}
       /**
@@ -2376,9 +2384,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        */
       onForcePass={viewOnly ? undefined : node => {
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
-        if (why) { setRedoProblems([why]); return }
+        if (why) { setRedoProblems([why]); return why }
         const blocked = forcePassFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
-        if (blocked) { setRedoProblems([blocked]); return }
+        if (blocked) { setRedoProblems([blocked]); return blocked }
         setForcePassTarget(node); setForcePassFrom('done'); setPhase('confirmForcePass')
       }}
       /**
@@ -2452,7 +2460,7 @@ export function RunningView(props: {
    * 和 runControl 分开传:那三个键当场就生效,而这一个要先弹一屏让用户选环节并看后果 ——
    * 它的落点是 `setPhase('confirmForcePass')`,不是一个即时动作。
    */
-  onForcePass?: (node: TaskNode) => void
+  onForcePass?: (node: TaskNode) => string | undefined
   /**
    * 运行中的重做三键(`r` 任务/阶段重做、`R` 快速重做失败环节、`s` 跳过失败环节)。
    *
@@ -2462,9 +2470,9 @@ export function RunningView(props: {
    *
    * 和 `onForcePass` 一样是「弹一屏关口」而不是即时动作,所以和 runControl 分开传。
    */
-  onRedo?: (node: TaskNode) => void
-  onRedoFailed?: (node: TaskNode) => void
-  onSkipFailed?: (node: TaskNode) => void
+  onRedo?: (node: TaskNode) => string | undefined
+  onRedoFailed?: (node: TaskNode) => string | undefined
+  onSkipFailed?: (node: TaskNode) => string | undefined
   /**
    * 详情页的 `c` 键:回收这棵子树里已验收任务的隔离工作区。
    *
@@ -2513,13 +2521,13 @@ export function DoneView(props: {
   /** 上一次重做**没做成**的事。空 = 干净;非空必须显示,每条都是会自己长回来的问题。 */
   redoProblems?: string[]
   /** 给了才有 r 键。 */
-  onRedo?: (node: TaskNode) => void
+  onRedo?: (node: TaskNode) => string | undefined
   /** 给了才有 R 键(快速重做失败的那个环节)。 */
-  onRedoFailed?: (node: TaskNode) => void
+  onRedoFailed?: (node: TaskNode) => string | undefined
   /** 给了才有 s 键(跳过失败的那个环节继续往下走)。 */
-  onSkipFailed?: (node: TaskNode) => void
+  onSkipFailed?: (node: TaskNode) => string | undefined
   /** 给了才有 f 键(强制通过失败的那个环节,并留下一条人工裁决)。 */
-  onForcePass?: (node: TaskNode) => void
+  onForcePass?: (node: TaskNode) => string | undefined
   /** 给了才有 c 键(回收这棵子树里已验收任务的隔离工作区)。 */
   onCleanupWorktrees?: (node: TaskNode) => void
   onExit: (outcome: Outcome | null) => void

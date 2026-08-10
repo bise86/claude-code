@@ -205,3 +205,104 @@ describe('详情页页脚的动作键在窄终端上活着', () => {
     expect(foot.indexOf('r 重做本任务')).toBeLessThan(foot.indexOf('选段落'))
   })
 })
+
+/**
+ * 用户报的三件事,各一组探针。
+ *
+ * 1. 「在任务详情页按了 r 其实是没有效果」—— 拒绝路径此前把原因写进一个**只有结束屏读**
+ *    的 state,而详情页在调回调之前就已经关掉了。按下去 = 详情页消失 + 什么都没发生。
+ * 2. 「可以看下是否所有功能键都在」—— `f 强制通过` 一直能按却从来没被宣告过。
+ * 3. 「功能键可以有翻页」—— 一屏放不下的键不再消失,而是等下一页。
+ */
+describe('动作键被拒时必须说话,而且不许把人踢出详情页', () => {
+  const NODE = (): TaskNode[] => [
+    mk('root', {
+      title: '根任务', status: 'BLOCKED', failedAt: 'ACCEPTANCE', blockedReason: '验收未通过',
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'x' }, execStatus: '改了 a.ts',
+    }),
+  ]
+
+  for (const [key, prop] of [['r', 'onRedo'], ['R', 'onRedoFailed'], ['s', 'onSkipFailed']] as const) {
+    it(`按 ${key} 被拒 → 理由上屏,而且详情页还开着`, async () => {
+      const t = fakeTty(100)
+      const app = await render(
+        <TaskTreePanel
+          nodes={NODE()} runId="003" interactive onExitKey={() => {}}
+          {...{ [prop]: () => '这个任务此刻正在运行 —— 先按 x 取消' }}
+        />,
+        { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      t.stdin.press(ENTER); await tick()
+      t.stdin.press(key); await tick()
+      const frame = t.lastFrame()
+      app.unmount()
+      expect(frame).toContain('先按 x 取消')
+      // 还在详情页 —— 被拒的语义是「什么都没发生」,不该顺带丢掉他的阅读位置
+      expect(frame).toContain('返回任务树')
+    })
+  }
+
+  it('放行时照常切屏(回 undefined = 调用方已经开关口了)', async () => {
+    const seen: string[] = []
+    const t = fakeTty(100)
+    const app = await render(
+      <TaskTreePanel
+        nodes={NODE()} runId="003" interactive onExitKey={() => {}}
+        onRedo={n => { seen.push(n.id); return undefined }}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(ENTER); await tick()
+    t.stdin.press('r'); await tick()
+    // 详情页已关(c 没有出口可打) —— 用回调是否再被调到来证明
+    t.stdin.press('r'); await tick()
+    app.unmount()
+    expect(seen).toEqual(['root', 'root']) // 树上按 r 同样会调,证明确实回到了树
+  })
+
+  it('`f 强制通过` 出现在页脚上 —— 它一直能按,却从来没被宣告过', async () => {
+    const t = fakeTty(100)
+    const app = await render(
+      <TaskTreePanel
+        nodes={NODE()} runId="003" interactive onExitKey={() => {}}
+        onForcePass={() => undefined}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(ENTER); await tick()
+    const frame = t.lastFrame()
+    app.unmount()
+    expect(frame).toContain('f 强制通过')
+  })
+
+  it('窄终端上按 ? 翻页 —— 装不下的键不再消失', async () => {
+    const t = fakeTty(80)
+    const app = await render(
+      <TaskTreePanel
+        nodes={NODE()} runId="003" interactive onExitKey={() => {}}
+        onRedo={() => undefined} onRedoFailed={() => undefined}
+        onSkipFailed={() => undefined} onForcePass={() => undefined}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(ENTER); await tick()
+    /**
+     * 断言做在**整帧的子串**上,不按行切。
+     *
+     * 两个坑都踩过:`reset()` 之后拿到的是半张帧(渲染器只写增量);而按 '\n' 切行时
+     * 两次重画可能落在同一条文本行里,于是「第 2 页」和「第 1 页」被 `.pop()` 合成一条,
+     * 断言当场恒真。页码本身是唯一可靠的判据。
+     */
+    expect(t.lastFrame()).toContain('[1/')
+    expect(t.lastFrame()).toContain('?换页')
+    t.stdin.press('?'); await tick()
+    const after = t.lastFrame()
+    app.unmount()
+    expect(after).toContain('[2/')          // 真的翻到了第 2 页
+    expect(after).toContain('Esc/q 返回任务树') // 出口每一页都在
+  })
+})

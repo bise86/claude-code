@@ -1176,3 +1176,71 @@ export function mouseHint(a: MouseAvailability): string {
     case 'clicks-disabled': return '点击被 CLAUDE_CODE_DISABLE_MOUSE_CLICKS 关掉了'
   }
 }
+
+/**
+ * 页脚的**按键提示分页**。
+ *
+ * ## 它治的是什么
+ *
+ * 页脚是 `truncate-end` 的一行,而键位一直在长。实测:详情页那一行光导航说明就 94 列,
+ * 而非全屏可用宽是 `columns - 4` —— **113 列以下 `r 重做本任务` 一个字都画不出来**,
+ * 130 列以下没有 `R`,141 列以下没有 `s`。用户报的原话是「子任务重跑和阶段重跑功能没有了」:
+ * 键一直是好的,而屏幕上从来没说过它们存在。
+ *
+ * 调次序只能决定**谁先被吃掉**,吃不下这件事本身没解决 —— 一屏放不下就是放不下。
+ * 所以给它翻页:一屏放不下的那些不再消失,而是等下一页。
+ *
+ * ## 三条不许动的规矩
+ *
+ * 1. **第一段钉在每一页上。** 那是「怎么出去」。这个仓库为「出口被截掉」付过一次学费
+ *    (评审实测:60~126 列上一律没有 `Esc/q 退出`),分页把同一个坑换成「出口翻到第 2 页了」
+ *    只是换个地方犯。
+ * 2. **页码本身要先占地方。** 先扣掉 `[1/2 ?换页]` 的宽度再填内容 —— 不扣的话最后一段会
+ *    把页码顶出去,于是屏幕上有第 2 页而没有任何字说得出它存在(截断提示必须活在被截断的
+ *    东西之外)。
+ * 3. **只有一页时一个字都不多写。** 宽终端上凭空多出「1/1 ?换页」是纯噪声,而且会让
+ *    「这一行还有别的东西」变成一句假话。
+ *
+ * `page` 会被**取模**,所以调用方可以一直加不用管边界。
+ */
+export function paginateHints(
+  segments: readonly string[],
+  width: number,
+  page = 0,
+  sep = ' · ',
+): { text: string; page: number; pages: number } {
+  const kept = segments.filter(s => s.length > 0)
+  if (kept.length === 0) return { text: '', page: 0, pages: 1 }
+  const head = kept[0]
+  const rest = kept.slice(1)
+  const w = (s: string): number => stringWidth(s)
+  // 一页都放不下头段时不分页 —— 交给 truncate-end,分页在这里帮不上任何忙。
+  if (rest.length === 0 || width <= w(head)) return { text: head, page: 0, pages: 1 }
+
+  /** 先按「不分页」试一次:装得下就一个字都不多写(规矩 3)。 */
+  const whole = kept.join(sep)
+  if (w(whole) <= width) return { text: whole, page: 0, pages: 1 }
+
+  // 分页:每页 = 头段 + 若干后续段 + 页码。页码宽度按最坏情况(两位数)预留。
+  const badge = (p: number, n: number): string => ` [${p + 1}/${n} ?换页]`
+  const reserve = w(badge(9, 99))
+  const pages: string[][] = []
+  let cur: string[] = []
+  let used = w(head) + reserve
+  for (const seg of rest) {
+    const add = w(sep) + w(seg)
+    if (cur.length > 0 && used + add > width) {
+      pages.push(cur)
+      cur = []
+      used = w(head) + reserve
+    }
+    cur.push(seg)
+    used += add
+  }
+  if (cur.length > 0) pages.push(cur)
+  if (pages.length === 0) return { text: head, page: 0, pages: 1 }
+  // 取模:调用方一直 +1 就行,不用自己管边界(而负数也要落回合法页)。
+  const n = pages.length
+  const p = ((page % n) + n) % n
+  return { text: [head, ...pages[p]].join(sep) + badge(p, n), page: p, pages: n }
+}

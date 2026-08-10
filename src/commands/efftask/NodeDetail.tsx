@@ -22,6 +22,7 @@ import {
   sectionCursor,
   tabFocused,
   mouseHint,
+  paginateHints,
   type LogPaneMode,
   type SectionSpec,
 } from './logView.js'
@@ -655,6 +656,17 @@ export function NodeDetail(props: {
    * 能不能按 d 重算依赖。只影响「依赖」段最后那一行提示 —— **不进段落标题**,
    * 理由见 depsBody 里那一段(标题是身份,而这个条件会被编排器自己 tick 掉)。
    */
+  /**
+   * 能不能按 `f` 强制通过一个环节。
+   *
+   * **这个键一直能按,却从来没被宣告过** —— `TaskTreePanel` 的详情分支接了 `k === 'f'`,
+   * 而这一行的提示串里没有它,这个组件连这个 prop 都没有。审计出来的。
+   */
+  canForcePass?: boolean
+  /** 页脚按键提示翻到第几页(取模,调用方一直加就行)。 */
+  hintPage?: number
+  /** 上一次动作键被拒的原因。给了就**盖住页脚那一行** —— 用户刚按了键,他只会看那儿。 */
+  actionNotice?: string
   canRecalcDeps?: boolean
   /** 上一次按 d 被拒绝的原因。渲染在详情页里,不切屏。 */
   recalcNotice?: string
@@ -950,48 +962,64 @@ export function NodeDetail(props: {
    *
    * 后三个只在这个节点真的能按时才写 —— 一个按了只会被拒绝的键和一个按了没反应的键一样糟。
    */
-  const redoHint = (props.canRedo ? ' · r 重做本任务' : '')
-    + (props.canRedoFailed ? ' · R 重做失败环节' : '')
-    + (props.canSkipFailed ? ' · s 跳过它' : '')
-    // 排在最后:它是这几个键里最不紧急的一个(腾空间,不影响这一趟跑不跑得下去),
-    // 而这一行是 truncate-end —— 窄终端上被吃掉的必须是最不重要的那一头。
-    // 依赖重算排在最后一档:主提示贴在「依赖」段上(见 depsBody),页脚这一句只是
-    // 宽终端上的补充 —— 实测 100 列时这一行连既有的 r/c 都已经在屏幕外。
-    + (props.canRecalcDeps ? ' · d 重算依赖' : '')
-    + (props.canCleanup ? ' · c 清理工作区' : '')
-  const footer = ((): string => {
-    if (zone === 'tabs') return `Esc/q 返回任务树${redoHint} · ←→ 选页卡 · 回车/空格 进入 · Tab 回内容`
+  /**
+   * 每一个键**都要在**,一个都不许因为终端太窄而消失 —— 装不下的那些翻页给它。
+   *
+   * 段落数组而不是拼好的一整行:分页要按段切,切在段中间会造出一个读起来像另一个键的
+   * 半截字符串。次序 = 被翻到后面去的先后:动作键在前(没有提示就完全不可发现),
+   * 导航在后(↑↓ 按下去本来就有反应)。
+   */
+  const actionHints = [
+    props.canRedo ? 'r 重做本任务' : '',
+    props.canRedoFailed ? 'R 重做失败环节' : '',
+    props.canSkipFailed ? 's 跳过它' : '',
+    // `f` 一直能按却从来没被宣告过 —— 审计出来的。
+    props.canForcePass ? 'f 强制通过' : '',
+    props.canRecalcDeps ? 'd 重算依赖' : '',
+    props.canCleanup ? 'c 清理工作区' : '',
+  ].filter(s => s.length > 0)
+  /** 页脚的段落清单。第一段是出口,分页会把它钉在每一页上。 */
+  const footerSegments = ((): string[] => {
+    if (zone === 'tabs') {
+      return ['Esc/q 返回任务树', ...actionHints, '←→ 选页卡', '回车/空格 进入', 'Tab 回内容']
+    }
     if (tab === 'log') {
-      if (!logPaneMounted) return `Esc/q 返回任务树${redoHint} · ←→ 换页卡 · Tab 到页签`
+      if (!logPaneMounted) return ['Esc/q 返回任务树', ...actionHints, '←→ 换页卡', 'Tab 到页签']
       /**
-       * ↑↓ 在这一屏有**两个**含义,所以这一行必须跟着模式变。
+       * ↑↓ 在这一屏有**两个**含义,所以这一段必须跟着模式变。
        *
        * 写死一句「↑↓/jk 滚动」的后果不是少一条说明:选中一条折叠的流时按 ↑↓ 换的是流,
        * 而页脚说它在滚动 —— 用户会以为滚动坏了。这个仓库为「页脚上写着的键按了没反应」
        * 已经付过两次学费(Tab 切换环节、页签条上的回车),这次是同一类。
        */
       const nav = logMode === 'select'
-        ? '↑↓/jk 选阶段 · 空格 展开(之后 ↑↓ 滚它的内容)'
-        : '↑↓/jk 滚动 · 空格 收起(回到选阶段)'
-      return `Esc/q 返回任务树${redoHint} · ${nav} · ←→ 换页卡 · Tab 到页签 · n 下一条 · g/G 顶部/底部 · t 思考 · 耗时含等你批权限的时间`
+        ? ['↑↓/jk 选阶段', '空格 展开(之后 ↑↓ 滚它的内容)']
+        : ['↑↓/jk 滚动', '空格 收起(回到选阶段)']
+      return [
+        'Esc/q 返回任务树', ...actionHints, ...nav,
+        '←→ 换页卡', 'Tab 到页签', 'n 下一条', 'g/G 顶部/底部', 't 思考', '耗时含等你批权限的时间',
+      ]
     }
     /**
-     * ↑↓ 在段落区也有**两个**含义了(用户原话:「和子 agent 上一样」),所以这一行
-     * 跟着模式变 —— 理由与上面输出页卡那一段逐字相同。
+     * ↑↓ 在段落区也有**两个**含义了(用户原话:「和子 agent 上一样」),理由与上面
+     * 输出页卡那一段逐字相同。
      *
-     * 两句都**量过宽度**:100 列的终端上页脚实际能写 95 列(truncate-end 自己占一列),
-     * 而这两句分别是 94 和 92。上一版写成「空格 展开(之后 ↑↓ 滚它的内容)」是 101 列 ——
-     * 超出去的部分从尾部吃掉,被吃掉的正好是 `^u/^d 翻页`,而那是 select 模式下**唯一**
-     * 的翻页手段(read 模式里 ↑↓ 本来就能滚,它可有可无)。截断只许吃掉最不重要的那一头。
-     *
-     * `n 下一段` 只写在 read 模式里:select 模式下 ↑↓ 就是换段落,列一个同义键只会挤掉
-     * 别的说明;而 read 模式下它是**唯一**不用先收起就能换段落的键(和输出页卡的 `n` 同位)。
+     * `n 下一段` 只写在 read 模式里:select 模式下 ↑↓ 就是换段落,列一个同义键只会多占
+     * 一段;而 read 模式下它是**唯一**不用先收起就能换段落的键(和输出页卡的 `n` 同位)。
      */
     const nav = secMode === 'select'
-      ? '↑↓/jk 选段落 · 空格 展开(→ ↑↓ 滚内容) · ←→ 换页卡 · Tab 到页签 · ^u/^d 翻页'
-      : '↑↓/jk 滚内容 · 空格 收起(→ ↑↓ 选段落) · n 下一段 · ←→ 换页卡 · Tab 到页签'
-    return `Esc/q 返回任务树${redoHint} · ${nav}`
+      ? ['↑↓/jk 选段落', '空格 展开(→ ↑↓ 滚内容)', '←→ 换页卡', 'Tab 到页签', '^u/^d 翻页']
+      : ['↑↓/jk 滚内容', '空格 收起(→ ↑↓ 选段落)', 'n 下一段', '←→ 换页卡', 'Tab 到页签']
+    return ['Esc/q 返回任务树', ...actionHints, ...nav]
   })()
+  /**
+   * 上一次动作键被拒的原因,**盖住这一行**。
+   *
+   * 它比键位提示当下重要得多:用户刚按了一个键、什么都没发生,而这一行是他唯一会看的
+   * 地方。下一次按键就把它清掉(见 TaskTreePanel 的 actionNotice)。
+   */
+  const paged = paginateHints(footerSegments, contentWidth - 1, props.hintPage ?? 0)
+  const footer = props.actionNotice ? `⚠ ${props.actionNotice}(按任意键继续)` : paged.text
 
   return (
     <Box
