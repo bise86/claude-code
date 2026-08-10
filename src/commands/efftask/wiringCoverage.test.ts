@@ -753,7 +753,7 @@ describe('改回去要变红的四处', () => {
     expect(iBox).toBeGreaterThanOrEqual(0)
     expect(iBox).toBeLessThan(iRun)
   })
-  it('只查看模式**照给**重做入口,但代价要同时写出来', () => {
+  it('先看树那条路**照给**四个动作键 —— 没有只读模式', () => {
     /**
      * 曾经是 `onRedo={viewOnly ? undefined : …}` 四个全摘,理由是「他刚刚明确选了不跑」。
      * 而恢复关口自己印着「树太长……**按 v 查看完整任务树**」—— 于是想看整棵树的人被指进
@@ -763,8 +763,12 @@ describe('改回去要变红的四处', () => {
      * 「只看」的本意是**不要自动把这个 run 跑起来**,不是「永远不许我动手」;而重做本来
      * 就要过确认屏,那是第二次明确决定。所以键照给 —— 但那句「按了会开跑」必须同屏。
      */
-    expect(SRC).not.toContain('onRedo={viewOnly ? undefined :')
-    expect(SRC).toContain("keysNote={viewOnly ? '只看模式:按这些键并确认后会开始跑一次' : undefined}")
+    // 四个动作键**无条件**给 —— 一个 viewOnly 三元都不许再有。
+    for (const k of ['onRedo', 'onRedoFailed', 'onSkipFailed', 'onForcePass']) {
+      expect(SRC).not.toContain(`${k}={viewOnly ? undefined :`)
+    }
+    // 也不许再有任何「只看模式」的说辞挂在键旁边 —— 那个模式不存在。
+    expect(SRC).not.toContain('只看模式')
   })
 
   it('树外那几条流是钉住的 —— 否则它们是第一批被淘汰的', () => {

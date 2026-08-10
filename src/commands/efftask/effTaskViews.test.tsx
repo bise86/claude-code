@@ -149,11 +149,14 @@ describe('并行占用 (spec §10.1) 的最后一跳', () => {
   })
 })
 
-describe('仅查看后退出 (spec §17.3):只读浏览,不能报成"被阻断"', () => {
-  it('viewOnly 时说的是"没有继续执行",并给出继续的命令', async () => {
+describe('先看树 (spec §17.3):没有只读模式,也不能报成"被阻断"', () => {
+  it('说的是"没有继续执行",并给出继续的命令,而且不许自称一种模式', async () => {
     // 用户按 v 是自己选择不继续,run 原封不动留在盘上、完全可以续跑。把这说成
     // 「✗ 高效任务被阻断」,是把用户的一次按键报成一次失败 —— 而"被阻断"在这个产品里
     // 有确切含义(有节点触阀/失败),会把人送去查一个根本不存在的故障。
+    //
+    // 而「仅查看 / 只读」这类**模式**说辞同样不许有:那一屏上所有键照常可用,
+    // 说它是一种受限模式就是屏幕在说假话(用户原话:「没有只读模式,所有功能都可以用」)。
     const t = fakeTty()
     const app = await render(
       React.createElement(DoneView as never, {
@@ -164,8 +167,10 @@ describe('仅查看后退出 (spec §17.3):只读浏览,不能报成"被阻断"'
     )
     await tick()
     const f = t.lastFrame()
-    expect(f).toContain('仅查看')
+    expect(f).toContain('没有继续执行')
     expect(f).not.toContain('被阻断')
+    expect(f).not.toContain('仅查看')
+    expect(f).not.toContain('只读')
     expect(f).toContain('--resume 003')
     app.unmount()
   })

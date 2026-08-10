@@ -230,87 +230,6 @@ export function TaskTreePanel(props: {
   /** Rows of tree drawn at once; the rest scrolls with the cursor. */
   maxRows?: number
   /**
-   * 这个面板**下面**还画着多少行别的东西。
-   *
-   * 完成视图在树的下面挂着一个总结框(收口结果 / 后续动作 / 重做遗留问题),行数运行时
-   * 可变;运行视图则是独占的。详情页要算自己的高度,而它看不见那个框 —— 只有调用方知道。
-   */
-  reservedRows?: number
-  onExitKey?: () => void
-  /**
-   * 让出键盘。
-   *
-   * 有权限确认对话框画在面板之上时必须为真:两个组件同时挂着,而 useInput 是广播的 ——
-   * 用户按回车批准工具,同一下回车也会打开光标所在节点的详情页。
-   */
-  suspended?: boolean
-  /**
-   * 重做入口。给了才有 `r` 键 —— 运行中的树不给,因为编排器正握着这些节点。
-   *
-   * 传的是节点本身而不是 id:调用方要立刻拿它的标题去渲染关口标题,而它手上那份
-   * nodes 可能比这次按键晚一拍(树是一直在长的)。
-   */
-  /**
-   * 重做入口。给了才有 `r` 键。
-   *
-   * **回一句话 = 这次被拒了**(和 `onRecalcDeps` 同一个形状),`undefined` = 已经切屏了。
-   * 此前这三个回调是 `void`,拒绝时调用方写进一个**只有结束屏读**的 state ——
-   * 运行视图里按 `r` 被拒时屏幕上一个字都没有,而详情页在调回调之前就已经关掉了。
-   * 用户报的原话:「在任务详情页按了 r 其实是没有效果」。
-   */
-  onRedo?: (node: TaskNode) => string | undefined
-  /**
-   * **快速**重做失败的那个环节(`R`)。给了才有这个键。
-   *
-   * 和 `onRedo` 分开而不是加一个参数:两者的粒度不同 —— `r` 是「我自己选」,`R` 是
-   * 「就那个失败的环节」。而它做不到时(节点没失败、失败点看不出来、失败在一个不能单独
-   * 重入的环节)必须**说出原因**,所以调用方拿到的是节点,由它去算并决定显示什么。
-   */
-  onRedoFailed?: (node: TaskNode) => string | undefined
-  /** 跳过失败的那个环节继续往下走(`s`)。给了才有这个键。 */
-  onSkipFailed?: (node: TaskNode) => string | undefined
-  /**
-   * 强制通过一个环节(`f`)。给了才有这个键。
-   *
-   * 和 `onSkipFailed` 分开而不是加一个参数:两者的**去处**不同 —— 跳过只对已阻断的
-   * 节点有意义,而强制通过在运行中的节点上也要能按(预先批准)。所以这个键不像 `s`
-   * 那样只挂在失败节点上,判断哪条路走得通由关口自己做,并在做不到时说原因。
-   */
-  onForcePass?: (node: TaskNode) => string | undefined
-  /**
-   * 一键回收这棵子树里已完成任务的隔离工作区(`c`)。给了才有这个键。
-   *
-   * **只挂在详情页上**,和上面那四个不同。用户要的就是详情页那个位置(「在任务详情页
-   * 下面有个控制键」),而树的页脚已经排到边界了 —— 那一行是 truncate-end,再加一句
-   * 会把「怎么退出去」挤出屏幕(重做那三个键为同一件事量过一次)。
-   */
-  onCleanupWorktrees?: (node: TaskNode) => void
-  /**
-   * 依赖重算(详情页 d 键)。给了才有这个键。
-   *
-   * **回调要回一句话或 undefined**:准入判据全是纯内存读,拒绝时**不切屏** ——
-   * 切屏会把本面板连同 NodeDetail 整棵卸载,用户展开到哪一段、读到第几行全没了,
-   * 而「什么都没发生」不该长成「你的阅读位置没了」。返回 undefined = 这次真的要去
-   * 调模型了,由调用方切屏。
-   */
-  onRecalcDeps?: (node: TaskNode) => string | undefined
-  /**
-   * 这个节点**此刻真的按得动**吗 —— 决定「按 d 重算」那行提示写不写。
-   *
-   * 和 `onRecalcDeps` 分开而不是让面板自己判:准入判据住在 `recalcScope` 里(它要看
-   * 整棵树、要问 RunControl 有没有被取消过),面板手上没有那些东西。抄一份的话,
-   * 提示和真实准入迟早分叉 —— 而分叉的方向恰好是「屏幕上写着、按下去被拒」。
-   */
-  recalcAvailable?: (node: TaskNode) => boolean
-  /**
-   * 动作键旁边要补的一句话(例如只看模式下「按了会开跑」)。给了就写在页脚上。
-   *
-   * 这个 prop 的来历:「只看」模式原来把四个动作键**全摘掉**,而恢复关口自己印着
-   * 「按 v 查看完整任务树」—— 想看树的人被指进一条死胡同,看得见、动不了,屏幕上还
-   * 一个字都不解释。现在键照给,代价写在这里。
-   */
-  keysNote?: string
-  /**
    * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
    * 活存储而不是 React state:事件流对每个在飞的节点每条消息都要触发一次,镜像进 state
@@ -636,7 +555,6 @@ export function TaskTreePanel(props: {
         actionNotice={notice?.nodeId === detail.id && notice.kind === 'action' ? notice.text : undefined}
         hintPage={hintPage}
         canForcePass={props.onForcePass !== undefined}
-        keysNote={props.keysNote}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
         maxRows={detailRows}
@@ -869,7 +787,6 @@ export function TaskTreePanel(props: {
                   ...(props.runControl.onAdjustStrictness ? ['<> 严格度'] : []),
                 ]
                 : []),
-              ...(props.keysNote ? [props.keysNote] : []),
               ...(props.onRedo ? ['r 重做'] : []),
               ...(onFailedNode && props.onRedoFailed ? ['R 重做失败环节'] : []),
               ...(onFailedNode && props.onSkipFailed ? ['s 跳过它'] : []),

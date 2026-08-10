@@ -1783,9 +1783,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           )
         }
         if (!decision.approved) {
-          // 仅查看后退出 (spec §17.3): the third answer, which used to be a synonym for Esc.
-          // The recovered tree is already in state — the gate rendered its counts from it — so
-          // hand it to the read-only browser rather than exiting on a key that promised a view.
+          // 「先看树」(spec §17.3):关口的第三个答案,曾经等价于 Esc。
+          // 恢复出来的树已经在 state 里(关口的计数就是从它算的),所以直接把它交给结束屏。
+          // **不是只读模式**:那一屏上重做/跳过/强制通过/清理工作区全部照常可用 ——
+          // 这个答案唯一的含义是「不要自动把这个 run 跑起来」。
           if (decision.viewOnly && isResumeGate) { setViewOnly(true); setPhase('done'); return }
           props.onExit(null) // cancelled at the gate: no run outcome to report
           return
@@ -2349,18 +2350,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 但缺席必须有理由 —— 否则屏幕上「重做这个功能没有了」和一个真 bug 长得一模一样。
        */
       /**
-       * 只看模式下**这四个键照给**,只是把代价说在明处。
+       * **没有「只读模式」这回事。** `v` 只是「不要自动把这个 run 跑起来,先让我看整棵树」,
+       * 看进去之后**所有键和普通结束屏逐字相同** —— 重做、重做失败环节、跳过、强制通过、
+       * 清理工作区,一个都不少(`--resume` 那条路在关口之前就把工作区池子建好了,所以
+       * `c` 也是通的)。
        *
-       * 原来是 `viewOnly ? undefined : …` 四个全摘 —— 而恢复关口自己印着
-       * 「树太长……**按 v 查看完整任务树**」。于是想看整棵树的人被指进一条死胡同:
-       * 看得见、动不了,而屏幕上一个字都不解释。用户报的原话:「是先按了 v,
-       * 不然树出不来」。
-       *
-       * 「只看」的本意是**不要自动把这个 run 跑起来**,不是「永远不许我动手」。而重做
-       * 本来就要过确认屏,那一屏的全部意义正是「按下确认之前先看清后果」—— 那是第二次
-       * 明确决定,不是替他做的。
+       * 曾经这里是 `viewOnly ? undefined : …` 四个全摘,而关口自己印着「按 v 查看完整
+       * 任务树」—— 想看树的人被指进一条死胡同:看得见、动不了。用户报的原话:
+       * 「是先按了 v,不然树出不来」「没有只读模式,所有功能都可以用」。
        */
-      keysNote={viewOnly ? '只看模式:按这些键并确认后会开始跑一次' : undefined}
       redoProblems={redoProblems}
       // 只查看模式下不给重做:那个 run 的编排器根本没起来过,重做等于**替用户决定**
       // 把它跑起来 —— 而他刚刚明确选了不跑。
@@ -2535,8 +2533,6 @@ export function DoneView(props: {
    * a failure the user's own keystroke caused, about a run that is still perfectly resumable.
    */
   viewOnly?: boolean
-  /** 动作键为什么不在。见 TaskTreePanel 同名 prop。 */
-  keysNote?: string
   /** 上一次重做**没做成**的事。空 = 干净;非空必须显示,每条都是会自己长回来的问题。 */
   redoProblems?: string[]
   /** 给了才有 r 键。 */
@@ -2580,20 +2576,19 @@ export function DoneView(props: {
         onRedoFailed={props.onRedoFailed}
         onSkipFailed={props.onSkipFailed}
         onForcePass={props.onForcePass}
-        keysNote={props.keysNote}
         onCleanupWorktrees={props.onCleanupWorktrees}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">
         <Text bold color={props.viewOnly ? 'warning' : ok ? 'success' : 'error'}>
-          {props.viewOnly ? '仅查看:本次没有继续执行' : ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
+          {props.viewOnly ? '这个 run 没有继续执行(你在关口选了先看树)' : ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
         </Text>
         {/* 这一趟是什么时候的事、跑了多久。排在结论下面第一行:一个隔天回来看的人,
             第一个要确认的就是屏幕上这棵树是不是刚才那一次。节点和阶段各自的时刻在
             详情页里(时间线那一段)。 */}
         {runSpan ? <Text dimColor>{runSpan}</Text> : null}
         {props.viewOnly
-          ? <Text dimColor>这个 run 原样留在盘上,想继续跑: /et --resume {props.runId}</Text>
+          ? <Text dimColor>树和这一屏的按键都照常可用;想让它继续跑: /et --resume {props.runId}</Text>
           : null}
         {!props.viewOnly && props.outcome?.reason ? <Text dimColor>原因: {props.outcome.reason}</Text> : null}
         {/* 收口结果排在最前:失败的话它是这一屏最重要的一行。用颜色区分,而不是让一条

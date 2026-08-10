@@ -26,7 +26,8 @@ const TREE_ROWS = 10
  * Esc sends, and this comment's own last sentence said so ("exactly like Esc") while the key
  * on screen said 仅查看后退出. Nothing was ever viewed. The recovered tree is already in
  * memory at that point (this gate renders its counts from it), so the answer now carries
- * `viewOnly` and the command hands that tree to the read-only browser instead of exiting.
+ * `viewOnly` = 「先别跑,让我看整棵树」。**不是只读模式** —— 那一屏上重做/跳过/强制通过/
+ * 清理工作区全部照常可用,和普通结束屏逐字相同;它唯一的含义是这一趟没有自动继续执行。
  */
 export function ConfirmResume(props: {
   config: EffTaskConfig
@@ -184,7 +185,7 @@ export function ConfirmResume(props: {
               is no cursor in this mode. Same rule the log pane and block() already follow. */}
           {props.nodes.length > TREE_ROWS ? (
             <Text dimColor>
-              {'  '}(树太长,上面只显示了前 {TREE_ROWS} 行,共 {props.nodes.length} 个节点;按 v 看完整任务树,那一屏里也能重做/跳过)
+              {'  '}(树太长,上面只显示了前 {TREE_ROWS} 行,共 {props.nodes.length} 个节点;按 v 看完整任务树)
             </Text>
           ) : null}
         </Box>
@@ -198,11 +199,17 @@ export function ConfirmResume(props: {
             : '回车 确认并继续 · Esc 退出编辑(没有可用角色,无法编辑)'}
         </Text>
       ) : (
-        // `v` 的措辞改过一次:原来写的是「仅查看后退出」,而上面那句又在教用户
-        // 「按 v 查看完整任务树」—— 于是想看树的人被指进一条死胡同(那一屏原来把四个
-        // 动作键全摘了,看得见、动不了)。现在那一屏能重做/跳过,这里就得说出来,
-        // 否则用户根本不会走进去。
-        <Text dimColor>回车/y 继续执行 · r 编辑角色名册 · ←/→ 调整并行数 · v 只看任务树(可重做/跳过) · Esc/n 取消</Text>
+        /**
+          * `v` 的措辞改过两次,而第二次是把一个概念删掉。
+          *
+          * 原来写的是「仅查看后退出」,而上面那句又在教用户「按 v 查看完整任务树」——
+          * 于是想看树的人被指进一条死胡同:那一屏当时把四个动作键全摘了,看得见、动不了。
+          *
+          * **现在没有「只读模式」这回事**:v 只是「先别把这个 run 跑起来,让我看整棵树」,
+          * 看进去之后所有键和普通结束屏逐字相同。所以这里不必再解释它能干什么 ——
+          * 它什么都能干。
+          */
+        <Text dimColor>回车/y 继续执行 · r 编辑角色名册 · ←/→ 调整并行数 · v 看完整任务树 · Esc/n 取消</Text>
       )}
     </Box>
   )
