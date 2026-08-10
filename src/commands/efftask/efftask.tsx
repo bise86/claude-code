@@ -1255,7 +1255,27 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     }
   }, [runId])
 
-  const startRun = React.useCallback((cfg: EffTaskConfig, rootSeed?: TaskNode[]): void => {
+  /**
+   * **这一趟编排还活着吗** —— 同步的闩,`startRun` 唯一的守卫。
+   *
+   * `orchRef` 不够用:它是 `runOrchestrator` 跑到一半才回填的(池子初始化、种子落盘都在
+   * 那之前),而同一个 stdin 块里连着来的两下回车之间**一次 await 都没有** —— 两次
+   * `startRun` 都会看到 `orchRef.current === null`,于是同一个 run 目录上起两个编排器:
+   * 两个池子各自守着用户设的并发上限(实际并发翻倍)、两棵树各自往同一个 `setNodes` 里
+   * 推(表头那几个数字来回跳)、node.md 被两边轮流覆写。根方案关口为这件事立过
+   * `rootDecided`,而重做 / 跳过 / 强制通过三条路是后来才接到 `startRun` 上的。
+   *
+   * 清点挂在 promise 的 `finally` 上,不是挂在某个成功路径上:`runOrchestrator` 承诺
+   * 总是 resolve,但它自己的收尾也做 I/O —— 漏掉异常路径的表现是「以后 r 键永远没反应」,
+   * 而这个仓库对「按下去没反应」付过两次学费。
+   */
+  const runLive = React.useRef(false)
+
+  const startRun = React.useCallback((cfg: EffTaskConfig, rootSeed?: TaskNode[]): boolean => {
+    // 已经有一趟在跑就**什么都不做**,并且如实答复 —— 调用方(重做那条路)已经把新树
+    // 写进磁盘了,静默丢掉的话屏幕会显示「已重做」而一个调用都不会发生。
+    if (runLive.current || orchRef.current) return false
+    runLive.current = true
     setPhase('running')
     /**
      * 新的一轮编排 = 每个节点都重新拿到一次机会。
@@ -1282,6 +1302,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // its worktree, which is real work the user has consented to. A failure is not fatal —
     // the run continues honestly un-isolated.
     const pool = poolRef.current
+    // `.finally` 挂在这一趟的 promise 上 —— 见 runLive 的注释:清点必须覆盖异常路径。
     void runOrchestrator(
       {
         config: cfg, runDir: runDir!, fs: props.fs, runAgent: props.runAgent,
@@ -1364,7 +1385,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       recordOutcome,
       setPhase,
       h => { handoffRef.current = h; props.handoffOut.current = h; setHandoff(h) },
-    )
+    ).finally(() => { runLive.current = false })
+    return true
     // biome-ignore lint/correctness/useExhaustiveDependencies: props/store are stable for a mount
   }, [runDir, runId, seed, props.fs, props.runAgent, props.signal, props.controller, recordOutcome, store, setAppState])
 
@@ -1448,7 +1470,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       : undefined,
     start: (n: TaskNode[], affected: readonly string[]) => {
       const orch = from === 'running' ? orchRef.current : null
-      if (!orch) { hold?.release(); startRun(cfg, n); return }
+      if (!orch) {
+        hold?.release()
+        /**
+         * 起不来要**说出口**。`startRun` 只在「已经有一趟在跑」时拒绝(见 runLive),而这次
+         * 重做**已经写进磁盘了** —— 静默返回的话屏幕会翻到运行视图,显示的却是另一趟的树。
+         */
+        if (!startRun(cfg, n)) {
+          setRedoProblems([
+            '上一轮编排还在收尾,这次重做已经写进磁盘但没有起跑;' +
+            '等它结束后 /et --resume 会按重做后的树继续。',
+          ])
+        }
+        return
+      }
       const applied = orch.applyLive(n, affected)
       // 扣住的一定要放回去 —— 换树成功与否都放:失败时那批节点得能继续被调度
       // (它们此刻在盘上是重做后的样子,但内存里还是旧的,让运行照旧继续是唯一诚实的结局)。

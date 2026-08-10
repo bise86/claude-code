@@ -8,7 +8,7 @@ import {
 import { MANUAL_PASS_ROLE, MAX_GUIDANCE_CHARS, PHASE_LABEL, type PhaseName, type TaskNode } from '../../tools/efftask/types.js'
 import { useModalOrTerminalSize } from '../../context/modalContext.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
-import { useLiveState } from './useLiveState.js'
+import { useLiveState, useSettleOnce } from './useLiveState.js'
 import { LineInput } from './LineInput.js'
 import { redoSummaryLines } from './ConfirmRedo.js'
 
@@ -89,12 +89,21 @@ export function ConfirmForcePass(props: {
    */
   const errored = !target || why !== undefined || (blocked && (phase === undefined || !preview))
 
+  /**
+   * 出口只许走一次(见 useSettleOnce)。
+   *
+   * 阻断那条路接的是 `applyForcePass → runForcePass → startRun`(两个编排器);预先批准
+   * 那条路只往 RunControl 上记一笔,但连按两下会记两条,而它是**一次性**标记 ——
+   * 多出来的那一条会作用到下一次同名环节上,那正是 `failedAt` 过期时踩过的坑。
+   */
+  const settle = useSettleOnce()
+
   useInput((input, key) => {
     // 补提示词那一屏的键盘整个归 LineInput:不让路的话,用户写「q 要改成小写」的那个 q
     // 会把整个关口关掉,他刚打的字全没了。
     if (notingRef.current) return
     const k = input.toLowerCase()
-    if (key.escape || k === 'q' || k === 'n') { props.onCancel(); return }
+    if (key.escape || k === 'q' || k === 'n') { settle(() => props.onCancel()); return }
     // 错误屏上**只有出口**。页脚写的就是这一句,不许多做一件事。
     if (errored) return
     if (blocked) {
@@ -103,7 +112,7 @@ export function ConfirmForcePass(props: {
         const t = noteRef.current.trim()
         // 强制通过的是一个环节,而补的这句话是给**这个节点接下来的路**的 —— 所以是
         // 'all',不是那个被放行的环节:往那个环节上写等于写给一个这次不会开会的读者。
-        props.onConfirm(t.length > 0 ? { scope: 'all', text: t } : undefined)
+        settle(() => props.onConfirm(t.length > 0 ? { scope: 'all', text: t } : undefined))
       }
       return
     }
@@ -113,7 +122,7 @@ export function ConfirmForcePass(props: {
     if (key.downArrow || k === 'j') { setPick((pickRef.current + 1) % enabled.length); return }
     if (key.return || k === 'y') {
       const chosen = enabled[pickRef.current]
-      if (chosen) props.onPreApprove?.(chosen.phase)
+      if (chosen) settle(() => props.onPreApprove?.(chosen.phase))
     }
   })
 

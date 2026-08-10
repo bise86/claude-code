@@ -17,6 +17,8 @@ import { EventEmitter } from 'node:events'
 import { render } from '../../ink.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
 import { ConfirmRedo } from './ConfirmRedo.js'
+import { ConfirmSkip } from './ConfirmSkip.js'
+import { ConfirmForcePass } from './ConfirmForcePass.js'
 import { DoneView } from './efftask.js'
 
 const NOW = new Date().toISOString()
@@ -521,5 +523,116 @@ describe('菜单画出来的样子', () => {
       t.stdin.press('[B'); await tick()
     }
     app.unmount()
+  })
+})
+
+/**
+ * 连按回车。
+ *
+ * 用户报的两件事的同一个病根:「失败任务重做时,整体并行任务数会超过设置的数」+
+ * 「最上面那几个数字老是在跳来跳去,一会儿高一会儿低」。
+ *
+ * 按下确认**不会**当场卸载这一屏 —— 卸载要等 React 提交下一帧,而在那之前到来的每一下
+ * 回车都会再跑一遍同一个 useInput 处理器、再发一次同一个回调。重做/跳过那条路的下游是
+ * `applyRedo → runRedo → startRun`,于是同一个 run 目录上起了两个编排器:两个并发池
+ * **各自**守着用户设的上限(实际并发翻倍),两棵树又各自往同一个 setNodes 里推
+ * (表头那几个计数来回跳)。根方案关口为这件事单独立过 `rootDecided`(注释里记着实测的
+ * 「三下快回车 = 三个编排器」),这三个关口是同一个形状。
+ *
+ * 实测过没有闩时的读数:三下回车 = 3 次 onConfirm。
+ */
+describe('关口的出口只走一次', () => {
+  const blockedAt = (phase: 'ACCEPTANCE' | 'EXECUTING'): TaskNode[] => [
+    mk('root', { title: '根任务', kind: 'decompose', childIds: ['root/00-a'], status: 'WAITING_CHILDREN' }),
+    mk('root/00-a', {
+      title: '甲', parentId: 'root', depth: 1, status: 'BLOCKED',
+      blockedReason: '连续返工超限', failedAt: phase,
+    }),
+  ]
+
+  it('ConfirmRedo:三下回车只确认一次', async () => {
+    let confirms = 0
+    const { t, app } = await mount(
+      <ConfirmRedo
+        nodes={blockedAt('EXECUTING')} targetId="root/00-a" now={NOW} initialEntry="execute"
+        onConfirm={() => { confirms++ }} onCancel={() => {}}
+      />,
+    )
+    // 三下之间**不等 React 提交** —— 真实的连按就是这样(见上面的注释)。
+    t.stdin.press('\r')
+    t.stdin.press('\r')
+    t.stdin.press('\r')
+    await tick()
+    app.unmount()
+    expect(`三下回车确认了几次: ${confirms}`).toBe('三下回车确认了几次: 1')
+  })
+
+  it('ConfirmRedo:确认之后的 Esc 不再发第二个决定', async () => {
+    // 确认和取消共用同一个闩:它们都是这一屏的出口,发过一个就不该再发另一个 ——
+    // 否则 onCancel 会把界面翻回 done,而重做已经开跑了。
+    const seen: string[] = []
+    const { t, app } = await mount(
+      <ConfirmRedo
+        nodes={blockedAt('EXECUTING')} targetId="root/00-a" now={NOW} initialEntry="execute"
+        onConfirm={() => seen.push('confirm')} onCancel={() => seen.push('cancel')}
+      />,
+    )
+    t.stdin.press('\r')
+    t.stdin.press('q') // q 和 Esc 同义,而 Esc 在假 TTY 上要等 tokenizer 的窗口
+    await tick()
+    app.unmount()
+    expect(seen).toEqual(['confirm'])
+  })
+
+  it('ConfirmSkip:两下回车只确认一次', async () => {
+    let confirms = 0
+    const { t, app } = await mount(
+      <ConfirmSkip
+        nodes={blockedAt('ACCEPTANCE')} targetId="root/00-a" now={NOW}
+        onConfirm={() => { confirms++ }} onCancel={() => {}}
+      />,
+    )
+    t.stdin.press('\r')
+    t.stdin.press('\r')
+    await tick()
+    app.unmount()
+    expect(`两下回车确认了几次: ${confirms}`).toBe('两下回车确认了几次: 1')
+  })
+
+  it('ConfirmForcePass:两下回车只确认一次', async () => {
+    let confirms = 0
+    const { t, app } = await mount(
+      <ConfirmForcePass
+        nodes={blockedAt('ACCEPTANCE')} targetId="root/00-a" now={NOW}
+        onConfirm={() => { confirms++ }} onCancel={() => {}}
+      />,
+    )
+    t.stdin.press('\r')
+    t.stdin.press('\r')
+    await tick()
+    app.unmount()
+    // 强制通过重开编排走的也是 startRun;而它留下的是一条署名的裁决记录,两次就是两条。
+    expect(`两下回车确认了几次: ${confirms}`).toBe('两下回车确认了几次: 1')
+  })
+
+  it('ConfirmForcePass:运行中预先批准也只记一笔', async () => {
+    // 这条路不重开编排,但预先批准是**一次性**标记:多记的那一条会作用到下一次同名环节上,
+    // 而那正是 failedAt 过期时踩过的坑。
+    const picks: string[] = []
+    const running: TaskNode[] = [
+      mk('root', { title: '根任务', kind: 'decompose', childIds: ['root/00-a'], status: 'WAITING_CHILDREN' }),
+      mk('root/00-a', { title: '甲', parentId: 'root', depth: 1, status: 'EXECUTING' }),
+    ]
+    const { t, app } = await mount(
+      <ConfirmForcePass
+        nodes={running} targetId="root/00-a" now={NOW}
+        onConfirm={() => {}} onCancel={() => {}} onPreApprove={p => { picks.push(p); return undefined }}
+      />,
+    )
+    t.stdin.press('\r')
+    t.stdin.press('\r')
+    await tick()
+    app.unmount()
+    expect(picks.length).toBe(1)
   })
 })

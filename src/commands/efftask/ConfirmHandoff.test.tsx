@@ -166,4 +166,21 @@ describe('收口关口', () => {
     expect(f).toContain('个提交已在跑的过程中合进了你当前的分支')
     expect(f).toContain('上还有')
   })
+
+  /**
+   * 连按回车。
+   *
+   * 这一屏的四个选择**每一个都是不可逆的 git 动作**(合并 / 推送 / 删分支),而按下确认
+   * 不会当场卸载这一屏 —— 卸载要等 React 提交下一帧,在那之前到来的每一下回车都会再跑
+   * 一遍同一个处理器。重做关口的同一个缺陷让同一个 run 起了两个编排器;这里的形态是
+   * 同一次收口被执行两遍。
+   */
+  it('两下回车只发一个决定', async () => {
+    const picks: HandoffChoice[] = []
+    const tty = await mount(H, c => picks.push(c))
+    tty.stdin.press('\r')
+    tty.stdin.press('\r')
+    await tick()
+    expect(picks.length).toBe(1)
+  })
 })

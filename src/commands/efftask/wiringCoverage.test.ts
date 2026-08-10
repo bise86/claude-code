@@ -597,7 +597,7 @@ describe('改回去要变红的四处', () => {
     // 重启 / 就地换树:两条路共用这一个出口(见 redoDeps 的 `from`)。少了它,用户按完
     // 确认会看到树变了、节点退回排队中,然后永远停在那儿。
     expect(head).toMatch(/start:\s*\(n: TaskNode\[\], affected: readonly string\[\]\) => \{/)
-    expect(head).toContain('startRun(cfg, n); return')
+    expect(head).toContain('if (!startRun(cfg, n)) {')
     expect(head).toContain('orch.applyLive(n, affected)')
     // 两个入口都真的用了这份 deps。少了任何一个,那条路的六件事一件都不会发生。
     expect(SRC).toMatch(/runRedo\([\s\S]{0,220}redoDeps\(cfg, runDir, /)
@@ -616,6 +616,30 @@ describe('改回去要变红的四处', () => {
      * 这里守的是「真存储被接上了」——store 那侧的行为由 agentStream.test.ts 钉。
      */
     expect(head).toMatch(/onDropStreams:[\s\S]{0,80}streams\.current\.dropNodes\(ids\)/)
+  })
+
+  it('同一个 run 上不许起第二个编排器 —— 而且清点覆盖异常路径', () => {
+    /**
+     * 用户报的两件事的同一个病根:「重做时并行任务数超过设置的数」+「最上面几个数字
+     * 一会儿高一会儿低」。两个编排器 = 两个并发池(各自守着用户设的上限)+ 两棵树轮流
+     * 推进同一个 `setNodes`。
+     *
+     * 关口那道闩(useSettleOnce)由真组件用例守着;这里守的是**最后一道**,因为
+     * `startRun` 住在这个挂不起来的文件里,而它的调用点已经有四个(第三关、跳过分析、
+     * 重做/跳过/强制通过共用的 redoDeps)。
+     *
+     * `orchRef` 单独用不住:它是 runOrchestrator 跑到一半才回填的,而同一个 stdin 块里
+     * 连着来的两下回车之间一次 await 都没有 —— 两次调用都会看到它是 null。所以闩必须是
+     * 同步置位的 `runLive`,而清点必须挂在 promise 的 finally 上(漏掉异常路径 = 以后
+     * r 键永远没反应)。
+     */
+    const start = SRC.slice(SRC.indexOf('const startRun = React.useCallback'))
+    const head = start.slice(0, start.indexOf('const redoDeps'))
+    expect(head).toContain('if (runLive.current || orchRef.current) return false')
+    expect(head).toMatch(/runLive\.current = true[\s\S]{0,80}setPhase\('running'\)/)
+    expect(head).toContain(".finally(() => { runLive.current = false })")
+    // 拒绝要**答复**,不许静默:这次重做已经落盘了。
+    expect(SRC).toContain('if (!startRun(cfg, n)) {')
   })
 
   it('交给 commitRedo 的 before 是 runRedo 给的那份,不是组件手上的', () => {

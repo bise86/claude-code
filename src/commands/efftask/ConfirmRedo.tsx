@@ -10,7 +10,7 @@ import { LineInput } from './LineInput.js'
 import { useModalOrTerminalSize } from '../../context/modalContext.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { clipToWidth, wrapDisplayWidth } from './logView.js'
-import { useLiveState } from './useLiveState.js'
+import { useLiveState, useSettleOnce } from './useLiveState.js'
 
 /**
  * 重做关口 —— 三屏。
@@ -351,6 +351,9 @@ export function ConfirmRedo(props: {
   const guidanceScope = (entry: RedoEntry): PhaseName | 'all' =>
     guidanceScopeFor(entry, scopeRef.current ?? 'phase')
 
+  /** 出口只许走一次(见 useSettleOnce):连按的第二下回车会再发一次同样的确认。 */
+  const settle = useSettleOnce()
+
   useInput((input, key) => {
     /**
      * 「节点不存在」那一屏上**只有出口**。
@@ -370,10 +373,12 @@ export function ConfirmRedo(props: {
       { scope: scopeRef.current, cursor: cursorRef.current, picked: pickedRef.current, noting: notingRef.current },
       options,
     )
-    if (act.kind === 'cancel') { props.onCancel(); return }
+    // 出口只走一次(见 useSettleOnce):连按的第二下回车会在同一个处理器里再发一次确认,
+    // 而重做那条路的下游是 `startRun` —— 两次就是同一个 run 上的两个编排器。
+    if (act.kind === 'cancel') { settle(() => props.onCancel()); return }
     if (act.kind === 'confirm') {
       const t = noteRef.current.trim()
-      props.onConfirm(act.entry, t.length > 0 ? { scope: guidanceScope(act.entry), text: t } : undefined)
+      settle(() => props.onConfirm(act.entry, t.length > 0 ? { scope: guidanceScope(act.entry), text: t } : undefined))
       return
     }
     if (act.kind === 'state') {

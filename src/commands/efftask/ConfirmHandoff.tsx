@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import { useLiveState } from './useLiveState.js'
+import { useLiveState, useSettleOnce } from './useLiveState.js'
 import { choiceLabels, discardConfirmLines, type HandoffChoice } from '../../tools/efftask/handoffActions.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
 
@@ -25,20 +25,26 @@ export function ConfirmHandoff(props: {
   // 二次确认只给「丢弃」——四个动作里唯一不可逆的那个。
   const [confirmingDiscard, setConfirming, confirmRef] = useLiveState(false)
 
+  /**
+   * 出口只许走一次(见 useSettleOnce)。这一屏的四个选择**每一个都是不可逆的 git 动作**
+   * (合并 / 推送 / 删分支),而连按的第二下回车会在同一个处理器里把它再发一次。
+   */
+  const settle = useSettleOnce()
+
   useInput((input, key) => {
     if (confirmRef.current) {
       // 二次确认里,只有明确的 y/回车 才算数;其余任何键都退回选择列表。
-      if (key.return || input === 'y' || input === 'Y') { props.onDecision('discard'); return }
+      if (key.return || input === 'y' || input === 'Y') { settle(() => props.onDecision('discard')); return }
       setConfirming(false)
       return
     }
-    if (key.escape) { props.onSkip(); return }
+    if (key.escape) { settle(() => props.onSkip()); return }
     if (key.upArrow) { setIdx((idxRef.current + choices.length - 1) % choices.length); return }
     if (key.downArrow) { setIdx((idxRef.current + 1) % choices.length); return }
     if (key.return) {
       const c = choices[idxRef.current].key
       if (c === 'discard') { setConfirming(true); return }
-      props.onDecision(c)
+      settle(() => props.onDecision(c))
     }
   })
 
