@@ -184,7 +184,7 @@ export function ConfirmResume(props: {
               is no cursor in this mode. Same rule the log pane and block() already follow. */}
           {props.nodes.length > TREE_ROWS ? (
             <Text dimColor>
-              {'  '}(树太长,上面只显示了前 {TREE_ROWS} 行,共 {props.nodes.length} 个节点;按 v 查看完整任务树)
+              {'  '}(树太长,上面只显示了前 {TREE_ROWS} 行,共 {props.nodes.length} 个节点;按 v 看完整任务树,那一屏里也能重做/跳过)
             </Text>
           ) : null}
         </Box>
@@ -198,7 +198,11 @@ export function ConfirmResume(props: {
             : '回车 确认并继续 · Esc 退出编辑(没有可用角色,无法编辑)'}
         </Text>
       ) : (
-        <Text dimColor>回车/y 继续执行 · r 编辑角色名册 · ←/→ 调整并行数 · v 仅查看后退出 · Esc/n 取消</Text>
+        // `v` 的措辞改过一次:原来写的是「仅查看后退出」,而上面那句又在教用户
+        // 「按 v 查看完整任务树」—— 于是想看树的人被指进一条死胡同(那一屏原来把四个
+        // 动作键全摘了,看得见、动不了)。现在那一屏能重做/跳过,这里就得说出来,
+        // 否则用户根本不会走进去。
+        <Text dimColor>回车/y 继续执行 · r 编辑角色名册 · ←/→ 调整并行数 · v 只看任务树(可重做/跳过) · Esc/n 取消</Text>
       )}
     </Box>
   )

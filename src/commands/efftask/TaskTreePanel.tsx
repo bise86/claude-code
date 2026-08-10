@@ -303,14 +303,13 @@ export function TaskTreePanel(props: {
    */
   recalcAvailable?: (node: TaskNode) => boolean
   /**
-   * **动作键为什么不在**。给了就写在页脚上。
+   * 动作键旁边要补的一句话(例如只看模式下「按了会开跑」)。给了就写在页脚上。
    *
-   * 「只看」模式(`--resume` 关口按 v)把 onRedo / onRedoFailed / onSkipFailed / onForcePass
-   * 四个全传 undefined —— 那是对的(用户刚刚明确说了只看),但屏幕上此前**一个字都不解释**:
-   * 用户看到的是「重做这个功能没有了」,而不是「你选了只看」。一个没有理由的缺席和一个
-   * bug 长得一模一样,而这个仓库为同一类失败付过好几次学费。
+   * 这个 prop 的来历:「只看」模式原来把四个动作键**全摘掉**,而恢复关口自己印着
+   * 「按 v 查看完整任务树」—— 想看树的人被指进一条死胡同,看得见、动不了,屏幕上还
+   * 一个字都不解释。现在键照给,代价写在这里。
    */
-  keysDisabledReason?: string
+  keysNote?: string
   /**
    * 子 agent 实时输出。详情视图按需读,树上的活动行也读它。
    *
@@ -637,7 +636,7 @@ export function TaskTreePanel(props: {
         actionNotice={notice?.nodeId === detail.id && notice.kind === 'action' ? notice.text : undefined}
         hintPage={hintPage}
         canForcePass={props.onForcePass !== undefined}
-        keysDisabledReason={props.keysDisabledReason}
+        keysNote={props.keysNote}
         node={detail}
         elapsed={elapsed(detail, nowMs)}
         maxRows={detailRows}
@@ -870,7 +869,7 @@ export function TaskTreePanel(props: {
                   ...(props.runControl.onAdjustStrictness ? ['<> 严格度'] : []),
                 ]
                 : []),
-              ...(props.keysDisabledReason ? [props.keysDisabledReason] : []),
+              ...(props.keysNote ? [props.keysNote] : []),
               ...(props.onRedo ? ['r 重做'] : []),
               ...(onFailedNode && props.onRedoFailed ? ['R 重做失败环节'] : []),
               ...(onFailedNode && props.onSkipFailed ? ['s 跳过它'] : []),

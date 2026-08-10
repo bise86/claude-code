@@ -2348,11 +2348,23 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 「只看」模式下那四个动作键**是故意不给的**(用户在恢复关口按了 v)。
        * 但缺席必须有理由 —— 否则屏幕上「重做这个功能没有了」和一个真 bug 长得一模一样。
        */
-      keysDisabledReason={viewOnly ? '只看模式:重做/跳过等键已关闭(恢复时选了「只看」)' : undefined}
+      /**
+       * 只看模式下**这四个键照给**,只是把代价说在明处。
+       *
+       * 原来是 `viewOnly ? undefined : …` 四个全摘 —— 而恢复关口自己印着
+       * 「树太长……**按 v 查看完整任务树**」。于是想看整棵树的人被指进一条死胡同:
+       * 看得见、动不了,而屏幕上一个字都不解释。用户报的原话:「是先按了 v,
+       * 不然树出不来」。
+       *
+       * 「只看」的本意是**不要自动把这个 run 跑起来**,不是「永远不许我动手」。而重做
+       * 本来就要过确认屏,那一屏的全部意义正是「按下确认之前先看清后果」—— 那是第二次
+       * 明确决定,不是替他做的。
+       */
+      keysNote={viewOnly ? '只看模式:按这些键并确认后会开始跑一次' : undefined}
       redoProblems={redoProblems}
       // 只查看模式下不给重做:那个 run 的编排器根本没起来过,重做等于**替用户决定**
       // 把它跑起来 —— 而他刚刚明确选了不跑。
-      onRedo={viewOnly ? undefined : node => {
+      onRedo={node => {
         // 中断过的 run 在这里重做会立刻再次阻断(见 redoUnavailableReason)。
         // 挡在**按键这一刻**,而不是让他选完环节、看完后果、确认完再看一遍失败。
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
@@ -2366,7 +2378,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 「这个节点的失败环节能不能重入」。反过来的话,一个中断过的 run 上的失败节点会先
        * 得到一句关于环节的解释,而真正的障碍是那个进程级的中断标记。
        */
-      onRedoFailed={viewOnly ? undefined : node => {
+      onRedoFailed={node => {
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
         if (why) { setRedoProblems([why]); return why }
         const byId = new Map(nodes.map(n => [n.id, n]))
@@ -2376,7 +2388,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         setRedoTarget(node); setRedoEntry(found.entry); setRedoFrom('done'); setPhase('confirmRedo')
       }}
       /** 跳过失败的那个环节继续往下走(`s`)。同样两道闸门,同样的顺序。 */
-      onSkipFailed={viewOnly ? undefined : node => {
+      onSkipFailed={node => {
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
         if (why) { setRedoProblems([why]); return why }
         const blocked = skipFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
@@ -2387,7 +2399,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 强制通过失败的那个环节(`f`)。闸门和 `s` 逐字相同(它们共用一份实现),
        * 顺序也一样:先判这一次能不能重开编排,再判这个环节能不能被放行。
        */
-      onForcePass={viewOnly ? undefined : node => {
+      onForcePass={node => {
         const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
         if (why) { setRedoProblems([why]); return why }
         const blocked = forcePassFailedPhaseReason(node, config ? phaseCtxOf(node, config) : undefined)
@@ -2524,7 +2536,7 @@ export function DoneView(props: {
    */
   viewOnly?: boolean
   /** 动作键为什么不在。见 TaskTreePanel 同名 prop。 */
-  keysDisabledReason?: string
+  keysNote?: string
   /** 上一次重做**没做成**的事。空 = 干净;非空必须显示,每条都是会自己长回来的问题。 */
   redoProblems?: string[]
   /** 给了才有 r 键。 */
@@ -2568,7 +2580,7 @@ export function DoneView(props: {
         onRedoFailed={props.onRedoFailed}
         onSkipFailed={props.onSkipFailed}
         onForcePass={props.onForcePass}
-        keysDisabledReason={props.keysDisabledReason}
+        keysNote={props.keysNote}
         onCleanupWorktrees={props.onCleanupWorktrees}
         onExitKey={() => props.onExit(props.outcome)}
       />

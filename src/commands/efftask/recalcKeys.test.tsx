@@ -308,21 +308,25 @@ describe('动作键被拒时必须说话,而且不许把人踢出详情页', () 
 })
 
 /**
- * **动作键缺席时必须有理由。**
+ * **「只看」不该剥夺重做。**
  *
- * 「只看」模式(`--resume` 关口按 v)把 onRedo/onRedoFailed/onSkipFailed/onForcePass 四个
- * 全传 undefined —— 那是对的,但屏幕上此前一个字都不解释。用户看到的是「重做这个功能
- * 没有了」,而一个没有理由的缺席和一个 bug 长得一模一样。
+ * 恢复关口自己印着「树太长……**按 v 查看完整任务树**」,而按 v 之后原来四个动作键
+ * 全被摘掉 —— 想看整棵树的人被指进一条死胡同:看得见、动不了。用户报的原话:
+ * 「是先按了 v,不然树出不来」。
+ *
+ * 现在键照给(重做本来就要过确认屏,那是第二次明确决定),代价写在页脚上。
  */
-describe('动作键缺席要有理由', () => {
+describe('只看模式下动作键仍然在,代价写在明处', () => {
   const NODE = (): TaskNode[] => [mk('root', { title: '根任务', status: 'BLOCKED' })]
 
-  it('只看模式:页脚说得出为什么没有 r/R/s/f', async () => {
+  it('键和「按了会开跑」这句话同时在页脚上', async () => {
     const t = fakeTty(100)
     const app = await render(
       <TaskTreePanel
         nodes={NODE()} runId="003" interactive onExitKey={() => {}}
-        keysDisabledReason="只看模式:重做/跳过等键已关闭(恢复时选了「只看」)"
+        onRedo={() => undefined} onRedoFailed={() => undefined}
+        onSkipFailed={() => undefined} onForcePass={() => undefined}
+        keysNote="只看模式:按这些键并确认后会开始跑一次"
       />,
       { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
     )
@@ -331,11 +335,28 @@ describe('动作键缺席要有理由', () => {
     t.stdin.press(ENTER); await tick()
     const detail = t.lastFrame()
     app.unmount()
-    // 树上和详情页上都要说
+    // 树上和详情页上都要有那句话,而且键**没有**消失
     expect(tree).toContain('只看模式')
+    expect(tree).toContain('r 重做')
     expect(detail).toContain('只看模式')
-    // 而且不许同时写着一个按不动的键
-    expect(tree).not.toContain('r 重做 ')
+  })
+
+  it('只看模式下按 r 真的会调到回调 —— 不是一个画上去的死键', async () => {
+    const seen: string[] = []
+    const t = fakeTty(100)
+    const app = await render(
+      <TaskTreePanel
+        nodes={NODE()} runId="003" interactive onExitKey={() => {}}
+        onRedo={n => { seen.push(n.id); return undefined }}
+        keysNote="只看模式:按这些键并确认后会开始跑一次"
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(ENTER); await tick()
+    t.stdin.press('r'); await tick()
+    app.unmount()
+    expect(seen).toEqual(['root'])
   })
 
   it('正常模式下一个字都不多写', async () => {

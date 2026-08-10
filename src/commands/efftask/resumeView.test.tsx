@@ -221,7 +221,7 @@ describe('ConfirmResume (vendored renderer)', () => {
     await tick()
     const f = lastFrame()
     expect(f).toContain('共 21 个节点')
-    expect(f).toContain('按 v 查看完整任务树')
+    expect(f).toContain('按 v 看完整任务树')
     app.unmount()
   })
 
@@ -233,7 +233,7 @@ describe('ConfirmResume (vendored renderer)', () => {
       { stdin: stdin as never, stdout: stdout as never, exitOnCtrlC: false, patchConsole: false },
     )
     await tick()
-    expect(lastFrame()).not.toContain('按 v 查看完整任务树')
+    expect(lastFrame()).not.toContain('按 v 看完整任务树')
     expect(lastFrame()).toContain('根任务') // 正向锚点:树确实渲染了
     app.unmount()
   })
