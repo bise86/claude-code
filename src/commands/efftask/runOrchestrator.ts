@@ -399,10 +399,24 @@ export async function runOrchestrator(
      * 不会真去合一棵没跑完的树(判据在 planFinish 里,而不是靠这里排除)。
      */
     await handOff()
-    // 待收口状态必须落盘,而异常路径上 happy path 的那次 queueManifest 根本没跑到 ——
-    // 于是 pendingHandoff 被设进 config、一次也没写出去,集成分支再没人处置。
-    // 幂等:happy path 已经写过时这只是再写一遍同样的内容。
-    if (args.config.pendingHandoff) await queueManifest(liveNodes, pendingOutcome)
+    /**
+     * **最终 manifest 无条件写,而且要 await —— 这一句是「退出时盘上和屏幕上一致」的唯一保证。**
+     *
+     * 原来的条件是 `if (args.config.pendingHandoff)`,理由只谈了待收口那一件事。而异常路径上
+     * happy path 那次 `queueManifest(nodes, result)` **根本没跑到**,于是没有待收口时:
+     *
+     *  - run.md 上留下的是最后一次**普通更新**的快照 —— 没有 `status`、没有 `reason`;
+     *  - 而 `--resume` 的关口和事后追责第一眼看的就是它:一个已经炸掉的 run 在盘上读起来
+     *    像「还在跑」。
+     *
+     * 而且 `onUpdate` 那一路是 `void queueManifest(...)`(合并队列、不等),所以**排干队列**
+     * 也只能靠这一句:`queueManifest` 返回的正是那条链,await 它等于等到最后一次写落地。
+     * 少了它,「最后一次状态到底写没写出去」取决于进程还活多久 —— 而用户报的正是这个:
+     * 「退出时有些任务状态还在内存里没有及时存储到文件」。
+     *
+     * 幂等:happy path 已经写过时这只是再写一遍同样的内容(合并队列本来就只保留最新一份)。
+     */
+    await queueManifest(liveNodes, pendingOutcome)
     // 面板同理:异常路径上 settle() 已经在 catch 里跑过了(那时 reclaim 还没发生),
     // 所以「待收口」得在这里补一次。终态任务只改描述,不动 status。
     if (args.config.pendingHandoff && taskId && entry) {

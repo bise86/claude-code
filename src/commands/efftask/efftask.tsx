@@ -2323,6 +2323,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           const cur = control.parallelism() ?? config.parallelism
           control.setParallelism(cur + d)
           setParallelismTick(t => t + 1)
+          // 立刻同步进 run.md —— 否则这次调整只活在内存里,直到某个节点恰好提交状态。
+          // 一个执行环节可以跑几分钟不提交,而 --resume 的并发上限是从 run.md 读回来的。
+          orchRef.current?.syncToDisk()
         },
         /**
          * 调严格度。基准取 control 现在的值,没调过才回落到关口批准的那一档 ——
@@ -2335,6 +2338,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           control.setStrictness(adjustStrictness(cur, d))
           // control 不是 React state,不 tick 的话改完屏幕不动 —— 和并发度同一个坑。
           setParallelismTick(t => t + 1)
+          // 落盘同上:档位也是 --resume 从 run.md 读回来的。
+          orchRef.current?.syncToDisk()
         },
         strictness: control.strictness() ?? config.caps.strictness,
       }}

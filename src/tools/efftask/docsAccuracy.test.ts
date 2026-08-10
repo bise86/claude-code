@@ -1332,3 +1332,15 @@ describe('依赖重算(README 的 `d` 那一节)', () => {
     expect(persistence).toContain('⟲ 依赖重算 ×')
   })
 })
+
+describe('收尾时最终 manifest 无条件写', () => {
+  it('finally 里那一句不带任何条件 —— 否则异常路径上 run.md 没有 status', () => {
+    const src = readFileSync(new URL('src/commands/efftask/runOrchestrator.ts', ROOT), 'utf8')
+    // 曾经是 `if (args.config.pendingHandoff) await queueManifest(...)`:没有待收口时
+    // 一次最终 manifest 都不写,盘上那个 run 读起来像「还在跑」。
+    expect(src).not.toContain('if (args.config.pendingHandoff) await queueManifest')
+    expect(src).toContain('await queueManifest(liveNodes, pendingOutcome)')
+    // 而且必须 await —— queueManifest 返回的正是那条串行队列,await 它等于排干。
+    expect(src).not.toContain('void queueManifest(liveNodes, pendingOutcome)')
+  })
+})

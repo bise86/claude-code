@@ -219,6 +219,23 @@ export class EffTaskOrchestrator {
   }
 
   /**
+   * **把此刻的状态同步到盘上** —— 运行中改过的那些**只活在内存里**的设置用它。
+   *
+   * `+/-` 并发、`<>` 严格度、`i` 追加指令改的都是 `RunControl`(纯内存),而它们进 run.md
+   * 的**唯一**通道是 `queueManifest` 里那两句 `args.config.parallelism = control.parallelism()`
+   * —— 而 `queueManifest` 只在 `onUpdate` 时被调用,也就是**某个节点提交状态**的时候。
+   * 一个执行环节可以跑几分钟不提交:这期间调过的并发/严格度,退出时就只在内存里,
+   * 而 `--resume` 是从 run.md 读回它们的。用户报的正是这个:
+   * 「退出时有些任务状态还在内存里没有及时存储到文件」。
+   *
+   * 走 `safeUpdate()` 而不是自己写盘:run.md 的唯一写入点是 `runOrchestrator` 里那条
+   * **串行 + 合并**的队列,从别处直调 `writeRunManifest` 会和它并发写同一个文件。
+   */
+  syncToDisk(): void {
+    this.safeUpdate()
+  }
+
+  /**
    * **依赖被就地改过了** —— 叫醒调度、上屏。依赖重算走这条,不走 `applyLive`。
    *
    * ## 为什么不复用 `applyLive`

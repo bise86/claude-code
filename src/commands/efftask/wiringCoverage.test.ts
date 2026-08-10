@@ -921,3 +921,19 @@ describe('依赖重算的接线不能被静默剪断', () => {
     expect(SRC).toContain('    availableTools: [],\n    activeAgents,\n    mainModelDefault,\n    timeoutMs: () => 120_000,')
   })
 })
+
+/**
+ * 退出时「盘上和屏幕上一致」这件事的接线。
+ *
+ * 用户报:「退出时有些任务状态还在内存里没有及时存储到文件。」两条路各自都能单独造成它。
+ */
+describe('落盘的两条尾巴不能被剪断', () => {
+  it('运行中改并发 / 改严格度之后立刻同步到盘上', () => {
+    /**
+     * 那两个键改的是 `RunControl`(纯内存),而它们进 run.md 的唯一通道是 `queueManifest`
+     * 里的两句同步 —— 只在**某个节点提交状态**时才被调用。一个执行环节可以跑几分钟不提交,
+     * 这期间调过的设置退出时就只在内存里,而 `--resume` 正是从 run.md 读回它们的。
+     */
+    expect(occurrences('orchRef.current?.syncToDisk()')).toBe(2)
+  })
+})
