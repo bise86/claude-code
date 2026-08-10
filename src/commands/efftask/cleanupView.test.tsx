@@ -118,9 +118,11 @@ describe('详情页的 c 键', () => {
     const off = without.t.lastFrame()
     without.app.unmount()
 
-    expect(on).toContain('清理已完成工作区')
+    // 措辞从「清理已完成工作区」缩成「清理工作区」是**量出来的**:动作键挪到导航说明
+    // 之前以后,这一行在 80 列上要同时装下 r / R / s,而它是这几个键里最不紧急的一个。
+    expect(on).toContain('c 清理工作区')
     // 共享工作树运行时没有池子 —— 写着一个按了什么都不会发生的键比没有这个键更糟。
-    expect(off).not.toContain('清理已完成工作区')
+    expect(off).not.toContain('c 清理工作区')
   })
 
   it('没给回调时按 c 不抛异常,也不会关掉详情页', async () => {

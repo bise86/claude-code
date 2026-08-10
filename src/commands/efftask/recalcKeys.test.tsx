@@ -148,3 +148,60 @@ describe('「依赖」段上的提示', () => {
     expect(done).toContain('依赖重算记录')
   })
 })
+
+/**
+ * 详情页页脚上的**动作键**在窄终端上必须活着。
+ *
+ * 用户报的原话是「子任务重跑和阶段重跑功能没有了」—— 而键一直是好的:页脚曾经把动作键
+ * 排在导航说明**之后**,而导航那一句自己就有 94 列,于是 113 列以下 `r 重做本任务` 一个字
+ * 都画不出来,130 列以下没有 `R`,141 列以下没有 `s`。**一个从不被宣告的键等于不存在。**
+ *
+ * 断言按**真渲染**做,不按拼出来的字符串:被截掉的那一半在字符串里是在的。
+ */
+describe('详情页页脚的动作键在窄终端上活着', () => {
+  const FAILED = (): TaskNode[] => [
+    mk('root', {
+      title: '根任务', status: 'BLOCKED', failedAt: 'ACCEPTANCE', blockedReason: '验收未通过',
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'x' }, execStatus: '改了 a.ts',
+    }),
+  ]
+
+  for (const cols of [80, 100, 120]) {
+    it(`${cols} 列:r / R / s 都画得出来`, async () => {
+      const t = fakeTty(cols)
+      const app = await render(
+        <TaskTreePanel
+          nodes={FAILED()} runId="003" interactive
+          onRedo={() => {}} onRedoFailed={() => {}} onSkipFailed={() => {}}
+          onExitKey={() => {}}
+        />,
+        { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+      )
+      await tick()
+      t.stdin.press(ENTER); await tick()
+      const foot = t.lastFrame().split('\n').filter(l => l.includes('返回任务树')).pop() ?? ''
+      app.unmount()
+      expect(foot).toContain('r 重做本任务')
+      expect(foot).toContain('R 重做失败环节')
+      expect(foot).toContain('s 跳过它')
+      // 出口永远排第一 —— 截断只许吃掉最不重要的那一头
+      expect(foot.indexOf('Esc/q')).toBeLessThan(foot.indexOf('r 重做本任务'))
+    })
+  }
+
+  it('动作键排在导航说明之前 —— ↑↓ 按下去就有反应,而 r 没提示就完全不可发现', async () => {
+    const t = fakeTty(160)
+    const app = await render(
+      <TaskTreePanel
+        nodes={FAILED()} runId="003" interactive
+        onRedo={() => {}} onRedoFailed={() => {}} onSkipFailed={() => {}} onExitKey={() => {}}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(ENTER); await tick()
+    const foot = t.lastFrame().split('\n').filter(l => l.includes('返回任务树')).pop() ?? ''
+    app.unmount()
+    expect(foot.indexOf('r 重做本任务')).toBeLessThan(foot.indexOf('选段落'))
+  })
+})
