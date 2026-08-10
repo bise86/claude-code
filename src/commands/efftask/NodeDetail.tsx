@@ -667,6 +667,8 @@ export function NodeDetail(props: {
   hintPage?: number
   /** 上一次动作键被拒的原因。给了就**盖住页脚那一行** —— 用户刚按了键,他只会看那儿。 */
   actionNotice?: string
+  /** 动作键为什么不在(例如「只看」模式)。见 TaskTreePanel 同名 prop。 */
+  keysDisabledReason?: string
   canRecalcDeps?: boolean
   /** 上一次按 d 被拒绝的原因。渲染在详情页里,不切屏。 */
   recalcNotice?: string
@@ -970,6 +972,8 @@ export function NodeDetail(props: {
    * 导航在后(↑↓ 按下去本来就有反应)。
    */
   const actionHints = [
+    // 动作键**为什么**不在。没有理由的缺席和一个 bug 长得一模一样。
+    props.keysDisabledReason ?? '',
     props.canRedo ? 'r 重做本任务' : '',
     props.canRedoFailed ? 'R 重做失败环节' : '',
     props.canSkipFailed ? 's 跳过它' : '',

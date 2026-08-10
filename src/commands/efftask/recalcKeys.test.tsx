@@ -306,3 +306,51 @@ describe('动作键被拒时必须说话,而且不许把人踢出详情页', () 
     expect(after).toContain('Esc/q 返回任务树') // 出口每一页都在
   })
 })
+
+/**
+ * **动作键缺席时必须有理由。**
+ *
+ * 「只看」模式(`--resume` 关口按 v)把 onRedo/onRedoFailed/onSkipFailed/onForcePass 四个
+ * 全传 undefined —— 那是对的,但屏幕上此前一个字都不解释。用户看到的是「重做这个功能
+ * 没有了」,而一个没有理由的缺席和一个 bug 长得一模一样。
+ */
+describe('动作键缺席要有理由', () => {
+  const NODE = (): TaskNode[] => [mk('root', { title: '根任务', status: 'BLOCKED' })]
+
+  it('只看模式:页脚说得出为什么没有 r/R/s/f', async () => {
+    const t = fakeTty(100)
+    const app = await render(
+      <TaskTreePanel
+        nodes={NODE()} runId="003" interactive onExitKey={() => {}}
+        keysDisabledReason="只看模式:重做/跳过等键已关闭(恢复时选了「只看」)"
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const tree = t.lastFrame()
+    t.stdin.press(ENTER); await tick()
+    const detail = t.lastFrame()
+    app.unmount()
+    // 树上和详情页上都要说
+    expect(tree).toContain('只看模式')
+    expect(detail).toContain('只看模式')
+    // 而且不许同时写着一个按不动的键
+    expect(tree).not.toContain('r 重做 ')
+  })
+
+  it('正常模式下一个字都不多写', async () => {
+    const t = fakeTty(100)
+    const app = await render(
+      <TaskTreePanel
+        nodes={NODE()} runId="003" interactive onExitKey={() => {}}
+        onRedo={() => undefined}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const frame = t.lastFrame()
+    app.unmount()
+    expect(frame).not.toContain('只看模式')
+    expect(frame).toContain('r 重做')
+  })
+})

@@ -2344,6 +2344,11 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       nodes={nodes} runId={runId ?? ''} streams={streams.current} outcome={outcome}
       handoff={handoff} handoffResult={handoffResult} handoffState={handoffState}
       viewOnly={viewOnly} onExit={props.onExit}
+      /**
+       * 「只看」模式下那四个动作键**是故意不给的**(用户在恢复关口按了 v)。
+       * 但缺席必须有理由 —— 否则屏幕上「重做这个功能没有了」和一个真 bug 长得一模一样。
+       */
+      keysDisabledReason={viewOnly ? '只看模式:重做/跳过等键已关闭(恢复时选了「只看」)' : undefined}
       redoProblems={redoProblems}
       // 只查看模式下不给重做:那个 run 的编排器根本没起来过,重做等于**替用户决定**
       // 把它跑起来 —— 而他刚刚明确选了不跑。
@@ -2518,6 +2523,8 @@ export function DoneView(props: {
    * a failure the user's own keystroke caused, about a run that is still perfectly resumable.
    */
   viewOnly?: boolean
+  /** 动作键为什么不在。见 TaskTreePanel 同名 prop。 */
+  keysDisabledReason?: string
   /** 上一次重做**没做成**的事。空 = 干净;非空必须显示,每条都是会自己长回来的问题。 */
   redoProblems?: string[]
   /** 给了才有 r 键。 */
@@ -2561,6 +2568,7 @@ export function DoneView(props: {
         onRedoFailed={props.onRedoFailed}
         onSkipFailed={props.onSkipFailed}
         onForcePass={props.onForcePass}
+        keysDisabledReason={props.keysDisabledReason}
         onCleanupWorktrees={props.onCleanupWorktrees}
         onExitKey={() => props.onExit(props.outcome)}
       />
