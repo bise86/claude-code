@@ -278,8 +278,25 @@ export class EffTaskOrchestrator {
    * This is the POOL's occupancy, not a count of running nodes: a roundtable's reviewers hold
    * slots too, and that is precisely the number the confirmation gate promised to cap.
    */
-  slotUsage(): { inUse: number; limit: number } {
-    return { inUse: this.slots.inUse(), limit: this.limit() }
+  /**
+   * `inFlight` —— **此刻真的有一步在跑的那些节点 id**,和 `runningNodeIds()` 同一份。
+   *
+   * 交出去是为了让表头能把 `inUse` 拆开说。用户报的原话:「顶端黄色显示 7 个任务在运行,
+   * 为什么并行那里写的是 20/20」。两个数各自都没算错,量的却是两件事:
+   *
+   *  - 黄色那个数按**节点状态**算(`uiStatus`),而 CREATED / READY / WAITING_CHILDREN 都是灰的;
+   *  - `inUse` 是**槽**,而槽在步骤被派出去的那一刻就拿走了(`launch` 里的 `slots.take()`)。
+   *
+   * 中间那道缝是实打实的:一个节点被派出去之后,要到它自己那一步跑到第一次 `commit(...)`
+   * 才变黄,而执行那条路在 `commit(EXECUTING)` 之前要先 `worktrees.acquire(node)` —— 那件事
+   * 被池子的**全局互斥锁**串起来(5 个并发 `git worktree add` 会把 `.git/config` 锁坏)。
+   * 于是排在锁后面的节点:槽占着、颜色是灰的、屏幕上没有任何东西解释这 13 个去哪了。
+   *
+   * 只给 id、不在这里算「准备中几个」:什么叫「黄」是渲染层的定义(`uiStatus`),在这里
+   * 再判一次就是第二份判据,而这个仓库为「同一条判据的第二份」反复付过账。
+   */
+  slotUsage(): { inUse: number; limit: number; inFlight: readonly string[] } {
+    return { inUse: this.slots.inUse(), limit: this.limit(), inFlight: this.runningNodeIds() }
   }
 
   /**

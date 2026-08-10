@@ -1194,13 +1194,32 @@ export function exitReportLine(args: {
    * 和「稍后收口: /et --resume … 会重新弹出四选一」,而两句都已经不成立。
    */
   handoffState?: HandoffState
+  /**
+   * 这一趟是**正常跑完**的吗。只有它为真时那句「完成」才需要被限定 —— 被阻断 / 已取消
+   * 的行本来就没在声称成功,再给它加一个尾巴只是噪音。
+   *
+   * 单独传一个布尔而不是去认 `how` 里的字:`how` 是给人看的散文
+   * (`被阻断(连续返工超限)`),按它做判断是把一个渲染串当成状态用。
+   */
+  completed?: boolean
 }): string {
   const verb = args.resumed ? '续跑' : ''
   const path = args.withPath ? ` · .claude/efftask/${args.runId}/run.md` : ''
   const where = args.handoff
     ? '\n' + handoffLines(args.handoff, args.runId, args.handoffState).join('\n')
     : ''
-  return `高效任务 ${args.runId} ${verb}${args.how}${path}${where}`
+  /**
+   * **「完成」要看产出到没到你的分支上。**
+   *
+   * 这行字进的是对话记录,面板关掉之后用户能回看的只剩它 —— 而一句光秃秃的
+   * 「高效任务 003 完成」会让人以为代码已经在手上了(底下那几行 handoffLines 说的是
+   * 反话,但结论在第一行)。判据与结束屏共用 `undeliveredCommits`。
+   */
+  const left = undeliveredCommits(args.handoff, args.handoffState)
+  const how = args.completed === true && left > 0
+    ? `${args.how}(产出还没到你的分支:${left} 个提交待收口)`
+    : args.how
+  return `高效任务 ${args.runId} ${verb}${how}${path}${where}`
 }
 
 /**
@@ -1211,6 +1230,41 @@ export function exitReportLine(args: {
  *  - 省略:没合(脏树 / 没跑完 / 没启用隔离),工作区确实没被动过。
  */
 export type HandoffState = 'merged' | 'conflicted'
+
+/**
+ * 这一趟的产出**还有多少提交没到用户当前的分支上**。0 = 都到了(或这一趟本来就没有产出)。
+ *
+ * ## 为什么要有这么一个函数,而不是各处自己判一次
+ *
+ * 用户原话:「worktree 的代码合并到主干,才算任务完成吧。」这句话在**节点**那一层不成立
+ * (见下面),但在**这一趟**这一层完全成立 —— 而在它之前,结束屏的结论行只看
+ * `outcome.status`,于是屏幕上是这样的:
+ *
+ *     ✓ 高效任务完成
+ *     ⚠ 你的工作区有未提交的改动,没有把产出合回你的目录
+ *     分支 efftask/003/integration 上还有 7 个提交没合进来
+ *
+ * 结论行和它底下三行互相矛盾,而用户读的是结论行。这个函数就是那条结论的判据,
+ * done 视图和退出报告(它进对话记录,比面板活得久)共用同一份 —— 两处各判一次的话,
+ * 同一个 run 在两个地方会有两个结局。
+ *
+ * ## 为什么判据不能下沉到节点状态
+ *
+ * 第二跳(集成分支 → 你的分支)合不上的原因全是**你的检出**此刻的性质:已跟踪文件脏、
+ * detached HEAD、你自己 `git reset` 回退过这一趟的提交。把它写进 ACCEPTED 会有三个后果:
+ * 节点状态变成你工作区的函数;依赖门(`deps` 全部 ACCEPTED)会被一个未提交的文件卡死,
+ * 而每个节点的工作区是从**集成分支**拉的、根本不看你的分支;`userRewound` 之后整棵树
+ * 永远完不成。而且「还在运行中」本身是假的 —— 没有任何 agent 在跑。真实状态是
+ * 「做完了,但没送到」,那是一个**投递**状态,住在这一层。
+ */
+export function undeliveredCommits(
+  h: Pick<HandoffSummary, 'commits'> | null | undefined,
+  state?: HandoffState,
+): number {
+  // 合成功 = 集成分支已经在你的 HEAD 里,`commits`(它是**合并之前**量的)不再成立。
+  if (!h || state === 'merged') return 0
+  return h.commits > 0 ? h.commits : 0
+}
 
 export function handoffLines(
   h: HandoffSummary,

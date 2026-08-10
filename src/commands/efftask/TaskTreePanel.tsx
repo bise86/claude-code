@@ -236,8 +236,14 @@ export function TaskTreePanel(props: {
    * 会让整棵树在每条消息上重绘。重绘由 useStreamTick 合批驱动(静默期零重绘)。
    */
   streams?: StreamStore
-  /** 并行占用 (spec §10.1). Read at render time; see `chunks` for why it is not state. */
-  pool?: () => { inUse: number; limit: number }
+  /**
+   * 并行占用 (spec §10.1). Read at render time; see `chunks` for why it is not state.
+   *
+   * `inFlight` 是**此刻真的有一步在跑的节点 id**。可缺省 —— 缺席时表头与这个字段不存在时
+   * 逐字相同(只画 `并行 n/N`);给了才拆得出「准备中 / 评审席」那一小截,而那一截回答的正是
+   * 「黄色 7 个,为什么这里写 20/20」。
+   */
+  pool?: () => { inUse: number; limit: number; inFlight?: readonly string[] }
   /**
    * 执行环节是不是被串行化了(没有隔离工作区时是)。
    *
@@ -247,6 +253,13 @@ export function TaskTreePanel(props: {
    * 两个执行者共用一棵工作树会互相覆盖对方的改动,**同时**各自向自己的验收员汇报成功。
    */
   serialExecute?: boolean
+  /**
+   * 详情页的 `m` 键:把这棵子树里还没合进主干的隔离工作区合掉(节点分支 → 集成分支 →
+   * 你当前的分支),撞冲突派主模型解决。
+   *
+   * 给了才有这个键 —— 共享工作树运行时没有池子,也就没有任何东西可合。
+   */
+  onMergeWorktrees?: (node: TaskNode) => void
   /**
    * 运行中的人工干预。给了才有 p / i / x 三个键。
    *
@@ -358,6 +371,18 @@ export function TaskTreePanel(props: {
   const idx = rows.length === 0 ? 0 : Math.min(cursor, rows.length - 1)
   const current = rows[idx]?.node
   const detail = detailId ? props.nodes.find(n => n.id === detailId) : undefined
+  /**
+   * 翻一页跳几行 —— **上一帧真的画出来的行数**,由下面的 `view` 回填。
+   *
+   * 不用 `height`:那是能用的**终端行数**,而树行有的占 1 行、有的占 2 行(带
+   * 「⎿ 此刻在调什么工具」那一行)。按 height 翻会在有活动的树上一次跳过屏幕外的内容,
+   * 而那正是这个键要解决的问题的反面。
+   *
+   * 用 ref 而不是直接读 `view`:`view` 声明在这个 handler **下面**,靠闭包晚绑定能跑,
+   * 但那是一条随时会被一次无害的重排弄断的隐形依赖 —— 而断了之后表现是「翻页步长变成 1」,
+   * 没有任何测试之外的人看得出来。
+   */
+  const pageRef = React.useRef(1)
 
   useInput((input, key) => {
     const k = input.toLowerCase()
@@ -436,6 +461,9 @@ export function TaskTreePanel(props: {
       // 一键回收已完成子任务的工作区。关口自己会先扫一遍再让用户确认,所以这里不判
       // 「有没有东西可清」—— 那需要跑 git,而按键处理里不能等。
       if (plain && k === 'c' && props.onCleanupWorktrees) { setDetailId(null); props.onCleanupWorktrees(detail); return }
+      // 手动把这棵子树里还没合进主干的工作区合掉。和 `c` 同一条规矩:关口自己会先扫一遍
+      // 再让用户确认,所以这里不判「有没有东西可合」—— 那需要跑 git,而按键处理里不能等。
+      if (plain && k === 'm' && props.onMergeWorktrees) { setDetailId(null); props.onMergeWorktrees(detail); return }
       // 依赖重算。**被拒时不清 detailId** —— 那是它最常见的结局,而被拒的语义是
       // 「什么都没发生」。拒绝理由渲染在详情页自己那一段里(见 onRecalcDeps)。
       if (plain && k === 'd' && props.onRecalcDeps) {
@@ -504,6 +532,34 @@ export function TaskTreePanel(props: {
     }
     if (key.upArrow || k === 'k') { setCursor(c => Math.max(0, Math.min(c, rows.length - 1) - 1)); return }
     if (key.downArrow || k === 'j') { setCursor(c => Math.min(rows.length - 1, Math.min(c, rows.length - 1) + 1)); return }
+    /**
+     * **整屏地翻。** 用户原话:「任务的孙子任务数很多、整颗任务树很大的情况下,通过向下或
+     * 向上键特别慢。可以通过 page down 和 page up 键来快速查看任务树。」跑机上那棵树此刻
+     * 958 行 —— 一行一行按是 958 下。
+     *
+     * ## 三个决定
+     *
+     *  - **步长 = 这一屏真的画出来的行数减一**(`view.slice.length`,不是 `height`):
+     *    树行有的占 1 行、有的占 2 行(带「⎿ 此刻在调什么工具」那一行),写死 height 会
+     *    在有活动的树上一次跳过屏幕外的内容。留 1 行重叠是给人对上下文用的 —— 翻完一页
+     *    还能看见上一屏的最后一行,和所有分页阅读器同一个惯例。
+     *  - **`^u`/`^d` 一起收**:详情页和日志窗早就是这两个键(`sectionPaneAction` /
+     *    `logPaneAction`),树上不收会让同一个手势在三屏里有两种结果;而且有些终端
+     *    (以及 tmux 的某些配置)根本不送 PgUp/PgDn。
+     *  - **用函数式 `setCursor`**:一个 stdin chunk 会被拆成多个按键事件**同步**派发
+     *    (按住 PgDn 就是这个形态),读 render 作用域的 `cursor` 会让一个 chunk 里后面
+     *    几下全部基于同一个陈旧值、互相覆盖 —— 上下键那两行早就是这么写的,理由相同。
+     *
+     * 夹取的写法照抄上面两行(先 `Math.min(c, rows.length - 1)`):树是会长的,而光标可能
+     * 停在一个已经不存在的下标上。
+     */
+    const page = Math.max(1, pageRef.current)
+    if (key.pageUp || (key.ctrl && k === 'u')) {
+      setCursor(c => Math.max(0, Math.min(c, rows.length - 1) - page)); return
+    }
+    if (key.pageDown || (key.ctrl && k === 'd')) {
+      setCursor(c => Math.min(rows.length - 1, Math.min(c, rows.length - 1) + page)); return
+    }
     if (key.return) { if (current) setDetailId(current.id); return }
     if (!current) return
     if (key.rightArrow || k === 'l') {
@@ -541,6 +597,9 @@ export function TaskTreePanel(props: {
         // 这个键**不看节点状态**:清的是整棵子树里已验收的那些,而一个还在跑的父节点
         // 底下完全可以已经躺着十个跑完的子任务 —— 那正是长跑途中最想按它的时刻。
         canCleanup={props.onCleanupWorktrees !== undefined}
+        // 同上,也**不看节点状态**:范围是整棵子树里还没合入集成分支的那些,而父节点自己
+        // 有没有工作区、是什么状态都不决定这件事。真正的范围由关口扫盘算出来。
+        canMergeWorktrees={props.onMergeWorktrees !== undefined}
         // 判据形状抄上面 canRedoFailed 那一条:回调给了 **且** 这个节点此刻真的能按。
         /**
    * 判据必须是**真的准入**,不是 `status === 'CREATED'`。
@@ -605,6 +664,8 @@ export function TaskTreePanel(props: {
   }
   const cost = rows.map(r => (activity.has(r.node.id) || rework.has(r.node.id) ? 2 : 1))
   const view = budgetedViewport(rows, cost, idx, height)
+  // 翻页步长回填给按键处理(见 pageRef)。留 1 行重叠:翻完一页还看得见上一屏的最后一行。
+  pageRef.current = Math.max(1, view.slice.length - 1)
   const counts: Record<UiStatus, number> = { done: 0, running: 0, queued: 0, failed: 0 }
   for (const n of props.nodes) counts[uiStatus(n.status)]++
   const mouse = currentMouseAvailability()
@@ -637,6 +698,53 @@ export function TaskTreePanel(props: {
     forcePassHint
   // 子树合计要按 id 找孩子。建一次给整屏用 —— 每行各建一个是 O(行 × 节点)。
   const byId = new Map(props.nodes.map(n => [n.id, n]))
+  /**
+   * 并行占用**读一次**,不是两次。
+   *
+   * 原来 `props.pool()` 在同一行里被调了两遍(分子一次、分母一次),而它读的是活数据 ——
+   * 两次之间池子完全可以变,屏幕上就会出现一个从没同时成立过的分数。
+   */
+  const slots = props.pool?.()
+  /**
+   * `并行 n/N` 里那些**不是黄色**的占用,拆开说清楚。
+   *
+   * 用户报的原话:「顶端黄色显示 7 个任务在运行,为什么并行那里写的是 20/20」。两个数
+   * 各自都没算错,量的却是两件事:黄色按**节点状态**数(CREATED / READY / WAITING_CHILDREN
+   * 都是灰的),而槽在步骤**被派出去的那一刻**就占上了。中间那道缝是实打实的:
+   *
+   *  - **准备中** = 已经派出去、但还没跑到第一次 `commit(...)` 的节点。执行那条路在
+   *    `commit(EXECUTING)` 之前要先 `worktrees.acquire(node)`,而 acquire 被池子的全局
+   *    互斥锁串起来(5 个并发 `git worktree add` 会把 `.git/config` 锁坏)—— 排在锁后面的
+   *    节点槽占着、颜色是灰的。它们**吃掉调度预算**(`budget = limit - inUse`),所以这个
+   *    数正是「并行调大了却没更快」的答案。
+   *  - **评审席** = 一场圆桌里除第一席之外的那些(`mapWithinPool` 给它们各借一个槽,
+   *    正是启动关口承诺要盖住的那个总量)。
+   *
+   * 判据只在这里算一次:什么叫「黄」是 `uiStatus` 说了算,编排器那边只交 id(见
+   * `slotUsage` 的注释)。
+   */
+  const inFlight = slots?.inFlight ?? []
+  const preparing = inFlight.reduce((n, id) => {
+    const x = byId.get(id)
+    return n + (x !== undefined && uiStatus(x.status) !== 'running' ? 1 : 0)
+  }, 0)
+  // 槽减去在飞的步骤 = 圆桌借走的席位。`inFlight` 缺席(老调用方 / 测试)时按 0 算,
+  // 那时这一整截不画,表头与这个功能不存在时逐字相同。
+  const seats = slots ? Math.max(0, slots.inUse - inFlight.length) : 0
+  const slotNote = [
+    preparing > 0 ? `准备中 ${preparing}` : '',
+    seats > 0 && inFlight.length > 0 ? `评审席 ${seats}` : '',
+  ].filter(s => s.length > 0).join(' · ')
+  /**
+   * 这一小截和用量合计**抢同一行**,而表头一旦折成两行,`budgetedViewport` 那句
+   * 「面板高度 = 边框 2 + 表头 1 + height + 提示」就不成立,被顶出屏幕的是底部的图例和
+   * 按键提示。所以:它比用量优先(它解释的是一个**当场看不懂**的数字,而用量只是个总账),
+   * 而让位的方式是把用量的阈值按**这一截真实的宽度**顶高,不是拍一个常量。
+   */
+  const noteWidth = slotNote.length > 0 ? stringWidth(`  · ${slotNote}`) : 0
+  const showSlotNote = slotNote.length > 0 && columns >= HEADER_USAGE_MIN_COLUMNS
+  // +4:`+/-` 那条提示也在这一行上(72 列起),它不该被这一截挤到下一行去。
+  const showUsage = !isEmptyUsage(total) && columns >= HEADER_USAGE_MIN_COLUMNS + (showSlotNote ? noteWidth + 4 : 0)
 
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
@@ -646,7 +754,9 @@ export function TaskTreePanel(props: {
         <Text color="inactive">○{counts.queued}</Text> <Text color="error">✗{counts.failed}</Text>
         {/* 并行占用 n/N (spec §10.1). The POOL's occupancy, which includes the reviewers a
             roundtable is running — that is the number the confirmation gate capped. */}
-        {props.pool ? <Text dimColor>{'  '}并行 {props.pool().inUse}/{props.pool().limit}</Text> : null}
+        {slots ? <Text dimColor>{'  '}并行 {slots.inUse}/{slots.limit}</Text> : null}
+        {/* 这些槽为什么不是黄的 —— 见上面 slotNote 那一段。只在有话可说时才画。 */}
+        {showSlotNote ? <Text dimColor>{'  · '}{slotNote}</Text> : null}
         {/* 「这个数能调」写在这个数**旁边**。页脚那一行在 80 列上早就被截掉右半截了
             (实测带 runControl 时整行 123 列),把一个新键塞进去等于让它在最常见的宽度上
             看不见;而这里紧挨着它要改的那个数字,4 列就够。 */}
@@ -669,7 +779,7 @@ export function TaskTreePanel(props: {
         {/* 窄终端上**整段不画**:表头是 wrap 的,多这一截会把它挤成两行,而
             「面板高度 = 边框 2 + 表头 1 + height + 提示」是下面行预算的前提 ——
             多一行就把底部的图例和按键提示顶出屏幕。行末那个标记已经有同样的让路规矩。 */}
-        {isEmptyUsage(total) || columns < HEADER_USAGE_MIN_COLUMNS ? null : (
+        {!showUsage ? null : (
           <Text dimColor>{'  '}⇅{total.calls} 次 · {(total.estimated ?? 0) > 0 ? '≈' : ''}{formatTokens(totalTokens(total))} tokens</Text>
         )}
         {rows.length > view.slice.length ? <Text dimColor>{'  '}{idx + 1}/{rows.length}</Text> : null}
@@ -791,7 +901,7 @@ export function TaskTreePanel(props: {
               ...(onFailedNode && props.onRedoFailed ? ['R 重做失败环节'] : []),
               ...(onFailedNode && props.onSkipFailed ? ['s 跳过它'] : []),
               ...(forcePassHint ? [forcePassHint.replace(' · ', '')] : []),
-              '↑↓/jk 移动', '←/→ 折叠', '空格切换', detailEntryHint(mouse),
+              '↑↓/jk 移动', 'PgUp/PgDn 翻页', '←/→ 折叠', '空格切换', detailEntryHint(mouse),
               `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定`,
             ], rowWidth, hintPage).text}
         </Text>

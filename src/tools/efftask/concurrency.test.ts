@@ -473,9 +473,12 @@ describe('slotUsage:状态条读的那个数', () => {
       caps: { ...DEFAULT_CAPS }, notices: [],
     }
     let seenPeak = 0
+    /** 在飞的步骤 id —— 表头拿它拆出「准备中 / 评审席」,见 slotUsage 的注释。 */
+    let seenInFlight = 0
     let orch: EffTaskOrchestrator
     const runAgent: RunAgentFn = async req => {
       seenPeak = Math.max(seenPeak, orch.slotUsage().inUse)
+      seenInFlight = Math.max(seenInFlight, orch.slotUsage().inFlight.length)
       await new Promise(r => setTimeout(r, 3))
       if (req.phase === 'plan') return '\u0060\u0060\u0060json\n{"kind":"executable","solution":"s","keyPoints":"","risks":"","acceptance":"跑 bun test 全绿"}\n\u0060\u0060\u0060'
       if (req.phase === 'execute') return '\u0060\u0060\u0060json\n{"execStatus":"done"}\n\u0060\u0060\u0060'
@@ -485,11 +488,15 @@ describe('slotUsage:状态条读的那个数', () => {
     orch = new EffTaskOrchestrator(cfg2, {
       runAgent, persist: async () => {}, now: () => new Date().toISOString(), onUpdate: () => {},
     }, new AbortController().signal)
-    expect(orch.slotUsage()).toEqual({ inUse: 0, limit: 3 })
+    expect(orch.slotUsage()).toEqual({ inUse: 0, limit: 3, inFlight: [] })
     await orch.run()
     expect(seenPeak).toBeGreaterThan(0)      // it MOVES
     expect(seenPeak).toBeLessThanOrEqual(3)  // and never exceeds the cap
     expect(orch.slotUsage().inUse).toBe(0)   // and settles back at the end
+    // 在飞的步骤也要真的报出来:表头按它算「准备中」(已派出、还没变黄的那些),
+    // 恒空的话那一截永远不画,而它正是「黄 7 个却写 20/20」的答案。
+    expect(seenInFlight).toBeGreaterThan(0)
+    expect(orch.slotUsage().inFlight).toEqual([])
   })
 
   it('limit 至少是 1,即使 config 说 0', () => {

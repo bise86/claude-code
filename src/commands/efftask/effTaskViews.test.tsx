@@ -267,6 +267,43 @@ describe('done 视图上的收口文案', () => {
     expect(f).toContain('未提交的改动')
   })
 
+  /**
+   * 用户原话:「worktree 的代码合并到主干,才算任务完成吧。」
+   *
+   * 在这之前结论行只看 `outcome.status`,于是这一屏是自相矛盾的:第一行 ✓ 高效任务完成,
+   * 第二行 ⚠ 没有把产出合回你的目录,第三行「还有 3 个提交没合进来」—— 而用户读的是第一行。
+   */
+  it('产出还没到你的分支时,结论行不许写「✓ 完成」', async () => {
+    const f = await frameOf({ handoffResult: { ok: false, message: '你的工作区有未提交的改动' } })
+    expect(f).not.toContain('✓ 高效任务完成')
+    expect(f).toContain('跑完了,但产出还没到你的分支')
+    // 数目要在结论行上 —— 「还差多少」是他决定下一步的依据。
+    expect(f).toContain('3 个提交')
+  })
+
+  it('产出已经在你的分支上时,结论行照旧是「✓ 完成」', async () => {
+    const f = await frameOf({ handoffState: 'merged', handoffResult: { ok: true, message: '已合并 3 个提交' } })
+    expect(f).toContain('✓ 高效任务完成')
+    expect(f).not.toContain('还没到你的分支')
+  })
+
+  it('被阻断的 run 不叠第二句 —— 那一行本来就没在声称成功', async () => {
+    const t = fakeTty(40)
+    const app = await render(
+      React.createElement(DoneView as never, {
+        nodes: [node({ id: 'root', title: '根任务' })] as never,
+        runId: '007', outcome: { status: 'blocked', reason: '连续返工超限' },
+        handoff: summary, onExit: () => {},
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('✗ 高效任务被阻断')
+    expect(f).not.toContain('跑完了,但产出还没到你的分支')
+  })
+
   it('撞冲突 → 说清工作区里留着一次未完成的合并', async () => {
     // 这一路是**自动**发生的:用户没按任何键就被丢进冲突态。屏幕上写「工作区未被改动」
     // 是这一屏最不能出的错。

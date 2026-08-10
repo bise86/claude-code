@@ -42,6 +42,10 @@ export type Phase =
   // 和上面几条一样是一条岔路而不是运行阶段,但它**既不重启编排、也不动任务树** ——
   // 它唯一改变的是磁盘上那些目录还在不在,所以确认之后原样回到来时那一屏。
   | 'confirmCleanup'
+  // 'confirmMerge' 是详情页的 `m` 键:把这棵子树里**还没合进主干**的隔离工作区逐个合掉
+  // (节点分支 → 集成分支 → 你当前的分支),撞了冲突派主模型解决。和上面那条一样是岔路
+  // 而不是运行阶段 —— 它不重启编排、不动任务树,只动 git,所以确认完原样回到来时那一屏。
+  | 'confirmMerge'
   // 'confirmRecalc' 是详情页的 `d` 键:让主模型把这个任务的粗依赖换成被依赖任务子树里
   // 更细的几项。**只在运行中有**(它要 hold 住节点、还要叫醒调度),也只在**真的要发起
   // 模型调用**时才切到这一屏 —— 准入被拒时不切屏,理由渲染在详情页里(切屏会把任务树
@@ -75,7 +79,7 @@ export async function runOrchestrator(
     openStream?: PipelineCtx['openStream']
     cwd?: PipelineCtx['cwd']
     /** 并行占用 (spec §10.1): called ONCE with a live reader for the status bar. */
-    onPool?: (read: () => { inUse: number; limit: number }) => void
+    onPool?: (read: () => { inUse: number; limit: number; inFlight: readonly string[] }) => void
     /**
      * 运行中重做 (用户原话:「不需要整体返回失败才能重做任务或阶段,在其它任务还在运行时
      * 就可以重做」)。**调用两次**:开跑时给出这一轮的编排器,收尾时给 `undefined`。

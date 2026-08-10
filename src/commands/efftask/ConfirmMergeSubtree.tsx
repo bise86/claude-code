@@ -1,0 +1,193 @@
+import * as React from 'react'
+
+import { Box, Text, useInput } from '../../ink.js'
+import {
+  subtreeMergeLines, subtreeMergeResultLines,
+  type SubtreeMergeOutcome, type SubtreeMergePlan,
+} from '../../tools/efftask/mergeSubtree.js'
+import type { TaskNode } from '../../tools/efftask/types.js'
+import { useModalOrTerminalSize } from '../../context/modalContext.js'
+import { useTerminalSize } from '../../hooks/useTerminalSize.js'
+import { useLiveState } from './useLiveState.js'
+import { redoSummaryLines } from './ConfirmRedo.js'
+
+/**
+ * 「把这棵子树里还没合的工作区合进主干」关口 —— 一屏,五个状态。
+ *
+ * 用户原话:「如果任务树上有 worktree 没有合并到主干,进入任务详情页,可以手动触发合并
+ * 提交,并且包括所有孙子任务。如果合并遇到问题用主模型解决并且进行合并提交。」
+ *
+ * ## 为什么不是「按一下就合」
+ *
+ * 这个动作会在**用户自己的检出**里产生真实的 merge commit,而且撞冲突时会派模型去改代码。
+ * 所以和回收工作区那一屏同一套骨架(ConfirmCleanup 的注释里逐条记着理由),外加一件它
+ * 没有的事:
+ *
+ *  - `working` **要有进度**。回收是几秒钟的 `worktree remove`;这一路每个冲突都是一次
+ *    模型调用,十几个节点跑几分钟很正常。一屏不动的「正在合并…」和死机在屏幕上没有区别,
+ *    而这个仓库为「按下去没反应」付过两次学费。
+ *  - `working` 里 **Esc/q 是「合完当前这个就停」**,不是「立刻停」:一次 git merge 中途
+ *    停下来只会留下半合并状态。屏幕上写的就是这句话,不写成「已取消」。
+ *
+ * 判据和动作住在 `mergeSubtree.ts`(那里对着真 git 测),这一屏不认识 git。
+ */
+export function ConfirmMergeSubtree(props: {
+  target: TaskNode
+  onScan: () => Promise<SubtreeMergePlan>
+  /** 执行。`onProgress` 由这一屏给进去 —— 进度是这一路唯一让人知道它还活着的东西。 */
+  onRun: (plan: SubtreeMergePlan, onProgress: (line: string) => void) => Promise<SubtreeMergeOutcome>
+  /** 「合完当前这个就停」。给了才在执行中提示这个键。 */
+  onInterrupt?: () => void
+  /** 关掉这一屏。合完也走它 —— 回到用户来的那一屏。 */
+  onDone: () => void
+  onCancel: () => void
+}): React.ReactElement {
+  const term = useTerminalSize()
+  const { rows, columns } = useModalOrTerminalSize(term)
+  const [mode, setMode, modeRef] = useLiveState<'scanning' | 'ready' | 'working' | 'done' | 'error'>('scanning')
+  const [plan, setPlan, planRef] = useLiveState<SubtreeMergePlan | null>(null)
+  const [outcome, setOutcome] = useLiveState<SubtreeMergeOutcome | null>(null)
+  const [error, setError] = useLiveState<string>('')
+  const [progress, setProgress] = useLiveState<readonly string[]>([])
+  const [stopping, setStopping] = useLiveState(false)
+  /**
+   * 卸载之后不再改 state。关口可以被 Esc 关掉,而扫描/合并还在跑 —— 而合并那一路**跑完
+   * 也不撤销**:它已经在用户的仓库里落了提交,只是没人再看着屏幕了。
+   */
+  const alive = React.useRef(true)
+  React.useEffect(() => () => { alive.current = false }, [])
+
+  React.useEffect(() => {
+    void props.onScan().then(
+      p => { if (alive.current) { setPlan(p); setMode('ready') } },
+      (e: unknown) => {
+        if (!alive.current) return
+        setError(e instanceof Error ? e.message : String(e))
+        setMode('error')
+      },
+    )
+    // biome-ignore lint/correctness/useExhaustiveDependencies: 只在挂载时扫一次
+  }, [])
+
+  useInput((input, key) => {
+    const k = input.toLowerCase()
+    const m = modeRef.current
+    if (m === 'working') {
+      // 合并中途唯一认的键:请求「合完当前这个就停」。**不是立刻停** —— 一次 git merge
+      // 被打断只会留下半合并状态,那正是这个功能要替用户避免的东西。
+      if ((key.escape || k === 'q') && props.onInterrupt && !stopping) {
+        setStopping(true)
+        props.onInterrupt()
+      }
+      return
+    }
+    if (m === 'done' || m === 'error') {
+      if (key.return || key.escape || k === 'q') props.onDone()
+      return
+    }
+    if (key.escape || k === 'q' || k === 'n') { props.onCancel(); return }
+    if (m !== 'ready') return
+    const p = planRef.current
+    /**
+     * 没有节点要合、而且第二跳也没什么可送时,回车是「知道了」,不是「执行一次空操作」。
+     *
+     * 判据**必须带上第二跳**:一个节点都不用合、而集成分支上压着十个提交没送到用户分支,
+     * 是这个键最典型的用法之一(逐任务合并那一路被脏树挡过)。只看 `items.length` 会把
+     * 那一次变成死键,而屏幕上写着「回车 确认合并」。
+     */
+    const nothing = !p || (p.items.length === 0 && (p.trunk.pending === 0 || p.trunk.blocked !== undefined))
+    if (nothing) {
+      if (key.return || k === 'y') props.onCancel()
+      return
+    }
+    if (key.return || k === 'y') {
+      setMode('working')
+      void props.onRun(p, line => { if (alive.current) setProgress(cur => [...cur, line]) }).then(
+        o => { if (alive.current) { setOutcome(o); setMode('done') } },
+        (e: unknown) => {
+          if (!alive.current) return
+          setError(e instanceof Error ? e.message : String(e))
+          setMode('error')
+        },
+      )
+    }
+  })
+
+  const title = `合并未合入主干的工作区 —— ${props.target.title}`
+  if (mode === 'scanning') {
+    return (
+      <Box borderStyle="round" paddingX={1} flexDirection="column">
+        <Text bold color="warning">{title}</Text>
+        <Text dimColor>正在清点这棵子树里还没合入集成分支的工作区…</Text>
+        <Text dimColor>q / Esc 取消</Text>
+      </Box>
+    )
+  }
+  if (mode === 'error') {
+    return (
+      <Box borderStyle="round" paddingX={1} flexDirection="column">
+        <Text bold color="warning">{title}</Text>
+        <Text color="error">{error || '未知错误'}</Text>
+        <Text dimColor>回车 / q / Esc 返回</Text>
+      </Box>
+    )
+  }
+  if (mode === 'working') {
+    /**
+     * 进度留**最新的几条**,滚掉的是最老的。
+     *
+     * `redoSummaryLines` 是从**尾部**裁的(它的用户是「一屏清单」,头几行最重要),而这一屏
+     * 正相反 —— 用户盯着它就是想知道「现在在干什么」,裁掉最新那几行等于把这一屏唯一的
+     * 用途裁掉。所以从头往下丢,直到一条都不用藏为止;丢掉了几条**说出来**,而那句话画在
+     * 被裁的内容**外面**(不然它自己会是第一个被裁掉的)。
+     */
+    const raw = progress.length > 0 ? [...progress] : ['正在合并…']
+    let recent = raw.slice(-Math.max(1, rows))
+    let fit = redoSummaryLines(recent, rows, columns)
+    while (fit.hidden > 0 && recent.length > 1) {
+      recent = recent.slice(1)
+      fit = redoSummaryLines(recent, rows, columns)
+    }
+    const scrolled = raw.length - recent.length
+    return (
+      <Box borderStyle="round" paddingX={1} flexDirection="column">
+        <Text bold color="warning">{title}</Text>
+        {scrolled > 0 ? <Text dimColor>…前面 {scrolled} 条已滚过</Text> : null}
+        {fit.shown.map((l, i) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: 折行结果按位置定义,内容可重复
+          <Text key={i} wrap="truncate-end" dimColor>{l}</Text>
+        ))}
+        <Text dimColor>
+          {stopping
+            ? '已请求中断:合完当前这个任务就停(一次 git merge 中途停下会留下半合并状态)'
+            : props.onInterrupt
+              ? 'q / Esc 请求中断(合完当前这个任务再停)'
+              : '合并期间按键不响应'}
+        </Text>
+      </Box>
+    )
+  }
+
+  const lines = mode === 'done'
+    ? (outcome ? subtreeMergeResultLines(outcome) : ['(没有结果)'])
+    : (plan ? subtreeMergeLines(plan) : ['(没有可合并的内容)'])
+  const { shown, hidden } = redoSummaryLines(lines, rows, columns)
+  const nothing = mode === 'ready' && plan !== null
+    && plan.items.length === 0 && (plan.trunk.pending === 0 || plan.trunk.blocked !== undefined)
+  const footer = mode === 'done' || nothing
+    ? '回车 / q / Esc 返回'
+    : '回车 / y 确认合并(会在你的分支上产生真实提交) · q / Esc / n 取消'
+  return (
+    <Box borderStyle="round" paddingX={1} flexDirection="column">
+      <Text bold color={mode === 'done' ? (outcome?.failed.length ? 'warning' : 'success') : 'warning'}>
+        {mode === 'done' ? `合并完成 —— ${props.target.title}` : title}
+      </Text>
+      {shown.map((l, i) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: 折行结果按位置定义,内容可重复
+        <Text key={i} wrap="truncate-end" color={l.startsWith('⚠') ? 'warning' : undefined}>{l}</Text>
+      ))}
+      {hidden > 0 ? <Text dimColor>…另有 {hidden} 条未显示(终端太矮);放大窗口再看</Text> : null}
+      <Text dimColor>{footer}</Text>
+    </Box>
+  )
+}

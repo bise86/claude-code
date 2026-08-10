@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -495,6 +495,62 @@ describe('exitReportLine:退出时留在 transcript 里的那一行', () => {
     const l = exitReportLine({ runId: '007', how: '完成', resumed: false, withPath: true, handoff: h })
     expect(l).toContain('efftask/007/integration')
     expect(l).toContain('3 个提交')
+  })
+
+  /**
+   * 用户原话:「worktree 的代码合并到主干,才算任务完成吧。」
+   *
+   * 这行字进对话记录、比面板活得久 —— 一句光秃秃的「高效任务 007 完成」会让人以为代码
+   * 已经在手上了(底下 handoffLines 说的是反话,但结论在第一行)。
+   */
+  it('产出还没到你的分支时,「完成」要被限定', () => {
+    const l = exitReportLine({ runId: '007', how: '完成', resumed: false, withPath: true, handoff: h, completed: true })
+    expect(l).toContain('完成(产出还没到你的分支:3 个提交待收口)')
+  })
+
+  it('合成功之后不加那个尾巴', () => {
+    const l = exitReportLine({
+      runId: '007', how: '完成', resumed: false, withPath: true, handoff: h,
+      handoffState: 'merged', completed: true,
+    })
+    expect(l).not.toContain('还没到你的分支')
+    expect(l).toContain('高效任务 007 完成')
+  })
+
+  it('被阻断 / 已取消不叠这句 —— 那一行本来就没在声称成功', () => {
+    const l = exitReportLine({
+      runId: '007', how: '被阻断(连续返工超限)', resumed: false, withPath: true, handoff: h, completed: false,
+    })
+    expect(l).not.toContain('还没到你的分支')
+  })
+
+  it('不传 completed 时逐字回到这个功能之前的样子', () => {
+    const l = exitReportLine({ runId: '007', how: '完成', resumed: false, withPath: true, handoff: h })
+    expect(l).not.toContain('还没到你的分支')
+  })
+})
+
+/**
+ * 「投递了没有」的唯一判据。done 视图的结论行、退出报告都读它 —— 两处各判一次的话,
+ * 同一个 run 在面板上和对话记录里会有两个结局。
+ */
+describe('undeliveredCommits', () => {
+  const h = (commits: number) => ({ branch: 'b', commits, kept: [], salvage: [] })
+
+  it('合成功 = 都到了,不管合并**之前**量到的是多少', () => {
+    // `commits` 是 handoff() 在 finishHandoff 之前量的(HEAD..集成分支),合完它就不成立了。
+    expect(undeliveredCommits(h(7), 'merged')).toBe(0)
+  })
+
+  it('没合 / 撞冲突 = 还有那么多没到', () => {
+    expect(undeliveredCommits(h(7))).toBe(7)
+    expect(undeliveredCommits(h(7), 'conflicted')).toBe(7)
+  })
+
+  it('没有产出、或者根本没有隔离运行 = 0', () => {
+    expect(undeliveredCommits(h(0))).toBe(0)
+    expect(undeliveredCommits(null)).toBe(0)
+    expect(undeliveredCommits(undefined)).toBe(0)
   })
 })
 

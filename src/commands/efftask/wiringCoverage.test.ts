@@ -205,8 +205,11 @@ describe('收口关口的接线(spec §8)', () => {
     // **`keep` 也算处置完了**,尽管它什么都没做:恢复路径在任何节点检查之前就判
     // pendingHandoff 并 return,而关口每个出口都走 done —— 不划掉的话一个「被安全阀挡住
     // + 有待收口」的 run 会永久卡在收口关口,--retry-blocked 永远到不了 reseat。
-    expect(SRC).toContain('if (result.ok) {')
+    expect(SRC).toContain('if (result.ok) await clearPendingHandoff()')
+    // 划掉这件事**只有一份实现**(详情页手动合并那条路也用它)。两份实现里迟早有一份
+    // 忘了划,而后果是下次 --resume 为一条已经合完的分支再弹一次四选一。
     expect(SRC).toContain('pendingHandoff: undefined')
+    expect(occurrences('pendingHandoff: undefined')).toBe(1)
   })
 
   it('静默超时真的换到了那口时钟上(新建和恢复两条路都要)', () => {
@@ -856,7 +859,12 @@ describe('启动关口拿得到员工端点', () => {
  */
 describe('收口关口的合并也带着解冲突的人', () => {
   it('settleHandoff 把解决者传给了 runHandoffChoice', () => {
-    expect(occurrences('makeHandoffConflictResolver({ runAgent: props.runAgent')).toBe(1)
+    /**
+     * **两处**:收口关口这一处,和详情页 `m` 键那一处(手动合并子树时同样要有人解冲突)。
+     * 数目仍然钉住 —— 只查存在会被另一处满足,而这个文件为那个陷阱写过两次注释;
+     * 各自到底接对没有,由下面那条正则和「手动合并」那一节分别判。
+     */
+    expect(occurrences('makeHandoffConflictResolver({ runAgent: props.runAgent')).toBe(2)
     // 第五个参数的位置就是解决者 —— 传成 undefined 或者干脆不传都会让关口退回老行为。
     expect(SRC).toMatch(/runHandoffChoice\(\s*choice, h, gitRunner, getCwd\(\),\s*\n\s*root \? makeHandoffConflictResolver/)
   })
@@ -898,6 +906,54 @@ describe('清理已完成工作区的接线不能被静默剪断', () => {
     expect(element('ConfirmCleanup')).toContain('runCleanup(deps, plan, nodes)')
     // 剪断这一句:工作区没了,而详情页的「隔离工作区」那一段还画着那条路径。
     expect(element('ConfirmCleanup')).toContain('setNodes([...nodes])')
+  })
+})
+
+/**
+ * 手动合并未合入主干的工作区(详情页 `m`)的三跳接线。
+ *
+ * 和上面那一节同因,而且后果更重:剪断任意一处,用户按 `m` 要么什么都不发生,要么关口开了
+ * 却对着一个空池子扫出「没有需要合并的工作区」—— 而真相是他的产出全锁在几条分支上,
+ * 一个字节都没到他的目录里。这一跳住在 `EffTaskRunner` 的 JSX 里,组件级用例挂不起来。
+ */
+describe('手动合并子树的接线不能被静默剪断', () => {
+  it('两条路径都把回调交给了树面板,并且都只在有池子时才给', () => {
+    // 计数:running 和 done 各一处,逐字相同 —— 只查存在会被另一处满足。
+    expect(occurrences('onMergeWorktrees={poolRef.current ? node => {')).toBe(2)
+    expect(occurrences("setMergeTarget(node); setMergeFrom('running'); setPhase('confirmMerge')")).toBe(1)
+    expect(occurrences("setMergeTarget(node); setMergeFrom('done'); setPhase('confirmMerge')")).toBe(1)
+    // 两个视图组件也要真的把它往下传,否则上面两处赋值只是喂给了一个没人读的 prop。
+    expect(occurrences('onMergeWorktrees={props.onMergeWorktrees}')).toBe(2)
+  })
+
+  it('关口拿到的是真的池子、解冲突的主模型、要写回的 run 目录,以及一条可中断的 signal', () => {
+    const deps = SRC.slice(SRC.indexOf('const mergeDeps ='), SRC.indexOf('const applyRedo ='))
+    // 池子是判据和动作的全部来源;换成自己拼一份 git 调用就会和自动路径分叉。
+    expect(deps).toContain('pool,')
+    // 用户原话里「用主模型解决」那一半 —— 剪掉它,撞冲突只会停下来报告。
+    expect(deps).toContain('resolve: makeHandoffConflictResolver({ runAgent: props.runAgent, node: root, signal })')
+    // 少了 persist,盘上就没有「这次合并是人手动触发的」这笔账。
+    expect(deps).toContain('persist: { fs: props.fs, runDir }')
+    // 中断要能到得了执行体:没有它,关口上的「合完当前这个就停」是一个假按钮。
+    expect(deps).toContain('signal,')
+    expect(element('ConfirmMergeSubtree')).toContain('onInterrupt={() => mergeAbort.current?.abort()}')
+  })
+
+  it('确认之后真的会去扫、去合,并把结果推回界面', () => {
+    expect(element('ConfirmMergeSubtree')).toContain('scanSubtreeMerge(deps, nodes, mergeTarget.id)')
+    expect(element('ConfirmMergeSubtree')).toContain('runSubtreeMerge({ ...deps, onProgress }, plan, nodes)')
+    // 剪断这一句:注记写进了 node.md,而详情页上一个字都不变。
+    expect(element('ConfirmMergeSubtree')).toContain('setNodes([...nodes])')
+  })
+
+  it('手动合成功之后,「投递了没有」这件事的三份记录一起改口', () => {
+    const el = element('ConfirmMergeSubtree')
+    // 剪断任意一条,同一个事实就会在三个地方说三种话:结束屏继续写「产出还没到你的分支」、
+    // 退出报告跟着错、下次 --resume 为一条已经合完的分支再弹一次四选一。
+    expect(el).toContain('if (out.trunk?.ok === true)')
+    expect(el).toContain("setHandoffState('merged')")
+    expect(el).toContain("props.handoffStateOut.current = 'merged'")
+    expect(el).toContain('await clearPendingHandoff()')
   })
 })
 

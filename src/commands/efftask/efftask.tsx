@@ -44,6 +44,8 @@ import { recalcScope, type RecalcPlan } from '../../tools/efftask/depsRecalc.js'
 import { notSchedulableReason } from '../../tools/efftask/scheduler.js'
 import { applyRecalc, askRecalc, type RecalcApply, type RecalcAsk } from '../../tools/efftask/depsRecalcRun.js'
 import { runCleanup, scanCleanup, type CleanupDeps } from '../../tools/efftask/cleanupWorktrees.js'
+import { runSubtreeMerge, scanSubtreeMerge, type SubtreeMergeDeps } from '../../tools/efftask/mergeSubtree.js'
+import { ConfirmMergeSubtree } from './ConfirmMergeSubtree.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
 import { createNode, emptyPhaseRoles, emptyPlan, DEFAULT_CAPS, MAX_RECORDED_REPAIRS } from '../../tools/efftask/types.js'
@@ -58,6 +60,7 @@ import {
   type StartupDecision,
   type ResumeSummary,
   handoffLines,
+  undeliveredCommits,
   exitReportLine,
   runSpanLine,
   applyStartupDecision,
@@ -535,6 +538,9 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
             exitReportLine({
               runId, how, resumed, withPath,
               handoff: handoffOut.current, handoffState: handoffStateOut.current,
+              // 「完成」那一格才需要被限定成「完成,但产出还没到你的分支」——
+              // 被阻断 / 已取消的行本来就没在声称成功。
+              completed: outcome?.status === 'completed',
             }) + suppressed,
             { display: 'system' },
           )
@@ -871,6 +877,24 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    */
   const recalcAbort = React.useRef<AbortController | null>(null)
   const [cleanupFrom, setCleanupFrom] = React.useState<Phase>('done')
+  /**
+   * 正在被「合并未合入主干的工作区」的那个节点,以及关口开之前是哪一屏。
+   *
+   * `mergeFrom` 和 `cleanupFrom` 逐字同因:这个关口同样能从 running 进来 —— 一棵跑三小时
+   * 的树,前十个子任务早就验收完了,而它们的产出可能因为用户当时工作区脏而一次都没送到
+   * 他的分支上。写死 'done' 会让一次取消把还在跑的 run 的界面换成结束屏。
+   */
+  const [mergeTarget, setMergeTarget] = React.useState<TaskNode | null>(null)
+  const [mergeFrom, setMergeFrom] = React.useState<Phase>('done')
+  /**
+   * 这一次手动合并自己的 AbortController。
+   *
+   * 和 `recalcAbort` 同因:关口上的「合完当前这个就停」不能 abort 掉整个 run,而 run 级
+   * 中止也必须能把它停下来 —— 所以每次一个,并且 chain 到 run 级 signal 上。
+   */
+  const mergeAbort = React.useRef<AbortController | null>(null)
+  /** 摘掉上一次挂在 run 级 signal 上的那个监听。见关口里的 `armSignal`。 */
+  const mergeAbortDetach = React.useRef<(() => void) | null>(null)
   /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
   const [redoProblems, setRedoProblems] = React.useState<string[]>([])
   /**
@@ -964,7 +988,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // 正好是状态。80 列是极常见的默认,而 ParsingView 是敲完 /et 看到的第一屏。
   const { columns: termColumns } = useTerminalSize()
   /** 并行占用 reader, handed over once by runOrchestrator. */
-  const poolRead = React.useRef<(() => { inUse: number; limit: number }) | null>(null)
+  const poolRead = React.useRef<(() => { inUse: number; limit: number; inFlight: readonly string[] }) | null>(null)
   /**
    * 正在跑的那个编排器 —— **运行中重做**唯一的把手(用户原话:「不需要整体返回失败才能
    * 重做任务或阶段,在其它任务还在运行时就可以重做」)。
@@ -1548,6 +1572,34 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for a mount
   }, [runDir, props.fs])
 
+  /**
+   * 一次「把还没合进主干的工作区合掉」要用的那几样东西 —— **只有池子在的时候才存在**。
+   *
+   * 三条接线各自都能单独让这个键失效:
+   *  - `pool` 是判据和动作的全部来源(`commitAndMerge` / `mergeIntegrationIntoNode` /
+   *    集成分支名 / 每个节点的工作区路径);少了它这个键只能扫出一屏空清单。
+   *  - `resolve` 是用户原话里「用主模型解决」那一半。**挂在根节点上**,理由与收口那次
+   *    解冲突逐字相同(见 makeHandoffConflictResolver):这一趟合的是整条集成分支,
+   *    「哪个节点」这回事在这里不成立,而根节点的目标恰好是解冲突时最该知道的上下文。
+   *  - `persist` 让 node.md 上留下「这次合并是人手动触发的」——盘上是这件事唯一的账。
+   */
+  const mergeDeps = React.useCallback((signal: AbortSignal): SubtreeMergeDeps | undefined => {
+    const pool = poolRef.current
+    if (!pool) return undefined
+    const root = nodes.find(n => n.parentId === null) ?? nodes[0]
+    return {
+      pool,
+      git: gitRunner,
+      ...(root ? { resolve: makeHandoffConflictResolver({ runAgent: props.runAgent, node: root, signal }) } : {}),
+      ...(runDir ? { persist: { fs: props.fs, runDir } } : {}),
+      signal,
+      // 编排器还在跑吗 —— 只影响确认屏上那句「会和它抢同一条集成分支」的提醒。
+      runActive: orchRef.current !== null,
+      onError: e => logError(e),
+    }
+    // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs / props.runAgent are stable for a mount
+  }, [runDir, nodes, props.fs])
+
   const applyRedo = React.useCallback((
     target: TaskNode, entry: RedoEntry, guidance?: { scope: PhaseName | 'all'; text: string },
   ): void => {
@@ -1601,6 +1653,28 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   }, [config, runDir, nodes, redoDeps, phaseCtxOf, forcePassFrom])
 
   /**
+   * 把 run.md 上那条「集成分支还没人处置」划掉。
+   *
+   * **两条路共用**:收口关口成功之后,以及详情页按 `m` 手动把集成分支合回你的分支之后。
+   * 两处各写一遍的话,其中一处迟早会忘 —— 而后果是下一次 `/et --resume` 为一条已经合完的
+   * 分支再弹一次四选一,「丢弃」那一项还会对着一条不存在的分支报错。
+   *
+   * 整段被 try 包着:划不掉不该带走调用方(合并已经发生了,那才是主事件)。
+   */
+  const clearPendingHandoff = React.useCallback(async (): Promise<void> => {
+    // props.effRoot,不是裸 effRoot —— 那个绑定只存在于 call() 的作用域。这几行躲在
+    // try/catch 后面,所以裸写它是**静默失败**:收口明明成功了,pendingHandoff 却永远划不掉。
+    try {
+      const dir = `${props.effRoot}/${runId}`
+      const { config: cur } = await readRunManifest(props.fs, dir)
+      const { nodes: onDisk } = await loadRun(props.fs, dir)
+      const cleared = { ...cur, pendingHandoff: undefined }
+      await writeRunManifest(props.fs, dir, cleared, onDisk)
+    } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
+    // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs / props.effRoot are stable for a mount
+  }, [runId, props.fs])
+
+  /**
    * 执行收口选择,然后把待收口记录从 run.md 里划掉。
    *
    * 划掉这一步不能省:留着的话,下一次 `/et --resume` 会为一条**已经合并/推送/删掉**的
@@ -1639,19 +1713,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
      * 代价是 ConfirmHandoff 上「Esc 稍后再说(等同「保留」)」那句话不完全准 —— 记录会被
      * 划掉,以后只能 `git merge <branch>` 自己来。文案已经按这个改口(见 ConfirmHandoff)。
      */
-    if (result.ok) {
-      // props.effRoot,不是裸 effRoot —— 那个绑定只存在于 call() 的作用域。这三行躲在
-      // try/catch 后面,所以裸写它是**静默失败**:收口明明成功了,pendingHandoff 却永远
-      // 划不掉,下次 --resume 会为一条已经合并/推送/删掉的分支再弹一次四选一,而「丢弃」
-      // 那一项会对着一条不存在的分支报错。
-      try {
-        const runDir = `${props.effRoot}/${runId}`
-        const { config: cur } = await readRunManifest(props.fs, runDir)
-        const { nodes } = await loadRun(props.fs, runDir)
-        const cleared = { ...cur, pendingHandoff: undefined }
-        await writeRunManifest(props.fs, runDir, cleared, nodes)
-      } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
-    }
+    if (result.ok) await clearPendingHandoff()
     setHandoffResult(result)
     // 关口里那次合并同样要让 done 视图改口 —— 判据和自动收口共用一个 state,
     // 否则同一件事在两条路上被描述成两个样子。
@@ -1660,7 +1722,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // props.effRoot,不是裸 effRoot:那个绑定只存在于 call() 的作用域,组件里没有。
   // 依赖数组**每次 render 都求值**,所以裸写它 = EffTaskRunner 第一次渲染就抛
   // ReferenceError,/et 输入任何内容都只得到一屏红色堆栈,一次模型调用都没有。
-  }, [pendingHandoff, runId, props.effRoot, props.fs, props.runAgent, props.signal, nodes])
+  }, [pendingHandoff, runId, props.effRoot, props.fs, props.runAgent, props.signal, nodes, clearPendingHandoff])
 
   // ---- 启动关口第三关: 起草根方案 + 首层任务树 (spec §2) ----
   React.useEffect(() => {
@@ -2109,6 +2171,81 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  if (phase === 'confirmMerge' && mergeTarget) {
+    /**
+     * 手动合并未合入主干的工作区。**这一屏不重启编排、不改任务树** —— 它唯一改变的是 git
+     * (节点分支 → 集成分支 → 你当前的分支),所以确认完原样回到来时那一屏。
+     *
+     * 判据和动作全在 `mergeSubtree.ts`(那里对着真 git 测);这里只接线。池子缺席时
+     * **在扫描里如实报错**,而不是渲染一屏空清单 —— 后者会让用户以为「已经全都合过了」,
+     * 而真相是这一趟根本没有隔离工作区(回收那个键为同一件事写过同样的注释)。
+     */
+    const noPool = (): never => {
+      throw new Error('这一趟没有使用隔离工作区(共享工作目录运行),执行者直接写在你的工作目录里,没有需要合并的分支')
+    }
+    /**
+     * 每次开这一屏建一个 controller,并 **chain 到 run 级 signal**:run 被中止时这一次
+     * 合并也要停(它会在下一个节点的边界上停下,而不是把一次 git merge 劈成两半)。
+     */
+    const armSignal = (): AbortSignal => {
+      const ctl = new AbortController()
+      // 上一次的监听要摘掉再挂新的:关口可以被开了又关很多次,而 run 级 signal 活到进程
+      // 结束 —— 只挂不摘的话,监听者会随着按 m 的次数一直涨(recalc 那条为同一件事在
+      // finally 里摘)。
+      mergeAbortDetach.current?.()
+      const onRunAbort = (): void => ctl.abort()
+      mergeAbort.current = ctl
+      mergeAbortDetach.current = () => {
+        props.signal.removeEventListener('abort', onRunAbort)
+        mergeAbortDetach.current = null
+      }
+      if (props.signal.aborted) ctl.abort()
+      else props.signal.addEventListener('abort', onRunAbort, { once: true })
+      return ctl.signal
+    }
+    /** 关掉这一屏时的收尾:摘监听、丢掉 controller。两个出口共用,漏一个就漏一处。 */
+    const disarm = (): void => { mergeAbortDetach.current?.(); mergeAbort.current = null }
+    return (
+      <ConfirmMergeSubtree
+        target={mergeTarget}
+        onScan={() => {
+          const deps = mergeDeps(armSignal())
+          return deps ? scanSubtreeMerge(deps, nodes, mergeTarget.id) : noPool()
+        }}
+        onRun={async (plan, onProgress) => {
+          // 扫描那次的 signal 已经挂在 mergeAbort 上了,执行沿用同一个 —— 换一个新的会让
+          // 用户在扫描期间按下的中断丢掉。
+          const deps = mergeDeps(mergeAbort.current?.signal ?? armSignal())
+          if (!deps) return noPool()
+          const out = await runSubtreeMerge({ ...deps, onProgress }, plan, nodes)
+          // 合并会往 node.execStatus 上写注记(就地改的是同一批节点对象),推一份新数组
+          // 让详情页重画 —— 否则盘上写了、屏幕上没有。
+          if (out.merged.length > 0) setNodes([...nodes])
+          /**
+           * **第二跳成了 = 这一趟已经投递了**,而结束屏的结论行、退出报告、`--resume` 的
+           * 收口关口读的都是同一件事的另外两份记录(`handoffState` 和 run.md 上的
+           * `pendingHandoff`)。不在这里改口的话:结束屏会对着一份已经在用户目录里的产出
+           * 继续写「产出还没到你的分支(N 个提交)」,而下一次 `--resume` 会为一条已经合完
+           * 的分支再弹一次四选一。
+           *
+           * 判据用 `trunk.ok`:它同时覆盖「刚合过去」和「你的分支上本来就已经有全部提交」——
+           * 两者对用户是同一个事实。这条路合的是**整条集成分支**(不只是这棵子树),
+           * 所以它和收口关口那次合并给出的是同一个结论。
+           */
+          if (out.trunk?.ok === true) {
+            setHandoffState('merged')
+            props.handoffStateOut.current = 'merged'
+            await clearPendingHandoff()
+          }
+          return out
+        }}
+        onInterrupt={() => mergeAbort.current?.abort()}
+        onDone={() => { disarm(); setMergeTarget(null); setPhase(mergeFrom) }}
+        // 取消 = 把还在跑的那次也停掉(它会在下一个节点的边界上停,不会劈开一次 git merge)。
+        onCancel={() => { mergeAbort.current?.abort(); disarm(); setMergeTarget(null); setPhase(mergeFrom) }}
+      />
+    )
+  }
   if (phase === 'confirmRecalc' && recalcTarget) {
     /**
      * 依赖重算。**只从运行视图进来**,而且只在准入已经过了、真要发起模型调用的时候 ——
@@ -2308,6 +2445,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         setCleanupTarget(node); setCleanupFrom('running'); setPhase('confirmCleanup')
       } : undefined}
       /**
+       * 运行中也能合 —— 而这正是它最有用的时刻之一:逐任务合并那一路会因为「你当时工作区
+       * 脏」「你在 detached HEAD 上」而**整趟都送不出去**,而那几条判据是故意不自动越过的。
+       * 收拾干净之后按一次 m,前面攒下的全部一起送到你的分支上。
+       *
+       * 这里**不挡任何东西**:范围由关口扫盘算(在飞的节点按定义不合,它们的工作区正被
+       * 执行者写着),关口自己会把「跳过 N 个还没跑完的任务」写在屏幕上。
+       */
+      onMergeWorktrees={poolRef.current ? node => {
+        setMergeTarget(node); setMergeFrom('running'); setPhase('confirmMerge')
+      } : undefined}
+      /**
        * 依赖重算(`d`)。**只在运行视图接线** —— 它要 hold 住节点、还要叫醒调度,
        * 而结束屏没有编排器可以做这两件事。
        *
@@ -2454,6 +2602,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       onCleanupWorktrees={poolRef.current ? node => {
         setCleanupTarget(node); setCleanupFrom('done'); setPhase('confirmCleanup')
       } : undefined}
+      /**
+       * 合并未合入主干的工作区(`m`)。**`viewOnly` 也给**,理由和上面那条逐字相同,
+       * 而且更硬:「只查看」进来的人多半正是发现产出不在自己目录里、回来找它的那个人。
+       * 这个键不重开编排、不动任务树,只把已经跑完的东西送到他的分支上。
+       */
+      onMergeWorktrees={poolRef.current ? node => {
+        setMergeTarget(node); setMergeFrom('done'); setPhase('confirmMerge')
+      } : undefined}
     />
   )
 }
@@ -2534,6 +2690,8 @@ export function RunningView(props: {
    * 给了才有这个键 —— 共享工作树运行时没有池子,也就没有任何目录可清。
    */
   onCleanupWorktrees?: (node: TaskNode) => void
+  /** 给了才有 m 键(把这棵子树里还没合进主干的隔离工作区合掉,撞冲突派主模型解决)。 */
+  onMergeWorktrees?: (node: TaskNode) => void
   /**
    * 依赖重算(详情页 d 键)。**只有运行视图有** —— 它要 hold 住节点、还要叫醒调度,
    * 而结束屏没有编排器可以做这两件事。回一句话 = 准入没过、不切屏;undefined = 去调模型。
@@ -2548,7 +2706,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
@@ -2585,11 +2743,15 @@ export function DoneView(props: {
   onForcePass?: (node: TaskNode) => string | undefined
   /** 给了才有 c 键(回收这棵子树里已验收任务的隔离工作区)。 */
   onCleanupWorktrees?: (node: TaskNode) => void
+  /** 给了才有 m 键(把这棵子树里还没合进主干的隔离工作区合掉,撞冲突派主模型解决)。 */
+  onMergeWorktrees?: (node: TaskNode) => void
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
   // node's detail — the run is over, so reading the tree matters more than leaving it fast.
   const ok = props.outcome?.status === 'completed'
+  /** 还有多少提交没到用户的分支上 —— 结论行按它改口。见 `undeliveredCommits`。 */
+  const undelivered = undeliveredCommits(props.handoff, props.handoffState)
   const handoff = props.handoff ? handoffLines(props.handoff, props.runId, props.handoffState) : []
   // 一次算好,两处用(占几行 / 画什么)—— 两处各算一次的话,它们迟早会不一致,
   // 而不一致的后果是详情页最底下那条页签条被顶出屏幕。
@@ -2617,11 +2779,33 @@ export function DoneView(props: {
         onSkipFailed={props.onSkipFailed}
         onForcePass={props.onForcePass}
         onCleanupWorktrees={props.onCleanupWorktrees}
+        onMergeWorktrees={props.onMergeWorktrees}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">
-        <Text bold color={props.viewOnly ? 'warning' : ok ? 'success' : 'error'}>
-          {props.viewOnly ? '这个 run 没有继续执行(你在关口选了先看树)' : ok ? '✓ 高效任务完成' : '✗ 高效任务被阻断'}
+        {/**
+          * 结论行。**「完成」要看产出到没到你的分支上**(用户原话:「worktree 的代码合并到
+          * 主干,才算任务完成吧」)。在这之前它只看 `outcome.status`,于是这一屏长这样:
+          *
+          *     ✓ 高效任务完成
+          *     ⚠ 你的工作区有未提交的改动,没有把产出合回你的目录
+          *     分支 efftask/003/integration 上还有 7 个提交没合进来
+          *
+          * 三行互相矛盾,而用户读的是第一行。判据(`undeliveredCommits`)与退出报告共用
+          * 同一份 —— 两处各判一次的话,同一个 run 在面板上和对话记录里会有两个结局。
+          *
+          * `wrap="truncate-end"`:这一行在 `doneSummaryRows` 里**按一行计**,而那个数决定
+          * 树能画多少行。窄终端上回流成两行会让树的最后一行被静默挤掉。截断只会吃掉
+          * 「(N 个提交)」——那个数在底下的 handoffLines 里还会再说一遍。
+          */}
+        <Text bold wrap="truncate-end" color={props.viewOnly ? 'warning' : ok ? (undelivered > 0 ? 'warning' : 'success') : 'error'}>
+          {props.viewOnly
+            ? '这个 run 没有继续执行(你在关口选了先看树)'
+            : ok
+              ? undelivered > 0
+                ? `⚠ 高效任务跑完了,但产出还没到你的分支(${undelivered} 个提交)`
+                : '✓ 高效任务完成'
+              : '✗ 高效任务被阻断'}
         </Text>
         {/* 这一趟是什么时候的事、跑了多久。排在结论下面第一行:一个隔天回来看的人,
             第一个要确认的就是屏幕上这棵树是不是刚才那一次。节点和阶段各自的时刻在

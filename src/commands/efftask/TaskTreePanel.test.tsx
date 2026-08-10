@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'bun:test'
 import * as React from 'react'
 import { EventEmitter } from 'node:events'
-import { render } from '../../ink.js'
+import { render, useInput } from '../../ink.js'
 import { TaskTreePanel, visibleRows, viewport, elapsed, budgetedViewport, kindGlyph, KIND_GLYPH, HEADER_HINT_MIN_COLUMNS } from './TaskTreePanel.js'
 import { NodeDetail, phaseTimeBody } from './NodeDetail.js'
 import { PHASE_LABEL, PHASE_NAMES } from '../../tools/efftask/types.js'
@@ -127,6 +127,85 @@ describe('表头一行装得下 —— 那是行预算的前提', () => {
   })
 })
 
+/**
+ * 「黄色 7 个,为什么并行写 20/20」—— 表头必须自己把这个差解释掉。
+ *
+ * 两个数各自都没算错,量的是两件事:黄色按**节点状态**数(CREATED / READY /
+ * WAITING_CHILDREN 都是灰的),而槽在步骤**被派出去的那一刻**就占上了。中间那道缝里
+ * 站着的是「已派出、还卡在 worktrees.acquire 的全局锁上、所以还没变黄」的节点 ——
+ * 它们吃掉调度预算(`budget = limit - inUse`),而屏幕上原来一个字都没有。
+ */
+describe('表头把并行占用拆开说', () => {
+  // 树里 EXECUTING 的是 `root/01-甲/02-b`(黄),READY/WAITING_CHILDREN 的是灰的。
+  const poolWith = (inFlight: string[], inUse = inFlight.length) =>
+    () => ({ inUse, limit: 20, inFlight })
+
+  it('已派出但还没变黄的,数出来叫「准备中」', async () => {
+    // 三个在飞:一个已经黄了(02-b EXECUTING),两个还灰着(root、01-甲)。
+    const m = await mount({ pool: poolWith(['root/01-甲/02-b', 'root', 'root/01-甲']) })
+    const f = m.lastFrame()
+    m.app.unmount()
+    expect(f).toContain('并行 3/20')
+    expect(f).toContain('准备中 2')
+  })
+
+  it('在飞的全是黄的 → 整截不画(没有话可说时不占版面)', async () => {
+    const m = await mount({ pool: poolWith(['root/01-甲/02-b']) })
+    const f = m.lastFrame()
+    m.app.unmount()
+    expect(f).toContain('并行 1/20')
+    expect(f).not.toContain('准备中')
+  })
+
+  it('槽比在飞的步骤多出来的那些,叫「评审席」', async () => {
+    // 1 个在飞的步骤 + 4 个圆桌席位借走的槽。
+    const m = await mount({ pool: poolWith(['root/01-甲/02-b'], 5) })
+    const f = m.lastFrame()
+    m.app.unmount()
+    expect(f).toContain('评审席 4')
+  })
+
+  it('不给 inFlight 的调用方,表头与这个功能不存在时逐字相同', async () => {
+    const m = await mount({ pool: () => ({ inUse: 5, limit: 20 }) })
+    const f = m.lastFrame()
+    m.app.unmount()
+    expect(f).toContain('并行 5/20')
+    expect(f).not.toContain('准备中')
+    expect(f).not.toContain('评审席')
+  })
+
+  it('窄终端上仍然是**一行** —— 让位的是用量合计,不是这一截', async () => {
+    /**
+     * 表头一旦折成两行,`budgetedViewport` 那句「面板高度 = 边框 2 + 表头 1 + height +
+     * 提示」就不成立,被顶出屏幕的是底部的图例和按键提示。而这一截比用量优先:它解释的是
+     * 一个**当场看不懂**的数字,用量只是个总账。
+     */
+    const usageTree = tree().map((n, i) => (
+      i === 0 ? { ...n, usage: { calls: 6, input: 900, output: 300, cacheRead: 0, cacheWrite: 0 } } : n
+    ))
+    const t = fakeTty(72)
+    const app = await render(
+      React.createElement(TaskTreePanel, {
+        nodes: usageTree, runId: '003', interactive: true,
+        pool: poolWith(['root', 'root/01-甲', 'root/01-甲/02-b']),
+        runControl: {
+          paused: false, onTogglePause: () => {}, onAddDirective: () => {},
+          onCancelNode: () => {}, onAdjustParallelism: () => {},
+        },
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 同一行上:并行 → 准备中 → +/-;用量合计让位了。
+    expect(f).toMatch(/并行 3\/20[^\n]*准备中 2[^\n]*\+\/-/)
+    // **只看表头那一行**:`⇅` 在树行上也有(每行自己的用量标记),整帧找它会恒真。
+    const header = f.split('\n').find(l => l.includes('run 003')) ?? ''
+    expect(header).not.toContain('⇅')
+  })
+})
+
 describe('visibleRows folds subtrees, parent before child', () => {
   it('hides a collapsed node\'s whole subtree', () => {
     const all = visibleRows(tree(), new Set())
@@ -195,6 +274,149 @@ describe('详情裁剪不能把最新发生的事截掉(真渲染器)', () => {
     expect(frame).toContain('已实现支付回调签名校验')          // the head is still there
     expect(frame).toContain('解决冲突时把退款回调的重试丢了')  // and so is the newest line
     expect(frame).toContain('中间省略')                        // honestly labelled
+  })
+})
+
+/**
+ * 大树上的翻页。用户原话:「任务的孙子任务数很多、整颗任务树很大的情况下,通过向下或
+ * 向上键特别慢。可以通过 page down 和 page up 键来快速查看任务树。」跑机上那棵树 958 行,
+ * 一行一行按是 958 下。
+ *
+ * 用**真的按键序列**驱动(`ESC[5~` / `ESC[6~`),不调判据函数:这个仓库在按键接线上割断过
+ * 三次,函数写对了、单测全绿、生产上零调用点。
+ */
+describe('PgUp / PgDn 整屏翻', () => {
+  const PGUP = ESC + '[5~'
+  const PGDN = ESC + '[6~'
+  const CTRL_D = ''
+  const CTRL_U = ''
+  /** 一棵 60 个叶子的平树 —— 一屏装不下,才谈得上翻页。 */
+  const flat = (): TaskNode[] => [
+    mk({ id: 'root', title: '根任务', status: 'WAITING_CHILDREN', kind: 'decompose', childIds: Array.from({ length: 60 }, (_, i) => `root/${i}`) }),
+    ...Array.from({ length: 60 }, (_, i) => mk({
+      id: `root/${i}`, title: `任务${String(i).padStart(2, '0')}`, parentId: 'root', depth: 1, kind: 'executable',
+    })),
+  ]
+  const mountFlat = async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(TaskTreePanel, { nodes: flat(), runId: '003', interactive: true } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    return { ...t, app }
+  }
+  /**
+   * 光标停在第几行 —— 只认表头那个 `n/61`,而且**每次只按一下**。
+   *
+   * 这个渲染器写的是**逐字符增量**,所以帧里几乎没有可靠的长串:
+   *  - 按 `❯` 找标题,拿到的是 `❯ 18`(前缀「任务」没变就不重画);
+   *  - 让一行新内容滚进屏幕再找它的标题也不行 —— 那个位置上原来是「任务39」,
+   *    滚成「任务59」时只有两位数字被改写,`任务59` 从来没有连续出现过;
+   *  - 连按两次翻页也不行:`20/61` → `39/61` 只重画了前两位,`/61` 不在缓冲里。
+   *
+   * 唯一稳的是**一次按键造成的那一处改写**:`1/61` → `20/61` 整段变了,会被整段写出来。
+   * 所以每条用例都从干净的挂载开始、只按一下。「没反应」同样可测:什么都没变 = 一个字节
+   * 都没写。
+   */
+  const jumped = (f: string): number => {
+    const m = f.match(/(\d+)\/61/)
+    return m ? Number(m[1]) : -1
+  }
+
+  it('PgDn 一次跳一屏,不是一行', async () => {
+    const m = await mountFlat()
+    m.reset(); m.stdin.press(PGDN); await tick()
+    const n = jumped(m.lastFrame())
+    m.app.unmount()
+    // 40 行的假终端上一屏是 20 行,所以落点是第 20 行(留 1 行重叠)。断言只要求
+    // 「远大于一行」——写死 20 会把一个跟终端高度走的量钉成常量。
+    expect(n).toBeGreaterThan(6)
+  })
+
+  it('PgUp 一次跳回来一屏', async () => {
+    const m = await mountFlat()
+    m.stdin.press(PGDN); await tick()
+    m.reset(); m.stdin.press(PGUP); await tick()
+    const n = jumped(m.lastFrame())
+    m.app.unmount()
+    // 翻下去一屏(第 20 行)再翻回来 → 回到第 1 行。**只跨这一次**:`20/61` → `1/61`
+    // 位数变了,整段会被重写;而 `39/61` → `20/61` 位数没变,缓冲里只剩两位数字,
+    // 那种断言会恒假(上面 jumped 的注释记了这条)。
+    expect(n).toBe(1)
+  })
+
+  it('到顶到底都停住 —— 而且是真的什么都没发生', async () => {
+    const top = await mountFlat()
+    top.reset(); top.stdin.press(PGUP); await tick()
+    // 光标本来就在第一行:夹取之后位置没变 → React 不重渲染 → 一个字节都没写。
+    // 越界的实现在这里会画出一屏空行,或者把计数写成 0/61。
+    const topWrote = top.lastFrame()
+    top.app.unmount()
+    expect(topWrote).toBe('')
+
+    const bot = await mountFlat()
+    for (let i = 0; i < 12; i++) { bot.stdin.press(PGDN); await tick() }
+    bot.reset(); bot.stdin.press(PGDN); await tick()
+    const botWrote = bot.lastFrame()
+    bot.app.unmount()
+    expect(botWrote).toBe('')
+  })
+
+  it('`^u` / `^d` 是同一件事 —— 详情页和日志窗早就是这两个键', async () => {
+    const m = await mountFlat()
+    m.reset(); m.stdin.press(CTRL_D); await tick()
+    const down = jumped(m.lastFrame())
+    m.reset(); m.stdin.press(CTRL_U); await tick()
+    const up = jumped(m.lastFrame())
+    m.app.unmount()
+    expect(down).toBeGreaterThan(6)
+    expect(up).toBe(1)
+  })
+
+  /**
+   * **翻到底之后,树自己长大了。** 这是运行中每分钟都在发生的事(编排器不停往树上挂子任务),
+   * 而它正是「不夹取上界」唯一看得见的后果:光标越界成 228,树长到 121 行时它当场跳到最后
+   * 一行去 —— 用户明明停在他刚翻到的那一行上,一个键都没按。
+   *
+   * 树由**父组件的 state** 换,不用 `app.rerender`:这个夹具里 rerender 会让面板重新挂载,
+   * 而光标就住在它自己的 state 里,重挂等于把要测的东西清零(detailSections 那边记过同一条)。
+   */
+  it('翻到底之后树长大了,光标留在原地而不是跳到新的末尾', async () => {
+    const big = (): TaskNode[] => [
+      ...flat(),
+      ...Array.from({ length: 60 }, (_, i) => mk({
+        id: `root/新${i}`, title: `新任务${String(i).padStart(2, '0')}`, parentId: 'root', depth: 1, kind: 'executable',
+      })),
+    ]
+    const Grow = (): React.ReactElement => {
+      const [nodes, setNodes] = React.useState<TaskNode[]>(flat)
+      // 'G' 在面板里没有任何含义,拿它当「树长大了」的开关不会和被测的键打架。
+      useInput(input => { if (input === 'G') setNodes(big()) })
+      return React.createElement(TaskTreePanel, { nodes, runId: '003', interactive: true } as never)
+    }
+    const t = fakeTty()
+    const app = await render(React.createElement(Grow), {
+      stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false,
+    })
+    await tick()
+    for (let i = 0; i < 12; i++) { t.stdin.press(PGDN); await tick() }
+    t.reset(); t.stdin.press('G'); await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 父节点的 childIds 只挂了原来那 60 个,所以新节点是孤儿、排在最后 —— 总行数 121。
+    // 夹住了:光标还在第 61 行。没夹住:它会是 121(越界的 228 被渲染期夹到末尾)。
+    // 又是逐字符增量:`61/61` → `61/121` 只重写了变化的那几位,缓冲里是 `61/ 21`。
+    // 所以认前半截(光标还在第 61 行),外加「没跳到新末尾」这条反面。
+    expect(f).toContain('61/')
+    expect(f).not.toContain('121/121')
+  })
+
+  it('页脚要宣告它 —— 一个没被宣告过的键等于不存在', async () => {
+    const m = await mountFlat()
+    const f = m.lastFrame()
+    m.app.unmount()
+    expect(f).toContain('PgUp/PgDn 翻页')
   })
 })
 

@@ -653,6 +653,14 @@ export function NodeDetail(props: {
    */
   canCleanup?: boolean
   /**
+   * 能不能按 `m` 把这棵子树里还没合进主干的工作区合掉。
+   *
+   * 和 `canCleanup` 同一条规矩:只有这一趟真的在用隔离工作区时才给 —— 共享工作树运行时
+   * 执行者直接写在同一棵树里,没有任何东西需要合,而一个按了什么都不会发生的键比没有
+   * 这个键更糟。
+   */
+  canMergeWorktrees?: boolean
+  /**
    * 能不能按 d 重算依赖。只影响「依赖」段最后那一行提示 —— **不进段落标题**,
    * 理由见 depsBody 里那一段(标题是身份,而这个条件会被编排器自己 tick 掉)。
    */
@@ -977,6 +985,9 @@ export function NodeDetail(props: {
     props.canForcePass ? 'f 强制通过' : '',
     props.canRecalcDeps ? 'd 重算依赖' : '',
     props.canCleanup ? 'c 清理工作区' : '',
+    // 「合并工作区」四个字不够:这个键会在**你自己的分支上**产生真实提交,而页脚是用户
+    // 唯一读得到它的地方。写清目的地,别让人按完才知道东西落到哪儿了。
+    props.canMergeWorktrees ? 'm 合并工作区到主干' : '',
   ].filter(s => s.length > 0)
   /** 页脚的段落清单。第一段是出口,分页会把它钉在每一页上。 */
   const footerSegments = ((): string[] => {
