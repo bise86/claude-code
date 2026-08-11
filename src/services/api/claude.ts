@@ -22,6 +22,7 @@ import type { Stream } from '@anthropic-ai/sdk/streaming.mjs'
 import { randomUUID } from 'crypto'
 import {
   getAPIProvider,
+  getAPIProviderForStatsig,
   isFirstPartyAnthropicBaseUrl,
 } from 'src/utils/model/providers.js'
 import {
@@ -74,6 +75,7 @@ import { computeFingerprintFromMessages } from '../../utils/fingerprint.js'
 import { captureAPIRequest, logError } from '../../utils/log.js'
 import {
   createAssistantAPIErrorMessage,
+  createSystemAPIErrorMessage,
   createUserMessage,
   ensureToolResultPairing,
   normalizeContentFromAPI,
@@ -253,10 +255,17 @@ import {
 import {
   CannotRetryError,
   FallbackTriggeredError,
+  getDefaultMaxRetries,
+  getRetryDelay,
   is529Error,
+  retryNoticeText,
   type RetryContext,
+  shouldRetry,
   withRetry,
 } from './withRetry.js'
+import { reportContextNotice } from './contextNoticeSink.js'
+import { isRetryableTransportError } from './errorPayload.js'
+import { sleep } from '../../utils/sleep.js'
 
 // Define a type that represents valid JSON values
 type JsonValue = string | number | boolean | null | JsonObject | JsonArray
@@ -1023,6 +1032,14 @@ async function* queryModel(
   tools: Tools,
   signal: AbortSignal,
   options: Options,
+  /**
+   * **流已经建起来之后**才失败的那些,这是第几次重来(见下面 `disableFallback` 那一段)。
+   *
+   * `withRetry` 的 try 只包到「把流建出来」为止 —— 它的 operation 返回的是 `Stream` 对象
+   * 本身,而真正的消费(`for await (const part of stream)`)发生在循环**外面**。所以流中途
+   * 的一帧 `event: error` 抛出来时,`shouldRetry` 根本不会被问到。
+   */
+  midStreamAttempt = 1,
 ): AsyncGenerator<
   StreamEvent | AssistantMessage | SystemAPIErrorMessage,
   void
@@ -1767,6 +1784,14 @@ async function* queryModel(
   let usage: NonNullableUsage = EMPTY_USAGE
   let costUSD = 0
   let stopReason: BetaStopReason | null = null
+  /**
+   * **这一趟有没有已经往调用方吐过东西。**
+   *
+   * 流中途失败之后能不能整轮重来,判据只有这一条:一个字都还没吐出去的失败,和一次
+   * 「请求根本没建起来」在外面看是同一件事;而已经吐过半截正文再重来,用户会看到同一段
+   * 话说两遍,工具调用甚至可能执行两次 —— 那比不重试坏得多。
+   */
+  let emittedToCaller = false
   let didFallBackToNonStreaming = false
   let fallbackMessage: AssistantMessage | undefined
   let maxOutputTokens = 0
@@ -2209,6 +2234,7 @@ async function* queryModel(
               ...(advisorModel && { advisorModel }),
             }
             newMessages.push(m)
+            emittedToCaller = true
             yield m
             break
           }
@@ -2314,6 +2340,14 @@ async function* queryModel(
             break
         }
 
+        /**
+         * `message_start` **不算「吐过东西」**。
+         *
+         * 网关最常见的失败形状恰恰是「先把流开起来(message_start),再吐一帧 error」——
+         * 把开场白算进去的话,这个判据会正好挡掉它要救的那一个。而它本身不带任何正文:
+         * 重来一次的代价只是调用方再收到一个开场事件,而不是同一段话被说两遍。
+         */
+        if (part.type !== 'message_start') emittedToCaller = true
         yield {
           type: 'stream_event',
           event: part,
@@ -2508,6 +2542,85 @@ async function* queryModel(
             ? 'watchdog'
             : 'other') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         })
+
+        /**
+         * **只走流式的链路上,这里是唯一还能重试的地方 —— 而在这之前它一次都不重试。**
+         *
+         * 用户报的现场(`/et` 席位,逐字):
+         *
+         *     ▸ 执行 第1轮 · 研发    ● 已完成 · 3s
+         *     │ 最新: API Error: {"type":"error","error":{"type":"api_error",
+         *                         "message":"Our servers are currently overloaded. Please try again later."}}
+         *
+         * 三秒、零重试,而 `shouldRetry` 对这一帧的判据是**对的**(errorPayload 把
+         * `api_error` 归一成 500)。病根不在判据,在**它根本不会被问到**:`withRetry` 的
+         * operation 返回的是 `Stream` 对象本身,try 到那一行就结束了,而流中途的一帧
+         * `event: error` 是在下面 `for await` 消费的时候才抛的 —— 已经在循环外面。
+         *
+         * 于是两件本来各自正确的事叠成了这个洞:
+         *  1. `5ba84ca` 把翻译型协议的非流式回退关掉了(它对这类链路永远走不通)——
+         *     而那条回退路里的 `executeNonStreamingRequest` **自带一整套 withRetry**,
+         *     也就是说它顺手拿走了这些席位唯一的重试;
+         *  2. `70f8a50` 修好的是 `shouldRetry` 的判据,而这条路上没人问它。
+         *
+         * 官方端点没有报这个,正是因为它的回退没关:错误落到非流式那条路上,在那里被
+         * 真正重试了。所以补丁只补这一个分支,不碰回退开着的那条路。
+         *
+         * 判据两条,缺一不可:
+         *  - **错误本身可重试** —— 复用 `shouldRetry`(它现在认得没有状态码的那一帧)
+         *    和传输层那条,和别处同一份判据,不在这里再写一套;
+         *  - **一个字都还没吐出去** —— 见 `emittedToCaller`。
+         *
+         * 退避复用 `getRetryDelay`(0.5s→1s→2s…),次数用通用的那个上限。中止不在其中:
+         * `APIUserAbortError` 在上面已经原样抛出去了。
+         */
+        const retryableMidStream =
+          (streamingError instanceof APIError && shouldRetry(streamingError)) ||
+          isRetryableTransportError(streamingError)
+        const midStreamMax = getDefaultMaxRetries()
+        if (retryableMidStream && !emittedToCaller && midStreamAttempt <= midStreamMax) {
+          // 旧的那条流和它的响应体必须先放掉:下面要重新建一条,而这一条已经废了。
+          releaseStreamResources()
+          const delayMs = getRetryDelay(midStreamAttempt)
+          logEvent('tengu_api_retry', {
+            attempt: midStreamAttempt,
+            delayMs,
+            error: errorMessage(
+              streamingError,
+            ) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            status: (streamingError as APIError).status,
+            provider: getAPIProviderForStatsig(),
+          })
+          if (streamingError instanceof APIError) {
+            yield createSystemAPIErrorMessage(
+              streamingError,
+              delayMs,
+              midStreamAttempt,
+              midStreamMax,
+            )
+          }
+          // 子 agent(`/et` 的席位)看不见上面那条 yield —— 走 ALS 那条旁路补一行,
+          // 否则退避期间席位窗口和「这一席挂死了」长得一模一样。
+          reportContextNotice({
+            kind: 'api-retry',
+            text: retryNoticeText(streamingError, delayMs, midStreamAttempt, midStreamMax),
+          })
+          await sleep(delayMs, signal, {
+            abortError: () => new APIUserAbortError(),
+          })
+          // 整轮重来:重新建流、重新消费。上面那些累计状态(newMessages/contentBlocks/
+          // usage…)全在新的一层里从头来过,这一层不再往下走。
+          return yield* queryModel(
+            messages,
+            systemPrompt,
+            thinkingConfig,
+            tools,
+            signal,
+            options,
+            midStreamAttempt + 1,
+          )
+        }
+
         throw streamingError
       }
 
