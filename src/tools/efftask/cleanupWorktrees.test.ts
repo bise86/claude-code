@@ -640,3 +640,65 @@ describe('系统临时目录里的残留', () => {
     expect(plan.scratch).toEqual([])
   })
 })
+
+/**
+ * **工作区里那些不叫 `target/` 的构建目录,一样跟着走。**
+ *
+ * 用户问的是跑机上真实存在的这一个:`.efftask-worktrees/efftask-001-d05873eb/` 底下的
+ * `.cargo-target-sql-restore`。它和上面那条用例里的 `target/` 有两处不同,而这两处恰好
+ * 是「会不会被漏掉」的全部可能:
+ *  - **点开头**(`.` 前缀):很多遍历默认跳过隐藏项;
+ *  - **没被 .gitignore 忽略**,只是未跟踪 —— 于是它不在 `--ignored` 那一类里。
+ *
+ * 判据是 `git worktree remove --force` 删的是**整个目录**,不是「git 认识的那些文件」。
+ * 这一条把它钉住:漏掉的话,用户按完 c 看见「已回收」,而几个 GB 还躺在盘上。
+ */
+describe('用户实测的那个目录名', () => {
+  it('.cargo-target-sql-restore(点开头、未被忽略)也一起删掉', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a', { status: 'ACCEPTED' })
+    const lease = await p.acquire(n)
+    const path = (lease as { path: string }).path
+    await writeFile(join(path, 'src.txt'), 'work\n')
+    expect((await p.commitAndMerge(n)).ok).toBe(true)
+
+    // 验收席位在这棵树里跑构建留下的三种残留,一起摆进去。
+    await mkdir(join(path, '.cargo-target-sql-restore', 'debug'), { recursive: true })
+    await writeFile(join(path, '.cargo-target-sql-restore', 'debug', 'big.bin'), 'x'.repeat(4096))
+    await mkdir(join(path, 'target'), { recursive: true })          // 被忽略的那种
+    await writeFile(join(path, 'target', 'big.bin'), 'x'.repeat(4096))
+    await writeFile(join(path, '.env.local'), 'K=V\n')              // 点开头的单个文件
+
+    const deps = depsOf(p, { dirSizeKb: async () => 8 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.items).toHaveLength(1)
+    // 确认屏必须把它数进「会被一并删掉」里 —— 只有 --ignored 而漏掉未跟踪的话,
+    // 屏幕上的条数会比实际删掉的少。
+    expect(plan.items[0]!.leftovers.join(' ') + plan.items[0]!.leftoverCount).toContain('cargo-target')
+
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.failed).toEqual([])
+    expect(await exists(join(path, '.cargo-target-sql-restore'))).toBe(false)
+    expect(await exists(join(path, 'target'))).toBe(false)
+    expect(await exists(join(path, '.env.local'))).toBe(false)
+    expect(await exists(path)).toBe(false)
+  })
+
+  /** 反向:**没验收**的节点,同一个目录一个字节都不许动 —— 那是现场。 */
+  it('节点还没验收时,这些目录原样留着', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a', { status: 'EXECUTING' })
+    const lease = await p.acquire(n)
+    const path = (lease as { path: string }).path
+    await mkdir(join(path, '.cargo-target-sql-restore'), { recursive: true })
+    await writeFile(join(path, '.cargo-target-sql-restore', 'big.bin'), 'x')
+
+    const deps = depsOf(p, { dirSizeKb: async () => 8 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.items).toEqual([])
+    await runCleanup(deps, plan, [n])
+    expect(await exists(join(path, '.cargo-target-sql-restore'))).toBe(true)
+  })
+})
