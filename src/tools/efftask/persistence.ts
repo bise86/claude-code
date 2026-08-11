@@ -1,4 +1,6 @@
 import { parse as yamlParse, stringify as yamlStringify } from 'yaml'
+import { AGENT_LOG_NAME } from './agentLog.js'
+import { NODE_JOURNAL_NAME, readNodeJournal, type NodeJournal } from './nodeJournal.js'
 import { PHASE_LABEL } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 import { uiStatus } from './stateMachine.js'
@@ -27,6 +29,69 @@ export interface FsLike {
   unlink(p: string): Promise<void>
   /** Remove an EMPTY directory. Used to release the lock directory; must not be recursive. */
   rmdir(p: string): Promise<void>
+  /**
+   * Rename `from` over `to`, replacing `to` if it exists. **Must be atomic** — that is the
+   * entire point (POSIX `rename(2)` / `fs.rename` are; a copy+unlink emulation is NOT and
+   * must not be substituted).
+   *
+   * REQUIRED, not optional. Making it optional and falling back to a plain overwrite would
+   * mean the fallback is the very bug this exists to fix, silently, on whichever adapter
+   * forgot it — see writeFileAtomic.
+   */
+  rename(from: string, to: string): Promise<void>
+  /**
+   * 往文件尾巴追加,文件不存在就建。**只有 agent-log.jsonl 用它。**
+   *
+   * 追加不需要原子性:被打断最坏是最后一行不完整,而读回那一侧按行解析、坏行跳过。
+   * 反过来,拿 `writeFileAtomic` 去写一份只增不改的日志,等于每追加一条就重写整个
+   * 文件 —— O(N) 的记录变成 O(N²) 的写盘。两种写法各有各的正确场合,见 agentLog.ts。
+   */
+  appendFile(p: string, data: string): Promise<void>
+}
+
+/**
+ * 「写一个文件」的**唯一**正确写法 —— 先写临时文件,再 rename 盖上去。
+ *
+ * ## 为什么必须这样
+ *
+ * 直接 `writeFile(p, data)` 是**先把旧文件截成 0 再写新内容**。写到一半被打断(磁盘满、
+ * 进程被杀)留下的不是「旧版本」也不是「新版本」,而是**新内容的前 N 个字节**,而旧内容
+ * 已经没了。对 node.md 来说这是致命的:frontmatter 的收尾 `---` 在文件末尾,半截文件
+ * 一定缺它,`parseNodeFile` 一律抛错,`loadRun` 于是把这个节点**整个丢掉**。
+ *
+ * 这不是假想。用户跑机上一个 1224 节点的 run,**43 个 node.md 被截断**,每一个都断在
+ * 4096 的整数倍上(短写就是按页断的)。后果是父任务 childIds 里写着 5 个孩子、树上只
+ * 画得出 3 个,而父任务顶着一句「子节点阻断」——三个孩子全 ACCEPTED,谁都看不出为什么。
+ *
+ * rename 是原子的:要么 `p` 还是旧内容,要么已经是完整的新内容,**没有第三种状态**。
+ * 磁盘满会让写临时文件失败,而那时 `p` 一个字节都没动过。
+ *
+ * ## 临时文件名
+ *
+ * 同目录(rename 跨设备会失败,而 /tmp 常常是另一个文件系统),前缀 `.`,后缀
+ * `.tmp` —— `loadRun` 只认**确切叫 `node.md`** 的文件,所以残留的临时文件不会被当成
+ * 节点读进来。名字里带 pid + 计数器:同一个进程里两次并发写同一个文件是存在的
+ * (queueManifest 与 writeNode),两次共用一个临时名会互相截断。
+ *
+ * 失败时**尽力**删掉临时文件,但删不掉不算失败 —— 真正的错误是写失败那一条,拿清理的
+ * 错误把它盖掉会让「磁盘满」显示成「删不掉临时文件」。
+ */
+let atomicSeq = 0
+export async function writeFileAtomic(fs: FsLike, path: string, data: string): Promise<void> {
+  const slash = path.lastIndexOf('/')
+  const dir = slash < 0 ? '.' : path.slice(0, slash)
+  const base = slash < 0 ? path : path.slice(slash + 1)
+  const pid = typeof process === 'undefined' ? 0 : process.pid
+  const tmp = `${dir}/.${base}.${pid}.${atomicSeq++}.tmp`
+  try {
+    // 写和 rename 一起兜:磁盘满是在**写**这一步失败的,那正是这个函数存在的理由,
+    // 而它留下的半截临时文件同样要清掉 —— 否则每一次磁盘满都往盘上多堆一份垃圾。
+    await fs.writeFile(tmp, data)
+    await fs.rename(tmp, path)
+  } catch (e) {
+    try { await fs.unlink(tmp) } catch { /* 清理失败不该盖掉真正的错误 */ }
+    throw e
+  }
 }
 
 /**
@@ -311,6 +376,83 @@ export function serializeNode(node: TaskNode): string {
   return `---\n${yamlStringify(fm)}---\n\n${body}`
 }
 
+/**
+ * 从**半截** node.md 里抢救出最长的合法 frontmatter 前缀。
+ *
+ * 用在 `loadRun` 的失败分支上。原来那条路是「解析不了 → 记一条 error → 把这个节点丢掉」,
+ * 而丢掉一个节点的后果远比丢掉它的正文严重:父节点 childIds 里还写着它,
+ * `validateLoadedNodes` 于是把父节点判成「子节点缺失」并**永久阻断**,整棵子树再也跑不完。
+ * 实测一个 1224 节点的 run 有 43 个这样的文件(见 writeFileAtomic)。
+ *
+ * ## 判据:逐行往回缩,缩到能解析且带 `id` 为止
+ *
+ * frontmatter 在文件**最前面**,被砍掉的一定是尾巴,所以前缀几乎总是完好的 ——
+ * 实测那 43 个文件全部抢救成功,`id`/`title`/`goal`/`parentId`/`childIds`/`deps`/
+ * `kind`/`status`/`phaseRoles` 无一丢失(断点落在 `plan.solution` 里)。
+ *
+ * **文件不以换行结尾时,最后一行无条件先扔掉。** 它是被砍断的半行,可能正好断在
+ * 一个键中间:`status: ACCEP` 解析得出来,值却是编的 —— 而这个字段直接决定这个节点
+ * 要不要重跑。宁可少要一行。
+ *
+ * **不做任何字段补全。** 缺 `status` 就是缺,交给 `validateLoadedNodes` 的
+ * `LEGAL_STATUS` 那道关去阻断并说明白 —— 在这里默认成 `CREATED` 会把一个已验收的
+ * 节点重新跑一遍,默认成 `ACCEPTED` 会把没做过的活报成完成。两个方向都是撒谎。
+ */
+export function salvageNodeFile(text: string): { node: TaskNode; droppedLines: number } | null {
+  if (!text.startsWith('---\n')) return null
+  const body = text.slice(4)
+  const lines = body.split('\n')
+  if (!body.endsWith('\n') && lines.length > 0) lines.pop()
+  for (let end = lines.length; end > 0; end--) {
+    const candidate = lines.slice(0, end).join('\n').replace(/\n+$/, '')
+    if (candidate.length === 0) continue
+    try {
+      const node = parseNodeFile(`---\n${candidate}\n---\n`)
+      // `id` 是这个节点的**身份**,也是它在盘上的路径。没有它就没有可抢救的东西。
+      if (typeof node.id === 'string' && node.id.length > 0) {
+        return { node, droppedLines: lines.length - end }
+      }
+    } catch { /* 再往回缩一行 */ }
+  }
+  return null
+}
+
+/** 一个**没能正常读出来、但被救回来了**的节点。调用方要当着用户的面说出来。 */
+export interface SalvageRecord {
+  path: string
+  id: string
+  /** 半截 frontmatter 丢掉的行数;纯靠账救回来时是 0。 */
+  droppedLines: number
+  /** 救它的是哪一边 —— 决定了「还缺什么」,也决定了要不要请主模型补。 */
+  from: '账 + 残骸' | '账' | '残骸'
+  /** 账里重放了多少条记录。0 = 这个节点没有账(老 run),只能靠残骸。 */
+  journalRecords: number
+}
+
+/**
+ * 把「半截 frontmatter 前缀」和「状态账」合成一个节点。任何一边活着都够用。
+ *
+ * **账压在残骸之上**,不是反过来:残骸停在文件被砍断的那一刻,账走到最后一次成功提交,
+ * 所以账更新。反过来合会用一份更旧的状态盖掉更新的 —— 一个已经 ACCEPTED 的节点会
+ * 退回 PLAN_REVIEW 并被重跑一遍。
+ *
+ * **`id` 以目录为准。** 路径即 id 是这个仓库的既定规矩(spec §5),而这两个来源都可能
+ * 缺 id:账的第一条如果是增量(不该发生,但盘上的东西不可信)、残骸砍在 id 之前。
+ * 目录是唯一一个不会被写坏的信息源 —— 它由文件系统自己保证。
+ */
+export function mergeSalvage(
+  fromFile: TaskNode | undefined,
+  fromJournal: Partial<TaskNode> | undefined,
+  dirId: string,
+): TaskNode | undefined {
+  if (!fromFile && !fromJournal) return undefined
+  const merged = { ...(fromFile ?? {}), ...(fromJournal ?? {}) } as TaskNode
+  const id = dirId.length > 0 ? dirId : merged.id
+  if (typeof id !== 'string' || id.length === 0) return undefined
+  merged.id = id
+  return merged
+}
+
 export function parseNodeFile(text: string): TaskNode {
   const m = text.match(/^---\n([\s\S]*?)\n---/)
   if (!m) throw new Error('efftask: node.md missing frontmatter')
@@ -335,13 +477,33 @@ export function parseNodeFile(text: string): TaskNode {
   return node
 }
 
-function nodeMdPath(runDir: string, nodeId: string): string {
+export function nodeMdPath(runDir: string, nodeId: string): string {
   return `${runDir}/${nodeId}/node.md`
 }
 
-export async function writeNode(fs: FsLike, runDir: string, node: TaskNode): Promise<void> {
+export async function writeNode(
+  fs: FsLike, runDir: string, node: TaskNode,
+  /**
+   * 状态账(`state.jsonl`)。**可选是为了兼容**:老用例和不关心持久化的调用点原样不变。
+   * 生产路径**必须**传 —— `wiringCoverage` 那一档钉着这件事,漏传的后果是
+   * 「node.md 写不下去时,这一关的结果整个没了」,而屏幕上只会说一句持久化失败。
+   */
+  journal?: NodeJournal,
+): Promise<void> {
   await fs.mkdir(`${runDir}/${node.id}`)
-  await fs.writeFile(nodeMdPath(runDir, node.id), serializeNode(node))
+  /**
+   * **账先写,node.md 后写。**
+   *
+   * 顺序是这里唯一重要的事。node.md 是整份重写,磁盘满时它**整个失败**,盘上留着的是
+   * 上一次的版本 —— 刚跑完的那一关就此不存在。而这一行只追加几百字节的增量,
+   * 七十 KB 写不下去的时候它往往还写得下去。反过来写的话,这份账永远只会比 node.md 旧,
+   * 那它就一条都救不回来。
+   *
+   * 记账失败**不阻断**:它是第二道保险,不是 node.md 的前置条件。
+   */
+  await journal?.record(node)
+  // 原子写。半截 node.md 会让这个节点在下一次 --resume 时**整个消失**(见 writeFileAtomic)。
+  await writeFileAtomic(fs, nodeMdPath(runDir, node.id), serializeNode(node))
 }
 
 /**
@@ -376,6 +538,17 @@ export async function removeNodeDirs(
     try {
       // node.md 可能本来就不在(节点还没落过盘),那不算失败 —— 目标是「盘上没有它」。
       if (await fs.exists(nodeMdPath(runDir, id))) await fs.unlink(nodeMdPath(runDir, id))
+      /**
+       * 事件日志也要删。**两个理由,第二个是硬的:**
+       *  1. 重做删掉的子树留着几 MB 的历史输出没有任何用处 —— 没有界面能再打开它们
+       *     (`dropNodes` 已经把内存那一份扔了)。
+       *  2. 下面那个 `rmdir` 是**非递归**的:目录里剩着 agent-log.jsonl 就删不掉,
+       *     于是 run 目录里堆满只剩一份日志的空壳目录。
+       */
+      for (const name of [AGENT_LOG_NAME, NODE_JOURNAL_NAME]) {
+        const side = `${runDir}/${id}/${name}`
+        if (await fs.exists(side)) await fs.unlink(side)
+      }
       // 目录留着是无害的(loadRun 只认 node.md),但留下一地空目录会让 run 目录难读。
       // 删不掉就算了 —— 里面可能还有别的东西,那更不该动。
       try { await fs.rmdir(dir) } catch { /* 非空或已不在,都无所谓 */ }
@@ -384,6 +557,83 @@ export async function removeNodeDirs(
     }
   }
   return { failed }
+}
+
+/** 原子写留下的临时文件长这样:`.<原名>.<pid>.<序号>.tmp`。 */
+export const TMP_RE = /^\.(.+)\.\d+\.\d+\.tmp$/
+
+/**
+ * 扫掉原子写留下的临时文件 —— **先抢救,确认没用了才删**。
+ *
+ * ## 为什么不能直接删
+ *
+ * `writeFileAtomic` 是「写临时文件 → rename 盖上去」。进程被 SIGKILL 打断在**这两步
+ * 之间**时,那个 `.tmp` 里是一份**完整的、比 node.md 更新的**内容 —— 它是刚跑完那一关
+ * 的结果,只差最后一次 rename。直接删掉,就是亲手扔掉这个功能存在的理由。
+ *
+ * (被打断在**写的中途**时,`.tmp` 是半截的 —— 那种解析不出来,才该删。两种情况在
+ * 文件名上完全一样,只能靠解析来分。)
+ *
+ * ## 判据
+ *
+ *  1. 目标文件不在 / 解析不出来,而 `.tmp` 解析得出来 → **抢救**(rename 回去);
+ *  2. 两边都解析得出来,`.tmp` 的 `updatedAt` 更新 → **抢救**;
+ *  3. 其余(半截的、更旧的、不是 node.md 的)→ 删。
+ *
+ * ## 为什么是独立函数,不塞进 `loadRun`
+ *
+ * `loadRun` 也被 `runRegistry.listRuns` 拿去列**别人的** run,而那些 run 可能**正在跑**——
+ * 那时目录里的 `.tmp` 属于一个活着的进程,删掉它等于在另一个进程的写入路径上下手。
+ * 这个函数只从恢复那条路调用,而那条路**已经拿到了独占的 run 锁**。
+ */
+export async function sweepTempFiles(
+  fs: FsLike, runDir: string,
+): Promise<{ recovered: { path: string; from: string }[]; deleted: string[] }> {
+  const recovered: { path: string; from: string }[] = []
+  const deleted: string[] = []
+  const parseOrNull = async (p: string): Promise<TaskNode | null> => {
+    try { return parseNodeFile(await fs.readFile(p)) } catch { return null }
+  }
+  async function walk(dir: string): Promise<void> {
+    let entries: string[]
+    try { entries = await fs.readdir(dir) } catch { return }
+    for (const name of entries) {
+      const m = TMP_RE.exec(name)
+      if (!m) {
+        if (name !== 'node.md' && !name.endsWith('.jsonl') && name !== 'run.md') await walk(`${dir}/${name}`)
+        continue
+      }
+      const tmpPath = `${dir}/${name}`
+      const target = `${dir}/${m[1]}`
+      // 只对 node.md 做抢救:run.md 的 tmp 同样可能是完整的,但 run.md 是**整棵树的快照**,
+      // 一份来自崩溃前的快照会把已经变化的树写回去。它由下一次 queueManifest 完整重写,
+      // 没有任何东西需要从 tmp 里救。
+      if (m[1] !== 'node.md') {
+        try { await fs.unlink(tmpPath); deleted.push(tmpPath) } catch { /* 删不掉就留着,无害 */ }
+        continue
+      }
+      const fromTmp = await parseOrNull(tmpPath)
+      if (!fromTmp) {
+        // 半截的 —— 这才是真正的垃圾。
+        try { await fs.unlink(tmpPath); deleted.push(tmpPath) } catch { /* 同上 */ }
+        continue
+      }
+      const cur = await parseOrNull(target)
+      const newer = cur === null
+        || typeof cur.updatedAt !== 'string'
+        || (typeof fromTmp.updatedAt === 'string' && fromTmp.updatedAt > cur.updatedAt)
+      if (!newer) {
+        try { await fs.unlink(tmpPath); deleted.push(tmpPath) } catch { /* 同上 */ }
+        continue
+      }
+      try {
+        await fs.rename(tmpPath, target)
+        recovered.push({ path: target, from: tmpPath })
+      } catch { /* 抢救失败就原样留着 —— 留着一份完整数据永远好过删掉它 */ }
+    }
+  }
+  await walk(runDir)
+  return { recovered, deleted }
 }
 
 export async function readNode(fs: FsLike, runDir: string, nodeId: string): Promise<TaskNode> {
@@ -398,41 +648,97 @@ export async function readNode(fs: FsLike, runDir: string, nodeId: string): Prom
  * `node.md` is exactly what a crash leaves behind — so losing every successfully
  * recovered node because one sibling is truncated would defeat the purpose. Failures
  * are returned in `errors` for the caller to surface; they are not swallowed silently.
+ *
+ * **解析失败先试抢救,再谈丢弃。** 「记一条 error 然后把节点丢掉」曾经是这里的全部行为,
+ * 而它的代价不是「少一份正文」,是**这个节点从树上消失** —— 父节点的 childIds 里还留着
+ * 它,`validateLoadedNodes` 把父节点判成「子节点缺失」并永久阻断。用户看到的是:
+ * 一个 BLOCKED 的父任务,底下三个子任务全绿,没有任何一处解释得了为什么。
+ * 抢救回来的节点进 `salvaged`,由调用方**当着用户的面**说出来 —— 它丢了正文,
+ * 而正文里有方案全文和验收记录。
  */
 export async function loadRun(
   fs: FsLike,
   runDir: string,
-): Promise<{ nodes: TaskNode[]; errors: { path: string; message: string }[] }> {
+): Promise<{
+  nodes: TaskNode[]
+  errors: { path: string; message: string }[]
+  salvaged: SalvageRecord[]
+}> {
   const nodes: TaskNode[] = []
   const errors: { path: string; message: string }[] = []
+  const salvaged: SalvageRecord[] = []
   async function walk(dir: string): Promise<void> {
     let entries: string[]
     try { entries = await fs.readdir(dir) } catch { return } // not a dir (e.g. a file) → skip
+    /**
+     * **`node.md` 整个不在,但状态账还在。**
+     *
+     * 这是「子任务信息不能丢」最硬的那一档:一个节点的第一次落盘就失败(磁盘满,
+     * 原子写不留半成品),或者 node.md 事后被删/被清空 —— 目录里只剩 `state.jsonl`。
+     * 走到下面那个循环时没有一个 name 等于 'node.md',这个目录会被当成「不是节点」
+     * 递归下去,节点连同它的名字一起消失。
+     *
+     * 而账的第一条记录是全量快照,带着 `id` / `title` / `parentId` —— 名字和归属都在。
+     * 这正是用户说的「可以只是子任务名称或 ID,详细信息存在别处」。
+     */
+    if (!entries.includes('node.md') && entries.includes(NODE_JOURNAL_NAME)) {
+      const fromDir = dir.slice(runDir.length + 1)
+      const j = fromDir.length > 0 ? await readNodeJournal(fs, runDir, fromDir) : undefined
+      const merged = mergeSalvage(undefined, j?.node, fromDir)
+      if (merged) {
+        salvaged.push({
+          path: `${dir}/${NODE_JOURNAL_NAME}`, id: merged.id, droppedLines: 0,
+          from: '账', journalRecords: j?.records ?? 0,
+        })
+        nodes.push(merged)
+      }
+    }
     for (const name of entries) {
       const path = `${dir}/${name}`
       if (name === 'node.md') {
+        const fromDir = dir.slice(runDir.length + 1)
+        let node: TaskNode
         try {
-          const node = parseNodeFile(await fs.readFile(path))
-          // 路径即 id (spec §5): "node.md frontmatter 的 id 与其磁盘路径一致(路径即 id)".
-          // Nothing checked it, so a hand-edited or mis-copied id silently detached the node
-          // from its own directory — every later writeNode would then create a SECOND
-          // directory and the original would be read back again on the next resume.
-          const fromPath = dir.slice(runDir.length + 1)
-          if (fromPath.length > 0 && node.id !== fromPath) {
-            errors.push({ path, message: `frontmatter 的 id (${node.id}) 与所在目录 (${fromPath}) 不一致,已按目录为准` })
-            node.id = fromPath
-          }
-          nodes.push(node)
+          node = parseNodeFile(await fs.readFile(path))
         } catch (e) {
-          errors.push({ path, message: e instanceof Error ? e.message : String(e) })
+          // 解析不了 ≠ 这个节点不存在。两条抢救路,按可靠度排:
+          //  1. `state.jsonl` —— 只增不改,记的是每一关**提交过**的结果与状态,最可信;
+          //  2. 半截 node.md 的 frontmatter 前缀 —— 能救回身份,但正文之后的字段没了。
+          // 丢掉这个节点会让父节点永久阻断在「子节点缺失」上(见函数头)。
+          const j = fromDir.length > 0 ? await readNodeJournal(fs, runDir, fromDir) : undefined
+          let text: string | undefined
+          try { text = await fs.readFile(path) } catch { /* 连读都读不了,只能靠账 */ }
+          const rescued = text === undefined ? null : salvageNodeFile(text)
+          // 两边都有就**账压在前缀上**:前缀停在被砍断的那一刻,账走到最后一次提交。
+          const merged = mergeSalvage(rescued?.node, j?.node, fromDir)
+          if (!merged) {
+            errors.push({ path, message: e instanceof Error ? e.message : String(e) })
+            continue
+          }
+          salvaged.push({
+            path, id: merged.id,
+            droppedLines: rescued?.droppedLines ?? 0,
+            from: rescued && j?.node ? '账 + 残骸' : j?.node ? '账' : '残骸',
+            journalRecords: j?.records ?? 0,
+          })
+          node = merged
         }
+        // 路径即 id (spec §5): "node.md frontmatter 的 id 与其磁盘路径一致(路径即 id)".
+        // Nothing checked it, so a hand-edited or mis-copied id silently detached the node
+        // from its own directory — every later writeNode would then create a SECOND
+        // directory and the original would be read back again on the next resume.
+        if (fromDir.length > 0 && node.id !== fromDir) {
+          errors.push({ path, message: `frontmatter 的 id (${node.id}) 与所在目录 (${fromDir}) 不一致,已按目录为准` })
+          node.id = fromDir
+        }
+        nodes.push(node)
       } else {
         await walk(path) // recurse into child node dirs; non-dirs (run.md) readdir-throw and skip
       }
     }
   }
   await walk(runDir)
-  return { nodes, errors }
+  return { nodes, errors, salvaged }
 }
 
 /**
@@ -576,5 +882,7 @@ export async function writeRunManifest(
     ...(result ? { status: result.status, reason: result.reason ?? '' } : {}),
   })}---\n\n`
   await fs.mkdir(runDir)
-  await fs.writeFile(`${runDir}/run.md`, header + renderTreeSnapshot(nodes))
+  // 原子写,理由和 node.md 一样 —— run.md 是 `--resume` 读并发度、名册、caps、待收口
+  // 记录的唯一来源,半截的 frontmatter 会让整个 run 恢复不出来(而不是丢一个节点)。
+  await writeFileAtomic(fs, `${runDir}/run.md`, header + renderTreeSnapshot(nodes))
 }

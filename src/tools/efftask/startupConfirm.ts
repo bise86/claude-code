@@ -692,6 +692,15 @@ export interface ResumeSummary {
   degraded: string[]
   /** loadRun: node files that could not be parsed. */
   loadErrors: string[]
+  /**
+   * loadRun: 被**抢救**回来的半截 node.md —— 节点还在,正文没了。
+   *
+   * 和 `loadErrors` 分开,因为要用户做的事完全不同:loadErrors 说的是「这个文件我读不了」,
+   * 而这一条说的是「这个节点回来了,但它的方案全文/质疑修复记录/验收记录已经丢了」。
+   * 并进 loadErrors 会让一句「有问题」同时代表两种结局,而抢救成功恰恰是**不需要用户
+   * 做任何事**的那一种。
+   */
+  salvaged?: string[]
   /** Guidance carried over from a previous resume, when this invocation supplied none. */
   inheritedGuidance?: string
 }
@@ -729,6 +738,19 @@ export function resumeSummarySections(s: ResumeSummary): SummarySection[] {
     // those files read perfectly well. One heading for two different facts sent users looking
     // for a corrupt file that is not corrupt.
     out.push({ heading: `${s.loadErrors.length} 个节点文件有问题(无法读取或 id 与目录不符)`, lines: s.loadErrors.slice(0, 5).map(l => clip(l, 100)), tone: 'warn' })
+  }
+  if (s.salvaged && s.salvaged.length > 0) {
+    /**
+     * 截断的 `>` 那一行**写在 heading 里**,不在被截断的 lines 里 —— lines 只印前 5 条,
+     * 第 6 条起的「还有几个」如果也放进 lines,它自己就是第 6 条,一个字都印不出来。
+     * 这个仓库为同一件事付过学费(见 truncation-notice-must-outlive-the-truncation)。
+     */
+    const extra = s.salvaged.length > 5 ? `,以下只列前 5 个` : ''
+    out.push({
+      heading: `抢救回 ${s.salvaged.length} 个被写坏的节点文件(节点已恢复,但方案全文与判决记录已丢失)${extra}`,
+      lines: s.salvaged.slice(0, 5).map(l => clip(l, 100)),
+      tone: 'warn',
+    })
   }
   if (s.degraded.length > 0) {
     out.push({ heading: '配置未能完整恢复', lines: s.degraded.map(l => clip(l, 100)), tone: 'warn' })

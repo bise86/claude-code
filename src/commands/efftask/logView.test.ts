@@ -236,7 +236,9 @@ describe('renderStreamLines', () => {
     const ls = render({ streams: [], historical: true, width: 60 })
     const all = plain(ls).join('')
     expect(all).toContain('上一次运行')
-    expect(all).toContain('不落盘')
+    // 措辞跟着事实改过:事件流现在**是**落盘的(agent-log.jsonl)。走到这一行只剩
+    // 「盘上没有」这一种情况,而旧文案「不落盘」现在是假话。
+    expect(all).toContain('盘上没有留下它的事件日志')
   })
 
   it('历史节点一旦有了新流,就按正常窗口渲染', () => {

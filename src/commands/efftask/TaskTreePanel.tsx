@@ -260,6 +260,8 @@ export function TaskTreePanel(props: {
    * 给了才有这个键 —— 共享工作树运行时没有池子,也就没有任何东西可合。
    */
   onMergeWorktrees?: (node: TaskNode) => void
+  /** 详情页 `g`:修复一个损毁的任务文件(账 + 残骸 + 主模型协助)。 */
+  onRepairNode?: (node: TaskNode) => void
   /**
    * 运行中的人工干预。给了才有 p / i / x 三个键。
    *
@@ -328,6 +330,20 @@ export function TaskTreePanel(props: {
    * 永远先跑,在 NodeDetail 里调 stopImmediatePropagation 已经来不及了。
    */
   const detailZone = React.useRef<DetailZone>('content')
+  /**
+   * 打开某个节点的详情页时,把它**上一次运行**的输出从盘上读回来。
+   *
+   * 按需 —— 只读正在看的这一个节点。全量读的代价在真实运行上是实打实的:用户跑机上
+   * 一个 run 有 900+ 个节点,启动时全读一遍既拖慢恢复,又会在读完的瞬间顶满
+   * `MAX_TOTAL_EVENTS`,然后全局淘汰开始压**用户此刻正在看的**那条流。
+   *
+   * `hydrate` 自己带幂等(读过的节点不再读),所以这里不必去重;`streams` 是活存储,
+   * 读回来之后由它自己 `notify()` 触发重绘。
+   */
+  React.useEffect(() => {
+    if (detailId === null) return
+    void props.streams?.hydrate(detailId)
+  }, [detailId, props.streams])
   /** 页脚按键提示翻到第几页。`?` 键 +1,`paginateHints` 自己取模。 */
   const [hintPage, setHintPage] = React.useState(0)
   /**
@@ -464,6 +480,15 @@ export function TaskTreePanel(props: {
       // 手动把这棵子树里还没合进主干的工作区合掉。和 `c` 同一条规矩:关口自己会先扫一遍
       // 再让用户确认,所以这里不判「有没有东西可合」—— 那需要跑 git,而按键处理里不能等。
       if (plain && k === 'm' && props.onMergeWorktrees) { setDetailId(null); props.onMergeWorktrees(detail); return }
+      /**
+       * 修复损毁的任务文件。和 `c`/`m` 同一条规矩:关口自己先读盘扫一遍再让用户确认,
+       * 所以这里不判「坏没坏」—— 那要读文件,而按键处理里不能等。
+       *
+       * **`g` 没有助记意义,是因为有意义的字母全被占了**(s 跳过 / f 强制 / r 重做 /
+       * c 清理 / m 合并 / d 依赖 / p 暂停 / i 追加 / x 取消 / n 换流 / t 思考 / q 退出)。
+       * 含义靠页脚那行提示承载,而不是靠字母本身。
+       */
+      if (plain && k === 'g' && props.onRepairNode) { setDetailId(null); props.onRepairNode(detail); return }
       // 依赖重算。**被拒时不清 detailId** —— 那是它最常见的结局,而被拒的语义是
       // 「什么都没发生」。拒绝理由渲染在详情页自己那一段里(见 onRecalcDeps)。
       if (plain && k === 'd' && props.onRecalcDeps) {
@@ -600,6 +625,7 @@ export function TaskTreePanel(props: {
         // 同上,也**不看节点状态**:范围是整棵子树里还没合入集成分支的那些,而父节点自己
         // 有没有工作区、是什么状态都不决定这件事。真正的范围由关口扫盘算出来。
         canMergeWorktrees={props.onMergeWorktrees !== undefined}
+        canRepairNode={props.onRepairNode !== undefined}
         // 判据形状抄上面 canRedoFailed 那一条:回调给了 **且** 这个节点此刻真的能按。
         /**
    * 判据必须是**真的准入**,不是 `status === 'CREATED'`。

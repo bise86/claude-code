@@ -32,12 +32,17 @@ function fakeFs(over: Partial<FsLike> = {}): { fs: FsLike; log: string[] } {
   const files = new Set<string>(['root/node.md', 'root/00-a/node.md'].map(p => `/run/${p}`))
   const fs: FsLike = {
     async readFile(p) { log.push(`read ${p}`); return '' },
-    async writeFile(p) { log.push(`write ${p}`); files.add(p) },
+    // 落盘现在走「写临时文件 → rename 盖上去」(writeFileAtomic)。日志记在 **rename**
+    // 那一刻:那才是这个文件对读者可见的时刻,顺序断言问的也正是这件事。临时文件本身
+    // 不进日志,否则每一次写都变成两行、而其中一行的名字里带着 pid。
+    async writeFile(p) { if (!p.endsWith('.tmp')) log.push(`write ${p}`); files.add(p) },
+    async appendFile(p) { files.add(p) },
+    async rename(a, b) { log.push(`write ${b}`); files.delete(a); files.add(b) },
     async mkdir(p) { log.push(`mkdir ${p}`) },
     async readdir() { return [] },
     async exists(p) { return files.has(p) },
     async mkdirExclusive() { return true },
-    async unlink(p) { log.push(`unlink ${p}`); files.delete(p) },
+    async unlink(p) { if (!p.endsWith('.tmp')) log.push(`unlink ${p}`); files.delete(p) },
     async rmdir(p) { log.push(`rmdir ${p}`) },
     ...over,
   }
@@ -137,7 +142,7 @@ describe('commitRedo 报出来的问题', () => {
   it('写不下去的节点也要上屏 —— 否则这次重做下次恢复时整个消失', async () => {
     const before = TREE()
     const plan = ok(planRedo(before, 'root/00-a', 'execute', 'T1'))
-    const { fs } = fakeFs({ async writeFile(p) { if (p.endsWith('node.md')) throw new Error('ENOSPC') } })
+    const { fs } = fakeFs({ async writeFile(p) { if (p.includes('node.md')) throw new Error('ENOSPC') } })
     const { problems } = await commitRedo({ fs, runDir: '/run', config: CONFIG, before }, plan)
     expect(problems.join()).toContain('下次恢复会读到旧状态')
   })
@@ -145,7 +150,7 @@ describe('commitRedo 报出来的问题', () => {
   it('删了子树但父节点写不回去:必须说清盘上现在是什么样', async () => {
     const before = TREE()
     const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
-    const { fs } = fakeFs({ async writeFile(p: string) { if (p.endsWith('node.md')) throw new Error('ENOSPC') } })
+    const { fs } = fakeFs({ async writeFile(p: string) { if (p.includes('node.md')) throw new Error('ENOSPC') } })
     const { problems } = await commitRedo({ fs, runDir: '/run', config: CONFIG, before }, plan)
     // 「读到旧状态」这句话在删过子树的情况下是**不完整**的,而不完整的那部分要命:
     // 盘上留着一个 childIds 指向一批不存在节点的父节点,下次 --resume 会以
@@ -157,7 +162,7 @@ describe('commitRedo 报出来的问题', () => {
   it('没删过子树时不说那句 —— 别吓唬人', async () => {
     const before = TREE()
     const plan = ok(planRedo(before, 'root/00-a', 'execute', 'T1'))
-    const { fs } = fakeFs({ async writeFile(p: string) { if (p.endsWith('node.md')) throw new Error('ENOSPC') } })
+    const { fs } = fakeFs({ async writeFile(p: string) { if (p.includes('node.md')) throw new Error('ENOSPC') } })
     const { problems } = await commitRedo({ fs, runDir: '/run', config: CONFIG, before }, plan)
     expect(problems.join()).not.toContain('子节点缺失')
   })
@@ -210,7 +215,7 @@ describe('commitRedo 报出来的问题', () => {
     const plan = ok(planRedo(before, 'root/00-a', 'execute', 'T1'))
     const errs: Error[] = []
     const { fs } = fakeFs({
-      async writeFile(p) { if (p.endsWith('run.md')) throw new Error('run.md 写不动') },
+      async writeFile(p) { if (p.includes('run.md')) throw new Error('run.md 写不动') },
     })
     const { problems } = await commitRedo(
       { fs, runDir: '/run', config: CONFIG, before, onError: e => errs.push(e) }, plan,

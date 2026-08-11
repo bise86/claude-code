@@ -192,10 +192,46 @@ export interface StreamStore {
   dropNodes(nodeIds: readonly string[]): number
   /** 仅供测试与断言:当前保存的事件总数。 */
   totalEvents(): number
+  /**
+   * 把这个节点**上一次运行**的事件流从盘上读回来(`agent-log.jsonl`)。
+   *
+   * 按需调用 —— 由详情页在打开某个节点的那一刻触发,不在 `--resume` 时全量读。
+   * 用户跑机上一个 run 有 900+ 个节点,全量读回既会拖住启动,又会在读完的瞬间把
+   * `MAX_TOTAL_EVENTS` 顶满,然后 `enforceGlobal` 开始压**正在被看的**那条流的墓碑。
+   *
+   * 返回读回来的流数。已经有流(内存里正在跑,或者已经读过一次)就不读,返回 0 ——
+   * 重复读会把同一条调用在详情页上显示两遍。
+   */
+  hydrate(nodeId: string): Promise<number>
 }
 
-export function createStreamStore(opts?: { now?: () => number }): StreamStore {
+/**
+ * 事件流的**落盘出口**。三件事各一个口子,对应 agent-log.jsonl 的三种记录。
+ *
+ * 全部是**同步、不抛**的:调用点在 `push`/`open`/`end` 的热路径上,一个异常会把这次
+ * 模型调用的输出整段带走,而这条落盘链路按定义只是「锦上添花」。真正的写盘由实现自己
+ * 攒着批量做(见 createAgentLogWriter)。
+ */
+export interface StreamSink {
+  opened(nodeId: string, seq: number, meta: StreamMeta, at: number): void
+  event(nodeId: string, seq: number, e: AgentEvent): void
+  closed(nodeId: string, seq: number, at: number, err?: string): void
+}
+
+/** 从盘上读回历史流。注入进来而不是直接 import,是为了让存储层不依赖 fs。 */
+export type StreamLoader = (nodeId: string) => Promise<StreamState[] | undefined>
+
+export function createStreamStore(opts?: {
+  now?: () => number
+  /** 落盘出口。缺省 = 不落盘(老行为),所有既有用例逐字不变。 */
+  sink?: StreamSink
+  /** 从盘上读回历史。缺省 = `hydrate` 恒返回 0。 */
+  load?: StreamLoader
+}): StreamStore {
   const now = opts?.now ?? (() => Date.now())
+  const sink = opts?.sink
+  /** 已经读过盘的节点 —— 读第二次会让同一条调用在详情页上出现两遍。 */
+  const hydrated = new Set<string>()
   const byNode = new Map<string, StreamState[]>()
   const droppedByNode = new Map<string, number>()
   const historical = new Set<string>()
@@ -307,6 +343,9 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
       const list = byNode.get(meta.nodeId)
       if (list) list.push(state)
       else byNode.set(meta.nodeId, [state])
+      // 表头**先落盘**。没有 open 这一行,后面的事件行读回来是「不知道是谁、哪一关」的
+      // 孤儿,parseAgentLog 只能把它们整段丢掉(见那里的注释)。
+      sink?.opened(meta.nodeId, state.seq, meta, state.startedAt)
       enforcePerNode(meta.nodeId)
       notify()
       return {
@@ -354,6 +393,14 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
             }
             return e
           })()
+          /**
+           * **落盘发生在环形缓冲之前。**
+           *
+           * 内存里那几条上限(单流 100 / 单节点 40 条流 / 全局 20000)存在的理由是
+           * 「界面只显示这么多」,而盘上那份存在的理由恰恰相反 —— 它就是给人**回头翻**
+           * 被挤掉的那些用的。放在淘汰之后落盘,等于把这个功能做成了内存那份的复印件。
+           */
+          sink?.event(state.meta.nodeId, state.seq, ev)
           // **换引用,不原地 push。** chunkBuffer 每次都造新数组,所以 React.memo /
           // useMemo([streams]) 能看见变化。原地追加的话数组引用永不变,一个 memo 过的窗口
           // 会永远停在第一帧。
@@ -400,6 +447,7 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
           state.closed = true
           state.endedAt = now()
           if (err) state.error = err
+          sink?.closed(state.meta.nodeId, state.seq, state.endedAt, err)
           closedQueue.push(state)
           enforceGlobal()
           notify()
@@ -452,5 +500,40 @@ export function createStreamStore(opts?: { now?: () => number }): StreamStore {
       return dropped
     },
     totalEvents: () => total,
+    async hydrate(nodeId) {
+      const load = opts?.load
+      if (!load) return 0
+      if (hydrated.has(nodeId)) return 0
+      /**
+       * 标记**在 await 之前**。详情页的打开会连着触发两次(挂载 + 订阅回调),
+       * 两次都在 await 上排队的话,同一份日志会被读回来两遍、追加成两组重复的流。
+       */
+      hydrated.add(nodeId)
+      let loaded: StreamState[] | undefined
+      try {
+        loaded = await load(nodeId)
+      } catch {
+        // 读不了就当没有历史。这一路是「锦上添花」,不该让详情页打不开。
+        return 0
+      }
+      if (!loaded || loaded.length === 0) return 0
+      /**
+       * **只在这个节点当前没有任何流时才灌进去。**
+       *
+       * 它可能在读盘这段时间里被重新跑起来了(用户按 r 重做,或者恢复之后调度到它)——
+       * 那时内存里那几条是**正在发生**的,而盘上这些是上一次的。混在一起会让详情页把
+       * 两次运行的调用排成一列,而且旧的排在前面看起来像「这一轮先干了这些」。
+       */
+      if ((byNode.get(nodeId) ?? []).length > 0) return 0
+      // 读回来的一律是历史:seq 用负数排在任何新流之前,且不与 seqCounter 撞车。
+      const restored = loaded.map((s, i) => ({ ...s, closed: true, seq: -loaded!.length + i }))
+      byNode.set(nodeId, restored)
+      // **不进 total,也不进 closedQueue。** 那两个是内存上限的记账,而这批是用户
+      // 此刻正在看的东西 —— 进了 closedQueue 就会被下一次 enforceGlobal 压成墓碑,
+      // 用户打开详情页看到的就是三行「最新: …」。它们的量由「一次只读一个节点」兜住。
+      historical.delete(nodeId) // 有真实历史了,不必再显示那句「上一次运行的输出看不到」
+      notify()
+      return restored.length
+    },
   }
 }

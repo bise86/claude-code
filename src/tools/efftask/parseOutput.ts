@@ -11,7 +11,7 @@ import type { NodeKind, NodePlan, Verdict } from './types.js'
  * recency both mis-select it, silently turning a fail into a pass. The tag is what
  * actually separates answer from quotation.
  */
-export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec', score: 'score', deps: 'deps' } as const
+export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec', score: 'score', deps: 'deps', repair: 'repair' } as const
 export type AnswerTag = (typeof ANSWER_TAGS)[keyof typeof ANSWER_TAGS]
 
 /**
@@ -716,4 +716,30 @@ export function parseScoreOutput(
     plan: { score: clamp(planO.score), rationale: str(planO.rationale) },
     exec: { score: clamp(execO.score), rationale: str(execO.rationale) },
   }
+}
+
+/**
+ * 节点修复的回答(详情页 `g` 键)。
+ *
+ * **`requireTag: true`**,和 `parseDepsRecalc` / `parseNewChildren` 同级同因,而且这里
+ * 更硬:提示词会把**损坏文件的原文**整段铺进去,而那段原文里本来就有这个节点上一版的
+ * 方案 JSON。宽松的 pick 会把那块旧内容当成本轮回答捡回来 —— 于是「修复」的结果是把
+ * 坏掉之前的半份数据原样抄回去,而屏幕上写着模型帮你恢复好了。
+ *
+ * 返回原始对象而不是收好的补丁:白名单、空值、以及「盘上已有真值就不采纳」那三条
+ * 判据全在 `nodeRepair.sanitizeRepair` 里,那里才看得见节点此刻的样子。
+ */
+export function parseRepair(text: string, tag: string): {
+  answer: Record<string, unknown> | null
+  ambiguous: boolean
+  broken: boolean
+} {
+  const { obj, ambiguous } = pickAnswer(
+    text, tag,
+    // 形状判据:至少带一个可修复的键。少了它,一个 `{}` 会被当成一次成功的修复,
+    // 而屏幕上会说「已恢复」——实际上一个字段都没补。
+    o => ['title', 'goal', 'kind', 'solution', 'acceptance'].some(k => typeof o[k] === 'string'),
+    true,
+  )
+  return { answer: obj, ambiguous, broken: taggedBlockBroken(text, tag) }
 }

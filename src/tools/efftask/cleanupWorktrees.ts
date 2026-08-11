@@ -1,4 +1,5 @@
 import { descendantsOf } from './redo.js'
+import { AGENT_LOG_NAME } from './agentLog.js'
 import { writeNode, type FsLike } from './persistence.js'
 import type { TaskNode } from './types.js'
 
@@ -35,11 +36,22 @@ import type { TaskNode } from './types.js'
  *  - **不碰集成工作区**(`.efftask-worktrees/integration`):收口、集成验收、之后每一次
  *    逐任务合并都在它里面发生,而 `init()` 下次运行还会复用它。
  *
- * ## 不删任务记录
+ * ## 不删任务记录 —— 只有**一个**例外,而且是被点名要求的
  *
- * 用户原话:「不要误删除任务状态等数据。」这个模块**只调 git**,`.claude/efftask/<runId>/`
- * 下的 run.md / node.md 一个字节都不动 —— 状态、评审记录、验收记录、日志原样留着。
- * 唯一写回 node.md 的是 `worktree` 那个引用本身(见 `runCleanup`),而那是为了让记录
+ * 用户原话(第一轮):「不要误删除任务状态等数据。」用户原话(本轮):「绝对不能删除任务的
+ * 基本信息和状态,以及各阶段结果状态。」
+ *
+ * 所以这里删的东西**只有一样**:`agent-log.jsonl` —— 子 agent 的事件流,也就是用户
+ * 自己划成「日志这些可丢」的那一份。它是占地大头(单节点最多 8 MB)。
+ *
+ * **`node.md` 和 `state.jsonl` 一个字节都不碰**,这条不是保守,是判据:
+ *  - `node.md` 是任务的基本信息、状态、各阶段结果;
+ *  - `state.jsonl` 是它们的**第二条恢复路径**(只增不改的状态账)。而这个键的作用范围
+ *    恰恰是 `ACCEPTED` 节点 —— 一个已验收节点的状态是最不能出错的那种:它丢了,
+ *    父任务的收口、集成分支的推进全都建立在一个查不回来的「已完成」上。
+ *    为了腾几 MB 把第二条恢复路径拆掉,是拿这一整轮 bug 的病根去换空间。
+ *
+ * 唯一写回 node.md 的仍然只有 `worktree` 那个引用本身(见 `runCleanup`),那是为了让记录
  * 别指着一个已经不存在的目录。
  */
 
@@ -99,6 +111,18 @@ export interface CleanupPlan {
   totalKb: number
   /** 占用是不是**每一个**都量到了。有一个量不到就为 false,屏幕上要说出来。 */
   sizeKnown: boolean
+  /**
+   * 会被删掉的**事件日志**(`agent-log.jsonl`)。
+   *
+   * 和 `items` 是**两份名单,不是一份** —— 范围不一样:工作区那份要求盘上真有那个目录
+   * (`absent` 的节点整个跳过),而日志和工作区没关系,一个早就被清过工作区的节点
+   * 照样留着几 MB 日志。挂在 items 上会正好漏掉最该清的那批。
+   */
+  logs: { nodeId: string; title: string; kb?: number }[]
+  /** 事件日志合计,KB。 */
+  logKb: number
+  /** 日志占用是不是每一个都量到了。 */
+  logSizeKnown: boolean
 }
 
 export interface CleanupOutcome {
@@ -106,6 +130,9 @@ export interface CleanupOutcome {
   failed: { nodeId: string; title: string; path: string; why: string }[]
   /** 删掉了工作区、但别的地方没做干净(分支没删掉、记录没写回)。每一条都要上屏。 */
   problems: string[]
+  /** 真的被删掉的事件日志数,以及它们腾出来的 KB。 */
+  logsRemoved: number
+  logsFreedKb: number
   freedKb: number
   sizeKnown: boolean
 }
@@ -200,7 +227,30 @@ export async function scanCleanup(
     })
   }
 
-  return { targetId, items, kept, unfinished, absent, totalKb, sizeKnown: sizeKnown && items.length > 0 }
+  /**
+   * 事件日志那一份名单。**走 `done` 全体,不走 `items`** —— 见 CleanupPlan.logs。
+   *
+   * 量不到大小就留 `undefined`,不编 0(`dirSizeKb` 那条注释的同一条规矩:那个数字
+   * 直接决定用户按不按下不可逆的确认)。`du -sk` 对普通文件一样有效,所以复用同一个接缝。
+   */
+  const logs: CleanupPlan['logs'] = []
+  let logKb = 0
+  let logSizeKnown = true
+  if (deps.persist) {
+    for (const node of done) {
+      const p = `${deps.persist.runDir}/${node.id}/${AGENT_LOG_NAME}`
+      if (!(await deps.persist.fs.exists(p))) continue
+      const kb = await deps.dirSizeKb?.(p)
+      if (kb === undefined) logSizeKnown = false
+      else logKb += kb
+      logs.push({ nodeId: node.id, title: node.title, ...(kb === undefined ? {} : { kb }) })
+    }
+  }
+  return {
+    targetId, items, kept, unfinished, absent, totalKb,
+    sizeKnown: sizeKnown && items.length > 0,
+    logs, logKb, logSizeKnown: logSizeKnown && logs.length > 0,
+  }
 }
 
 /**
@@ -274,7 +324,34 @@ export async function runCleanup(
     removed.push(item)
   }
 
-  return { removed, failed, problems, freedKb, sizeKnown: sizeKnown && removed.length > 0 }
+  /**
+   * 事件日志。**排在工作区之后**,而且删不掉只记一条 problem、不算失败 ——
+   * 一个删不掉的日志文件不影响这次回收的主要目的,而把它算成失败会让屏幕上那句
+   * 「回收了 N 个工作区」变成红的。
+   *
+   * **只删 `agent-log.jsonl`。** `node.md` 和 `state.jsonl` 不在这个循环里,也不该被
+   * 加进来 —— 见模块头「只有一个例外」那一节。
+   */
+  let logsRemoved = 0
+  let logsFreedKb = 0
+  if (deps.persist) {
+    for (const l of plan.logs) {
+      const p = `${deps.persist.runDir}/${l.nodeId}/${AGENT_LOG_NAME}`
+      try {
+        if (!(await deps.persist.fs.exists(p))) continue
+        await deps.persist.fs.unlink(p)
+        logsRemoved++
+        logsFreedKb += l.kb ?? 0
+      } catch (e) {
+        problems.push(`${l.title}:事件日志没删掉(${e instanceof Error ? e.message : String(e)})`)
+      }
+    }
+  }
+
+  return {
+    removed, failed, problems, freedKb, sizeKnown: sizeKnown && removed.length > 0,
+    logsRemoved, logsFreedKb,
+  }
 }
 
 /** KB → 人读的大小。量不到时给一个明确的「未知」,不给 0 —— 0 是一句假话。 */
@@ -314,7 +391,19 @@ export function cleanupLines(plan: CleanupPlan): string[] {
     out.push('⚠ 那些未提交内容(构建产物、未跟踪文件、已跟踪文件的改动)会被一并删掉,不可恢复。')
     out.push('  它们全部产生在这些任务通过验收**之后**——交付物本身早已合进集成分支,不在其中。')
   }
-  out.push('任务记录不受影响:run.md / node.md 里的状态、方案、评审与验收记录、耗时统计原样保留。')
+  /**
+   * 事件日志那一段。**必须自己占一行说出来** —— 这个键原来的承诺是「只动 git」,
+   * 现在它会删文件了,而静默删除和静默截断是这个仓库反复在修的同一类毛病。
+   */
+  if (plan.logs.length > 0) {
+    const lsize = plan.logSizeKnown
+      ? `,共 ${formatSize(plan.logKb)}`
+      : plan.logKb > 0 ? `,至少 ${formatSize(plan.logKb)}(有文件量不到大小)` : '(量不到大小)'
+    out.push(`并删除 ${plan.logs.length} 份子 agent 事件日志(agent-log.jsonl)${lsize} —— 只是历史输出记录。`)
+  }
+  // 措辞逐条点名,不说「任务记录不受影响」那种笼统话:现在**确实**有一样记录会被删,
+  // 而一句笼统的保证配上一次真实的删除,就是这一屏最坏的读法。
+  out.push('不会动的:node.md(基本信息、状态、方案、评审与验收记录)和 state.jsonl(状态账)一个字节都不碰。')
   if (plan.kept.length > 0) {
     out.push(`保留 ${plan.kept.length} 个:`)
     for (const k of plan.kept) out.push(`  · ${k.title}:${k.why}`)
@@ -344,6 +433,13 @@ export function cleanupResultLines(out: CleanupOutcome): string[] {
       ? `,腾出 ${formatSize(out.freedKb)}`
       : out.freedKb > 0 ? `,至少腾出 ${formatSize(out.freedKb)}` : ''
     lines.push(`已删除 ${out.removed.length} 个隔离工作区${size}。`)
+  }
+  /**
+   * 日志那一句**只在真的删过时才印**。`logsRemoved === 0` 时印「已删除 0 份」
+   * 读起来像一次成功的空操作 —— 和上面 removed 那条同一条规矩。
+   */
+  if (out.logsRemoved > 0) {
+    lines.push(`已删除 ${out.logsRemoved} 份事件日志${out.logsFreedKb > 0 ? `,腾出 ${formatSize(out.logsFreedKb)}` : ''}。`)
   }
   for (const f of out.failed) lines.push(`⚠ ${f.title} 没删掉:${f.why}`)
   for (const p of out.problems) lines.push(`⚠ ${p}`)

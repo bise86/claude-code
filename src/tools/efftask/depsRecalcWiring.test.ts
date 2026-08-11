@@ -235,7 +235,7 @@ describe('redoCommit 的悬空依赖诊断', () => {
           writeFile: async () => { throw new Error('磁盘满') },
           mkdir: async () => {}, readFile: async () => '', readdir: async () => [],
           exists: async () => true, mkdirExclusive: async () => true,
-          unlink: async () => {}, rmdir: async () => {},
+          unlink: async () => {}, rmdir: async () => {}, rename: async () => {}, appendFile: async () => {},
         } as never,
         runDir: '/run/001', config: cfg(), before,
       },

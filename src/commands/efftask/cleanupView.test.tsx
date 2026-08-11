@@ -73,6 +73,7 @@ const PLAN = (over: Partial<CleanupPlan> = {}): CleanupPlan => ({
     sizeKb: 3 * 1024 * 1024, leftovers: ['!! target/'], leftoverCount: 9,
   }],
   kept: [], unfinished: 1, absent: 0, totalKb: 3 * 1024 * 1024, sizeKnown: true,
+  logs: [], logKb: 0, logSizeKnown: false,
   ...over,
 })
 
@@ -156,7 +157,7 @@ describe('清理关口', () => {
       <ConfirmCleanup
         target={target}
         onScan={async () => PLAN()}
-        onRun={async () => ({ removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false })}
+        onRun={async () => ({ removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false, logsRemoved: 0, logsFreedKb: 0 })}
         onDone={() => {}} onCancel={() => {}}
       />,
     )
@@ -165,7 +166,10 @@ describe('清理关口', () => {
     app.unmount()
     expect(frame).toContain('3.0 GB')
     expect(frame).toContain('连带删除 9 项')
-    expect(frame).toContain('任务记录不受影响')
+    // 现在**确实**有一样东西会被删(agent-log.jsonl),所以这一屏不再给笼统保证,
+    // 而是逐条点名什么不会被动 —— 笼统保证配一次真实删除是最坏的读法。
+    expect(frame).toContain('node.md')
+    expect(frame).toContain('state.jsonl')
     // 还没验收的那个必须说清楚是「跳过」,不是被算进了删除。
     expect(frame).toContain('跳过 1 个')
     expect(frame).toContain('不可恢复')
@@ -179,7 +183,7 @@ describe('清理关口', () => {
       <ConfirmCleanup
         target={target}
         onScan={() => gate}
-        onRun={async () => { ran++; return { removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false } }}
+        onRun={async () => { ran++; return { removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false, logsRemoved: 0, logsFreedKb: 0 } }}
         onDone={() => {}} onCancel={() => {}}
       />,
     )
@@ -198,7 +202,7 @@ describe('清理关口', () => {
     const running = new Promise<CleanupOutcome>(res => {
       finish = () => res({
         removed: [{ nodeId: 'root/00-a', title: '甲', path: '/w/a', branch: 'b', sizeKb: 2048, leftovers: [], leftoverCount: 0 }],
-        failed: [], problems: [], freedKb: 2048, sizeKnown: true,
+        failed: [], problems: [], freedKb: 2048, sizeKnown: true, logsRemoved: 0, logsFreedKb: 0,
       })
     })
     const { t, app } = await mount(
@@ -230,7 +234,7 @@ describe('清理关口', () => {
       <ConfirmCleanup
         target={target}
         onScan={async () => PLAN({ items: [], totalKb: 0, sizeKnown: false, absent: 2 })}
-        onRun={async () => { ran++; return { removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false } }}
+        onRun={async () => { ran++; return { removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false, logsRemoved: 0, logsFreedKb: 0 } }}
         onDone={() => {}} onCancel={() => { cancelled++ }}
       />,
     )
@@ -248,7 +252,7 @@ describe('清理关口', () => {
       <ConfirmCleanup
         target={target}
         onScan={async () => { throw new Error('这一趟没有使用隔离工作区') }}
-        onRun={async () => ({ removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false })}
+        onRun={async () => ({ removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false, logsRemoved: 0, logsFreedKb: 0 })}
         onDone={() => {}} onCancel={() => {}}
       />,
     )
@@ -267,7 +271,7 @@ describe('清理关口', () => {
       <ConfirmCleanup
         target={target}
         onScan={async () => PLAN()}
-        onRun={async () => { ran++; return { removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false } }}
+        onRun={async () => { ran++; return { removed: [], failed: [], problems: [], freedKb: 0, sizeKnown: false, logsRemoved: 0, logsFreedKb: 0 } }}
         onDone={() => {}} onCancel={() => { cancelled++ }}
       />,
     )

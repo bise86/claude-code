@@ -2,6 +2,7 @@ import type { RunControl } from '../../tools/efftask/control.js'
 import { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import type { PipelineCtx } from '../../tools/efftask/pipeline.js'
 import { writeNode, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
+import { createNodeJournal } from '../../tools/efftask/nodeJournal.js'
 import type { EffTaskConfig, TaskNode } from '../../tools/efftask/types.js'
 import type { RunAgentFn } from '../../tools/efftask/roundtable.js'
 import { logError } from '../../utils/log.js'
@@ -51,6 +52,10 @@ export type Phase =
   // 模型调用**时才切到这一屏 —— 准入被拒时不切屏,理由渲染在详情页里(切屏会把任务树
   // 连同详情页整棵卸载,而「什么都没发生」不该长成「你的阅读位置没了」)。
   | 'confirmRecalc'
+  // 'confirmRepair' 是详情页的 `g` 键:把一个**磁盘文件被写坏**的任务恢复回来
+  // (状态账 → 残骸 → 主模型协助)。和 c/m 一样是岔路而不是运行阶段 —— 它不重启
+  // 编排、不动别的节点,只把这一个节点在盘上那份修好,所以确认完原样回到来时那一屏。
+  | 'confirmRepair'
 
 /**
  * Drive one run to completion and report it.
@@ -337,7 +342,14 @@ export async function runOrchestrator(
   }
   let liveNodes: TaskNode[] = []
   try {
-    const persist = (n: TaskNode) => writeNode(args.fs, args.runDir, n)
+    /**
+     * 状态账 —— 每个节点一份只增不改的 `state.jsonl`。**每个阶段的结果和状态都要落它。**
+     *
+     * 建在这里(整趟一个实例)而不是每次 persist 现建:它靠「上一次写进去的样子」算增量,
+     * 每次新建等于每次都写全量快照,一个跑几十关的节点会把这份账撑成几 MB。
+     */
+    const journal = createNodeJournal({ fs: args.fs, runDir: args.runDir })
+    const persist = (n: TaskNode) => writeNode(args.fs, args.runDir, n, journal)
     const now = () => new Date().toISOString()
     const orch = new EffTaskOrchestrator(
       args.config,

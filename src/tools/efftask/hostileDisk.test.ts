@@ -212,7 +212,7 @@ function diskWith(nodeMd: string, runMd = '---\ncreatedAt: x\ngoalPrompt: g\n---
   return {
     readFile: async p => { const v = files.get(p); if (v === undefined) throw new Error('ENOENT ' + p); return v },
     writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
-    unlink: async () => {}, rmdir: async () => {}, exists: async () => true,
+    unlink: async () => {}, rmdir: async () => {}, rename: async () => {}, appendFile: async () => {}, exists: async () => true,
     readdir: async d => {
       if (d === '/run') return ['run.md', 'root']
       if (d === '/run/root') return ['node.md']

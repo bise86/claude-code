@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, emptyPhaseRoles, DEFAULT_CAPS } from './types.js'
-import type { EffTaskConfig } from './types.js'
-import { FsLike, slugify, childId, allocateRunId, serializeNode, parseNodeFile, writeNode, readNode, loadRun, removeNodeDirs, writeRunManifest, renderTreeSnapshot } from './persistence.js'
+import type { EffTaskConfig, TaskNode } from './types.js'
+import { FsLike, salvageNodeFile, sweepTempFiles, writeFileAtomic, slugify, childId, allocateRunId, serializeNode, parseNodeFile, writeNode, readNode, loadRun, removeNodeDirs, writeRunManifest, renderTreeSnapshot } from './persistence.js'
 
 const NOW = '2026-07-25T00:00:00Z'
 function memFs(seed: Record<string, string> = {}): FsLike & { store: Map<string, string> } {
@@ -15,6 +15,13 @@ function memFs(seed: Record<string, string> = {}): FsLike & { store: Map<string,
     async mkdirExclusive(p) { if (dirs.has(p)) return false; dirs.add(p); return true },
     async unlink(p) { store.delete(p) },
     async rmdir(p) { dirs.delete(p) },
+    async appendFile(p, data) { store.set(p, (store.get(p) ?? '') + data) },
+    async rename(from, to) {
+      const v = store.get(from)
+      if (v === undefined) throw new Error('ENOENT ' + from)
+      store.set(to, v)
+      store.delete(from)
+    },
     async exists(p) { return store.has(p) || dirs.has(p) },
     async readdir(p) {
       const prefix = p.endsWith('/') ? p : p + '/'
@@ -302,7 +309,7 @@ describe('路径即 id (spec §5)', () => {
     const fs2 = {
       readFile: async (p: string) => { const v = files.get(p); if (v === undefined) throw new Error('ENOENT'); return v },
       writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
-      unlink: async () => {}, rmdir: async () => {}, exists: async () => true,
+      unlink: async () => {}, rmdir: async () => {}, rename: async () => {}, appendFile: async () => {}, exists: async () => true,
       readdir: async (d: string) => {
         if (d === '/run') return ['root']
         if (d === '/run/root') return ['01-right']
@@ -652,5 +659,251 @@ describe('修改建议要出现在 node.md 的正文里', () => {
     const body = md.slice(md.indexOf('## 质疑修复记录'))
     expect(body).toContain('修改建议')
     expect(body).toContain('把 repo 值改成 etcd')
+  })
+})
+
+/**
+ * 半截 node.md —— 用户跑机上的真实事故。
+ *
+ * 1224 个节点的 run 里 **43 个 node.md 被写成了半截**,每一个都断在 4096 的整数倍上
+ * (磁盘满时的短写就是按页断的)。旧行为是:解析失败 → 记一条 error → **把这个节点丢掉**。
+ * 于是父任务的 childIds 里写着 5 个孩子、树上只画得出 3 个,而父任务顶着一句
+ * 「子节点阻断」—— 那 3 个孩子全是 ACCEPTED,屏幕上没有任何一处解释得了为什么。
+ */
+describe('半截 node.md:原子写防住,抢救兜住', () => {
+  const nodeOf = (id: string, status: TaskNode['status'] = 'PLAN_REVIEW') => {
+    const n = createNode({ id, title: id.split('/').pop()!, parentId: id.includes('/') ? id.slice(0, id.lastIndexOf('/')) : null, deps: [], depth: id.split('/').length - 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    n.status = status
+    n.kind = 'executable'
+    // 方案正文要足够长,截断点才落得进 frontmatter 之后 —— 真实事故正是断在这里。
+    n.plan.solution = 'x'.repeat(20000)
+    return n
+  }
+
+  it('写盘写到一半失败时,盘上那个文件一个字节都没被动过', async () => {
+    const fs = memFs()
+    const good = nodeOf('root/01-a', 'ACCEPTED')
+    await writeNode(fs, '/eff/001', good)
+    const before = fs.store.get('/eff/001/root/01-a/node.md')!
+    expect(before.length).toBeGreaterThan(0)
+
+    // 磁盘满:写**临时文件**那一步失败。旧实现是直接往 node.md 上写,同样的失败会把
+    // 它截成半截;现在这一步碰不到 node.md。
+    const full: FsLike = {
+      ...fs,
+      async writeFile(p, data) {
+        if (p.endsWith('.tmp')) throw new Error('ENOSPC: no space left on device')
+        return fs.writeFile(p, data)
+      },
+    }
+    const changed = { ...good, plan: { ...good.plan, solution: 'y'.repeat(30000) } }
+    await expect(writeNode(full, '/eff/001', changed)).rejects.toThrow(/ENOSPC/)
+    // 关键断言:失败之后盘上还是**完整的旧版本**,不是新版本的前 N 个字节。
+    expect(fs.store.get('/eff/001/root/01-a/node.md')).toBe(before)
+    expect(parseNodeFile(fs.store.get('/eff/001/root/01-a/node.md')!).id).toBe('root/01-a')
+  })
+
+  it('写完临时文件、rename 失败时,也不留下半截 node.md,临时文件被清掉', async () => {
+    const fs = memFs()
+    await writeNode(fs, '/eff/001', nodeOf('root/01-a', 'ACCEPTED'))
+    const before = fs.store.get('/eff/001/root/01-a/node.md')!
+    const broken: FsLike = { ...fs, async rename() { throw new Error('EXDEV') } }
+    await expect(writeNode(broken, '/eff/001', nodeOf('root/01-a', 'ACCEPTED'))).rejects.toThrow(/EXDEV/)
+    expect(fs.store.get('/eff/001/root/01-a/node.md')).toBe(before)
+    expect([...fs.store.keys()].filter(k => k.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('writeFileAtomic 确实走的是「临时文件 + rename」,不是直接覆盖', async () => {
+    const fs = memFs()
+    const seen: string[] = []
+    const spy: FsLike = {
+      ...fs,
+      async writeFile(p, d) { seen.push(`write ${p}`); return fs.writeFile(p, d) },
+      async rename(a, b) { seen.push(`rename ${a} -> ${b}`); return fs.rename(a, b) },
+    }
+    await writeFileAtomic(spy, '/eff/001/run.md', 'hello')
+    // 顺序必须是「先写别的地方,再 rename 盖上去」。直接 write 目标路径 = 旧实现。
+    expect(seen).toHaveLength(2)
+    expect(seen[0]).toMatch(/^write \/eff\/001\/\.run\.md\..*\.tmp$/)
+    expect(seen[1]).toMatch(/^rename \/eff\/001\/\.run\.md\..*\.tmp -> \/eff\/001\/run\.md$/)
+    expect(fs.store.get('/eff/001/run.md')).toBe('hello')
+  })
+
+  it('临时文件不叫 node.md,所以 loadRun 不会把它当成一个节点读进来', async () => {
+    const fs = memFs()
+    await writeNode(fs, '/eff/001', nodeOf('root'))
+    // 模拟一次崩在 rename 之前的写:临时文件留在盘上。
+    fs.store.set('/eff/001/root/.node.md.999.0.tmp', fs.store.get('/eff/001/root/node.md')!)
+    const { nodes } = await loadRun(fs, '/eff/001')
+    expect(nodes.map(n => n.id)).toEqual(['root'])
+  })
+
+  it('抢救:半截文件不再让节点消失,身份与状态原样回来', async () => {
+    const fs = memFs()
+    const parent = nodeOf('root', 'WAITING_CHILDREN')
+    parent.kind = 'decompose'
+    parent.childIds = ['root/01-a', 'root/02-b']
+    const a = nodeOf('root/01-a', 'ACCEPTED')
+    const b = nodeOf('root/02-b', 'PLAN_REVIEW')
+    for (const n of [parent, a, b]) await writeNode(fs, '/eff/001', n)
+
+    // 真实事故的形状:按 4096 的整数倍砍断。
+    const full = fs.store.get('/eff/001/root/02-b/node.md')!
+    fs.store.set('/eff/001/root/02-b/node.md', full.slice(0, 8192))
+    expect(() => parseNodeFile(fs.store.get('/eff/001/root/02-b/node.md')!)).toThrow()
+
+    const { nodes, errors, salvaged } = await loadRun(fs, '/eff/001')
+    expect(errors).toEqual([])
+    expect(nodes.map(n => n.id).sort()).toEqual(['root', 'root/01-a', 'root/02-b'])
+    const back = nodes.find(n => n.id === 'root/02-b')!
+    expect(back.status).toBe('PLAN_REVIEW') // 状态是决定它要不要重跑的字段,必须是真的
+    expect(back.title).toBe('02-b')
+    expect(back.parentId).toBe('root')
+    expect(salvaged.map(s => s.id)).toEqual(['root/02-b'])
+  })
+
+  it('抢救后父节点看得见全部子节点 —— 不再「childIds 有 2 个、树上只有 1 个」', async () => {
+    const fs = memFs()
+    const parent = nodeOf('root', 'WAITING_CHILDREN')
+    parent.kind = 'decompose'
+    parent.childIds = ['root/01-a', 'root/02-b']
+    for (const n of [parent, nodeOf('root/01-a', 'ACCEPTED'), nodeOf('root/02-b')]) await writeNode(fs, '/eff/001', n)
+    fs.store.set('/eff/001/root/02-b/node.md', fs.store.get('/eff/001/root/02-b/node.md')!.slice(0, 4096))
+
+    const { nodes } = await loadRun(fs, '/eff/001')
+    const byId = new Map(nodes.map(n => [n.id, n]))
+    const p = byId.get('root')!
+    expect(p.childIds.filter(c => byId.has(c))).toEqual(p.childIds)
+  })
+
+  it('被砍断的最后半行一律扔掉 —— `status: ACCEP` 解析得出来,但那个值是编的', () => {
+    const n = nodeOf('root/01-a', 'CREATED')
+    const text = serializeNode(n)
+    // 砍在 status 那一行中间。
+    const at = text.indexOf('status: CREATED')
+    expect(at).toBeGreaterThan(0)
+    const cut = text.slice(0, at + 'status: CRE'.length) // 没有换行结尾 = 半行
+    const r = salvageNodeFile(cut)
+    expect(r).not.toBeNull()
+    expect(r!.node.id).toBe('root/01-a')
+    // 半行被扔掉,所以 status 要么缺席、要么是合法值 —— 绝不能是 'CRE'。
+    expect(r!.node.status).not.toBe('CRE')
+  })
+
+  it('连 id 都没留下就老实说抢救不了,不编一个节点出来', () => {
+    expect(salvageNodeFile('---\ntitle: 只剩标题')).toBeNull()
+    expect(salvageNodeFile('完全不是 node.md')).toBeNull()
+  })
+})
+
+/**
+ * 重做删子树时,事件日志也要一起删。
+ *
+ * 两个理由,第二个是硬的:`rmdir` 是**非递归**的,目录里剩着 agent-log.jsonl 就删不掉,
+ * run 目录里会堆满只剩一份日志的空壳目录;而那些日志再也没有任何界面能打开
+ * (`dropNodes` 已经把内存那一份扔了)。
+ */
+describe('removeNodeDirs 要连事件日志一起清掉', () => {
+  it('node.md 和 agent-log.jsonl 都从盘上消失,目录也删得掉', async () => {
+    const fs = memFs()
+    const n = createNode({ id: 'root/01-a', title: 'A', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    await writeNode(fs, '/eff/001', n)
+    await fs.appendFile('/eff/001/root/01-a/agent-log.jsonl', '{"t":"open","s":0,"at":1,"meta":{}}\n')
+    expect(fs.store.has('/eff/001/root/01-a/agent-log.jsonl')).toBe(true)
+    // 状态账也一样要删 —— 少了它 rmdir 删不掉这个目录,而账本身再没人会读。
+    await fs.appendFile('/eff/001/root/01-a/state.jsonl', '{"t":"f","at":"x","d":{}}\n')
+    expect(fs.store.has('/eff/001/root/01-a/state.jsonl')).toBe(true)
+
+    const { failed } = await removeNodeDirs(fs, '/eff/001', ['root/01-a'])
+    expect(failed).toEqual([])
+    expect(fs.store.has('/eff/001/root/01-a/node.md')).toBe(false)
+    // 少了这一条,目录非空、rmdir 删不掉,而且几 MB 的历史输出永远留在盘上。
+    expect(fs.store.has('/eff/001/root/01-a/agent-log.jsonl')).toBe(false)
+    expect(fs.store.has('/eff/001/root/01-a/state.jsonl')).toBe(false)
+  })
+})
+
+/**
+ * 原子写留下的 `.tmp` —— **先抢救,确认没用了才删**(用户原话:「首先进行恢复后确认无用可删除」)。
+ *
+ * 关键在于 `.tmp` 有两种,文件名一模一样:
+ *  - 被打断在**写的中途** → 半截,是垃圾;
+ *  - 被打断在**写完之后、rename 之前** → 一份**完整且更新**的 node.md,只差最后一步。
+ * 后一种直接删掉,就是亲手扔掉刚跑完那一关的结果。
+ */
+describe('临时文件:先抢救再删', () => {
+  const tmpName = (base: string) => `.${base}.4242.0.tmp`
+
+  it('写完但没 rename 的 .tmp 更新 → 抢救回 node.md', async () => {
+    const fs = memFs()
+    const old = createNode({ id: 'root', title: '旧', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    old.updatedAt = '2026-08-11T00:00:00Z'
+    await writeNode(fs, '/eff/001', old)
+    const fresh = { ...old, title: '这一关跑完的结果', updatedAt: '2026-08-11T09:00:00Z' }
+    fs.store.set(`/eff/001/root/${tmpName('node.md')}`, serializeNode(fresh))
+
+    const out = await sweepTempFiles(fs, '/eff/001')
+    expect(out.recovered.map(r => r.path)).toEqual(['/eff/001/root/node.md'])
+    expect(out.deleted).toEqual([])
+    const { nodes } = await loadRun(fs, '/eff/001')
+    expect(nodes[0].title).toBe('这一关跑完的结果')
+    expect(fs.store.has(`/eff/001/root/${tmpName('node.md')}`)).toBe(false)
+  })
+
+  it('半截的 .tmp → 删掉,而 node.md 一个字节没动', async () => {
+    const fs = memFs()
+    const n = createNode({ id: 'root', title: '好的', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    await writeNode(fs, '/eff/001', n)
+    const before = fs.store.get('/eff/001/root/node.md')!
+    fs.store.set(`/eff/001/root/${tmpName('node.md')}`, serializeNode(n).slice(0, 4096))
+
+    const out = await sweepTempFiles(fs, '/eff/001')
+    expect(out.recovered).toEqual([])
+    expect(out.deleted).toHaveLength(1)
+    expect(fs.store.get('/eff/001/root/node.md')).toBe(before)
+  })
+
+  it('.tmp 比盘上那份**旧** → 删掉,不许拿旧的盖新的', async () => {
+    const fs = memFs()
+    const cur = createNode({ id: 'root', title: '新的', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    cur.updatedAt = '2026-08-11T09:00:00Z'
+    await writeNode(fs, '/eff/001', cur)
+    const stale = { ...cur, title: '上一轮的', updatedAt: '2026-08-10T00:00:00Z' }
+    fs.store.set(`/eff/001/root/${tmpName('node.md')}`, serializeNode(stale))
+
+    await sweepTempFiles(fs, '/eff/001')
+    const { nodes } = await loadRun(fs, '/eff/001')
+    expect(nodes[0].title).toBe('新的')
+  })
+
+  it('node.md 整个不在时,完整的 .tmp 就是唯一的真相 —— 一定要救', async () => {
+    const fs = memFs()
+    const n = createNode({ id: 'root', title: '只剩临时文件', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    await fs.mkdir('/eff/001/root')
+    fs.store.set(`/eff/001/root/${tmpName('node.md')}`, serializeNode(n))
+    const out = await sweepTempFiles(fs, '/eff/001')
+    expect(out.recovered).toHaveLength(1)
+    const { nodes } = await loadRun(fs, '/eff/001')
+    expect(nodes.map(x => x.title)).toEqual(['只剩临时文件'])
+  })
+
+  it('run.md 的 .tmp 直接删,不抢救 —— 它是整棵树的快照,救回来会写回一棵旧树', async () => {
+    const fs = memFs()
+    await fs.mkdir('/eff/001')
+    fs.store.set(`/eff/001/${tmpName('run.md')}`, '---\ncreatedAt: x\n---\n')
+    const out = await sweepTempFiles(fs, '/eff/001')
+    expect(out.recovered).toEqual([])
+    expect(out.deleted).toHaveLength(1)
+  })
+
+  it('不碰任何不是 .tmp 的文件', async () => {
+    const fs = memFs()
+    const n = createNode({ id: 'root', title: 'T', parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW })
+    await writeNode(fs, '/eff/001', n)
+    await fs.appendFile('/eff/001/root/state.jsonl', '{"t":"f","at":"x","d":{}}\n')
+    await fs.appendFile('/eff/001/root/agent-log.jsonl', 'x\n')
+    const before = [...fs.store.keys()].sort()
+    await sweepTempFiles(fs, '/eff/001')
+    expect([...fs.store.keys()].sort()).toEqual(before)
   })
 })

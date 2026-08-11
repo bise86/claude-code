@@ -660,6 +660,7 @@ export function NodeDetail(props: {
    * 这个键更糟。
    */
   canMergeWorktrees?: boolean
+  canRepairNode?: boolean
   /**
    * 能不能按 d 重算依赖。只影响「依赖」段最后那一行提示 —— **不进段落标题**,
    * 理由见 depsBody 里那一段(标题是身份,而这个条件会被编排器自己 tick 掉)。
@@ -988,6 +989,7 @@ export function NodeDetail(props: {
     // 「合并工作区」四个字不够:这个键会在**你自己的分支上**产生真实提交,而页脚是用户
     // 唯一读得到它的地方。写清目的地,别让人按完才知道东西落到哪儿了。
     props.canMergeWorktrees ? 'm 合并工作区到主干' : '',
+    props.canRepairNode ? 'g 修复损毁的任务' : '',
   ].filter(s => s.length > 0)
   /** 页脚的段落清单。第一段是出口,分页会把它钉在每一页上。 */
   const footerSegments = ((): string[] => {
@@ -1093,7 +1095,7 @@ export function NodeDetail(props: {
           {...(tab === 'log' ? { flexGrow: 1 } : { height: 0, flexShrink: 0 })}
         >
           {props.historical === true && !hasLog ? (
-            <Text dimColor>子 agent 输出:属于上一次运行,事件流只在内存里、不落盘,看不到历史。</Text>
+            <Text dimColor>子 agent 输出:属于上一次运行,而盘上没有留下它的事件日志(在启用落盘之前跑的,或已被清理)。</Text>
           ) : (
             <AgentLogPane
               streams={props.streams ?? []}

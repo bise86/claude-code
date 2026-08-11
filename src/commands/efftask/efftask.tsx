@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import { access, mkdir, readFile, readdir, rmdir, unlink, writeFile } from 'node:fs/promises'
+import { access, appendFile, mkdir, readFile, readdir, rename, rmdir, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { LocalJSXCommandCall } from '../../types/command.js'
@@ -19,7 +19,7 @@ import type { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
-import { loadRun, writeNode as writeNodeFile, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
+import { loadRun, sweepTempFiles, writeNode as writeNodeFile, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
 import { failedRedoTarget, forcePassFailedPhaseReason, redoContextOf, redoUnavailableReason, skipFailedPhaseReason, type RedoEntry, type RedoPlan } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
 import { runForcePass, runRedo, runSkip } from '../../tools/efftask/redoRun.js'
@@ -81,6 +81,9 @@ import { useAppStateStore, useSetAppState } from '../../state/AppState.js'
 import { getCwd } from '../../utils/cwd.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { createStreamStore, PRE_TREE_NODE, type StreamHandle, type StreamState, type StreamStore } from '../../tools/efftask/agentStream.js'
+import { createAgentLogWriter, readAgentLog, type AgentLogWriter } from '../../tools/efftask/agentLog.js'
+import { ConfirmRepair } from './ConfirmRepair.js'
+import { repairNode, scanRepair, type RepairDeps } from '../../tools/efftask/nodeRepairRun.js'
 import { AgentLogPane, useStreamTick } from './AgentLogPane.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { logError } from '../../utils/log.js'
@@ -728,6 +731,11 @@ function fsAdapter(): FsLike {
     },
     unlink: p => unlink(p),
     rmdir: p => rmdir(p), // NON-recursive: releasing a lock must never delete a tree
+    // `fs.rename` 是原子的(POSIX rename(2)),writeFileAtomic 的全部保证都建立在这一条上。
+    // 绝不能退化成「copy 再 unlink」—— 那正好又是一次可以被打断在中间的覆盖写。
+    // 追加,文件不存在就建。只有 agent-log.jsonl 走这条(见 FsLike.appendFile)。
+    appendFile: (p, d) => appendFile(p, d, 'utf-8'),
+    rename: (from, to) => rename(from, to),
     readdir: p => readdir(p), // returns string[] by default — matches FsLike
     exists: p => access(p).then(() => true, () => false),
   }
@@ -885,6 +893,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * 他的分支上。写死 'done' 会让一次取消把还在跑的 run 的界面换成结束屏。
    */
   const [mergeTarget, setMergeTarget] = React.useState<TaskNode | null>(null)
+  /** 详情页 `g`:要修的那个节点、从哪一屏进来的、以及这一次修复调用的 controller。 */
+  const [repairTarget, setRepairTarget] = React.useState<TaskNode | null>(null)
+  const [repairFrom, setRepairFrom] = React.useState<'running' | 'done'>('running')
+  const repairAbort = React.useRef<AbortController | null>(null)
   const [mergeFrom, setMergeFrom] = React.useState<Phase>('done')
   /**
    * 这一次手动合并自己的 AbortController。
@@ -944,8 +956,44 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // Per-run escalation budget (see createEscalationLimiter). A ref, not state: it must not
   // reset on re-render, and nothing renders from it.
   const cardLimit = React.useRef(createEscalationLimiter())
+  /**
+   * 事件流的落盘出口与读回口。
+   *
+   * 两个 ref 而不是直接把 runDir 传进 store:`createStreamStore` 在 `useRef` 的初值里
+   * 构造(整个运行一个实例),而那一刻 **runId 还不存在** —— 新 run 要等关口确认之后才
+   * 分配,`--resume` 要等参数解析。所以出口先建好,等 runDir 有了再把写入器放进来;
+   * 在那之前 `?.` 全部落空,一个字节也不会写到错误的地方。
+   */
+  const logWriter = React.useRef<AgentLogWriter | null>(null)
+  const logRunDir = React.useRef<string | null>(null)
   // 子 agent 实时输出 (spec §10.2). One bounded ring buffer per node for the whole run.
-  const streams = React.useRef(createStreamStore())
+  const streams = React.useRef(createStreamStore({
+    sink: {
+      opened: (nodeId, s, meta, at) => logWriter.current?.record(nodeId, { t: 'open', s, at, meta }),
+      event: (nodeId, s, e) => logWriter.current?.record(nodeId, { t: 'ev', s, e }),
+      closed: (nodeId, s, at, err) => logWriter.current?.record(nodeId, { t: 'end', s, at, ...(err === undefined ? {} : { err }) }),
+    },
+    load: async nodeId => {
+      const dir = logRunDir.current
+      if (dir === null) return undefined
+      return (await readAgentLog(props.fs, dir, nodeId))?.streams
+    },
+  }))
+  /**
+   * 攒着的日志行**定期落盘**。
+   *
+   * 没有这个定时器,一次「跑了四十分钟然后被 kill」的运行会把这四十分钟的输出全部留在
+   * 内存里 —— 而这个功能存在的全部理由就是那种情况。2 秒是「崩溃最多丢 2 秒」和
+   * 「不要把写盘变成热路径」之间的取舍;`flush` 自己是幂等的,没东西攒着时它什么都不做。
+   */
+  React.useEffect(() => {
+    const t = setInterval(() => { void logWriter.current?.flush() }, 2000)
+    return () => {
+      clearInterval(t)
+      // 卸载时**再排一次**:最后那一段(往往正是失败现场)不该因为没等到下一个 tick 而丢。
+      void logWriter.current?.flush()
+    }
+  }, [])
   /**
    * 树还没建起来时的两次真实模型调用也要有窗口。
    *
@@ -1001,6 +1049,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [fatal, setFatal] = React.useState<string | null>(null)
   const [runId, setRunId] = React.useState<string | null>(props.active.runId)
   const runDir = runId ? `${props.effRoot}/${runId}` : null
+  /**
+   * runDir 一确定就把事件日志的写入器接上。**必须在这里,不能提到 streams 那一段** ——
+   * `runDir` 是下面这行 const,提上去会在依赖数组求值时撞 TDZ,整个视图渲染不出来。
+   */
+  React.useEffect(() => {
+    if (runDir === null) return
+    logRunDir.current = runDir
+    if (logWriter.current === null) logWriter.current = createAgentLogWriter({ fs: props.fs, runDir })
+    // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for the run
+  }, [runDir])
   const store = useAppStateStore()
   const setAppState = useSetAppState()
   // The terminal surface stashes raceConfirm's `claim` here so the rendered ConfirmStartup
@@ -1082,11 +1140,37 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         setPhase('handoff')
         return
       }
-      const { nodes: raw, errors } = await loadRun(props.fs, runDir)
+      /**
+       * 先扫临时文件,**再**读树 —— 顺序是硬的:抢救会把一个 `.tmp` rename 成 node.md,
+       * 而那份内容比盘上现有的更新。放在 loadRun 之后,这一趟读到的仍然是旧的那份。
+       *
+       * 放在这里(而不是 loadRun 里)是因为这条路**已经拿到了独占的 run 锁**;
+       * `loadRun` 还被 `listRuns` 拿去列别人的 run,那些 run 可能正在跑。
+       */
+      const swept = await sweepTempFiles(props.fs, runDir).catch(() => ({ recovered: [], deleted: [] }))
+      const { nodes: raw, errors, salvaged } = await loadRun(props.fs, runDir)
       const now = new Date().toISOString()
       const validated = validateLoadedNodes(raw, {
         goal: recovered.goalPrompt, phaseRoles: recovered.phaseRoles, now,
       })
+      /**
+       * 抢救回来的节点**立刻按完整格式写回去**,让这次恢复只发生一次。
+       *
+       * 不写回的话,一个已经 ACCEPTED 的节点再也不会 commit,于是那份半截文件永远留在盘上,
+       * 之后每一次 `--resume` 都要重新抢救一遍 —— 而每一次都在赌抢救还能成功。
+       * 写回走的是 `writeNode`(原子写),所以这次写自己不会再制造一个半截文件。
+       *
+       * 写失败**不阻断恢复**:内存里的树已经是对的,这一步只是把它固化下来。把整个 run
+       * 卡在这儿,等于让一个能跑的运行因为一次写盘失败而彻底打不开。
+       */
+      if (salvaged.length > 0) {
+        const byId = new Map(validated.nodes.map(n => [n.id, n]))
+        for (const s of salvaged) {
+          const n = byId.get(s.id)
+          if (!n) continue
+          try { await writeNodeFile(props.fs, runDir, n) } catch { /* 见上:不阻断 */ }
+        }
+      }
       const reseated = reseatTransientNodes(validated.nodes, now, recovered.caps, {
         retryBlocked: props.resumeArgs.retryBlocked,
       })
@@ -1135,6 +1219,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         retried: reseated.retried,
         degraded,
         loadErrors: errors.map(e => `${e.path}: ${e.message}`),
+        salvaged: [
+          ...salvaged.map(s => `${s.id}(来源:${s.from};丢了 frontmatter 尾部 ${s.droppedLines} 行 + 全部正文)`),
+          ...swept.recovered.map(r => `${r.path.slice(runDir.length + 1)}(从崩溃时留下的临时文件里抢救回来,它比盘上那份更新)`),
+        ],
         inheritedGuidance: inherited,
       })
       // 这些节点是从盘上恢复的,事件流不落盘 —— 所以它们的窗口是空的。**空 ≠ 什么
@@ -2246,6 +2334,62 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  if (phase === 'confirmRepair' && repairTarget) {
+    /**
+     * 修复损毁的任务(详情页 `g`)。**不重启编排、不动别的节点** —— 它只把这一个节点
+     * 在盘上那份修好并写回去,所以确认完原样回到来时那一屏。
+     *
+     * 判据在 `nodeRepair.ts`(纯函数),顺序在 `nodeRepairRun.ts`;这里只接线。
+     */
+    const target = repairTarget
+    const dir = runDir
+    const byId = (): Map<string, TaskNode> =>
+      new Map((orchRef.current?.nodes() ?? nodes).map(n => [n.id, n] as [string, TaskNode]))
+    /**
+     * 每次调用一个 controller,并 **chain 到 run 级 signal**:run 被中止时这一次也要停,
+     * 而反过来 Esc 只停这一次。摘监听放在 finally 里 —— 关口可以被开关很多次,而
+     * run 级 signal 活到进程结束,只挂不摘的话监听者会随按 g 的次数一直涨。
+     */
+    const repairDeps = (signal: AbortSignal): RepairDeps => ({
+      fs: props.fs, runDir: dir!, byId,
+      runAgent: a => props.runRecalcAgent(a),
+      openStream: () => streams.current.open({ nodeId: target.id, phaseLabel: '修复任务', label: '主模型' }),
+    })
+    const close = (): void => { repairAbort.current = null; setRepairTarget(null); setPhase(repairFrom) }
+    return (
+      <ConfirmRepair
+        target={target}
+        streams={streams.current.streams(target.id)}
+        onScan={async () => {
+          // runDir 不在 = 这一趟还没分配 run 目录,盘上根本没有这个节点的文件。
+          if (!dir) return { damage: { blocking: ['这一趟还没有 run 目录,盘上没有它的文件'], soft: [] }, journalRecords: 0 }
+          return scanRepair(target, repairDeps(new AbortController().signal))
+        }}
+        onRepair={async ({ skipModel }) => {
+          if (!dir) return { ok: false as const, kind: 'write-failed' as const, reason: '这一趟还没有 run 目录,没有可以写回去的地方。' }
+          const ac = new AbortController()
+          repairAbort.current = ac
+          const onRunAbort = (): void => ac.abort()
+          if (props.signal.aborted) ac.abort()
+          else props.signal.addEventListener('abort', onRunAbort, { once: true })
+          try {
+            const out = await repairNode(target, repairDeps(ac.signal), ac.signal, { skipModel })
+            /**
+             * 修好的节点要**推回界面**。`repairNode` 返回的是一个新对象,而编排器和面板
+             * 持有的是旧那一个 —— 不换掉的话盘上修好了、屏幕上还是坏的,而用户刚看完
+             * 一屏「已恢复」。就地换进同一个数组位置,和 `cleanupWorktrees` 那条同因。
+             */
+            if (out.ok) setNodes(nodes.map(n => (n.id === out.node.id ? out.node : n)))
+            return out
+          } finally {
+            props.signal.removeEventListener('abort', onRunAbort)
+          }
+        }}
+        onCancelAsk={() => repairAbort.current?.abort()}
+        onDone={close}
+      />
+    )
+  }
   if (phase === 'confirmRecalc' && recalcTarget) {
     /**
      * 依赖重算。**只从运行视图进来**,而且只在准入已经过了、真要发起模型调用的时候 ——
@@ -2452,6 +2596,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 这里**不挡任何东西**:范围由关口扫盘算(在飞的节点按定义不合,它们的工作区正被
        * 执行者写着),关口自己会把「跳过 N 个还没跑完的任务」写在屏幕上。
        */
+      onRepairNode={node => { setRepairTarget(node); setRepairFrom('running'); setPhase('confirmRepair') }}
       onMergeWorktrees={poolRef.current ? node => {
         setMergeTarget(node); setMergeFrom('running'); setPhase('confirmMerge')
       } : undefined}
@@ -2607,6 +2752,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 而且更硬:「只查看」进来的人多半正是发现产出不在自己目录里、回来找它的那个人。
        * 这个键不重开编排、不动任务树,只把已经跑完的东西送到他的分支上。
        */
+      onRepairNode={node => { setRepairTarget(node); setRepairFrom('done'); setPhase('confirmRepair') }}
       onMergeWorktrees={poolRef.current ? node => {
         setMergeTarget(node); setMergeFrom('done'); setPhase('confirmMerge')
       } : undefined}
@@ -2692,6 +2838,7 @@ export function RunningView(props: {
   onCleanupWorktrees?: (node: TaskNode) => void
   /** 给了才有 m 键(把这棵子树里还没合进主干的隔离工作区合掉,撞冲突派主模型解决)。 */
   onMergeWorktrees?: (node: TaskNode) => void
+  onRepairNode?: (node: TaskNode) => void
   /**
    * 依赖重算(详情页 d 键)。**只有运行视图有** —— 它要 hold 住节点、还要叫醒调度,
    * 而结束屏没有编排器可以做这两件事。回一句话 = 准入没过、不切屏;undefined = 去调模型。
@@ -2706,7 +2853,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
@@ -2745,6 +2892,7 @@ export function DoneView(props: {
   onCleanupWorktrees?: (node: TaskNode) => void
   /** 给了才有 m 键(把这棵子树里还没合进主干的隔离工作区合掉,撞冲突派主模型解决)。 */
   onMergeWorktrees?: (node: TaskNode) => void
+  onRepairNode?: (node: TaskNode) => void
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -2780,6 +2928,7 @@ export function DoneView(props: {
         onForcePass={props.onForcePass}
         onCleanupWorktrees={props.onCleanupWorktrees}
         onMergeWorktrees={props.onMergeWorktrees}
+        onRepairNode={props.onRepairNode}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">

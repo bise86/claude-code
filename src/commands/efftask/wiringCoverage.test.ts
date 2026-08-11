@@ -20,6 +20,8 @@ import { readFileSync } from 'node:fs'
 import { subAgentToolPool } from './efftask.js'
 
 const SRC = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
+/** 详情页的按需读回住在树面板里 —— 这一跳断了,盘上的历史永远没人去读。 */
+const TREE = readFileSync(new URL('./TaskTreePanel.tsx', import.meta.url), 'utf8')
 /** 关口组件自己的源码 —— 编辑器接线在这里,不在 efftask.tsx。 */
 const GATE_SRC = readFileSync(new URL('./ConfirmStartup.tsx', import.meta.url), 'utf8')
 
@@ -374,7 +376,12 @@ describe('子 agent 实时窗口:五跳都要接上', () => {
   const ADAPTER = readFileSync(new URL('../../tools/efftask/runAgentAdapter.ts', import.meta.url), 'utf8')
 
   it('efftask.tsx 建了 store 并把 openStream 交给编排器', () => {
-    expect(SRC).toContain('createStreamStore()')
+    expect(SRC).toContain('createStreamStore({')
+    // 事件流落盘的两个口子必须真的接上去 —— 少了 sink 就一个字节都不写,
+    // 少了 load 详情页永远读不回历史,而两种情况屏幕上都只是「暂无输出」。
+    expect(`sink 接了: ${SRC.includes('sink: {')}`).toBe('sink 接了: true')
+    expect(`load 接了: ${SRC.includes('load: async nodeId =>')}`).toBe('load 接了: true')
+    expect(`详情页触发读回: ${TREE.includes('props.streams?.hydrate(detailId)')}`).toBe('详情页触发读回: true')
     expect(SRC).toContain('openStream: meta => streams.current.open(meta)')
   })
 
@@ -1015,5 +1022,54 @@ describe('落盘的两条尾巴不能被剪断', () => {
      * 这期间调过的设置退出时就只在内存里,而 `--resume` 正是从 run.md 读回它们的。
      */
     expect(occurrences('orchRef.current?.syncToDisk()')).toBe(2)
+  })
+})
+
+/**
+ * 详情页 `g`:修复损毁的任务。**五跳,断一跳这个键就是死键。**
+ *
+ * 这一档的存在理由和上面那几个逐字相同:这个仓库反复出现「声明了却没接上」——
+ * 组件写好、判据写好、测试全绿,而产品里那个键按下去什么都不会发生。
+ */
+describe('修复损毁的任务:g 键五跳都要接上', () => {
+  const PANEL = readFileSync(new URL('./TaskTreePanel.tsx', import.meta.url), 'utf8')
+  const DETAIL = readFileSync(new URL('./NodeDetail.tsx', import.meta.url), 'utf8')
+  const RUNNER = readFileSync(new URL('./runOrchestrator.ts', import.meta.url), 'utf8')
+
+  it('面板认这个键,并把节点交出去', () => {
+    expect(`按键接了: ${PANEL.includes("k === 'g' && props.onRepairNode")}`).toBe('按键接了: true')
+    expect(`prop 声明了: ${PANEL.includes('onRepairNode?: (node: TaskNode) => void')}`).toBe('prop 声明了: true')
+  })
+
+  it('页脚要宣告它 —— 一个没被宣告过的键等于不存在', () => {
+    expect(`详情页收了: ${DETAIL.includes('canRepairNode')}`).toBe('详情页收了: true')
+    expect(DETAIL).toContain('g 修复损毁的任务')
+    expect(`面板传了: ${PANEL.includes('canRepairNode={props.onRepairNode !== undefined}')}`).toBe('面板传了: true')
+  })
+
+  it('phase 注册了,关口渲染得出来', () => {
+    expect(`phase 声明了: ${RUNNER.includes("| 'confirmRepair'")}`).toBe('phase 声明了: true')
+    expect(`关口渲染了: ${SRC.includes("phase === 'confirmRepair' && repairTarget")}`).toBe('关口渲染了: true')
+  })
+
+  it('运行视图和结束视图**都**接上 —— 只接一边的话另一边是死键', () => {
+    expect(`running 接了: ${SRC.includes("setRepairFrom('running'); setPhase('confirmRepair')")}`)
+      .toBe('running 接了: true')
+    expect(`done 接了: ${SRC.includes("setRepairFrom('done'); setPhase('confirmRepair')")}`)
+      .toBe('done 接了: true')
+  })
+
+  it('关口真的会去调 repairNode,而且带着实时输出窗', () => {
+    expect(`调了: ${SRC.includes('repairNode(target, repairDeps(ac.signal), ac.signal, { skipModel })')}`)
+      .toBe('调了: true')
+    // 少了输出窗,那几分钟里「卡住了」和「正常跑」在屏幕上长得一模一样。
+    expect(`输出窗接了: ${SRC.includes("phaseLabel: '修复任务'")}`).toBe('输出窗接了: true')
+  })
+
+  it('状态账接在生产落盘路径上 —— 少了它,阶段结果在磁盘满时就没了', () => {
+    expect(`账建了: ${RUNNER.includes('createNodeJournal({ fs: args.fs, runDir: args.runDir })')}`)
+      .toBe('账建了: true')
+    expect(`persist 带上了: ${RUNNER.includes('writeNode(args.fs, args.runDir, n, journal)')}`)
+      .toBe('persist 带上了: true')
   })
 })

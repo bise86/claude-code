@@ -30,7 +30,7 @@ const rec = (over: Partial<RoundtableRecord> = {}): RoundtableRecord => ({
 const fsWith = (files: Record<string, string>): FsLike => ({
   readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error(`ENOENT ${p}`); return v },
   writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
-  unlink: async () => {}, rmdir: async () => {},
+  unlink: async () => {}, rmdir: async () => {}, rename: async () => {}, appendFile: async () => {},
   readdir: async () => [], exists: async (p: string) => p in files,
 })
 const manifest = (caps: string[]): string => [

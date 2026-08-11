@@ -302,7 +302,12 @@ export function renderStreamLines(args: RenderArgs): LogLine[] {
   if (args.historical === true && args.streams.length === 0) {
     // 空 store + 已完成的节点 = 「这个节点什么都没干」,而事实是它上次跑了四十分钟。
     // 残缺的视图不许看起来像完整的视图 —— 这条规矩 NodeDetail 的裁剪已经付过一次学费。
-    for (const l of wrapDisplayWidth('本节点的输出属于上一次运行。事件流只存在内存中,不落盘,所以看不到历史。', w)) {
+    //
+    // 措辞跟着事实改过一次:事件流现在**是**落盘的(`agent-log.jsonl`,打开详情页时
+    // 按需读回)。走到这一行只剩两种情况 —— 这个节点是在开始落盘之前跑的,或者它那份
+    // 日志被清理掉了。原来那句「不落盘,所以看不到历史」现在是假话,而它恰恰印在
+    // 唯一能让用户发现真相的地方。
+    for (const l of wrapDisplayWidth('本节点的输出属于上一次运行,而盘上没有留下它的事件日志(在启用落盘之前跑的,或已被清理)。', w)) {
       out.push({ text: l, dim: true, streamIndex: -1 })
     }
     return out

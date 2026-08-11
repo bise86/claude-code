@@ -928,7 +928,7 @@ describe('--resume 带进来的节点:输出页卡要说清为什么是空的', 
     const f = t.lastFrame()
     app.unmount()
     expect(f).toContain('属于上一次运行')
-    expect(f).toContain('不落盘')
+    expect(f).toContain('盘上没有留下它的事件日志')
     // 这一屏没有日志窗,页脚就不许列日志窗的键 —— 那一排全是死键。
     expect(f).not.toContain('n 换流')
     expect(f).not.toContain('t 思考')

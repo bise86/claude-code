@@ -207,6 +207,11 @@ const fsWith = (files: Record<string, string>): FsLike => ({
   readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error(`ENOENT ${p}`); return v },
   writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
   unlink: async () => {}, rmdir: async () => {},
+  // 真的搬,不是空实现。`writeFileAtomic` 走的是「写临时文件 → rename 盖上去」,
+  // 一个 no-op rename 会让每一次写盘**静默地什么都不做**,而断言读回来的那一半
+  // 恰好读的是这个 fake 自己的 `files` —— 于是探针对着一个从没写成功过的文件全绿。
+  rename: async (a: string, b: string) => { files[b] = files[a]; delete files[a] },
+  appendFile: async (p: string, c: string) => { files[p] = (files[p] ?? '') + c },
   readdir: async () => [], exists: async (p: string) => p in files,
 })
 
@@ -703,7 +708,7 @@ describe('run.md 里的 scoreThreshold 不是数字时,关口不能说假话', (
   const memfs = (runMd: string) => ({
     readFile: async (p: string) => { if (p.endsWith('run.md')) return runMd; throw new Error('ENOENT') },
     writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
-    unlink: async () => {}, rmdir: async () => {}, readdir: async () => [], exists: async () => true,
+    unlink: async () => {}, rmdir: async () => {}, rename: async () => {}, readdir: async () => [], exists: async () => true,
   })
 
   it('非数字被忽略,并且明确告诉用户"评分不会触发返工"', async () => {
@@ -759,7 +764,7 @@ describe('剩下五条守卫也要有测试', () => {
     const memfs = (runMd) => ({
       readFile: async (p) => { if (p.endsWith('run.md')) return runMd; throw new Error('ENOENT') },
       writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
-      unlink: async () => {}, rmdir: async () => {}, readdir: async () => [], exists: async () => true,
+      unlink: async () => {}, rmdir: async () => {}, rename: async () => {}, readdir: async () => [], exists: async () => true,
     })
     const { config, degraded } = await readRunManifest(memfs('---\ngoalPrompt: g\ncaps:\n  scoreThreshold: -5\n---\n\n'), '/r')
     expect(config.caps.scoreThreshold).toBeUndefined()
@@ -770,7 +775,7 @@ describe('剩下五条守卫也要有测试', () => {
     const memfs = (runMd) => ({
       readFile: async (p) => { if (p.endsWith('run.md')) return runMd; throw new Error('ENOENT') },
       writeFile: async () => {}, mkdir: async () => {}, mkdirExclusive: async () => true,
-      unlink: async () => {}, rmdir: async () => {}, readdir: async () => [], exists: async () => true,
+      unlink: async () => {}, rmdir: async () => {}, rename: async () => {}, readdir: async () => [], exists: async () => true,
     })
     const { degraded } = await readRunManifest(memfs('---\ngoalPrompt: g\ncaps:\n  scoreThreshold: "80"\n---\n\n'), '/r')
     expect(degraded[0]).toContain('"80"')
@@ -808,6 +813,8 @@ describe('角色定义必须能从 run.md 原样回来', () => {
       ...fsWith(files),
       readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error(`ENOENT ${p}`); return v },
       writeFile: async (p: string, c: string) => { files[p] = c },
+      rename: async (a: string, b: string) => { files[b] = files[a]; delete files[a] },
+      appendFile: async (p: string, c: string) => { files[p] = (files[p] ?? '') + c },
     }
     await writeRunManifest(fs, '/r', {
       goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(),
@@ -937,6 +944,8 @@ describe('待收口状态必须能从 run.md 读回', () => {
       ...fsWith(files),
       readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error('ENOENT'); return v },
       writeFile: async (p: string, c: string) => { files[p] = c },
+      rename: async (a: string, b: string) => { files[b] = files[a]; delete files[a] },
+      appendFile: async (p: string, c: string) => { files[p] = (files[p] ?? '') + c },
     }
     await writeRunManifest(fs2, '/r', {
       goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [],
@@ -1101,6 +1110,8 @@ describe('跳过的环节必须能从 run.md 读回', () => {
       ...fsWith(files),
       readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error('ENOENT'); return v },
       writeFile: async (p: string, c: string) => { files[p] = c },
+      rename: async (a: string, b: string) => { files[b] = files[a]; delete files[a] },
+      appendFile: async (p: string, c: string) => { files[p] = (files[p] ?? '') + c },
     }
     await writeRunManifest(fs2, '/r', {
       goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
@@ -1160,6 +1171,8 @@ describe('git 开关必须能从 run.md 读回(收口方式已取消,只剩隔�
       ...fsWith(files),
       readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error('ENOENT'); return v },
       writeFile: async (p: string, c: string) => { files[p] = c },
+      rename: async (a: string, b: string) => { files[b] = files[a]; delete files[a] },
+      appendFile: async (p: string, c: string) => { files[p] = (files[p] ?? '') + c },
     }
     const base = {
       goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [],
@@ -1178,6 +1191,8 @@ describe('git 开关必须能从 run.md 读回(收口方式已取消,只剩隔�
       ...fsWith(files),
       readFile: async (p: string) => { const v = files[p]; if (v === undefined) throw new Error('ENOENT'); return v },
       writeFile: async (p: string, c: string) => { files[p] = c },
+      rename: async (a: string, b: string) => { files[b] = files[a]; delete files[a] },
+      appendFile: async (p: string, c: string) => { files[p] = (files[p] ?? '') + c },
     }
     await writeRunManifest(fs2, '/r', {
       goalPrompt: 'g', parallelism: 2, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },

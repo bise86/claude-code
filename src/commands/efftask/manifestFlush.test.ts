@@ -25,6 +25,13 @@ function memFs(): FsLike & { files: Map<string, string> } {
     mkdirExclusive: async () => true,
     unlink: async p => { files.delete(p) },
     rmdir: async () => {},
+    appendFile: async (p, d) => { files.set(p, (files.get(p) ?? '') + d) },
+    rename: async (from, to) => {
+      const v = files.get(from)
+      if (v === undefined) throw new Error(`ENOENT ${from}`)
+      files.set(to, v)
+      files.delete(from)
+    },
   }
 }
 

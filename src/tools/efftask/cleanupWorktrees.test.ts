@@ -226,6 +226,7 @@ describe('scanCleanup / runCleanup against real git', () => {
       mkdirExclusive: async () => true,
       unlink: async () => {},
       rmdir: async () => {},
+      rename: async () => {}, appendFile: async () => {},
       readdir: async () => [],
       exists: async () => true,
     }
@@ -277,7 +278,8 @@ describe('scanCleanup / runCleanup against real git', () => {
 
 describe('屏幕上的每一行', () => {
   const planWith = (over: Partial<Parameters<typeof cleanupLines>[0]> = {}) => cleanupLines({
-    targetId: 'root', items: [], kept: [], unfinished: 0, absent: 0, totalKb: 0, sizeKnown: false, ...over,
+    targetId: 'root', items: [], kept: [], unfinished: 0, absent: 0, totalKb: 0, sizeKnown: false,
+    logs: [], logKb: 0, logSizeKnown: false, ...over,
   })
 
   it('说得出删几个、腾多少', () => {
@@ -299,8 +301,9 @@ describe('屏幕上的每一行', () => {
     expect(lines.join('\n')).not.toContain('0 KB')
   })
 
-  it('总要说一句「任务记录不受影响」—— 那是用户唯一真正担心的事', () => {
-    expect(planWith().join('\n')).toContain('任务记录不受影响')
+  it('总要逐条点名什么不会被动 —— 那是用户唯一真正担心的事', () => {
+    expect(planWith().join('\n')).toContain('node.md')
+    expect(planWith().join('\n')).toContain('state.jsonl')
   })
 
   it('保留和跳过各自摆出来,不合并成一个数', () => {
@@ -329,5 +332,125 @@ describe('屏幕上的每一行', () => {
     expect(formatSize(512)).toBe('512 KB')
     expect(formatSize(1536)).toBe('1.5 MB')
     expect(formatSize(3 * 1024 * 1024)).toBe('3.0 GB')
+  })
+})
+
+/**
+ * 用户原话:「1, 绝对不能删除任务的基本信息和状态,以及各阶段结果状态。」
+ *
+ * 这一档钉的是**边界**,不是功能:`c` 删事件日志,而 `node.md` / `state.jsonl`
+ * 一个字节都不许动。三条断言分开写 —— 合成一句「只删了日志」在实现把 node.md 也删掉时
+ * 同样是绿的(它只断言日志没了)。
+ */
+describe('c 键的删除边界', () => {
+  const memFs = (): FsLike & { store: Map<string, string> } => {
+    const store = new Map<string, string>()
+    return {
+      store,
+      async readFile(p) { const v = store.get(p); if (v === undefined) throw new Error('ENOENT'); return v },
+      async writeFile(p, d) { store.set(p, d) },
+      async appendFile(p, d) { store.set(p, (store.get(p) ?? '') + d) },
+      async mkdir() {}, async mkdirExclusive() { return true },
+      async unlink(p) { store.delete(p) },
+      async rmdir() {},
+      async rename(a, b) { const v = store.get(a)!; store.set(b, v); store.delete(a) },
+      async readdir() { return [] },
+      async exists(p) { return store.has(p) },
+    }
+  }
+
+  it('删事件日志,而 node.md 和 state.jsonl 原样留着', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root', { status: 'ACCEPTED' })
+    const { path } = await p.acquire(n)
+    await writeFile(join(path, 'f.txt'), 'done\n')
+    expect((await p.commitAndMerge(n)).ok).toBe(true)
+
+    const fs = memFs()
+    fs.store.set('/run/root/node.md', '---\nid: root\n---\n')
+    fs.store.set('/run/root/state.jsonl', '{"t":"f","at":"x","d":{}}\n')
+    fs.store.set('/run/root/agent-log.jsonl', 'x'.repeat(4096))
+
+    const deps = depsOf(p, { persist: { fs, runDir: '/run' }, dirSizeKb: async () => 4 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.logs.map(l => l.nodeId)).toEqual(['root'])
+
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.logsRemoved).toBe(1)
+    expect(fs.store.has('/run/root/agent-log.jsonl')).toBe(false)
+    // **这两条是这一档存在的全部理由。**
+    expect(fs.store.has('/run/root/node.md')).toBe(true)
+    expect(fs.store.has('/run/root/state.jsonl')).toBe(true)
+  })
+
+  it('确认屏必须把这件事说出来 —— 静默删除和静默截断是同一类毛病', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root', { status: 'ACCEPTED' })
+    const { path } = await p.acquire(n)
+    await writeFile(join(path, 'f.txt'), 'done\n')
+    await p.commitAndMerge(n)
+
+    const fs = memFs()
+    fs.store.set('/run/root/agent-log.jsonl', 'x'.repeat(4096))
+    const deps = depsOf(p, { persist: { fs, runDir: '/run' }, dirSizeKb: async () => 4 })
+    const text = cleanupLines(await scanCleanup(deps, [n], n.id)).join('\n')
+    expect(text).toContain('agent-log.jsonl')
+    expect(text).toContain('node.md')
+    expect(text).toContain('state.jsonl')
+  })
+
+  it('没有 persist 接缝时一个文件都不删 —— 老调用点逐字不变', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root', { status: 'ACCEPTED' })
+    await p.acquire(n)
+    const deps = depsOf(p)
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.logs).toEqual([])
+    expect((await runCleanup(deps, plan, [n])).logsRemoved).toBe(0)
+  })
+})
+
+/**
+ * 探针补洞:变异测试抓到「日志名单挂在 items 上」时全绿 —— 说明没有任何用例
+ * 区分得了 `done` 和 `items`。而这正是 CleanupPlan.logs 那段注释讲的事:
+ * 一个**工作区早就被清过**的已验收节点(`absent`),日志照样躺在盘上几 MB,
+ * 而它恰恰是最该被清的那一批。
+ */
+describe('日志名单走 done 全体,不走 items', () => {
+  it('工作区已经不在的已验收节点,日志照样进名单并被删掉', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root', { status: 'ACCEPTED' })
+    // **不 acquire** —— 盘上根本没有这个节点的工作区目录,scanCleanup 会把它记成 absent。
+    const fs: FsLike & { store: Map<string, string> } = (() => {
+      const store = new Map<string, string>()
+      return {
+        store,
+        async readFile(x) { const v = store.get(x); if (v === undefined) throw new Error('ENOENT'); return v },
+        async writeFile(x, d) { store.set(x, d) },
+        async appendFile(x, d) { store.set(x, (store.get(x) ?? '') + d) },
+        async mkdir() {}, async mkdirExclusive() { return true },
+        async unlink(x) { store.delete(x) },
+        async rmdir() {},
+        async rename(a, b) { const v = store.get(a)!; store.set(b, v); store.delete(a) },
+        async readdir() { return [] },
+        async exists(x) { return store.has(x) },
+      }
+    })()
+    fs.store.set('/run/root/agent-log.jsonl', 'x'.repeat(4096))
+
+    const deps = depsOf(p, { persist: { fs, runDir: '/run' }, dirSizeKb: async () => 4 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    // 工作区那份名单是空的(目录不在)……
+    expect(plan.items).toEqual([])
+    expect(plan.absent).toBe(1)
+    // ……而日志那份**不是**。挂在 items 上的话这里会是 []。
+    expect(plan.logs.map(l => l.nodeId)).toEqual(['root'])
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.logsRemoved).toBe(1)
+    expect(fs.store.has('/run/root/agent-log.jsonl')).toBe(false)
   })
 })
