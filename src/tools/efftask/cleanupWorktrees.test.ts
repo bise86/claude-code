@@ -279,7 +279,8 @@ describe('scanCleanup / runCleanup against real git', () => {
 describe('屏幕上的每一行', () => {
   const planWith = (over: Partial<Parameters<typeof cleanupLines>[0]> = {}) => cleanupLines({
     targetId: 'root', items: [], kept: [], unfinished: 0, absent: 0, totalKb: 0, sizeKnown: false,
-    logs: [], logKb: 0, logSizeKnown: false, ...over,
+    logs: [], logKb: 0, logSizeKnown: false,
+    scratch: [], scratchKb: 0, scratchSizeKnown: false, ...over,
   })
 
   it('说得出删几个、腾多少', () => {
@@ -322,9 +323,50 @@ describe('屏幕上的每一行', () => {
     const text = cleanupResultLines({
       removed: [], failed: [{ nodeId: 'a', title: '建表', path: '/w/a', why: 'locked' }],
       problems: [], freedKb: 0, sizeKnown: false,
+      logsRemoved: 0, logsFreedKb: 0,
+      scratchRemoved: 0, scratchFreedKb: 0, integrationCleaned: false, integrationFreedKb: 0,
     }).join('\n')
     expect(text).toContain('没有删除任何工作区')
     expect(text).toContain('⚠ 建表 没删掉')
+    // 这一格没做的两件事一个字都不许印 —— 「已删除 0 个」读起来像一次成功的空操作。
+    expect(text).not.toContain('临时目录')
+    expect(text).not.toContain('构建产物')
+  })
+
+  /**
+   * 临时目录那一行**必须点名它在项目之外**:用户看着一屏「回收工作区」,而这一条删的是
+   * `/tmp`。变异:把 `cleanupLines` 里 scratch 那一段删掉 → 这条红。
+   */
+  it('临时目录那一段说得出在哪、有多少', () => {
+    const text = planWith({
+      scratch: [{ path: '/tmp/efftask-001-0184c778-target', kb: 1024 * 1024 }],
+      scratchKb: 1024 * 1024, scratchSizeKnown: true,
+    }).join('\n')
+    expect(text).toContain('临时目录')
+    expect(text).toContain('1 个')
+    expect(text).toContain('1.0 GB')
+  })
+
+  /**
+   * 集成工作区那两行:**说清代价**(全量重编),并且**说清目录本身留着**。
+   * 只印「腾出 22 GB」而不说要重编,是拿一句半真话换一次按键。
+   */
+  it('集成工作区:清产物、留目录、说出重编的代价', () => {
+    const text = planWith({
+      integration: { path: '/w/integration', entries: ['target/'], entryCount: 1, kb: 22 * 1024 * 1024 },
+    }).join('\n')
+    expect(text).toContain('构建产物')
+    expect(text).toContain('22 GB')
+    expect(text).toContain('全量重编')
+    expect(text).toContain('本身保留')
+  })
+
+  /** 没有可清产物时,那句话要改口 —— 不能一直印着「只清掉它里面的构建产物」。 */
+  it('集成工作区没东西可清时,措辞跟着改', () => {
+    const text = planWith().join('\n')
+    expect(text).toContain('本身保留')
+    expect(text).toContain('没有可清的构建产物')
+    expect(text).not.toContain('全量重编')
   })
 
   it('大小的量纲', () => {
@@ -452,5 +494,149 @@ describe('日志名单走 done 全体,不走 items', () => {
     const out = await runCleanup(deps, plan, [n])
     expect(out.logsRemoved).toBe(1)
     expect(fs.store.has('/run/root/agent-log.jsonl')).toBe(false)
+  })
+})
+
+/**
+ * **磁盘被撑爆的那两个大头,`c` 键现在都管。**
+ *
+ * 跑机实测(qianbase-xtp run 001,盘 100% 满、`/` 只剩 1.7 MB,84 次
+ * `ENOSPC: no space left on device`):
+ *  - `.efftask-worktrees/integration/target` 一个人 22 GB —— 它是**唯一**不随节点回收
+ *    走掉的构建产物,因为集成工作区被复用,永远不会被 `worktree remove`;
+ *  - 系统临时目录里 141 个条目、23 GB,最老的躺了 8 天 —— 席位自己写出去的,
+ *    工作树删掉时一个都不跟着走。
+ */
+describe('集成工作区的构建产物', () => {
+  it('清掉 target/,而目录本身和未被忽略的文件都留着', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a', { status: 'ACCEPTED' })
+    const lease = await p.acquire(n)
+    await writeFile(join((lease as { path: string }).path, 'src.txt'), 'work\n')
+    await p.commitAndMerge(n)
+
+    // 集成工作区里跑过构建:target/ 被 .gitignore 忽略,conflict.txt 只是未跟踪。
+    await mkdir(join(p.integrationPath, 'target'), { recursive: true })
+    await writeFile(join(p.integrationPath, 'target', 'big.bin'), 'x'.repeat(4096))
+    await writeFile(join(p.integrationPath, 'conflict.txt'), '<<<<<<< 现场\n')
+
+    const deps = depsOf(p, { integrationPath: p.integrationPath, dirSizeKb: async () => 12 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.integration?.entryCount).toBeGreaterThanOrEqual(1)
+    expect(plan.integration?.entries.join(' ')).toContain('target/')
+
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.integrationCleaned).toBe(true)
+    expect(await exists(join(p.integrationPath, 'target'))).toBe(false)
+    // 目录本身留着 —— 下一次收口和每一次合并都在它里面发生。
+    expect(await exists(p.integrationPath)).toBe(true)
+    // 未跟踪但**没被忽略**的文件一个都不碰:那可能是一次正在进行的冲突解决现场。
+    // 变异:把 runCleanup 里的 `-X` 换成 `-x` → 这条红。
+    expect(await exists(join(p.integrationPath, 'conflict.txt'))).toBe(true)
+  })
+
+  it('没给 integrationPath 就完全不碰它(旧行为)', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a', { status: 'ACCEPTED' })
+    await p.acquire(n)
+    await p.commitAndMerge(n)
+    await mkdir(join(p.integrationPath, 'target'), { recursive: true })
+    await writeFile(join(p.integrationPath, 'target', 'big.bin'), 'x')
+
+    const deps = depsOf(p)
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.integration).toBeUndefined()
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.integrationCleaned).toBe(false)
+    expect(await exists(join(p.integrationPath, 'target'))).toBe(true)
+  })
+})
+
+describe('系统临时目录里的残留', () => {
+  /** 用一个真目录当 /tmp:接缝要测的是 slug 怎么算、删了没有,不是 node:os 的行为。 */
+  const scratchIn = async (dir: string, names: string[]): Promise<void> => {
+    await mkdir(dir, { recursive: true })
+    for (const n of names) await writeFile(join(dir, n), 'x'.repeat(1024))
+  }
+  const scratchDeps = (dir: string) => ({
+    list: async (slugs: readonly string[]) => {
+      const { readdir } = await import('node:fs/promises')
+      const names = await readdir(dir)
+      return names.filter(n => slugs.some(s => n.includes(s))).map(n => ({ path: join(dir, n), kb: 1 }))
+    },
+    remove: async (path: string) => { await rm(path, { recursive: true, force: true }) },
+  })
+
+  it('按 slug 认得出属于这些任务的那些,删掉;别人的一个不动', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a', { status: 'ACCEPTED' })
+    await p.acquire(n)
+    await p.commitAndMerge(n)
+    const slug = p.worktreePathOf(n).split('/').pop()!
+
+    const tmp = join(worktreeRoot, '..', 'faketmp')
+    await scratchIn(tmp, [
+      `${slug}-target`,          // 这一趟这个节点的
+      `qianbase-${slug}-check.log`, // 同一个 slug,另一种命名
+      'efftask-999-deadbeef-target', // 另一趟 run 的 —— 不许动
+      'unrelated.txt',
+    ])
+
+    const deps = depsOf(p, { scratch: scratchDeps(tmp) })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.scratch.map(s => s.path.split('/').pop()).sort())
+      .toEqual([`${slug}-target`, `qianbase-${slug}-check.log`].sort())
+
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.scratchRemoved).toBe(2)
+    expect(await exists(join(tmp, `${slug}-target`))).toBe(false)
+    // 反向:别人的东西还在。变异:把匹配从 slug 换成「以 efftask 开头」→ 这条红。
+    expect(await exists(join(tmp, 'efftask-999-deadbeef-target'))).toBe(true)
+    expect(await exists(join(tmp, 'unrelated.txt'))).toBe(true)
+  })
+
+  /**
+   * **走 `done` 全体,不走 `items`** —— 和事件日志那份名单同一条规矩。一个工作区早就被
+   * 清掉的节点,`/tmp` 里那几个 GB 照样还在,而它正是攒得最久的那一批。
+   */
+  it('工作区已经不在的节点,它的临时残留照样清得掉', async () => {
+    const p = pool()
+    const n = node('root', { status: 'ACCEPTED' })
+    const slug = p.worktreePathOf(n).split('/').pop()!
+    const tmp = join(worktreeRoot, '..', 'faketmp2')
+    await scratchIn(tmp, [`${slug}-target`])
+
+    const deps = depsOf(p, { scratch: scratchDeps(tmp) })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.items).toEqual([])       // 盘上没有工作区目录
+    expect(plan.absent).toBe(1)
+    expect(plan.scratch).toHaveLength(1) // 而这一份**不是**空的
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.scratchRemoved).toBe(1)
+    expect(await exists(join(tmp, `${slug}-target`))).toBe(false)
+  })
+
+  /**
+   * 退化的 slug 不许进到匹配里 —— 消费者拿它做的是子串匹配 + `rm -rf`。
+   * 变异:把 `.filter(s => s.length >= 8)` 删掉 → 这条红(list 会收到一个 `''`,
+   * 而 `''` 是任何名字的子串)。
+   */
+  it('slug 退化时宁可什么都不清', async () => {
+    const p = pool()
+    const n = node('root', { status: 'ACCEPTED' })
+    let got: readonly string[] | undefined
+    const deps = depsOf(p, {
+      pathFor: () => '/',           // 末段是空
+      scratch: {
+        list: async slugs => { got = slugs; return [] },
+        remove: async () => { throw new Error('不该走到这里') },
+      },
+    })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(got).toBeUndefined()
+    expect(plan.scratch).toEqual([])
   })
 })

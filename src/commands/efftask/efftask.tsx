@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import { access, appendFile, mkdir, readFile, readdir, rename, rmdir, unlink, writeFile } from 'node:fs/promises'
+import { access, appendFile, mkdir, readFile, readdir, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { LocalJSXCommandCall } from '../../types/command.js'
@@ -655,6 +656,43 @@ const duKb = (path: string): Promise<number | undefined> =>
     })
     p.on('error', () => resolve(undefined))
   })
+
+/**
+ * 系统临时目录里属于某些工作区的残留 —— `c` 键的第三份名单(见 `CleanupDeps.scratch`)。
+ *
+ * 跑机实测(qianbase-xtp run 001):`/tmp` 下 141 个条目、23 GB,最老的躺了 8 天。它们是
+ * **子 agent 自己**写出去的(`efftask-001-<slug>-target`、`…-sql-check.log` 之类),所以
+ * 工作树被删掉时一个都不会跟着走,而这一层从来没有人清。
+ *
+ * **只扫顶层,不递归**:要删的东西全都是 `tmpdir()` 下的一级条目,而递归会把一个
+ * `rm -rf` 的输入源扩大到整棵临时目录树。匹配用 `includes(slug)`,slug 的下限由
+ * `scanCleanup` 那一侧守着(它拿不到就不给这里)。
+ */
+const tmpScratch: NonNullable<CleanupDeps['scratch']> = {
+  list: async slugs => {
+    const dir = tmpdir()
+    let names: string[]
+    try {
+      names = await readdir(dir)
+    } catch {
+      // 临时目录读不出来 = 这一格什么都不做。它不该让整屏确认打不开。
+      return []
+    }
+    const out: { path: string; kb?: number }[] = []
+    for (const name of names) {
+      if (!slugs.some(s => name.includes(s))) continue
+      const path = `${dir}/${name}`
+      const kb = await duKb(path)
+      out.push({ path, ...(kb === undefined ? {} : { kb }) })
+    }
+    return out
+  },
+  remove: async path => {
+    // `force` 吞掉「已经不在了」——两次按键之间它完全可能被系统的临时目录清理带走,
+    // 而那不是一个要摆到屏幕上的失败。
+    await rm(path, { recursive: true, force: true })
+  },
+}
 
 /**
  * Build the isolation pool, or report why the run has to share the working tree.
@@ -1666,6 +1704,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       branchFor: n => pool.worktreeBranchOf(n),
       dirSizeKb: duKb,
       persist: { fs: props.fs, runDir },
+      scratch: tmpScratch,
+      // 集成工作区的**构建产物**归这个键管(目录本身永远留着,见 CleanupDeps.integrationPath)。
+      // 跑机上它一个人就是 22 GB。
+      integrationPath: pool.integrationPath,
       onError: e => logError(e),
     }
     // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for a mount

@@ -74,6 +74,33 @@ export interface CleanupDeps {
   dirSizeKb?: (path: string) => Promise<number | undefined>
   /** 清理成功后把 node.worktree 从 node.md 上抹掉。缺省 = 只动 git。 */
   persist?: { fs: FsLike; runDir: string }
+  /**
+   * **系统临时目录里那些席位自己写的东西。**
+   *
+   * 跑机实测(qianbase-xtp run 001):`/tmp` 下有 141 个条目、23 GB,最老的躺了 8 天 ——
+   * `efftask-001-<slug>-target`、`…-sql-check`、`…-cargo-check.log` 之类。它们不是这一层
+   * 造的(`src/tools/efftask/` 全目录没有一处写 `/tmp`),是**子 agent 自己**为了不把
+   * 构建产物塞进工作树而写出去的,所以工作树被删掉时它们一个都不会跟着走。
+   *
+   * 接缝按 **slug 精确匹配**,不按前缀猜:`worktreeSlug` 是 `hash(nodeId)` 算出来的,
+   * 名字里带着它的那些条目和这个节点是一一对应的关系,而「以 efftask 开头」会连上
+   * 别的 run(用户机器上同时存在 001 和 etcd3 那两趟)。
+   */
+  scratch?: {
+    /** 列出名字里含有其中任一 slug 的顶层条目。量不到大小就留 undefined,不编 0。 */
+    list: (slugs: readonly string[]) => Promise<{ path: string; kb?: number }[]>
+    /** 删掉一个条目(可能是目录,也可能是单个文件)。 */
+    remove: (path: string) => Promise<void>
+  }
+  /**
+   * 集成工作区的路径。**给了才会清它的构建产物**。
+   *
+   * 这个目录本身**永远不删** —— 收口、集成验收、之后每一次逐任务合并都在它里面发生,
+   * `init()` 下次运行还要复用它。清的只有 `git clean -X` 认定的**被忽略**的那些
+   * (跑机上是 22 GB 的 `target/`)。未跟踪但没被忽略的文件一个都不碰:那可能是一次
+   * 正在进行的冲突解决留下的现场,而它和构建产物长得完全不一样。
+   */
+  integrationPath?: string
   onError?: (e: Error) => void
 }
 
@@ -123,6 +150,26 @@ export interface CleanupPlan {
   logKb: number
   /** 日志占用是不是每一个都量到了。 */
   logSizeKnown: boolean
+  /**
+   * 临时目录里的残留(见 `CleanupDeps.scratch`)。
+   *
+   * **第三份名单** —— 和 `items`、`logs` 的范围都不一样,理由和 `logs` 那一条同源:
+   * 它认的是 slug,不是盘上还有没有那个工作树。一个早就被清过工作区的节点,`/tmp` 里
+   * 那几个 GB 照样还在,而它恰恰是攒得最久的那一批。
+   */
+  scratch: { path: string; kb?: number }[]
+  scratchKb: number
+  scratchSizeKnown: boolean
+  /**
+   * 集成工作区里会被清掉的构建产物。`undefined` = 没给路径,或者那里根本没有被忽略的东西。
+   */
+  integration?: {
+    path: string
+    /** 被忽略的顶层条目(给人看的前几条)。 */
+    entries: string[]
+    entryCount: number
+    kb?: number
+  }
 }
 
 export interface CleanupOutcome {
@@ -133,6 +180,12 @@ export interface CleanupOutcome {
   /** 真的被删掉的事件日志数,以及它们腾出来的 KB。 */
   logsRemoved: number
   logsFreedKb: number
+  /** 真的被删掉的临时目录条目数,以及它们腾出来的 KB。 */
+  scratchRemoved: number
+  scratchFreedKb: number
+  /** 集成工作区的构建产物清掉了没有(没给路径 / 没东西可清 = false)。 */
+  integrationCleaned: boolean
+  integrationFreedKb: number
   freedKb: number
   sizeKnown: boolean
 }
@@ -246,11 +299,84 @@ export async function scanCleanup(
       logs.push({ nodeId: node.id, title: node.title, ...(kb === undefined ? {} : { kb }) })
     }
   }
+  /**
+   * 临时目录那一份名单。**同样走 `done` 全体** —— 见 CleanupPlan.scratch:它认的是 slug,
+   * 而不是盘上还有没有那个工作树。
+   *
+   * slug 从 `pathFor` 的最后一段取,不在这里重算一遍:`worktreeSlug` 的规则改动的那一天,
+   * 重算的那一份会开始匹配另一批目录,而这里做的是 `rm -rf`(池子路径那条注释同一个理由)。
+   */
+  const scratch: CleanupPlan['scratch'] = []
+  let scratchKb = 0
+  let scratchSizeKnown = true
+  if (deps.scratch) {
+    /**
+     * `length >= 8` 不是洁癖:消费者拿这些 slug 去**子串匹配**系统临时目录里的条目,
+     * 然后 `rm -rf`。一个退化的 slug(路径末尾是空、是 `.`、是单个字符)会匹配上
+     * 半个 `/tmp`。真实的 slug 是 `efftask-<runId>-<8位hash>`,离这条线很远 ——
+     * 它挡的是「`worktreeSlug` 哪天变了或 `pathFor` 返回了个怪东西」的那一天。
+     */
+    const slugs = [...new Set(done.map(n => slugOf(deps.pathFor(n))))].filter(s => s.length >= 8)
+    if (slugs.length > 0) {
+      try {
+        for (const e of await deps.scratch.list(slugs)) {
+          if (e.kb === undefined) scratchSizeKnown = false
+          else scratchKb += e.kb
+          scratch.push(e)
+        }
+      } catch (e) {
+        // 列不出来就当没有 —— 这一格失败不该让整屏确认打不开(工作区那一份才是主菜)。
+        deps.onError?.(e instanceof Error ? e : new Error(String(e)))
+        scratchSizeKnown = false
+      }
+    }
+  }
+
+  /**
+   * 集成工作区的构建产物。**只问被忽略的那些**(`--ignored` 里 `!!` 打头的行)——
+   * 未跟踪但没被忽略的文件不在其中,理由见 `CleanupDeps.integrationPath`。
+   */
+  let integration: CleanupPlan['integration']
+  if (deps.integrationPath) {
+    const st = await deps.git(
+      ['-c', 'core.quotepath=false', 'status', '--porcelain', '--ignored'],
+      deps.integrationPath,
+    )
+    if (st.code === 0) {
+      const ignored = st.stdout
+        .split('\n')
+        .filter(l => l.startsWith('!!'))
+        .map(l => l.slice(2).trim())
+        .filter(Boolean)
+      if (ignored.length > 0) {
+        let kb: number | undefined = 0
+        for (const rel of ignored) {
+          const one = await deps.dirSizeKb?.(`${deps.integrationPath}/${rel}`).catch(() => undefined)
+          if (one === undefined) kb = undefined
+          else if (kb !== undefined) kb += one
+        }
+        integration = {
+          path: deps.integrationPath,
+          entries: ignored.slice(0, 3),
+          entryCount: ignored.length,
+          ...(kb === undefined ? {} : { kb }),
+        }
+      }
+    }
+  }
+
   return {
     targetId, items, kept, unfinished, absent, totalKb,
     sizeKnown: sizeKnown && items.length > 0,
     logs, logKb, logSizeKnown: logSizeKnown && logs.length > 0,
+    scratch, scratchKb, scratchSizeKnown: scratchSizeKnown && scratch.length > 0,
+    ...(integration ? { integration } : {}),
   }
+}
+
+/** 路径的最后一段 —— 工作树目录名就是它的 slug。 */
+function slugOf(path: string): string {
+  return path.split('/').filter(Boolean).pop() ?? ''
 }
 
 /**
@@ -348,9 +474,54 @@ export async function runCleanup(
     }
   }
 
+  /**
+   * 临时目录的残留。**排在工作区之后,失败只记 problem** —— 和事件日志同一条规矩:
+   * 一个删不掉的 `/tmp` 条目不影响这次回收的主要目的,把它算成失败会让「回收了 N 个
+   * 工作区」变成红的。
+   *
+   * 逐条删、逐条记大小:一次 `rm -rf` 整批的写法在这里是错的,因为其中任何一条失败
+   * (权限、正在被写)都会让剩下的全部不了了之,而屏幕上那个「腾出多少」已经承诺过了。
+   */
+  let scratchRemoved = 0
+  let scratchFreedKb = 0
+  if (deps.scratch) {
+    for (const s of plan.scratch) {
+      try {
+        await deps.scratch.remove(s.path)
+        scratchRemoved++
+        scratchFreedKb += s.kb ?? 0
+      } catch (e) {
+        problems.push(`临时目录 ${s.path} 没删掉(${e instanceof Error ? e.message : String(e)})`)
+      }
+    }
+  }
+
+  /**
+   * 集成工作区的构建产物。`git clean -X -d -f`:
+   *  - `-X` **只删被忽略的**(不是 `-x`)—— 未跟踪但没被忽略的文件可能是一次正在进行的
+   *    冲突解决现场,那不是构建产物;
+   *  - `-d` 进入被忽略的目录(不加它,`target/` 这种整目录被忽略的一个字节都清不掉);
+   *  - `-f` 是 git 对删除操作的必答项。
+   *
+   * 这个目录**本身不删**,只清里面的产物 —— 下一次收口、合并还要用它。
+   */
+  let integrationCleaned = false
+  let integrationFreedKb = 0
+  if (plan.integration) {
+    const clean = await deps.git(['clean', '-X', '-d', '-f'], plan.integration.path)
+    if (clean.code === 0) {
+      integrationCleaned = true
+      integrationFreedKb = plan.integration.kb ?? 0
+    } else {
+      problems.push(`集成工作区的构建产物没清掉(${clean.stderr.trim() || `git clean 退出码 ${clean.code}`})`)
+    }
+  }
+
   return {
     removed, failed, problems, freedKb, sizeKnown: sizeKnown && removed.length > 0,
     logsRemoved, logsFreedKb,
+    scratchRemoved, scratchFreedKb,
+    integrationCleaned, integrationFreedKb,
   }
 }
 
@@ -373,6 +544,13 @@ export function formatSize(kb: number | undefined): string {
  */
 export function cleanupLines(plan: CleanupPlan): string[] {
   const out: string[] = []
+  /**
+   * 新加的那几格**必须容得下一个不带它们的 plan**。类型上它们是必填的,而这一屏的
+   * 失败方式是:少一个字段 → 渲染时抛 → 用户看到的不是清单,是一屏红色的 ERROR 栈,
+   * 连「取消」都要靠猜。一次实测(cleanupView 那四条)就是这个形状。
+   */
+  const scratch = plan.scratch ?? []
+  const scratchKb = plan.scratchKb ?? 0
   const size = plan.items.length === 0
     ? ''
     : plan.sizeKnown
@@ -401,6 +579,24 @@ export function cleanupLines(plan: CleanupPlan): string[] {
       : plan.logKb > 0 ? `,至少 ${formatSize(plan.logKb)}(有文件量不到大小)` : '(量不到大小)'
     out.push(`并删除 ${plan.logs.length} 份子 agent 事件日志(agent-log.jsonl)${lsize} —— 只是历史输出记录。`)
   }
+  /**
+   * 临时目录那一段。**必须点名它在系统 `/tmp` 里** —— 用户看着一屏「回收工作区」,
+   * 而这一条删的是项目目录**之外**的东西,那是他最没预期会被动到的地方。
+   */
+  if (scratch.length > 0) {
+    const ssize = plan.scratchSizeKnown
+      ? `,共 ${formatSize(scratchKb)}`
+      : scratchKb > 0 ? `,至少 ${formatSize(scratchKb)}(有条目量不到大小)` : '(量不到大小)'
+    out.push(`并删除系统临时目录里 ${scratch.length} 个属于这些任务的残留${ssize} —— 席位自己写出去的构建目录和检查日志,名字里带着它们的工作区编号。`)
+  }
+  /**
+   * 集成工作区那一段。这一条**必须说出代价**:清掉之后下一次集成验收是全量重编。
+   * 只说「腾出 22 GB」而不说要重编,是拿一句半真话换一次按键。
+   */
+  if (plan.integration) {
+    out.push(`并清掉集成工作区里 ${plan.integration.entryCount} 项构建产物(${plan.integration.entries.join('、')}${plan.integration.entryCount > plan.integration.entries.length ? '…' : ''})${plan.integration.kb === undefined ? '(量不到大小)' : `,共 ${formatSize(plan.integration.kb)}`}。`)
+    out.push('⚠ 它们是被 .gitignore 忽略的构建产物,删掉不丢任何产出,但下一次集成验收会全量重编。')
+  }
   // 措辞逐条点名,不说「任务记录不受影响」那种笼统话:现在**确实**有一样记录会被删,
   // 而一句笼统的保证配上一次真实的删除,就是这一屏最坏的读法。
   out.push('不会动的:node.md(基本信息、状态、方案、评审与验收记录)和 state.jsonl(状态账)一个字节都不碰。')
@@ -412,7 +608,11 @@ export function cleanupLines(plan: CleanupPlan): string[] {
     out.push(`跳过 ${plan.unfinished} 个还没验收的任务 —— 它们的工作区正是现场,不在本次范围。`)
   }
   if (plan.absent > 0) out.push(`另有 ${plan.absent} 个已验收任务在盘上没有工作区目录(清过了,或那一趟没隔离)。`)
-  out.push('集成工作区(.efftask-worktrees/integration)不在范围内:收口和每一次合并都在它里面发生。')
+  // 集成工作区那句话分两半,而且两半都要说:**目录留着**(下一次收口和合并都在它里面
+  // 发生,`init()` 还要复用),**里面的构建产物清掉**。只说前半句是这一屏原来的措辞,
+  // 而它现在会是一句假话。
+  out.push('集成工作区(.efftask-worktrees/integration)本身保留:收口和每一次合并都在它里面发生;'
+    + (plan.integration ? '只清掉它里面被忽略的构建产物。' : '这次它里面没有可清的构建产物。'))
   return out
 }
 
@@ -440,6 +640,13 @@ export function cleanupResultLines(out: CleanupOutcome): string[] {
    */
   if (out.logsRemoved > 0) {
     lines.push(`已删除 ${out.logsRemoved} 份事件日志${out.logsFreedKb > 0 ? `,腾出 ${formatSize(out.logsFreedKb)}` : ''}。`)
+  }
+  // 同上:0 条时一个字都不印。
+  if (out.scratchRemoved > 0) {
+    lines.push(`已删除临时目录里 ${out.scratchRemoved} 个残留${out.scratchFreedKb > 0 ? `,腾出 ${formatSize(out.scratchFreedKb)}` : ''}。`)
+  }
+  if (out.integrationCleaned) {
+    lines.push(`已清掉集成工作区的构建产物${out.integrationFreedKb > 0 ? `,腾出 ${formatSize(out.integrationFreedKb)}` : ''} —— 下一次集成验收会全量重编。`)
   }
   for (const f of out.failed) lines.push(`⚠ ${f.title} 没删掉:${f.why}`)
   for (const p of out.problems) lines.push(`⚠ ${p}`)

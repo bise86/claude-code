@@ -21,10 +21,17 @@ import type Anthropic from '@anthropic-ai/sdk'
 import { withContextNoticeSink } from './contextNoticeSink.js'
 import {
   effectiveErrorStatus,
+  isDeterministicBadRequest,
+  isRetryableGatewayBadRequest,
   isRetryableTransportError,
   transientStatusFromErrorPayload,
 } from './errorPayload.js'
-import { is529Error, shouldRetry, withRetry } from './withRetry.js'
+import {
+  getRetryDelay,
+  is529Error,
+  shouldRetry,
+  withRetry,
+} from './withRetry.js'
 
 /** SDK 在流中途收到 `event: error` 时做的事,逐行照抄 `@anthropic-ai/sdk/core/streaming.js`。 */
 function midStreamError(data: string): APIError {
@@ -220,8 +227,30 @@ describe('归一成状态码', () => {
       undefined,
       new Headers(),
     )
+    // 归一表把 api_error 读成 500,而这里**必须**仍然是 400 —— 400 走的是自己那套
+    // (次数封在 3 次、退避 10→60s),被翻成 500 就会去走通用的 10 次 × 32s。
     expect(effectiveErrorStatus(e)).toBe(400)
-    expect(shouldRetry(e)).toBe(false)
+  })
+
+  /**
+   * 同一个形状在**重试判据**上的归属:400 现在按「网关形状」重试(见下面那一档),
+   * 而确定性的那一半仍然当场失败。这条钉的是「翻案与否」和「重不重试」是两件事。
+   */
+  it('真 400 的重试与否由 400 自己那套判据决定,不由归一表决定', () => {
+    const gateway = new APIError(
+      400,
+      { type: 'error', error: { type: 'api_error', message: 'bad request' } },
+      undefined,
+      new Headers(),
+    )
+    expect(shouldRetry(gateway)).toBe(true)
+    const deterministic = new APIError(
+      400,
+      { type: 'error', error: { type: 'invalid_request_error', message: 'messages: at least one message is required' } },
+      undefined,
+      new Headers(),
+    )
+    expect(shouldRetry(deterministic)).toBe(false)
   })
 })
 
@@ -351,3 +380,173 @@ describe('传输层失败(连 APIError 都不是的那一类)', () => {
     expect(attempts).toBe(1)
   }, 30_000)
 })
+
+/**
+ * **400 也重试** —— 但只重试「网关自己吐的」那一半。
+ *
+ * 跑机实测(qianbase-xtp run 001,7 个节点各一次):
+ *
+ *     POST http://10.10.20.21:3000/v1/responses → 400 Bad Request · 上游原文:
+ *     {"error":{"message":"Stream must be set to true","type":"bad_response_status_code",…}}
+ *
+ * 这一档的两侧同样重要:**放行网关形状**(正向),**挡住四类确定性 400**(反向)。少了反向
+ * 那一半,把 `isDeterministicBadRequest` 写成 `return false` 也能让正向全绿 —— 而那正是
+ * 「一个必死的 400 把一席堵满 8 分钟」的形态。
+ */
+describe('网关形状的 400', () => {
+  /** SDK 拿到一个**真的** HTTP 400 时造出来的东西。 */
+  function badRequest(body: unknown): APIError {
+    return new APIError(400, body, undefined, new Headers())
+  }
+
+  /**
+   * 翻译层(`openaiCompat/roleFetch.ts`)的形状:外层 type 是 `api_error`,网关原文
+   * **整段塞在 message 里**。判据必须扫到 message,否则结构化字段永远只看到 api_error。
+   */
+  function roleFetch400(upstream: string): APIError {
+    return badRequest({
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: `员工「测试」(openai-responses 协议)调用失败 · POST http://10.10.20.21:3000/v1/responses → 400 Bad Request · 上游原文:${upstream}`,
+      },
+    })
+  }
+
+  /** 主判据。变异:`isRetryableGatewayBadRequest` 恒返回 false → 这条红。 */
+  it('跑机实测那句 Stream must be set to true 会重试', () => {
+    const e = roleFetch400(
+      '{"error":{"message":"Stream must be set to true","type":"bad_response_status_code","param":"","code":"bad_response_status_code"}}',
+    )
+    expect(e.status).toBe(400)
+    expect(shouldRetry(e)).toBe(true)
+  })
+
+  it('网关把自己的故障写成 400 的那些,也重试', () => {
+    expect(shouldRetry(badRequest({ error: { message: 'upstream connect error', code: 'bad_gateway' } }))).toBe(true)
+    expect(shouldRetry(badRequest('Bad Request'))).toBe(true)
+  })
+
+  /**
+   * 反向 ①:提示词超长。它有压缩重发那条专门的路(`PROMPT_SHRINK_RATIOS`),
+   * 原样重发三次只是把该说的那句话推迟半分钟。
+   */
+  it('提示词超长的 400 仍然不重试', () => {
+    const e = badRequest({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'prompt is too long: 250000 tokens > 200000 maximum' },
+    })
+    expect(shouldRetry(e)).toBe(false)
+  })
+
+  /**
+   * 反向 ②:**同一件事经翻译层出来**。外层是 api_error,只有 message 里那段原文能说明
+   * 它是长度问题。变异:把 `isDeterministicBadRequest` 的文本兜底删掉 → 这条红。
+   */
+  it('翻译层包过一层的长度类 400,仍然认得出来', () => {
+    const e = roleFetch400(
+      '{"error":{"message":"This model\'s maximum context length is 128000 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}',
+    )
+    expect(isDeterministicBadRequest(e)).toBe(true)
+    expect(shouldRetry(e)).toBe(false)
+  })
+
+  /** 反向 ③:工具块对不上 —— 重发的是同一段坏掉的历史。 */
+  it('tool_use id 重复的 400 仍然不重试', () => {
+    const e = badRequest({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'messages.12: `tool_use` ids must be unique' },
+    })
+    expect(shouldRetry(e)).toBe(false)
+  })
+
+  /** 反向 ④:配置错。 */
+  it('模型名写错的 400 仍然不重试', () => {
+    expect(shouldRetry(badRequest({ error: { message: 'The model `gpt-9` does not exist', code: 'model_not_found' } }))).toBe(false)
+  })
+
+  /** 判据只管 400 —— 别的状态码有各自的策略,不该从这条路进来。 */
+  it('只对 400 生效', () => {
+    expect(isRetryableGatewayBadRequest(new APIError(500, {}, undefined, new Headers()))).toBe(false)
+    expect(isRetryableGatewayBadRequest(new APIError(429, {}, undefined, new Headers()))).toBe(false)
+    expect(isRetryableGatewayBadRequest(new APIError(undefined, { type: 'error', error: { type: 'api_error' } }, undefined, new Headers()))).toBe(false)
+  })
+
+  /**
+   * 退避的两个端点。10s 起、翻倍、封顶 60s —— 抖动只往上加(≤25%),所以下界就是基数。
+   * 变异:把 `baseDelayMs` 这个新参数去掉(回落到 500ms)→ 这条红。
+   */
+  it('退避是 10→20→40,封顶 60', () => {
+    const at = (n: number) => getRetryDelay(n, null, 60_000, 10_000)
+    expect(at(1)).toBeGreaterThanOrEqual(10_000)
+    expect(at(1)).toBeLessThan(12_500 + 1)
+    expect(at(2)).toBeGreaterThanOrEqual(20_000)
+    expect(at(3)).toBeGreaterThanOrEqual(40_000)
+    expect(at(9)).toBeLessThanOrEqual(60_000 * 1.25)
+    expect(at(9)).toBeGreaterThanOrEqual(60_000)
+  })
+
+  /**
+   * **封顶真的存在**。用 `CLAUDE_CODE_MAX_400_RETRIES=0` 量:一个必死的 400 在真循环里
+   * 只调用一次就结束,而不是走满通用的那 10 次。
+   *
+   * 变异:把主循环里 `badRequestRetries > getMaxBadRequestRetries()` 那一段删掉 →
+   * 这条会跑满 10 次(并且要等好几分钟)→ 红。
+   */
+  it('真循环:次数用完当场结束,不占用通用的 10 次', async () => {
+    const prev = process.env.CLAUDE_CODE_MAX_400_RETRIES
+    process.env.CLAUDE_CODE_MAX_400_RETRIES = '0'
+    let attempts = 0
+    try {
+      const gen = withRetry(
+        async () => ({}) as Anthropic,
+        async () => {
+          attempts++
+          throw badRequest({ error: { message: 'Stream must be set to true', code: 'bad_response_status_code' } })
+        },
+        { model: 'claude-opus-5', thinkingConfig: { type: 'disabled' }, maxRetries: 10 },
+      )
+      try {
+        let out = await gen.next()
+        while (out.done !== true) out = await gen.next()
+      } catch { /* CannotRetryError —— 正是要的 */ }
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_MAX_400_RETRIES
+      else process.env.CLAUDE_CODE_MAX_400_RETRIES = prev
+    }
+    expect(attempts).toBe(1)
+  }, 30_000)
+
+  /**
+   * 而次数没用完的时候它**真的会再发一次** —— 这一条是从真循环外面看的正向探针。
+   * 要等一次真实退避(10s),所以只留一次重试。
+   */
+  it('真循环:网关 400 一次之后,第二次拿到答案', async () => {
+    const prev = process.env.CLAUDE_CODE_MAX_400_RETRIES
+    process.env.CLAUDE_CODE_MAX_400_RETRIES = '1'
+    let attempts = 0
+    let value: unknown
+    try {
+      const gen = withRetry(
+        async () => ({}) as Anthropic,
+        async () => {
+          attempts++
+          if (attempts < 2) {
+            throw badRequest({ error: { message: 'Stream must be set to true', code: 'bad_response_status_code' } })
+          }
+          return '答上来了'
+        },
+        { model: 'claude-opus-5', thinkingConfig: { type: 'disabled' }, maxRetries: 10 },
+      )
+      let out = await gen.next()
+      while (out.done !== true) out = await gen.next()
+      value = out.value
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_MAX_400_RETRIES
+      else process.env.CLAUDE_CODE_MAX_400_RETRIES = prev
+    }
+    expect(value).toBe('答上来了')
+    expect(attempts).toBe(2)
+  }, 40_000)
+})
+

@@ -46,7 +46,11 @@ import {
 } from '../rateLimitMocking.js'
 import { reportContextNotice } from './contextNoticeSink.js'
 import { REPEATED_529_ERROR_MESSAGE } from './errors.js'
-import { effectiveErrorStatus, isRetryableTransportError } from './errorPayload.js'
+import {
+  effectiveErrorStatus,
+  isRetryableGatewayBadRequest,
+  isRetryableTransportError,
+} from './errorPayload.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
 
 const abortError = () => new APIUserAbortError()
@@ -55,6 +59,21 @@ const DEFAULT_MAX_RETRIES = 10
 const FLOOR_OUTPUT_TOKENS = 3000
 const MAX_529_RETRIES = 3
 export const BASE_DELAY_MS = 500
+
+/**
+ * 网关形状的 400 —— **自己一套次数和退避**(判据见 errorPayload.isRetryableGatewayBadRequest)。
+ *
+ * 为什么不跟着通用的那 10 次走:400 里认不出来的那些,默认方向是「重试」,也就是说
+ * 一个我们没认出来的确定性 400 会被白试。跟着 10 次 + 32s 封顶走,它能把一席堵满
+ * 8 分钟,而 20 席并发时是 20 席一起堵。单独封在 3 次 × 最长 60s 以内,最坏 70 秒。
+ *
+ * 退避的两个端点是**给定的**(10s 起、60s 封顶),所以 `Retry-After` 也被夹在这个区间里 ——
+ * 别处让 `Retry-After` 越过封顶是对的(那是服务端在说自己什么时候好),但 400 这一类
+ * 本来就是「网关自己也没说清」,一个越界的头没有资格改这两个端点。
+ */
+const BAD_REQUEST_BASE_DELAY_MS = 10_000
+const BAD_REQUEST_MAX_DELAY_MS = 60_000
+const DEFAULT_MAX_BAD_REQUEST_RETRIES = 3
 
 // Foreground query sources where the user IS blocking on the result — these
 // retry on 529. Everything else (summaries, titles, suggestions, classifiers)
@@ -187,6 +206,8 @@ export async function* withRetry<T>(
   }
   let client: Anthropic | null = null
   let consecutive529Errors = options.initialConsecutive529Errors ?? 0
+  /** 网关形状的 400 用掉了几次。**累计,不是连续** —— 见下面封顶那一段。 */
+  let badRequestRetries = 0
   let lastError: unknown
   let persistentAttempt = 0
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
@@ -367,6 +388,25 @@ export async function* withRetry<T>(
         }
       }
 
+      /**
+       * 网关形状的 400 单独封顶。
+       *
+       * **累计而不是「连续」**:429 那个计数器可以清零,因为一次成功证明容量确实回来了;
+       * 而 400 这一类里,我们没认出来的确定性错误**每一次都长得一模一样**。用连续计数的话,
+       * 一个「奇数次成功、偶数次 400」的网关能让它无限试下去,而那正是这个封顶要挡的。
+       *
+       * 判据放在闸门**之前**:走到 `shouldRetry` 的时候次数已经用完了,而那个函数拿不到
+       * 这一趟的计数(它是纯函数,只看一个错误对象)。
+       */
+      const gatewayBadRequest =
+        error instanceof APIError && isRetryableGatewayBadRequest(error)
+      if (gatewayBadRequest) {
+        badRequestRetries++
+        if (badRequestRetries > getMaxBadRequestRetries()) {
+          throw new CannotRetryError(error, retryContext)
+        }
+      }
+
       // Only retry if the error indicates we should
       const persistent =
         isPersistentRetryEnabled() && isTransientCapacityError(error)
@@ -473,6 +513,25 @@ export async function* withRetry<T>(
           ),
           PERSISTENT_RESET_CAP_MS,
         )
+      } else if (gatewayBadRequest) {
+        /**
+         * 10s 起、翻倍、封顶 60s,而且**两端都是硬的** —— `getRetryDelay` 里
+         * `Retry-After` 会越过 `maxDelayMs`(那是有意的),但 400 这一类不给它这个资格:
+         * 见 BAD_REQUEST_BASE_DELAY_MS 那一段。抖动只会往上加,所以下界夹在取抖动之后
+         * 仍然是 10s。
+         */
+        delayMs = Math.min(
+          Math.max(
+            getRetryDelay(
+              badRequestRetries,
+              retryAfter,
+              BAD_REQUEST_MAX_DELAY_MS,
+              BAD_REQUEST_BASE_DELAY_MS,
+            ),
+            BAD_REQUEST_BASE_DELAY_MS,
+          ),
+          BAD_REQUEST_MAX_DELAY_MS,
+        )
       } else {
         delayMs = getRetryDelay(attempt, retryAfter)
       }
@@ -571,6 +630,7 @@ export function getRetryDelay(
   attempt: number,
   retryAfterHeader?: string | null,
   maxDelayMs = 32000,
+  baseDelayMs = BASE_DELAY_MS,
 ): number {
   if (retryAfterHeader) {
     const seconds = parseInt(retryAfterHeader, 10)
@@ -580,7 +640,7 @@ export function getRetryDelay(
   }
 
   const baseDelay = Math.min(
-    BASE_DELAY_MS * Math.pow(2, attempt - 1),
+    baseDelayMs * Math.pow(2, attempt - 1),
     maxDelayMs,
   )
   const jitter = Math.random() * 0.25 * baseDelay
@@ -832,6 +892,16 @@ export function shouldRetry(error: APIError): boolean {
     return true
   }
 
+  /**
+   * **网关形状的 400 也重试** —— 判据和它为什么把默认方向反过来,见
+   * `errorPayload.isRetryableGatewayBadRequest`。
+   *
+   * 位置在 `parseMaxTokensContextOverflowError` **之后**是必须的:那一条是「改小
+   * max_tokens 再发」的受控重试,而这里发的是原样的同一个请求。次数与退避由主循环
+   * 单独管(`DEFAULT_MAX_BAD_REQUEST_RETRIES`),不走那 10 次。
+   */
+  if (status === 400) return isRetryableGatewayBadRequest(error)
+
   // Retry internal errors.
   if (status >= 500) return true
 
@@ -846,6 +916,19 @@ export function getDefaultMaxRetries(): number {
 }
 function getMaxRetries(options: RetryOptions): number {
   return options.maxRetries ?? getDefaultMaxRetries()
+}
+
+/**
+ * 网关形状的 400 最多试几次。默认 3 —— 调大了才碰得到 60s 那个封顶(3 次是 10/20/40s)。
+ * 认不出来的值(负数、NaN)一律回落到默认:这个数字直接决定一个必死的 400 能堵多久。
+ */
+export function getMaxBadRequestRetries(): number {
+  const raw = process.env.CLAUDE_CODE_MAX_400_RETRIES
+  if (raw) {
+    const n = parseInt(raw, 10)
+    if (Number.isFinite(n) && n >= 0) return n
+  }
+  return DEFAULT_MAX_BAD_REQUEST_RETRIES
 }
 
 const DEFAULT_FAST_MODE_FALLBACK_HOLD_MS = 30 * 60 * 1000 // 30 minutes

@@ -925,6 +925,15 @@ describe('清理已完成工作区的接线不能被静默剪断', () => {
     expect(SRC).toContain('integrationBranch: pool.integrationBranchName')
     // 少了 persist,目录删了而 node.md 还指着它 —— 下次 --resume 读回一条指向空气的记录。
     expect(SRC).toContain('persist: { fs: props.fs, runDir }')
+    /**
+     * 磁盘被撑爆的那两个大头也归这个键管(跑机 qianbase-xtp run 001:盘 100% 满、
+     * 84 次 ENOSPC)。它们是**纯接线** —— 判据全在 cleanupWorktrees.ts 里被真 git 测过,
+     * 而这两行剪断之后那些用例照样全绿,屏幕上却再也不会出现这两段:
+     *  - 集成工作区的 target/(那一趟 22 GB):它永远不被 worktree remove,只能从这里清;
+     *  - 系统临时目录里按 slug 认出来的残留(那一趟 141 个条目、23 GB)。
+     */
+    expect(SRC).toContain('scratch: tmpScratch')
+    expect(SRC).toContain('integrationPath: pool.integrationPath')
   })
 
   it('确认之后真的会去扫、去删,并把结果推回界面', () => {

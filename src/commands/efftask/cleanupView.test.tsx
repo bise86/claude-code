@@ -74,6 +74,7 @@ const PLAN = (over: Partial<CleanupPlan> = {}): CleanupPlan => ({
   }],
   kept: [], unfinished: 1, absent: 0, totalKb: 3 * 1024 * 1024, sizeKnown: true,
   logs: [], logKb: 0, logSizeKnown: false,
+  scratch: [], scratchKb: 0, scratchSizeKnown: false,
   ...over,
 })
 
