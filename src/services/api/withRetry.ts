@@ -46,7 +46,7 @@ import {
 } from '../rateLimitMocking.js'
 import { reportContextNotice } from './contextNoticeSink.js'
 import { REPEATED_529_ERROR_MESSAGE } from './errors.js'
-import { effectiveErrorStatus } from './errorPayload.js'
+import { effectiveErrorStatus, isRetryableTransportError } from './errorPayload.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
 
 const abortError = () => new APIUserAbortError()
@@ -377,8 +377,20 @@ export async function* withRetry<T>(
       // AWS/GCP errors aren't always APIError, but can be retried
       const handledCloudAuthError =
         handleAwsCredentialError(error) || handleGcpCredentialError(error)
+      /**
+       * **传输层的失败也不是 APIError,同样可以重试**(见 errorPayload.isRetryableTransportError)。
+       *
+       * 这道闸原来的写法是「不是 APIError 就一定不重试」。而 Bun 的 fetch 在**响应流被中途
+       * 掐断**时抛的是一个普通 Error —— 那时候 SDK 早把响应交出去了,不会再包成
+       * APIConnectionError。跑机实测:这一趟每一个杀掉席位的错误都是这一类。
+       *
+       * 放在 `shouldRetry` 那一侧治不了:它的形参就是 `APIError`,而问题恰恰是错误根本
+       * 到不了那儿。所以判据必须加在**闸上**。
+       */
+      const transport = isRetryableTransportError(error)
       if (
         !handledCloudAuthError &&
+        !transport &&
         (!(error instanceof APIError) || !shouldRetry(error))
       ) {
         throw new CannotRetryError(error, retryContext)

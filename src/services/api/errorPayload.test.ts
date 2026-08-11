@@ -21,6 +21,7 @@ import type Anthropic from '@anthropic-ai/sdk'
 import { withContextNoticeSink } from './contextNoticeSink.js'
 import {
   effectiveErrorStatus,
+  isRetryableTransportError,
   transientStatusFromErrorPayload,
 } from './errorPayload.js'
 import { is529Error, shouldRetry, withRetry } from './withRetry.js'
@@ -222,4 +223,131 @@ describe('归一成状态码', () => {
     expect(effectiveErrorStatus(e)).toBe(400)
     expect(shouldRetry(e)).toBe(false)
   })
+})
+
+/**
+ * **同一个洞低一层:传输层的错连 APIError 都不是。**
+ *
+ * 上面那一档治的是「有错误体、没状态码」。跑机(qianbase-xtp run 001)在那之后的日志里,
+ * **每一个**杀掉席位的错误都换成了这一类,16/20 逐字是
+ *
+ *     角色调用失败: API Error: The socket connection was closed unexpectedly.
+ *     For more information, pass `verbose: true` in the second argument to fetch()
+ *
+ * 那是 Bun 的 fetch 在**消费响应流**时抛的普通 Error —— SDK 只包装 `fetch()` 本身抛出的
+ * 异常,流是后来才炸的,所以既不是 APIError 也不是 APIConnectionError。而 `withRetry`
+ * 那道闸写的是「不是 APIError 就一定不重试」。
+ */
+describe('传输层失败(连 APIError 都不是的那一类)', () => {
+  /** Bun 在流被中途掐断时抛的那一个,逐字。 */
+  const bunSocketClose = (): Error =>
+    new Error(
+      'The socket connection was closed unexpectedly. For more information, ' +
+      'pass `verbose: true` in the second argument to fetch()',
+    )
+
+  it('跑机上那 16 次:socket 被掐断,现在算可重试', () => {
+    expect(isRetryableTransportError(bunSocketClose())).toBe(true)
+  })
+
+  it('按错误码认(ECONNRESET / undici 的超时)', () => {
+    expect(isRetryableTransportError(Object.assign(new Error('read'), { code: 'ECONNRESET' }))).toBe(true)
+    expect(isRetryableTransportError(Object.assign(new Error('x'), { code: 'UND_ERR_HEADERS_TIMEOUT' }))).toBe(true)
+  })
+
+  /**
+   * **最常见的形状:外层文本太笼统,真因挂在 `cause` 上。**
+   *
+   * 外层**故意不用** `fetch failed` —— 那一句本身就在文本表里,拿它做输入的话
+   * 第一层就返回 true,`cause` 那条递归一次都不执行。第一版探针就是这么写的,
+   * 变异测试当场证明:剪掉整条 `cause` 递归,22 条测试一条不红。
+   */
+  it('穿透 cause:外层文本不匹配,真因在 cause 上(ECONNRESET)', () => {
+    const inner = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
+    const outer = Object.assign(new Error('request to http://10.10.20.9/v1 did not complete'), { cause: inner })
+    expect(isRetryableTransportError(outer)).toBe(true)
+    // 反证外层自己不算数,这条测的确实是递归。
+    expect(isRetryableTransportError(new Error('request to http://10.10.20.9/v1 did not complete'))).toBe(false)
+  })
+
+  /** undici 真实的形状。它靠外层文本就能认出来 —— 记在这里免得有人以为上一条多余。 */
+  it('undici 的 TypeError: fetch failed 靠外层文本就认得', () => {
+    expect(isRetryableTransportError(new TypeError('fetch failed'))).toBe(true)
+  })
+
+  it('cause 成环也不挂(深度有界)', () => {
+    const a = new Error('outer') as Error & { cause?: unknown }
+    const b = new Error('inner') as Error & { cause?: unknown }
+    a.cause = b
+    b.cause = a
+    expect(isRetryableTransportError(a)).toBe(false)
+  })
+
+  /**
+   * **中止不是传输故障。** 用户按 Esc、阶段超时闸门开火,底层长得和「连接断了」一模一样;
+   * 当成故障重试 = 用户按了停止之后又跑十次。`roleFetch` 的 catch 里为同一件事写过同一条例外。
+   */
+  it('AbortError 不重试,哪怕它同时长着一句 socket 文本', () => {
+    expect(isRetryableTransportError(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }))).toBe(false)
+    const aborted = Object.assign(bunSocketClose(), { name: 'AbortError' })
+    expect(isRetryableTransportError(aborted)).toBe(false)
+  })
+
+  /**
+   * **配置错不重试。** 域名打错一个字母、网关没起 —— 重试十次只是把一句能看懂的报错
+   * 换成五分钟之后的同一句。和归一表那边「认不出来的一律沿用旧行为」同源。
+   */
+  it('ENOTFOUND / ECONNREFUSED 仍然当场失败', () => {
+    expect(isRetryableTransportError(Object.assign(new Error('getaddrinfo ENOTFOUND typo.example'), { code: 'ENOTFOUND' }))).toBe(false)
+    expect(isRetryableTransportError(Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }))).toBe(false)
+  })
+
+  it('普通的业务异常不受影响', () => {
+    expect(isRetryableTransportError(new Error('方案解析失败'))).toBe(false)
+    expect(isRetryableTransportError(null)).toBe(false)
+    expect(isRetryableTransportError('socket connection was closed')).toBe(false) // 字符串不是错误对象
+  })
+
+  /**
+   * 从**真的** `withRetry` 循环外面看。这一条才是用户报的那件事:
+   * 修之前它在第一次就 `CannotRetryError`,那一席当场死掉。
+   *
+   * 变异:把闸上的 `!transport &&` 删掉 → 这条红。
+   */
+  it('真循环:socket 断两次,第三次拿到答案', async () => {
+    let attempts = 0
+    const gen = withRetry(
+      async () => ({}) as Anthropic,
+      async () => {
+        attempts++
+        if (attempts < 3) throw bunSocketClose()
+        return '答上来了'
+      },
+      { model: 'claude-opus-5', thinkingConfig: { type: 'disabled' }, maxRetries: 3 },
+    )
+    let out = await gen.next()
+    while (out.done !== true) out = await gen.next()
+    expect(out.value).toBe('答上来了')
+    expect(attempts).toBe(3)
+  }, 30_000)
+
+  /** 反向:中止在真循环里**一次都不重试**(否则 Esc 会变成十次调用)。 */
+  it('真循环:AbortError 当场结束,只调用一次', async () => {
+    let attempts = 0
+    const gen = withRetry(
+      async () => ({}) as Anthropic,
+      async () => {
+        attempts++
+        throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
+      },
+      { model: 'claude-opus-5', thinkingConfig: { type: 'disabled' }, maxRetries: 3 },
+    )
+    await (async () => {
+      try {
+        let out = await gen.next()
+        while (out.done !== true) out = await gen.next()
+      } catch { /* CannotRetryError —— 正是要的 */ }
+    })()
+    expect(attempts).toBe(1)
+  }, 30_000)
 })
