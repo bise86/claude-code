@@ -31,7 +31,18 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 
-export type ContextNoticeKind = 'tool-result-persisted' | 'ptl-volume-shrink'
+export type ContextNoticeKind =
+  | 'tool-result-persisted'
+  | 'ptl-volume-shrink'
+  /**
+   * 上游报错、正在退避重试。
+   *
+   * 严格说它改的不是「上下文」,借道这里是因为这是**子 agent 那条路上唯一看得见的旁路**
+   * (上面那段解释了为什么不能用 addNotification)。而它必须被看见:一次 10 连重试的
+   * 退避加起来能有两分半,期间席位窗口上一个字都不会动 —— 和「这一席挂死了」长得一模一样,
+   * 而用户上一次为这类静默付的代价就是那句「没看到日志」。
+   */
+  | 'api-retry'
 
 export interface ContextNotice {
   kind: ContextNoticeKind

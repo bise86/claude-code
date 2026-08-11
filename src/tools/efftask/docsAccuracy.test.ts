@@ -501,14 +501,17 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
      * 永远不触发静默阀,而它和挂死是同一类故障。文档承诺了倍数和「设 0 一起关掉」,
      * 两条都要能在代码里对上 —— 一个只写在 README 里的阀等于没有阀。
      */
-    expect(README).toContain(norm('| 总时长 | 这一次调用**总共**跑了多久（× 6） | 1 小时 |'))
+    expect(README).toContain(norm('| 总时长 | 多久**没能完成一条完整消息**（× 6） | 1 小时 |'))
     expect(README).toContain(norm('把 `caps.nodeTimeoutMs` 设成 0 会把两条一起关掉'))
     expect(TOTAL_LIMIT_FACTOR).toBe(6)
     const src = readFileSync(new URL('src/tools/efftask/runAgentAdapter.ts', ROOT), 'utf8')
     // 设 0 时总上限也是 0(禁用)—— 这一句就是「一起关掉」的全部实现。
     expect(src).toContain('const totalLimitMs = limitMs && limitMs > 0 ? limitMs * TOTAL_LIMIT_FACTOR : 0')
+    // 文档说它量的是「自上一条完整消息以来」,判据就得真的从那个时刻算起 ——
+    // 这一句写成 `now - startedAt` 的那一版,会把跑一小时的大执行节点当滴水上游杀掉。
+    expect(src).toContain('now - lastMessageAt >= totalLimitMs')
     // 而两条都不含等人的那段时间。
-    expect(src).toContain('humanSpentMs += Date.now() - humanWaitFrom')
+    expect(src).toContain('lastMessageAt += Date.now() - humanWaitFrom')
     expect(README).toContain(norm('两条都**不含等你批工具权限的时间**'))
   })
 

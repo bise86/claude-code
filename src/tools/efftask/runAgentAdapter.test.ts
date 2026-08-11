@@ -1193,6 +1193,32 @@ describe('两个时钟:等人回答不能算进接口超时', () => {
     expect(ticks).toBeGreaterThan(5)
   })
 
+  it('**一直在完成消息的长调用不该被总时长杀掉** —— 跑机上它杀错了一个小时的真活', async () => {
+    /**
+     * 真实跑机(qianbase-xtp run 001)的那个节点,数字逐字抄在这里:
+     *
+     *     phaseMs.EXECUTING = 3600567   usage.calls = 103   input = 2.49M   capCategory: timeout
+     *     blockedReason: 阶段调用总时长超限(3600000 ms):一直有输出但迟迟不结束,已中止
+     *
+     * 一小时里 103 次真实模型调用 —— 那是一个大执行节点正常的样子,不是滴水。旧判据量的是
+     * 「这次调用总共跑了多久」,于是它必然在整点开火,而给出的建议是「把这个节点拆小」。
+     *
+     * 这条用例就是那个节点的缩微版:总上限 300ms(50 × 6),但每 40ms 完成一条**完整消息**,
+     * 一共跑 600ms —— 远超旧上限。变异:把判据换回 `now - startedAt` → 这条立刻红。
+     */
+    let msgs = 0
+    async function* busy(): AsyncGenerator<never> {
+      for (let i = 0; i < 15; i++) {
+        await new Promise(r => setTimeout(r, 40))
+        msgs++
+        yield { type: 'assistant', message: { content: [{ type: 'text', text: `第${i}步 ` }] } } as never
+      }
+    }
+    const text = await call(makeRunAgentFn(deps(busy, { timeoutMs: 50 })))
+    expect(msgs).toBe(15)
+    expect(text).toContain('第14步')
+  })
+
   it('总时长上限跟着 timeoutMs=0(禁用)一起关掉 —— 「关掉超时」要真的关掉', async () => {
     // 留一个用户没听说过的上限,比没有上限更糟。
     let ticks = 0

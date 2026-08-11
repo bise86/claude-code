@@ -28,7 +28,7 @@ export type TimeoutKind =
   /** 等人回答工具权限确认。 */
   | 'human'
   /**
-   * 总时长:一直在吐字,但这一次调用久到不像话。
+   * 一直在吐字,但**迟迟凑不出一条完整消息**。
    *
    * **是 stall 修好之后新开的洞。** 在「流式增量算进展」之前,`nodeTimeoutMs` 顺带给了
    * 每一次调用一个总时长上限(错的判据、对的边界);之后一个每分钟吐一个 token 的上游
@@ -37,6 +37,24 @@ export type TimeoutKind =
    *
    * 上限取 `nodeTimeoutMs × TOTAL_LIMIT_FACTOR`(默认 10 分钟 × 6 = 1 小时),
    * 用同一个旋钮,不再多一个要解释的数。补救建议也不同:它不是「没反应」,是「太慢」。
+   *
+   * ## 量的是「自上一条完整消息以来」,不是「这次调用总共跑了多久」
+   *
+   * 前一版量的是后者,而它在真实跑机上杀错了人(qianbase-xtp run 001):
+   *
+   *     phaseMs.EXECUTING = 3600567   usage.calls = 103   input = 2.49M
+   *     blockedReason: 阶段调用总时长超限(3600000 ms)…
+   *
+   * 一小时里 **103 次真实模型调用**、几百次工具往返,一个大执行节点就是这样的 ——
+   * 它一秒都没滴水,却拿到一句「一直有输出但迟迟不结束」和一条「把节点拆小」的建议。
+   * 而阀本来要拦的滴水式上游,特征恰恰是**攒不满一条消息**:每分钟一个 token 的端点
+   * 想凑够一条 500 token 的回答要 8 小时,照样在这个预算上开火。
+   *
+   * 也就是说,换成「自上一条完整消息以来」之后,该拦的一个没漏,不该拦的一个不碰。
+   * 放弃的是「单次调用的绝对墙钟上限」:一个**一直在完成消息**的子 agent(比如卡在工具
+   * 循环里反复干同一件事)不再被这一条掐掉。那不是这个阀设计要拦的故障,也不该由它
+   * 冒着杀错一小时真活的风险去兼职 —— 而且再加一个用户没听说过的绝对上限,正是这个
+   * 文件下面 `timeoutMs = 0` 那一段明确反对的做法。
    */
   | 'total'
 
@@ -87,9 +105,9 @@ export function pollIntervalMs(limitMs: number | undefined): number {
 /**
  * 总时长上限 = 静默预算的几倍。
  *
- * 6 不是随便取的:静默预算的语义是「多久没动静算挂死」,而一次**正常**的长调用
- * (读二十个文件、跑一遍测试、改几处代码)可以是它的好几倍。取 6 让默认配置下的绝对
- * 上限落在 1 小时 —— 比任何一次健康的阶段调用都长,又不至于让一个滴水的上游挂一整天。
+ * 6 不是随便取的:静默预算的语义是「多久没动静算挂死」,而**攒一条完整消息**
+ * (一段长思考、一次读二十个文件的工具轮次)可以是它的好几倍。取 6 让默认配置下这个
+ * 上限落在 1 小时 —— 比任何一条健康的消息都长,又不至于让一个滴水的上游挂一整天。
  */
 export const TOTAL_LIMIT_FACTOR = 6
 
@@ -111,8 +129,8 @@ export class PhaseTimeoutError extends Error {
         ? `等待人工确认超时(${limitMs} ms):没有人回答工具权限确认,已中止`
         : kind === 'total'
           // 这一句**必须**和静默那句分得开:它一直在吐字,叫用户去调静默预算或者
-          // 「检查网络」都不对症 —— 该看的是这一席为什么这么慢(或者这个节点太大了)。
-          ? `阶段调用总时长超限(${limitMs} ms):一直有输出但迟迟不结束,已中止`
+          // 「检查网络」都不对症 —— 该看的是这个端点为什么连一条消息都攒不出来。
+          ? `阶段调用总时长超限(${limitMs} ms):一直有输出,但这么久都没能完成一条消息,已中止`
           : `阶段调用超时(${limitMs} ms):静默超过该时长没有任何输出,已中止`,
     )
     this.name = 'PhaseTimeoutError'
@@ -486,7 +504,9 @@ export function makeRunAgentFn(deps: {
       } finally {
         // 等人这段时间从**总时长**里扣掉 —— 静默时钟本来就不走它(轮询器里那条早退),
         // 而总时长如果算上它,用户去倒杯水回来会看到一次「总时长超限」。
-        if (humanWaitFrom !== undefined) humanSpentMs += Date.now() - humanWaitFrom
+        // 扣法是把原点往后推同样长:总时长量的是「自上一条完整消息以来」,而等人的
+        // 那段时间里本来就不可能有新消息到达。
+        if (humanWaitFrom !== undefined) lastMessageAt += Date.now() - humanWaitFrom
         humanWaitFrom = undefined
         markProgress()
         // finally 里发,所以用户拒绝、超时中止、provider 抛错,面板都会拿回键盘。
@@ -535,22 +555,26 @@ export function makeRunAgentFn(deps: {
     const humanLimitMs = typeof deps.humanTimeoutMs === 'function' ? deps.humanTimeoutMs() : deps.humanTimeoutMs
     let lastProgressAt = Date.now()
     /**
-     * 这次调用起跑的时刻 —— 总时长上限的起点。
+     * 上一条**完整消息**到达的时刻 —— 总时长上限的起点。
      *
-     * **不含等人的那段时间**(见下面 `humanSpentMs`):否则用户去倒杯水回来,一次正常的
-     * 调用会以「总时长超限」阻断,而那正是两个时钟当初被拆开的全部理由。
+     * 不是「这次调用起跑的时刻」:那一版会把一个跑了一小时、完成了 103 次调用的大执行
+     * 节点当成滴水上游杀掉(见 TimeoutKind.total 上那段跑机记录)。
+     *
+     * **不含等人的那段时间**:等人回答工具权限时把原点一起往后推(见 canUseTool 的
+     * finally),否则用户去倒杯水回来,一次正常的调用会以「总时长超限」阻断 ——
+     * 而那正是两个时钟当初被拆开的全部理由。
      */
-    const startedAt = Date.now()
-    /** 累计等人回答花掉的毫秒 —— 从总时长里扣掉。 */
-    let humanSpentMs = 0
+    let lastMessageAt = Date.now()
     /** 正在等人回答的那一刻;不在等人时是 undefined。 */
     let humanWaitFrom: number | undefined
     const markProgress = (): void => { lastProgressAt = Date.now() }
+    /** 一条**完整消息**到手 —— 只有它能重置总时长时钟(流式增量不能)。 */
+    const markMessage = (): void => { lastMessageAt = Date.now() }
     const fire = (kind: TimeoutKind): void => { timedOut = true; timeoutKind = kind; inner.abort() }
     /**
-     * 总时长的绝对上限。
+     * 「多久没能完成一条消息」的上限。
      *
-     * 「流式增量算进展」把静默时钟修对了,同时把**总时长**这一维变成了完全无界的 ——
+     * 「流式增量算进展」把静默时钟修对了,同时把这一维变成了完全无界的 ——
      * 一个每分钟吐一个 token 的上游从此可以永远跑下去,而这个文件里 `deps.timeoutMs`
      * 的存在理由写的就是「a provider that hangs without ever rejecting has no bound at all」。
      * 滴水和挂死是同一类故障,只是一个装得像在干活。
@@ -573,7 +597,7 @@ export function makeRunAgentFn(deps: {
           if (limitMs && limitMs > 0 && now - lastProgressAt >= limitMs) { fire('stall'); return }
           // 总时长排在静默**之后**判:两个同时到点时,「一个字都没有」比「太慢」更能解释
           // 这次失败,而它们的补救建议不同。
-          if (totalLimitMs > 0 && now - startedAt - humanSpentMs >= totalLimitMs) fire('total')
+          if (totalLimitMs > 0 && now - lastMessageAt >= totalLimitMs) fire('total')
         }, tickMs)
       : undefined
 
@@ -671,6 +695,8 @@ export function makeRunAgentFn(deps: {
       for await (const message of invoke()) {
         // 有输出 = 没卡住。stall 时钟从这里重置 —— 这就是「静默时长」和「总时长」的区别。
         markProgress()
+        // 而**完整的一条**消息才能重置总时长时钟:滴水式上游的特征正是攒不满一条。
+        markMessage()
         collected.push(message)
         meter.observe(message)
         bankUsage()
@@ -793,7 +819,7 @@ export function makeRunAgentFn(deps: {
           : timedOut
             ? (timeoutKind === 'human'
               ? '等待人工确认超时'
-              : timeoutKind === 'total' ? '总时长超限(一直有输出但不结束)' : '静默超时(没有任何输出)')
+              : timeoutKind === 'total' ? '总时长超限(有输出但攒不出一条消息)' : '静默超时(没有任何输出)')
             : failure,
       )
     }

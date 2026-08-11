@@ -44,7 +44,9 @@ import {
   checkMockRateLimitError,
   isMockRateLimitError,
 } from '../rateLimitMocking.js'
+import { reportContextNotice } from './contextNoticeSink.js'
 import { REPEATED_529_ERROR_MESSAGE } from './errors.js'
+import { effectiveErrorStatus } from './errorPayload.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
 
 const abortError = () => new APIUserAbortError()
@@ -105,7 +107,8 @@ function isPersistentRetryEnabled(): boolean {
 
 function isTransientCapacityError(error: unknown): boolean {
   return (
-    is529Error(error) || (error instanceof APIError && error.status === 429)
+    is529Error(error) ||
+    (error instanceof APIError && effectiveErrorStatus(error) === 429)
   )
 }
 
@@ -508,12 +511,37 @@ export async function* withRetry<T>(
         if (error instanceof APIError) {
           yield createSystemAPIErrorMessage(error, delayMs, attempt, maxRetries)
         }
+        // 子 agent(`/et` 的席位)那条路上,上面那个 yield 是看不见的 —— 它只到
+        // QueryEngine。退避期间席位窗口一个字都不动,而一串重试加起来能有两分半:
+        // 和「这一席挂死了」长得一模一样。旁路一行,让它看得见自己在等什么。
+        reportContextNotice({
+          kind: 'api-retry',
+          text: retryNoticeText(error, delayMs, attempt, maxRetries),
+        })
         await sleep(delayMs, options.signal, { abortError })
       }
     }
   }
 
   throw new CannotRetryError(lastError, retryContext)
+}
+
+/** 席位窗口上那一行。**一行**,因为它挤在流式正文中间。 */
+export function retryNoticeText(
+  error: unknown,
+  delayMs: number,
+  attempt: number,
+  maxRetries: number,
+): string {
+  const status =
+    error instanceof APIError ? effectiveErrorStatus(error) : undefined
+  const raw = errorMessage(error).replace(/\s+/g, ' ').trim()
+  // 上游的 JSON 原文可以很长,而这一行要挤在正文里 —— 留够看清是哪一类错就行。
+  const detail = raw.length > 120 ? `${raw.slice(0, 120)}…` : raw
+  return (
+    `上游报错${status ? `(${status})` : ''}:${detail} · ` +
+    `${Math.max(1, Math.round(delayMs / 1000))}s 后重试(第 ${attempt}/${maxRetries} 次)`
+  )
 }
 
 function getRetryAfter(error: unknown): string | null {
@@ -612,12 +640,11 @@ export function is529Error(error: unknown): boolean {
     return false
   }
 
-  // Check for 529 status code or overloaded error in message
-  return (
-    error.status === 529 ||
-    // See below: the SDK sometimes fails to properly pass the 529 status code during streaming
-    (error.message?.includes('"type":"overloaded_error"') ?? false)
-  )
+  // Check for 529 status code or overloaded error in the payload.
+  // See below: the SDK sometimes fails to properly pass the 529 status code during
+  // streaming — a mid-stream `event: error` frame yields status === undefined, so the
+  // only signal left is the error body's own type (see errorPayload.ts).
+  return error.status === 529 || effectiveErrorStatus(error) === 529
 }
 
 function isOAuthTokenRevokedError(error: unknown): boolean {
@@ -693,7 +720,7 @@ function handleGcpCredentialError(error: unknown): boolean {
   return false
 }
 
-function shouldRetry(error: APIError): boolean {
+export function shouldRetry(error: APIError): boolean {
   // Never retry mock errors - they're from /mock-limits command for testing
   if (isMockRateLimitError(error)) {
     return false
@@ -716,10 +743,10 @@ function shouldRetry(error: APIError): boolean {
     return true
   }
 
-  // Check for overloaded errors first by examining the message content
+  // Check for overloaded errors first by examining the payload.
   // The SDK sometimes fails to properly pass the 529 status code during streaming,
-  // so we need to check the error message directly
-  if (error.message?.includes('"type":"overloaded_error"')) {
+  // so we need to check the error body's own type (see errorPayload.ts).
+  if (is529Error(error)) {
     return true
   }
 
@@ -754,22 +781,35 @@ function shouldRetry(error: APIError): boolean {
     return true
   }
 
-  if (!error.status) return false
+  /**
+   * 没有状态码时,回落到**错误体自己说的类型**(见 errorPayload.ts)。
+   *
+   * 流中途的一帧 `event: error` 在 SDK 里造出来的 APIError 的 status 恒为 undefined ——
+   * 而上游在那一帧里说的可能正是「我过载了,请稍后重试」。此前这里直接
+   * `if (!error.status) return false`,也就是这一整类可重试的故障**一次都不重试**。
+   *
+   * 下面每一条判据原样复用:归一到状态码之后,这一层不需要重复任何一条重试策略。
+   */
+  const status = effectiveErrorStatus(error)
+
+  if (!status) return false
 
   // Retry on request timeouts.
-  if (error.status === 408) return true
+  if (status === 408) return true
 
   // Retry on lock timeouts.
-  if (error.status === 409) return true
+  if (status === 409) return true
 
   // Retry on rate limits, but not for ClaudeAI Subscription users
   // Enterprise users can retry because they typically use PAYG instead of rate limits
-  if (error.status === 429) {
+  if (status === 429) {
     return !isClaudeAISubscriber() || isEnterpriseSubscriber()
   }
 
   // Clear API key cache on 401 and allow retry.
   // OAuth token handling is done in the main retry loop via handleOAuth401Error.
+  // 只认**真**状态码:errorPayload 故意不映射鉴权类,401 在主循环里会触发一次
+  // OAuth 刷新,那是另一件事,不该由一帧流中错误来发起。
   if (error.status === 401) {
     clearApiKeyHelperCache()
     return true
@@ -781,7 +821,7 @@ function shouldRetry(error: APIError): boolean {
   }
 
   // Retry internal errors.
-  if (error.status && error.status >= 500) return true
+  if (status >= 500) return true
 
   return false
 }
