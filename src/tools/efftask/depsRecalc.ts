@@ -171,6 +171,11 @@ export function recalcScope(
     cancelled?: boolean
     /** 编排器已经跑完了吗。 */
     finished?: boolean
+    /**
+     * 这一趟有没有隔离工作区。**没有 = 执行环节被强制串行**
+     * (`orchestrator.serialiseExecute`),而这个功能买的就是并发。
+     */
+    serialExecute?: boolean
   } = {},
 ): RecalcScope | RecalcRefusal {
   const no = (reason: string, details: string[] = []): RecalcRefusal => ({ ok: false, reason, details })
@@ -178,6 +183,27 @@ export function recalcScope(
   if (opts.finished === true) {
     return no('本次编排已经结束,依赖重算需要编排器还在跑。' +
       '`/et --resume` 继续这一趟之后,这个键就回来了。')
+  }
+  /**
+   * **共享工作树下,细化依赖买不到任何并发。**
+   *
+   * 排在最前面(只让「已经结束」在它之前):下面每一条拒绝理由讲的都是「这个**节点**
+   * 为什么不合适」,而这一条讲的是「这一**趟**根本没有并发可买」—— 对一个刚被告知
+   * 「依赖已细化成 3 条」的用户来说,两句话的下一步完全不同。
+   *
+   * 判据用池子在不在,不用配置里写的 isolation:配置可以说「隔离」而每一次 acquire 都失败。
+   * 和 `orchestrator.serialiseExecute` 同一份真相(`deps.worktrees === undefined`)。
+   *
+   * 跑机实测(qianbase-xtp run 001):`parallelism: 20`、44 个 READY、恒 1 席在飞,而
+   * 用户在详情页按 d 重算依赖,关口回他「本任务的依赖现在全部满足,马上就会被调度」——
+   * 那句话在这一趟里对**除了队首之外的每一个节点**都是假的。
+   */
+  if (opts.serialExecute === true) {
+    return no(
+      '这一趟没有隔离工作区(共享工作树),执行环节被强制串行 —— 无论依赖拆得多细,' +
+      '同一时刻只会有一个任务在改代码。重算买不到并发。' +
+      '要并行请先让隔离可用(关口上会写明这一趟为什么用不了),再 `/et --resume`。',
+    )
   }
   if (opts.running?.has(node.id) === true) {
     // 不许复用下面那条「已经开始分析」的文案:`CREATED` + 正在运行写成

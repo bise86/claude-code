@@ -122,6 +122,25 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     expect(element('ConfirmStartup')).toContain('isolationReason={')
     expect(element('ConfirmStartup')).toContain('onInitGit={')
   })
+  /**
+   * **「这一趟是串行的」必须从池子这一个真相流到每一处口径。**
+   *
+   * 剪断任何一处的后果都是同一种谎:关口对着一个排在单线队列后面的节点说
+   * 「本任务的依赖现在全部满足,马上就会被调度」。跑机(qianbase-xtp run 001)上
+   * `parallelism: 20`、44 个 READY、恒 1 席在飞,用户报的就是这一句。
+   *
+   * 判据一律用 `poolRef.current === undefined`,和 orchestrator 的
+   * `serialiseExecute = kind === 'execute' && this.deps.worktrees === undefined` 同源 ——
+   * **不用配置里的 isolation**:配置可以写着「隔离」而每一次 acquire 都失败。
+   */
+  it('执行串行这件事流到了重算关口和「马上就会被调度」那一句', () => {
+    // 三个 recalcScope 入口(关口自己的 scopeOpts、树上的 recalcAvailable、按 d 那一下)
+    // 加上 schedulableNow —— 少一个都会让屏幕上写着的和按下去发生的分叉。
+    expect(occurrences('serialExecute: poolRef.current === undefined')).toBe(4)
+    // 表头那一行是同一个真相的另一个出口(它早就在了,一起钉住:两处说法必须同源)。
+    expect(SRC).toContain('serialExecute={poolRef.current === undefined}')
+  })
+
 
   it('第三关起草拿到了隔离池 (spec §16)', () => {
     // 剪断它:关口上给用户看的那棵树是在**没有**冲突约束的情况下拆出来的,而 run 随后按

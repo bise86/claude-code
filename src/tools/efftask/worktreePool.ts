@@ -1,5 +1,5 @@
 import { integrationBranch, worktreeBranch, worktreeSlug } from './worktreeId.js'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import type { TaskNode } from './types.js'
 
 /**
@@ -50,6 +50,11 @@ export type MergeResult =
  * was never created, and 4 concurrent merges into one checkout produced rc=128
  * `cannot lock ref 'HEAD'` and rc=2 alongside a single winner.
  */
+/** 盘上有没有这个路径。缺席**和**探不明白都算「没有」—— 这里的调用方拿它当动手的前提。 */
+async function exists(p: string): Promise<boolean> {
+  try { await stat(p); return true } catch { return false }
+}
+
 function mutex(): <T>(fn: () => Promise<T>) => Promise<T> {
   let tail: Promise<unknown> = Promise.resolve()
   return <T>(fn: () => Promise<T>): Promise<T> => {
@@ -304,6 +309,163 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     return { advanced: false, reason: why, conflicted: left.length > 0 || !restored }
   }
 
+  /**
+   * `init()` 自愈时动过的东西,给收口/关口读。
+   *
+   * 挪走一个孤儿工作树目录是**盘上的真实变化**(实测那一个 15G),让出集成分支同理 ——
+   * 静默做掉和静默截断是同一类毛病。
+   */
+  const healNotes: string[] = []
+  const noteHeal = (notes: string[]): void => {
+    for (const n of notes) if (!healNotes.includes(n)) healNotes.push(n)
+  }
+
+  /**
+   * `git worktree list --porcelain` 的记录。
+   *
+   * 逐块解析而不是 `git worktree list` 的人类格式:后者把路径、sha、分支挤在一行并按
+   * 列对齐,**路径里有空格**时切不开 —— 而 `worktreeRoot` 来自用户的 cwd。
+   */
+  async function listWorktrees(): Promise<{ path: string; branch?: string }[]> {
+    const r = await git(['worktree', 'list', '--porcelain'], gitRoot)
+    if (r.code !== 0) return []
+    const out: { path: string; branch?: string }[] = []
+    let cur: { path: string; branch?: string } | undefined
+    for (const line of r.stdout.split('\n')) {
+      if (line.startsWith('worktree ')) { cur = { path: line.slice('worktree '.length).trim() }; out.push(cur) }
+      else if (line.startsWith('branch ') && cur) cur.branch = line.slice('branch '.length).trim()
+    }
+    return out
+  }
+
+  /**
+   * 让 `git worktree add <intPath> <intBranch>` 有第二次机会 —— **只动我们自己的东西**。
+   *
+   * 两种成因各自都会让隔离**永久**建不起来(每次 `--resume` 原样重演),而两种的补救都
+   * 不该由用户手工做,因为屏幕上只有一句 git 的 `already exists`,它不说要删什么。
+   *
+   * 一、**孤儿目录**:`intPath` 在盘上,但 git 的登记项没了(仓库被移动过 + 上面那句
+   *    `worktree prune`)。**挪走,不删** —— 那个目录可能有 git 此刻读不出来的内容,而这
+   *    个仓库的规矩是盘上的东西不许静默消失。挪到隔壁并把新名字说出来,让人自己处置。
+   *
+   * 二、**集成分支被另一棵树占着**:git 不许两棵工作树占同一条分支。只在那棵树
+   *    **是我们自己建的**(路径在 `worktreeRoot` 底下、且不是用户的检出)时才 `--detach`
+   *    让出来;别人的检出一律不碰 —— 那可能正是用户此刻在里面干活的地方。
+   *    `--detach` 而不是删除:那棵树上可能有还没合走的提交,detach 之后它们仍在原 sha 上。
+   */
+  async function healIntegrationSlot(): Promise<{ changed: boolean; notes: string[] }> {
+    const notes: string[] = []
+    let changed = false
+
+    const trees = await listWorktrees()
+    const known = new Set(trees.map(t => t.path))
+
+    // 一、孤儿目录。判据是「盘上有 + git 不认」,两条都要:只判存在会在正常的重复
+    // 调用上把一棵**好的**工作树挪走(init 是可重入的,上面那句 rev-parse 失败也可能
+    // 只是一次瞬时的 git 错误)。
+    if (!known.has(intPath) && await exists(intPath)) {
+      const parked = `${intPath}.orphan`
+      const dest = await freeName(parked)
+      try {
+        await rename(intPath, dest)
+        changed = true
+        notes.push(`把 git 已不认识的孤儿目录挪到了 ${dest}(没有删除;确认无用后请自行清理)`)
+      } catch (e) {
+        notes.push(`孤儿目录 ${intPath} 挪不走(${e instanceof Error ? e.message : String(e)})`)
+      }
+    }
+
+    // 二、分支被占。**排在孤儿之后**:挪走目录之后 add 仍会因为这条失败,而两条一起
+    // 治才只需要一次重试 —— 分两轮的话第一轮的重试会白白付一次 checkout 的钱。
+    const holder = trees.find(t => t.branch === `refs/heads/${intBranch}` && t.path !== intPath)
+    if (holder) {
+      const ours = holder.path.startsWith(`${worktreeRoot}/`) && holder.path !== gitRoot
+      if (!ours) {
+        notes.push(`集成分支 ${intBranch} 被 ${holder.path} 占着,那不是本次运行建的工作树 —— 没有动它`)
+      } else {
+        const det = await git(['checkout', '--detach'], holder.path)
+        if (det.code === 0) {
+          changed = true
+          notes.push(`集成分支 ${intBranch} 被自建工作树 ${holder.path} 占着,已让它切到 detached HEAD`)
+        } else {
+          notes.push(`集成分支 ${intBranch} 被 ${holder.path} 占着,让不出来:${det.stderr.trim()}`)
+        }
+      }
+    }
+    return { changed, notes }
+  }
+
+/**
+   * 「分支名已存在」之后的一次诊断 + 让路。**返回 changed=false 就绝不重置。**
+   *
+   * 两种成因,和 `healIntegrationSlot` 一一对应,只是降到节点这一层:
+   *
+   * 一、**残留分支**:上一趟(或用户手工 `rm -rf .efftask-worktrees/`)把工作区目录清了,
+   *    分支没删。分支里**已经全部合进集成分支**时它就是个空壳,重置零损失。
+   *    **没合进去的时候先存一条 salvage 分支再重置** —— 那是 `acquire` 上面那一整段
+   *    「commits the executor made itself that never reached the integration branch」
+   *    防的同一件事,只是那段防的是复用目录这条路,这里是重建目录这条路。
+   *    **存不下来就整条放弃**(宁可这个节点报错,不可静默丢掉一次执行的产出)。
+   *
+   * 二、**分支被另一棵工作树占着**:只在那棵树**是我们自己建的**时才让它 detach。
+   *    别人的检出一律不碰 —— 那可能正是用户此刻在里面干活的地方。
+   *
+   * 判据都跑在 `gitRoot` 上:`path` 这时候按定义还不存在。
+   */
+  async function reclaimNodeBranch(
+    node: TaskNode, branch: string, path: string,
+  ): Promise<{ changed: boolean; notes: string[] }> {
+    // 「这条分支确实存在」由调用点建立(它就是靠这个决定 `-b` 还是 `-B` 的)——
+    // 这里不再自己判一次:那会是一个永远为真的条件,而这个仓库为不可达分支付过账。
+    const notes: string[] = []
+    /**
+     * **先 prune。** 目录被清掉、而 `.git/worktrees/<slug>` 登记项还在,是这一类残留
+     * **最常见**的形状 —— 跑机实测(10.10.20.13 / etcd3):32 条登记项里 31 条是 prunable。
+     * 那种状态下分支被一棵**并不存在**的工作树占着,git 拒绝一切动作(`branch -D` 说
+     * 「无法删除检出于 … 的分支」,`worktree add` 说 already used),而 `checkout --detach`
+     * 也没地方跑 —— 下面那段让路逻辑对它完全无能为力。
+     *
+     * prune 只清「目录已经不在」的登记项,不碰任何还在的工作树。放在 `acquireLock` 里,
+     * 不会和并发的 `worktree add` 抢 `.git/config`(见 mutex 那段实测)。
+     */
+    await git(['worktree', 'prune'], gitRoot)
+    const contained = await git(['merge-base', '--is-ancestor', branch, intBranch], gitRoot)
+    if (contained.code !== 0) {
+      const salvage = `efftask/${runId}/salvage/${slugFor(node)}`
+      const saved = await git(['branch', '-f', salvage, branch], gitRoot)
+      if (saved.code !== 0) {
+        notes.push(`残留分支 ${branch} 上有没合进集成分支的提交,而它存不进 ${salvage}(${saved.stderr.trim()})—— 没有重置它`)
+        return { changed: false, notes }
+      }
+      notes.push(`残留分支 ${branch} 上有没合进集成分支的提交,已先存到 ${salvage} 再重置`)
+    } else {
+      notes.push(`复用残留分支 ${branch}(它的提交都已在集成分支上,重置零损失)`)
+    }
+
+    const holder = (await listWorktrees()).find(t => t.branch === `refs/heads/${branch}` && t.path !== path)
+    if (holder) {
+      const ours = holder.path.startsWith(`${worktreeRoot}/`) && holder.path !== gitRoot
+      if (!ours) {
+        notes.push(`而 ${branch} 还被 ${holder.path} 占着,那不是本次运行建的工作树 —— 没有动它`)
+        return { changed: false, notes }
+      }
+      const det = await git(['checkout', '--detach'], holder.path)
+      if (det.code !== 0) {
+        notes.push(`而 ${branch} 被自建工作树 ${holder.path} 占着,让不出来:${det.stderr.trim()}`)
+        return { changed: false, notes }
+      }
+      notes.push(`并让占着它的自建工作树 ${holder.path} 切到 detached HEAD`)
+    }
+    return { changed: true, notes }
+  }
+
+  /** 第一个还没被占用的名字。`.orphan`、`.orphan-2`、…… —— 治过一次的仓库会治第二次。 */
+  async function freeName(base: string): Promise<string> {
+    if (!await exists(base)) return base
+    for (let i = 2; i < 100; i++) if (!await exists(`${base}-${i}`)) return `${base}-${i}`
+    return `${base}-${100}`
+  }
+
   return {
     /**
      * Create the integration branch and a dedicated worktree to merge in.
@@ -369,11 +531,45 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       const registered = await git(['rev-parse', '--git-dir'], intPath)
       if (registered.code !== 0) {
         await git(['worktree', 'prune'], gitRoot)
-        const add = await git(['worktree', 'add', intPath, intBranch], gitRoot)
-        if (add.code !== 0) return { ok: false, reason: `无法创建集成工作区: ${add.stderr.trim()}` }
+        let add = await git(['worktree', 'add', intPath, intBranch], gitRoot)
+        /**
+         * **`worktree add` 失败一次不等于这一趟没有隔离。**
+         *
+         * 实测事故(跑机 qianbase-xtp,run 001):`.efftask-worktrees/integration` 是一个
+         * **git 已经不认识的目录** —— 它的 `.git` 文件指向 `.git/worktrees/integration`,
+         * 而那个登记项已经不在了。于是 `rev-parse --git-dir` 128、`worktree prune` 不删
+         * 目录(prune 删的是登记项,不是工作树)、`worktree add` 报 `already exists`。
+         * 池子建不起来 → `serialiseExecute` 为真 → **20 个并发退化成 1**,而且**每一次
+         * `--resume` 都会原样再来一遍**:没有任何一条路径会去动那个目录。用户看到的是
+         * 「44 个 READY,只有一个在跑」,连着好几天。
+         *
+         * 更要命的是这个状态**是 init() 自己造的**:上面那句 `worktree prune` 在仓库被
+         * 移动过之后(登记的绝对路径失效)会把登记项清掉,而工作树目录原地留着。
+         *
+         * 所以失败之后诊断一次再重试一次。两种成因**都只动我们自己的东西**,判据写在
+         * 各自的 helper 里 —— 拿不准就不动,把原因说清楚让人来处理。
+         */
+        if (add.code !== 0) {
+          const healed = await healIntegrationSlot()
+          if (healed.changed) add = await git(['worktree', 'add', intPath, intBranch], gitRoot)
+          if (add.code !== 0) {
+            // 诊断要跟着失败一起走出去。原来只有 git 那句 `already exists`,而它不说
+            // 「那个目录是个孤儿」,更不说「分支被另一棵树占着」—— 用户读完仍然不知道
+            // 要删什么。
+            const notes = healed.notes.length > 0 ? ` (已尝试:${healed.notes.join(';')})` : ''
+            return { ok: false, reason: `无法创建集成工作区: ${add.stderr.trim()}${notes}` }
+          }
+          if (healed.notes.length > 0) noteHeal(healed.notes)
+        }
       }
       return { ok: true }
     },
+
+    /**
+     * `init()` 自愈时挪走/让出了什么。**必须报出去** —— 挪走一个 15G 的孤儿目录是盘上的
+     * 真实变化,静默做掉和静默截断是同一类毛病。空 = 什么都没治。
+     */
+    healNotes(): readonly string[] { return healNotes },
 
     /**
      * A worktree for this node, based on the integration branch's CURRENT state so a node
@@ -431,7 +627,38 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
             }
           }
         } else {
-          const add = await git(['worktree', 'add', '-f', '-b', branch, path, intBranch], gitRoot)
+          /**
+           * **目录不在了,分支还在** —— `-b` 是「新建分支」,而 `-f` 只强制**路径**,
+           * 于是 git 报 `fatal: a branch named 'worktree-efftask-001-…' already exists`,
+           * 这个节点**永久**起不来:分支名是 `hash(nodeId)`,不随时间变,重做走的是同一条路。
+           *
+           * 跑机实测(10.10.20.13 / qianbase-xtp,2026-08-11):154 条节点分支里 10 条
+           * 处于这个形状(工作区目录被清掉了、分支没删),用户报「重做也一样失败」。
+           * 和 `healIntegrationSlot` 是同一个病:池子清不掉自己留下的东西,而没有任何
+           * 一条路径会去动它。
+           */
+          /**
+           * **先看分支在不在,再决定 `-b` 还是 `-B`** —— 不是「失败之后再补救」。
+           *
+           * 补救式的写法要能分辨「add 是因为分支失败的」和「因为别的失败的」,而唯一的
+           * 材料是 git 的报错文本 —— 那句话**随 locale 变**(跑机上逐字是
+           * 「fatal: 一个分支名 'worktree-efftask-001-54b6ba01' 已经存在」)。
+           * 按文本判会在中文机器上整条失效,而这个功能的现场恰恰就是那台机器。
+           * 顺带也不会再对一次注定失败的 add 白白重置一遍分支。
+           */
+          const existing = await git(['rev-parse', '--verify', '--quiet', branch], gitRoot)
+          let create = '-b'
+          if (existing.code === 0) {
+            const healed = await reclaimNodeBranch(node, branch, path)
+            // `-B` = 有就重置。**只在 reclaim 说可以之后**用它:重置一条还带着没合走的
+            // 提交的分支,正是上面那一整段 salvage 拼命在防的事。
+            if (!healed.changed) {
+              return { error: `无法创建工作区:${healed.notes.join(';') || `残留分支 ${branch} 拦着,而它动不得`}` }
+            }
+            noteHeal(healed.notes)
+            create = '-B'
+          }
+          const add = await git(['worktree', 'add', '-f', create, branch, path, intBranch], gitRoot)
           if (add.code !== 0) return { error: `无法创建工作区: ${add.stderr.trim()}` }
           return { path, branch, gitRoot }
         }

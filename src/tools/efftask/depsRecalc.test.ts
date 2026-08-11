@@ -618,3 +618,40 @@ describe('血缘工具', () => {
     expect(depLabel('root/99-ghost', m, 'root')).toContain('节点缺失')
   })
 })
+
+/**
+ * **共享工作树下,这个功能买的东西根本不存在。**
+ *
+ * 执行环节被 `orchestrator.serialiseExecute` 强制串行(没有池子 = 两个执行者会落在
+ * 同一棵工作树上),所以无论依赖拆得多细,同一时刻只有一个任务在改代码。
+ * 跑机(qianbase-xtp run 001):`parallelism: 20`、44 个 READY、恒 1 席在飞。
+ */
+describe('共享工作树:重算买不到并发', () => {
+  it('拒绝,并说清这是这一趟的事而不是这个节点的事', () => {
+    const m = tree()
+    const r = recalcScope(m.get(A)!, m, { serialExecute: true })
+    expect(r.ok).toBe(false)
+    const reason = (r as { reason: string }).reason
+    expect(reason).toContain('共享工作树')
+    expect(reason).toContain('串行')
+    // 下一步要说得出来 —— 否则用户只知道被拒了。
+    expect(reason).toContain('--resume')
+  })
+
+  /**
+   * **排在「已经结束」之后、其余全部之前。** 下面每一条讲的都是「这个节点不合适」,
+   * 而这一条讲的是「这一趟没有并发可买」—— 对着一个刚被告知「依赖已细化成 3 条」的人,
+   * 两句话的下一步完全不同。
+   */
+  it('编排器已经结束时,仍然先说「已经结束」', () => {
+    const m = tree()
+    const r = recalcScope(m.get(A)!, m, { serialExecute: true, finished: true })
+    expect((r as { reason: string }).reason).toContain('本次编排已经结束')
+  })
+
+  it('隔离运行下一个字都不说(同一棵树、同一个节点)', () => {
+    const m = tree()
+    expect(recalcScope(m.get(A)!, m, { serialExecute: false }).ok).toBe(true)
+    expect(recalcScope(m.get(A)!, m).ok).toBe(true)
+  })
+})

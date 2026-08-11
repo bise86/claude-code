@@ -14,6 +14,7 @@ import {
 } from './depsRecalc.js'
 import { ANSWER_TAGS, answerTag, capText, parseDepsRecalc, MAX_RECALC_ID_CHARS } from './parseOutput.js'
 import { notSchedulableReason } from './scheduler.js'
+import { advanceableKind } from './stateMachine.js'
 import { renderTreeSnapshot, serializeNode } from './persistence.js'
 import { validateLoadedNodes } from './resumeCore.js'
 import { createStreamStore } from './agentStream.js'
@@ -531,6 +532,78 @@ describe('notSchedulableReason', () => {
   it('推得动的节点返回 undefined', () => {
     const m = tree({ [B]: { status: 'ACCEPTED', childIds: [] } })
     expect(notSchedulableReason(m.get(A)!, m)).toBeUndefined()
+  })
+
+  /**
+   * **共享工作树:执行互斥 `pickBatch` 看不见。**
+   *
+   * 互斥住在编排器的 `launch()`(`executeChain`)—— 节点照样被挑中,只是排队。
+   * 跑机(qianbase-xtp run 001)上 44 个 READY、恒 1 席在飞,而关口对着队尾那些节点
+   * 逐字写着「本任务的依赖现在全部满足,马上就会被调度」。
+   */
+  describe('执行串行(共享工作树)', () => {
+    /** 甲是可执行叶子、依赖已满足 —— 隔离运行下它就是「马上跑」。 */
+    const ready = (): Map<string, TaskNode> => tree({
+      [A]: { status: 'READY', kind: 'executable', deps: [B] },
+      [B]: { status: 'ACCEPTED', childIds: [] },
+    })
+
+    it('前面有别的执行任务在跑 → 说「排队」,不说「马上就会被调度」', () => {
+      const m = ready()
+      Object.assign(m.get(B3)!, { kind: 'executable', status: 'EXECUTING' })
+      const why = notSchedulableReason(m.get(A)!, m, {
+        inFlight: new Set([B3]), serialExecute: true,
+      })
+      expect(why).toContain('排队')
+      expect(why).toContain('执行环节串行')
+    })
+
+    it('队首不撒谎:没人占着互斥时仍然是 undefined', () => {
+      const m = ready()
+      expect(notSchedulableReason(m.get(A)!, m, { inFlight: new Set(), serialExecute: true })).toBeUndefined()
+    })
+
+    it('隔离运行下这一条整个不参与(同样的树、同样的在飞)', () => {
+      const m = ready()
+      Object.assign(m.get(B3)!, { kind: 'executable', status: 'EXECUTING' })
+      expect(notSchedulableReason(m.get(A)!, m, { inFlight: new Set([B3]) })).toBeUndefined()
+    })
+
+    /**
+     * **在飞的不是执行型时不许说排队。** 互斥只锁 execute;一个正在跑集成验收的
+     * decompose 节点占的是池子的槽,不是执行位。
+     */
+    it('在飞的是拆分节点 → 不算占着执行互斥', () => {
+      const m = ready()
+      // 用 B1 而不是 B:B 是甲的依赖,改它的状态会顺手把「依赖已满足」也打掉,
+      // 那样这条测的就变成「还在等依赖」了(第一版就是这么写的,当场红)。
+      Object.assign(m.get(B1)!, { status: 'WAITING_CHILDREN', kind: 'decompose' })
+      expect(notSchedulableReason(m.get(A)!, m, {
+        inFlight: new Set([B1]), serialExecute: true,
+      })).toBeUndefined()
+    })
+
+    /**
+     * **判据不能用 `advanceableKind` 去认在飞的那一个。** 它那时已经是 EXECUTING,
+     * `advanceableKind` 对它返回 null —— 拿它做判据这一整条恒不触发。这条钉的就是那个写法。
+     */
+    it('在飞的那个已经是 EXECUTING(advanceableKind 对它返回 null)', () => {
+      const m = ready()
+      Object.assign(m.get(B3)!, { kind: 'executable', status: 'EXECUTING' })
+      expect(advanceableKind(m.get(B3)!, m)).toBeNull()
+      expect(notSchedulableReason(m.get(A)!, m, {
+        inFlight: new Set([B3]), serialExecute: true,
+      })).toContain('排队')
+    })
+
+    /** 还在等依赖时,理由该是「等依赖」—— 那和「排队」的下一步完全不同。 */
+    it('依赖没满足时不被这一条抢答', () => {
+      const m = tree({ [A]: { status: 'CREATED', deps: [B] } })
+      Object.assign(m.get(B3)!, { kind: 'executable', status: 'EXECUTING' })
+      expect(notSchedulableReason(m.get(A)!, m, {
+        inFlight: new Set([B3]), serialExecute: true,
+      })).toContain('还在等')
+    })
   })
 })
 

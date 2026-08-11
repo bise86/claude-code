@@ -34,6 +34,15 @@ export function ConfirmResume(props: {
   summary: ResumeSummary
   isolation?: 'worktree' | 'none'
   /**
+   * 池子没建起来的**真因**(git 的原话)。
+   *
+   * 关口原来只印一句自造的「这一趟没有可用的隔离工作区」—— 它说的是**结果**,
+   * 而用户唯一能据此动手的是原因。跑机实测那一次逐字是
+   * `无法创建集成工作区: fatal: '….efftask-worktrees/integration' already exists`,
+   * 而它只出现在下面一长串 notices 里的某一条。
+   */
+  isolationReason?: string
+  /**
    * 恢复出的任务树 (spec §17.3 的第一项)。
    *
    * The gate listed counts and a repair summary but never showed the tree itself, so a user
@@ -146,7 +155,7 @@ export function ConfirmResume(props: {
       {gitChoiceLines(shown, {
         editable: false,
         unavailable: props.isolation === 'none' && (shown.isolation ?? 'worktree') === 'worktree'
-          ? '这一趟没有可用的隔离工作区' : undefined,
+          ? (props.isolationReason ?? '这一趟没有可用的隔离工作区') : undefined,
       }).map(l => (
         <Text key={l} dimColor>{l}</Text>
       ))}

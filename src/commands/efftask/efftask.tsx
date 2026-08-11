@@ -679,6 +679,11 @@ async function makeWorktreePool(
   needsFirstCommit?: boolean
   /** 仓库根 —— 补空提交要用它,不能用 cwd(见上)。 */
   gitRoot?: string
+  /**
+   * init() 为了把池子建起来动过的东西(挪走孤儿工作树目录、让出被占的集成分支)。
+   * **必须走到 notices**:那是盘上的真实变化,静默做掉和静默截断是同一类毛病。
+   */
+  healed?: readonly string[]
 }> {
   const top = await gitRunner(['rev-parse', '--show-toplevel'], cwd)
   // notARepo is reported SEPARATELY from the reason string because it is the only condition
@@ -705,7 +710,7 @@ async function makeWorktreePool(
   const pool = createWorktreePool({ runId, gitRoot, git: gitRunner, worktreeRoot: `${gitRoot}/.efftask-worktrees` })
   const init = await pool.init()
   if (!init.ok) return { reason: init.reason }
-  return { pool }
+  return { pool, ...(pool.healNotes().length > 0 ? { healed: pool.healNotes() } : {}) }
 }
 
 function fsAdapter(): FsLike {
@@ -1208,6 +1213,11 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       poolRef.current = isoR.pool
       setIsolation(isoR.pool ? 'worktree' : 'none')
       if (!isoR.pool && isoR.reason) withGuidance.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${isoR.reason}`)
+      // 隔离**是靠自愈才建起来的** —— 盘上被动过,必须说出口(见 makeWorktreePool.healed)。
+      for (const h of isoR.healed ?? []) withGuidance.notices.push(`隔离工作区自愈: ${h}`)
+      // 恢复关口原来只会说「这一趟没有可用的隔离工作区」,把真因扔了 —— 而真因
+      // (`fatal: '…' already exists`)才是用户唯一能据此动手的东西。
+      setIsolationReason(isoR.pool ? null : (isoR.reason ?? '未知原因'))
       setConfig(annotateRoleModels(withGuidance, props.agentModels, props.mainModel))
       setSeed(reseated.nodes)
       setSummary({
@@ -1279,6 +1289,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // ALSO recorded in run.md. Replacing the notices.push with component state alone meant
         // the manifest stopped saying the run was un-isolated, while the resume path still did.
         if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
+        for (const h of iso.healed ?? []) cfg.notices.push(`隔离工作区自愈: ${h}`)
         // 配置文件那条录入口的诊断。放在**最前**:它讲的是用户写在盘上的东西哪里不对,
         // 比运行期的降级更该先看到。也一并落进 run.md —— notices 是持久的。
         if (baseRoleNotices && baseRoleNotices.length > 0) cfg.notices.unshift(...baseRoleNotices)
@@ -2088,6 +2099,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         config={config}
         summary={summary}
         isolation={isolation}
+        // 真因,不是「这一趟没有可用的隔离工作区」那句同义反复 —— 用户能据此动手的
+        // 只有 git 那句原文(实测那一次是 `fatal: '…/integration' already exists`)。
+        isolationReason={isolationReason ?? undefined}
         nodes={nodes}
         // 名册可编辑 (spec §17.3). Same two props ConfirmStartup gets: only roles this session
         // can actually dispatch, each rendered with the model it would run on.
@@ -2411,6 +2425,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       running: new Set(orchRef.current?.runningNodeIds() ?? []),
       cancelled: control.wasCancelled(target.id),
       finished: orchRef.current === null,
+      // 和 orchestrator 的 `serialiseExecute` 同一份真相:没有池子 = 执行串行。
+      serialExecute: poolRef.current === undefined,
     })
     return (
       <ConfirmRecalcDeps
@@ -2491,6 +2507,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           const n = m.get(target.id)
           return n !== undefined && notSchedulableReason(n, m, {
             inFlight: new Set(orchRef.current?.runningNodeIds() ?? []),
+            // 共享工作树下第 2 个及以后的执行型节点只是**排队**,不是「马上就会被调度」。
+            serialExecute: poolRef.current === undefined,
           }) === undefined
         }}
         onCancelAsk={() => {
@@ -2616,12 +2634,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         running: new Set(orchRef.current?.runningNodeIds() ?? []),
         cancelled: control.wasCancelled(node.id),
         finished: orchRef.current === null,
+        serialExecute: poolRef.current === undefined,
       }).ok === true}
       onRecalcDeps={node => {
         const why = recalcScope(node, new Map(nodes.map(n => [n.id, n] as [string, TaskNode])), {
           running: new Set(orchRef.current?.runningNodeIds() ?? []),
           cancelled: control.wasCancelled(node.id),
           finished: orchRef.current === null,
+          serialExecute: poolRef.current === undefined,
         })
         if (why.ok !== true) {
           return [why.reason, ...why.details.map(d => `· ${d}`)].join('\n')

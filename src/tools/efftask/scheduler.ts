@@ -69,12 +69,53 @@ export function notSchedulableReason(
   // `held` 不单独收:编排器把被扣住的节点**折进了同一个集合**
   // (`pickBatch(…, new Set([...inFlight.keys(), ...this.held]), …)`),再开一个形参
   // 只会得到一个永远没有实参的分支 —— 而这个仓库刚为「不可达分支」付过一轮验收。
-  opts?: { inFlight?: ReadonlySet<string> },
+  opts?: {
+    inFlight?: ReadonlySet<string>
+    /**
+     * 这一趟有没有隔离工作区。**没有 = 执行环节被强制串行**,而 `pickBatch` 看不见这件事:
+     * 互斥住在编排器的 `launch()` 里(`executeChain`),被挑中的节点照样进队列,只是**排队**。
+     *
+     * 所以「推得动」这个判断在共享工作树下必须多问一句 —— 否则关口会对着一个排在
+     * 单线队列后面的节点说「马上就会被调度」,而那正是用户报的那一句
+     * (跑机 qianbase-xtp run 001:44 个 READY、恒 1 席在飞)。
+     */
+    serialExecute?: boolean
+  },
 ): string | undefined {
   if (opts?.inFlight?.has(node.id) === true) return '此刻正在运行(或被另一次操作扣住)'
   if (isTerminal(node.status)) return `已经是终态(${node.status})`
   if (hasBlockedAncestor(node, byId)) return '上级任务已阻断 —— 它的整棵子树都不会再被调度'
-  if (advanceableKind(node, byId) === null) {
+  /**
+   * 执行互斥。**排在 `advanceableKind` 之后**判(下面那个 if 里),不能提到这儿:
+   * 一个还在等依赖的节点,拒绝理由该是「等依赖」而不是「排队」—— 那两件事用户的下一步
+   * 完全不同。所以这一条只在「其它条件都满足、就差一个执行位」时才说话。
+   */
+  const kind = advanceableKind(node, byId)
+  if (kind === 'execute' && opts?.serialExecute === true) {
+    /**
+     * 队首**不撒谎**:共享工作树下没有别人占着互斥时,它确实马上就跑。
+     *
+     * 「谁占着互斥」= 在飞的节点里还有别的执行型任务。用 `kind === 'executable'` +
+     * 非终态判,不能用 `advanceableKind` —— 在飞的那个状态已经是 EXECUTING,
+     * `advanceableKind` 对它返回 null,拿它做判据的话这一条恒不触发。
+     */
+    /**
+     * 不用再排除 node 自己:它在 inFlight 里的话,上面第一条早就返回「正在运行」了。
+     * 多写一个 `n.id !== node.id` 是一个永远为真的条件 —— 这个仓库为不可达分支付过账。
+     *
+     * **也不判终态。** 第一版写了 `!isTerminal(n.status)`,而互斥链上的一节要等 `step`
+     * **返回**才释放,`commit(ACCEPTED)` 发生在 step 里面 —— 于是「已经 ACCEPTED、
+     * 但还在 inFlight」的节点**仍然占着执行位**。排除它会让这里在那个窗口里说
+     * 「马上就会被调度」,正是这次要修的那句谎换个地方再犯一遍。
+     * (代价:被 `hold` 扣住的终态执行节点会被算进来 —— 那个方向只会多说一句「要排队」,
+     * 而这一条存在的全部理由就是别把排队说成马上。)
+     */
+    const ahead = [...(opts.inFlight ?? [])].filter(id => byId.get(id)?.kind === 'executable')
+    if (ahead.length > 0) {
+      return `共享工作树:执行环节串行,前面还有 ${ahead.length} 个执行任务 —— 它得排队(和依赖无关)`
+    }
+  }
+  if (kind === null) {
     // 依赖没满足是最常见的那一种,单独说;其余(等子任务、状态本身不可推进)合成一句。
     const unmet = node.deps.filter(id => byId.get(id)?.status !== 'ACCEPTED')
     if (unmet.length > 0) return `还在等 ${unmet.length} 个依赖任务完成`

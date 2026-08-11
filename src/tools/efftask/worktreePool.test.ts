@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner } from './worktreePool.js'
+import { worktreeSlug } from './worktreeId.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
 const git: GitRunner = (args, cwd) =>
@@ -1405,5 +1406,255 @@ describe('洗掉重试:失败出口同样要报 cleaned;不在集成分支上就
     // 没有把这个节点的提交合进别人的分支
     const theirs = await git(['log', '--oneline', 'somebody-elses-branch'], gitRoot)
     expect(theirs.stdout).not.toContain('e1')
+  })
+})
+
+/**
+ * `init()` 建不起池子 = 这一趟 `serialiseExecute` 恒为真 = **并发全丢**,而且每一次
+ * `--resume` 都原样重演(没有任何路径会去动这两种残留)。
+ *
+ * 跑机实测(qianbase-xtp run 001):`parallelism: 20`、44 个 READY、只有 1 个席位在飞,
+ * 连着好几天。用户的原话是「这个任务怎么感觉并行不起来」。
+ */
+describe('init 对两种「永久建不起池子」的残留自愈', () => {
+  const intPathOf = (): string => join(worktreeRoot, 'integration')
+
+  it('孤儿目录:盘上有、git 不认 —— 挪走并重试,不是放弃', async () => {
+    expect(await pool().init()).toEqual({ ok: true })
+    // 现场的形状:登记项没了(仓库被移动过 + init 自己那句 worktree prune),
+    // 工作树目录原地留着,`.git` 文件指向一个不存在的 gitdir。
+    await rm(join(gitRoot, '.git', 'worktrees', 'integration'), { recursive: true, force: true })
+    await writeFile(join(intPathOf(), 'leftover.txt'), '15G 的 target/ 就是这么留下的\n')
+
+    // 修之前:rev-parse 128 → prune 不删目录 → add 报 already exists。
+    const probe = await git(['rev-parse', '--git-dir'], intPathOf())
+    expect(probe.code).not.toBe(0)
+    const wouldFail = await git(['worktree', 'add', intPathOf(), 'efftask/001/integration'], gitRoot)
+    expect(wouldFail.code).not.toBe(0)
+    expect(wouldFail.stderr).toContain('already exists')
+
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    // 池子真的可用了 —— 不是「返回了 ok」,是集成工作区真的在 git 的名册上。
+    expect((await git(['rev-parse', '--git-dir'], intPathOf())).code).toBe(0)
+    // 挪走,**不删**:那个目录里可能有 git 此刻读不出来的东西。
+    expect(await readFile(join(`${intPathOf()}.orphan`, 'leftover.txt'), 'utf-8')).toContain('15G')
+    expect(p.healNotes().join('\n')).toContain('孤儿目录')
+  })
+
+  it('集成分支被自建工作树占着 —— 让它 detach 再重试', async () => {
+    expect(await pool().init()).toEqual({ ok: true })
+    // 一棵节点工作树坐到了集成分支上(执行者自己 checkout 过就是这个形状),
+    // 而集成工作区的目录不在了。
+    await git(['worktree', 'remove', '--force', intPathOf()], gitRoot)
+    const squatter = join(worktreeRoot, 'efftask-001-squatter')
+    expect((await git(['worktree', 'add', squatter, 'efftask/001/integration'], gitRoot)).code).toBe(0)
+    const wouldFail = await git(['worktree', 'add', intPathOf(), 'efftask/001/integration'], gitRoot)
+    expect(wouldFail.stderr).toContain('already used by worktree')
+
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    expect((await git(['rev-parse', '--git-dir'], intPathOf())).code).toBe(0)
+    // detach 而不是删除:那棵树上可能有还没合走的提交。
+    expect(await exists(squatter)).toBe(true)
+    expect(p.healNotes().join('\n')).toContain('detached HEAD')
+  })
+
+  it('占着分支的不是我们建的树 —— 一个字节都不碰,把它是谁说出来', async () => {
+    expect(await pool().init()).toEqual({ ok: true })
+    await git(['worktree', 'remove', '--force', intPathOf()], gitRoot)
+    // 用户自己的检出(在 worktreeRoot 外面)。切进去动它 = 把别人正在干活的树掀了。
+    const theirs = join(gitRoot, '..', 'their-checkout')
+    expect((await git(['worktree', 'add', theirs, 'efftask/001/integration'], gitRoot)).code).toBe(0)
+
+    const p = pool()
+    const r = await p.init()
+    expect(r.ok).toBe(false)
+    if (r.ok) throw new Error('expected failure')
+    expect(r.reason).toContain('那不是本次运行建的工作树')
+    // 还在原来的分支上 —— 没被 detach。
+    const still = await git(['rev-parse', '--abbrev-ref', 'HEAD'], theirs)
+    expect(still.stdout.trim()).toBe('efftask/001/integration')
+  })
+
+  it('一切正常时不动任何东西(自愈只在 add 真的失败之后发生)', async () => {
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    expect(await p.init()).toEqual({ ok: true }) // 可重入
+    expect(p.healNotes()).toEqual([])
+    expect(await exists(`${intPathOf()}.orphan`)).toBe(false)
+  })
+})
+
+async function exists(p: string): Promise<boolean> {
+  try { await readFile(join(p, '.git')); return true } catch { /* fallthrough */ }
+  try { const { stat } = await import('node:fs/promises'); await stat(p); return true } catch { return false }
+}
+
+/**
+ * **目录被清掉、分支没删 → 这个节点永久起不来。**
+ *
+ * `acquire` 的重建路径用 `-b`(新建分支),而 `-f` 只强制路径。分支名是 `hash(nodeId)`,
+ * 不随时间变 —— 所以重做走的是逐字相同的一条路,用户报的原话是「重做也一样失败」。
+ *
+ * 跑机实测(10.10.20.13 / qianbase-xtp,2026-08-11):154 条节点分支里 10 条是这个形状
+ * (用户自己 `rm -rf .efftask-worktrees/` 之后必然如此),报错逐字是
+ * `无法为该节点准备隔离工作区,拒绝在共享工作区执行: 无法创建工作区: fatal: 一个分支名
+ * 'worktree-efftask-001-54b6ba01' 已经存在`。
+ */
+describe('acquire 撞上残留的节点分支', () => {
+  /** 用户清掉工作区目录、分支留下 —— 跑机上那 10 条的形状。 */
+  async function orphanBranch(n: TaskNode): Promise<string> {
+    const lease = await (async () => {
+      const p = pool()
+      expect(await p.init()).toEqual({ ok: true })
+      const l = await p.acquire(n)
+      if ('error' in l) throw new Error(l.error)
+      return l
+    })()
+    await git(['worktree', 'remove', '--force', lease.path], gitRoot)
+    // `worktree remove` 会连分支一起留下 —— 这正是现场的形状。
+    expect((await git(['rev-parse', '--verify', '--quiet', lease.branch], gitRoot)).code).toBe(0)
+    return lease.branch
+  }
+
+  it('分支已全部合进集成分支 → 复用它,节点跑得起来', async () => {
+    const n = node('e1')
+    const branch = await orphanBranch(n)
+    // 修之前:worktree add -b 报 already exists,节点当场阻断。
+    const wouldFail = await git(['worktree', 'add', '-f', '-b', branch, join(worktreeRoot, 'x'), 'efftask/001/integration'], gitRoot)
+    expect(wouldFail.code).not.toBe(0)
+
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    const lease = await p.acquire(n)
+    expect('error' in lease).toBe(false)
+    if ('error' in lease) throw new Error(lease.error)
+    expect(lease.branch).toBe(branch)
+    expect((await git(['rev-parse', '--git-dir'], lease.path)).code).toBe(0)
+    expect(p.healNotes().join('\n')).toContain('复用残留分支')
+  })
+
+  /**
+   * **分支上还有没合走的提交时,先存 salvage 再重置。**
+   * 这是 acquire 复用目录那条路上 salvage 段防的同一件事,只是换成重建目录这条路 ——
+   * 少了它,`-B` 会把那次执行的产出重置进 0 个 ref。
+   */
+  it('分支上有没合走的提交 → 先存 salvage 分支,再重置', async () => {
+    const n = node('e2')
+    const p0 = pool()
+    expect(await p0.init()).toEqual({ ok: true })
+    const l0 = await p0.acquire(n)
+    if ('error' in l0) throw new Error(l0.error)
+    await writeFile(join(l0.path, 'only-here.txt'), '没合走的活\n')
+    await git(['add', '-A'], l0.path)
+    await git(['commit', '-qm', 'e2 干了活但没合'], l0.path)
+    const lost = (await git(['rev-parse', 'HEAD'], l0.path)).stdout.trim()
+    await git(['worktree', 'remove', '--force', l0.path], gitRoot)
+
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    const lease = await p.acquire(n)
+    if ('error' in lease) throw new Error(lease.error)
+    // 提交还在 —— 存到了 salvage 分支上,没有被 `-B` 重置掉。
+    const salvage = (await git(['rev-parse', 'efftask/001/salvage/' + lease.branch.replace('worktree-', '')], gitRoot)).stdout.trim()
+    expect(salvage).toBe(lost)
+    // 而新工作区是从集成分支重开的 —— 那个文件不在里面(salvage 是它唯一的去处)。
+    expect(await readFile(join(lease.path, 'only-here.txt'), 'utf-8').catch(() => 'gone')).toBe('gone')
+    expect(p.healNotes().join('\n')).toContain('已先存到')
+  })
+
+/**
+   * **存不下来就绝不重置。** 宁可这个节点报错,不可静默丢掉一次执行的产出。
+   *
+   * 用一条**同名的父 ref** 挡住 salvage:git 的 ref 存在文件系统上,
+   * 有了分支 `efftask/001/salvage` 就再也建不出 `efftask/001/salvage/<slug>`
+   * (`cannot lock ref`)。这是真会发生的形状 —— 只要有人手工建过那条分支。
+   */
+  it('salvage 存不下来 → 拒绝重置,提交仍在原分支上', async () => {
+    const n = node('e4')
+    const p0 = pool()
+    expect(await p0.init()).toEqual({ ok: true })
+    const l0 = await p0.acquire(n)
+    if ('error' in l0) throw new Error(l0.error)
+    await writeFile(join(l0.path, 'only-here.txt'), '没合走的活\n')
+    await git(['add', '-A'], l0.path)
+    await git(['commit', '-qm', 'e4 干了活但没合'], l0.path)
+    const lost = (await git(['rev-parse', 'HEAD'], l0.path)).stdout.trim()
+    await git(['worktree', 'remove', '--force', l0.path], gitRoot)
+    // 把 salvage 的父路径占成一条分支 —— 之后任何 efftask/001/salvage/* 都建不出来。
+    expect((await git(['branch', 'efftask/001/salvage', 'HEAD'], gitRoot)).code).toBe(0)
+
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    const lease = await p.acquire(n)
+    // 报错而不是重置。
+    expect('error' in lease).toBe(true)
+    if (!('error' in lease)) throw new Error('expected refusal')
+    expect(lease.error).toContain('没有重置它')
+    // 活还在原地 —— 这条断言才是这个测试的全部意义。
+    const still = await git(['rev-parse', (await git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/worktree-efftask-001-*'], gitRoot)).stdout.trim()], gitRoot)
+    expect(still.stdout.trim()).toBe(lost)
+  })
+
+  /**
+   * **add 因为别的原因失败时,不许给出一句关于分支的假诊断。**
+   *
+   * 判据是「这条分支在不在」,而且是在**发 add 之前**问的 —— 补救式的写法只能靠解析
+   * git 的报错文本来分辨,而那句话随 locale 变(跑机上是中文)。这条钉的是:分支不存在时
+   * 整条自愈路径不参与,报出去的是 git 的真因,healNotes 一个字都不多。
+   */
+  it('路径被一个普通目录占着 → 报的是 git 的真因,不是编出来的分支诊断', async () => {
+    const n = node('e5')
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    // 目录在、但不是工作树(rev-parse --git-dir 失败 → 走重建那条路)
+    await mkdir(join(worktreeRoot, worktreeSlug('001', 'e5')), { recursive: true })
+    await writeFile(join(worktreeRoot, worktreeSlug('001', 'e5'), 'junk.txt'), 'x\n')
+
+    const lease = await p.acquire(n)
+    expect('error' in lease).toBe(true)
+    if (!('error' in lease)) throw new Error('expected failure')
+    expect(lease.error).not.toContain('残留分支')
+    expect(p.healNotes()).toEqual([])
+  })
+
+/**
+   * **最常见的那一种:目录被手工删掉,`.git/worktrees/<slug>` 登记项还在。**
+   *
+   * 跑机实测(10.10.20.13 / etcd3):32 条登记项里 **31 条**是这个形状。git 在这种状态下
+   * 拒绝一切动作 —— `branch -D` 回「无法删除检出于 … 的分支」、`worktree add` 回
+   * already used,而那个「…」指向的目录根本不存在,所以 `checkout --detach` 也没地方跑。
+   * 唯一的出路是 `worktree prune`,而 `acquire` 这条路上从来没有调过它。
+   */
+  it('登记项还在、目录被手工删掉 → prune 掉再重建', async () => {
+    const n = node('e6')
+    const p0 = pool()
+    expect(await p0.init()).toEqual({ ok: true })
+    const l0 = await p0.acquire(n)
+    if ('error' in l0) throw new Error(l0.error)
+    // 手工删目录(用户清空间时就是这么干的),**不动登记项**。
+    await rm(l0.path, { recursive: true, force: true })
+    expect((await git(['worktree', 'list', '--porcelain'], gitRoot)).stdout).toContain('prunable')
+    // 修之前:分支被一棵不存在的工作树占着,连删都删不掉。
+    const cantDelete = await git(['branch', '-D', l0.branch], gitRoot)
+    expect(cantDelete.code).not.toBe(0)
+
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    const lease = await p.acquire(n)
+    expect('error' in lease).toBe(false)
+    if ('error' in lease) throw new Error(lease.error)
+    expect((await git(['rev-parse', '--git-dir'], lease.path)).code).toBe(0)
+    expect((await git(['worktree', 'list', '--porcelain'], gitRoot)).stdout).not.toContain('prunable')
+  })
+
+  /** 正常路径一个字都不说 —— 自愈只在 add 真的失败之后发生。 */
+  it('没有残留时不留任何自愈记录', async () => {
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    const lease = await p.acquire(node('e3'))
+    expect('error' in lease).toBe(false)
+    expect(p.healNotes()).toEqual([])
   })
 })

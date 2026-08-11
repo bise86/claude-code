@@ -258,7 +258,10 @@ export function gitChoiceLines(
   const out: string[] = []
   out.push(
     opts.unavailable
-      ? `隔离方式: 共享工作树(执行串行)—— 不是你选的,当前环境用不了隔离:${clip(opts.unavailable, 40)}`
+      // 40 字砍在 `fatal: '/home/…/integration` 中间 —— 恰好把 `already exists`
+      // (唯一能让人动手的那半句)切掉。这一行是整个关口上最该读全的一句,关口是整屏视图,
+      // 换行没有代价;而它一旦被砍,用户能做的只剩「知道降级了」。
+      ? `隔离方式: 共享工作树(执行串行)—— 不是你选的,当前环境用不了隔离:${clip(opts.unavailable, 160)}`
       : iso === 'worktree'
         ? `隔离方式: worktree 隔离,可并行执行 ${key('w')}`
         : `隔离方式: 共享工作树 —— 执行者直接改你当前目录,而且执行阶段强制串行 ${key('w')}`,
