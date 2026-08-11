@@ -15,8 +15,8 @@
  * 回调里 throw —— 那个形状恰恰是「在循环里面抛」,它绿了一整天,而真实链路一次都没重试过。
  * 这里数的是 `fetchOverride` 被调了几次:它是 `/et` 的员工链路真正出网的那一层。
  */
-import { describe, expect, it } from 'bun:test'
-import { mkdtempSync } from 'node:fs'
+import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Message } from '../../types/message.js'
@@ -38,17 +38,44 @@ import type { Message } from '../../types/message.js'
 }
 
 /**
- * **把 VCR 支到一个一次性目录去。**
+ * **VCR 必须让开,而且只能在这两条用例期间让开。**
  *
- * `shouldUseVCR()` 在 `NODE_ENV === 'test'` 下恒为真,于是第一次跑会把这次交互录成磁带
- * 写进仓库根的 `fixtures/`,之后每一次都是**回放** —— fetchOverride 一次都不会被调到
- * (实测:calls 从 2 变成 0,而失败点在回放的记账代码里)。这一档数的就是出网次数,
- * 回放会让它永远量不到真实行为。
+ * `shouldUseVCR()` 在 `NODE_ENV === 'test'` 下恒为真,于是这条链路默认走磁带,而这一档
+ * 数的正是**出网次数** —— 回放会让它永远量不到真实行为。两种环境两种坏法,都实测过:
+ *
+ *  - 本地:第一次跑把交互录进仓库根的 `fixtures/`,之后每次都是回放,`fetchOverride`
+ *    一次都不调(calls 从 2 变 0);
+ *  - CI(`env.isCI`):没有磁带时**直接抛** `Anthropic API fixture missing`,`f()` 压根
+ *    不执行 —— 这就是 CI 上那两条 `Received: 0`。
+ *
+ * 所以磁带目录支到一次性临时目录,并且打开 `VCR_RECORD` 让 CI 那条分支去「录」(录 =
+ * 真的调用底下那个函数)。
+ *
+ * **三个环境变量都在 beforeAll 里设、afterAll 里还回去**,不再写在模块顶层:同一个进程
+ * 里跑着上百个测试文件,一个被支走的 fixtures 根目录会让**别人的**磁带全部找不到,
+ * 而一个常开的 `VCR_RECORD` 会把别人「缺磁带就该报错」这条保护悄悄关掉。
  */
-process.env.CLAUDE_CODE_TEST_FIXTURES_ROOT = mkdtempSync(join(tmpdir(), 'midstream-vcr-'))
-// 客户端建不起来就一次网都不出,而这一档数的正是出网次数。**在文件里自己给**,不靠
-// 命令行传:整套跑的时候没人会替这一个文件设环境变量(实测:单跑绿、全量跑红)。
-process.env.ANTHROPIC_API_KEY ??= 'test-key-not-a-real-secret'
+const FIXTURES_ROOT = mkdtempSync(join(tmpdir(), 'midstream-vcr-'))
+const SAVED: Record<string, string | undefined> = {}
+
+beforeAll(() => {
+  for (const k of ['CLAUDE_CODE_TEST_FIXTURES_ROOT', 'VCR_RECORD', 'ANTHROPIC_API_KEY']) {
+    SAVED[k] = process.env[k]
+  }
+  process.env.CLAUDE_CODE_TEST_FIXTURES_ROOT = FIXTURES_ROOT
+  process.env.VCR_RECORD = '1'
+  // 客户端建不起来就一次网都不出。**自己给**,不靠命令行传:整套跑的时候没人会替这一个
+  // 文件设环境变量(实测:单跑绿、全量跑红)。
+  process.env.ANTHROPIC_API_KEY ??= 'test-key-not-a-real-secret'
+})
+
+afterAll(() => {
+  for (const [k, v] of Object.entries(SAVED)) {
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
+  rmSync(FIXTURES_ROOT, { recursive: true, force: true })
+})
 
 const { queryModelWithStreaming } = await import('./claude.js')
 type Options = Awaited<typeof import('./claude.js')>['Options'] extends never
@@ -130,9 +157,12 @@ async function drain(gen: AsyncGenerator<unknown>): Promise<{ ok: boolean; error
   }
 }
 
-/** **每条用例一份新的、而且正文各不相同** —— VCR 按消息内容做磁带的键,两条用例说同一句话时,
- * 第二条会命中第一条刚录下的磁带,一次网都不出(实测 calls 从 1 掉到 0)。 —— 这条链路会往消息数组里追加,共用一份的话第二条用例拿到的是
- * 第一条跑完的残留(实测:它在 `message.message.model` 上炸掉,一次网都没出)。 */
+/**
+ * **每条用例一份新的、而且正文各不相同。** 两件事各自都实测过:
+ *  - 共用同一个数组:这条链路会往里追加,第二条用例拿到的是第一条跑完的残留,
+ *    在 `message.message.model` 上炸掉,一次网都没出;
+ *  - 说同一句话:VCR 按消息内容做磁带的键,第二条会命中第一条刚录下的磁带(calls 掉到 0)。
+ */
 const messagesFixture = (text: string): Message[] => [
   { type: 'user', message: { role: 'user', content: text }, uuid: 'u1', timestamp: '' } as never,
 ]
