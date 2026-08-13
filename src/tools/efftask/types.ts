@@ -89,6 +89,15 @@ export type NodeKind = 'decompose' | 'executable' | 'unknown'
  */
 export type BlockCategory =
   | 'cap-iteration' | 'cap-nodes' | 'rework' | 'timeout' | 'infra' | 'cap-depth'
+  /**
+   * **零贡献**:执行跑完了,而集成分支上一个字节都没多。
+   *
+   * 单独一档,不复用 `rework` —— 后者的建议是「先看该节点的验收记录,按阻断意见改代码;
+   * 必要时提高 caps.maxIterations」,而这一档下那三样**没有一样对得上**:跳过验收的运行
+   * 根本没有验收记录,阻断意见也不存在,而迭代上限和「什么都没产出」毫无关系。
+   * 用户报的原话:「普通任务怎么会去验收呢,前面已经将验收阶段跳过了」。
+   */
+  | 'no-output'
   // 补救拆分 (spec §4.1). The only member that is NOT a valve: nothing tripped and nothing
   // stopped — the node recovered and is waiting on new children. It has its own category
   // because reusing 'rework' produced a card headed 连续返工超限 (a STOPPING reason) over a

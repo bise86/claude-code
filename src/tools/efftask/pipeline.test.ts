@@ -6947,3 +6947,44 @@ describe('执行者拿到「你在哪、别碰什么」', () => {
     expect(p).toContain('留在那里的未提交改动会让别的节点合并失败')
   })
 })
+
+/**
+ * **零贡献那一条阻断,措辞里一个字都不许提验收。**
+ *
+ * 用户报的原话:「普通任务怎么会去验收呢,前面已经将验收阶段跳过了。应该执行阶段完成后
+ * 就去合并提交了。」—— 上一版这条走 `rework`,而那一档的建议是「先看该节点的验收记录…
+ * 必要时提高 caps.maxIterations」。跳过验收的运行根本没有验收记录。
+ */
+describe('零贡献阻断的措辞与类别', () => {
+  it('走 no-output 这一档,而且说的是去哪儿找那批产出', async () => {
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.worktree = { branch: 'b', path: '/wt/root' }
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    const ctx = {
+      ...ctxFor([n], runAgent),
+      worktrees: {
+        acquire: async () => ({ path: '/wt/root', branch: 'b', gitRoot: '/repo' }),
+        // **什么都没合上** —— 这一格正是这条闸要拦的。
+        commitAndMerge: async () => ({ ok: true, merged: false }),
+        release: async () => ({ removed: true }),
+        withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      } as never,
+    }
+    await stepExecute(n, ctx)
+    expect(n.status).toBe('BLOCKED')
+    // 类别不落在节点上,它随 reason 一起被写成「处理方式」那一段(见 blockWithReason)——
+    // 所以判据落在那段文字上:no-output 那一档的建议和 rework 逐字不同。
+    expect(n.blockedReason).toContain('先确认执行者到底把文件写到哪了')
+    expect(n.blockedReason).not.toContain('caps.maxIterations')
+    expect(n.blockedReason).toContain('.gitignore')
+    expect(n.blockedReason).toContain('工作区之外')
+    // 这一条和验收无关 —— 阻断原因里不许出现「验收意见」。
+    expect(n.blockedReason).not.toContain('验收意见')
+  })
+})

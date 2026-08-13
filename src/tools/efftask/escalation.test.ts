@@ -385,3 +385,49 @@ describe('降级放行的升级卡不许自相矛盾', () => {
     expect(stopsTheNode('degrade')).toBe(false)
   })
 })
+
+/**
+ * **零贡献那一档不许提验收和 maxIterations。**
+ *
+ * 用户报的原话:「普通任务怎么会去验收呢,前面已经将验收阶段跳过了。应该执行阶段完成后
+ * 就去合并提交了。」—— 上一版这条走的是 `rework`,而那一档的建议是「先看该节点的验收
+ * 记录,按阻断意见改代码;必要时提高 caps.maxIterations」。跳过验收的运行根本没有验收
+ * 记录,阻断意见也不存在,而迭代上限和「什么都没产出」毫无关系:三句话没有一句对得上。
+ */
+describe('零贡献的阻断卡', () => {
+  const t = (): string => blockReasonWithRemedy('该节点没有向集成分支贡献任何改动', 'no-output', '001')
+
+  it('一个字都不提验收记录 / maxIterations', () => {
+    expect(t()).not.toContain('验收记录')
+    expect(t()).not.toContain('maxIterations')
+  })
+
+  it('说的是「去哪儿找那批产出」', () => {
+    expect(t()).toContain('工作区之外')
+    expect(t()).toContain('.gitignore')
+    expect(t()).toContain('按 r 重做')
+  })
+
+  /** 对照:`rework` 那一档仍然该提那两样 —— 它本来就是「验收打回来了」。 */
+  it('rework 那一档照旧', () => {
+    const r = blockReasonWithRemedy('验收迭代超限', 'rework', '001')
+    expect(r).toContain('验收记录')
+    expect(r).toContain('maxIterations')
+  })
+
+  /** 标题不许写成安全阀 —— 没有任何上限被触到。 */
+  it('标题不是安全阀', () => {
+    const n = createNode({
+      id: 'root/01', title: '写 a.ts', parentId: 'root', deps: [], depth: 1,
+      phaseRoles: emptyPhaseRoles(), now: '2026-08-13T00:00:00Z',
+    })
+    const text = blockEscalationLines({
+      category: 'no-output', node: n,
+      reason: '该节点没有向集成分支贡献任何改动',
+    } as never).join('\n')
+    // 只看**类别**那一行 —— 底下那句通用的重试说明里本来就有「安全阀」三个字。
+    const kind = text.split('\n').find(l => l.startsWith('类别:')) ?? ''
+    expect(kind).not.toContain('安全阀')
+    expect(kind).toContain('产出没有落到集成分支上')
+  })
+})

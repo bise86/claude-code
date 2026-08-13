@@ -4378,14 +4378,26 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
      * 拦下来之后走 `b` 回溯(它认的正是这条)或者 `r` 重做 —— 两条路都在,而且卡片要说清。
      */
     if (node.kind === 'executable' && node.contributed !== true) {
+      /**
+       * **这一档和验收无关,措辞里一个字都不许提它。**
+       *
+       * 用户报的原话:「普通任务怎么会去验收呢,前面已经将验收阶段跳过了。应该执行阶段
+       * 完成后就去合并提交了。」—— 而上一版这句话写着「按 b 回溯(会带着**验收意见**重新
+       * 执行)」,`rework` 那一档的建议又是「先看该节点的**验收记录**……必要时提高
+       * `caps.maxIterations`」。跳过验收的运行根本没有验收记录,而迭代上限和「什么都
+       * 没产出」毫无关系:三句话没有一句对得上,用户只能去找他没有的东西。
+       *
+       * 换成 `no-output`,正文说的是**去哪儿找那批产出**(见 escalation 的 REMEDY)。
+       */
       await blockWithReason(
         node,
         `${NO_CONTRIBUTION_LEAD}${NO_CONTRIBUTION_NOTE} —— 产出不在集成分支上,也不在任何别的地方。` +
         `没有合并提交就不算完成,所以这里不判通过。` +
-        `按 b 回溯(会带着验收意见重新执行),或者按 r 重做本任务。`,
+        `常见原因:执行者把文件写到了本任务工作区之外,或者产出全被 .gitignore 忽略了` +
+        `(git add -A 不暂存被忽略的文件)。` +
+        `按 r 重做本任务,或按 b 回溯(带着上下文重跑执行阶段)。`,
         ctx,
-        // 不是基础设施故障、也不是触阀 —— 归 rework:它要人做的事就是让它重跑一次。
-        'rework',
+        'no-output',
       )
       return false
     }
