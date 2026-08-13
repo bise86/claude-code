@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner } from './worktreePool.js'
-import { scanStranded, strandedLines, STRANDED_KINDS, STRANDED_KIND_LIST, type StrandedDeps } from './stranded.js'
+import { scanStranded, STRANDED_KINDS, STRANDED_KIND_LIST, type StrandedDeps } from './stranded.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
 const git: GitRunner = (args, cwd) =>
@@ -288,7 +288,7 @@ describe('要你自己定的那几格', () => {
 })
 
 describe('探不明白 ≠ 没问题', () => {
-  it('merge-base 探测失败的条目要带 unknown,并在屏幕上单独说一句', async () => {
+  it('merge-base 探测失败的条目要带 unknown', async () => {
     const p = pool(); await p.init()
     const n = node('root/12', { status: 'ACCEPTED' })
     await p.acquire(n)
@@ -299,7 +299,6 @@ describe('探不明白 ≠ 没问题', () => {
     })
     const r = await scanStranded(deps, [n])
     expect(r.items.some(i => i.unknown === true)).toBe(true)
-    expect(strandedLines(r).join('\n')).toContain('未知')
   })
 
   it('列不出抢救分支时要说这一格是空白,不是没有', async () => {
@@ -325,27 +324,31 @@ describe('在飞的节点不算卡住', () => {
   })
 })
 
-describe('屏幕上说了什么', () => {
-  it('一条都没有时说「都送到了」,不印空标题', async () => {
-    const p = pool(); await p.init()
-    const lines = strandedLines(await scanStranded(depsOf(p), []))
-    expect(lines[0]).toContain('没有卡住的活')
-    expect(lines.join('\n')).not.toContain('可以合进来的')
-  })
-
-  it('按去处分组,而不是按分类', async () => {
+/**
+ * **这一节曾经断言 `strandedLines` 的输出,而那个渲染器已经删掉了。**
+ *
+ * 它从落地那天起就只被这里引用 —— 上屏那一份住在 `mergeSubtree.subtreeMergeLines`,
+ * 按「这个键认领哪几格」组织而不是按分类法组织。两份渲染器里活着的那份总会先退化,
+ * 而这个仓库为「声明了、实现了、测过了,而生产上没有任何人用它」付过账。
+ *
+ * 它守的两件事换了地方,一样有人守:
+ *  - 「按去处分组」→ `counts` 仍然按 action 累加(下面那条);
+ *  - 「一条都没有时说清楚」→ `mergeSubtree.test.ts` 的「查过了、确实没有」那一条。
+ */
+describe('去处分组', () => {
+  it('counts 按 action 累加,三类各自数得出来', async () => {
     const p = pool(); await p.init()
     const n = node('root/14', {
       status: 'ACCEPTED',
       execStatus: '(注:该节点没有向集成分支贡献任何改动)',
-      cancelled: false,
     })
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'loose.ts'), 'x\n')
     const r = await scanStranded(depsOf(p), [n])
-    const text = strandedLines(r).join('\n')
-    expect(text).toContain('可以合进来的')
-    expect(text).toContain('要返工的')
+    expect(r.counts.merge).toBeGreaterThan(0)
+    expect(r.counts.backtrack).toBeGreaterThan(0)
+    // 三个去处的和 = 全部条目,一条都不许掉在分类之外。
+    expect(r.counts.merge + r.counts.backtrack + r.counts.report).toBe(r.items.length)
   })
 })
 

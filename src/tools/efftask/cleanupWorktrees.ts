@@ -1,6 +1,7 @@
 import { descendantsOf } from './redo.js'
 import { AGENT_LOG_NAME } from './agentLog.js'
 import { writeNode, type FsLike } from './persistence.js'
+import { createNodeJournal } from './nodeJournal.js'
 import { scanBuildOutputs, wipeBuildOutputs, type BuildWipePlan } from './buildOutputs.js'
 import type { TaskNode } from './types.js'
 
@@ -591,7 +592,11 @@ export async function runCleanup(
       node.worktree = undefined
       if (deps.persist) {
         try {
-          await writeNode(deps.persist.fs, deps.persist.runDir, node)
+          // 状态账一起写 —— 见 redoCommit 里那一段。
+          await writeNode(
+            deps.persist.fs, deps.persist.runDir, node,
+            createNodeJournal({ fs: deps.persist.fs, runDir: deps.persist.runDir }),
+          )
         } catch (e) {
           const err = e instanceof Error ? e : new Error(String(e))
           deps.onError?.(err)

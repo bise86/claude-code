@@ -1,4 +1,7 @@
 import { parse as yamlParse } from 'yaml'
+// 「零贡献」那句注记的措辞和 pipeline / 回溯共用一份 —— 各写一份的话,哪天改了措辞,
+// 这次回填就会把真的零贡献节点也放行。
+import { NO_CONTRIBUTION_NOTE } from './backtrack.js'
 import { MAX_DEPS_RECALC_RECORDS, MAX_NODES_CEILING, clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEGRADABLE_PHASES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, MIN_TRUNK_RESOLVE, MAX_TRUNK_RESOLVE, DEFAULT_TRUNK_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
 import type { Caps, DegradeRecord, DepsRecalcRecord, EffTaskConfig, NodeKind, NodePlan, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
@@ -695,6 +698,25 @@ export function validateLoadedNodes(
     // hand-edited node.md) is not `=== true`, so the node would buy a SECOND corrective
     // subtree — which is the one bound the whole cost argument rests on.
     if (n.revised !== undefined && n.revised !== true) n.revised = false
+    /**
+     * **`contributed`:同样的 `!== true → false` 纪律,外加一次给老 run 的回填。**
+     *
+     * 这个标记是「没有合并提交就不算完成」那道闸用来区分两种「这一次没合」的东西:
+     * 从来没贡献过(拦下来)vs 此前贡献过、这一次只是没有新东西(放行)。
+     *
+     * 而它是本轮才引入的 —— **本轮之前跑完的 run,盘上一个节点都没有它**。恢复那种 run 再
+     * `--retry-blocked`:节点重跑、没有新产出 → `isMerged` 为真 → `{merged:false}` →
+     * 判 `contributed !== true` → **BLOCKED**,理由逐字是「该节点没有向集成分支贡献任何
+     * 改动」,而它当初真的贡献过。一次纯粹由升级造成的误杀。
+     *
+     * 回填判据:**已验收、而且 execStatus 上没有那句「零贡献」的注记**。那句注记正是
+     * `mergeAndRelease` 在 `merged === false` 时写下的,所以「没有它」= 当初合成功过。
+     * 判据窄到不会把真的零贡献节点也回填进去 —— 那种节点带着注记,回填不到它头上。
+     */
+    if (n.contributed !== undefined && n.contributed !== true) n.contributed = false
+    else if (n.contributed === undefined && n.status === 'ACCEPTED' && !n.execStatus.includes(NO_CONTRIBUTION_NOTE)) {
+      n.contributed = true
+    }
     // 各阶段耗时: a plain number map off disk, so every value needs the same treatment the
     // iteration counters get. NaN would render as "NaNs" and a negative would render a phase
     // that finished before it began; both are reachable by hand-editing node.md, and the

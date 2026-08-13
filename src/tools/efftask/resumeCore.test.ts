@@ -1576,3 +1576,53 @@ describe('新增的 caps 字段要读得回来', () => {
     expect(config.caps.trunkResolveRounds).toBeUndefined()
   })
 })
+
+/**
+ * **老 run 的 `contributed` 要回填 —— 否则一次纯粹由升级造成的误杀。**
+ *
+ * 这个标记是本轮才引入的:本轮之前跑完的 run,盘上一个节点都没有它。恢复那种 run 再
+ * `--retry-blocked` → 节点重跑、没有新产出 → `isMerged` 为真 → `{merged:false}` →
+ * 判 `contributed !== true` → **BLOCKED**,理由逐字是「该节点没有向集成分支贡献任何改动」,
+ * 而它当初真的贡献过。
+ */
+describe('老 run 的 contributed 回填', () => {
+  const n = (over: Partial<TaskNode>): TaskNode => ({
+    ...createNode({
+      id: 'root', title: 'r', parentId: null, deps: [], depth: 0,
+      phaseRoles: emptyPhaseRoles(), now: 'T0',
+    }),
+    ...over,
+  })
+
+  it('已验收、且没有「零贡献」注记 → 回填成 true', () => {
+    const node = n({ status: 'ACCEPTED', execStatus: '实现了 api.ts' })
+    validateLoadedNodes([node])
+    expect(node.contributed).toBe(true)
+  })
+
+  /** 带着那句注记的**不能**回填 —— 它当初就是零贡献,回填等于把闸门关掉。 */
+  it('带着「零贡献」注记的不回填', () => {
+    const node = n({ status: 'ACCEPTED', execStatus: '(注:该节点没有向集成分支贡献任何改动)' })
+    validateLoadedNodes([node])
+    expect(node.contributed).toBeUndefined()
+  })
+
+  it('还没验收通过的不回填', () => {
+    const node = n({ status: 'BLOCKED', execStatus: '做了一半' })
+    validateLoadedNodes([node])
+    expect(node.contributed).toBeUndefined()
+  })
+
+  /** 手改 node.md 写进一个真值非布尔 —— 和别的持久布尔同一条 `!== true → false` 纪律。 */
+  it('非布尔一律归一成 false', () => {
+    const node = n({ status: 'ACCEPTED', contributed: 'yes' as never })
+    validateLoadedNodes([node])
+    expect(node.contributed).toBe(false)
+  })
+
+  it('已经是 true 的不动', () => {
+    const node = n({ status: 'ACCEPTED', contributed: true })
+    validateLoadedNodes([node])
+    expect(node.contributed).toBe(true)
+  })
+})

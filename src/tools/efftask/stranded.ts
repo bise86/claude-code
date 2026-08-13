@@ -431,37 +431,13 @@ export async function scanStranded(
 
 
 /**
- * 清单那一屏的每一行。**是数据,不是 JSX** —— 屏幕上到底说了什么要能被断言钉住。
+ * **这里刻意**没有**一个 `strandedLines` 渲染器。**
  *
- * 按**去处**分组而不是按分类:用户看这一屏是为了决定按哪个键,而不是为了学会我们的分类法。
- * 一条都没有时说「都送到了」,而不是印一堆空标题 —— 空标题读起来像功能坏了。
+ * 曾经有过,而它从落地那天起就只被自己的测试引用 —— 上屏那一份住在
+ * `mergeSubtree.subtreeMergeLines`(它按「这个键认领哪几格」组织,而不是按分类法组织,
+ * 因为用户看那一屏是为了决定按哪个键)。两份渲染器里活着的那份总会先退化,
+ * 而这个仓库为「声明了、实现了、测过了,而生产上没有任何人用它」付过账。
+ *
+ * 需要一份独立视图时,从 `StrandedReport` 现写 —— 分类表 `STRANDED_KINDS` 带着
+ * label / action / how 三样,足够任何一屏自己组织。
  */
-export function strandedLines(report: StrandedReport): string[] {
-  const out: string[] = []
-  if (report.items.length === 0) {
-    out.push('没有卡住的活:产出都已合入,也没有功能没达标的任务。')
-  } else {
-    const group = (action: StrandedAction, head: string): void => {
-      const list = report.items.filter(i => STRANDED_KINDS[i.kind].action === action)
-      if (list.length === 0) return
-      out.push(head.replace('{n}', String(list.length)))
-      for (const it of list) {
-        const bits: string[] = []
-        if (it.commits !== undefined && it.commits > 0) bits.push(`${it.commits} 个提交`)
-        if (it.loose !== undefined && it.loose > 0) bits.push(`${it.loose} 项未提交`)
-        const where = it.branch ?? it.path ?? ''
-        out.push(`  · ${it.title ?? where}${bits.length > 0 ? `(${bits.join(' · ')})` : ''}:${it.why}`)
-      }
-    }
-    group('merge', '可以合进来的 {n} 处 —— 东西还在,只是没送到:')
-    group('backtrack', '要返工的 {n} 处 —— 产出不在了,或者功能没达标,合并解决不了:')
-    group('report', '要你自己定的 {n} 处 —— 该不该动不是我们能替你判的:')
-  }
-  const unknown = report.items.filter(i => i.unknown === true).length
-  if (unknown > 0) {
-    // 「探不明白」和「这里没有东西」在屏幕上长得一模一样,而它们要做的事完全不同。
-    out.push(`⚠ 其中 ${unknown} 处 git 探测失败 —— 它们的状态是**未知**,不是「没问题」。`)
-  }
-  for (const p of report.problems) out.push(`⚠ ${p}`)
-  return out
-}

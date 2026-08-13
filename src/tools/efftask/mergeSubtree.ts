@@ -1,6 +1,7 @@
 import { descendantsOf } from './redo.js'
 import { isTerminal } from './stateMachine.js'
 import { writeNode, type FsLike } from './persistence.js'
+import { createNodeJournal } from './nodeJournal.js'
 import { autoResolveMerge, trackedChanges, type ConflictResolver, type GitFn } from './handoffActions.js'
 import { syncTrunk } from './integrationMerge.js'
 import { scanStranded, STRANDED_KINDS } from './stranded.js'
@@ -397,6 +398,17 @@ async function scanRescue(
   const refOnly = report.items.filter(
     i => i.kind === 'salvage' || i.kind === 'salvageOrphan' || i.kind === 'branchOnly' || i.kind === 'orphanDir',
   )
+  /**
+   * **「只摆出来」那一桶也要真的摆出来。**
+   *
+   * `scanStranded` 算出 12 格,这个键只认领其中 4 格(能合的);而
+   * `action: 'report'` 那几格(集成工作区脏、降级放行、被你取消的)算出来之后
+   * **没有任何人渲染** —— 而那一档存在的全部意义就是上屏。用户按 `m` 是为了确认
+   * 「还有没有东西没送到」,这几条正是「有东西,但该不该动是你的决定」。
+   */
+  const notices = report.items
+    .filter(i => STRANDED_KINDS[i.kind].action === 'report')
+    .map(i => `${i.title ?? i.path ?? i.branch ?? STRANDED_KINDS[i.kind].label}:${i.why}`)
   const plan = await planRescue({
     git,
     gitRoot: pool.gitRoot,
@@ -410,6 +422,7 @@ async function scanRescue(
     ...(deps.onProgress ? { onProgress: deps.onProgress } : {}),
     ...(deps.signal ? { signal: deps.signal } : {}),
   }, refOnly, deps.listFiles)
+  plan.problems.push(...notices)
   // 扫描本身的问题(列不出抢救分支之类)要并进来 —— 它们是「这一格是空白,不是没有」。
   plan.problems.push(...report.problems)
   return { rescue: plan }
@@ -743,7 +756,11 @@ async function noteMerged(deps: SubtreeMergeDeps, node: TaskNode, out: SubtreeMe
     node.execStatus = `${node.execStatus}${node.execStatus ? '\n' : ''}${line}`
   }
   try {
-    await writeNode(deps.persist.fs, deps.persist.runDir, node)
+    // 状态账一起写 —— 见 redoCommit 里那一段:node.md 是覆盖写,而账是只增不改的。
+    await writeNode(
+      deps.persist.fs, deps.persist.runDir, node,
+      createNodeJournal({ fs: deps.persist.fs, runDir: deps.persist.runDir }),
+    )
   } catch (e) {
     const err = e instanceof Error ? e : new Error(String(e))
     deps.onError?.(err)

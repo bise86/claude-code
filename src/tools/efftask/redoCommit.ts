@@ -1,4 +1,5 @@
 import { removeNodeDirs, writeNode, writeRunManifest, type FsLike } from './persistence.js'
+import { createNodeJournal } from './nodeJournal.js'
 import type { RedoPlan } from './redo.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
 
@@ -52,6 +53,7 @@ export interface RedoCommitDeps {
 
 export async function commitRedo(deps: RedoCommitDeps, plan: RedoPlan): Promise<{ problems: string[] }> {
   const problems: string[] = []
+  const journal = createNodeJournal({ fs: deps.fs, runDir: deps.runDir })
   const byId = new Map(deps.before.map(n => [n.id, n]))
 
   for (const w of plan.worktreesToRelease) {
@@ -106,7 +108,13 @@ export async function commitRedo(deps: RedoCommitDeps, plan: RedoPlan): Promise<
   const deletedSet = new Set(plan.deleted)
   for (const n of plan.nodes) {
     try {
-      await writeNode(deps.fs, deps.runDir, n)
+      /**
+       * **状态账要一起写。** `writeNode` 的 journal 参数在生产路径上是必须的
+       * (persistence 那边逐字写着):`node.md` 是覆盖写,磁盘满的那一刻盘上留着的是
+       * **上一次**的完整文件 —— 这次重做/回溯的全部状态变化就此不存在。而账是只增不改的,
+       * 七十 KB 写不下去时它往往还写得下。
+       */
+      await writeNode(deps.fs, deps.runDir, n, journal)
     } catch (e) {
       // 落盘失败不该拦住重做本身(内存里的树是对的,run 照跑),但**必须说** ——
       // 否则这次重做在下一次 --resume 时会整个消失。
