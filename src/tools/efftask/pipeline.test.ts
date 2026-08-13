@@ -6948,7 +6948,15 @@ describe('执行者拿到「你在哪、别碰什么」', () => {
       } as never,
     })
     expect(p).toContain('.efftask-worktrees/integration')
-    expect(p).toContain('留在那里的未提交改动会让别的节点合并失败')
+    /**
+     * **执行者那一份要先说「在哪写」。** 今天把这段话接进执行提示词之后,跑机上的执行者
+     * 把「不要在这些目录里跑任何会改动文件的命令」读成了「不要在你现在这个目录里改文件」
+     * —— 而它的 cwd 正是 `.efftask-worktrees/efftask-001-xxxx`。
+     */
+    expect(p).toContain('这就是你要写文件的地方')
+    expect(p).toContain('只约束那一个目录,不影响你在上面自己的工作区里读写')
+    // 反面:那句会被读成全局禁令的话,不许出现在执行提示词里。
+    expect(p).not.toContain('不要在这些目录里跑构建/测试或任何会改动文件的命令')
   })
 })
 

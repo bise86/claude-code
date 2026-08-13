@@ -849,7 +849,7 @@ function promptTooLongRemedy(): string {
  * **共享模式此前返回空串 = 执行者收到的约束是零**,而第三档(共享 + 并发)恰恰是唯一
  * 一种「没有任何机制能挡住两个执行者改同一个文件」的运行 —— 那句约束是它全部的安全网。
  */
-function sharedTreeNote(isolated: boolean, own?: string, sharedParallel?: boolean): string {
+function sharedTreeNote(isolated: boolean, own?: string, sharedParallel?: boolean, audience: 'plan' | 'execute' = 'plan'): string {
   if (!isolated) {
     return sharedParallel === true
       ? '注意:本次运行**没有隔离**,而且**多个任务正在同一个目录里同时工作**。\n' +
@@ -859,6 +859,28 @@ function sharedTreeNote(isolated: boolean, own?: string, sharedParallel?: boolea
         '覆盖了不会有任何东西报错。\n'
       : '注意:本次运行没有隔离,你直接在用户自己的工作目录里改代码,改动不会被自动提交。\n' +
         '只动与本任务相关的文件。\n'
+  }
+  /**
+   * **给执行者的那一份必须先说「在哪写」,再说「哪儿别碰」,而且禁令只能指向 integration。**
+   *
+   * 这段话在今天之前只进方案提示词(方案环节不写代码,怎么写都无害)。接进执行提示词之后,
+   * 跑机上的执行者读到的是「仓库下的 .efftask-worktrees/ …**不要在这些目录里跑任何会改动
+   * 文件的命令**」—— 而它的 cwd 正是 .efftask-worktrees/efftask-001-xxxx。它把这句读成了
+   * 「不要在你现在这个目录里改文件」,于是写了 92 分钟分析、一个文件没动,execStatus 逐字是
+   * summary_only_blocked_no_tools_called、「当前禁止调用工具」。
+   *
+   * 所以执行者那一份:第一句就是**你必须在这里写文件**,禁令严格限定到 integration 一个
+   * 目录,并明说「只约束那一个目录,不影响你在自己工作区里读写」。
+   */
+  if (audience === 'execute') {
+    return own
+      ? `你现在在**本节点专属**的隔离工作区 \`${quote(own)}\` 里 —— **这就是你要写文件的地方**,` +
+        '本任务的所有代码改动都必须落在这个目录里(它已经落在集成分支的当前状态上,依赖的产出都在)。\n' +
+        '唯一的禁区是仓库下的 `.efftask-worktrees/integration`(所有节点共享):不要进那个目录跑任何' +
+        '会改动文件的命令。**这条只约束那一个目录,不影响你在上面自己的工作区里读写。**\n'
+      : '本次运行没有为本节点分配隔离工作区,你直接在当前工作目录里改代码 —— **该写的文件照写**。\n' +
+        '唯一的禁区是仓库下的 `.efftask-worktrees/integration`(所有节点共享的集成工作区):' +
+        '不要进那个目录跑任何会改动文件的命令。\n'
   }
   return own
     ? `注意:你现在在**本节点专属**的隔离工作区 \`${quote(own)}\` 里,它已经落在集成分支的当前状态上 —— ` +
@@ -1613,7 +1635,7 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
      * 位置在方案之后、`degradeSection` 之前:先说「做什么」,再说「在哪做、别碰什么」,
      * 然后才是上游已知的坑。
      */
-    sharedTreeNote(ctx.worktrees !== undefined, node.worktree?.path, ctx.sharedParallel) +
+    sharedTreeNote(ctx.worktrees !== undefined, node.worktree?.path, ctx.sharedParallel, 'execute') +
     // 工作目录本身也要说 —— 隔离档下 `sharedTreeNote` 已经带了路径,共享档下带不了
     // (那句话说的是「没有隔离」),而执行者需要知道对着哪个目录动手。
     (node.worktree?.path === undefined && ctx.cwd ? `工作目录:${quote(ctx.cwd)}\n` : '') +
