@@ -391,7 +391,7 @@ function notifyValve(node: TaskNode, reason: string, category: BlockCategory, ct
  * 每一关**单独一段** —— 合成一段会让「方案评审没通过」和「测试没跑通」的建议混在一起,
  * 而它们的处理方式不同:前者要在动手前先想清楚,后者是手上这一版的具体缺陷。
  */
-function degradeSection(node: TaskNode): string {
+function degradeSection(node: TaskNode, audience: 'act' | 'judge' = 'act'): string {
   return (node.degraded ?? [])
     /**
      * **过 `quote()`。** `reason` 和 `advice` 逐字都是模型写的:前者来自
@@ -404,7 +404,7 @@ function degradeSection(node: TaskNode): string {
      *
      * `answerRule` 的注释里写着「模型写的文本一律先过 quote()」,这一处不过就是让那句话变假。
      */
-    .map(d => degradeCarryPrompt(PHASE_LABEL[d.phase], quote(d.reason), d.advice.map(quote)))
+    .map(d => degradeCarryPrompt(PHASE_LABEL[d.phase], quote(d.reason), d.advice.map(quote), audience))
     .join('')
 }
 
@@ -850,6 +850,35 @@ function promptTooLongRemedy(): string {
  * 一种「没有任何机制能挡住两个执行者改同一个文件」的运行 —— 那句约束是它全部的安全网。
  */
 function sharedTreeNote(isolated: boolean, own?: string, sharedParallel?: boolean, audience: 'plan' | 'execute' = 'plan'): string {
+  if (audience === 'execute') {
+    /**
+     * **执行者那一份:先说「在哪写」,再说「哪儿别碰」。**
+     *
+     * 共享两档的安全网(「多个任务同时改同一个目录」「不要跑会全局改写的命令」)一个字
+     * 都不能少 —— 它们本来就是写给执行者的;要改的只是**开头**:先明确他必须写文件,
+     * 否则那串禁令读起来就是「别动手」(隔离档上已经真实发生过一次)。
+     */
+    if (!isolated) {
+      return sharedParallel === true
+        ? '**你必须真的改文件** —— 本任务的产出就写在你当前的工作目录里。\n' +
+          '注意:本次运行**没有隔离**,而且**多个任务正在同一个目录里同时工作**。\n' +
+          '你只能创建/修改**属于本任务**的文件(方案与验收点里点名的那些);' +
+          '不要改别的任务的文件,也不要跑会全局改写的命令(整仓格式化、更新锁文件、' +
+          '`cargo fmt --all`、`git checkout .` 之类)—— 别人的产出就在同一棵树里,' +
+          '覆盖了不会有任何东西报错。\n'
+        : '**你必须真的改文件** —— 本任务的产出就写在你当前的工作目录里。\n' +
+          '注意:本次运行没有隔离,你直接在用户自己的工作目录里改代码,改动不会被自动提交。' +
+          '只动与本任务相关的文件。\n'
+    }
+    return own
+      ? `你现在在**本节点专属**的隔离工作区 \`${quote(own)}\` 里 —— **这就是你要写文件的地方**,` +
+        '本任务的所有代码改动都必须落在这个目录里(它已经落在集成分支的当前状态上,依赖的产出都在)。\n' +
+        '唯一的禁区是仓库下的 `.efftask-worktrees/integration`(所有节点共享):不要进那个目录跑任何' +
+        '会改动文件的命令。**这条只约束那一个目录,不影响你在上面自己的工作区里读写。**\n'
+      : '本次运行没有为本节点分配隔离工作区,你直接在当前工作目录里改代码 —— **该写的文件照写**。\n' +
+        '唯一的禁区是仓库下的 `.efftask-worktrees/integration`(所有节点共享的集成工作区):' +
+        '不要进那个目录跑任何会改动文件的命令。\n'
+  }
   if (!isolated) {
     return sharedParallel === true
       ? '注意:本次运行**没有隔离**,而且**多个任务正在同一个目录里同时工作**。\n' +
@@ -872,16 +901,6 @@ function sharedTreeNote(isolated: boolean, own?: string, sharedParallel?: boolea
    * 所以执行者那一份:第一句就是**你必须在这里写文件**,禁令严格限定到 integration 一个
    * 目录,并明说「只约束那一个目录,不影响你在自己工作区里读写」。
    */
-  if (audience === 'execute') {
-    return own
-      ? `你现在在**本节点专属**的隔离工作区 \`${quote(own)}\` 里 —— **这就是你要写文件的地方**,` +
-        '本任务的所有代码改动都必须落在这个目录里(它已经落在集成分支的当前状态上,依赖的产出都在)。\n' +
-        '唯一的禁区是仓库下的 `.efftask-worktrees/integration`(所有节点共享):不要进那个目录跑任何' +
-        '会改动文件的命令。**这条只约束那一个目录,不影响你在上面自己的工作区里读写。**\n'
-      : '本次运行没有为本节点分配隔离工作区,你直接在当前工作目录里改代码 —— **该写的文件照写**。\n' +
-        '唯一的禁区是仓库下的 `.efftask-worktrees/integration`(所有节点共享的集成工作区):' +
-        '不要进那个目录跑任何会改动文件的命令。\n'
-  }
   return own
     ? `注意:你现在在**本节点专属**的隔离工作区 \`${quote(own)}\` 里,它已经落在集成分支的当前状态上 —— ` +
       '所有已通过验收的任务(包括本节点的依赖)的产出都在这里。读代码、跑构建/测试都请在这个目录里进行。\n' +
@@ -1791,8 +1810,26 @@ function verifyFixPrompt(
     // judgeGuidance 而不是 guidanceSection:那一句「用户补充的约束优先于原方案的枝节」是
     // 说给**拿着旧验收点去对照产出**的人听的,而这一席正是这种人 —— 它要按补充后的意图
     // 决定「这算不算问题、要不要动手改」。少了它,实测过的那条死循环换个环节重演一遍。
-    judgeGuidance(ctx) +
-    `你是本任务的**测试修复**席位(第 ${seatNo}/${seatCount} 位)。\n` +
+    /**
+     * **不是 `judgeGuidance`** —— 这一关已经被移出 `JUDGING_PHASES`(它自己动手改,不裁决),
+     * 而 `judgeGuidance = guidanceSection + JUDGE_NOTE`,那条注记是说给「判别人有没有做完」
+     * 的人听的。发给一个自己动手的席位,最坏的读法正是「那就别改了」——
+     * `JUDGING_PHASES` 那段注释自己预言过这个坏读法,而这条路把它拉了回来。
+     */
+    guidanceSection(ctx) +
+    /**
+     * **和 `executePrompt` 同一句反声明,同一个理由。**
+     *
+     * 定向注入经 `CROSS.verify = 'execute'` 把用户写给执行环节的限制原样送到这里
+     * (跑机上那份是「所有 MCP 只读且仅探查下一层;所有模型调用工具尽量少;禁止使用 devenv」),
+     * 而这一关**必须实跑、必须动手改**。执行那一关因为缺这句话,真的出过「92 分钟一个文件
+     * 没写」的事故;这一关更隐蔽 —— 它还有一条被系统认可的出口(「本节点无可执行验证手段」),
+     * 而空报告在这里是 `pass: true`。
+     */
+    '**本环节必须真的把验证跑起来、跑不过就动手改。** 上面那些「只读 / 只探查下一层 / 少用工具」' +
+    '之类的限制,约束的是你**读**代码的范围,**不解除你实跑和改代码的义务**,也不表示工具被禁用。\n' +
+    '「本节点无可执行验证手段」指的是**仓库里确实不存在**可跑的测试或构建 —— 不是指你被要求少用工具;' +
+    '拿它当出口而实际没试过,是这一关唯一不能做的事。\n' +    `你是本任务的**测试修复**席位(第 ${seatNo}/${seatCount} 位)。\n` +
     `职责:**实际把验证跑起来**,跑出问题就**自己改到对** —— 不要只报告问题,` +
     `也没有别人可以把问题交回去。\n` +
     `这一关**没有裁决**:没有通过/不通过,也不会因为你说不行就打回重做。` +
@@ -2112,7 +2149,7 @@ function acceptPrompt(
     // 用户原话:「三轮到测试验证还是有问题,就把修改建议给验收,让验收来修改。」
     // 这一段就是那个交接点 —— 验收员必须知道测试验证那一关是**降级放行**过来的,
     // 以及它留下了哪些没解决的东西,否则它会把一份没验过的产出当成验过的来判。
-    degradeSection(node) +
+    degradeSection(node, 'judge') +
     /**
      * 目标要**无条件**渲染 —— 原来它只出现在「验收点为空」的兜底分支里。
      *

@@ -7133,3 +7133,100 @@ describe('一轮没改任何文件的执行', () => {
     expect(n.status).toBe('ACCEPTED')
   })
 })
+
+/**
+ * **同一段话,两个受众 —— 这是今天那次事故的同一条病灶。**
+ *
+ * 「降级放行」那段原本只写给执行者(「由你接着推进」「能做的直接做掉」「在你的产出里
+ * 写明」),而它同时被 `acceptPrompt` 消费。验收席位没有产出,schema 只有
+ * pass/blocking/comments;更要紧的是七个环节共用同一份工具池 —— 裁决席位拿得到
+ * Edit/Write/Bash,所以「能做的直接做掉」对它**是可执行的**,那是唯一一句明确邀请
+ * 裁决者自己动手改代码、再给自己判通过的话。
+ */
+describe('降级放行那段按受众分开', () => {
+  const withDegrade = async (phase: 'execute' | 'accept'): Promise<string> => {
+    let seen = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === phase) seen = req.prompt
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.degraded = [{ phase: 'verify', reason: '测试没跑起来', advice: ['先装 devenv'], at: NOW, round: 3 }] as never
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: 'a' }] }
+    await stepExecute(n, ctxFor([n], runAgent, { ...cfg, phaseRoles: n.phaseRoles }))
+    return seen
+  }
+
+  it('执行者:照旧「能做的直接做掉」', async () => {
+    const p = await withDegrade('execute')
+    expect(p).toContain('先装 devenv')
+    expect(p).toContain('能做的直接做掉')
+  })
+
+  it('验收裁决:明确禁止自己动手补,而且不提「你的产出」', async () => {
+    const p = await withDegrade('accept')
+    expect(p).toContain('先装 devenv')
+    expect(p).toContain('不要自己动手把它们补掉')
+    expect(p).toContain('这一关要的是判断,不是产出')
+    // 反向:那句会被它执行的祈使句不许出现。
+    expect(p).not.toContain('能做的直接做掉')
+    expect(p).not.toContain('在你的产出里写明')
+  })
+})
+
+/**
+ * **测试修复席位收到同一串工具限制,却没有反声明 —— 和执行那次逐字同因。**
+ *
+ * 定向注入经 `CROSS.verify = 'execute'` 把用户写给执行环节的限制原样送到这一关,而这一关
+ * **必须实跑、必须动手改**。执行那关因为缺这句话出过「92 分钟一个文件没写」的事故;这一关
+ * 更隐蔽:它还有一条被系统认可的出口(「本节点无可执行验证手段」),而空报告在这里是
+ * `pass: true`。
+ */
+describe('测试修复席位的反声明', () => {
+  const verifyPrompt = async (): Promise<string> => {
+    let seen = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'verify') seen = req.prompt
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.phaseRoles = { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }] }
+    await stepExecute(n, ctxFor([n], runAgent, {
+      ...cfg,
+      phaseRoles: n.phaseRoles,
+      phaseGuidance: { execute: '所有 MCP 只读且仅探查下一层,少用工具' },
+    }))
+    return seen
+  }
+
+  it('说清限制约束的是读,不解除实跑和改代码的义务', async () => {
+    const p = await verifyPrompt()
+    expect(p).toContain('必须真的把验证跑起来')
+    expect(p).toContain('不解除你实跑和改代码的义务')
+  })
+
+  it('把「没有验证手段」那条出口限定死', async () => {
+    const p = await verifyPrompt()
+    expect(p).toContain('仓库里确实不存在')
+    expect(p).toContain('不是指你被要求少用工具')
+  })
+
+  /**
+   * **不许再从 `judgeGuidance` 那条路把 `JUDGE_NOTE` 拿回来。** 这一关已经被移出
+   * `JUDGING_PHASES`(它自己动手改,不裁决),而那条注记最坏的读法正是「那就别改了」。
+   */
+  it('不带裁决口径的注记', async () => {
+    // JUDGE_NOTE 的独有片段 —— 它整段的意思是「按补充后的意图**判**」,而这一关不判。
+    expect(await verifyPrompt()).not.toContain('用户补充的约束**优先于原方案的枝节**')
+  })
+})

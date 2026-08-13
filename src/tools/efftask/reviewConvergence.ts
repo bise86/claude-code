@@ -748,7 +748,16 @@ export function adviceOf(log: readonly RoundtableRecord[], step?: PhaseName): st
  * 判据是「有没有建议」,不是「降级过没有」:一段写着「以下是累积的修改建议:」而底下
  * 什么都没有的提示词,比不写更糟 —— 它在告诉下游「上面那些意见你已经拿到了」。
  */
-export function degradeCarryPrompt(label: string, reason: string, advice: readonly string[]): string {
+/**
+ * **两个受众,两份措辞。**
+ *
+ * 这段话原本只写给执行者(「由你接着推进」「能做的直接做掉」「在你的产出里写明」),
+ * 而它同时被 `acceptPrompt` 消费 —— 验收席位**没有产出**,它的 schema 只有
+ * pass/blocking/comments。更要紧的是七个环节共用同一份工具池(见 runAgentAdapter 的
+ * 那段说明):裁决席位拿得到 Edit/Write/Bash,所以「能做的直接做掉」对它**是可执行的**
+ * —— 那是唯一一句明确邀请裁决者自己动手改代码、再给自己判通过的话。
+ */
+export function degradeCarryPrompt(label: string, reason: string, advice: readonly string[], audience: 'act' | 'judge' = 'act'): string {
   if (advice.length === 0 && !reason) return ''
   return `\n## ${label}未通过,但本节点已降级放行,由你接着推进\n` +
     `这一关的迭代轮数用完了,判决**没有通过**。工作没有被丢掉,意见也没有 —— 它们在下面。\n` +
@@ -757,7 +766,10 @@ export function degradeCarryPrompt(label: string, reason: string, advice: readon
       ? `累积的修改建议(按提出顺序,已去重),请逐条处理:\n` +
         advice.map((a, i) => `  ${i + 1}. ${a}`).join('\n') + '\n'
       : '') +
-    `这些是**要求**,不是参考:能做的直接做掉;做不了的,在你的产出里写明哪一条、为什么。\n`
+    (audience === 'judge'
+      ? `上面这几条是它**欠下的**,不是你的活:请核对它们是否落在你的验收点上 —— 落在的记进 blocking,` +
+        `不落在的写进 comments。**不要自己动手把它们补掉**:这一关要的是判断,不是产出。\n`
+      : `这些是**要求**,不是参考:能做的直接做掉;做不了的,在你的产出里写明哪一条、为什么。\n`)
 }
 
 /**
