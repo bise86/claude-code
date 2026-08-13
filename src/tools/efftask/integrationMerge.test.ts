@@ -359,30 +359,61 @@ describe('syncTrunk —— 先同步主干,再快进', () => {
     expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], gitRoot)).code).not.toBe(0)
   })
 
-  it('脏树(已跟踪改动)先挡住,而且给得出能照做的下一步', async () => {
+  /**
+   * **脏树不再前置挡 —— 这一条推翻了它的上一版。**
+   *
+   * 上一版断言「有已跟踪改动就 `ok:false`」。真 git 上量过那道闸比 git 本身严得多:
+   * git 的保护是**逐文件**的,合并碰不到那几个脏文件就直接成功、改动毫发无损。跑机实测
+   * (qianbase-xtp run 001):3 个不相干的脏文件把 607 个提交全堵在集成分支上。
+   *
+   * 夹具用**真脏文件**,不是桩 —— 这一条的全部意义就是「用户的改动在合并前后逐字节相同」。
+   */
+  it('脏文件和这次合并不相交 → 照常合上,而且用户的改动一个字节都没变', async () => {
     const p = pool(); await p.init()
-    /**
-     * **集成分支必须先领先一步,这条判据才轮得到。**
-     *
-     * 「已经是最新的」那条早退排在脏树之前(而且应该排在前面:没什么可合的时候,
-     * 用户脏不脏与他无关)。第一版夹具没造这一步,于是它断言的是一条**根本走不到**的分支
-     * —— 对着一个好的实现「失败」,而按它去改代码会把早退的顺序改错。
-     */
+    // 集成分支必须先领先一步,这条判据才轮得到(「已经是最新的」那条早退排在前面)。
     const n = node('root/t-dirty')
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'out.ts'), 'produced\n')
     await p.commitAndMerge(n)
     await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+    // 用户手上一个**和 out.ts 无关**的脏文件。
+    const mine = join(gitRoot, 'base.txt')
+    await writeFile(mine, '我正在改的东西\n')
 
-    const res = await syncTrunk({
-      ...depsOf(p),
-      trackedDirty: async () => ({ dirty: true, detail: ' M src/a.ts' }),
-    })
+    const res = await syncTrunk({ ...depsOf(p), trackedDirty: async () => ({ dirty: true, detail: ' M base.txt' }) })
+    expect(res.ok).toBe(true)
+    expect(await readFile(mine, 'utf8')).toBe('我正在改的东西\n')
+    // 而且它仍然是未提交的 —— 合并没有把它卷进任何提交。
+    const st = await git(['status', '--porcelain', '--', 'base.txt'], gitRoot)
+    expect(st.stdout.trim()).toContain('base.txt')
+  })
+
+  /**
+   * 真撞上时:git 当场拒绝、**一个字节不动**,而这一层要认得出它的原话并点名文件 ——
+   * 此前这一串会掉进底下的 3 次重试循环,最后报「你在同步期间反复提交,重试 3 次仍未
+   * 合上」,一条**假原因**(用户根本没有反复提交,他只是有几个文件没存)。
+   */
+  it('脏文件正好被这次合并改到 → 如实说是哪个文件,不说「反复提交」', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/t-collide')
+    const l = await p.acquire(n) as { path: string }
+    // 这次合并要改的正是 base.txt。
+    await writeFile(join(l.path, 'base.txt'), '来自任务的内容\n')
+    await p.commitAndMerge(n)
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+    const mine = join(gitRoot, 'base.txt')
+    await writeFile(mine, '我正在改的东西\n')
+
+    const res = await syncTrunk({ ...depsOf(p), trackedDirty: async () => ({ dirty: true, detail: ' M base.txt' }) })
     expect(res.ok).toBe(false)
     if (!res.ok) {
-      expect(res.why).toContain('未提交的改动')
+      expect(res.why).toContain('base.txt')
+      expect(res.why).toContain('没有任何东西被改动')
+      expect(res.why).not.toContain('反复提交')
       expect(res.followUps.join('\n')).toContain('stash')
     }
+    // 最要紧的:他的文件原样在。
+    expect(await readFile(mine, 'utf8')).toBe('我正在改的东西\n')
   })
 
   it('detached HEAD 不合', async () => {

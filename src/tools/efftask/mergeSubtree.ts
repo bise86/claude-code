@@ -464,18 +464,22 @@ async function scanTrunk(deps: SubtreeMergeDeps): Promise<TrunkPlan> {
         `请先 git switch 回你自己的分支`,
     }
   }
-  // 未跟踪文件不算脏:`/et` 自己就在用户的检出里写 `.claude/efftask/`,按 `status --porcelain`
-  // 判会让这个功能在正常仓库里一次都不发生(handoffActions.trackedChanges 为此付过学费)。
+  /**
+   * **脏树不再挡住第 2 跳 —— 让 git 去判。**
+   *
+   * 这里原来是「有任何一个已跟踪文件是脏的 → `blocked`」,于是 `m` 的确认屏印
+   * 「⚠ 合回你当前分支这一步现在做不了」,而真正跑那一跳的 `syncTrunk` 根本没被调到。
+   * 真 git 上量过:合并碰不到那几个脏文件就直接成功、改动毫发无损;真要覆盖则当场拒绝、
+   * 一个字节不动 —— 而 `syncTrunk` 现在逐条认得出 git 的三种回答(含「你有未提交的改动
+   * 正好落在这次合并要改的文件上」那一种,并会点名是哪几个文件)。
+   *
+   * 探不出干净与否那一格(`code > 1` = git 自己出错)**仍然挡** —— 那不是「脏」,是
+   * 「这个仓库现在问不出话来」,继续往下走等于在一个已经出问题的仓库上做合并。
+   */
   const worktree = await git(['diff', '--quiet'], root)
   const staged = await git(['diff', '--cached', '--quiet'], root)
   if (worktree.code > 1 || staged.code > 1) {
     return { branch, pending, blocked: '无法判断你的工作区是否干净(git diff 失败)' }
-  }
-  if (worktree.code !== 0 || staged.code !== 0) {
-    return {
-      branch, pending,
-      blocked: '你的工作区有未提交的改动(已跟踪文件)—— 先提交或 stash,你的改动不该被一次合并卷进来',
-    }
   }
   return { branch, pending }
 }

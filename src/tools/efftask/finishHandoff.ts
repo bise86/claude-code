@@ -100,17 +100,24 @@ export function planFinish(
    * 它和逐任务合并互斥:一个每完成一个子任务就把集成分支合回当前分支的运行,没有办法
    * 同时承诺「产出留在分支上不动你的目录」。走到这里的一定是「该合但还没合上」。
    */
+  /**
+   * **脏树不再直接判 `skip` —— 让 git 去判。**
+   *
+   * 这里原来只要有一个已跟踪文件是脏的就整个不合,理由是「你的改动不该被一次合并卷进来」。
+   * 真 git 上量过那个担心不成立:合并碰不到那几个文件就直接成功、改动原样留着;真要覆盖
+   * 则当场拒绝、一个字节不动。而自动解冲突那一支**只 `git add -- <冲突文件>`、从不
+   * `add -A`**(handoffActions 那段注释正是为这件事写的),所以用户不相干的脏文件不可能
+   * 被卷进合并提交 —— 它们要是相干,git 在前面就拒绝了。
+   *
+   * 脏这件事仍然要说,只是降成**警告**:合并失败时用户需要知道自己手上有没有没存的东西。
+   */
   if (opts.dirty) {
-    return {
-      action: 'skip',
-      // 「已跟踪文件的改动」—— 措辞要准:未跟踪文件**不**算(见 trackedChanges),
-      // 而说成「未提交的改动」会让一个只有 `?? scratch.txt` 的用户去找他没有的东西。
-      why: '你的工作区有未提交的改动(已跟踪文件),没有自动合并 —— 你的改动不该被一次合并卷进来',
-      followUps: [
-        ...(opts.dirtyDetail ? [`未提交:${opts.dirtyDetail}`] : []),
-        `先提交或 stash,再 git merge ${h.branch}(或 /et --resume 走收口关口)`,
-      ],
-    }
+    // `warn` 是 string[](每条单独一行进 followUps),不是一整段。
+    const note = [
+      `你的工作区有未提交的改动(已跟踪文件)${opts.dirtyDetail ? `:${opts.dirtyDetail}` : ''}`,
+      '合并不会把它们提交进去;git 只在这次合并正好要改到这些文件时才会拒绝(那时会点名是哪几个)',
+    ]
+    return { action: 'merge', warn: warn ? [...warn, ...note] : note }
   }
   return warn ? { action: 'merge', warn } : { action: 'merge' }
 }

@@ -242,16 +242,25 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     }
     const contained = await git(['merge-base', '--is-ancestor', intBranch, 'HEAD'], gitRoot)
     if (contained.code === 0) return { advanced: false } // 已经是最新的,没什么可合
-    const worktree = await git(['diff', '--quiet'], gitRoot)
-    const staged = await git(['diff', '--cached', '--quiet'], gitRoot)
-    // `git diff --quiet` 的约定:0 = 无差异,1 = 有差异,>1 = 命令自己出错。探不出来按脏算。
-    if (worktree.code !== 0 || staged.code !== 0) {
-      const why = worktree.code > 1 || staged.code > 1
-        ? `无法判断你的工作区是否干净(git diff 失败),没有把产出合回你的目录`
-        : `你的工作区有未提交的改动(已跟踪文件),没有把产出合回你的目录 —— 你的改动不该被一次合并卷进来`
-      noteSkip(why)
-      return { advanced: false, reason: why }
-    }
+    /**
+     * **脏树不再前置挡 —— 让 git 去判。**
+     *
+     * 这里原来是「只要用户目录里有任何一个已跟踪文件是脏的,这一跳整个跳过」,理由写的是
+     * 「你的改动不该被一次合并卷进来」。真 git 上量过,那个担心不成立:
+     *
+     *  · 合并碰不到那几个脏文件 → 直接成功,他的改动**毫发无损**(merge 提交只含已提交
+     *    的内容,不会卷进未提交的东西);
+     *  · 真要覆盖 → git 当场拒绝、**一个字节不动**、不留 `MERGE_HEAD`,于是下面那条失败
+     *    路径的 `restored` 直接为真,并且会把 git 的原话(含文件名)如实带出来。
+     *
+     * git 的保护是**逐文件**的,这道闸是「一处脏就全不合」。跑机实测(qianbase-xtp
+     * run 001):3 个不相干的脏文件把 607 个提交全堵在集成分支上 —— 每个子任务完成时
+     * 都印一句「已合入集成分支,但还没送到你的分支」,跑了几百次。用户原话:
+     * 「这个不应该自动合进来吗」。
+     *
+     * **拿掉闸的前提是下面那条失败路径已经安全**,而它本来就是:判据用「有没有
+     * `MERGE_HEAD`」而不是「有没有 UU 行」,无条件 abort,再复核现场还在不在。
+     */
     const merge = await git(['merge', '--no-edit', '--no-verify', intBranch], gitRoot)
     if (merge.code === 0) {
       trunkMerged++

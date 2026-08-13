@@ -221,12 +221,17 @@ describe('合并到主干', () => {
     await pool.init()
     const a = mk('root/00-a', { title: '甲' })
     await work(pool, a, 'a.txt', 'hello\n')
-    // 用户的检出脏着 —— 逐任务合并会合进集成分支,但送不到 main。
-    await writeFile(join(gitRoot, 'shared.txt'), 'dirty\n')
     expect((await pool.commitAndMerge(a)).ok).toBe(true)
+    /**
+     * **让第 2 跳重新变成「欠着的」。**
+     *
+     * 上一版是靠「把用户的检出弄脏」做到这一点的 —— 而脏树已经不再挡住这一跳了
+     * (git 的保护是逐文件的,不相交就直接合上)。改用 `reset --hard HEAD~1`:
+     * 用户自己回退掉刚合进来的那一笔,集成分支于是重新领先一步,而 `items` 仍然是空的
+     * (那个节点已经合过了)—— 这条用例要测的正是「一个节点都不用合,但主干这一跳有欠账」。
+     */
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
     expect(await Bun.file(join(gitRoot, 'a.txt')).exists()).toBe(false)
-    // 用户收拾干净之后再按 m。
-    await git(['checkout', '--', 'shared.txt'], gitRoot)
 
     const deps = depsOf(pool)
     const plan = await scanSubtreeMerge(deps, [a], a.id)
@@ -237,23 +242,50 @@ describe('合并到主干', () => {
     expect(await readFile(join(gitRoot, 'a.txt'), 'utf-8')).toBe('hello\n')
   })
 
-  it('工作区脏时**不合**,而且如实说出来', async () => {
+  /**
+   * **脏树不再挡住第 2 跳 —— 这一条推翻了它的上一版。**
+   *
+   * 上一版断言 `plan.trunk.blocked` 含「未提交的改动」,于是 `m` 的确认屏印
+   * 「⚠ 合回你当前分支这一步现在做不了」,而真正跑那一跳的 `syncTrunk` 根本没被调到。
+   * 跑机实测(qianbase-xtp run 001):3 个不相干的脏文件把 607 个提交全堵住。
+   */
+  it('脏文件和这次合并不相交 → 第 2 跳照做,而且用户的脏文件一个字节没变', async () => {
     const pool = newPool()
     await pool.init()
     const a = mk('root/00-a', { title: '甲' })
     await work(pool, a, 'a.txt', 'hello\n')
+    // 用户手上一个**和 a.txt 无关**的脏文件(shared.txt 是已跟踪的)。
     await writeFile(join(gitRoot, 'shared.txt'), 'dirty\n')
 
     const deps = depsOf(pool)
     const plan = await scanSubtreeMerge(deps, [a], a.id)
-    expect(plan.trunk.blocked).toContain('未提交的改动')
-    expect(subtreeMergeLines(plan).some(l => l.startsWith('⚠') && l.includes('未提交的改动'))).toBe(true)
+    expect(plan.trunk.blocked).toBeUndefined()
     const out = await runSubtreeMerge(deps, plan, [a])
-    // 第一跳照做(产出进了集成分支),第二跳如实报告没做。
     expect(out.merged).toHaveLength(1)
-    expect(out.trunk?.ok).toBe(false)
+    expect(out.trunk?.ok).toBe(true)
+    // 产出到了,而他的改动原样在、而且仍然是未提交的。
+    expect(await readFile(join(gitRoot, 'a.txt'), 'utf-8')).toBe('hello\n')
     expect(await readFile(join(gitRoot, 'shared.txt'), 'utf-8')).toBe('dirty\n')
-    expect(subtreeMergeResultLines(out).some(l => l.startsWith('⚠'))).toBe(true)
+    const st = await git(['status', '--porcelain', '--', 'shared.txt'], gitRoot)
+    expect(st.stdout.trim()).toContain('shared.txt')
+  })
+
+  /** 探不出干净与否(git 自己出错)仍然要挡 —— 那不是「脏」,是这个仓库问不出话来。 */
+  it('git diff 探测失败仍然挡住第 2 跳', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+    const deps = depsOf(pool)
+    const broken = {
+      ...deps,
+      git: async (args: string[], cwd: string) =>
+        args[0] === 'diff' && cwd === gitRoot
+          ? { code: 128, stdout: '', stderr: 'fatal: 坏了' }
+          : deps.git(args, cwd),
+    }
+    const plan = await scanSubtreeMerge(broken, [a], a.id)
+    expect(plan.trunk.blocked).toContain('无法判断')
   })
 })
 

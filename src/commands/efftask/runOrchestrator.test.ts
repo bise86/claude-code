@@ -345,11 +345,29 @@ describe('收口:跑完就把产出送回当前目录', () => {
     expect(r.phases).toEqual(['done'])
   })
 
-  it('工作区脏 → 不合、不清,run.md 留着待收口', async () => {
-    // 判据是 `git diff --quiet`(1 = 有差异),**不看未跟踪文件** —— 见 trackedChanges:
-    // `/et` 自己写的 `.claude/efftask/` 会让 `status --porcelain` 永远非空。
+  /**
+   * **脏树不再前置挡 —— 这一条推翻了它的上一版。**
+   *
+   * 上一版断言「脏 → 一条 merge 都不跑」。真 git 上量过 git 的保护是**逐文件**的:
+   * 碰不到那几个脏文件就直接合上、改动毫发无损。跑机实测(qianbase-xtp run 001):
+   * 3 个不相干的脏文件把 607 个提交全堵住,用户原话「这个不应该自动合进来吗」。
+   */
+  it('工作区脏但撞不上 → 照合、照清,而脏在哪仍然要说', async () => {
     const r = await run({ answers: { 'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M src/app.ts\n' } } })
-    expect(r.g.ran('merge')).toBe(false)
+    expect(r.g.ran('merge')).toBe(true)
+    expect(r.results[0]?.merged).toBe(true)
+    expect(r.config.pendingHandoff).toBeUndefined()
+    // 降成警告,但必须还在:合并失败时用户需要知道自己手上有没有没存的东西。
+    // 它走的是 followUps(planFinish 的 `warn` 会被并进去,见 finishHandoff:279)。
+    expect((r.results[0]?.result?.followUps ?? []).join('\n')).toContain('src/app.ts')
+  })
+
+  /** git 真拒绝那一次(脏文件正好被这次合并改到)—— 记录必须留着,等他收拾完再来。 */
+  it('git 拒绝合并 → 不清,run.md 留着待收口', async () => {
+    const r = await run({ answers: {
+      'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M src/app.ts\n' },
+      'merge': { code: 1, stderr: 'error: Your local changes to the following files would be overwritten by merge:\n\tsrc/app.ts\nPlease commit your changes or stash them before you merge.\nAborting\n' },
+    } })
     expect(r.results[0]?.merged).toBe(false)
     expect(r.config.pendingHandoff?.branch).toBe('efftask/004/integration')
     expect(r.manifest).toContain('pendingHandoff')
@@ -363,7 +381,11 @@ describe('收口:跑完就把产出送回当前目录', () => {
   it('待收口记录带上 trunkLanded,并且落盘', async () => {
     const r = await run({
       commits: 2, trunkLanded: 5,
-      answers: { 'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M src/app.ts\n' } },
+      answers: {
+        'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M src/app.ts\n' },
+        // 记录要留下来,就得让这次合并**真的没成** —— 脏本身已经不再是拒绝的理由了。
+        'merge': { code: 1, stderr: 'error: Your local changes to the following files would be overwritten by merge:\n\tsrc/app.ts\nPlease commit your changes or stash them before you merge.\nAborting\n' },
+      },
     })
     expect(r.config.pendingHandoff?.trunkLanded).toBe(5)
     expect(r.manifest).toContain('trunkLanded')
@@ -468,7 +490,11 @@ describe('收口:跑完就把产出送回当前目录', () => {
      * 还在,第二次调用会把同一份诊断再探一遍、再报一遍 —— 屏幕上出现两条收口结果,
      * 而 `git status` 也白跑一次。
      */
-    const r = await run({ answers: { 'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M a.ts\n' } } })
+    const r = await run({ answers: {
+      'diff --quiet': { code: 1 }, 'status --porcelain': { stdout: ' M a.ts\n' },
+      // 同上:要一条**没清掉**的路,就得让合并真的失败。
+      'merge': { code: 1, stderr: 'error: Your local changes to the following files would be overwritten by merge:\n\tsrc/app.ts\nPlease commit your changes or stash them before you merge.\nAborting\n' },
+    } })
     expect(r.results).toHaveLength(1)
     expect(r.config.pendingHandoff).toBeDefined()
     // 判据也只探一次(两次的话这里是 4:diff/diff --cached/status × 2)。

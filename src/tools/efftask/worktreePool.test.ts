@@ -721,7 +721,16 @@ describe('逐任务合回主干', () => {
     expect(h.commits).toBe(0)
   })
 
-  it('用户的工作区有未提交的**已跟踪**改动 → 不合,并说清为什么;产出留在集成分支上', async () => {
+  /**
+   * **脏树不再前置挡 —— 这一条推翻了它的上一版,而推翻它的是跑机上的真实后果。**
+   *
+   * 上一版断言「有已跟踪改动 → 这一跳整个跳过」。qianbase-xtp run 001 实测:3 个不相干的
+   * 脏文件把 **607 个提交**全堵在集成分支上,每个子任务完成时都印一句「已合入集成分支,
+   * 但还没送到你的分支」,跑了几百次。用户原话:「这个不应该自动合进来吗」。
+   *
+   * git 的保护是**逐文件**的:碰不到就直接合上,真要覆盖则当场拒绝、一个字节不动。
+   */
+  it('用户的脏文件和这次合并不相交 → 照常送到,而且他的改动一个字节没变', async () => {
     const p = pool()
     await p.init()
     await writeFile(join(gitRoot, 'base.txt'), '用户自己正在改\n')
@@ -729,14 +738,35 @@ describe('逐任务合回主干', () => {
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'shipped.ts'), 'the work\n')
     const res = await p.commitAndMerge(n) as { ok: true; merged: boolean; trunk?: { advanced: boolean; reason?: string } }
-    // 节点自己是成功的 —— 产出在集成分支上,判决不受影响。
+    expect(res).toMatchObject({ ok: true, merged: true })
+    expect(res.trunk?.advanced).toBe(true)
+    // 产出真的到了用户的目录里。
+    expect(await trunkFile('shipped.ts')).toContain('the work')
+    // 而他手上那份改动原样在,并且仍然是未提交的 —— 合并没有把它卷进任何提交。
+    expect(await trunkFile('base.txt')).toContain('用户自己正在改')
+    expect((await git(['status', '--porcelain', '--', 'base.txt'], gitRoot)).stdout).toContain('base.txt')
+    expect((await p.handoff([])).trunkSkips).toHaveLength(0)
+  })
+
+  /**
+   * 真撞上时:git 当场拒绝、**一个字节不动**、不留 `MERGE_HEAD`,于是失败路径的
+   * `restored` 直接为真,并把 git 的原话带出来。节点自己的判决不受影响。
+   */
+  it('用户的脏文件正好被这次合并改到 → git 拒绝,产出留在集成分支上,他的改动毫发无损', async () => {
+    const p = pool()
+    await p.init()
+    await writeFile(join(gitRoot, 'base.txt'), '用户自己正在改\n')
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    // 这次任务改的正是 base.txt。
+    await writeFile(join(l.path, 'base.txt'), '来自任务的内容\n')
+    const res = await p.commitAndMerge(n) as { ok: true; merged: boolean; trunk?: { advanced: boolean; reason?: string } }
     expect(res).toMatchObject({ ok: true, merged: true })
     expect(res.trunk?.advanced).toBe(false)
-    expect(res.trunk?.reason).toContain('未提交的改动')
-    expect(await trunkFile('shipped.ts')).toBeNull()
-    // 用户自己的改动一个字节都没动。
+    // 说的是 git 的原话,而且要带上文件名 —— 用户据此才知道该去存哪个文件。
+    expect(res.trunk?.reason ?? '').toContain('base.txt')
     expect(await trunkFile('base.txt')).toContain('用户自己正在改')
-    expect((await p.handoff([])).trunkSkips.join(' ')).toContain('未提交的改动')
+    expect((await p.handoff([])).trunkSkips.join(' ')).toContain('base.txt')
   })
 
   it('**未跟踪**文件不算脏 —— 按 status --porcelain 判的话这个功能几乎一次都不会发生', async () => {
@@ -913,22 +943,24 @@ describe('逐任务合回主干', () => {
   it('一次成功的合并会把此前「没送到」的警告清掉 —— 集成分支是累积的', async () => {
     const p = pool()
     await p.init()
+    // 造一次**真的**没送到:任务改的正好是用户手上没存的那个文件,git 当场拒绝。
+    // (「脏就整个跳过」那道前置闸已经拿掉了 —— 不相交的脏文件不再产生 skip。)
     await writeFile(join(gitRoot, 'base.txt'), '用户正在改\n')
     const a = node('root/01-a')
     const la = await p.acquire(a) as { path: string }
-    await writeFile(join(la.path, 'a.ts'), 'A\n')
+    await writeFile(join(la.path, 'base.txt'), '来自任务甲\n')
     await p.commitAndMerge(a)
     expect((await p.handoff([])).trunkSkips.length).toBe(1)
 
-    await git(['add', '-A'], gitRoot)
-    await git(['commit', '-qm', 'user'], gitRoot)
+    // 用户把自己那份改动撤了 —— 下一次就合得上。
+    await git(['checkout', '--', 'base.txt'], gitRoot)
     const b = node('root/02-b')
     const lb = await p.acquire(b) as { path: string }
     await writeFile(join(lb.path, 'b.ts'), 'B\n')
     await p.commitAndMerge(b)
     // 两笔都到了,那句警告在这一刻已经不成立 —— 留着它会和上面那句「已逐一合并回你的
     // 分支」同时印在收口屏上。
-    expect(await trunkFile('a.ts')).toContain('A')
+    expect(await trunkFile('base.txt')).toContain('来自任务甲')
     expect((await p.handoff([])).trunkSkips).toEqual([])
   })
 
@@ -1007,22 +1039,22 @@ describe('逐任务合回主干', () => {
   it('脏树挡掉一次之后,树干净了 → 下一个子任务把两笔一起带过去', async () => {
     const p = pool()
     await p.init()
+    // 同上:用真撞车造这一次「没送到」。
     await writeFile(join(gitRoot, 'base.txt'), '用户自己正在改\n')
     const a = node('root/01-a')
     const la = await p.acquire(a) as { path: string }
-    await writeFile(join(la.path, 'a.ts'), 'A\n')
+    await writeFile(join(la.path, 'base.txt'), '来自任务甲\n')
     await p.commitAndMerge(a)
-    expect(await trunkFile('a.ts')).toBeNull()
+    expect(await trunkFile('base.txt')).toContain('用户自己正在改')
 
-    // 用户提交了自己的改动 —— 树干净了。
-    await git(['add', '-A'], gitRoot)
-    await git(['commit', '-qm', 'user commit'], gitRoot)
+    // 用户把自己那份撤了 —— 树干净了。
+    await git(['checkout', '--', 'base.txt'], gitRoot)
     const b = node('root/02-b')
     const lb = await p.acquire(b) as { path: string }
     await writeFile(join(lb.path, 'b.ts'), 'B\n')
     expect(await p.commitAndMerge(b)).toMatchObject({ trunk: { advanced: true } })
     // **两笔**都到了:落下的那一笔不需要等到收口。
-    expect(await trunkFile('a.ts')).toContain('A')
+    expect(await trunkFile('base.txt')).toContain('来自任务甲')
     expect(await trunkFile('b.ts')).toContain('B')
   })
 })

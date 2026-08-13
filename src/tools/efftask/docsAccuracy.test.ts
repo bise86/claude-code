@@ -592,7 +592,17 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(pool.split('await intoTrunk()').length - 1).toBeGreaterThanOrEqual(3)
     // 跑完那一次仍然在(它补齐前面落下的),三条不合的判据一条不少。
     expect(planFinish(handoffFixture(), { dirty: false })).toEqual({ action: 'merge' })
-    expect(planFinish(handoffFixture(), { dirty: true }).action).toBe('skip')
+    /**
+     * **脏树那一格已经不是 `skip` 了。**
+     *
+     * 真 git 上量过:git 的保护是逐文件的,碰不到那几个脏文件就直接合上、改动毫发无损。
+     * 跑机实测(qianbase-xtp run 001)3 个不相干的脏文件把 607 个提交全堵在集成分支上 ——
+     * 那道闸比 git 本身严,现在交给 git 去判。脏这件事仍然要说,降成 `warn`。
+     */
+    const dirtyPlan = planFinish(handoffFixture(), { dirty: true, dirtyDetail: ' M src/app.ts' })
+    expect(dirtyPlan.action).toBe('merge')
+    expect(dirtyPlan.action === 'merge' && (dirtyPlan.warn ?? []).join('\n')).toContain('src/app.ts')
+    // 「没跑完不合」那一格照旧 —— 它和脏不脏无关。
     expect(planFinish(handoffFixture({ outcome: 'blocked' }), { dirty: false }).action).toBe('skip')
     // 关口必须先说 —— 用户批准的是他看到的东西,而这一趟**中途就会**动他的工作区。
     expect(parallelismLine(

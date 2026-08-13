@@ -311,21 +311,22 @@ export async function syncTrunk(
       return { ok: true, advanced: false, message: `${branch} 上已经有集成分支的全部提交`, resolvedFiles: [] }
     }
     /**
-     * 脏树先挡。**只看已跟踪的改动** —— `/et` 自己就在用户检出里写 `.claude/efftask/`,
-     * 按 `status --porcelain` 判会让这个功能在正常仓库里一次都不发生
-     * (`trackedChanges` 为同一件事付过学费)。
+     * **脏树不再前置挡 —— 让 git 去判。**
+     *
+     * 这里原来是「只要有任何一个已跟踪文件是脏的就整个拒绝」,理由写的是「你的改动不该
+     * 被一次合并卷进来」。真 git 上量过,那个担心不成立、而代价极大:
+     *
+     *  · 合并碰不到那几个脏文件 → 直接成功,用户的改动**毫发无损**留在工作区里
+     *    (merge 提交只含已提交的内容,它不会卷进未提交的东西);
+     *  · 真要覆盖 → git 当场拒绝并**一个字节不动**,而下面已经逐条认得出它的原话。
+     *
+     * git 的保护是**逐文件**的,这道闸是「一处脏就全不合」。跑机实测(qianbase-xtp
+     * run 001):3 个不相干的脏文件把 607 个提交全堵在集成分支上,用户原话「这个不应该
+     * 自动合进来吗」。
+     *
+     * `trackedDirty` 这个 dep 仍然留着 —— C 节那一档(先 stash 再合)要用它决定
+     * 「值不值得提供」,而**判据不再由它来做**。
      */
-    const dirty = await deps.trackedDirty()
-    if (dirty.dirty) {
-      return {
-        ok: false,
-        why: '你的工作区有未提交的改动(已跟踪文件)—— 你的改动不该被一次合并卷进来',
-        followUps: [
-          '先提交或 stash,再试一次',
-          ...(dirty.detail ? [`改动:${dirty.detail}`] : []),
-        ],
-      }
-    }
 
     /**
      * **第一步:把主干合进集成分支。** 冲突(如果有)在临时工作树里由模型解掉,
@@ -377,6 +378,27 @@ export async function syncTrunk(
         ok: false,
         why: '你的目录里有未跟踪的文件会被这次合并覆盖,git 拒绝了(你的文件原样保留,没有任何东西被改动)',
         followUps: [msg.split('\n').slice(0, 5).join(' / ')],
+      }
+    }
+    /**
+     * **已跟踪文件撞上,是另一种良性拒绝 —— 而它此前掉进了重试循环。**
+     *
+     * git 的原话是 `error: Your local changes to the following files would be overwritten
+     * by merge:` + 文件名。和上面那一种一样:git 当场拒绝、**一个字节都不动**、没有半
+     * 合并态。它重试也不会好 —— 而底下那句「你在同步期间反复提交,重试 3 次仍未合上」
+     * 是**一条假原因**:用户根本没有反复提交,他只是有几个文件没存。
+     *
+     * 这一条是「让 git 去判」那条路的另一半:前置脏闸拿掉之后,这里必须认得出 git 的
+     * 每一种回答,否则拿掉闸只是把一句诚实的拒绝换成了一句瞎猜。
+     */
+    if (msg.includes('Your local changes to the following files would be overwritten')) {
+      // 文件名在**后面几行** —— 第一行是一句没有宾语的话(和 untracked 那一串同一个形状)。
+      const files = msg.split('\n').map(l => l.trim())
+        .filter(l => l.length > 0 && !l.startsWith('error:') && !l.startsWith('Please') && !l.startsWith('Aborting'))
+      return {
+        ok: false,
+        why: `你有未提交的改动正好落在这次合并要改的文件上,git 拒绝了(你的改动原样保留,没有任何东西被改动)${files.length > 0 ? `:${files.slice(0, 5).join('、')}` : ''}`,
+        followUps: ['提交或 stash 这几个文件之后再按一次;产出仍在集成分支上,一个字节都没丢'],
       }
     }
     deps.onProgress?.('你在这期间又提交了 —— 重新同步一次再合…')

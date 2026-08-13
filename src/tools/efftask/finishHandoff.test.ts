@@ -63,12 +63,24 @@ describe('planFinish —— 什么时候可以替用户合并', () => {
     expect(p.followUps.join('\n')).toContain('efftask/001/integration')
   })
 
-  it('工作区脏 → 不合,并把脏在哪印出来', () => {
+  /**
+   * **脏树不再判 `skip` —— 这一条推翻了它的上一版。**
+   *
+   * 上一版断言「脏 → 不合」。真 git 上量过那个担心不成立:合并碰不到那几个脏文件就直接
+   * 成功、改动毫发无损;真要覆盖则当场拒绝、一个字节不动。而自动解冲突那一支只
+   * `git add -- <冲突文件>`、从不 `add -A`,所以不相干的脏文件不可能被卷进合并提交。
+   * 脏这件事仍然要说,只是降成**警告**。
+   */
+  it('工作区脏 → 照合,但把脏在哪说清楚(降成警告)', () => {
     const p = planFinish(h(), { dirty: true, dirtyDetail: ' M src/app.ts' })
-    expect(p.action).toBe('skip')
-    if (p.action !== 'skip') throw new Error('unreachable')
-    expect(p.why).toContain('未提交')
-    expect(p.followUps.join('\n')).toContain('src/app.ts')
+    expect(p.action).toBe('merge')
+    if (p.action !== 'merge') throw new Error('unreachable')
+    const t = (p.warn ?? []).join('\n')
+    expect(t).toContain('src/app.ts')
+    // 必须说清合并**不会**把它们提交进去 —— 这正是上一版拿来当拒绝理由的那件事。
+    expect(t).toContain('不会把它们提交进去')
+    // 也要说清 git 什么时候才会拒绝,否则「照合」听起来像「不管三七二十一」。
+    expect(t).toContain('正好要改到这些文件')
   })
 })
 
