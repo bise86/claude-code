@@ -527,6 +527,11 @@ async function scanRescue(
 export const MERGE_KEY_REPORTS: readonly string[] = [
   // 摆出来:该不该动是用户的决定。
   'integrationDirty', 'degraded', 'cancelled',
+  /**
+   * 悬空提交:**只念,不自动合**。它没有主、没有名字,也没有任何东西能证明它属于这一趟 ——
+   * 自动合就是把「拿不准一律不合」翻面。给 sha、给命令,由用户自己判。
+   */
+  'dangling',
   // 合并解决不了,要按 b 回溯:产出丢了 / 集成验收没通过。
   'missing', 'integrateFail',
   // 这两格的 action 是 'report',但 `refOnly` **也会真的去合它们**(它们有 ref 或目录)——
@@ -974,9 +979,15 @@ async function noteRescueStranded(
     const list = strandedRefsOf(node)
     // 同一条 ref 重按一次 `m` 不该叠出第二条 —— 判据是 ref,不是整行(它带时间戳)。
     const kept = list.filter(x => x.ref !== s.ref)
-    kept.push({ ref: s.ref, why: s.why, at, remaining: s.remaining })
+    kept.push({
+      ref: s.ref, why: s.why, at, remaining: s.remaining,
+      ...(s.paths && s.paths.length > 0 ? { paths: s.paths } : {}),
+    })
     node.rescueStranded = kept.slice(-MAX_STRANDED_PER_NODE)
-    const line = `${RESCUE_STRANDED_NOTE}(${at}:${s.ref},还差 ${s.remaining} 处)`
+    const files = s.paths && s.paths.length > 0
+      ? `:${s.paths.slice(0, 5).join('、')}${s.paths.length > 5 ? '…' : ''}`
+      : ''
+    const line = `${RESCUE_STRANDED_NOTE}(${at}:${s.ref},还差 ${s.remaining} 处${files})`
     if (!node.execStatus.includes(RESCUE_STRANDED_NOTE)) {
       node.execStatus = `${node.execStatus}${node.execStatus ? '\n' : ''}${line}`
     }

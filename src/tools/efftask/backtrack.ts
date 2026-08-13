@@ -128,7 +128,9 @@ export function backtrackCanClaim(n: TaskNode): boolean {
  * 会让 `.map` 当场抛在恢复链路里。这个仓库为「读侧不校验」逐字写过判决:不抛、不修复、
  * 纯造谣 —— 所以这里只认数组里长得对的那些,别的当没有。
  */
-export function strandedRefsOf(n: TaskNode): { ref: string; why: string; at: string; remaining: number }[] {
+export function strandedRefsOf(
+  n: TaskNode,
+): { ref: string; why: string; at: string; remaining: number; paths: string[] }[] {
   const raw: unknown = n.rescueStranded
   if (!Array.isArray(raw)) return []
   return raw.filter((x): x is { ref: string; why: string; at: string; remaining: number } =>
@@ -138,6 +140,9 @@ export function strandedRefsOf(n: TaskNode): { ref: string; why: string; at: str
       why: typeof x.why === 'string' ? x.why : '',
       at: typeof x.at === 'string' ? x.at : '',
       remaining: typeof x.remaining === 'number' ? x.remaining : 0,
+      paths: Array.isArray((x as { paths?: unknown }).paths)
+        ? ((x as { paths: unknown[] }).paths.filter(s => typeof s === 'string') as string[])
+        : [],
     }))
 }
 
@@ -242,8 +247,17 @@ function whyWithoutVerdict(n: TaskNode, missing: boolean, stranded: boolean): st
   if (missing) return '这个任务判了通过,而集成分支上一个字节都没多 —— 产出不在任何地方,只能重新生成'
   if (!stranded) return ''
   const refs = strandedRefsOf(n).slice(0, 3)
+  /**
+   * **要说清是哪几个文件。**
+   *
+   * 上一版只带个数,执行者收到的是「还差 3 处」—— 他不知道是哪 3 个,据此动不了手。
+   * 而那份清单在 `m` 那一刻就是量出来的,只是被 `.length` 扔掉了。
+   */
   const detail = refs.length > 0
-    ? refs.map(r => `${r.ref}(还差 ${r.remaining} 处:${r.why})`).join(';')
+    ? refs.map(r => {
+      const files = r.paths.length > 0 ? `:${r.paths.slice(0, 8).join('、')}${r.paths.length > 8 ? '…' : ''}` : ''
+      return `${r.ref}(还差 ${r.remaining} 处${files};${r.why})`
+    }).join(';')
     : '(明细已经不在节点上了)'
   /**
    * **抬头要跟着真实成因走。**

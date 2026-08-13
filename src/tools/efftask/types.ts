@@ -781,7 +781,7 @@ export interface TaskNode {
    * 字段在任何一次序列化事故里丢掉,`b` 就静默地扫不到 —— 而丢字段这件事这个仓库
    * 见过三次。夹了条数上限,因为 `m` 可以被反复按。
    */
-  rescueStranded?: { ref: string; why: string; at: string; remaining: number }[]
+  rescueStranded?: { ref: string; why: string; at: string; remaining: number; paths?: string[] }[]
   /**
    * 这个节点在哪几关被**降级放行**过。见 `DegradeRecord` —— 既是审计记录,也是闩。
    *

@@ -324,6 +324,9 @@ export async function planRescue(
   return { merge, backfill, hold, orphanFiles, problems }
 }
 
+/** 落痕里最多带几个文件名。够执行者动手,又不至于把 node.md 撑爆。 */
+export const MAX_STRANDED_PATHS = 12
+
 export interface RescueOutcome {
   merged: { ref: string; commits: number; title?: string; resolvedFiles?: string[] }[]
   /** 第 2 级真的补进集成分支的。`added` 为空也要留一条 —— 「试过了,一个都没得补」是结论。 */
@@ -335,7 +338,11 @@ export interface RescueOutcome {
    * 判据是 git 说了算的:补录之后再问一次 `git diff --name-only <集成分支> <ref>`,
    * 还有内容 = 还有东西没进来。不是「我们放弃了」,是「量出来还差这些」。
    */
-  stranded: { ref: string; nodeId?: string; title?: string; why: string; remaining: number }[]
+  stranded: {
+    ref: string; nodeId?: string; title?: string; why: string; remaining: number
+    /** 具体是哪几个文件(截断)。少了它,执行者收到的只有一个数字,据此动不了手。 */
+    paths?: string[]
+  }[]
   problems: string[]
   aborted: boolean
 }
@@ -379,13 +386,13 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
   const out: RescueOutcome = {
     merged: [], backfilled: [], failed: [], stranded: [], problems: [...plan.problems], aborted: false,
   }
-  const remainingOf = (ref: string): Promise<number> => remainingOnRef(deps, ref)
   /** 第 3 级:记一条「三级都试过、还是没回来」。`-1` = 连量都量不出来,那更要说。 */
   const strand = async (c: RescueCandidate, why: string): Promise<void> => {
-    const remaining = await remainingOf(c.evidence.ref)
+    const { count: remaining, paths } = await remainingPathsOf(deps, c.evidence.ref)
     if (remaining === 0) return
     out.stranded.push({
       ref: c.evidence.ref, why, remaining,
+      ...(paths.length > 0 ? { paths: paths.slice(0, MAX_STRANDED_PATHS) } : {}),
       ...(c.evidence.nodeId ? { nodeId: c.evidence.nodeId } : {}),
       ...(c.evidence.title ? { title: c.evidence.title } : {}),
     })
@@ -484,17 +491,30 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
  * 探不动回 -1:那是「量不出来」,和「量出来是 0」必须分开 —— 后者才允许不落痕。
  */
 export async function remainingOnRef(deps: RescueDeps, ref: string): Promise<number> {
+  return (await remainingPathsOf(deps, ref)).count
+}
+
+/**
+ * 同上,但把**是哪几个文件**一起带出来。
+ *
+ * 验收席点名:落痕只记了个数,于是执行者收到的是「还差 3 处」—— 他不知道是哪 3 个文件,
+ * 据此动不了手。而那份清单就在同一行 `git diff --name-only` 的输出里,上一版被 `.length`
+ * 扔掉了。
+ */
+export async function remainingPathsOf(
+  deps: RescueDeps, ref: string,
+): Promise<{ count: number; paths: string[] }> {
   const d = await deps.git(
     ['diff', '--name-only', '-z', deps.integrationBranch, ref], deps.gitRoot,
   )
-  if (d.code !== 0) return -1
-  const paths = d.stdout.split('\0').filter(x => x.length > 0)
-  let n = 0
-  for (const path of paths) {
+  if (d.code !== 0) return { count: -1, paths: [] }
+  const all = d.stdout.split('\0').filter(x => x.length > 0)
+  const paths: string[] = []
+  for (const path of all) {
     const onRef = await deps.git(['rev-parse', '--verify', '-q', `${ref}:${path}`], deps.gitRoot)
-    if (onRef.code === 0) n += 1
+    if (onRef.code === 0) paths.push(path)
   }
-  return n
+  return { count: paths.length, paths }
 }
 
 /**
@@ -516,10 +536,11 @@ async function descend(
     ...(c.evidence.nodeId ? { nodeId: c.evidence.nodeId } : {}),
   })
   if (!res.ok && res.why !== undefined) out.problems.push(`${ref} 补录没成:${res.why}`)
-  const remaining = await remainingOnRef(deps, ref)
+  const { count: remaining, paths } = await remainingPathsOf(deps, ref)
   if (remaining === 0) return
   out.stranded.push({
     ref, remaining,
+    ...(paths.length > 0 ? { paths: paths.slice(0, MAX_STRANDED_PATHS) } : {}),
     why: res.added.length > 0
       ? `${why};补录了 ${res.added.length} 个文件,还有 ${remaining} 处两边都有而内容不同的没能捞回`
       : why,

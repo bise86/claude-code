@@ -103,12 +103,25 @@ export const STRANDED_KINDS = {
     action: 'report',
     how: '迭代打满之后放行的',
   },
+  dangling: {
+    label: '不在任何分支上的提交(git 只在 gc 之前还留着它)',
+    action: 'report',
+    /**
+     * 这个仓库**自己量过**这一格:`worktreePool` 的两处注释记着 `branch -f` 打第二次抢救
+     * 时上一版落在零个 ref 上、以及 init 重置集成分支那次每个已合并节点的提交都进了
+     * `fsck --unreachable`。命名唯一化之后新的 run 不再产生,但已经发生的从来没人捞过。
+     */
+    how: '老 run 的 branch -f 覆盖过一次抢救 ref,或者集成分支被重置过 —— gc 之后就真没了',
+  },
   cancelled: {
     label: '被你按 x 取消的任务',
     action: 'report',
     how: '你自己的决定 —— 列出来只是为了这份清单是完整的',
   },
 } as const
+
+/** 悬空提交最多列几条 —— 一个 gc 没跑过的老仓库能有几百个,而清单要能读得完。 */
+const MAX_DANGLING = 10
 
 export type StrandedKind = keyof typeof STRANDED_KINDS
 export type StrandedAction = (typeof STRANDED_KINDS)[StrandedKind]['action']
@@ -471,6 +484,62 @@ export async function scanStranded(
         ...(state === 'unknown' ? { unknown: true } : {}),
         why: '一条工作树分支,而树上已经没有认领它的任务了(重做或回溯删过子树)',
       })
+    }
+  }
+
+  /**
+   * ── 落在**零个 ref** 上的抢救提交 ────────────────────────────────
+   *
+   * 用户:「必须尽最大努力去捞。」而这个仓库**自己量过**两处落在零个 ref 上的丢失,
+   * 就写在 `worktreePool.ts` 的注释里:`branch -f` 打第二次抢救时上一版落在零个 ref 上
+   * (实测 `for-each-ref --contains | wc -l` → 0),以及 init 无条件重置集成分支那次,
+   * 每个已合并节点的提交都进了 `git fsck --unreachable`。两处都写着「gc 之后就真没了」。
+   *
+   * 命名唯一化之后**新的** run 不再产生这一类,但**已经发生的**(老 run、`--resume` 一个
+   * 旧 run、gc 之前的悬空对象)一个都没被捞过 —— 而 `scanStranded` 的全部 ref 探测
+   * 就是上面那两句 `for-each-ref`。一份自称「最大努力」的清单漏掉自己文件里点名的
+   * 丢失通道,这条最重。
+   *
+   * **只列,不自动合。** 一个悬空提交没有主、没有名字、也没有任何东西能证明它属于这一趟;
+   * 自动合它就是把「拿不准一律不合」翻面。给出 sha 和能照做的命令,由用户自己判 ——
+   * 这正是分类表里 `action: 'report'` 那一档的含义。
+   *
+   * `--no-reflogs` 是刻意的:带 reflog 的话,**每一次**正常的 `reset --hard` 都会冒出来,
+   * 清单会被自己的日常操作淹掉,而「一份没人看的清单」和「没有清单」是同一件事。
+   */
+  const dangling = await deps.git(
+    ['fsck', '--unreachable', '--no-reflogs', '--no-progress', 'HEAD', deps.integrationBranch],
+    deps.gitRoot,
+  )
+  if (dangling.code !== 0) {
+    problems.push(`列不出悬空提交(${dangling.stderr.trim().split('\n')[0] ?? `退出码 ${dangling.code}`})—— 这一格这次是空白,不代表没有`)
+  } else {
+    const shas = dangling.stdout.split('\n')
+      .map(l => /^unreachable commit ([0-9a-f]{7,40})/.exec(l.trim())?.[1])
+      .filter((x): x is string => x !== undefined)
+    /**
+     * 只留**看起来是这一趟产出**的:提交信息以 `efftask:` 开头。
+     *
+     * 不加这条判据的话,用户自己 rebase / amend 掉的每一个旧提交都会进来 ——
+     * 那是他的历史,不是这次运行卡住的活,而把它们混进「还没捞回来」会让真正那几条淹掉。
+     */
+    let listed = 0
+    for (const sha of shas) {
+      if (listed >= MAX_DANGLING) break
+      const subj = await deps.git(['log', '-1', '--format=%s', sha], deps.gitRoot)
+      if (subj.code !== 0 || !subj.stdout.trim().startsWith('efftask:')) continue
+      const contained = await deps.git(
+        ['merge-base', '--is-ancestor', sha, deps.integrationBranch], deps.gitRoot,
+      )
+      if (contained.code === 0) continue
+      listed += 1
+      items.push({
+        kind: 'dangling', branch: sha,
+        why: `一个不在任何分支上的提交(${subj.stdout.trim()})—— gc 之后就真没了`,
+      })
+    }
+    if (shas.length > MAX_DANGLING) {
+      problems.push(`悬空提交超过 ${MAX_DANGLING} 个(共 ${shas.length} 个),只列了前 ${MAX_DANGLING} 个;全部:git fsck --unreachable --no-reflogs`)
     }
   }
 

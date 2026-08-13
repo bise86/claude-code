@@ -442,3 +442,45 @@ describe('抢救分支的来历', () => {
     expect(r.items.find(i => i.kind === 'salvage')!.fate).toBe('superseded')
   })
 })
+
+/**
+ * **落在零个 ref 上的提交** —— 这个仓库自己量过两次的丢失通道,而清单里此前一格都没有。
+ *
+ * `worktreePool` 的注释记着:`branch -f` 打第二次抢救时上一版落在零个 ref 上
+ * (实测 `for-each-ref --contains | wc -l` → 0),以及 init 重置集成分支那次每个已合并
+ * 节点的提交都进了 `git fsck --unreachable`。两处都写着「gc 之后就真没了」。
+ */
+describe('悬空提交', () => {
+  it('efftask 打的、又落在零个 ref 上的提交要被列出来', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/dg', { status: 'ACCEPTED' })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'v1.ts'), 'first\n')
+    const d = await p.discard(n)
+    // 老 run 的形状:抢救 ref 被覆盖掉,那一版落在零个 ref 上。
+    const sha = (await git(['rev-parse', d.salvaged!], gitRoot)).stdout.trim()
+    await git(['update-ref', '-d', `refs/heads/${d.salvaged}`], gitRoot)
+    expect((await git(['for-each-ref', '--contains', sha], gitRoot)).stdout.trim()).toBe('')
+
+    const r = await scanStranded(depsOf(p), [node('root', { status: 'ACCEPTED' })])
+    const item = r.items.find(i => i.kind === 'dangling')
+    expect(item?.branch).toBe(sha)
+    expect(item?.why).toContain('gc 之后就真没了')
+  })
+
+  /**
+   * **用户自己的历史不算这一趟卡住的活。** 不加这条判据的话,他 rebase / amend 掉的
+   * 每一个旧提交都会涌进来,把真正那几条淹掉 —— 而一份没人看的清单等于没有清单。
+   */
+  it('不是 efftask 打的悬空提交不进清单', async () => {
+    const p = pool(); await p.init()
+    await writeFile(join(gitRoot, 'mine.txt'), 'x\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'my own work'], gitRoot)
+    const sha = (await git(['rev-parse', 'HEAD'], gitRoot)).stdout.trim()
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+
+    const r = await scanStranded(depsOf(p), [node('root', { status: 'ACCEPTED' })])
+    expect(r.items.some(i => i.kind === 'dangling' && i.branch === sha)).toBe(false)
+  })
+})
