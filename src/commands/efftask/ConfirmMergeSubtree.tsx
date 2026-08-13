@@ -62,7 +62,8 @@ export function ConfirmMergeSubtree(props: {
   target: TaskNode
   onScan: () => Promise<SubtreeMergePlan>
   /** 执行。`onProgress` 由这一屏给进去 —— 进度是这一路唯一让人知道它还活着的东西。 */
-  onRun: (plan: SubtreeMergePlan, onProgress: (line: string) => void) => Promise<SubtreeMergeOutcome>
+  /** `stash` = 用户按过 `s`:第 2 跳先收起他的改动,合完自动放回(见 stashGuard)。 */
+  onRun: (plan: SubtreeMergePlan, stash: boolean, onProgress: (line: string) => void) => Promise<SubtreeMergeOutcome>
   /** 「合完当前这个就停」。给了才在执行中提示这个键。 */
   onInterrupt?: () => void
   /** 关掉这一屏。合完也走它 —— 回到用户来的那一屏。 */
@@ -96,6 +97,13 @@ export function ConfirmMergeSubtree(props: {
     // biome-ignore lint/correctness/useExhaustiveDependencies: 只在挂载时扫一次
   }, [])
 
+  /**
+   * 这一趟要不要先 stash。**用 ref 读**:按键处理器是在 `useInput` 的闭包里,
+   * 而 `onRun` 在同一次按键里就被调用 —— state 那一份这时还没提交。
+   */
+  const [stash, setStash] = React.useState(false)
+  const stashRef = React.useRef(false)
+  stashRef.current = stash
   useInput((input, key) => {
     const k = input.toLowerCase()
     const m = modeRef.current
@@ -127,9 +135,17 @@ export function ConfirmMergeSubtree(props: {
       if (key.return || k === 'y') props.onCancel()
       return
     }
+    /**
+     * **`s`:先把你的改动收起来、合完自动放回去。**
+     *
+     * 只在「你手上确实有未提交的已跟踪改动」时才是一个选择 —— 否则它是一个按下去什么都
+     * 不会变的键,而那比没有这个键更糟。用户原话:「提供选项,但要你按一下」;
+     * 「检测到脏就自动 stash」那一档他明确否决过,所以默认永远是关。
+     */
+    if (k === 's' && p?.trunk.dirty !== undefined) { setStash(v => !v); return }
     if (key.return || k === 'y') {
       setMode('working')
-      void props.onRun(p, line => { if (alive.current) setProgress(cur => [...cur, line]) }).then(
+      void props.onRun(p, stashRef.current, line => { if (alive.current) setProgress(cur => [...cur, line]) }).then(
         o => { if (alive.current) { setOutcome(o); setMode('done') } },
         (e: unknown) => {
           if (!alive.current) return
@@ -203,6 +219,9 @@ export function ConfirmMergeSubtree(props: {
   const footer = mode === 'done' || nothing
     ? '回车 / q / Esc 返回'
     : '回车 / y 确认合并(会在你的分支上产生真实提交) · q / Esc / n 取消'
+      + (plan?.trunk.dirty !== undefined
+        ? ` · s ${stash ? '「先 stash 再合」已开(合完自动放回)' : '先 stash 再合'}`
+        : '')
   return (
     <Box borderStyle="round" paddingX={1} flexDirection="column">
       <Text bold color={mode === 'done' ? (outcome?.failed.length ? 'warning' : 'success') : 'warning'}>

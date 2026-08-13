@@ -1042,7 +1042,8 @@ describe('手动合并子树的接线不能被静默剪断', () => {
 
   it('确认之后真的会去扫、去合,并把结果推回界面', () => {
     expect(element('ConfirmMergeSubtree')).toContain('scanSubtreeMerge(deps, nodes, mergeTarget.id)')
-    expect(element('ConfirmMergeSubtree')).toContain('runSubtreeMerge({ ...deps, onProgress }, plan, nodes)')
+    // `stash` 也要流进去 —— 用户在这一屏按的那一下 s,是它唯一的来源。
+    expect(element('ConfirmMergeSubtree')).toContain('runSubtreeMerge({ ...deps, onProgress, stash }, plan, nodes)')
     // 剪断这一句:注记写进了 node.md,而详情页上一个字都不变。
     expect(element('ConfirmMergeSubtree')).toContain('setNodes([...nodes])')
   })

@@ -78,7 +78,7 @@ const PLAN = (over: Partial<SubtreeMergePlan> = {}): SubtreeMergePlan => ({
     path: '/w/b', branch: 'efftask/001/node-b', commits: 3, loose: 2,
   }],
   skipped: [{ nodeId: 'root/02-c', title: '丙', why: '还没跑完(EXECUTING)—— 它的工作区正被执行者写着' }],
-  alreadyMerged: 1, absent: 0,
+  alreadyMerged: 1, absent: 0, ignoredOnly: 0,
   trunk: { branch: 'main', pending: 4 },
   canResolve: true, runActive: false,
   ...over,
@@ -263,7 +263,7 @@ describe('合并关口', () => {
     const { t, app } = await mount(
       <ConfirmMergeSubtree
         target={target} onScan={async () => PLAN()}
-        onRun={(_p, onProgress) => { ran++; push = onProgress; return running }}
+        onRun={(_p, _stash, onProgress) => { ran++; push = onProgress; return running }}
         onInterrupt={() => { interrupted++ }}
         onDone={() => {}} onCancel={() => {}}
       />,
@@ -310,5 +310,77 @@ describe('合并关口', () => {
     expect(frame).toContain('乙 没合上')
     expect(frame).toContain('未提交的改动')
     expect(frame).not.toContain('已合并 0 个')
+  })
+})
+
+/**
+ * **`s`:先把你的改动收起来、合完自动放回去 —— 默认关,按一下才开。**
+ *
+ * 用户原话:「提供选项,但要你按一下」;「检测到脏就自动 stash」那一档他明确否决过。
+ * 而这个键只在「你手上确实有未提交的已跟踪改动」时才是一个选择 —— 否则它按下去什么都
+ * 不会变,那比没有这个键更糟。
+ */
+describe('合并关口的 s 键', () => {
+  const target = mk('root', { title: '根任务' })
+  const noop = async (): Promise<SubtreeMergeOutcome> => OUTCOME({ merged: [] })
+  const dirtyPlan = () => PLAN({ trunk: { branch: 'main', pending: 3, dirty: ' M src/app.ts' } })
+
+  it('脏的时候把这一档摆出来,按一下开、再按一下关', async () => {
+    const { t, app } = await mount(
+      <ConfirmMergeSubtree
+        target={target} onScan={async () => dirtyPlan()} onRun={noop}
+        onDone={() => {}} onCancel={() => {}}
+      />,
+    )
+    expect(t.lastFrame()).toContain('s 先 stash 再合')
+    t.stdin.press('s'); await tick()
+    expect(t.lastFrame()).toContain('已开')
+    t.stdin.press('s'); await tick()
+    expect(t.lastFrame()).toContain('s 先 stash 再合')
+    app.unmount()
+  })
+
+  it('按过 s 之后,onRun 真的收到 true', async () => {
+    let got: boolean | undefined
+    const { t, app } = await mount(
+      <ConfirmMergeSubtree
+        target={target} onScan={async () => dirtyPlan()}
+        onRun={async (_p, stash) => { got = stash; return OUTCOME() }}
+        onDone={() => {}} onCancel={() => {}}
+      />,
+    )
+    t.stdin.press('s'); await tick()
+    t.stdin.press('\r'); await tick()
+    app.unmount()
+    expect(got).toBe(true)
+  })
+
+  it('没按过就是 false —— 默认永远是关', async () => {
+    let got: boolean | undefined
+    const { t, app } = await mount(
+      <ConfirmMergeSubtree
+        target={target} onScan={async () => dirtyPlan()}
+        onRun={async (_p, stash) => { got = stash; return OUTCOME() }}
+        onDone={() => {}} onCancel={() => {}}
+      />,
+    )
+    t.stdin.press('\r'); await tick()
+    app.unmount()
+    expect(got).toBe(false)
+  })
+
+  /** 树不脏时这个键**不摆出来**,也按不动 —— 一个按下去什么都不变的键比没有它更糟。 */
+  it('不脏就不印这个键', async () => {
+    const { t, app } = await mount(
+      <ConfirmMergeSubtree
+        target={target} onScan={async () => PLAN()} onRun={noop}
+        onDone={() => {}} onCancel={() => {}}
+      />,
+    )
+    t.stdin.press('s'); await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).not.toContain('先 stash 再合')
+    expect(f).not.toContain('已开')
   })
 })

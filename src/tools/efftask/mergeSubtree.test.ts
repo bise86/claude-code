@@ -718,3 +718,137 @@ describe('合并解决不了的那几项要指向 b', () => {
     expect(subtreeMergeLines(plan).join('\n')).not.toContain('合并解决不了')
   })
 })
+
+/**
+ * **「先 stash 再合」那一档 —— 用户按一下才开。**
+ *
+ * 用户原话:「提供选项,但要你按一下」;「检测到脏就自动 stash」那一档他明确否决过。
+ * 真正的正确性住在 `stashGuard`(独立原语,14 条真 git 探针),这里钉的是接线:
+ * 默认关、开了才包住第 2 跳、而且撞上时用户的改动真的回来了。
+ */
+describe('第 2 跳的 stash 那一档', () => {
+  /** 造一个「脏文件正好被这次合并改到」的现场:不开这一档,git 会拒绝。 */
+  const collide = async (pool: WorktreePool) => {
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'shared.txt', '来自任务\n')
+    await writeFile(join(gitRoot, 'shared.txt'), '我正在改\n')
+    return a
+  }
+
+  it('默认不开 → git 拒绝,改动原样在,而且屏幕点名文件', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = await collide(pool)
+    const deps = depsOf(pool, { runId: '001' })
+    const plan = await scanSubtreeMerge(deps, [a], a.id)
+    // 脏不再阻断,只是被记下来,并把那一档摆出来。
+    expect(plan.trunk.blocked).toBeUndefined()
+    expect(plan.trunk.dirty).toContain('shared.txt')
+    expect(subtreeMergeLines(plan).join('\n')).toContain('按 s')
+
+    const out = await runSubtreeMerge(deps, plan, [a])
+    expect(out.trunk?.ok).toBe(false)
+    expect(out.trunk?.message ?? '').toContain('shared.txt')
+    expect(await readFile(join(gitRoot, 'shared.txt'), 'utf-8')).toBe('我正在改\n')
+  })
+
+  /** 脏文件和这次合并**不相交**:合得上,改动原样回到工作区,不留任何痕迹。 */
+  it('开了 + 脏文件不相交 → 合得上,改动原样放回,且不留 stash', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+    await writeFile(join(gitRoot, 'shared.txt'), '我正在改\n')
+
+    const deps = depsOf(pool, { runId: '001', stash: true })
+    const out = await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [a], a.id), [a])
+    expect(out.trunk?.ok).toBe(true)
+    expect(await readFile(join(gitRoot, 'a.txt'), 'utf-8')).toBe('hello\n')
+    expect(await readFile(join(gitRoot, 'shared.txt'), 'utf-8')).toBe('我正在改\n')
+    expect((await git(['stash', 'list'], gitRoot)).stdout.trim()).toBe('')
+    expect((await git(['rev-parse', '--verify', '--quiet', 'refs/et/stash-backup/001'], gitRoot)).stdout.trim()).toBe('')
+  })
+
+  /**
+   * **真撞车时 pop 一定会冲突** —— 这是这一档最该说实话的一格,不是失败,是「合并做完了,
+   * 但你的改动放回来时和它撞上了」。两处都留着,而且屏幕要把取回命令写全。
+   */
+  it('开了 + 脏文件正好撞上 → 合得上,而改动两处都还在(不许吞)', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = await collide(pool)
+    const deps = depsOf(pool, { runId: '001', stash: true })
+    const out = await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [a], a.id), [a])
+
+    expect(out.trunk?.ok).toBe(true)
+    const t = (out.trunk?.followUps ?? []).join('\n')
+    expect(t).toContain('一个字节都没丢')
+    expect(t).toContain('git stash drop')
+    expect(t).toContain('git stash apply refs/et/stash-backup/001')
+    // 两处都真的在。
+    expect((await git(['stash', 'list'], gitRoot)).stdout).toContain('et: 自动 stash(001)')
+    expect((await git(['rev-parse', '--verify', '--quiet', 'refs/et/stash-backup/001'], gitRoot)).stdout.trim().length).toBeGreaterThan(0)
+  })
+
+  /** 不脏的那一趟开着它也无害:什么都没 stash,照常合。 */
+  it('树本来就干净 → 开着也不出事', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+    const deps = depsOf(pool, { runId: '001', stash: true })
+    const out = await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [a], a.id), [a])
+    expect(out.trunk?.ok).toBe(true)
+    expect((await git(['stash', 'list'], gitRoot)).stdout.trim()).toBe('')
+  })
+})
+
+/**
+ * **「只剩构建产物」的保留工作区:结束屏说它「未回收」,而 `m` 合不了它。**
+ *
+ * `handoff().kept` 用的是 `status --porcelain --ignored`,`m` 这一路用的是不带 `--ignored`
+ * 的那一份。于是用户读到「保留的工作区(…未回收): /path」→ 按 `m` → 一屏「没有需要合并
+ * 的工作区」,而那句「⚠ 被 .gitignore 忽略的文件不会被提交」又被 `items.some(loose>0)`
+ * 门控住,一个字都不印。他拿到的是一屏静默的「没事」。
+ */
+describe('只剩构建产物的保留工作区', () => {
+  it('m 这一屏要自己说清:合不了,要腾空间按 c', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+    expect((await pool.commitAndMerge(a)).ok).toBe(true)
+    /**
+     * 合完之后目录里只剩被忽略的构建产物。忽略规则写进 `$GIT_COMMON_DIR/info/exclude` ——
+     * 它对 linked worktree 同样生效(真 git 实测),而在工作区里提交一个 `.gitignore`
+     * 会让这个节点重新变成「有没合入的提交」,那就不是这一格要测的形态了。
+     */
+    const dir = pool.worktreePathOf(a)
+    await mkdir(join(gitRoot, '.git', 'info'), { recursive: true })
+    await writeFile(join(gitRoot, '.git', 'info', 'exclude'), 'build/\n')
+    await mkdir(join(dir, 'build'), { recursive: true })
+    await writeFile(join(dir, 'build', 'big.o'), 'x'.repeat(64))
+    // `status --porcelain` 看不见它,`--ignored` 看得见 —— 这一格的全部前提。
+    expect((await git(['status', '--porcelain'], dir)).stdout.trim()).toBe('')
+    expect((await git(['status', '--porcelain', '--ignored'], dir)).stdout).toContain('build/')
+
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
+    const t = subtreeMergeLines(plan).join('\n')
+    expect(plan.ignoredOnly).toBeGreaterThan(0)
+    expect(t).toContain('只剩构建产物')
+    expect(t).toContain('按 c')
+    // 那句「不会被提交」也要出现 —— 它此前被 items 门控住了。
+    expect(t).toContain('不会**被提交')
+  })
+
+  it('目录里真的什么都没有时,一个字都不多说', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+    await pool.commitAndMerge(a)
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
+    expect(plan.ignoredOnly).toBe(0)
+    expect(subtreeMergeLines(plan).join('\n')).not.toContain('只剩构建产物')
+  })
+})

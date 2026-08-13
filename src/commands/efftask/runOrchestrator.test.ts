@@ -242,7 +242,7 @@ describe('收口:跑完就把产出送回当前目录', () => {
     iteration: { planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
     depth: 0, createdAt: 'T0', updatedAt: 'T0',
   }]
-  const poolWithCommits = (commits: number, trunkLanded = 0, stranded: { kept?: string[]; salvage?: string[] } = {}) => ({
+  const poolWithCommits = (commits: number, trunkLanded = 0, stranded: { kept?: { path: string; why: string }[]; salvage?: string[] } = {}) => ({
     init: async () => ({ ok: true }),
     acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b', gitRoot: '/repo' }),
     commitAndMerge: async () => ({ ok: true, merged: true }),
@@ -306,11 +306,17 @@ describe('收口:跑完就把产出送回当前目录', () => {
     /** 收口撞上冲突时被派去解冲突的那一位。默认什么都不回答(这条路上没人调用它)。 */
     runAgent?: RunAgentFn
     /** 盘上还剩的那两类:保留的工作区 / 抢救出来的提交。它们和 commits 无关。 */
-    stranded?: { kept?: string[]; salvage?: string[] }
+    stranded?: { kept?: { path: string; why: string }[]; salvage?: string[] }
   } = {}) => {
     const fs = memFs()
     const g = git(over.answers)
-    const results: { merged: boolean; result?: { ok: boolean; message: string }; push?: { ok: boolean; message: string } }[] = []
+    const results: {
+      merged: boolean
+      // `followUps` 一直都在(planFinish 的 warn 被并进它),只是这个本地类型没写 ——
+      // 于是断言「脏在哪要说出来」时 TypeScript 说这个字段不存在。
+      result?: { ok: boolean; message: string; followUps?: string[] }
+      push?: { ok: boolean; message: string }
+    }[] = []
     const config = { ...cfg(), ...(over.autoPush === undefined ? {} : { autoPush: over.autoPush }) }
     const phases: string[] = []
     /**
@@ -415,15 +421,15 @@ describe('收口:跑完就把产出送回当前目录', () => {
    * 字都没有,**再也没有任何一条路径提到它们**。
    */
   it('零提交但盘上还剩抢救分支 / 保留工作区 → 记录必须落盘', async () => {
-    const r = await run({ commits: 0, stranded: { salvage: ['efftask/004/salvage/a'], kept: ['/wt/x'] } })
+    const r = await run({ commits: 0, stranded: { salvage: ['efftask/004/salvage/a'], kept: [{ path: '/wt/x', why: '未回收' }] } })
     expect(r.config.pendingHandoff?.commits).toBe(0)
     expect(r.config.pendingHandoff?.salvage).toEqual(['efftask/004/salvage/a'])
-    expect(r.config.pendingHandoff?.kept).toEqual(['/wt/x'])
+    expect(r.config.pendingHandoff?.kept).toEqual([{ path: '/wt/x', why: '未回收' }])
     expect(r.manifest).toContain('pendingHandoff')
   })
 
   it('只有保留的工作区(一条抢救分支都没有)也要留', async () => {
-    const r = await run({ commits: 0, stranded: { kept: ['/wt/x'] } })
+    const r = await run({ commits: 0, stranded: { kept: [{ path: '/wt/x', why: '未回收' }] } })
     expect(r.config.pendingHandoff).toBeDefined()
   })
 

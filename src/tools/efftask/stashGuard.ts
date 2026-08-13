@@ -1,0 +1,241 @@
+/**
+ * 「先把用户没提交的东西收起来,做完再原样放回去」。
+ *
+ * ## 为什么是一个独立原语,而不是在合并那一处内联
+ *
+ * 需要它的地方不止一处(收口那一跳、`m` 键那一跳,以后还会有),而这条路上**每一种失手
+ * 方式都会真的弄丢用户的工作**。内联写三份的结局在这个仓库里见过:活着的那一份总会先
+ * 退化,而这一份退化的代价是「他改了一天的东西没了」。
+ *
+ * ## 圆桌评审在真 git 上打掉的两条机制(它们看起来都很合理)
+ *
+ *  1. **`git stash pop <sha>` 不存在。** git 明确拒绝:`error: '95976a4b…' is not a stash
+ *     reference`,`git stash drop <sha>` 同样被拒。能接受 sha 的只有 `git stash apply`。
+ *     所以 pop 之前必须**现场**把 sha 解析成 `stash@{n}`(`git stash list --format='%H %gd'`),
+ *     而且要在 pop 的**那一刻**解析 —— 中途有别的东西 stash 的话下标会漂移。
+ *  2. **「push 之后记下 `refs/stash`」在最该管用的场景里失效。** `git stash push` 无事可做
+ *     时退出码是 **0**(`No local changes to save`),而 `refs/stash` 这时指向的是**用户
+ *     自己那条 stash**。判据与按键之间隔着一屏确认(分钟级窗口),用户完全可能在这期间
+ *     提交或撤销了改动 —— 于是「我们那一条」其实是他的,后面一 pop:内容被应用进工作区、
+ *     条目被 `Dropped`。判据必须是**前后比较**:`BEFORE !== AFTER` 且 `AFTER` 非空。
+ *
+ * ## 另外三条同样是实测出来的
+ *
+ *  - **冲突态下 `stash push` 本身就失败**(`could not write index / needs merge`,退出码 1,
+ *    一条都没建)。所以有 `MERGE_HEAD` / `REBASE_HEAD` / `CHERRY_PICK_HEAD` 时这一档
+ *    **不许出现** —— 那时屏幕该说的是「你正卡在一次没做完的合并里」。
+ *  - **半合并态下 pop 必然失败**,得先 `merge --abort`。而合并失败**也要** pop 回来:
+ *    否则用户的改动停在一个他没主动创建的 stash 里,而屏幕正在讲合并失败。
+ *  - **耐久备份**:`git stash create` 给出 sha 且不动工作区,`update-ref` 把它钉住 ——
+ *    之后即使条目被误 drop、被 gc,东西还在。成功路径上再删掉它。
+ *
+ * ## 未跟踪文件:不加 `-u`,而且不要复用 `utils/git.ts` 的 `stashToCleanState`
+ *
+ * `/et` 自己就往用户检出里写 `.claude/efftask/`,`-u` 会把它卷进 stash。而
+ * `stashToCleanState` 比 `-u` 还糟:它先 `git add <untracked>` 再 stash,等于把用户的
+ * 未跟踪文件塞进索引再打包带走。
+ */
+
+/** 跑一条 git 命令。和仓库其余各处同一个形状。 */
+export interface StashGit {
+  (args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }>
+}
+
+export interface StashGuardDeps {
+  git: StashGit
+  /** 在**哪棵树**上 stash。永远是用户自己的检出,不是任何节点工作区。 */
+  cwd: string
+  /** 备份 ref 的名字要能认出是哪一趟留下的。 */
+  runId: string
+  /** 进度播报(可选)—— 这几步各自都可能卡住几秒。 */
+  onProgress?: (s: string) => void
+}
+
+/** 这一档现在能不能提供给用户。 */
+export type StashAvailability =
+  | { available: true }
+  /** 不能。`why` 是照着说给用户听的原话,`hint` 是他能照做的下一步。 */
+  | { available: false; why: string; hint?: string }
+
+const IN_PROGRESS: readonly [string, string][] = [
+  ['MERGE_HEAD', '一次没做完的合并'],
+  ['REBASE_HEAD', '一次没做完的 rebase'],
+  ['CHERRY_PICK_HEAD', '一次没做完的 cherry-pick'],
+  ['REVERT_HEAD', '一次没做完的 revert'],
+]
+
+/**
+ * 现在提供这一档合不合适。
+ *
+ * **不是「脏不脏」** —— 脏是调用方自己判的(它才知道这次要做什么)。这里回答的是
+ * 「按下去会不会当场失败」,而唯一会当场失败的形态是仓库正卡在一次没做完的操作里。
+ */
+export async function stashAvailability(deps: StashGuardDeps): Promise<StashAvailability> {
+  for (const [ref, what] of IN_PROGRESS) {
+    const r = await deps.git(['rev-parse', '-q', '--verify', ref], deps.cwd)
+    if (r.code === 0) {
+      return {
+        available: false,
+        why: `你正卡在${what}里 —— 这种状态下 git 连 stash 都做不了(索引写不出去)`,
+        hint: `先把它解决掉(git status 看冲突文件),或者 git ${ref === 'MERGE_HEAD' ? 'merge' : ref === 'REBASE_HEAD' ? 'rebase' : ref === 'CHERRY_PICK_HEAD' ? 'cherry-pick' : 'revert'} --abort 回到之前的状态`,
+      }
+    }
+  }
+  return { available: true }
+}
+
+export interface StashOutcome<T> {
+  /** 被包住的那件事的返回值。没跑成(前置失败)时缺席。 */
+  result?: T
+  /** 改动是不是已经原样回到工作区了。 */
+  restored: boolean
+  /** 照着说给用户听的话。**一条都不许吞** —— 这条路上每一句都对应一次真实的盘上状态。 */
+  lines: string[]
+  /** 备份 ref(还在的话)。撞冲突时用户要靠它。 */
+  backupRef?: string
+  /** 我们那条 stash 现在的下标(还在的话)。 */
+  stashEntry?: string
+}
+
+const MSG = {
+  nothingToStash: '没有执行:准备 stash 时你的工作区已经不脏了(可能你刚提交或撤销了改动)。'
+    + '**没有创建任何 stash,也没有动你已有的 stash。**请重新按一次。',
+} as const
+
+/**
+ * 把 `fn` 包在一次 stash / pop 之间。
+ *
+ * 契约:**只要走到了 stash 这一步,就一定会尝试把它放回去** —— 无论 `fn` 成功、失败、
+ * 还是抛异常。放不回去时(撞冲突)也绝不吞:改动同时留在 stash 条目和备份 ref 两处,
+ * 而两处的取回命令都会写进 `lines`。
+ */
+export async function withStash<T>(
+  deps: StashGuardDeps, fn: () => Promise<T>,
+): Promise<StashOutcome<T>> {
+  const { git, cwd, runId } = deps
+  const lines: string[] = []
+  const backupRef = `refs/et/stash-backup/${runId}`
+
+  const avail = await stashAvailability(deps)
+  if (!avail.available) {
+    return { restored: true, lines: [avail.why, ...(avail.hint ? [avail.hint] : [])] }
+  }
+
+  /**
+   * 耐久备份。**先于 push** —— `stash create` 只是造一个提交对象,不动工作区,所以它
+   * 失败了也什么都没发生;而 push 之后再造就来不及了(那时工作区已经干净)。
+   */
+  deps.onProgress?.('把你的改动先备份一份…')
+  const created = await git(['stash', 'create'], cwd)
+  const bak = created.stdout.trim()
+  if (created.code !== 0 || bak.length === 0) {
+    // 干净树时 `stash create` 输出空且退出码 0 —— 这是「没什么可 stash」,不是错误。
+    return { restored: true, lines: [MSG.nothingToStash] }
+  }
+  const ref = await git(['update-ref', backupRef, bak], cwd)
+  if (ref.code !== 0) {
+    return {
+      restored: true,
+      lines: [`没有执行:备份你的改动失败(${oneLine(ref.stderr) || `退出码 ${ref.code}`})—— 什么都没动。`],
+    }
+  }
+
+  const before = await stashTip(git, cwd)
+  deps.onProgress?.('收起你未提交的改动…')
+  const push = await git(['stash', 'push', '-m', `et: 自动 stash(${runId})`], cwd)
+  const after = await stashTip(git, cwd)
+  /**
+   * **判据是「多了一条」,不是「退出码为 0」。** 无事可做时 push 也返回 0,而这时
+   * `after === before`(甚至指向用户自己那条)—— 那种情况下再 pop 就是弹别人的东西。
+   */
+  /**
+   * **变异复验说明**:单独把 `after === before` 去掉打不红任何探针 —— 因为上面那次
+   * `stash create` 已经先把「树其实不脏」拦掉了(干净树时它输出空)。两道是**纵深**,不是
+   * 重复:圆桌评审量到的失效场景发生在没有 `create` 那一步的设计里,而这一条保证的是
+   * 「即使将来有人把 create 那步挪走,也不会去 pop 用户自己那条 stash」。
+   */
+  if (push.code !== 0 || after === undefined || after === before) {
+    await git(['update-ref', '-d', backupRef], cwd)
+    return {
+      restored: true,
+      lines: push.code !== 0
+        ? [`没有执行:收起改动失败(${oneLine(push.stderr) || `退出码 ${push.code}`})—— 什么都没动。`]
+        : [MSG.nothingToStash],
+    }
+  }
+
+  let result: T | undefined
+  let threw: unknown
+  try {
+    result = await fn()
+  } catch (e) {
+    threw = e
+  }
+
+  /**
+   * **无论如何都要收拾现场再 pop。** 合并撞冲突会留下 `MERGE_HEAD`,而那时 pop 必然
+   * 失败(`could not write index / needs merge`)。abort 的成败不看退出码 —— 没有合并在
+   * 进行时它本来就非零;看**收拾完之后现场还在不在**。
+   */
+  for (const [r] of IN_PROGRESS) {
+    if ((await git(['rev-parse', '-q', '--verify', r], cwd)).code === 0) {
+      await git(['merge', '--abort'], cwd)
+      break
+    }
+  }
+
+  deps.onProgress?.('把你的改动放回去…')
+  const entry = await entryFor(git, cwd, after)
+  if (entry === undefined) {
+    // 有人在这中间把我们那条 drop 了 —— 备份 ref 就是为这一刻留的。
+    const applied = await git(['stash', 'apply', backupRef], cwd)
+    lines.push(applied.code === 0
+      ? '你的改动已经从备份恢复(中途那条 stash 条目不见了)。'
+      : `**你的改动没能自动放回来**:stash 条目不见了,而从备份恢复也失败了(${oneLine(applied.stderr)})。`)
+    lines.push(`备份仍在:git stash apply ${backupRef}`)
+    return { restored: applied.code === 0, lines, backupRef, ...(threw ? {} : { result: result as T }) }
+  }
+  const pop = await git(['stash', 'pop', entry], cwd)
+  if (pop.code === 0) {
+    await git(['update-ref', '-d', backupRef], cwd)
+    lines.push('你未提交的改动已经原样放回工作区。')
+    if (threw) throw threw
+    return { restored: true, lines, result: result as T }
+  }
+
+  /**
+   * pop 撞冲突。**改动一个字节都没丢**,而且同时在两个地方 —— 但工作区现在带着冲突
+   * 标记,再 pop 一次会失败(和冲突态下 push 同一个原因)。这三句都要说全。
+   */
+  lines.push('合并做完了,但把你的改动放回来时**撞了冲突** —— 你的改动一个字节都没丢,两处都在:')
+  lines.push(`  · stash 条目:${entry}(git stash list 看得到,消息是「et: 自动 stash(${runId})」)`)
+  lines.push(`  · 备份 ref:${backupRef}`)
+  lines.push('工作区现在有冲突标记(git status 会显示 UU/AA),**在这个状态下再 pop 一次会失败**。')
+  lines.push(`解完冲突后丢掉那条:git stash drop ${entry}`)
+  lines.push(`想推倒重来:git reset --hard && git stash apply ${backupRef}`)
+  if (threw) throw threw
+  return { restored: false, lines, backupRef, stashEntry: entry, result: result as T }
+}
+
+/** `refs/stash` 现在指向谁。没有 stash 时返回 undefined(而不是让 git 往 stderr 吐 fatal)。 */
+async function stashTip(git: StashGit, cwd: string): Promise<string | undefined> {
+  const r = await git(['rev-parse', '--verify', '--quiet', 'refs/stash'], cwd)
+  const sha = r.stdout.trim()
+  return r.code === 0 && sha.length > 0 ? sha : undefined
+}
+
+/**
+ * sha → `stash@{n}`。**必须在 pop 的那一刻算** —— 中途有别的东西 stash 的话下标会漂移
+ * (实测:我们那条从 `stash@{0}` 变成 `stash@{1}`,而裸 `git stash pop` 会弹掉别人的)。
+ */
+async function entryFor(git: StashGit, cwd: string, sha: string): Promise<string | undefined> {
+  const r = await git(['stash', 'list', '--format=%H %gd'], cwd)
+  if (r.code !== 0) return undefined
+  for (const line of r.stdout.split('\n')) {
+    const [h, gd] = line.trim().split(/\s+/)
+    if (h === sha && gd) return gd
+  }
+  return undefined
+}
+
+const oneLine = (s: string): string => s.trim().split('\n').filter(Boolean).slice(0, 2).join('; ')

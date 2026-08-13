@@ -3,6 +3,7 @@ import { isTerminal } from './stateMachine.js'
 import { writeNode, type FsLike } from './persistence.js'
 import { createNodeJournal } from './nodeJournal.js'
 import { autoResolveMerge, trackedChanges, type ConflictResolver, type GitFn } from './handoffActions.js'
+import { withStash } from './stashGuard.js'
 import { syncTrunk } from './integrationMerge.js'
 import { scanStranded, STRANDED_KINDS } from './stranded.js'
 import { planRescue, rescueLines, runRescue, type RescuePlan, type RescueTriage } from './rescue.js'
@@ -74,6 +75,11 @@ export interface SubtreeMergePool {
 }
 
 export interface SubtreeMergeDeps {
+  /**
+   * 第 2 跳要不要「先 stash 再合、合完自动放回」。**默认关,由用户按一下打开。**
+   * 见 `stashGuard`:这条路上每一种失手方式都会真的弄丢工作,所以它是一个独立原语。
+   */
+  stash?: boolean
   pool: SubtreeMergePool
   git: GitFn
   /**
@@ -144,8 +150,13 @@ export interface TrunkPlan {
   branch?: string
   /** 集成分支上还没到那条分支的提交数。 */
   pending: number
-  /** 现在就知道合不了的原因(detached / 停在集成分支上 / 工作区脏)。 */
+  /** 现在就知道合不了的原因(detached / 停在集成分支上 / git 问不出话来)。 */
   blocked?: string
+  /**
+   * 你手上有没提交的已跟踪改动 —— **不阻断**,只是决定要不要把「先 stash 再合」那一档
+   * 摆出来。判据本身交给 git(它逐文件判,而这一条只是「值不值得提供那个选项」)。
+   */
+  dirty?: string
 }
 
 export interface SubtreeMergePlan {
@@ -154,6 +165,12 @@ export interface SubtreeMergePlan {
   skipped: SubtreeMergeSkip[]
   /** 血统里已经合过了的节点数。 */
   alreadyMerged: number
+  /**
+   * 「提交都合过了、`status` 也说没有,而目录里只剩被 .gitignore 忽略的东西」的节点数。
+   * 结束屏会把它们印成「保留的工作区(未回收)」,而 `m` 合不了 —— 这一屏必须自己说清,
+   * 否则用户拿到的是一屏静默的「没事」,对着一个刚被说成「未回收」的目录。
+   */
+  ignoredOnly: number
   /** 血统里盘上根本没有工作区目录的节点数。 */
   absent: number
   trunk: TrunkPlan
@@ -227,6 +244,7 @@ export async function scanSubtreeMerge(
   const { scope } = subtreeMergeScope(nodes, targetId)
   const items: SubtreeMergeItem[] = []
   const skipped: SubtreeMergeSkip[] = []
+  let ignoredOnly = 0
   let alreadyMerged = 0
   let absent = 0
   /** 此刻真的有一步在跑的节点。`undefined` = 拿不到,那时退回「非终态」这条老判据。 */
@@ -259,7 +277,24 @@ export async function scanSubtreeMerge(
        */
       const st0 = await git(['-c', 'core.quotepath=false', 'status', '--porcelain'], path)
       const loose0 = st0.stdout.split('\n').map(l => l.trim()).filter(Boolean)
-      if (loose0.length === 0) { alreadyMerged++; continue }
+      if (loose0.length === 0) {
+        /**
+         * **「`status` 说没有」也不等于「目录是空的」。**
+         *
+         * `handoff().kept` 用的是 `status --porcelain --ignored`,`m` 这一路用的是不带
+         * `--ignored` 的那一份。于是「只剩 build/ 的保留工作区」会被结束屏印成
+         * 「保留的工作区(…未回收)」,而用户按 `m` 得到一屏「没有需要合并的工作区」——
+         * 而那句「⚠ 被 .gitignore 忽略的文件不会被提交」又被 `items.some(loose>0)` 门控
+         * 住了,items 为空时一个字都不印。他拿到的是一屏静默的「没事」,对着一个屏幕上
+         * 刚说过「未回收」的目录。
+         *
+         * 这里**只记一笔**,不把它变成待合项(它确实没有可合的东西)。
+         */
+        const ign = await git(['-c', 'core.quotepath=false', 'status', '--porcelain', '--ignored'], path)
+        if (ign.stdout.split('\n').some(l => l.trim().startsWith('!!'))) ignoredOnly++
+        alreadyMerged++
+        continue
+      }
       items.push({
         nodeId: node.id, title: node.title, status: node.status, path, branch,
         commits: 0, loose: loose0.length,
@@ -360,6 +395,7 @@ export async function scanSubtreeMerge(
     }),
     skipped,
     alreadyMerged,
+    ignoredOnly,
     absent,
     trunk: await scanTrunk(deps),
     canResolve: deps.resolve !== undefined,
@@ -523,6 +559,10 @@ async function scanTrunk(deps: SubtreeMergeDeps): Promise<TrunkPlan> {
   const staged = await git(['diff', '--cached', '--quiet'], root)
   if (worktree.code > 1 || staged.code > 1) {
     return { branch, pending, blocked: '无法判断你的工作区是否干净(git diff 失败)' }
+  }
+  if (worktree.code !== 0 || staged.code !== 0) {
+    const d = await trackedChanges(git, root)
+    return { branch, pending, dirty: d.detail ?? '(列不出具体文件)' }
   }
   return { branch, pending }
 }
@@ -754,7 +794,14 @@ async function mergeToTrunk(
       followUps: [`产出仍在集成分支 ${intBranch} 上,可以自己 git merge ${intBranch}`],
     }
   }
-  const res = await syncTrunk({
+  /**
+   * **「先 stash 再合」那一档。** 只包住这一跳 —— 窗口从「几十次 merge + 派模型解冲突」
+   * 缩到一次合并,而 stash 每多活一秒,用户的改动就多一分停在他没主动创建的地方的风险。
+   *
+   * 默认关。它由用户在关口按一下打开(用户原话:「提供选项,但要你按一下」)——
+   * 「检测到脏就自动 stash」那一档他明确否决过。
+   */
+  const runSync = async (): Promise<Awaited<ReturnType<typeof syncTrunk>>> => await syncTrunk({
     git,
     gitRoot: pool.gitRoot,
     integrationBranch: intBranch,
@@ -767,12 +814,31 @@ async function mergeToTrunk(
     ...(deps.signal ? { signal: deps.signal } : {}),
     trackedDirty: () => trackedChanges(git, pool.gitRoot),
   })
-  if (res.ok) return { ok: true, message: res.message, followUps: [] }
+  let stashLines: string[] = []
+  let res: Awaited<ReturnType<typeof syncTrunk>>
+  if (deps.stash === true && deps.runId) {
+    const guarded = await withStash(
+      { git, cwd: pool.gitRoot, runId: deps.runId, ...(deps.onProgress ? { onProgress: deps.onProgress } : {}) },
+      runSync,
+    )
+    stashLines = guarded.lines
+    /**
+     * `result` 缺席 = **这一跳根本没跑**(树其实不脏、或者卡在一次没做完的合并里)。
+     * 那时要照常跑一次,而不是报「没有执行」—— 树干净本来就该直接合,而这一档的意义
+     * 只是「脏的时候多一条路」,不是「开了就换一套流程」。`stashLines` 仍然带上:
+     * 前置没过那一条里有用户能照做的下一步。
+     */
+    res = guarded.result ?? await runSync()
+  } else {
+    res = await runSync()
+  }
+  if (res.ok) return { ok: true, message: res.message, followUps: stashLines }
   return {
     ok: false,
     message: `没有把产出合回你的分支:${res.why}`,
     followUps: [
       ...res.followUps,
+      ...stashLines,
       `产出仍在集成分支 ${intBranch} 上,处理完之后可以再按一次 m`,
     ],
   }
@@ -842,6 +908,15 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
   // 最容易被误以为「什么都没发生」的一次。
   if (plan.trunk.blocked !== undefined) {
     out.push(`⚠ 合回你当前分支这一步现在做不了:${plan.trunk.blocked}`)
+  } else if (plan.trunk.dirty !== undefined) {
+    /**
+     * **脏不再阻断这一跳**(git 的保护是逐文件的),但要把话说全:撞上的那几次 git 会
+     * 当场拒绝并点名文件,而这时用户有一条不必自己 stash 的路。
+     */
+    out.push(`然后把集成分支合回 ${plan.trunk.branch}${plan.trunk.pending > 0 ? `(现在就有 ${plan.trunk.pending} 个提交没送过去,合完还会更多)` : '(本次合入的提交会一并送过去)'}。`)
+    out.push(`你手上有未提交的改动(${plan.trunk.dirty})—— 合并**不会**把它们提交进去;`
+      + '只有这次合并正好要改到这些文件时 git 才会拒绝(那时会点名是哪几个)。')
+    out.push('按 s 可以切成「先把你的改动收起来、合完自动放回去」—— 撞冲突时改动一个字节都不会丢(条目和备份 ref 两处都留着)。')
   } else if (plan.trunk.pending > 0) {
     out.push(`然后把集成分支合回 ${plan.trunk.branch}(现在就有 ${plan.trunk.pending} 个提交没送过去,合完还会更多)。`)
   } else if (plan.items.length > 0) {
@@ -886,9 +961,17 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
    * 再回来按 c」:他按了 m 会以为构建产物保住了,回来按 c 把它们删掉。
    * **同一批东西,一屏承诺、另一屏兑现不了** —— 所以这一屏必须自己把边界讲清。
    */
-  if (plan.items.some(i => i.loose > 0)) {
+  /**
+   * 门控**不能只看待合项**:「只剩构建产物的保留工作区」那一桶 `items` 是空的,而它恰恰
+   * 是最需要这句话的一格 —— 结束屏刚把它印成「未回收」,而这一屏合不了它。
+   */
+  if (plan.items.some(i => i.loose > 0) || plan.ignoredOnly > 0) {
     out.push('⚠ 被 .gitignore 忽略的文件(target/ 这些构建产物)**不会**被提交 —— `git add -A` 不暂存它们。')
     out.push('  它们不是交付物;要腾空间请按 c,那一屏会逐个列出来。')
+  }
+  if (plan.ignoredOnly > 0) {
+    out.push(`${plan.ignoredOnly} 个工作区目录里**只剩构建产物**(提交都已合入)—— m 合不了它们,`
+      + '结束屏把它们印成「保留的工作区(未回收)」说的就是这一批;要腾空间按 c。')
   }
   out.push('任务状态不会被改动:合并只动 git,节点的判决、评审与验收记录原样保留。')
   if (plan.runActive) {

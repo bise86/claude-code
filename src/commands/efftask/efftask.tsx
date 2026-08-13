@@ -2563,12 +2563,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           const deps = mergeDeps(armSignal())
           return deps ? scanSubtreeMerge(deps, nodes, mergeTarget.id) : noPool()
         }}
-        onRun={async (plan, onProgress) => {
+        onRun={async (plan, stash, onProgress) => {
           // 扫描那次的 signal 已经挂在 mergeAbort 上了,执行沿用同一个 —— 换一个新的会让
           // 用户在扫描期间按下的中断丢掉。
           const deps = mergeDeps(mergeAbort.current?.signal ?? armSignal())
           if (!deps) return noPool()
-          const out = await runSubtreeMerge({ ...deps, onProgress }, plan, nodes)
+          // `stash` = 用户在这一屏按过 s。默认关 —— 见 stashGuard 的文件头。
+          const out = await runSubtreeMerge({ ...deps, onProgress, stash }, plan, nodes)
           // 合并会往 node.execStatus 上写注记(就地改的是同一批节点对象),推一份新数组
           // 让详情页重画 —— 否则盘上写了、屏幕上没有。
           if (out.merged.length > 0) setNodes([...nodes])
