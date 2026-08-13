@@ -389,3 +389,41 @@ describe('降级放行:照样合,但必须说出口', () => {
     expect(planFinish(h(), { dirty: false })).toEqual({ action: 'merge' })
   })
 })
+
+/**
+ * **「先 stash 再合」在收口这一路也要有。**
+ *
+ * 它此前只接在 `m` 那条用户主动按的路上,而收口是**默认落地**的那一条 —— 同一件事
+ * (第 2 跳)在两条路上有两种保护,正是验收席点名的断线。
+ */
+describe('收口那一路的 stash 档', () => {
+  it('没开时一条 stash 命令都不跑', async () => {
+    const g = fakeGit()
+    await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo' })
+    expect(g.calls.some(c => c[0] === 'stash')).toBe(false)
+  })
+
+  it('开了就走 withStash(会先 stash create 备份)', async () => {
+    // 桩 git 默认对一切返回 0 —— 那会让 `rev-parse -q --verify MERGE_HEAD` 看起来成功,
+    // 于是 withStash 认为「你正卡在一次没做完的合并里」而拒绝。真仓库里那一问是 1。
+    const g = fakeGit({ 'rev-parse -q --verify': { code: 1 } })
+    await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', stash: true, runId: '001' })
+    expect(g.ran('stash create')).toBe(true)
+  })
+
+  /** 卡在一次没做完的合并里 → 这一档拒绝,而且**不许**退回去不带保护地合。 */
+  it('卡在一次没做完的合并里 → 不合,并说清怎么脱身', async () => {
+    const g = fakeGit()
+    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', stash: true, runId: '001' })
+    expect(out.merged).toBe(false)
+    expect(g.ran('merge --no-edit')).toBe(false)
+    expect((out.result?.followUps ?? []).join('\n')).toContain('--abort')
+  })
+
+  /** 没给 runId 就不能开 —— 备份 ref 要按 run 命名,不然认不出是哪一趟留下的。 */
+  it('缺 runId 时不开', async () => {
+    const g = fakeGit()
+    await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', stash: true })
+    expect(g.calls.some(c => c[0] === 'stash')).toBe(false)
+  })
+})

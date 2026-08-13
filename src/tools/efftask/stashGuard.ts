@@ -52,10 +52,18 @@ export interface StashGuardDeps {
 }
 
 /** 这一档现在能不能提供给用户。 */
-export type StashAvailability =
-  | { available: true }
-  /** 不能。`why` 是照着说给用户听的原话,`hint` 是他能照做的下一步。 */
-  | { available: false; why: string; hint?: string }
+/**
+ * 这一档现在能不能提供。**一个形状,不是可辨识联合** —— 这个仓库的 tsc 解析在联合收窄上
+ * 本来就不可靠(全仓基线里同类报错上千条),而为了绕开它去写类型断言,等于把一个纯粹的
+ * 工具类型变成噪声源。`why`/`hint` 只在 `available === false` 时有值。
+ */
+export interface StashAvailability {
+  available: boolean
+  /** 照着说给用户听的原话。 */
+  why?: string
+  /** 他能照做的下一步。 */
+  hint?: string
+}
 
 /** ref、说给用户听的名字、以及**收拾它要用的子命令**(三者必须配套,见收尾那一段)。 */
 const IN_PROGRESS: readonly [string, string, string][] = [
@@ -135,7 +143,10 @@ export async function withStash<T>(
 
   const avail = await stashAvailability(deps)
   if (!avail.available) {
-    return { failed: true, restored: true, lines: [avail.why, ...(avail.hint ? [avail.hint] : [])] }
+    return {
+      failed: true, restored: true,
+      lines: [...(avail.why ? [avail.why] : []), ...(avail.hint ? [avail.hint] : [])],
+    }
   }
 
   /**

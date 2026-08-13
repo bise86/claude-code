@@ -184,3 +184,79 @@ describe('收口关口', () => {
     expect(picks.length).toBe(1)
   })
 })
+
+/**
+ * **`commits === 0` 时这一屏在说反话。**
+ *
+ * F 节之后,这个关口也会为「没有待合的提交、但盘上还剩 salvage / 保留工作区」的 run 弹出来
+ * —— 而默认选中的「合并回当前分支」对 0 个提交是**空操作**,「你的工作区未被改动」又把
+ * 注意力从真正剩下的东西上引开。验收席实测的就是那一屏。
+ */
+describe('没有待合的提交,但盘上还剩东西', () => {
+  const h = (over: Partial<PendingHandoff> = {}): PendingHandoff => ({
+    branch: 'efftask/001/integration', commits: 0,
+    kept: [{ path: '/wt/x', why: '未回收' }],
+    salvage: ['efftask/001/salvage/a', 'efftask/001/salvage/b'],
+    ...over,
+  } as PendingHandoff)
+
+  it('明说合并对它们无效,并指出能捞的那条路', async () => {
+    const t = await mount(h(), () => {})
+    const f = t.lastFrame()
+    expect(f).toContain('没有待合的提交')
+    expect(f).toContain('对它们无效')
+    // 帧里 ANSI 会被替换成空格、长行还会折 —— 断言落在不跨行的那一段上。
+    expect(f).toContain('捞回它们要')
+  })
+
+  /** 真有提交要合的那一屏不许多这一句 —— 那时「合并回当前分支」正是该做的事。 */
+  it('有提交要合时不印', async () => {
+    const t = await mount(h({ commits: 7 }), () => {})
+    expect(t.lastFrame()).not.toContain('对它们无效')
+  })
+
+  it('盘上也干净时不印', async () => {
+    const t = await mount(h({ kept: [], salvage: [] }), () => {})
+    expect(t.lastFrame()).not.toContain('对它们无效')
+  })
+})
+
+/**
+ * **二次确认那一下会删集成分支和集成工作区 —— 带修饰键的不算数。**
+ *
+ * 验收席真按键实测:`Ctrl+Y` / `Alt+y` / kitty `ESC[121;5u` 四条全部确认了「丢弃」。
+ */
+describe('丢弃的二次确认不认修饰键', () => {
+  const ESC = String.fromCharCode(27)
+  const h: PendingHandoff = {
+    branch: 'efftask/001/integration', commits: 3, kept: [], salvage: [],
+  } as PendingHandoff
+
+  it('Ctrl+Y / Alt+y / kitty C-y 都不算确认', async () => {
+    const seen: string[] = []
+    const t = await mount(h, c => seen.push(c))
+    // 这一屏没有字母快捷键:靠 ↑/↓ 选中「丢弃」(最后一项)再回车。
+    t.stdin.press('\u001b[A')
+    await new Promise(r => setTimeout(r, 20))
+    t.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    for (const seq of ['\x19', `${ESC}y`, `${ESC}[121;5u`]) {
+      t.stdin.press(seq)
+      await new Promise(r => setTimeout(r, 20))
+    }
+    expect(seen).toEqual([])
+  })
+
+  it('裸 y 仍然算', async () => {
+    const seen: string[] = []
+    const t = await mount(h, c => seen.push(c))
+    // 这一屏没有字母快捷键:靠 ↑/↓ 选中「丢弃」(最后一项)再回车。
+    t.stdin.press('\u001b[A')
+    await new Promise(r => setTimeout(r, 20))
+    t.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    t.stdin.press('y')
+    await new Promise(r => setTimeout(r, 20))
+    expect(seen).toEqual(['discard'])
+  })
+})

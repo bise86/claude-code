@@ -332,3 +332,41 @@ describe('空树上的键位提示', () => {
     expect(f).toContain('m 合并/捞回未合入的产出')
   })
 })
+
+/**
+ * **大写不算。** `k = input.toLowerCase()` 会让 `M`/`C`/`B` 和 kitty 的 Shift 序列一起触发,
+ * 而这一屏本来就在教用户按 Shift(`R 重做失败环节`)—— Shift+ 相邻键误触的概率不是零,
+ * 而 `C` 那一下打开的是删目录的关口。这三个键从来没被宣告成大写形式。
+ */
+describe('树层的 m / c / b 只认小写', () => {
+  it('大写 M / C / B 一个都不触发', async () => {
+    const hits: string[] = []
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        onMergeWorktrees={() => hits.push('m')} onCleanupWorktrees={() => hits.push('c')}
+        onBacktrack={() => hits.push('b')} onExitKey={() => {}}
+      />,
+    )
+    for (const key of ['M', 'C', 'B']) {
+      t.stdin.press(key)
+      await new Promise(r => setTimeout(r, 20))
+    }
+    app.unmount()
+    expect(hits).toEqual([])
+  })
+
+  it('小写照旧能按', async () => {
+    const hits: string[] = []
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        onCleanupWorktrees={() => hits.push('c')} onExitKey={() => {}}
+      />,
+    )
+    t.stdin.press('c')
+    await new Promise(r => setTimeout(r, 20))
+    app.unmount()
+    expect(hits).toEqual(['c'])
+  })
+})

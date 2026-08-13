@@ -82,6 +82,24 @@ export function ConfirmHandoff(props: {
           ? `分支 ${h.branch} 上还有 ${h.commits} 个提交没合进来;另有 ${h.trunkLanded} 个提交已在跑的过程中合进了你当前的分支`
           : `分支 ${h.branch} 上有 ${h.commits} 个提交,你的工作区未被改动`}
       </Text>
+      {/**
+        * **`commits === 0` 时这一屏在说反话。**
+        *
+        * 这个关口现在也会为「没有待合的提交、但盘上还剩 salvage / 保留工作区」的 run 弹出来
+        * (那正是 F 节要救的那一类)。而默认选中的「合并回当前分支」对 0 个提交是**空操作**,
+        * 「你的工作区未被改动」又把注意力从真正剩下的东西上引开。所以这一档要自己说清:
+        * 合并这条路捞不到它们,能捞的是任务树上的 `m`。
+        */}
+      {h.commits === 0 && (h.salvage.length > 0 || h.kept.length > 0) ? (
+        <Box flexDirection="column">
+          <Text color="warning">
+            ⚠ 没有待合的提交,但还有 {h.salvage.length} 条抢救分支 / {h.kept.length} 个保留工作区没送到。
+          </Text>
+          <Text color="warning">
+            {'  '}「合并回当前分支」对它们无效 —— 它们按定义就不在集成分支上;捞回它们要**进任务树按 m**。
+          </Text>
+        </Box>
+      ) : null}
       {h.integrationPath ? <Text dimColor>集成工作区: {h.integrationPath}</Text> : null}
       {h.salvage.map(s => <Text key={s} dimColor>抢救出的提交(未合入集成分支的中间产物): {s}</Text>)}
       {h.kept.map(k => <Text key={k.path} dimColor>保留的工作区({k.why}): {k.path}</Text>)}

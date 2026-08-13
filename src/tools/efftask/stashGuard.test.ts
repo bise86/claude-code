@@ -62,8 +62,7 @@ describe('前置:什么时候不许提供这一档', () => {
 
     const a = await stashAvailability(deps())
     expect(a.available).toBe(false)
-    if (a.available) throw new Error('unreachable')
-    expect(a.why).toContain('没做完的合并')
+    expect(a.why ?? '').toContain('没做完的合并')
     expect(a.hint ?? '').toContain('--abort')
   })
 

@@ -1921,7 +1921,7 @@ describe('handoffLines 对 salvage / 保留工作区说实话', () => {
   }) as HandoffSummary
 
   it('有 salvage / kept → 明说 git merge 捞不到,并给出两条能照做的路', () => {
-    const t = handoffLines(h({ salvage: ['efftask/001/salvage/a'], kept: [{ path: '/wt/x', why: '未回收' }] }), { runId: '001' }).join('\n')
+    const t = handoffLines(h({ salvage: ['efftask/001/salvage/a'], kept: [{ path: '/wt/x', why: '未回收' }] }), '001').join('\n')
     expect(t).toContain('不在集成分支上')
     expect(t).toContain('捞不到它们')
     expect(t).toContain('按 m')
@@ -1931,11 +1931,34 @@ describe('handoffLines 对 salvage / 保留工作区说实话', () => {
 
   /** 最危险的一屏:逐任务合并全部落地(commits === 0),那里根本没有「合并:」那行命令可改。 */
   it('commits === 0 时也要说 —— 那一屏没有别的命令可改', () => {
-    const t = handoffLines(h({ commits: 0, salvage: ['efftask/001/salvage/a'] }), { runId: '001' }).join('\n')
+    const t = handoffLines(h({ commits: 0, salvage: ['efftask/001/salvage/a'] }), '001').join('\n')
     expect(t).toContain('捞不到它们')
   })
 
   it('两类都没有时一个字都不多说', () => {
-    expect(handoffLines(h({ commits: 3 }), { runId: '001' }).join('\n')).not.toContain('捞不到它们')
+    expect(handoffLines(h({ commits: 3 }), '001').join('\n')).not.toContain('捞不到它们')
+  })
+})
+
+/**
+ * **「本次没有产生任何改动」只在盘上真的什么都没剩时才成立。**
+ *
+ * 验收实测:`commits === 0` + 7 条 salvage + 3 个保留工作区那一屏,结论行写着「还有 10 处
+ * 产出没送到」,而这一行紧接着说「本次没有产生任何改动」—— 三行互相矛盾,而用户读的是
+ * 第一行。
+ */
+describe('commits === 0 时那一句不许和结论行打架', () => {
+  const h = (over: Partial<HandoffSummary> = {}): HandoffSummary => ({
+    branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [], ...over,
+  }) as HandoffSummary
+
+  it('盘上还剩东西 → 不许说「没有产生任何改动」', () => {
+    const t = handoffLines(h({ salvage: ['a'], kept: [{ path: '/wt/x', why: '未回收' }] }), '001').join('\n')
+    expect(t).not.toContain('本次没有产生任何改动')
+    expect(t).toContain('没有待合的提交,但下面还有没送到的产出')
+  })
+
+  it('盘上真的干净 → 照旧那句', () => {
+    expect(handoffLines(h(), '001').join('\n')).toContain('本次没有产生任何改动')
   })
 })

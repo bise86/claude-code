@@ -24,6 +24,7 @@
 // 所以这里只做一件明确的事:**跑完了、而且干净,就合;否则不合、并且说清为什么**。
 // 关口原样留在 `--resume` 那条路上(用户清理完工作区再进来,四个选项一个不少)。
 import type { PendingHandoff } from './types.js'
+import { withStash } from './stashGuard.js'
 import {
   mergeLeftovers, runHandoffChoice, trackedChanges,
   type ConflictResolver, type GitFn, type HandoffResult,
@@ -185,6 +186,13 @@ export async function finishHandoff(deps: {
    */
   resolveConflict?: ConflictResolver
   /**
+   * 第 2 跳要不要「先 stash 再合、合完自动放回」。**默认关,由用户按一下打开** ——
+   * 这一档此前只接在 `m` 那条路上,而收口是默认落地的那一条(验收席点名的断线)。
+   */
+  stash?: boolean
+  /** 备份 ref 要按 run 命名 —— 见 stashGuard 的 P0 注释。 */
+  runId?: string
+  /**
    * **「先同步主干、再迭代解冲突」那条路。** 给了就用它来做收口那一次合并。
    *
    * 收口和 `m` 键面对的是**同一件事**(集成分支 → 用户当前分支),而在这之前只有 `m`
@@ -267,7 +275,17 @@ export async function finishHandoff(deps: {
     }
     // 走**现成的**那一份:脏树复查、失败时如实报告、分支原样保留全在里面,而收口关口
     // 按的也是同一个函数。两份实现迟早给出两种答案。
-    const res = await runHandoffChoice(
+    /**
+     * **「先 stash 再合」这一档在收口这一路也要有。**
+     *
+     * 它此前只接在 `m` 那条**用户主动按**的路上,而收口是**默认落地**的那一条 —— 验收席
+     * 点名的断线:同一件事(第 2 跳)在两条路上有两种保护。
+     *
+     * 判据同样是「用户按过」:`deps.stash` 由关口那一屏传下来,默认关(用户明确否决过
+     * 「检测到脏就自动 stash」)。`withStash` 自己会在树不脏 / 卡在一次没做完的操作里时
+     * 拒绝并说明,见 stashGuard。
+     */
+    const doMerge = async () => await runHandoffChoice(
       'merge', h, git, cwd, deps.resolveConflict,
       // 给了就走「先同步主干」那条 —— 方向反过来之后,用户的检出一次三方合并都不会经历。
       deps.syncTrunkMerge ? async () => {
@@ -275,11 +293,37 @@ export async function finishHandoff(deps: {
         return { ok: r.ok, message: r.message, ...(r.followUps ? { followUps: r.followUps } : {}) }
       } : undefined,
     )
+    let stashLines: string[] = []
+    let res: Awaited<ReturnType<typeof runHandoffChoice>>
+    if (deps.stash === true && deps.runId) {
+      const guarded = await withStash({ git, cwd, runId: deps.runId }, doMerge)
+      stashLines = guarded.lines
+      if (guarded.failed === true) {
+        return {
+          merged: false,
+          result: { ok: false, message: '没有合并:先 stash 那一步没做成', followUps: stashLines },
+        }
+      }
+      res = guarded.result ?? await doMerge()
+      if (guarded.restored === false) {
+        return {
+          merged: true,
+          result: {
+            ok: false,
+            message: '⚠ 产出合回你的分支了,但把你未提交的改动放回来时撞了冲突 —— 改动一个字节都没丢',
+            followUps: stashLines,
+          },
+        }
+      }
+    } else {
+      res = await doMerge()
+    }
     if (res.ok) {
       // 合成功了才推当前分支 —— 没合的话,推上去的是一份不含本次产出的分支。
       const push = deps.autoPush === true ? await pushCurrent(git, cwd) : undefined
       // 降级放行那句话跟着**成功**这条路走(它现在是「合了但要说」,不是「不合」)。
-      const withWarn = plan.warn ? { ...res, followUps: [...plan.warn, ...(res.followUps ?? [])] } : res
+      const extra = [...(plan.warn ?? []), ...stashLines]
+      const withWarn = extra.length > 0 ? { ...res, followUps: [...extra, ...(res.followUps ?? [])] } : res
       return { merged: true, result: withWarn, ...(push ? { push } : {}) }
     }
     // 失败了 —— 工作区被留在半合并状态了吗?这一问必须由**我们**来问:这一路是自动

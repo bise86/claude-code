@@ -461,6 +461,31 @@ describe('覆盖完整性', () => {
     }
   })
 
+  /**
+   * **上面那条是字面量比字面量 —— 它红不了任何一次实现回退。**
+   *
+   * 验收实测:把 `scanRescue` 的核心判据改回 `=== 'report'`(那正是 G 节要消灭的缺陷),
+   * 覆盖探针**仍然全绿**。所以这一条把两张表和**真实现**接上:表里声称「会被念到」的
+   * 那几格,判据必须真的收得下它们。
+   */
+  it('声称「会被念到」的那几格,判据真的收得下', () => {
+    for (const k of MERGE_KEY_REPORTS) {
+      const kind = STRANDED_KINDS[k as keyof typeof STRANDED_KINDS]
+      // `scanRescue` 的 notices 判据是「不是 merge」——两张表的分工必须和它对得上。
+      const collected = kind.action !== 'merge'
+      expect(`${k}: ${collected ? '收得下' : '判据漏掉它'}`).toBe(`${k}: 收得下`)
+    }
+  })
+
+  /** 反过来:认领表里的每一格都必须真的是「能合的」(或在 refOnly 里被处置)。 */
+  it('认领表里的每一格都不是纯报告项', () => {
+    for (const k of MERGE_KEY_COVERS) {
+      const kind = STRANDED_KINDS[k as keyof typeof STRANDED_KINDS]
+      const mergeable = kind.action === 'merge' || MERGE_KEY_REPORTS.includes(k)
+      expect(`${k}: ${mergeable ? 'ok' : '既不能合也没人念'}`).toBe(`${k}: ok`)
+    }
+  })
+
   /** 「合并解决不了」那两格要指向 `b`,而不是混进「摆出来」那一堆。 */
   it('backtrack 那两格在念出来的表里', () => {
     for (const k of STRANDED_KIND_LIST.filter(x => STRANDED_KINDS[x].action === 'backtrack')) {

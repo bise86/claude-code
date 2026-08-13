@@ -3356,7 +3356,15 @@ export function DoneView(props: {
           ? <Text color={props.handoffResult.ok ? 'success' : 'error'}>{props.handoffResult.message}</Text>
           : null}
         {props.handoffResult?.followUps?.map(l => <Text key={l} dimColor>{l}</Text>) ?? null}
-        {handoff.map(l => <Text key={l} dimColor>{l}</Text>)}
+        {/**
+          * `wrap` 必须有:`doneSummaryRows` 按**条数**预算这批行,而它们没有 wrap 时会在
+          * 窄终端上回流 —— 实测 44 列下 15 条占 28 行,`reservedRows` 偏小 13 行,于是树多
+          * 画那么多行,24 行终端上总输出到 38 行。
+          *
+          * `key` 用下标:这一屏的职责是**列全**,而一旦有两行文案相同,行文本作 key 会
+          * 静默少印一行。
+          */}
+        {handoff.map((l, i) => <Text key={`h-${i}`} dimColor wrap="truncate-end">{l}</Text>)}
         {props.redoProblems?.map(l => <Text key={l} color="warning">⚠ {l}</Text>) ?? null}
         {/**
           * `wrap="truncate-end"` **是必须的**:`doneSummaryRows` 把这一行按常数 1 行计,

@@ -585,9 +585,16 @@ export function TaskTreePanel(props: {
      * 坏了」的地方;而且多一项会把 100 列 + runControl 的页脚从 3 页推到 4 页。它的可见性
      * 由详情页页脚承担(`canRepairNode`)。
      */
-    if (plain && k === 'm' && props.onMergeWorktrees && current) { props.onMergeWorktrees(current); return }
-    if (plain && k === 'c' && props.onCleanupWorktrees && current) { props.onCleanupWorktrees(current); return }
-    if (plain && k === 'b' && props.onBacktrack && current) { props.onBacktrack(current); return }
+    /**
+     * **判据用 `input` 而不是小写化后的 `k`。**
+     *
+     * `k = input.toLowerCase()` 会让 `M`/`C`/`B` 和 kitty 的 Shift 序列一起触发 —— 而这一屏
+     * 本来就在教用户按 Shift(`R 重做失败环节`),Shift+ 相邻键误触的概率不是零,
+     * 而 `C` 那一下打开的是删目录的关口。这三个键从来没被宣告成大写形式。
+     */
+    if (plain && input === 'm' && props.onMergeWorktrees && current) { props.onMergeWorktrees(current); return }
+    if (plain && input === 'c' && props.onCleanupWorktrees && current) { props.onCleanupWorktrees(current); return }
+    if (plain && input === 'b' && props.onBacktrack && current) { props.onBacktrack(current); return }
     // 页脚提示翻页。放在方向键之前,和上面那几个键同一档。
     if (input === '?' && key.ctrl !== true && key.meta !== true) { setHintPage(x => x + 1); return }
     // 运行中的人工干预。同样放在方向键之前,同样的理由。
