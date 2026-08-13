@@ -59,6 +59,7 @@ const depsOf = (p: ReturnType<typeof pool>, over: Partial<RescueDeps> = {}): Res
   gitRoot: p.gitRoot,
   integrationBranch: p.integrationBranchName,
   integrationPath: p.integrationPath,
+  worktreeRoot,
   withIntegrationLock: fn => p.withIntegrationRead(fn),
   ...over,
 })

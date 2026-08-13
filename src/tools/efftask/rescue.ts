@@ -1,3 +1,4 @@
+import { mergeIntoIntegration, type IntegrationMergeDeps } from './integrationMerge.js'
 import type { StrandedItem } from './stranded.js'
 
 /**
@@ -83,9 +84,21 @@ export interface RescueDeps {
   gitRoot: string
   integrationBranch: string
   integrationPath: string
+  /** 临时合并工作树建在哪 —— 模型解冲突就发生在那里(见 `integrationMerge.ts`)。 */
+  worktreeRoot: string
   /** 集成工作区只有一个 index、一个检出 —— 合并必须排队。由池子的 `withIntegrationRead` 给。 */
   withIntegrationLock: <T>(fn: () => Promise<T>) => Promise<T>
   triage?: RescueTriage
+  /**
+   * **用解决合并冲突的模型来执行合并**(用户原话)。
+   *
+   * 不给 = 撞了冲突就如实报告,而不是假装没有这个功能。给了的话,合并本身走
+   * `mergeIntoIntegration`:在一棵**专用的临时工作树**里合、在那里迭代解、
+   * 最后只用一次毫秒级快进进集成分支 —— 模型调用一次都不在 `mergeLock` 里。
+   */
+  resolve?: IntegrationMergeDeps['resolve']
+  /** 同一次合并最多让模型解几轮。见 `caps.trunkResolveRounds`。 */
+  rounds?: number
   onProgress?: (line: string) => void
   signal?: AbortSignal
 }
@@ -232,11 +245,33 @@ export async function planRescue(
 }
 
 export interface RescueOutcome {
-  merged: { ref: string; commits: number; title?: string }[]
+  merged: { ref: string; commits: number; title?: string; resolvedFiles?: string[] }[]
   failed: { ref: string; why: string }[]
   problems: string[]
   aborted: boolean
 }
+
+/**
+ * 交给解冲突模型的那句「另一半是什么来历」。
+ *
+ * 这是**调用方知道、而模型无从得知**的事实,也是这条路上唯一能防住「废稿反向污染」的东西:
+ * 一条被取代的抢救分支和集成分支在同一个文件上都有内容 → add/add 冲突 → 一个不知情的
+ * 解决者会尽力「保留双方的意图」,于是把废稿留了下来。真 git 上验过这个形状。
+ */
+export function provenanceNote(c: RescueCandidate): string {
+  const who = c.evidence.title ?? c.evidence.nodeId ?? '一个已经不在树上的任务'
+  const base = `正在合入的这一半来自 ${quote(c.evidence.ref)} —— 「${who}」此前某一版产出的抢救分支,` +
+    `它没有合进过集成分支。分诊结论:${c.why}`
+  if (c.evidence.fate === 'superseded') {
+    // 这一句是这条路存在的全部理由,不能省成一句泛泛的提醒。
+    return `${base}\n**注意:这一版已经被后来的版本取代。** 冲突时以集成分支(HEAD)那一侧为准,` +
+      `只在被合入的这一侧含有集成分支**确实缺失**的内容时才采纳它 —— 不要为了「保留双方意图」` +
+      `把已经被替换掉的旧实现留下来。`
+  }
+  return `${base}\n冲突时优先保住集成分支(HEAD)已有的行为,把这一侧独有的产出补进去。`
+}
+
+const quote = (s: string): string => `\`${s}\``
 
 /**
  * 真的捞。**只对分诊判「合」的那些**,一个都不多。
@@ -257,31 +292,46 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
     if (deps.signal?.aborted) { out.aborted = true; break }
     const ref = c.evidence.ref
     deps.onProgress?.(`捞回 ${ref}(${c.evidence.commits} 个提交)…`)
-    const res = await deps.withIntegrationLock(async () => {
-      const m = await deps.git(['merge', '--no-edit', '--no-verify', ref], deps.integrationPath)
-      if (m.code === 0) return { ok: true as const }
-      const conflicts = (await deps.git(['diff', '--name-only', '--diff-filter=U'], deps.integrationPath))
-        .stdout.split('\n').map(l => l.trim()).filter(Boolean)
-      // 无条件收拾,判据看现场而不是退出码。
-      const inMerge = await deps.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], deps.integrationPath)
-      if (inMerge.code === 0) await deps.git(['merge', '--abort'], deps.integrationPath)
-      const still = (await deps.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], deps.integrationPath)).code === 0
-      return {
-        ok: false as const,
-        why: conflicts.length > 0
-          ? `撞了冲突(${conflicts.slice(0, 3).join('、')}${conflicts.length > 3 ? ` 等 ${conflicts.length} 个` : ''})`
-          : (m.stderr.trim() || m.stdout.trim() || '合并未生效'),
-        stillInMerge: still,
-      }
-    })
+    /**
+     * **合并本身交给解冲突的模型**(用户原话:「用解决合并冲突的模型来执行合并」)。
+     *
+     * 合发生在一棵**专用的临时工作树**里,不是集成工作区 —— 后者只有一个 index、一个检出,
+     * 而 `commitAndMerge` 写它、集成验收读它,两者共用 `mergeLock`。把一次几分钟的模型
+     * 调用关进那把锁,整棵树的合并当场停摆。锁只用在最后那一次毫秒级快进上。
+     *
+     * `provenanceNote` 一路带到解冲突的提示词里 —— 少了它,一个不知情的解决者会把
+     * 被取代的废稿「保留双方意图」地留下来。
+     */
+    const res = await mergeIntoIntegration(
+      {
+        git: deps.git,
+        gitRoot: deps.gitRoot,
+        integrationBranch: deps.integrationBranch,
+        integrationPath: deps.integrationPath,
+        worktreeRoot: deps.worktreeRoot,
+        withIntegrationLock: deps.withIntegrationLock,
+        ...(deps.resolve ? { resolve: deps.resolve } : {}),
+        ...(deps.rounds === undefined ? {} : { rounds: deps.rounds }),
+        ...(deps.signal ? { signal: deps.signal } : {}),
+        ...(deps.onProgress ? { onProgress: deps.onProgress } : {}),
+      },
+      ref,
+      provenanceNote(c),
+    )
     if (res.ok) {
-      out.merged.push({ ref, commits: c.evidence.commits, ...(c.evidence.title ? { title: c.evidence.title } : {}) })
+      out.merged.push({
+        ref, commits: c.evidence.commits,
+        ...(c.evidence.title ? { title: c.evidence.title } : {}),
+        ...(res.resolvedFiles.length > 0 ? { resolvedFiles: res.resolvedFiles } : {}),
+      })
       continue
     }
     out.failed.push({ ref, why: res.why })
-    if (res.stillInMerge) {
-      // 集成工作区停在半合并态 —— 后面每一次合并都会被它挡住,必须说。
-      out.problems.push(`集成工作区里留着一次没收拾干净的合并(${ref})—— 请到 ${deps.integrationPath} 处理`)
+    if (!res.restored) {
+      // 临时工作树停在半合并态 —— 下一条捞会被它挡住,必须说,而且到此为止。
+      out.problems.push(
+        `临时合并工作区里留着一次没收拾干净的合并(${ref})—— 请到 ${deps.worktreeRoot}/merge-scratch 处理`,
+      )
       break
     }
   }

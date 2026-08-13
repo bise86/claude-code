@@ -36,6 +36,18 @@ export type ConflictResolver = (info: {
   /** 合进来的那条分支(集成分支)。不给的话模型不知道自己在解谁和谁的冲突。 */
   branch: string
   cwd: string
+  /**
+   * **这次合并的另一半是什么来历。**
+   *
+   * 可选,而且只有捞回孤立产出那条路会给。理由是那条路上有一种输入会让「按常理解冲突」
+   * 得到反向的结果:`discard` 抢救下来的分支里有一类是**被验收否决过的产出**,而对应的
+   * 任务后来重做出了正确版本。两边在同一个文件上都有内容 → add/add 冲突 → 一个不知情的
+   * 解决者会尽力「保留双方的意图」,于是把废稿的内容留了下来,盖在已经修好的代码上。
+   * 真 git 上验过这个形状。
+   *
+   * 所以「哪一半可信」不能让模型猜,它是调用方**知道**而模型无从得知的事实。
+   */
+  note?: string
 }) => Promise<void>
 
 /** 暂存区里还留着冲突标记的文件。空 = 干净。 */
@@ -67,8 +79,10 @@ export async function autoResolveMerge(deps: {
   branch: string
   files: string[]
   resolve: ConflictResolver
+  /** 「另一半是什么来历」——原样交给解决者,见 `ConflictResolver.note`。 */
+  note?: string
 }): Promise<{ ok: true } | { ok: false; why: string; restored: boolean }> {
-  const { git, cwd, branch, files, resolve } = deps
+  const { git, cwd, branch, files, resolve, note } = deps
   const fail = async (why: string): Promise<{ ok: false; why: string; restored: boolean }> => {
     // 还原到合并前。git 在内容冲突时不回滚,不 abort 的话用户的工作区就停在半合并状态 ——
     // 而他没按过任何键,屏幕上一句「你的工作区未被改动」当场变成假话。
@@ -76,7 +90,8 @@ export async function autoResolveMerge(deps: {
     return { ok: false, why, restored: ab.code === 0 }
   }
   try {
-    await resolve({ files, branch, cwd })
+    // `note` 只在给了的时候才带上 —— 老调用方一个字都不变。
+    await resolve({ files, branch, cwd, ...(note ? { note } : {}) })
   } catch (e) {
     return fail(`自动解决调用失败: ${e instanceof Error ? e.message : String(e)}`)
   }
