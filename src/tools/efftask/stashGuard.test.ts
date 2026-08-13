@@ -2,10 +2,11 @@
 // 任何一条(圆桌评审就是靠真 git 打掉了方案里两条看起来很合理的机制)。
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
-import { stashAvailability, withStash, type StashGit } from './stashGuard.js'
+import { stashAvailability, sweepStashBackups, withStash, type StashGit } from './stashGuard.js'
 
 const git: StashGit = (args, cwd) =>
   new Promise(resolve => {
@@ -387,5 +388,98 @@ describe('索引划分', () => {
     expect(out.restored).toBe(true)
     expect(await read('a.txt')).toBe('第二版\n')
     expect((await git(['status', '--porcelain'], repo)).stdout.trim()).toBe(before)
+  })
+})
+
+/**
+ * **备份 ref 必须有人回收。** 用户原话:「没有用就及时清理,有用就在任务完成后清理掉」。
+ *
+ * 成功路径上 `withStash` 当场就删了;留下来的只有「pop 撞冲突」那一次 —— 而取完之后
+ * 此前没人清,每一次失败的按键永久留下一个 ref + 一个 commit 对象,还把那批对象一直
+ * 挡在 gc 之外。
+ */
+describe('备份 ref 的回收', () => {
+  const refs = async (): Promise<string[]> =>
+    (await git(['for-each-ref', '--format=%(refname)', 'refs/et/stash-backup'], repo))
+      .stdout.split('\n').map(l => l.trim()).filter(Boolean)
+
+  /** 造一次 pop 撞冲突:条目和备份 ref 都会留下。 */
+  const conflicted = async () => {
+    await git(['checkout', '-qb', 'other'], repo)
+    await writeFile(file('a.txt'), '来自 other\n')
+    await git(['commit', '-qam', 'other'], repo)
+    await git(['checkout', '-q', 'main'], repo)
+    await writeFile(file('a.txt'), '我的一天\n')
+    const out = await withStash(deps(), async () => { await git(['merge', '--no-edit', 'other'], repo) })
+    expect(out.restored).toBe(false)
+    expect(await refs()).toHaveLength(1)
+    return out
+  }
+
+  it('条目还在(他还没处理完)→ 留着,并说清为什么', async () => {
+    await conflicted()
+    const swept = await sweepStashBackups(deps())
+    expect(swept.removed).toEqual([])
+    expect(swept.kept).toHaveLength(1)
+    expect(swept.kept[0]?.why ?? '').toContain('还没处理完')
+    expect(await refs()).toHaveLength(1)
+  })
+
+  it('他解完冲突、drop 掉条目之后 → 这一份使命结束,回收掉', async () => {
+    await conflicted()
+    // 用户照屏幕说的做:解冲突、丢掉那条 stash。
+    await writeFile(file('a.txt'), '解完了\n')
+    await git(['add', 'a.txt'], repo)
+    await git(['stash', 'drop', '-q'], repo)
+    const swept = await sweepStashBackups(deps())
+    expect(swept.removed).toHaveLength(1)
+    expect(await refs()).toEqual([])
+  })
+
+  it('成功那一趟本来就不留 —— 回收时无事可做', async () => {
+    await writeFile(file('a.txt'), '我正在改\n')
+    await withStash(deps(), async () => 'ok')
+    expect(await refs()).toEqual([])
+    expect(await sweepStashBackups(deps())).toEqual({ removed: [], kept: [] })
+  })
+
+  /** 只管本 run 的:别的 run 可能还开着,替它做决定不是这里的事。 */
+  it('别的 run 的备份一个都不碰', async () => {
+    await conflicted()
+    await git(['update-ref', 'refs/et/stash-backup/999/abcdef', 'HEAD'], repo)
+    await writeFile(file('a.txt'), '解完了\n')
+    await git(['add', 'a.txt'], repo)
+    await git(['stash', 'drop', '-q'], repo)
+    await sweepStashBackups(deps())
+    expect(await refs()).toEqual(['refs/et/stash-backup/999/abcdef'])
+  })
+})
+
+/**
+ * **回收要有生产调用者。**
+ *
+ * 这个仓库的招牌缺陷是断线:声明了、实现了、探针也全绿,而生产里没人调它。上面那四条
+ * 只证明 `sweepStashBackups` 自己是对的 —— 这一条钉的是「收口那一刻真的会调它」,
+ * 以及留下来的那几条真的会被念出来(否则它就是一个没人知道的 ref,而那正是要修的毛病)。
+ */
+describe('回收接进了收口', () => {
+  const SRC = readFileSync(new URL('../../commands/efftask/runOrchestrator.ts', import.meta.url), 'utf8')
+
+  it('reclaim 里调了 sweepStashBackups', () => {
+    expect(SRC).toContain("import { sweepStashBackups } from '../../tools/efftask/stashGuard.js'")
+    expect(SRC).toContain('const swept = await sweepStashBackups({')
+    // 只管本 run 的:别的 run 可能还开着。
+    expect(SRC).toContain('runId: args.taskEntry.runId')
+  })
+
+  it('留下来的那几条并进 trunkSkips(结束屏 / 退出报告 / 收口关口读的都是它)', () => {
+    expect(SRC).toContain('keptBackups.length > 0')
+    expect(SRC).toContain("trunkSkips: [...(h0.trunkSkips ?? []), ...keptBackups]")
+  })
+
+  /** 回收失败不该把收口本身带倒 —— 它只是省空间。 */
+  it('回收裹在 try 里', () => {
+    const i = SRC.indexOf('sweepStashBackups({')
+    expect(SRC.slice(Math.max(0, i - 200), i)).toContain('try {')
   })
 })

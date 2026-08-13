@@ -213,6 +213,25 @@ export async function withStash<T>(
     }
   }
 
+  /**
+   * **改名成「按 stash 条目的 sha」。**
+   *
+   * `stash create` 和 `stash push` 造的是**两个不同的 commit** —— 回收那一侧要问的是
+   * 「那条 stash 条目还在不在」,所以 ref 名里必须是**条目**的 sha,不是备份对象的。
+   *
+   * 先按备份 sha 写、再改名:两步之间工作区还没被动过(动它的是 push),所以那个窗口里
+   * 即使崩了也没有东西可丢;而反过来(等条目 sha 出来再写)会让 push 之后有一小段
+   * 完全没有备份的时间。
+   */
+  const entryRef = `refs/et/stash-backup/${runId}/${after.slice(0, 12)}`
+  if (entryRef !== backupRef) {
+    const moved = await git(['update-ref', entryRef, bak], cwd)
+    if (moved.code === 0) {
+      await git(['update-ref', '-d', backupRef, bak], cwd)
+      backupRef = entryRef
+    }
+  }
+
   let result: T | undefined
   let threw: unknown
   try {
@@ -309,3 +328,50 @@ async function entryFor(git: StashGit, cwd: string, sha: string): Promise<string
 }
 
 const oneLine = (s: string): string => s.trim().split('\n').filter(Boolean).slice(0, 2).join('; ')
+
+/**
+ * **备份 ref 的回收。**
+ *
+ * 这些 ref 是 `withStash` 留下的耐久备份(见文件头)。成功路径上它当场就删了,留下来的
+ * 只有一种:**pop 撞冲突**那一次 —— 那时用户的改动同时在 stash 条目和这个 ref 上,而屏幕
+ * 让他二选一去取。问题是取完之后没人清:每一次失败的按键永久留下一个 ref + 一个 commit
+ * 对象,而它们还会把那批对象一直挡在 gc 之外。
+ *
+ * 判据是**「那次撞冲突处理完了没有」**,不是时间、也不是数量:
+ *
+ *  · stash 列表里还有同 sha 的条目 → **他还没处理完**,留着(这正是备份存在的那一刻);
+ *  · 列表里没有了 → 要么已经 pop 回去(那时我们自己就删了)、要么他解完冲突后
+ *    `git stash drop` 了 —— 两种都意味着这份备份的使命结束。
+ *
+ * 判据只看**本 run** 的 ref:别的 run 可能还开着,替它做决定不是这里的事。
+ */
+export async function sweepStashBackups(
+  deps: Pick<StashGuardDeps, 'git' | 'cwd' | 'runId'>,
+): Promise<{ removed: string[]; kept: { ref: string; why: string }[] }> {
+  const { git, cwd, runId } = deps
+  const removed: string[] = []
+  const kept: { ref: string; why: string }[] = []
+  const listed = await git(['for-each-ref', '--format=%(refname) %(objectname)', `refs/et/stash-backup/${runId}`], cwd)
+  if (listed.code !== 0) return { removed, kept }
+  const stashed = new Set(
+    (await git(['stash', 'list', '--format=%H'], cwd)).stdout.split('\n').map(l => l.trim()).filter(Boolean),
+  )
+  for (const line of listed.stdout.split('\n')) {
+    const [ref, sha] = line.trim().split(/\s+/)
+    if (!ref || !sha) continue
+    /**
+     * ref 名的最后一段是**那条 stash 条目**的 sha 前缀(不是备份对象自己的 —— `stash create`
+     * 和 `stash push` 造的是两个不同的 commit,这一点实测过)。
+     */
+    const entry = ref.slice(ref.lastIndexOf('/') + 1)
+    if ([...stashed].some(h => h.startsWith(entry))) {
+      kept.push({ ref, why: '那一次 pop 撞了冲突,而对应的 stash 条目还在 —— 你还没处理完它' })
+      continue
+    }
+    // **按 sha 删**,不按名字:两次之间有人往同名 ref 上写过东西的话,删的就不是我们看到的那个。
+    const del = await git(['update-ref', '-d', ref, sha], cwd)
+    if (del.code === 0) removed.push(ref)
+    else kept.push({ ref, why: `删不掉(${oneLine(del.stderr) || `退出码 ${del.code}`})` })
+  }
+  return { removed, kept }
+}

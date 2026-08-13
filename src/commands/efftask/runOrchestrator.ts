@@ -1,4 +1,5 @@
 import type { RunControl } from '../../tools/efftask/control.js'
+import { sweepStashBackups } from '../../tools/efftask/stashGuard.js'
 import { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import type { PipelineCtx } from '../../tools/efftask/pipeline.js'
 import { writeNode, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
@@ -264,6 +265,7 @@ export async function runOrchestrator(
   let pendingOutcome: Outcome = { status: 'blocked', reason: '未知' }
   /** 这一趟已经落在用户当前分支上的提交数(reclaim 里从 handoff 读,handoff 从 git 现算)。 */
   let trunkLanded = 0
+  let keptBackups: string[] = []
   const reclaim = async (nodes: TaskNode[]): Promise<void> => {
     if (ran || !args.worktrees) return
     ran = true
@@ -272,7 +274,34 @@ export async function runOrchestrator(
       // worktrees that genuinely still hold something. Reporting before reclaiming would list
       // directories that are about to disappear.
       await args.worktrees.dispose(nodes)
-      const h = await args.worktrees.handoff(nodes)
+      /**
+       * **「先 stash 再合」留下的备份 ref,到这一刻该回收了。**
+       *
+       * 用户原话:「没有用就及时清理,有用就在任务完成后,清理掉」。成功路径上
+       * `withStash` 当场就删了;留下来的只有「pop 撞冲突」那一次 —— 而判据是
+       * 「那条 stash 条目还在不在」:还在 = 他还没处理完,留着;不在 = 他已经解完并
+       * drop 了,这份备份的使命结束(见 sweepStashBackups)。
+       *
+       * 放在 dispose 之后、handoff 之前:留下来的那几条要能被 handoff 那一屏念出来。
+       */
+      if (args.git && args.taskEntry?.runId && args.worktrees.gitRoot) {
+        try {
+          const swept = await sweepStashBackups({
+            git: args.git as never, cwd: args.worktrees.gitRoot, runId: args.taskEntry.runId,
+          })
+          keptBackups = swept.kept.map(k =>
+            `保留了一份你未提交改动的备份:${k.ref} —— ${k.why};取回:git stash apply ${k.ref}`)
+        } catch { /* 回收失败不该影响收口本身 —— 它只是省空间 */ }
+      }
+      const h0 = await args.worktrees.handoff(nodes)
+      /**
+       * 留下来的备份并进 `trunkSkips` —— 那一栏的语义正是「有东西没送到你的目录,原因
+       * 如下」,而结束屏、退出报告、收口关口读的都是它。另起一个字段等于再造一条只有
+       * 一个消费者的通道。
+       */
+      const h = keptBackups.length > 0
+        ? { ...h0, trunkSkips: [...(h0.trunkSkips ?? []), ...keptBackups] }
+        : h0
       // 逐任务合并已经送进用户分支几次 —— 收口那一步靠它决定「没有待收口 ≠ 什么都没发生」
       // (自动推送在这条正常路径上必须照样发生)。
       trunkLanded = h.trunkLanded ?? 0
