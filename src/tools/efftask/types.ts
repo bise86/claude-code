@@ -774,6 +774,15 @@ export interface TaskNode {
    */
   backtrack?: { rounds: number; at: string }
   /**
+   * `m` 键三级都试过、仍然没捞回集成分支的那几条 ref。**载荷,不是判据。**
+   *
+   * 认领这个节点的判据是 `execStatus` 上的 `RESCUE_STRANDED_NOTE`(见 `backtrack.ts`);
+   * 这个字段只带明细,好让回溯注入的那句话说得出「还差哪几处」。反过来做的话,
+   * 字段在任何一次序列化事故里丢掉,`b` 就静默地扫不到 —— 而丢字段这件事这个仓库
+   * 见过三次。夹了条数上限,因为 `m` 可以被反复按。
+   */
+  rescueStranded?: { ref: string; why: string; at: string; remaining: number }[]
+  /**
    * 这个节点在哪几关被**降级放行**过。见 `DegradeRecord` —— 既是审计记录,也是闩。
    *
    * 缺席 / 空数组 = 从来没降级过 = 今天的行为逐字不变。渲染层必须把它当成

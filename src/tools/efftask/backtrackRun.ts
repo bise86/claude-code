@@ -142,11 +142,31 @@ export async function runBacktrack(
     if (levelOfChild.get(t.node.id) === undefined) levelOfChild.set(t.node.id, t.level)
     for (const s of t.suspects) if (levelOfChild.get(s) === undefined) levelOfChild.set(s, t.level)
   }
-  const entries = ids.map(id => ({
-    nodeId: id,
-    entry: (levelOfChild.get(id) === 2 ? 'plan' : 'execute') as 'execute' | 'plan',
-    ...(guidanceOf.has(id) ? { guidance: guidanceOf.get(id)! } : {}),
-  }))
+  /**
+   * **模型缺席时用已经写下来的意见兜底注入。**
+   *
+   * 规范席点名:`guidanceOf` **只**从模型的映射来,而屏幕上那句承诺是无条件的 ——
+   * 「把集成验收的意见**注入执行提示词**,重跑一遍」。没有 `deps.map`(或它抛了)的那一趟,
+   * `attachGuidance` 一次都不进,重跑就是**裸重跑**:同样的提示词、同样的模型,
+   * 凭什么这次会不一样。而 `BacktrackTarget.blocking` 里那句话**本来就在盘上**,
+   * 它此前只被拿去上屏和喂模型,从没送进过执行提示词。
+   *
+   * 兜底的话按目标归属:被点到的子任务拿它父目标的那句(阶梯本来就是记在父目标身上的)。
+   */
+  const fallbackOf = new Map<string, string>()
+  for (const t of targets) {
+    if (t.blocking.trim().length === 0) continue
+    if (!fallbackOf.has(t.node.id)) fallbackOf.set(t.node.id, t.blocking)
+    for (const s of t.suspects) if (!fallbackOf.has(s)) fallbackOf.set(s, t.blocking)
+  }
+  const entries = ids.map(id => {
+    const guidance = guidanceOf.get(id) ?? fallbackOf.get(id)
+    return {
+      nodeId: id,
+      entry: (levelOfChild.get(id) === 2 ? 'plan' : 'execute') as 'execute' | 'plan',
+      ...(guidance !== undefined && guidance.trim().length > 0 ? { guidance } : {}),
+    }
+  })
 
   const computed = composeRedos(nodes, entries, now, n => ctxFor?.(n))
   if ('error' in computed) {

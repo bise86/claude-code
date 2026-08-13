@@ -100,14 +100,39 @@ beforeEach(freshRepo)
 afterAll(async () => { for (const r of roots) await rm(r, { recursive: true, force: true }) })
 
 describe('分诊:模型只圈范围,默认方向朝安全那一侧', () => {
-  it('没有分诊模型时一条都不合,而且要说出来', async () => {
+  it('没有分诊模型时一条都不整条合并,而且要说出来', async () => {
     const p = pool(); await p.init()
     const { branch } = await strandedBranch(p, 'root/01', 'a.ts', 'work\n')
     const plan = await planRescue(depsOf(p), [item({ kind: 'branchOnly', branch, why: '' })])
     expect(plan.merge).toEqual([])
-    expect(plan.hold).toHaveLength(1)
-    expect(plan.hold[0]!.verdict).toBe('unsure')
+    /**
+     * **「不整条合并」和「什么都不做」是两件事。**
+     *
+     * 拿不准的落 `backfill`(第 2 级:只补录集成分支根本没有的路径),不落 `merge`。
+     * 这一条钉的正是那个分界:把它挪回 `merge` 就是「沉默被读成同意」,
+     * 把第 2 级删掉就是「一次判决冒充最大努力」。
+     */
+    expect(plan.backfill).toHaveLength(1)
+    expect(plan.backfill[0]!.verdict).toBe('unsure')
+    expect(plan.hold).toEqual([])
     expect(plan.problems.join('\n')).toContain('没有可用的分诊模型')
+  })
+
+  /**
+   * **被取代的那一版连补录都不做。**
+   *
+   * 它「集成分支上没有」的文件,很可能正是后继版本**故意删掉**的那个 —— 补录回去
+   * 是另一种污染。这一条和上面那条是一对:同样是 `unsure`,`fate` 决定去哪个桶。
+   */
+  it('拿不准、但已经被取代的 → 不补录,进 hold', async () => {
+    const p = pool(); await p.init()
+    const { branch } = await strandedBranch(p, 'root/01s', 'a.ts', 'work\n')
+    const plan = await planRescue(
+      depsOf(p), [{ ...item({ kind: 'salvage', branch, why: '' }), fate: 'superseded' }],
+    )
+    expect(plan.backfill).toEqual([])
+    expect(plan.hold).toHaveLength(1)
+    expect(plan.hold[0]!.evidence.fate).toBe('superseded')
   })
 
   /**
@@ -125,8 +150,57 @@ describe('分诊:模型只圈范围,默认方向朝安全那一侧', () => {
       [item({ kind: 'branchOnly', branch: a.branch, why: '' }), item({ kind: 'branchOnly', branch: b.branch, why: '' })],
     )
     expect(plan.merge.map(c => c.evidence.ref)).toEqual([a.branch])
+    expect(plan.backfill.map(c => c.evidence.ref)).toEqual([b.branch])
+    expect(plan.backfill[0]!.verdict).toBe('unsure')
+  })
+
+  /**
+   * **模型漏说的那几条要单独再问一轮 —— 一次沉默不是永久放弃。**
+   *
+   * 反向断言在这里是判据的一半:第二轮**只带漏掉的那些**。带全量就是把同一份长清单
+   * 再问一遍,而漏说最常见的成因正是清单太长。
+   */
+  it('分诊漏说的条目会被单独追问一轮', async () => {
+    const p = pool(); await p.init()
+    const a = await strandedBranch(p, 'root/02r-a', 'a.ts', 'A\n')
+    const b = await strandedBranch(p, 'root/02r-b', 'b.ts', 'B\n')
+    const rounds: string[][] = []
+    const plan = await planRescue(
+      depsOf(p, {
+        triage: async ev => {
+          rounds.push(ev.map(e => e.ref))
+          return rounds.length === 1
+            ? [{ ref: a.branch, verdict: 'merge' as const, why: '独有产出' }]
+            : [{ ref: b.branch, verdict: 'skip' as const, why: '第二轮才说清' }]
+        },
+      }),
+      [item({ kind: 'branchOnly', branch: a.branch, why: '' }), item({ kind: 'branchOnly', branch: b.branch, why: '' })],
+    )
+    expect(rounds).toHaveLength(2)
+    expect(rounds[1]).toEqual([b.branch])
     expect(plan.hold.map(c => c.evidence.ref)).toEqual([b.branch])
-    expect(plan.hold[0]!.verdict).toBe('unsure')
+    expect(plan.hold[0]!.verdict).toBe('skip')
+  })
+
+  /** 已经按过 Esc 了就别再发第二轮 —— `planRescue` 此前从头到尾没读过 signal。 */
+  it('中断之后不再追问第二轮', async () => {
+    const p = pool(); await p.init()
+    const a = await strandedBranch(p, 'root/02s-a', 'a.ts', 'A\n')
+    const b = await strandedBranch(p, 'root/02s-b', 'b.ts', 'B\n')
+    const ctl = new AbortController()
+    let calls = 0
+    await planRescue(
+      depsOf(p, {
+        signal: ctl.signal,
+        triage: async () => {
+          calls += 1
+          ctl.abort()
+          return [{ ref: a.branch, verdict: 'merge' as const, why: '独有' }]
+        },
+      }),
+      [item({ kind: 'branchOnly', branch: a.branch, why: '' }), item({ kind: 'branchOnly', branch: b.branch, why: '' })],
+    )
+    expect(calls).toBe(1)
   })
 
   it('分诊调用抛异常 → 整批按「拿不准」,一条都不合', async () => {
@@ -289,20 +363,60 @@ describe('孤儿目录', () => {
     await mkdir(orphan, { recursive: true })
     await writeFile(join(orphan, 'lost.ts'), 'only here\n')
     const plan = await planRescue(depsOf(p), [item({ kind: 'orphanDir', path: orphan, why: '' })], listFiles)
-    const text = rescueLines(plan).join('\n')
-    expect(text).toContain('已经不是 git 工作树')
-    expect(text).toContain('目录不会被删')
+    /**
+     * **同一份计划,两句相反的话,判据是这一趟有没有拷贝接缝。**
+     *
+     * 上一版这里无条件写「没法合并,请手工取用」—— 加法补录落地之后那句话就是假的,
+     * 而它印在用户按下 y **之前**。所以正反两面各钉一条:接缝缺席时不许承诺补录,
+     * 接缝在时不许还说「手工取用」。
+     */
+    const without = rescueLines(plan, false).join('\n')
+    expect(without).toContain('没有拷贝接缝')
+    expect(without).toContain('手工取用')
+    expect(without).not.toContain('会被**补录**')
+    const withSeam = rescueLines(plan, true).join('\n')
+    expect(withSeam).toContain('会被**补录**进集成分支')
+    expect(withSeam).not.toContain('手工取用')
+    expect(withSeam).toContain('目录本身不会被删')
   })
 })
 
 describe('屏幕上说了什么', () => {
-  it('「拿不准」要单独数出来,并给出能照做的命令', async () => {
+  it('「拿不准」要说清会补录、也要说清不会动什么', async () => {
     const p = pool(); await p.init()
     const { branch } = await strandedBranch(p, 'root/09', 'a.ts', 'x\n')
     const plan = await planRescue(depsOf(p), [item({ kind: 'branchOnly', branch, why: '' })])
     const text = rescueLines(plan).join('\n')
     expect(text).toContain('拿不准')
-    expect(text).toContain('git diff')
+    /**
+     * **屏幕说的和代码要做的必须是同一件事。**
+     *
+     * 拿不准那一桶现在会被真的写进集成分支(只写它没有的路径)。上一版把它印成
+     * 「**保留不合**」—— 屏幕说着不动,代码正要动手。所以正反各钉一条。
+     */
+    expect(text).toContain('不整条合并')
+    expect(text).toContain('覆盖不了任何已有内容')
+    expect(text).not.toContain('保留不合')
+  })
+
+  /**
+   * **`skip` 和「拿不准」的归宿不同,屏幕上就必须是两句话。**
+   *
+   * `skip` 到此为止:不补录、也不落痕(让 `b` 去重做一个有理由被排除的废稿是纯破坏)。
+   * 而「到此为止」这件事必须说出来,并给出推翻它的命令 —— 混在一句「保留不合」里,
+   * 用户读到的是「先放着」,实际是「永远放着」。
+   */
+  it('判定不合的那些要说「到此为止」,并给出自己动手的命令', async () => {
+    const p = pool(); await p.init()
+    const { branch } = await strandedBranch(p, 'root/09s', 'a.ts', 'x\n')
+    const plan = await planRescue(
+      depsOf(p, { triage: async ev => ev.map(e => ({ ref: e.ref, verdict: 'skip' as const, why: '已被取代' })) }),
+      [item({ kind: 'branchOnly', branch, why: '' })],
+    )
+    const text = rescueLines(plan).join('\n')
+    expect(text).toContain('到此为止')
+    expect(text).toContain(`git merge ${branch}`)
+    expect(plan.backfill).toEqual([])
   })
 
   it('要合的那一段必须说「分支照样保留」', async () => {

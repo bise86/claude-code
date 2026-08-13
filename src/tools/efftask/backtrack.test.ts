@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import {
   backtrackLines, backtrackScope, composeRedos, levelFor, markBacktracked, outputMissing,
-  NO_CONTRIBUTION_NOTE, type BacktrackTarget,
+  NO_CONTRIBUTION_NOTE, RESCUE_STRANDED_NOTE, strandedRefsOf, type BacktrackTarget,
 } from './backtrack.js'
 import { parseNodeFile, serializeNode } from './persistence.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
@@ -323,5 +323,134 @@ describe('确认屏 · 没有隔离工作区时', () => {
   /** 不传 = 当成有隔离(既有调用点的语义不变)。 */
   it('缺省当成有隔离', () => {
     expect(backtrackLines(targets(), entries).join('\n')).toContain('隔离工作区会被删掉')
+  })
+})
+
+/**
+ * **第三格:`m` 三级都试过、还是没捞回来的产出。**
+ *
+ * 用户 2026-08-13:「如果实在捞不回来,会在回溯里检查不。」此前这一段是**断的** ——
+ * `m` 判 hold 是一条 ref 的事,而这里认的是节点级信号,中间没有任何东西。
+ */
+describe('捞不回来的产出要能被 b 认领', () => {
+  const stranded = (id: string, over: Partial<TaskNode> = {}): TaskNode => mk(id, {
+    status: 'ACCEPTED',
+    // 执行型 —— 只有它才有执行环节可重跑(unknown / decompose 那两格 planRedo 判 disabled)。
+    kind: 'executable',
+    execStatus: `做完了\n${RESCUE_STRANDED_NOTE}(${NOW}:efftask/1/salvage/ab12cd34,还差 2 处)`,
+    rescueStranded: [{ ref: 'efftask/1/salvage/ab12cd34', why: '两边都有而内容不同', at: NOW, remaining: 2 }],
+    ...over,
+  })
+
+  it('叶子节点上的痕迹会被收进回溯范围,并且带着能注入的理由', () => {
+    const nodes = [mk('root', { childIds: ['root/00-a'], status: 'WAITING_CHILDREN' }), stranded('root/00-a', { parentId: 'root' })]
+    const { targets } = backtrackScope(nodes, 'root')
+    expect(targets.map(t => t.node.id)).toEqual(['root/00-a'])
+    /**
+     * **注入的话不许说「集成验收没通过」** —— 这一格根本没有集成验收意见。
+     * 送一句假前提给执行者,正是这个仓库记过的那类事故。
+     */
+    expect(targets[0]!.blocking).toContain('没能全部捞回集成分支')
+    expect(targets[0]!.blocking).toContain('efftask/1/salvage/ab12cd34')
+    expect(targets[0]!.blocking).not.toContain('集成验收')
+  })
+
+  /**
+   * **拆分型节点上的痕迹不立 target。**
+   *
+   * 立了的话:它子树全绿 → suspects 为空 → 回溯它自己 → `planRedo(execute)` 对拆分任务
+   * 判 disabled → `composeRedos` 一错**整条不做** → 连真正集成验收没过的节点一起,
+   * 一个都不重跑。一条挂错地方的 ref 能让整次回溯变成空操作。
+   */
+  it('拆分型节点上的痕迹不立 target,而且不会拖垮同一次回溯里的别人', () => {
+    const nodes = [
+      mk('root', {
+        childIds: ['root/00-a'], status: 'WAITING_CHILDREN', kind: 'decompose',
+        execStatus: `${RESCUE_STRANDED_NOTE}(${NOW}:efftask/1/salvage/zz,还差 1 处)`,
+      }),
+      mk('root/00-a', { parentId: 'root', status: 'BLOCKED', acceptLog: [integrateFail()] }),
+    ]
+    const { targets } = backtrackScope(nodes, 'root')
+    expect(targets.map(t => t.node.id)).toEqual(['root/00-a'])
+  })
+
+  /**
+   * **还没有方案的节点(kind: unknown)也不许立 target。**
+   *
+   * 第一版判据写的是 `kind !== 'decompose'`,而 `planRedo(execute)` 对 unknown 同样判
+   * disabled(「本节点还没有方案」)—— 后果和拆分型一模一样:`composeRedos` 一错整条不做。
+   */
+  it('还没有方案的节点不立 target', () => {
+    const nodes = [
+      mk('root', { childIds: ['root/00-a'], status: 'WAITING_CHILDREN', kind: 'decompose' }),
+      stranded('root/00-a', { parentId: 'root', kind: 'unknown' }),
+    ]
+    expect(backtrackScope(nodes, 'root').targets).toEqual([])
+  })
+
+  /**
+   * **只因为捞不回来进来的,恒走第 1 级。**
+   *
+   * `levelFor` 读的是终身回溯计数 —— 一个此前因为别的原因回溯过一次的节点,这次只是
+   * 有条 ref 没捞回,却会直接跳到「完全重做 + 删整片子树」。用户定的阶梯是
+   * 「优先重新执行……如果不行,才完全重做」,而「不行」说的是这件事试过一遍。
+   */
+  it('捞不回来这一格不吃终身回溯计数,恒走第 1 级', () => {
+    const n = stranded('root', { backtrack: { rounds: 3, at: NOW } })
+    expect(levelFor(n)).toBe(2)
+    expect(backtrackScope([n], 'root').targets[0]!.level).toBe(1)
+  })
+
+  /** 集成验收也没过的话,阶梯照常升级 —— 上面那条不能把正常的升级一起关掉。 */
+  it('同时还有集成验收没过时,阶梯照常升级', () => {
+    const n = stranded('root', { backtrack: { rounds: 1, at: NOW }, status: 'BLOCKED', acceptLog: [integrateFail()] })
+    expect(backtrackScope([n], 'root').targets[0]!.level).toBe(2)
+  })
+
+  /**
+   * **痕迹要被这一次回溯消费掉。**
+   *
+   * `planRedo` 是 structuredClone、`resetForExecute` 只追加不清空 —— 不清的话这个节点
+   * 从此每次按 `b` 都被判进来,永远重跑。
+   */
+  it('回溯落地时把痕迹和载荷一起清掉', () => {
+    const n = stranded('root')
+    const plan = composeRedos([n], [{ nodeId: 'root', entry: 'execute' }], NOW)
+    expect('error' in plan).toBe(false)
+    if ('error' in plan) return
+    markBacktracked(plan, backtrackScope([n], 'root').targets, NOW)
+    const after = plan.nodes.find(x => x.id === 'root')!
+    expect(after.execStatus).not.toContain(RESCUE_STRANDED_NOTE)
+    expect(after.rescueStranded).toBeUndefined()
+    // 清掉之后就不该再被认领 —— 否则「永远重跑」只是换了个地方发生。
+    expect(backtrackScope([after], 'root').targets).toEqual([])
+  })
+
+  /** 载荷被写坏时只丢明细,不许把恢复链路带崩、也不许让判据失灵。 */
+  it('载荷写坏了照样认领,只是没有明细', () => {
+    const n = stranded('root')
+    ;(n as unknown as { rescueStranded: unknown }).rescueStranded = 'boom'
+    expect(strandedRefsOf(n)).toEqual([])
+    const { targets } = backtrackScope([n], 'root')
+    expect(targets).toHaveLength(1)
+    expect(targets[0]!.blocking).toContain('明细已经不在节点上了')
+  })
+
+  it('屏幕上要把这一类和「集成验收没通过」分开说', () => {
+    const nodes = [stranded('root')]
+    const text = backtrackLines(backtrackScope(nodes, 'root').targets, [{ nodeId: 'root', entry: 'execute' }]).join('\n')
+    expect(text).toContain('产出没能捞回来')
+    expect(text).toContain('efftask/1/salvage/ab12cd34')
+    // 那条分支照样留着 —— 「捞是加法,不删任何东西」这条铁律要在屏幕上兑现。
+    expect(text).toContain('照样留着')
+  })
+
+  /** 顶层字段必须能落盘、能读回 —— 只写不读的字段在第一次 --resume 时清零,这个仓库付过三次账。 */
+  it('痕迹和载荷都能被 --resume 读回来', () => {
+    const n = stranded('root')
+    const back = parseNodeFile(serializeNode(n))
+    expect(back?.execStatus).toContain(RESCUE_STRANDED_NOTE)
+    expect(strandedRefsOf(back!)).toHaveLength(1)
+    expect(strandedRefsOf(back!)[0]!.remaining).toBe(2)
   })
 })

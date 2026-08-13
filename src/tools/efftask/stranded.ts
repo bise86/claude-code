@@ -1,4 +1,4 @@
-import { worktreeSlug } from './worktreeId.js'
+import { worktreeBranch, worktreeSlug } from './worktreeId.js'
 // 「产出丢了」和「集成验收没通过」这两条判据和回溯那一侧**共用一份**。
 // 验收实测过分家的后果:本轮把零贡献节点从 ACCEPTED 改成 BLOCKED 之后,这边那份
 // 硬编码副本(只认 ACCEPTED + 字面量)一件都扫不到,而同一个节点在回溯那边判 true。
@@ -57,9 +57,16 @@ export const STRANDED_KINDS = {
     how: 'acquire 复用目录 / 重做时 discard —— 都会先把当时的产出存成一条 salvage ref',
   },
   salvageOrphan: {
-    label: '抢救出来的提交,而对应的任务已经不在树上',
+    label: '孤立的分支,而对应的任务已经不在树上',
     action: 'report',
-    how: '重做删掉过子树,或回溯改写过树 —— 而 slug 是单向哈希,认不回是谁的',
+    /**
+     * 两条来路:抢救 ref,以及**没人认领的工作树分支**(后者此前一格都没有 —— 回溯/重做
+     * 删过子树而 `release()` 没跑到时,那条分支对每一个扫描器都是隐形的)。
+     *
+     * slug 是单向哈希,但**提交信息里有节点 id 明文**:认得回「它是谁的」,
+     * 只是认不回**节点对象**(树上已经没有了),所以回溯仍然落不了痕。
+     */
+    how: '重做删掉过子树,或回溯改写过树 —— 节点对象没了,但提交信息里还留着它的 id',
   },
   branchOnly: {
     label: '只剩分支,工作区目录已经不在',
@@ -356,7 +363,43 @@ export async function scanStranded(
        */
       const tail = ref.split('/').pop() ?? ''
       const slug = tail.replace(/-\d+$/, '')
-      const owner = bySlug.get(slug)
+      let owner = bySlug.get(slug)
+      /**
+       * **slug 单向,而提交信息不是。**
+       *
+       * 上一版到这里就收手了,并且在注释里把「认不回来」写成了定局(「slug 是
+       * `sha256(nodeId)[:8]`,单向」)。规范席指出那是个**代码里就是假的**前提:
+       * 打抢救提交的那两处把**节点 id 明文写进了提交信息**(`efftask: 固化工作区残留 (<id>)`)。
+       * 一条 `git log --format=%s` 就能认回来,而且认回来之后**再用 slug 正向校验一次** ——
+       * 零猜测,认错主比认不回主更坏(`b` 会去重跑一个和它无关的任务)。
+       *
+       * 认回主的差别不是渲染:`salvageOrphan` 落不到任何节点上,于是它捞不回来时
+       * 回溯认不了、只能让用户自己处置。
+       */
+      let hintedId: string | undefined
+      if (owner === undefined) {
+        const subj = await deps.git(['log', '--format=%s', '-n', '20', ref], deps.gitRoot)
+        if (subj.code === 0) {
+          for (const line of subj.stdout.split('\n')) {
+            const m = /\(([^()]+)\)\s*$/.exec(line.trim())
+            const id = m?.[1]
+            if (id === undefined || id.length === 0) continue
+            const cand = nodes.find(n => n.id === id)
+            // 节点还在树上 → 正向校验 slug 之后认主(这一格 `bySlug` 没命中才会走到)。
+            if (cand !== undefined) {
+              if (worktreeSlug(deps.runId, cand.id) === slug) { owner = cand; break }
+              continue
+            }
+            /**
+             * 节点**已经不在树上**了 —— 这才是这条路真正的常态(重做/回溯删过子树)。
+             * 认不回**节点对象**,但认得回**它是谁**:回溯仍然认领不了它(没有节点可落),
+             * 而屏幕上从「`efftask/…/salvage/ab12cd34` 捞不回来」变成「`root/05-gone` 的
+             * 那一版产出捞不回来」—— 用户唯一能据以动手的东西。
+             */
+            hintedId ??= id
+          }
+        }
+      }
       /**
        * **来历要算出来,不能写死。**
        *
@@ -366,9 +409,21 @@ export async function scanStranded(
        * 反过来的假事实(「还没有别的版本合入」)交给了分诊模型。
        * 真 git 上跑出来的结果:废稿被合进了集成分支,盖在已修好的实现上。
        */
+      /**
+       * **被回溯过 ≠ 已经被取代。**
+       *
+       * 上一版把 `backtrack !== undefined` 也算成 `superseded`,而规范席顺着这条线找出一个
+       * 自噬回路:捞不回来 → 落痕 → 用户按 `b` → 节点被打上 `backtrack` → **下一次按 `m`,
+       * 这个节点全部抢救 ref 变成「废稿」** → 分诊按「已被取代」处理 → 大概率 `skip` → 出局。
+       * 而如果那次重执行又没产出(那正是它进回溯的原因),这条 ref 就是唯一的副本。
+       *
+       * 判据收紧到只认 `contributed`:那是「确实有另一版进了集成分支」的硬证据。
+       * 「被回溯过」是真的、也有用,但它说的是「有人在重做它,**不知道成没成**」——
+       * 那是 `still-open`,而且要把这句话如实带给分诊。
+       */
       const fate: 'superseded' | 'still-open' | 'unknown' = owner === undefined
         ? 'unknown'
-        : (owner.contributed === true || owner.backtrack !== undefined) ? 'superseded' : 'still-open'
+        : owner.contributed === true ? 'superseded' : 'still-open'
       items.push(owner
         ? {
           kind: 'salvage', nodeId: owner.id, title: owner.title, branch: ref, fate,
@@ -380,8 +435,42 @@ export async function scanStranded(
           kind: 'salvageOrphan', branch: ref, fate,
           ...(ahead === undefined ? {} : { commits: ahead }),
           ...(state === 'unknown' ? { unknown: true } : {}),
-          why: '抢救出来的提交,但对应的任务已经不在树上了(重做或回溯改写过树)',
+          why: hintedId === undefined
+            ? '抢救出来的提交,但对应的任务已经不在树上了(重做或回溯改写过树)'
+            : `抢救出来的提交,它属于「${hintedId}」—— 那个任务已经不在树上了(重做或回溯改写过树)`,
         })
+    }
+  }
+
+  /**
+   * ── 树上已经没有的节点留下的**工作树分支** ────────────────────────
+   *
+   * 上面那一整段 `branchOnly` 是 `for (const n of nodes)` 驱动的:**只对现存节点**
+   * 问一句「你的分支还在吗」。而回溯/重做的第 2 级会连盘上的节点目录一起删掉子树,
+   * 分支删不删要看 `release()` 有没有跑到 —— 抢救 ref 有 `salvageOrphan` 那一格兜底,
+   * **工作树分支一格都没有**。规范席点名:一份自称「最大努力」的清单漏掉了一整条通道。
+   *
+   * 判据只有一条:名字对得上这个 run 的工作树分支前缀,而**没有任何现存节点认领它**。
+   */
+  const wtRefs = await deps.git(
+    ['for-each-ref', '--format=%(refname:short)', `refs/heads/${worktreeBranch(`efftask-${deps.runId}-`)}*`],
+    deps.gitRoot,
+  )
+  if (wtRefs.code !== 0) {
+    problems.push(`列不出这个 run 的工作树分支(${wtRefs.stderr.trim() || `退出码 ${wtRefs.code}`})—— 这一格这次是空白,不代表没有`)
+  } else {
+    const claimed = new Set(nodes.map(n => deps.branchFor(n)).filter((b): b is string => typeof b === 'string'))
+    for (const ref of wtRefs.stdout.split('\n').map(s => s.trim()).filter(Boolean)) {
+      if (claimed.has(ref)) continue
+      const state = await containedIn(deps, ref)
+      if (state === 'yes') continue
+      const ahead = await aheadOf(deps, ref)
+      items.push({
+        kind: 'salvageOrphan', branch: ref, fate: 'unknown',
+        ...(ahead === undefined ? {} : { commits: ahead }),
+        ...(state === 'unknown' ? { unknown: true } : {}),
+        why: '一条工作树分支,而树上已经没有认领它的任务了(重做或回溯删过子树)',
+      })
     }
   }
 

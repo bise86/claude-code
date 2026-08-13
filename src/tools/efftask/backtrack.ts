@@ -86,6 +86,44 @@ export function lastIntegrateFailed(n: TaskNode): boolean {
 export const NO_CONTRIBUTION_NOTE = '没有向集成分支贡献任何改动'
 /** 阻断原因里那句话的抬头 —— 让阻断和 execStatus 上的注记能被同一条判据认出来。 */
 export const NO_CONTRIBUTION_LEAD = '该节点'
+/**
+ * **`m` 键三级都试过、仍然没捞回来的产出。**
+ *
+ * 用户 2026-08-13:「按 m 键触发,没有捞回的数据任务……如果实在捞不回来,会在回溯里检查不。」
+ * 此前这一段是**断的**:`m` 判 hold / 补录不全是**一条 ref** 的事,而回溯认的是
+ * `lastIntegrateFailed` / `outputMissing` 两条**节点级**信号 —— 一条捞不回来的 ref
+ * 在节点上不留任何痕迹,`b` 扫不到它,它只活在那一屏的文字里,用户看完就走了。
+ *
+ * **注记做判据,字段做载荷**(和 `outputMissing` 同一个形状):`execStatus` 上这句话决定
+ * `b` 认不认领,`node.rescueStranded` 只带明细。反过来做的话,字段在任何一次序列化事故里
+ * 丢掉,`b` 就静默地扫不到 —— 而这个仓库为「只写不读的字段第一次 `--resume` 时清零」
+ * 付过三次账。
+ */
+export const RESCUE_STRANDED_NOTE = '有产出没能捞回集成分支'
+export function rescueStranded(n: TaskNode): boolean {
+  return n.execStatus.includes(RESCUE_STRANDED_NOTE) || n.blockedReason.includes(RESCUE_STRANDED_NOTE)
+}
+
+/**
+ * 载荷,**读出来一律校验**。
+ *
+ * `validateLoadedNodes` 不认识这个字段,一个手改坏的 node.md 上 `rescueStranded: boom`
+ * 会让 `.map` 当场抛在恢复链路里。这个仓库为「读侧不校验」逐字写过判决:不抛、不修复、
+ * 纯造谣 —— 所以这里只认数组里长得对的那些,别的当没有。
+ */
+export function strandedRefsOf(n: TaskNode): { ref: string; why: string; at: string; remaining: number }[] {
+  const raw: unknown = n.rescueStranded
+  if (!Array.isArray(raw)) return []
+  return raw.filter((x): x is { ref: string; why: string; at: string; remaining: number } =>
+    typeof x === 'object' && x !== null && typeof (x as { ref?: unknown }).ref === 'string')
+    .map(x => ({
+      ref: x.ref,
+      why: typeof x.why === 'string' ? x.why : '',
+      at: typeof x.at === 'string' ? x.at : '',
+      remaining: typeof x.remaining === 'number' ? x.remaining : 0,
+    }))
+}
+
 export function outputMissing(n: TaskNode): boolean {
   if (!n.execStatus.includes(NO_CONTRIBUTION_NOTE) && !n.blockedReason.includes(NO_CONTRIBUTION_NOTE)) return false
   // 还在跑的不算 —— 它本来就还没轮到贡献。
@@ -124,7 +162,25 @@ export function backtrackScope(
   for (const n of scope) {
     const failed = lastIntegrateFailed(n)
     const missing = outputMissing(n)
-    if (!failed && !missing) continue
+    /**
+     * **第三条判据不和前两条同权。**
+     *
+     * 接缝席在真调用链上推过一条会把整次回溯变成空操作的路:一条没捞回的 ref 恰好挂在
+     * **拆分型节点**上 → 它的子树全绿 → `suspects` 为空 → `runBacktrack` 退回「回溯它自己」
+     * → `planRedo(entry:'execute')` 对拆分任务判 disabled → `composeRedos` 一错**整条不做**
+     * → 连那些真正集成验收没通过的节点**一起,一个都不重跑**。
+     *
+     * 所以只对**真的有执行环节**的节点立 target。拆分型节点上的 ref 不是没人管:
+     * 它的痕迹照样在 `execStatus` 上、照样在 `m` 的结果屏上,只是不由这个键动手 ——
+     * 让 `b` 去重跑一个自己不干活的节点,除了删掉它健康的子树之外什么都不会发生。
+     *
+     * 判据是 `kind === 'executable'`,**不是** `!== 'decompose'`:第一版写成后者,
+     * 而夹具当场把它顶红了 —— `unknown` 那一格 `planRedo` 同样判 disabled
+     * (「本节点还没有方案,分析之后才知道它是拆分还是执行」),后果和拆分型一模一样。
+     * 这个仓库两天前刚为「`!== 'worktree'` 把 `undefined` 判成反面」付过一次账。
+     */
+    const stranded = rescueStranded(n) && n.childIds.length === 0 && n.kind === 'executable'
+    if (!failed && !missing && !stranded) continue
     const rec = failed ? lastIntegrateRecord(n) : undefined
     const remedy: string[] = []
     for (const v of rec?.verdicts ?? []) {
@@ -132,8 +188,16 @@ export function backtrackScope(
     }
     targets.push({
       node: n,
-      level: levelFor(n),
-      blocking: rec?.synthesized.blockingSummary ?? (missing ? '这个任务判了通过,而集成分支上一个字节都没多 —— 产出不在任何地方' : ''),
+      /**
+       * **只因为「捞不回」进来的,恒走第 1 级。**
+       *
+       * `levelFor` 读的是这个节点的**终身**回溯计数 —— 一个此前因为别的原因被回溯过一次的
+       * 节点,这次只是有条 ref 没捞回来,却会直接跳到第 2 级:重新分析并拆分 + **删掉整片
+       * 子树**。用户定的阶梯是「优先重新执行……**如果不行**,才完全重做」,而「不行」的判据
+       * 是这件事试过一遍,不是这个节点这辈子被回溯过几次。
+       */
+      level: !failed && !missing ? 1 : levelFor(n),
+      blocking: rec?.synthesized.blockingSummary ?? whyWithoutVerdict(n, missing, stranded),
       remedy,
       /**
        * 保守名单:**没验收通过的子任务** + **产出丢了的子任务**。
@@ -148,6 +212,24 @@ export function backtrackScope(
     })
   }
   return { target, targets }
+}
+
+/**
+ * 没有集成验收记录时,这个节点为什么被点进来 —— **一句能直接注入执行提示词的话**。
+ *
+ * 这三格里只有第一格有「意见」可用,而屏幕和送给模型的提示词都无条件写着
+ * 「集成验收没通过,它给的意见:」。对另外两格那是**假前提**(规范席点名:这件事今天
+ * 对 `outputMissing` 那一格就已经在发生),所以这里给的是那一格自己的真实理由。
+ */
+function whyWithoutVerdict(n: TaskNode, missing: boolean, stranded: boolean): string {
+  if (missing) return '这个任务判了通过,而集成分支上一个字节都没多 —— 产出不在任何地方,只能重新生成'
+  if (!stranded) return ''
+  const refs = strandedRefsOf(n).slice(0, 3)
+  const detail = refs.length > 0
+    ? refs.map(r => `${r.ref}(还差 ${r.remaining} 处:${r.why})`).join(';')
+    : '(明细已经不在节点上了)'
+  return `这个任务此前某一版的产出躺在孤立的分支上,合并、加法补录都试过了,仍然没能全部捞回集成分支:${detail}。`
+    + '这一次要把那些内容重新做出来 —— 不要去合那条分支,它已经试过了。'
 }
 
 function lastIntegrateRecord(n: TaskNode): TaskNode['acceptLog'][number] | undefined {
@@ -253,6 +335,18 @@ export function markBacktracked(
     const n = plan.nodes.find(x => x.id === t.node.id)
     if (!n) continue
     n.backtrack = { rounds: (n.backtrack?.rounds ?? 0) + 1, at: now }
+    /**
+     * **痕迹在这里被消费掉。**
+     *
+     * `planRedo` 是 `structuredClone`,`resetForExecute` 只往 `execStatus` **追加**一句
+     * REDO 注记、不清空 —— 不清的话这个节点从此每次按 `b` 都被判进来,永远重跑。
+     * 清的是**判据**(注记)和载荷两样:载荷留着而判据没了,下一次 `m` 又捞不回来时
+     * 会重新写一份完整的。
+     */
+    if (n.execStatus.includes(RESCUE_STRANDED_NOTE)) {
+      n.execStatus = n.execStatus.split('\n').filter(l => !l.includes(RESCUE_STRANDED_NOTE)).join('\n')
+    }
+    delete n.rescueStranded
     if (t.level === 2 && n.revised === true) {
       n.revised = false
       rearmed.push(n.id)
@@ -279,8 +373,21 @@ export function backtrackLines(
 ): string[] {
   const out: string[] = []
   if (targets.length === 0) {
-    out.push('这棵子树里没有需要回溯的任务:集成验收都通过了,产出也都在集成分支上。')
+    out.push('这棵子树里没有需要回溯的任务:集成验收都通过了,产出也都在集成分支上,`m` 也没有留下捞不回来的东西。')
     return out
+  }
+  /**
+   * **「为什么重跑」这件事要分开说。** 三格的成因完全不同,而下游动作一样(重跑执行阶段),
+   * 于是很容易混成一句「集成验收没通过」—— 那对另外两格是假话,而用户正是据此决定按不按。
+   */
+  const stranded = targets.filter(t => rescueStranded(t.node))
+  if (stranded.length > 0) {
+    out.push(`其中 ${stranded.length} 个是因为**产出没能捞回来**(m 键已经把合并和加法补录都试过了):`)
+    for (const t of stranded) {
+      const refs = strandedRefsOf(t.node).map(r => r.ref).slice(0, 2).join('、')
+      out.push(`  · ${t.node.title}${refs ? `(${refs})` : ''} —— 这一次要把那些内容重新做出来`)
+    }
+    out.push('  它们原来的分支**照样留着**,一个字节都不会删;重跑不是去合那条分支,是重新生成。')
   }
   const lvl1 = targets.filter(t => t.level === 1)
   const lvl2 = targets.filter(t => t.level === 2)

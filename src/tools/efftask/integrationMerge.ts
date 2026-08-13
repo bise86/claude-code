@@ -77,8 +77,8 @@ const DEFAULT_ROUNDS = DEFAULT_TRUNK_RESOLVE
  * 「`reset --hard` + `clean -fd`」—— 上一趟可能把它留在半合并态或者留了一地散落文件。
  * 这棵树是我们自己的、没有第二个读者,所以在这里 `clean -fd` 不会误伤任何人。
  */
-async function stageAt(
-  deps: IntegrationMergeDeps, path: string, tip: string,
+export async function stageAt(
+  deps: Pick<IntegrationMergeDeps, 'git' | 'gitRoot'>, path: string, tip: string,
 ): Promise<{ ok: true } | { ok: false; why: string }> {
   const there = await deps.git(['rev-parse', '--git-dir'], path)
   if (there.code !== 0) {
@@ -106,6 +106,21 @@ async function stageAt(
    */
   const inMerge = await deps.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], path)
   if (inMerge.code === 0) await deps.git(['merge', '--abort'], path)
+  /**
+   * **先脱离分支,再 `reset --hard`。**
+   *
+   * 这棵树按设计永远是 detached(`worktree add --detach`),而「按设计」在这里不够:
+   * 数据安全席在真 git 上复现过一条把它推上分支的路 —— `git checkout <ref> --` 在
+   * pathspec **为空**时不是空操作,是**切分支**。一旦 HEAD 停在某条抢救分支上,
+   * 下一趟进来的这句 `reset --hard <集成分支 tip>` 就会把**那条分支**挪到集成分支上,
+   * 而 `rescue.ts` 的铁律正是「成功不删分支 —— 这条 ref 是那一版产出唯一的落脚点」。
+   * 实测结果:分支指向 tip,那一版产出只剩悬垂对象,等 gc。
+   *
+   * 空 pathspec 那条路已经在 `backfill.ts` 里堵死了,但闸要留两道:这一句是**最后一道**,
+   * 而且它不改任何文件(只把 HEAD 从符号引用换成 sha),对正常那条路是零成本。
+   */
+  const onBranch = await deps.git(['symbolic-ref', '-q', 'HEAD'], path)
+  if (onBranch.code === 0) await deps.git(['checkout', '--detach'], path)
   const reset = await deps.git(['reset', '--hard', tip], path)
   if (reset.code !== 0) return { ok: false, why: `临时合并工作区对不齐集成分支: ${reset.stderr.trim()}` }
   await deps.git(['clean', '-fd'], path)

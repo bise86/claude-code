@@ -388,3 +388,57 @@ describe('产出丢了:两种形态都要认', () => {
     expect(kinds(r)).not.toContain('missing')
   })
 })
+
+/**
+ * **认不回主的那些,至少要认得回它是谁的。**
+ *
+ * 规范席点名:上一版把「认不回来」写成了定局(「slug 是 sha256,单向」),而那是个
+ * **代码里就是假的**前提 —— 打抢救提交的两处把节点 id 明文写进了提交信息。
+ * 回溯仍然认领不了它(没有节点对象可落痕),但屏幕上从一串 slug 变成了任务 id,
+ * 而那是用户唯一能据以动手的东西。
+ */
+describe('抢救分支的来历', () => {
+  it('任务已经不在树上时,从提交信息里认回它是谁的', async () => {
+    const p = pool(); await p.init()
+    const gone = node('root/07-gone', { status: 'ACCEPTED' })
+    const l = await p.acquire(gone) as { path: string }
+    await writeFile(join(l.path, 'v1.ts'), 'first\n')
+    await p.discard(gone)
+
+    const r = await scanStranded(depsOf(p), [node('root', { status: 'ACCEPTED' })])
+    const item = r.items.find(i => i.kind === 'salvageOrphan')!
+    expect(item.why).toContain('root/07-gone')
+    // 认得回是谁的 ≠ 有节点可落痕 —— 这一格仍然是 orphan,不许假装有主。
+    expect(item.nodeId).toBeUndefined()
+  })
+
+  /**
+   * **被回溯过 ≠ 已经被取代。**
+   *
+   * 这条判据上一版还认 `backtrack`,于是有一个自噬回路:捞不回来 → 落痕 → 按 b →
+   * 节点被打上 backtrack → 下一次按 m,它全部抢救 ref 变成「废稿」→ 分诊大概率 skip →
+   * 出局。而那次重执行如果又没产出(那正是它进回溯的原因),这条 ref 就是唯一的副本。
+   */
+  it('只被回溯过的节点,它的抢救分支不算废稿', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/08', { status: 'ACCEPTED', backtrack: { rounds: 1, at: '2026-08-13T00:00:00Z' } })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'v1.ts'), 'first\n')
+    await p.discard(n)
+
+    const r = await scanStranded(depsOf(p), [n])
+    expect(r.items.find(i => i.kind === 'salvage')!.fate).toBe('still-open')
+  })
+
+  /** 真的有另一版进了集成分支,那才是废稿 —— 这一条不能被上面那条一起关掉。 */
+  it('真的贡献过别的版本时,抢救分支算废稿', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/09', { status: 'ACCEPTED', contributed: true })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'v1.ts'), 'first\n')
+    await p.discard(n)
+
+    const r = await scanStranded(depsOf(p), [n])
+    expect(r.items.find(i => i.kind === 'salvage')!.fate).toBe('superseded')
+  })
+})

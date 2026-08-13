@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { Box, Text, useInput } from '../../ink.js'
-import { access, appendFile, mkdir, readFile, readdir, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises'
+import { access, appendFile, copyFile, mkdir, readFile, readdir, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -1861,6 +1861,19 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       exists: p => access(p).then(() => true, () => false),
       listFiles: listFilesUnder,
       /**
+       * 孤儿目录的加法补录靠这条缝把文件拷进临时合并工作树。
+       *
+       * **不给这一行,那一格就静默退回「只列不捞」** —— 四类里它是此前唯一 0% 捞回的一格,
+       * 而用户点名「这个必须要捞回」。接缝席把这条列成三个必须一起改的注入点之一,
+       * 少一处就是这个仓库的招牌断线:声明了、实现了、测过了,生产上没有人调用。
+       *
+       * `recursive: true` 是必须的:补录的路径可能落在集成分支上还不存在的目录里。
+       */
+      copyInto: async (from, to) => {
+        await mkdir(dirname(to), { recursive: true })
+        await copyFile(from, to)
+      },
+      /**
        * 分诊:那条孤立的 ref 该不该合。**用的是同一个主模型接缝**,而它只圈范围、
        * 不下判决(见 rescue.ts)—— 拿不准一律不合,而且要说出来。
        */
@@ -2614,7 +2627,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
               }
             } catch { /* 回收失败不该影响这次合并的结论 */ }
           }
-          const heldBack = (out.rescue?.hold.length ?? 0) + out.failed.length
+          /**
+           * `stranded` 也算扣押:那是三级都试过、由 git 量出来「还差 N 处」的那些。
+           * 漏掉它的后果和当初漏掉 `hold` 一样 —— 记录被抹掉、下次 `--resume` 不再弹关口,
+           * 而那些内容确实还没进用户的分支。
+           */
+          const heldBack = (out.rescue?.hold.length ?? 0) + out.failed.length + (out.stranded?.length ?? 0)
           if (out.trunk?.ok === true && heldBack === 0) {
             setHandoffState('merged')
             props.handoffStateOut.current = 'merged'

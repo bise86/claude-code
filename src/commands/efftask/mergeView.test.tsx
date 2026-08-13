@@ -181,7 +181,16 @@ describe('合并关口', () => {
     expect(frame).toContain('未提交内容会被一并提交')
     expect(frame).toContain('主模型')
     expect(frame).toContain('main')
-    expect(frame).toContain('任务状态不会被改动')
+    /**
+     * **它承诺的是「不改判决」,而不是「什么都不写」。**
+     *
+     * 上一版这一屏印的是「任务状态不会被改动」,而 `m` 早就会往 node.md 上写手动合并的
+     * 注记,现在还会写「有产出没能捞回来」的痕迹(它决定按 `b` 之后对这些节点做什么)。
+     * 这句话印在用户按下 y **之前**,所以正反两面都要钉:承诺要在,而那句更大的
+     * 承诺不许回来。
+     */
+    expect(frame).toContain('不会改动任何判决')
+    expect(frame).not.toContain('任务状态不会被改动')
     // 还在跑的那个必须说清楚是「跳过」,不是被算进了这次合并。
     expect(frame).toContain('跳过 1 个')
     expect(frame).toContain('确认合并')

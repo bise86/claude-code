@@ -21,6 +21,7 @@ import {
   type SubtreeMergeDeps,
 } from './mergeSubtree.js'
  import { STRANDED_KINDS, STRANDED_KIND_LIST } from './stranded.js'
+import { backtrackScope, rescueStranded, strandedRefsOf } from './backtrack.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
 const git: GitRunner = (args, cwd) =>
@@ -648,7 +649,7 @@ describe('捞回那一批要出现在确认屏上', () => {
     expect(text).toContain('照样保留')
   })
 
-  it('分诊拿不准的只列出来,而且要数出「拿不准」几处', async () => {
+  it('分诊拿不准的要说清会做加法补录,而不是「保留不合」', async () => {
     const pool = newPool()
     await pool.init()
     const a = mk('root/r-2', { title: '乙' })
@@ -659,8 +660,17 @@ describe('捞回那一批要出现在确认屏上', () => {
 
     // 不给 triage —— 全部落「拿不准」。
     const text = subtreeMergeLines(await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)).join('\n')
-    expect(text).toContain('不合')
     expect(text).toContain('拿不准')
+    /**
+     * **屏幕上那句话必须和这一屏之后真正会发生的事一致。**
+     *
+     * 拿不准的现在走第 2 级(只补录集成分支根本没有的路径),所以「保留不合」是假话 ——
+     * 而它印在用户按下 y 之前。反向断言在这里是判据的一半:把第 2 级去掉、退回老措辞,
+     * 这一条要变红。
+     */
+    expect(text).toContain('不整条合并')
+    expect(text).toContain('尽最大努力捞')
+    expect(text).not.toContain('保留不合')
   })
 
   /**
@@ -958,5 +968,99 @@ describe('全部被扣下时,结果屏不许是一句无保留的成功', () => 
       expect(t).toContain(h.item.branch ?? h.item.path ?? h.item.title ?? '')
     }
     expect(t).toContain('一个字节都没丢')
+  })
+})
+
+/**
+ * **第 3 级:三级都试过、还是没捞回来的,要落到节点上让 `b` 认领。**
+ *
+ * 这一段此前是断的:捞不回来是**一条 ref** 的事,而回溯认的是节点级信号 ——
+ * 中间没有任何东西,那几条 ref 只活在这一屏的文字里。
+ */
+describe('捞不回来的要在节点上留痕', () => {
+  const fakeFs = () => {
+    const files = new Map<string, string>()
+    return {
+      files,
+      fs: {
+        readFile: async (p: string) => files.get(p) ?? '',
+        writeFile: async (p: string, d: string) => { files.set(p, d) },
+        mkdir: async () => {},
+        readdir: async () => [],
+        exists: async (p: string) => files.has(p),
+        rm: async () => {},
+        stat: async () => ({ mtimeMs: 0 }),
+      } as never,
+    }
+  }
+
+  /** 造一条「有产出、目录已经没了、而且和集成分支在同一个文件上打架」的孤立分支。 */
+  async function conflicting(pool: WorktreePool, n: TaskNode): Promise<string> {
+    const path = await work(pool, n, 'shared.txt', 'REF SIDE\n')
+    const branch = pool.worktreeBranchOf(n)
+    await rm(path, { recursive: true, force: true })
+    await git(['worktree', 'prune'], gitRoot)
+    // 集成分支上同一个文件写成别的内容 —— 补录判据据此判定「两边都有」,一个都不取。
+    await writeFile(join(pool.integrationPath, 'shared.txt'), 'INTEGRATION SIDE\n')
+    await git(['add', '-A'], pool.integrationPath)
+    await git(['commit', '-qm', 'int side'], pool.integrationPath)
+    return branch
+  }
+
+  it('两边都有而内容不同的 → 补录取不走 → 节点上留痕并落盘', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/s-1', { title: '甲', kind: 'executable' })
+    await conflicting(pool, a)
+    a.worktree = undefined
+    const { files, fs } = fakeFs()
+    const deps = depsOf(pool, { runId: '001', persist: { fs, runDir: '/run' }, now: () => 'T1' })
+    const out = await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [a], a.id), [a])
+
+    expect(out.stranded?.map(s => s.nodeId)).toEqual([a.id])
+    expect(out.stranded?.[0]!.remaining).toBeGreaterThan(0)
+    /**
+     * **注记做判据,字段做载荷。** 判据丢了 `b` 就静默扫不到,所以两样都要,
+     * 而且都要真的写到盘上 —— 只改内存对象的话,`--resume` 之后一切照旧。
+     */
+    expect(rescueStranded(a)).toBe(true)
+    expect(strandedRefsOf(a)).toHaveLength(1)
+    expect([...files.keys()].some(k => k.includes('root/s-1'))).toBe(true)
+    expect([...files.values()].join('\n')).toContain('有产出没能捞回集成分支')
+    // 而且这条链要真的接上:落痕之后 `b` 认得到它。
+    expect(backtrackScope([a], a.id).targets.map(t => t.node.id)).toEqual([a.id])
+  })
+
+  /** 同一条 ref 连按两次 `m` 不许叠出两条 —— 判据是 ref,不是整行(它带时间戳)。 */
+  it('连按两次不会叠出重复的痕迹', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/s-2', { title: '乙', kind: 'executable' })
+    await conflicting(pool, a)
+    a.worktree = undefined
+    const { fs } = fakeFs()
+    const deps = depsOf(pool, { runId: '001', persist: { fs, runDir: '/run' }, now: () => 'T1' })
+    await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [a], a.id), [a])
+    await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [a], a.id), [a])
+    expect(a.execStatus.match(/有产出没能捞回集成分支/g)).toHaveLength(1)
+    expect(strandedRefsOf(a)).toHaveLength(1)
+  })
+
+  /**
+   * **无主的不许假装有主。** 认不回节点的那些落不到任何节点上;把它挂到别人身上
+   * 会让 `b` 去重跑一个和它无关的任务,而不说则是第二个「按 q 之后永久失联」。
+   */
+  it('认不回主的那条:单列出来,不挂到别的节点上', async () => {
+    const pool = newPool()
+    await pool.init()
+    const gone = mk('root/s-gone', { title: '丙', kind: 'executable' })
+    await conflicting(pool, gone)
+    const other = mk('root/s-3', { title: '丁', kind: 'executable' })
+    const { fs } = fakeFs()
+    const deps = depsOf(pool, { runId: '001', persist: { fs, runDir: '/run' }, now: () => 'T1' })
+    // 树里没有那个节点了 —— 重做删掉子树之后的形状。
+    const out = await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [other], other.id), [other])
+    expect(rescueStranded(other)).toBe(false)
+    expect(out.problems.join('\n')).toContain('没有对应的任务')
   })
 })

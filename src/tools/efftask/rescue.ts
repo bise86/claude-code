@@ -1,3 +1,4 @@
+import { backfillFromDir, backfillFromRef, type BackfillSkip, type CopyInto } from './backfill.js'
 import { mergeIntoIntegration, type IntegrationMergeDeps } from './integrationMerge.js'
 import type { StrandedItem } from './stranded.js'
 
@@ -30,6 +31,28 @@ import type { StrandedItem } from './stranded.js'
  *     合错了是把废稿盖到已经修好的代码上);
  *  3. **一个字节都不删** —— 「捞」是往集成分支加东西,不是清理。分支合完照样留着,
  *     孤儿目录合完照样留着,由用户自己处置。
+ *
+ * ## 三级递降 —— 「必须尽最大努力去捞」(用户 2026-08-13 原话)
+ *
+ * 上面第 2 条**原样有效**,而「不合」不等于「不试」。一次分诊、一种手段、失败即止,
+ * 那是一次判决,不是最大努力。所以拆成三级,每一级严格弱于上一级:
+ *
+ * | 级 | 手段 | 谁进这一级 |
+ * |---|---|---|
+ * | 1 | 整条 `git merge`(解冲突模型) | 分诊判 `merge` |
+ * | 2 | **加法补录**:只取「这条 ref 上有、而集成分支上根本没有」的路径(见 `backfill.ts`) | `unsure` 且**不是**被取代的那些;以及第 1 级合失败的 |
+ * | 3 | 在节点上落痕 → `b` 回溯认领 → 重新执行 / 完全重做 | 前两级之后仍有内容没进来的 |
+ *
+ * 第 2 级**不是合并**:它只加集成分支从来没有过的路径,落成单独一笔可 `revert` 的提交,
+ * 那条 ref 也不会被记成已合入。「拿不准一律不合」因此没有被翻面 —— 加进来的东西按 git 的
+ * 复核(`--diff-filter=DMR` 必须为空)覆盖不了任何已有内容。
+ *
+ * **`skip` 不进第 2 级,也不落痕。** `unsure` 是我们没把握,`skip` 是分诊**有理由地**排除
+ * (最典型:这一版被后来的版本取代)。一个被取代的版本里「集成分支上没有」的文件,
+ * 很可能正是后继版本**故意删掉**的那个 —— 补录回去是另一种污染;而让 `b` 去重做一个
+ * 有理由被排除的废稿是纯破坏。同理 `fate === 'superseded'` 的 `unsure` 也不补录。
+ * 但屏幕上必须把这两类**分开说**,并给出推翻这次分诊的命令 —— 混在一句「保留不合」里,
+ * 用户读到的是「先放着」,而实际是「永远放着」。
  *
  * ## 孤儿目录为什么要单独一条路
  *
@@ -99,6 +122,13 @@ export interface RescueDeps {
   resolve?: IntegrationMergeDeps['resolve']
   /** 同一次合并最多让模型解几轮。见 `caps.trunkResolveRounds`。 */
   rounds?: number
+  /**
+   * 孤儿目录补录用的拷贝接缝(纯模块不许自己碰 fs)。
+   *
+   * **不给 = 那一格退回「只列不捞」,并且要在 `problems` 里说出来** —— 四类里
+   * 它是此前唯一 0% 捞回的一格,静默退回等于这条路白写。
+   */
+  copyInto?: CopyInto
   onProgress?: (line: string) => void
   signal?: AbortSignal
 }
@@ -113,7 +143,14 @@ export interface RescueCandidate {
 export interface RescuePlan {
   /** 分诊判「合」的。 */
   merge: RescueCandidate[]
-  /** 分诊判「不合」或「拿不准」的 —— **照样列出来**,附上能照做的 git 命令。 */
+  /**
+   * 第 2 级:**加法补录**。`unsure` 且不是被取代的那些 —— 只取集成分支根本没有的路径。
+   *
+   * 和 `hold` 分开是判据的一部分,不是渲染口味:混在一个桶里的后果是屏幕上写着
+   * 「保留不合」而代码正要往集成分支写东西。
+   */
+  backfill: RescueCandidate[]
+  /** 分诊判「不合」、以及被取代的「拿不准」—— **照样列出来**,附上能照做的 git 命令。 */
   hold: RescueCandidate[]
   /** 孤儿目录里可能有、而集成分支上没有的文件。 */
   orphanFiles: { path: string; files: { rel: string; kind: 'absent' | 'differs' }[] }[]
@@ -216,12 +253,35 @@ export async function planRescue(
     } catch (e) {
       problems.push(`分诊调用没打通(${e instanceof Error ? e.message : String(e)})—— 这一批全部按「拿不准」处理,没有自动合并`)
     }
+    /**
+     * **模型漏说的那几条,单独再问一轮。**
+     *
+     * 一次沉默 = 永久放弃,那不是最大努力。第二轮只带**没被覆盖**的那些(证据一样,
+     * 但清单短得多,而漏说最常见的成因就是清单长)。**最多一轮** —— 再多也只是把
+     * 同样的沉默推迟几分钟。
+     *
+     * 中断要在发之前看:`planRescue` 此前从头到尾没读过 `deps.signal`,于是 Esc 之后
+     * 首轮照发;加一轮就是照发两次。
+     */
+    const covered = new Set(verdicts.map(v => v.ref))
+    const missed = withRef.filter(w => !covered.has(w.evidence.ref))
+    if (missed.length > 0 && missed.length < withRef.length && !deps.signal?.aborted) {
+      deps.onProgress?.(`分诊漏了 ${missed.length} 条,单独再问一轮…`)
+      try {
+        const more = await deps.triage(missed.map(w => w.evidence))
+        // 第二轮只补,不覆盖首轮已经给过的结论。
+        for (const v of more) if (!covered.has(v.ref)) { verdicts.push(v); covered.add(v.ref) }
+      } catch (e) {
+        problems.push(`第二轮分诊也没打通(${e instanceof Error ? e.message : String(e)})—— 漏掉的那 ${missed.length} 条按「拿不准」处理`)
+      }
+    }
   } else if (withRef.length > 0) {
     problems.push('这一趟没有可用的分诊模型 —— 全部按「拿不准」处理,只列出来不自动合并')
   }
   const byRef = new Map(verdicts.map(v => [v.ref, v]))
 
   const merge: RescueCandidate[] = []
+  const backfill: RescueCandidate[] = []
   const hold: RescueCandidate[] = []
   for (const w of withRef) {
     const v = byRef.get(w.evidence.ref)
@@ -233,6 +293,12 @@ export async function planRescue(
     const why = v?.why ?? '分诊没有覆盖这一条'
     const c: RescueCandidate = { item: w.item, evidence: w.evidence, verdict, why }
     if (verdict === 'merge') merge.push(c)
+    /**
+     * **被取代的那一版不补录。** 它「集成分支上没有」的文件,很可能正是后继版本故意
+     * 删掉的那个 —— 和「集成分支删过这条路径」是同一个形状,而那一条在 `backfill.ts`
+     * 里也是不收。这里挡的是同一件事在 ref 这一层的版本。
+     */
+    else if (verdict === 'unsure' && w.evidence.fate !== 'superseded') backfill.push(c)
     else hold.push(c)
   }
 
@@ -247,13 +313,29 @@ export async function planRescue(
     problems.push(...f.problems)
     if (f.files.length > 0) orphanFiles.push({ path: it.path, files: f.files })
   }
+  /**
+   * 接缝缺席**要说**。四类里孤儿目录是此前唯一 0% 捞回的一格,静默退回「只列不捞」
+   * 就是这个仓库的招牌断线:声明了、实现了、测过了,而生产上没有人调用。
+   */
+  if (orphanFiles.some(o => o.files.some(f => f.kind === 'absent')) && !deps.copyInto) {
+    problems.push('孤儿目录里有集成分支缺失的文件,但这一趟没有拷贝接缝 —— 只列出来,没有补录')
+  }
 
-  return { merge, hold, orphanFiles, problems }
+  return { merge, backfill, hold, orphanFiles, problems }
 }
 
 export interface RescueOutcome {
   merged: { ref: string; commits: number; title?: string; resolvedFiles?: string[] }[]
+  /** 第 2 级真的补进集成分支的。`added` 为空也要留一条 —— 「试过了,一个都没得补」是结论。 */
+  backfilled: { ref: string; title?: string; added: string[]; skipped: BackfillSkip[]; nodeId?: string }[]
   failed: { ref: string; why: string }[]
+  /**
+   * **三级都试过、仍然没捞回来的。** 这份清单是第 3 级(落痕 → `b` 回溯)的**唯一**输入。
+   *
+   * 判据是 git 说了算的:补录之后再问一次 `git diff --name-only <集成分支> <ref>`,
+   * 还有内容 = 还有东西没进来。不是「我们放弃了」,是「量出来还差这些」。
+   */
+  stranded: { ref: string; nodeId?: string; title?: string; why: string; remaining: number }[]
   problems: string[]
   aborted: boolean
 }
@@ -294,7 +376,25 @@ const quote = (s: string): string => `\`${s}\``
  * 唯一的落脚点。
  */
 export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<RescueOutcome> {
-  const out: RescueOutcome = { merged: [], failed: [], problems: [...plan.problems], aborted: false }
+  const out: RescueOutcome = {
+    merged: [], backfilled: [], failed: [], stranded: [], problems: [...plan.problems], aborted: false,
+  }
+  /** 这条 ref 相对集成分支还剩多少路径没进来。**捞完之后由 git 重新量**,不靠记账。 */
+  const remainingOf = async (ref: string): Promise<number> => {
+    const d = await deps.git(['diff', '--name-only', '-z', deps.integrationBranch, ref], deps.gitRoot)
+    if (d.code !== 0) return -1
+    return d.stdout.split('\0').map(s => s.trim()).filter(Boolean).length
+  }
+  /** 第 3 级:记一条「三级都试过、还是没回来」。`-1` = 连量都量不出来,那更要说。 */
+  const strand = async (c: RescueCandidate, why: string): Promise<void> => {
+    const remaining = await remainingOf(c.evidence.ref)
+    if (remaining === 0) return
+    out.stranded.push({
+      ref: c.evidence.ref, why, remaining,
+      ...(c.evidence.nodeId ? { nodeId: c.evidence.nodeId } : {}),
+      ...(c.evidence.title ? { title: c.evidence.title } : {}),
+    })
+  }
   for (const c of plan.merge) {
     if (deps.signal?.aborted) { out.aborted = true; break }
     const ref = c.evidence.ref
@@ -341,14 +441,86 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
       )
       break
     }
+    /**
+     * **合不上不等于捞不到。** 一次解不掉的冲突只说明「同一个文件两边都改了」,
+     * 而这条 ref 上那些**集成分支根本没有**的文件和这场冲突毫无关系 —— 它们此前
+     * 跟着整条 ref 一起被放弃了。降到第 2 级。
+     */
+    await descend(deps, out, c, `第 1 级合并没成(${res.why})`)
+  }
+
+  // ── 第 2 级:分诊拿不准的那些 ────────────────────────────────────
+  for (const c of plan.backfill) {
+    if (deps.signal?.aborted) { out.aborted = true; break }
+    await descend(deps, out, c, '分诊拿不准,没有整条合并')
+  }
+
+  // ── 第 2 级:孤儿目录 ───────────────────────────────────────────
+  for (const o of plan.orphanFiles) {
+    if (deps.signal?.aborted) { out.aborted = true; break }
+    const absent = o.files.filter(f => f.kind === 'absent').map(f => f.rel)
+    if (absent.length === 0 || !deps.copyInto) continue
+    const res = await backfillFromDir(
+      deps, o.path, absent, deps.copyInto,
+      `来自自愈时挪走的孤儿工作树目录 ${o.path};只补录集成分支上根本没有的路径。`,
+    )
+    out.backfilled.push({ ref: o.path, added: res.added, skipped: res.skipped })
+    if (!res.ok && res.why !== undefined) out.problems.push(`孤儿目录 ${o.path} 补录没成:${res.why}`)
+  }
+
+  // ── 第 3 级:分诊判「拿不准」而被取代、因此连补录都没做的 ────────
+  for (const c of plan.hold) {
+    // `skip` 是**有理由的排除**,不落痕 —— 让 `b` 去重做一个废稿是纯破坏。
+    if (c.verdict !== 'unsure') continue
+    await strand(c, `分诊拿不准,而这一版已经被后来的版本取代,没有补录:${c.why}`)
   }
   return out
 }
 
-/** 确认屏那几行。**是数据,不是 JSX**。 */
-export function rescueLines(plan: RescuePlan): string[] {
+/**
+ * 降到第 2 级:加法补录,然后**用 git 重新量**还剩多少没进来。
+ *
+ * 补录成功 ≠ 全部捞回:一条 ref 上「两边都有、而内容不同」的文件按判据一个都不会进来
+ * (那正是唯一会覆盖的一格)。所以这里不记「成功」,只记**量出来的差额** —— 差额还在,
+ * 就交给第 3 级。
+ */
+async function descend(
+  deps: RescueDeps, out: RescueOutcome, c: RescueCandidate, why: string,
+): Promise<void> {
+  const ref = c.evidence.ref
+  deps.onProgress?.(`补录 ${ref} 上集成分支缺失的文件…`)
+  const res = await backfillFromRef(deps, ref, provenanceNote(c))
+  out.backfilled.push({
+    ref, added: res.added, skipped: res.skipped,
+    ...(c.evidence.title ? { title: c.evidence.title } : {}),
+    ...(c.evidence.nodeId ? { nodeId: c.evidence.nodeId } : {}),
+  })
+  if (!res.ok && res.why !== undefined) out.problems.push(`${ref} 补录没成:${res.why}`)
+  const d = await deps.git(['diff', '--name-only', '-z', deps.integrationBranch, ref], deps.gitRoot)
+  const remaining = d.code !== 0
+    ? -1
+    : d.stdout.split('\0').map(s => s.trim()).filter(Boolean).length
+  if (remaining === 0) return
+  out.stranded.push({
+    ref, remaining,
+    why: res.added.length > 0
+      ? `${why};补录了 ${res.added.length} 个文件,还有 ${remaining} 处两边都有而内容不同的没能捞回`
+      : why,
+    ...(c.evidence.nodeId ? { nodeId: c.evidence.nodeId } : {}),
+    ...(c.evidence.title ? { title: c.evidence.title } : {}),
+  })
+}
+
+/**
+ * 确认屏那几行。**是数据,不是 JSX**。
+ *
+ * `canBackfillOrphan` = 这一趟有没有拷贝接缝。**必须由调用方传真值**:孤儿目录那一格
+ * 会不会真的被补录取决于它,而屏幕是在用户按下 `y` **之前**读的。
+ */
+export function rescueLines(plan: RescuePlan, canBackfillOrphan = false): string[] {
   const out: string[] = []
-  if (plan.merge.length === 0 && plan.hold.length === 0 && plan.orphanFiles.length === 0) {
+  if (plan.merge.length === 0 && plan.backfill.length === 0 && plan.hold.length === 0
+    && plan.orphanFiles.length === 0) {
     out.push('没有需要捞回来的东西:孤立的分支和目录里都没有集成分支缺的内容。')
   }
   if (plan.merge.length > 0) {
@@ -359,13 +531,38 @@ export function rescueLines(plan: RescuePlan): string[] {
     }
     out.push('合完这些分支**照样保留** —— 捞是往集成分支加东西,不是清理。')
   }
+  /**
+   * 第 2 级要**单独说**,而且要说清它和第 1 级不是一回事:整条合进去和只捡集成分支没有的
+   * 文件,对用户是两个不同的事实,而上一版把它们混在同一句「保留不合」里 —— 屏幕说着
+   * 「保留不合」,代码正要往集成分支写东西。
+   */
+  if (plan.backfill.length > 0) {
+    out.push(`另有 ${plan.backfill.length} 处分诊拿不准,**不整条合并**,但会尽最大努力捞:`
+      + '只把「集成分支上根本没有」的文件补录进去(单独一笔提交,覆盖不了任何已有内容,随时可以 git revert)。')
+    for (const c of plan.backfill) {
+      out.push(`  · ${c.evidence.title ?? c.evidence.ref}(${c.evidence.fileCount} 个文件):${c.why}`)
+    }
+    out.push('  两边都有、而内容不同的那些**一个都不会动** —— 那是唯一会覆盖的一格,留给回溯。')
+  }
   if (plan.hold.length > 0) {
-    // 「拿不准」和「判定不合」要分开数:前者是我们没把握,后者是有理由的排除。
-    const unsure = plan.hold.filter(c => c.verdict === 'unsure').length
-    out.push(`保留不合 ${plan.hold.length} 处${unsure > 0 ? `(其中 ${unsure} 处拿不准)` : ''}:`)
-    for (const c of plan.hold) {
-      out.push(`  · ${c.evidence.title ?? c.evidence.ref}:${c.why}`)
-      out.push(`    想自己看:git log ${c.evidence.ref} · git diff <集成分支>...${c.evidence.ref}`)
+    // 「拿不准」和「判定不合」是两件事,而且**归宿不同**:前者会被补录/落痕,
+    // 后者到此为止。混在一行里,用户读到的是「先放着」,实际是「永远放着」。
+    const skipped = plan.hold.filter(c => c.verdict === 'skip')
+    const superseded = plan.hold.filter(c => c.verdict !== 'skip')
+    if (skipped.length > 0) {
+      out.push(`判定**不该合** ${skipped.length} 处 —— 这几条到此为止,自动的路不会再碰它们:`)
+      for (const c of skipped) {
+        out.push(`  · ${c.evidence.title ?? c.evidence.ref}:${c.why}`)
+        out.push(`    不同意这个判断的话,自己来:git merge ${c.evidence.ref}(先看:git diff <集成分支> ${c.evidence.ref})`)
+      }
+    }
+    if (superseded.length > 0) {
+      out.push(`拿不准、而且这一版已经被后来的版本取代 ${superseded.length} 处 —— **连补录都不做**`
+        + '(它「集成分支上没有」的文件,很可能正是后来那一版故意删掉的):')
+      for (const c of superseded) {
+        out.push(`  · ${c.evidence.title ?? c.evidence.ref}:${c.why}`)
+        out.push(`    想自己看:git log ${c.evidence.ref} · git diff <集成分支> ${c.evidence.ref}`)
+      }
     }
   }
   for (const o of plan.orphanFiles) {
@@ -374,8 +571,20 @@ export function rescueLines(plan: RescuePlan): string[] {
     for (const f of o.files.slice(0, 5)) {
       out.push(`  · ${f.rel}(${f.kind === 'absent' ? '集成分支上没有' : '内容不同'})`)
     }
-    // 它不是 git 工作树,合不进来 —— 这句必须说,否则用户以为按一下就收进去了。
-    out.push('  ⚠ 这个目录已经不是 git 工作树,没法合并;请自行确认后手工取用(目录不会被删)。')
+    /**
+     * 它**不是** git 工作树,所以合不进来 —— 但「合不进来」不等于「捞不回来」。
+     * `absent` 那些走加法补录(拷进临时工作树、`git add`、单独一笔提交),
+     * `differs` 那些一个都不动。这两句话必须分开说:上一版只有一句「没法合并,请手工取用」,
+     * 而那句话在补录落地之后就是假的。
+     */
+    if (absent > 0 && canBackfillOrphan) {
+      out.push(`  这 ${absent} 个集成分支根本没有的会被**补录**进集成分支(单独一笔提交);目录本身不会被删。`)
+    } else if (absent > 0) {
+      out.push('  ⚠ 这一趟没有拷贝接缝,这几个文件**不会**被补录 —— 请自行确认后手工取用(目录不会被删)。')
+    }
+    if (o.files.length - absent > 0) {
+      out.push(`  ⚠ 另外 ${o.files.length - absent} 个和集成分支内容不同的**一个都不会动** —— 那一格只能你自己判。`)
+    }
   }
   for (const p of plan.problems) out.push(`⚠ ${p}`)
   return out

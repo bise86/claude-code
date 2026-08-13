@@ -121,6 +121,34 @@ describe('主模型那一步', () => {
     expect(problems[0]!.join('\n')).toContain('保守名单')
   })
 
+  /**
+   * **模型缺席时,注入也必须真的发生。**
+   *
+   * 屏幕上那句承诺是无条件的:「把集成验收的意见**注入执行提示词**,重跑一遍」。
+   * 而 `guidance` 此前**只**从模型的映射来 —— 没有模型的那一趟是**裸重跑**:
+   * 同样的提示词、同样的模型,凭什么这次会不一样。而那句意见本来就在盘上
+   * (`BacktrackTarget.blocking`),它此前只被拿去上屏和喂模型。
+   */
+  it('没有主模型时,用盘上已有的意见兜底注入', async () => {
+    const { deps, started } = spyDeps()
+    await runBacktrack(tree(), 'root', NOW, deps)
+    /**
+     * 断言落在**交出去的那棵树**上:`runBacktrack` 的返回值刻意不带 guidance,
+     * 而真正决定重跑那一趟长什么样的是树上那句话。
+     */
+    const child = started[0]!.find(n => n.id === 'root/00-a')!
+    expect(JSON.stringify(child)).toContain('合起来没覆盖导出接口')
+  })
+
+  /** 模型给了话就用模型的 —— 兜底不许把更具体的那句顶掉。 */
+  it('模型给了补充提示词时,兜底不生效', async () => {
+    const { deps, started } = spyDeps({ map: async () => [{ nodeId: 'root/00-a', guidance: '这次把导出接口补上' }] })
+    await runBacktrack(tree(), 'root', NOW, deps)
+    const child = JSON.stringify(started[0]!.find(n => n.id === 'root/00-a')!)
+    expect(child).toContain('这次把导出接口补上')
+    expect(child).not.toContain('合起来没覆盖导出接口')
+  })
+
   /** 模型答了、但一条有效的都没有 —— 和「没答」对用户是同一个结果,不该一个静默一个说话。 */
   it('模型只给了无效项 → 也算降级', async () => {
     const { deps } = spyDeps({ map: async () => [{ nodeId: '不存在' }] })

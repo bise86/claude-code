@@ -147,9 +147,23 @@ export function makeBacktrackMapper(deps: {
 }): (targets: readonly BacktrackTarget[]) => Promise<{ nodeId: string; guidance?: string }[]> {
   return async targets => {
     if (targets.length === 0) return []
+    /**
+     * **抬头要说这一条**为什么**进来,不能一律写「集成验收没通过」。**
+     *
+     * 三格的成因完全不同:集成验收判了不通过 / 产出根本不在了 / 三级都捞不回来。
+     * 后两格从来没有过集成验收意见,而上一版对它们照样印「集成验收没通过,它给的意见:」——
+     * 那是把一句**假前提**交给模型,而这个仓库为「送达 ≠ 说得通」付过账。
+     * 判据现成:`blocking` 那句话本身就是各格自己写的理由。
+     */
+    const lead = (t: BacktrackTarget): string =>
+      t.blocking.includes('捞回集成分支')
+        ? '它的产出没能捞回集成分支(合并和加法补录都试过了),要重新做出来:'
+        : t.blocking.includes('一个字节都没多')
+          ? '它判了通过,而集成分支上一个字节都没多 —— 产出不在任何地方:'
+          : '集成验收没通过,它给的意见:'
     const list = targets.map(t =>
       `## 任务 ${JSON.stringify(t.node.id)} —— ${t.node.title}\n` +
-      `集成验收没通过,它给的意见:\n${t.blocking || '(没有留下意见)'}\n` +
+      `${lead(t)}\n${t.blocking || '(没有留下意见)'}\n` +
       (t.remedy.length > 0 ? `它还提过这些补救项:${t.remedy.join('、')}\n` : '') +
       `它的子任务:\n${t.node.childIds.map(id => `- ${JSON.stringify(id)}`).join('\n') || '(没有子任务)'}\n` +
       (t.suspects.length > 0 ? `其中看起来有问题的:${t.suspects.map(s => JSON.stringify(s)).join('、')}\n` : ''),
@@ -160,7 +174,8 @@ export function makeBacktrackMapper(deps: {
       role: null,
       system: 'plan',
       prompt:
-        `下面这些任务的**集成验收没有通过**。请把每一条意见对上**具体该重跑哪个子任务**,` +
+        `下面这些任务**要返工**(各自的原因写在它自己那一段里:集成验收没通过 / 产出根本不在了 / ` +
+        `产出没能捞回集成分支)。请把每一条对上**具体该重跑哪个子任务**,` +
         `并给它一句针对性的修正要求。\n\n${list}\n\n` +
         `规则:\n` +
         `- 只能点上面列出来的任务 id(父任务自己或它的子任务),**不要编新的 id**;\n` +

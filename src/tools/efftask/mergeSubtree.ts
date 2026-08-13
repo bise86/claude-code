@@ -5,8 +5,10 @@ import { createNodeJournal } from './nodeJournal.js'
 import { autoResolveMerge, trackedChanges, type ConflictResolver, type GitFn } from './handoffActions.js'
 import { withStash } from './stashGuard.js'
 import { syncTrunk } from './integrationMerge.js'
+import { RESCUE_STRANDED_NOTE, strandedRefsOf } from './backtrack.js'
+import type { CopyInto } from './backfill.js'
 import { scanStranded, STRANDED_KINDS } from './stranded.js'
-import { planRescue, rescueLines, runRescue, type RescuePlan, type RescueTriage } from './rescue.js'
+import { planRescue, rescueLines, runRescue, type RescueOutcome, type RescuePlan, type RescueTriage } from './rescue.js'
 import type { MergeResult } from './worktreePool.js'
 import type { TaskNode } from './types.js'
 
@@ -110,6 +112,13 @@ export interface SubtreeMergeDeps {
   exists?: (path: string) => Promise<boolean>
   /** 孤儿目录里有哪些文件(相对路径,递归)。 */
   listFiles?: (dir: string) => Promise<string[]>
+  /**
+   * 把孤儿目录里的一个文件拷进临时合并工作树(要负责建父目录)。
+   *
+   * **不给 = 孤儿目录那一格退回「只列不捞」**,而且屏幕上会照实说。四类里它是此前唯一
+   * 0% 捞回的一格,所以这条接缝断了要看得见 —— 静默退回正是这个仓库的招牌缺陷。
+   */
+  copyInto?: CopyInto
   /** 编排器还在跑吗 —— 只影响确认屏上那句提醒。 */
   runActive?: boolean
   /**
@@ -191,6 +200,8 @@ export interface SubtreeMergePlan {
    * 那时屏幕上必须说出来 —— 空白和「没有」长得一样。
    */
   rescue?: RescuePlan
+  /** 这一趟有没有孤儿目录的拷贝接缝 —— 确认屏据它决定承诺「补录」还是「手工取用」。 */
+  canBackfillOrphan?: boolean
 }
 
 export interface SubtreeMergeOutcome {
@@ -199,6 +210,11 @@ export interface SubtreeMergeOutcome {
    * 不能只看第 2 跳成没成(见 efftask.tsx 那一段)。
    */
   rescue?: RescuePlan
+  /**
+   * 三级都试过、仍然没捞回来的 ref。**已经落到对应节点上**(`b` 据此认领);
+   * 认不回主的那几条只在 `problems` 里,因为没有节点可落。
+   */
+  stranded?: RescueOutcome['stranded']
   merged: { nodeId: string; title: string; commits: number; resolvedFiles?: string[] }[]
   failed: { nodeId: string; title: string; why: string; followUps: string[] }[]
   /** 第 2 跳的结果。`undefined` = 根本没走到那一步(中途被取消)。 */
@@ -404,6 +420,7 @@ export async function scanSubtreeMerge(
     absent,
     trunk: await scanTrunk(deps),
     canResolve: deps.resolve !== undefined,
+    canBackfillOrphan: deps.copyInto !== undefined,
     runActive: deps.runActive === true,
     ...(await scanRescue(deps, nodes)),
   }
@@ -478,13 +495,14 @@ async function scanRescue(
     ...(deps.triage ? { triage: deps.triage } : {}),
     ...(deps.resolve ? { resolve: deps.resolve } : {}),
     ...(deps.rounds === undefined ? {} : { rounds: deps.rounds }),
+    ...(deps.copyInto ? { copyInto: deps.copyInto } : {}),
     ...(deps.onProgress ? { onProgress: deps.onProgress } : {}),
     ...(deps.signal ? { signal: deps.signal } : {}),
   }, refOnly, deps.listFiles)
   if (needBacktrack > 0) {
     plan.problems.push(
-      `上面这 ${needBacktrack} 项**合并解决不了**(产出丢了 / 集成验收没通过)—— 按 b 回溯:` +
-      '它会把集成验收的意见注入执行阶段重跑,必要时完全重做并加新任务。',
+      `上面这 ${needBacktrack} 项**合并解决不了**(产出丢了 / 集成验收没通过 / 三级都试过还是没捞回)`
+      + '—— 按 b 回溯:它会把已有的意见注入执行阶段重跑,必要时完全重做并加新任务。',
     )
   }
   plan.problems.push(...notices)
@@ -671,15 +689,29 @@ export async function runSubtreeMerge(
    * 也算 unsure)结果屏是一句无保留的成功 —— G 节算出来的「产出丢了 / 集成验收没通过 /
    * 降级放行 / 被你取消的 / 集成工作区脏 / 孤儿目录」**全部消失**,而记录正在这一刻被抹掉。
    */
-  if (!out.aborted && plan.rescue && plan.rescue.merge.length === 0) {
+  /**
+   * **这一段和上面那条判据一起,曾经让最常见的一趟一个字都不上屏。**
+   *
+   * 老判据是 `merge.length === 0` 才抄 problems、`> 0` 才跑 `runRescue`。评审席逐字点过
+   * 中间那一格:合成了 1 条、剩 5 条捞不回来 → 走 `> 0` 那一支 → 那 5 条 hold **一个字
+   * 都不上屏**,而标题色只看 `failed`,屏幕是绿色的「合并完成」。所以现在拆成两件事:
+   * **该说的一律说**,**有活才干活**。
+   */
+  if (!out.aborted && plan.rescue) {
     out.problems.push(...plan.rescue.problems)
     for (const h of plan.rescue.hold) {
       const what = h.item.branch ?? h.item.path ?? h.item.title ?? '(未命名)'
-      out.problems.push(`${what}:没有自动合并(${h.why})—— 产出还在那里,一个字节都没丢`)
+      out.problems.push(h.verdict === 'skip'
+        ? `${what}:分诊判定不该合(${h.why})—— 到此为止;不同意的话自己来:git merge ${h.item.branch ?? what}`
+        : `${what}:拿不准、而且已经被后来的版本取代(${h.why})—— 连补录都没做,产出还在那里,一个字节都没丢`)
     }
   }
-  if (!out.aborted && plan.rescue && plan.rescue.merge.length > 0) {
-    note(`捞回 ${plan.rescue.merge.length} 处没有工作区目录的产出…`)
+  const rescueWork = plan.rescue !== undefined && (
+    plan.rescue.merge.length > 0 || plan.rescue.backfill.length > 0
+    || (deps.copyInto !== undefined && plan.rescue.orphanFiles.some(o => o.files.some(f => f.kind === 'absent')))
+  )
+  if (!out.aborted && plan.rescue && rescueWork) {
+    note(`捞回 ${plan.rescue.merge.length + plan.rescue.backfill.length} 处没有工作区目录的产出…`)
     const r = await runRescue({
       git: deps.git,
       gitRoot: deps.pool.gitRoot,
@@ -689,6 +721,8 @@ export async function runSubtreeMerge(
       withIntegrationLock: fn => deps.pool.withIntegrationRead(fn),
       ...(deps.resolve ? { resolve: deps.resolve } : {}),
       ...(deps.rounds === undefined ? {} : { rounds: deps.rounds }),
+      // 少了这一行,孤儿目录那一格会**静默**退回「只列不捞」—— 接缝席点名的三个注入点之一。
+      ...(deps.copyInto ? { copyInto: deps.copyInto } : {}),
       ...(deps.onProgress ? { onProgress: deps.onProgress } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
     }, plan.rescue)
@@ -701,7 +735,17 @@ export async function runSubtreeMerge(
     for (const f of r.failed) {
       out.failed.push({ nodeId: f.ref, title: f.ref, why: f.why, followUps: [`产出仍在 ${f.ref} 上,一个字节都没丢`] })
     }
-    out.problems.push(...r.problems)
+    for (const b of r.backfilled) {
+      if (b.added.length > 0) {
+        out.problems.push(`${b.title ?? b.ref}:补录了 ${b.added.length} 个集成分支缺失的文件(${b.added.slice(0, 3).join('、')}${b.added.length > 3 ? '…' : ''})`)
+      }
+      // 被判据挡下来的那些是「捞不回来」的明细 —— 最大努力的另一半是说清哪几条没捞到。
+      for (const s of b.skipped.slice(0, 5)) out.problems.push(`  · 没补录 ${s.path}:${s.why}`)
+    }
+    // `runRescue` 的 problems 是拿 `plan.problems` 起头的,上面那一支已经抄过一遍。
+    out.problems.push(...r.problems.filter(p => !plan.rescue!.problems.includes(p)))
+    out.stranded = r.stranded
+    await noteRescueStranded(deps, r.stranded, byId, out)
     if (r.aborted) out.aborted = true
   }
 
@@ -887,6 +931,74 @@ async function mergeToTrunk(
   }
 }
 
+/** 同一个节点上最多记几条捞不回来的 ref。`m` 可以被反复按,不夹就是 node.md 无界增长。 */
+const MAX_STRANDED_PER_NODE = 20
+
+/**
+ * **第 3 级:把「捞不回来」落到节点上,让 `b` 认领。**
+ *
+ * 用户 2026-08-13:「如果实在捞不回来,会在回溯里检查不。」此前这一段是断的 ——
+ * 捞不回来是**一条 ref** 的事,而回溯认的是节点级信号,两者之间没有任何东西。
+ *
+ * 写**注记**(判据)和**字段**(载荷)两样:判据放在 `execStatus` 上,和 `outputMissing`
+ * 同一个形状 —— 字段丢了只是少了明细,不会让 `b` 静默扫不到。
+ *
+ * 认不回主的那些(`salvageOrphan` / 孤儿目录)落不到任何节点上,**不许假装有主**:
+ * 它们进 `out.problems`,由结果屏单列。
+ */
+async function noteRescueStranded(
+  deps: SubtreeMergeDeps, stranded: readonly RescueOutcome['stranded'][number][],
+  byId: Map<string, TaskNode>, out: SubtreeMergeOutcome,
+): Promise<void> {
+  if (stranded.length === 0) return
+  const at = (deps.now ?? (() => new Date().toISOString()))()
+  const orphans: typeof stranded[number][] = []
+  const touched = new Map<string, TaskNode>()
+  for (const s of stranded) {
+    const node = s.nodeId === undefined ? undefined : byId.get(s.nodeId)
+    if (!node) { orphans.push(s); continue }
+    const list = strandedRefsOf(node)
+    // 同一条 ref 重按一次 `m` 不该叠出第二条 —— 判据是 ref,不是整行(它带时间戳)。
+    const kept = list.filter(x => x.ref !== s.ref)
+    kept.push({ ref: s.ref, why: s.why, at, remaining: s.remaining })
+    node.rescueStranded = kept.slice(-MAX_STRANDED_PER_NODE)
+    const line = `${RESCUE_STRANDED_NOTE}(${at}:${s.ref},还差 ${s.remaining} 处)`
+    if (!node.execStatus.includes(RESCUE_STRANDED_NOTE)) {
+      node.execStatus = `${node.execStatus}${node.execStatus ? '\n' : ''}${line}`
+    }
+    touched.set(node.id, node)
+  }
+  for (const node of touched.values()) {
+    if (!deps.persist) {
+      out.problems.push(`${node.title}:有产出没能捞回来,而这一趟没有落盘接缝 —— 按 b 回溯认不到它,请手工处理`)
+      continue
+    }
+    try {
+      await writeNode(
+        deps.persist.fs, deps.persist.runDir, node,
+        createNodeJournal({ fs: deps.persist.fs, runDir: deps.persist.runDir }),
+      )
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e))
+      deps.onError?.(err)
+      out.problems.push(`${node.title}:有产出没能捞回来,而这条记录没能写回 node.md(${err.message})—— 按 b 回溯可能认不到它`)
+    }
+  }
+  if (touched.size > 0) {
+    out.problems.push(`${touched.size} 个任务有产出没能捞回来,已经记在它们身上 —— **按 b 回溯**会把这些内容重新做出来。`)
+  }
+  for (const o of orphans) {
+    /**
+     * **无主的不许假装有主。** `salvageOrphan` 按定义认不回是谁的,孤儿目录也没有节点。
+     * 把它挂到某个节点上会让 `b` 去重跑一个和它无关的任务;不说则是第二个「按 q 之后永久失联」。
+     */
+    out.problems.push(
+      `⚠ ${o.ref} 还差 ${o.remaining} 处没捞回来,而它**没有对应的任务**(${o.why})—— `
+      + `回溯认不了它,只能你自己处置:git diff ${deps.pool.integrationBranchName} ${o.ref}`,
+    )
+  }
+}
+
 /** 盘上要留下「这次合并是人手动触发的」这个事实。写失败不影响合并本身,但**要说**。 */
 async function noteMerged(deps: SubtreeMergeDeps, node: TaskNode, out: SubtreeMergeOutcome): Promise<void> {
   if (!deps.persist) return
@@ -994,7 +1106,9 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
      * 「集成分支上根本没有」和「内容不同」的拆分与文件清单。而那几样恰恰是用户唯一能
      * 据以动手的东西。一个功能两份渲染,活着的那份总会先退化。
      */
-    out.push(...rescueLines(plan.rescue))
+    // 第二个参数是「这一趟有没有拷贝接缝」—— 孤儿目录那一格到底捞不捞由它决定,
+    // 而这一屏是在用户按下 y **之前**读的。写死一个值就是在承诺一件没有根据的事。
+    out.push(...rescueLines(plan.rescue, plan.canBackfillOrphan === true))
   }
   /**
    * **「所有未提交的都要提交」有个后半句,必须说出口。**
@@ -1016,7 +1130,15 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
     out.push(`${plan.ignoredOnly} 个工作区目录里**只剩构建产物**(提交都已合入)—— m 合不了它们,`
       + '结束屏把它们印成「保留的工作区(未回收)」说的就是这一批;要腾空间按 c。')
   }
-  out.push('任务状态不会被改动:合并只动 git,节点的判决、评审与验收记录原样保留。')
+  /**
+   * **这句话从「不改任何状态」退成「不改判决」,因为它已经不全对了。**
+   *
+   * 规范席点名:它印在确认屏、在用户按下 `y` **之前**,而三级递降落地之后 `m` 会往
+   * node.md 上写两样东西 —— 手动合并的注记(早就有)和「有产出没能捞回来」的痕迹(新的)。
+   * 后者还会改变按 `b` 之后对这些节点做什么。承诺「状态不会被改动」就是假话。
+   */
+  out.push('不会改动任何判决:节点的评审、验收记录原样保留。'
+    + '(合过的任务会记一句手动合并的注记;三级都捞不回来的会记一句痕迹,好让 b 回溯认得到它。)')
   if (plan.runActive) {
     out.push('⚠ 这一趟还在跑:合并会和编排器共用同一条集成分支,两边按顺序排队(可能要等在飞的那次合并让出来)。')
   }
