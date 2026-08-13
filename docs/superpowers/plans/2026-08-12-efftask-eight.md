@@ -1,3 +1,24 @@
+> ## ⚠ 这份文档是**方案**,不是实现记录 —— 落地之后有四处与代码不符
+> 
+> 验收(规范席)逐条核出来的,列在这里而不是就地改掉:方案的价值在于它当时的判断,
+> 而「后来发现判断错在哪」比一份被悄悄改对的文档有用。**以代码为准。**
+> 
+> 1. **§A.3 的模块名**:实际落地叫 `integrationMerge.ts`,不是 `trunkSync.ts`;
+>    `syncTrunk` 是它里面的一个导出。
+> 2. **§A.4 的 `resolveMergeLoop`「一份实现,三条路共用」**:没有独立成函数,迭代循环内联在
+>    `mergeIntoIntegration` 里,三条路(`m` 键 / 收口关口 / 自动收口)复用的是**那个函数**。
+> 3. **§A.5 的「节点→集成第一跳补同步」是一次误读** —— `conflictScene` 的 `fresh` 分支
+>    本来就调 `mergeIntegrationIntoNode`(把集成分支合进节点工作区),那**就是**同步。
+>    需要额外 `integrationAhead` 判断的只有 `staged` 那一支,理由是它不能盲目提交一份
+>    已被否决的解决。**代码是对的,方案写错了。**
+> 4. **§E(第三档 `shared-parallel`,15 处判据)整节作废** —— 用户明确说需求 1 暂不做,
+>    全仓 `grep -a "sharedParallel|shared-parallel"` 零命中,没有半成品。
+> 5. **§F.4 的「显式 add[] + 抽出 createChildren 纯段」作废**:落地版是第 2 级解开父节点的
+>    `revised` 闩,让编排器自己那条已经测过的 `reviseDecomposition` 去长补救子任务。
+>    这一点验收判为**曲解**用户原话,已在确认屏上把它说清(见 `backtrackLines`)。
+> 
+> 另外,九条需求里的**第 1 条(当前目录并发)按用户要求暂不做**,§1/§E 只作存档。
+
 # /et 第十九轮:八件事的方案(v2 —— 四席圆桌之后)
 
 > 基线:branch `feature/efficient-task-mode`,HEAD `6a3ffa7`,

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { emptyPhaseRoles, DEFAULT_CAPS, DEFAULT_PARALLELISM } from './types.js'
 import type { EffTaskConfig } from './types.js'
+import { runBacktrack } from './backtrackRun.js'
 import { EffTaskOrchestrator } from './orchestrator.js'
 import type { RunAgentFn } from './roundtable.js'
 
@@ -724,5 +725,84 @@ describe('构建产物回收的接线', () => {
       new AbortController().signal,
     )
     expect((await orch.run()).status).toBe('completed')
+  })
+})
+
+/**
+ * **回溯之后,产出真的会被重新合并提交。**
+ *
+ * 用户原话:「回溯的目的是将验收不过导致的任务,**重新执行,重新合并提交**。」
+ *
+ * 这条此前只是**隐含成立**(execute 链尾就是 `commitAndMerge`),而方案自己写着
+ * 「要有一条探针把它钉住」—— 验收点名它不存在。隐含成立的东西在这个仓库里活不过三轮:
+ * 只要哪天回溯把节点坐到别的状态上,或者 `worktreesToRelease` 漏了它,合并就静默不发生,
+ * 而屏幕照样说「已重跑」。
+ */
+describe('回溯之后重新合并提交', () => {
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
+  const okAgent = (async (req: { phase: string; prompt: string }) => {
+    if (req.phase === 'plan') return leafPlan
+    if (req.phase === 'execute') return '```json\n{"execStatus":"做完"}\n```'
+    const tag = req.prompt.match(/语言标记\(fence info string\)写成 (accept[a-z]*|verify[a-z]*)/)?.[1] ?? 'accept'
+    return '```' + tag + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+  }) as RunAgentFn
+
+  it('被回溯的节点会再走一次 commitAndMerge,而且工作区先被销毁重建', async () => {
+    const merges: string[] = []
+    const discards: string[] = []
+    const acquires: string[] = []
+    const pool = {
+      init: async () => ({ ok: true }),
+      acquire: async (n: { id: string }) => {
+        acquires.push(n.id)
+        return { path: '/wt/' + n.id, branch: 'b-' + n.id, gitRoot: '/repo' }
+      },
+      commitAndMerge: async (n: { id: string }) => { merges.push(n.id); return { ok: true, merged: true } },
+      discard: async (n: { id: string }) => { discards.push(n.id); return { removed: true } },
+      release: async () => ({ removed: true }),
+      dispose: async () => ({ kept: [] }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      handoff: async () => ({ branch: 'b', commits: 0, kept: [], salvage: [] }),
+      refreshFromIntegration: async () => ({ ok: true, updated: false }),
+      conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+      mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
+      integrationPath: '/wt/integration',
+      integrationBranchName: 'efftask/001/integration',
+    }
+    // 第一趟:跑到 ACCEPTED,合过一次。
+    const first = new EffTaskOrchestrator(
+      cfg(), { ...deps(okAgent), worktrees: pool as never }, new AbortController().signal,
+    )
+    expect((await first.run()).status).toBe('completed')
+    expect(merges).toEqual(['root'])
+    const after = first.nodes()
+
+    // 造出「集成验收没通过」的形状,再回溯一次。
+    const target = after.find(n => n.id === 'root')!
+    target.status = 'BLOCKED'
+    target.acceptLog = [{
+      round: 1, step: 'integrate', verdicts: [],
+      synthesized: { pass: false, blockingSummary: '合起来没覆盖导出接口' },
+    }]
+    let restarted: TaskNode[] = []
+    await runBacktrack(after, 'root', NOW, {
+      commit: async () => ({ problems: [] }),
+      onProblems: () => {},
+      onNodes: () => {},
+      start: n => { restarted = n },
+      onDone: () => {},
+    })
+    expect(restarted.length).toBeGreaterThan(0)
+
+    // 第二趟:回溯出来的树重新跑 —— 产出必须**重新合并提交**。
+    merges.length = 0
+    const second = new EffTaskOrchestrator(
+      cfg(), { ...deps(okAgent), worktrees: pool as never }, new AbortController().signal, restarted,
+    )
+    expect((await second.run()).status).toBe('completed')
+    expect(merges).toContain('root')
+    // 而且它是从**重建的**工作区里合出去的:回溯把旧目录列进了销毁名单,
+    // 下一次 acquire 从集成分支最新状态重建 —— 用户第 2、3、4 条要的「删 target、重新同步」。
+    expect(acquires.filter(id => id === 'root').length).toBeGreaterThanOrEqual(2)
   })
 })

@@ -229,10 +229,25 @@ export async function runHandoffChoice(
    * 大多不需要它。真正的接线在 runOrchestrator(自动收口)和 efftask.tsx(收口关口)。
    */
   resolve?: ConflictResolver,
+  /**
+   * **「先同步主干、再迭代解冲突」那条路。给了就用它来做 `merge`。**
+   *
+   * 下面那段原地实现的方向是反的:在**用户自己的检出**里 `git merge <集成分支>`,于是
+   * 撞冲突时现场落在他正在用的目录里 —— 只能 abort,产出永远送不到。`syncTrunk` 反过来
+   * 做(先把他的分支合进集成分支,在临时工作树里由模型迭代解),之后回主干那一跳自然
+   * 是快进,他的检出一次三方合并都不会经历。
+   *
+   * 做成可选的注入而不是直接 import:这个模块是**纯的**(见文件头),而 `syncTrunk` 要
+   * 工作树根、要集成工作区的锁 —— 那些住在池子里。缺席时逐字退回下面那段老实现,
+   * 也就是引入它之前的行为。
+   */
+  mergeVia?: () => Promise<HandoffResult>,
 ): Promise<HandoffResult> {
   if (choice === 'keep') {
     return { ok: true, message: `已保留分支 ${h.branch}` }
   }
+
+  if (choice === 'merge' && mergeVia) return mergeVia()
 
   if (choice === 'merge') {
     // 脏树先挡住:git 会拒绝合并,但报错文字是英文的 git 内部消息,而且用户会以为是 bug。

@@ -10,6 +10,8 @@ import type { WorktreePool } from '../../tools/efftask/worktreePool.js'
 import type { HandoffSummary } from '../../tools/efftask/startupConfirm.js'
 import type { GitFn, HandoffResult } from '../../tools/efftask/handoffActions.js'
 import { finishHandoff } from '../../tools/efftask/finishHandoff.js'
+import { trackedChanges } from '../../tools/efftask/handoffActions.js'
+import { syncTrunk } from '../../tools/efftask/integrationMerge.js'
 import { makeHandoffConflictResolver } from '../../tools/efftask/handoffResolve.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { finishEffTaskRun, markEffTaskPendingHandoff, registerEffTaskRun, updateEffTaskRun } from '../../tasks/EffTaskTask/EffTaskTask.js'
@@ -334,6 +336,39 @@ export async function runOrchestrator(
       resolveConflict: root
         ? makeHandoffConflictResolver({ runAgent: args.runAgent, node: root, signal: args.signal })
         : undefined,
+      /**
+       * **自动收口那一次也走「先同步主干」。**
+       *
+       * 方向反过来之后,冲突在临时工作树里由模型解,用户的检出一次三方合并都不会经历 ——
+       * 而这一次是**全自动**发生的(他多半不在屏幕前),把他的目录留在半合并态是这条路上
+       * 最坏的结局。池子缺席(共享工作树)时不接:那时根本没有集成分支。
+       */
+      ...(args.worktrees
+        ? {
+          syncTrunkMerge: async () => {
+            const pool = args.worktrees!
+            const r = await syncTrunk({
+              git: args.git,
+              gitRoot: pool.gitRoot,
+              integrationBranch: pool.integrationBranchName,
+              integrationPath: pool.integrationPath,
+              worktreeRoot: `${pool.gitRoot}/.efftask-worktrees`,
+              withIntegrationLock: fn => pool.withIntegrationRead(fn),
+              ...(root
+                ? { resolve: makeHandoffConflictResolver({ runAgent: args.runAgent, node: root, signal: args.signal }) }
+                : {}),
+              ...(args.config.caps?.trunkResolveRounds === undefined
+                ? {}
+                : { rounds: args.config.caps.trunkResolveRounds }),
+              signal: args.signal,
+              trackedDirty: () => trackedChanges(args.git, pool.gitRoot),
+            })
+            return r.ok
+              ? { ok: true, message: r.message }
+              : { ok: false, message: r.why, followUps: r.followUps }
+          },
+        }
+        : {}),
       // 关口上打开的自动推送。**从 config 读**(不是另开一个参数):它已经被
       // `applyStartupDecision` 写进去、被 run.md 落盘、也被 `--resume` 读回,多一条传递路径
       // 就多一处会漂移的地方。

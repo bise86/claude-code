@@ -892,7 +892,17 @@ describe('收口关口的合并也带着解冲突的人', () => {
      */
     expect(occurrences('makeHandoffConflictResolver({ runAgent: props.runAgent')).toBe(2)
     // 第五个参数的位置就是解决者 —— 传成 undefined 或者干脆不传都会让关口退回老行为。
-    expect(SRC).toMatch(/runHandoffChoice\(\s*choice, h, gitRunner, getCwd\(\),\s*\n\s*root \? makeHandoffConflictResolver/)
+    expect(SRC).toMatch(/runHandoffChoice\(\s*\n?\s*choice, h, gitRunner, getCwd\(\), resolver,/)
+    /**
+     * **第六个参数是「先同步主干」那条路。**
+     *
+     * 收口和 `m` 键面对的是同一件事(集成分支 → 用户当前分支),而在这之前只有 `m` 走了
+     * 新机制:收口仍在用户自己的检出里 `git merge`,撞冲突只能 abort —— 于是
+     * 「跑完把产出送回你的目录」在最容易撞冲突的那一次上失效,而那正是一整趟运行的结尾。
+     * 剪断它不会有任何测试红,除了这一条。
+     */
+    expect(SRC).toContain('poolNow')
+    expect(SRC).toMatch(/syncTrunk\(\{[\s\S]*?trackedDirty:/)
   })
 })
 

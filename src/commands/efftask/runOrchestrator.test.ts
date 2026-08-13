@@ -255,10 +255,31 @@ describe('收口:跑完就把产出送回当前目录', () => {
       trunkLanded,
     }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    // `syncTrunk` 拿它当**用户检出**的 cwd(送达那一跳就在这里跑)。
+    // 少了它,那一跳的 cwd 是 undefined —— 而这一屏的判据正是「它必须落在用户目录上」。
+    gitRoot: '/repo',
     integrationPath: '/wt/integration',
     integrationBranchName: 'efftask/004/integration',
   })
+  /**
+   * 收口那一次合并现在走 `syncTrunk`(先把用户分支合进集成分支,回主干必然快进)——
+   * 所以假 git 要给出一个**自洽的世界**,否则它会在第一问上就早退:
+   *
+   *  - `symbolic-ref` 回空串 → 被当成 detached HEAD;
+   *  - `merge-base --is-ancestor <集成分支> HEAD` 回 0 → 被当成「已经是最新的」。
+   *
+   * 两条都回 0 的旧夹具正好同时踩中这两个 —— 于是一次本该发生的合并一个字都没跑,
+   * 而断言看起来只是「merge 没执行」。
+   */
+  const HANDOFF_WORLD: Record<string, { code?: number; stdout?: string; stderr?: string }> = {
+    'symbolic-ref': { code: 0, stdout: 'main\n' },
+    // 集成分支**还没**进用户分支 → 确实有东西要送。
+    'merge-base --is-ancestor efftask/004/integration HEAD': { code: 1 },
+    // 用户分支已经在集成分支里 → 不需要先同步那一步,直接快进。
+    'merge-base --is-ancestor main efftask/004/integration': { code: 0 },
+  }
   const git = (answers: Record<string, { code?: number; stdout?: string; stderr?: string }> = {}) => {
+    answers = { ...HANDOFF_WORLD, ...answers }
     const calls: string[][] = []
     /** 每条命令的 cwd —— 跑错目录时 merge 会回答 Already up to date. 而屏幕报「已合并」。 */
     const cwds: (string | undefined)[] = []
@@ -313,7 +334,9 @@ describe('收口:跑完就把产出送回当前目录', () => {
 
   it('干净的检出 + 跑完 → 真的 git merge,而且 run.md 里不再留待收口', async () => {
     const r = await run()
-    expect(r.g.ran('merge --no-edit efftask/004/integration')).toBe(true)
+    // 方向反过来之后,送到用户目录那一跳是**快进**(集成分支此刻已含他的提交)。
+    // 意图没变:必须真的有一次合并落到他的检出上,而不是在集成工作区里空转。
+    expect(r.g.ran('merge --ff-only --no-verify efftask/004/integration')).toBe(true)
     expect(r.results[0]?.merged).toBe(true)
     // 清掉了,而且**落盘了** —— 只清内存的话下一次 --resume 会为一条已经合过的分支
     // 再弹一次四选一,而「丢弃」会对着它跑 branch -D。
@@ -394,12 +417,20 @@ describe('收口:跑完就把产出送回当前目录', () => {
     expect(r.phases).toEqual(['done'])
   })
 
-  it('每一条 git 都跑在**用户的** cwd 上,而不是集成工作区', async () => {
+  it('**送达那一跳**跑在用户的 cwd 上,而不是集成工作区', async () => {
     // 跑错目录时 `git merge` 会回答 `Already up to date.`(那里已经在集成分支上)→
     // code 0 → 屏幕报「已合并」,而用户目录里一个文件都没有。
+    //
+    // 判据从「每一条 git 都在 /repo」收窄成「**送达那一跳**在 /repo」:方向反过来之后,
+    // 同步那一步**故意**跑在临时工作树里(冲突现场不能落在用户正在用的目录上),
+    // 而最后那次快进才是把产出交到他手上的那一下。
     const r = await run()
     expect(r.g.calls.length).toBeGreaterThan(0)
-    for (const c of r.g.cwds) expect(c).toBe('/repo')
+    const ffAt = r.g.calls
+      .map((c, i) => ({ c: c.join(' '), cwd: r.g.cwds[i] }))
+      .filter(x => x.c.startsWith('merge --ff-only --no-verify efftask/004/integration'))
+    expect(ffAt.length).toBeGreaterThan(0)
+    for (const x of ffAt) expect(x.cwd).toBe('/repo')
   })
 
   it('收口排在 settle 之前 —— 否则 /tasks 那一行会教用户敲一条没有关口的命令', async () => {
@@ -977,22 +1008,44 @@ describe('收口撞上冲突:模型先解一次(用户要求的那件事)', () =
   it('冲突 → 真的派出一次带写工具的模型调用,解完复核通过就提交', async () => {
     const fs = memFs()
     const calls: string[][] = []
-    let statuses = 0
+    /**
+     * **按状态回答,不按调用次数。**
+     *
+     * 原来是一个计数器(第 1 次有冲突、之后干净)—— 而这条路上 `status` 被问几次是
+     * 实现细节:方向反过来之后中间多了几问,那个 `UU pay.ts` 就被别处消耗掉了,
+     * 于是提示词里的冲突文件列表是空的,而断言看起来只是「提示词里没有 pay.ts」。
+     * 改成「解完之前一直有冲突」—— 那才是真 git 的行为。
+     */
+    let resolved = false
     const git = async (args: string[]) => {
       calls.push(args)
       const [a, b] = args
       if (a === 'diff') return { code: 0, stdout: '', stderr: '' }
-      if (a === 'symbolic-ref') return { code: 0, stdout: 'refs/heads/main\n', stderr: '' }
+      if (a === 'symbolic-ref') return { code: 0, stdout: 'main\n', stderr: '' }
+      /**
+       * **这个世界要支持「有东西要送,而且用户分支还没进集成分支」** —— 否则
+       * `syncTrunk` 会在第一问上早退(「已经是最新的」),同步那一步不发生,
+       * 模型也就永远不会被派出去,而这条用例要钉的正是那次派发。
+       */
+      if (a === 'merge-base') {
+        // 集成分支还没进用户分支 = 有东西要送;用户分支也还没进集成分支 = 要先同步。
+        return { code: 1, stdout: '', stderr: '' }
+      }
+      if (a === 'worktree') return { code: 0, stdout: '', stderr: '' }
+      if (a === 'reset' || a === 'clean' || a === 'checkout') return { code: 0, stdout: '', stderr: '' }
       if (a === 'rev-parse') return { code: 0, stdout: 'cafe123\n', stderr: '' }
       if (a === 'merge' && b === '--abort') return { code: 0, stdout: '', stderr: '' }
+      // **快进不会冲突** —— 只有三方合并会。原来对所有 merge 一律回冲突,于是解完之后
+      // 那次把产出送到用户目录的快进也被当成冲突,整条路退回「反复重试仍未合上」。
+      if (a === 'merge' && args.includes('--ff-only')) return { code: 0, stdout: '', stderr: '' }
       if (a === 'merge') return { code: 1, stdout: '', stderr: 'CONFLICT (content): Merge conflict in pay.ts' }
-      // 第一次问是合并之后(有冲突),之后是模型解完之后(干净)。
-      if (a === 'status') return { code: 0, stdout: statuses++ === 0 ? 'UU pay.ts\n' : '', stderr: '' }
+      if (a === 'status') return { code: 0, stdout: resolved ? '' : 'UU pay.ts\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
     const dispatched: { phase: string; cwd?: string; prompt: string; nodeId: string }[] = []
     const runAgent: RunAgentFn = async req => {
       dispatched.push({ phase: req.phase, cwd: req.cwd, prompt: req.prompt, nodeId: req.node.id })
+      resolved = true
       return ''
     }
     const results: { merged: boolean; result?: { ok: boolean; message: string } }[] = []
@@ -1008,6 +1061,7 @@ describe('收口撞上冲突:模型先解一次(用户要求的那件事)', () =
           dispose: async () => ({ kept: [] }),
           handoff: async () => ({ branch: 'efftask/005/integration', commits: 3, kept: [], salvage: [], integrationPath: '/wt/integration' }),
           withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+          gitRoot: '/repo',
           integrationPath: '/wt/integration',
           integrationBranchName: 'efftask/005/integration',
         } as never,
@@ -1026,16 +1080,24 @@ describe('收口撞上冲突:模型先解一次(用户要求的那件事)', () =
       () => {}, () => {}, () => {},
     )
     expect(dispatched.length).toBe(1)
-    // execute 才带写工具;跑在**用户的检出**里,不是隔离工作区 —— 冲突现场在那儿。
+    /**
+     * execute 才带写工具。而 cwd 是**临时合并工作树**,不是用户的检出 ——
+     * 这一条是这次改造的目的本身:方向反过来之后,冲突现场落在一棵没有第二个读者的树里,
+     * 用户正在用的目录一次三方合并都不会经历,更不会被留在半合并态。
+     * (旧断言写的是 `/repo`,那正是「只能 abort、产出送不到」的那条老路。)
+     */
     expect(dispatched[0]!.phase).toBe('execute')
-    expect(dispatched[0]!.cwd).toBe('/repo')
+    expect(dispatched[0]!.cwd).toBe('/repo/.efftask-worktrees/merge-scratch')
     expect(dispatched[0]!.nodeId).toBe('root')
     expect(dispatched[0]!.prompt).toContain('pay.ts')
     expect(dispatched[0]!.prompt).toContain('efftask/005/integration')
     // 解完了才提交,而且屏幕上说的是实话。
     expect(calls.some(c => c[0] === 'commit')).toBe(true)
     expect(results[0]?.merged).toBe(true)
-    expect(results[0]?.result?.message).toContain('已自动解决')
+    // 措辞跟着新路径走:合的是「集成分支 → 你的分支」,而解决发生在同步那一步。
+    // 意图不变 —— 屏幕必须说出「解决了几个冲突文件」,而不是笼统一句「已合并」。
+    expect(results[0]?.result?.message).toContain('已把集成分支合回')
+    expect(results[0]?.result?.message).toContain('解决了 1 个冲突文件')
   })
 })
 

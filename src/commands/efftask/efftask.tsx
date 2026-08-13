@@ -27,7 +27,8 @@ import { runForcePass, runRedo, runSkip } from '../../tools/efftask/redoRun.js'
 import { runBacktrack } from '../../tools/efftask/backtrackRun.js'
 import { liveRedoUnavailableReason } from '../../tools/efftask/liveRedo.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
-import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
+import { runHandoffChoice, trackedChanges, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
+import { syncTrunk } from '../../tools/efftask/integrationMerge.js'
 import { makeBacktrackMapper, makeHandoffConflictResolver, makeRescueTriage } from '../../tools/efftask/handoffResolve.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
 import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResumeArgs.js'
@@ -1951,9 +1952,40 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 拿不到根节点(恢复路径下 nodes 尚未载入)就不接线,退回留下冲突现场的老行为。
        */
       const root = nodes.find(n => n.id === 'root')
+      const resolver = root
+        ? makeHandoffConflictResolver({ runAgent: props.runAgent, node: root, signal: props.signal })
+        : undefined
+      /**
+       * **收口那一次合并也走「先同步主干」。**
+       *
+       * 它和 `m` 键面对的是同一件事(集成分支 → 用户当前分支),而在这之前只有 `m` 走了
+       * 新机制:收口仍在用户自己的检出里 `git merge`,撞冲突只能 abort —— 于是
+       * 「跑完把产出送回你的目录」在最容易撞冲突的那一次上失效,而那正是一整趟运行的结尾。
+       *
+       * 池子缺席(共享工作树)时不接:那时根本没有集成分支,老实现的四条早退才是对的。
+       */
+      const poolNow = poolRef.current
       result = await runHandoffChoice(
-        choice, h, gitRunner, getCwd(),
-        root ? makeHandoffConflictResolver({ runAgent: props.runAgent, node: root, signal: props.signal }) : undefined,
+        choice, h, gitRunner, getCwd(), resolver,
+        poolNow
+          ? async () => {
+            const r = await syncTrunk({
+              git: gitRunner,
+              gitRoot: poolNow.gitRoot,
+              integrationBranch: poolNow.integrationBranchName,
+              integrationPath: poolNow.integrationPath,
+              worktreeRoot: `${poolNow.gitRoot}/.efftask-worktrees`,
+              withIntegrationLock: fn => poolNow.withIntegrationRead(fn),
+              ...(resolver ? { resolve: resolver } : {}),
+              ...(config?.caps?.trunkResolveRounds === undefined ? {} : { rounds: config.caps.trunkResolveRounds }),
+              signal: props.signal,
+              trackedDirty: () => trackedChanges(gitRunner, poolNow.gitRoot),
+            })
+            return r.ok
+              ? { ok: true, message: r.message }
+              : { ok: false, message: r.why, followUps: r.followUps }
+          }
+          : undefined,
       )
     } catch (e) {
       result = { ok: false, message: `收口失败: ${e instanceof Error ? e.message : String(e)}` }

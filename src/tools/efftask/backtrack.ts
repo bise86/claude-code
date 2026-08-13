@@ -289,8 +289,18 @@ export function backtrackLines(
     for (const t of lvl2) {
       const kids = t.suspects.length > 0 ? t.suspects : [t.node.id]
       out.push(`  · ${t.node.title} 下的 ${kids.length} 个子任务:重新分析并拆分(会先删掉它们各自的子任务)`)
+      /**
+       * **「加新任务」到底是什么,必须在**按下之前**说清。**
+       *
+       * 验收(规范席)判它是一次曲解:用户说的是「完全重做任务**和**加新任务」,而落地的是
+       * 「解开一次补救拆分的机会,由**之后那次集成验收**决定加不加、加什么」。回溯本身对此
+       * 零控制。这个实现是有理由的(`createChildren` 要 `PipelineCtx` 的原子预留,
+       * 按键处理里手搓一个等于把 `maxNodes` 静默关掉),但**理由不能替代告知** ——
+       * 结果屏此前诚实地写了「下一轮集成验收**可以**给它们加新的子任务」,而那是按完之后。
+       */
+      out.push('    并重新开放一次「补救拆分」:下一轮集成验收**可以**给它加新的子任务(加不加、加什么由那一轮决定)。')
       if (t.remedy.length > 0) {
-        out.push(`    并重新武装补救拆分,集成验收提过的补救项:${t.remedy.slice(0, 3).join('、')}${t.remedy.length > 3 ? '…' : ''}`)
+        out.push(`    集成验收此前提过的补救项:${t.remedy.slice(0, 3).join('、')}${t.remedy.length > 3 ? '…' : ''}`)
       }
     }
   }

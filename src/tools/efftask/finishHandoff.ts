@@ -177,6 +177,16 @@ export async function finishHandoff(deps: {
    * 刚才发生过一次合并。
    */
   resolveConflict?: ConflictResolver
+  /**
+   * **「先同步主干、再迭代解冲突」那条路。** 给了就用它来做收口那一次合并。
+   *
+   * 收口和 `m` 键面对的是**同一件事**(集成分支 → 用户当前分支),而在这之前只有 `m`
+   * 走了新机制:收口仍在用户自己的检出里 `git merge`,撞冲突只能 abort ——
+   * 于是「跑完把产出送回你的目录」在最容易撞冲突的那一次上失效,而那正是一整趟运行的结尾。
+   *
+   * 可选:测试和不带池子的调用方不给它,那时逐字退回老实现。
+   */
+  syncTrunkMerge?: () => Promise<{ ok: boolean; message: string; followUps?: string[] }>
   /** 关口上打开的自动推送。默认关 —— 推送是对外动作,必须由人打开。 */
   autoPush?: boolean
   /**
@@ -250,7 +260,14 @@ export async function finishHandoff(deps: {
     }
     // 走**现成的**那一份:脏树复查、失败时如实报告、分支原样保留全在里面,而收口关口
     // 按的也是同一个函数。两份实现迟早给出两种答案。
-    const res = await runHandoffChoice('merge', h, git, cwd, deps.resolveConflict)
+    const res = await runHandoffChoice(
+      'merge', h, git, cwd, deps.resolveConflict,
+      // 给了就走「先同步主干」那条 —— 方向反过来之后,用户的检出一次三方合并都不会经历。
+      deps.syncTrunkMerge ? async () => {
+        const r = await deps.syncTrunkMerge!()
+        return { ok: r.ok, message: r.message, ...(r.followUps ? { followUps: r.followUps } : {}) }
+      } : undefined,
+    )
     if (res.ok) {
       // 合成功了才推当前分支 —— 没合的话,推上去的是一份不含本次产出的分支。
       const push = deps.autoPush === true ? await pushCurrent(git, cwd) : undefined
