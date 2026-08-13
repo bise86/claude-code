@@ -131,6 +131,12 @@ function richNode(): TaskNode {
   // the whole cost argument for that feature rests on.
   n.revised = true
   /**
+   * 回溯轮次。阶梯靠它决定下一次走「重新执行」还是「完全重做」——写坏成一个非对象
+   * (或者 `rounds` 是字符串)会让 `levelFor` 读出 NaN,而 `NaN >= 1` 是 false:
+   * 阶梯**永远停在第 1 级**,一个已经证明重跑不管用的任务被反复重跑。
+   */
+  n.backtrack = { rounds: 2, at: '2026-08-13T00:00:00Z' }
+  /**
    * 降级放行记录。**结构最深的一个持久字段**:数组里是对象,对象里还有一个字符串数组,
    * 而渲染层会 `d.advice.join()`、`degraded.length`。node.md 按设计可以手工编辑,
    * 崩在半路也会留下半条记录 —— 敌意值一路走到 commit() 抛 TypeError 就是永久死节点,
