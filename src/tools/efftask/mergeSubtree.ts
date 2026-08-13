@@ -406,9 +406,27 @@ async function scanRescue(
    * **没有任何人渲染** —— 而那一档存在的全部意义就是上屏。用户按 `m` 是为了确认
    * 「还有没有东西没送到」,这几条正是「有东西,但该不该动是你的决定」。
    */
+  /**
+   * **判据是「不是 merge」,不是「是 report」。**
+   *
+   * 分类表有三种 action:`merge`(上面那两桶认领)、`report`(摆出来)、`backtrack`
+   * (产出丢了 / 集成验收没通过 —— 用户原话里的「功能没有达标的」)。写成 `=== 'report'`
+   * 的话,`backtrack` 那两格**两边都不进**:`refOnly` 不收、notices 不收,于是
+   * `scanStranded` 唯一的消费者把它们算出来之后原样扔掉。
+   *
+   * `stranded.ts` 自己在文件头写着「漏一格就是『全部捞出来』这句话变成假的」,而这里
+   * 恰好漏了两格 —— 而且是用户三段要求里的第三段。
+   */
   const notices = report.items
-    .filter(i => STRANDED_KINDS[i.kind].action === 'report')
+    .filter(i => STRANDED_KINDS[i.kind].action !== 'merge')
     .map(i => `${i.title ?? i.path ?? i.branch ?? STRANDED_KINDS[i.kind].label}:${i.why}`)
+  /** 这几项**合并解决不了**,得按 `b` 回溯 —— 屏幕上要分开说,别混进「摆出来」那一堆。 */
+  /**
+   * 这几项**合并解决不了** —— 产出丢了 / 集成验收没通过,得按 `b` 回溯。
+   * 单独数出来,让确认屏能分开说,别混进「摆出来」那一堆(那一堆是「该不该动是你的决定」,
+   * 这一堆是「合并这条路对它们根本无效」)。
+   */
+  const needBacktrack = report.items.filter(i => STRANDED_KINDS[i.kind].action === 'backtrack').length
   const plan = await planRescue({
     git,
     gitRoot: pool.gitRoot,
@@ -422,6 +440,12 @@ async function scanRescue(
     ...(deps.onProgress ? { onProgress: deps.onProgress } : {}),
     ...(deps.signal ? { signal: deps.signal } : {}),
   }, refOnly, deps.listFiles)
+  if (needBacktrack > 0) {
+    plan.problems.push(
+      `上面这 ${needBacktrack} 项**合并解决不了**(产出丢了 / 集成验收没通过)—— 按 b 回溯:` +
+      '它会把集成验收的意见注入执行阶段重跑,必要时完全重做并加新任务。',
+    )
+  }
   plan.problems.push(...notices)
   // 扫描本身的问题(列不出抢救分支之类)要并进来 —— 它们是「这一格是空白,不是没有」。
   plan.problems.push(...report.problems)
@@ -434,11 +458,30 @@ async function scanRescue(
  * 导出是为了让探针能对着它断言:分类表新增一格「能合的」而这个键没跟上时,它变红。
  * 「全部捞回」的验收标准是一件都不漏,而漏项唯一的形态就是「新增了一类,没人认领」。
  */
+/**
+ * `m` 键**自己合不了、但必须念出来**的那几格。
+ *
+ * 和 `MERGE_KEY_COVERS` 是一对:两份加起来必须覆盖 `STRANDED_KINDS` 的每一格,
+ * 否则「全部捞出来」这句话就有一格是假的。探针按这条断言(此前只断言 merge 那几格,
+ * 于是 `backtrack` 那两格被静默丢掉时它照样绿)。
+ */
+export const MERGE_KEY_REPORTS: readonly string[] = [
+  // 摆出来:该不该动是用户的决定。
+  'integrationDirty', 'degraded', 'cancelled',
+  // 合并解决不了,要按 b 回溯:产出丢了 / 集成验收没通过。
+  'missing', 'integrateFail',
+  // 这两格的 action 是 'report',但 `refOnly` **也会真的去合它们**(它们有 ref 或目录)——
+  // 所以两张表都收。探针要的是「每一格都有人管」,不是「两表互斥」。
+  'salvageOrphan', 'orphanDir',
+]
+
 export const MERGE_KEY_COVERS: readonly string[] = [
   // 逐节点那条路(复用 commitAndMerge):工作区里未提交的、已提交没合入的。
   'loose', 'unmerged',
   // 捞那条路(主模型分诊 + 解冲突模型执行合并):没有工作区目录的那几类。
-  'salvage', 'salvageOrphan', 'branchOnly',
+  // `orphanDir` 也在 `refOnly` 里(它是盘上的孤儿目录),分类表把它标成 'report' 是因为
+  // 「该不该动是用户的决定」—— 但这个键确实会去处置它,所以认领表要收。
+  'salvage', 'salvageOrphan', 'branchOnly', 'orphanDir',
   // 第二跳:集成分支 → 你当前的分支。
   'trunk',
 ]

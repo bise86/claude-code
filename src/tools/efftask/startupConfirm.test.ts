@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, type IsolationChoice, ISOLATION_DEGRADE_PREFIX, ISOLATION_REASON_PREFIX, ISOLATION_RECORD_PREFIX, reconcileIsolationNotices, splitNotices, isSharedTree, isolationChoiceLines, parallelismIsolation, poolDisposition, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, type IsolationChoice, ISOLATION_DEGRADE_PREFIX, ISOLATION_REASON_PREFIX, ISOLATION_RECORD_PREFIX, reconcileIsolationNotices, splitNotices, isSharedTree, isolationChoiceLines, parallelismIsolation, poolDisposition, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines , type HandoffSummary } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -1905,5 +1905,37 @@ describe('共享档留在盘上的那两样', () => {
 
   it('worktree 档不说 —— 那一档它们本来就是正常工作的一部分', () => {
     expect(t('worktree')).not.toContain('git worktree remove')
+  })
+})
+
+/**
+ * **`git merge <集成分支>` 捞不到 salvage 和保留工作区 —— 屏幕不能把用户指上这条路。**
+ *
+ * 进 `kept` / `salvage` 的前提就是「不在集成分支里」。而这一屏同时印着「合并: git merge …」
+ * 那条建议命令,它只覆盖四类里的一类。跑机实测(run 001)那一屏上是 607 个提交 + 7 条
+ * salvage + 3 个保留工作区,而唯一的建议命令对后两类一件都捞不到。
+ */
+describe('handoffLines 对 salvage / 保留工作区说实话', () => {
+  const h = (over: Partial<HandoffSummary> = {}): HandoffSummary => ({
+    branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [], ...over,
+  }) as HandoffSummary
+
+  it('有 salvage / kept → 明说 git merge 捞不到,并给出两条能照做的路', () => {
+    const t = handoffLines(h({ salvage: ['efftask/001/salvage/a'], kept: [{ path: '/wt/x', why: '未回收' }] }), { runId: '001' }).join('\n')
+    expect(t).toContain('不在集成分支上')
+    expect(t).toContain('捞不到它们')
+    expect(t).toContain('按 m')
+    // 逐条那条路必须也在 —— 这几行会进对话记录,那时面板已经关了,「按 m」按不到。
+    expect(t).toContain('逐条 git merge')
+  })
+
+  /** 最危险的一屏:逐任务合并全部落地(commits === 0),那里根本没有「合并:」那行命令可改。 */
+  it('commits === 0 时也要说 —— 那一屏没有别的命令可改', () => {
+    const t = handoffLines(h({ commits: 0, salvage: ['efftask/001/salvage/a'] }), { runId: '001' }).join('\n')
+    expect(t).toContain('捞不到它们')
+  })
+
+  it('两类都没有时一个字都不多说', () => {
+    expect(handoffLines(h({ commits: 3 }), { runId: '001' }).join('\n')).not.toContain('捞不到它们')
   })
 })

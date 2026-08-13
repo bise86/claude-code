@@ -17,6 +17,7 @@ import { createWorktreePool, type GitRunner, type WorktreePool } from './worktre
 import {
   runSubtreeMerge, scanSubtreeMerge, subtreeMergeLines, subtreeMergeResultLines, subtreeMergeScope,
   MERGE_KEY_COVERS,
+  MERGE_KEY_REPORTS,
   type SubtreeMergeDeps,
 } from './mergeSubtree.js'
  import { STRANDED_KINDS, STRANDED_KIND_LIST } from './stranded.js'
@@ -124,7 +125,7 @@ describe('扫描', () => {
     await pool.init()
     const a = mk('root/00-a', { title: '甲', status: 'EXECUTING' })
     await work(pool, a, 'a.txt', 'a\n')
-    const plan = await scanSubtreeMerge(depsOf(pool), [a], a.id)
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
     expect(plan.items).toHaveLength(0)
     expect(plan.skipped[0]!.why).toContain('还没跑完')
   })
@@ -134,7 +135,7 @@ describe('扫描', () => {
     await pool.init()
     const a = mk('root/00-a', { title: '甲', status: 'BLOCKED', mergeConflict: true })
     await work(pool, a, 'a.txt', 'a\n')
-    const plan = await scanSubtreeMerge(depsOf(pool), [a], a.id)
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
     expect(plan.items.map(i => i.nodeId)).toEqual([a.id])
   })
 
@@ -190,7 +191,7 @@ describe('扫描', () => {
     const a = mk('root/00-a', { title: '甲' })
     const path = await work(pool, a, 'a.txt', 'a\n')
     await writeFile(join(path, 'loose.txt'), 'loose\n')
-    const plan = await scanSubtreeMerge(depsOf(pool), [a], a.id)
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
     expect(plan.items[0]!.loose).toBe(1)
     expect(subtreeMergeLines(plan).join('\n')).toContain('未提交内容会被一并提交')
   })
@@ -444,6 +445,28 @@ describe('覆盖完整性', () => {
   it('认领表里没有分类表之外的名字', () => {
     for (const k of MERGE_KEY_COVERS) expect(STRANDED_KIND_LIST).toContain(k)
   })
+
+  /**
+   * **每一格都要有人管 —— 不只是「能合的」那几格。**
+   *
+   * 上一版只断言 `action === 'merge'` 的格子,于是 `missing` / `integrateFail`
+   * (用户原话里的「功能没有达标的」)被 `scanRescue` 静默丢掉时,这一组照样全绿:
+   * `refOnly` 不收它们,而 notices 的判据写的是 `=== 'report'`,两边都不进。
+   */
+  it('分类表里每一格要么被合、要么被念出来', () => {
+    for (const k of STRANDED_KIND_LIST) {
+      expect(
+        `${k}: ${MERGE_KEY_COVERS.includes(k) || MERGE_KEY_REPORTS.includes(k) ? '有人管' : '没人管'}`,
+      ).toBe(`${k}: 有人管`)
+    }
+  })
+
+  /** 「合并解决不了」那两格要指向 `b`,而不是混进「摆出来」那一堆。 */
+  it('backtrack 那两格在念出来的表里', () => {
+    for (const k of STRANDED_KIND_LIST.filter(x => STRANDED_KINDS[x].action === 'backtrack')) {
+      expect(MERGE_KEY_REPORTS).toContain(k)
+    }
+  })
 })
 
 /**
@@ -642,5 +665,56 @@ describe('捞回那一批要出现在确认屏上', () => {
     // 锚要精确到**捞回那一段的抬头**:「没有工作区目录」这几个字在既有文案里也出现
     // (「另有 N 个任务在盘上没有工作区目录」),按它断言等于什么都没断言。
     expect(text).not.toContain('另外捞回')
+  })
+})
+
+/**
+ * **「功能没达标」那两格:算出来了,就必须念出来。**
+ *
+ * 用户原话三段里的第三段(「功能没有达标的」)对应 `missing`(产出丢了)和
+ * `integrateFail`(集成验收没通过)。它们的 action 是 `backtrack` —— 合并这条路对它们
+ * 根本无效,而上一版 `scanRescue` 的 notices 判据写的是 `=== 'report'`,于是这两格
+ * `refOnly` 不收、notices 也不收,被唯一的消费者算出来之后原样扔掉。
+ */
+describe('合并解决不了的那几项要指向 b', () => {
+  /**
+   * `integrateFail` 的判据是 `status === 'BLOCKED'` **且** acceptLog 里最后一条
+   * `step: 'integrate'` 的裁决没通过(见 `lastIntegrateFailed`)。缺 `step` 的老记录
+   * 谁的历史都不算 —— 那正是它专门挡的东西。
+   */
+  const mkFail = (id: string): TaskNode => {
+    const n = mk(id, { title: '甲' })
+    n.status = 'BLOCKED'
+    n.acceptLog = [{
+      step: 'integrate', at: 'T0', round: 1, verdicts: [],
+      synthesized: { pass: false, blocking: ['产出对不上'], comments: '' },
+    }] as never
+    return n
+  }
+
+  it('集成验收没通过 → 屏幕上明说「合并解决不了,按 b 回溯」', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mkFail('root/00-a')
+    await work(pool, a, 'a.txt', 'hello\n')
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
+    const t = subtreeMergeLines(plan).join('\n')
+    expect(t).toContain('合并解决不了')
+    expect(t).toContain('按 b 回溯')
+    /**
+     * **逐条列出来,不只是数一个数。** 用户要知道是**哪几个任务**没达标 —— 这几条正是
+     * `notices` 那一路(判据是「不是 merge」而不是「是 report」;写成后者的话这两格
+     * 两边都不进,屏幕上只剩一句没有主语的总数)。
+     */
+    expect(t).toContain('甲:集成验收没通过')
+  })
+
+  it('没有这类项时一个字都不多说', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
+    expect(subtreeMergeLines(plan).join('\n')).not.toContain('合并解决不了')
   })
 })

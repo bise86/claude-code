@@ -242,14 +242,16 @@ describe('收口:跑完就把产出送回当前目录', () => {
     iteration: { planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
     depth: 0, createdAt: 'T0', updatedAt: 'T0',
   }]
-  const poolWithCommits = (commits: number, trunkLanded = 0) => ({
+  const poolWithCommits = (commits: number, trunkLanded = 0, stranded: { kept?: string[]; salvage?: string[] } = {}) => ({
     init: async () => ({ ok: true }),
     acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b', gitRoot: '/repo' }),
     commitAndMerge: async () => ({ ok: true, merged: true }),
     release: async () => ({ removed: true }),
     dispose: async () => ({ kept: [] }),
     handoff: async () => ({
-      branch: 'efftask/004/integration', commits, kept: [], salvage: [], integrationPath: '/wt/integration',
+      branch: 'efftask/004/integration', commits,
+      kept: stranded.kept ?? [], salvage: stranded.salvage ?? [],
+      integrationPath: '/wt/integration',
       // 逐任务合并这一路:`trunkLanded` 是「已经在用户分支上」的提交数,收口那一步靠它
       // 决定「没有待收口 ≠ 什么都没发生」。桩 pool 不给这个字段的话,那条路一次也跑不到。
       trunkLanded,
@@ -303,6 +305,8 @@ describe('收口:跑完就把产出送回当前目录', () => {
     withGit?: boolean
     /** 收口撞上冲突时被派去解冲突的那一位。默认什么都不回答(这条路上没人调用它)。 */
     runAgent?: RunAgentFn
+    /** 盘上还剩的那两类:保留的工作区 / 抢救出来的提交。它们和 commits 无关。 */
+    stranded?: { kept?: string[]; salvage?: string[] }
   } = {}) => {
     const fs = memFs()
     const g = git(over.answers)
@@ -320,7 +324,7 @@ describe('收口:跑完就把产出送回当前目录', () => {
       {
         config, runDir: '/run/004', fs, runAgent: over.runAgent ?? ((async () => '') as RunAgentFn),
         signal: new AbortController().signal,
-        worktrees: poolWithCommits(over.commits ?? 3, over.trunkLanded ?? 0) as never,
+        worktrees: poolWithCommits(over.commits ?? 3, over.trunkLanded ?? 0, over.stranded ?? {}) as never,
         seed: doneSeed() as never, cwd: '/repo',
         ...(over.withGit === false ? {} : { git: g.fn as never }),
         onHandoffResult: r => results.push(r as never),
@@ -395,6 +399,32 @@ describe('收口:跑完就把产出送回当前目录', () => {
     const r = await run({ commits: 0 })
     expect(r.g.calls).toEqual([])
     expect(r.results).toEqual([])
+    // 盘上也确实什么都没剩,才该不留记录。
+    expect(r.config.pendingHandoff).toBeUndefined()
+  })
+
+  /**
+   * **零提交 ≠ 盘上没东西 —— 而这一格此前会把它们永久弄丢。**
+   *
+   * 落盘判据原来只看 `commits`,而 `kept`(保留的工作区)/ `salvage`(抢救出来的提交)
+   * 就在同一个对象里。跑机形态:逐任务合并全部落地(`commits === 0`),盘上仍留着 7 条
+   * `efftask/001/salvage/*` 和 3 个保留工作区。
+   *
+   * 而 `scanStranded` 全仓库只有一个消费者(`m` 键),`m` 只能从任务树进,任务树只能
+   * 从关口/结束屏进。记录不落盘 = 用户按 `q` 之后 `--resume` 什么都不弹,run.md 里一个
+   * 字都没有,**再也没有任何一条路径提到它们**。
+   */
+  it('零提交但盘上还剩抢救分支 / 保留工作区 → 记录必须落盘', async () => {
+    const r = await run({ commits: 0, stranded: { salvage: ['efftask/004/salvage/a'], kept: ['/wt/x'] } })
+    expect(r.config.pendingHandoff?.commits).toBe(0)
+    expect(r.config.pendingHandoff?.salvage).toEqual(['efftask/004/salvage/a'])
+    expect(r.config.pendingHandoff?.kept).toEqual(['/wt/x'])
+    expect(r.manifest).toContain('pendingHandoff')
+  })
+
+  it('只有保留的工作区(一条抢救分支都没有)也要留', async () => {
+    const r = await run({ commits: 0, stranded: { kept: ['/wt/x'] } })
+    expect(r.config.pendingHandoff).toBeDefined()
   })
 
   /**

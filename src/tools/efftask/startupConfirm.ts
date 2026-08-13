@@ -1611,5 +1611,28 @@ export function handoffLines(
    * 一个未跟踪文件就会走上这条路,一次中断都没发生过。措辞按**内容**说,不按成因说。
    */
   for (const s of h.salvage) out.push(`抢救出的提交(未合入集成分支的中间产物): ${s}`)
+  /**
+   * **`git merge <集成分支>` 捞不到上面这两类 —— 不说清就是把用户指上一条捞不全的路。**
+   *
+   * 逐类核过(`stranded.ts` 的分类表):进 `kept` / `salvage` 的前提**就是**「不在集成
+   * 分支里」(`merge-base --is-ancestor` 判不通过才进清单)。而这一屏同时印着那条
+   * 「合并: git merge …」的建议命令 —— 它只覆盖 `trunk` 那一格,四类里的一类。
+   *
+   * 无条件追加,不挂在 `h.commits > 0` 里面:最危险的恰恰是 `commits === 0`(逐任务
+   * 合并全部落地)而仍有 salvage 的那一屏,那里根本没有那行命令可改。
+   *
+   * **不能只写「按 m」**:这几行同时被 `exitReportLine` 用,而那是 `/et` 退出后写进
+   * **对话记录**的一行 —— 那时面板已经关了,「按 m」是一条按不到的指令。所以两条路都给,
+   * 而且逐条 `git merge <ref>` 是真能照做的:上面已经把 ref 名字全印出来了。
+   */
+  if (h.kept.length > 0 || h.salvage.length > 0) {
+    out.push(
+      `⚠ 上面这 ${h.salvage.length} 条抢救分支和 ${h.kept.length} 个保留工作区**不在集成分支上**,` +
+      `git merge ${h.branch} 捞不到它们`,
+    )
+    out.push(runId
+      ? `  捞回它们:/et --resume ${runId} 之后在任务树上按 m(一次全捞);或者逐条 git merge <上面的 ref>`
+      : '  捞回它们:重新进 /et 后在任务树上按 m(一次全捞);或者逐条 git merge <上面的 ref>')
+  }
   return out
 }

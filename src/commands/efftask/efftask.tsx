@@ -1253,7 +1253,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       // 已经 ACCEPTED,reseat 一个节点也捞不回来,于是下面那句「没有可恢复的节点」会直接
       // 把用户挡在门外,而集成分支就永远没人处置了。这正是「跑完先还终端、回头再收口」
       // 这条路唯一的入口。
-      if (recovered.pendingHandoff && recovered.pendingHandoff.commits > 0) {
+      // 判据和落盘那一侧同源(runOrchestrator 那段注释):kept / salvage 与「集成分支上
+      // 还剩几个提交」无关,只看 commits 的话,逐任务合并全部落地的那一趟里那 7 条抢救
+      // 分支和 3 个保留工作区连关口都进不去 —— 而 `m` 是它们唯一的入口。
+      if (recovered.pendingHandoff && (
+        recovered.pendingHandoff.commits > 0
+        || (recovered.pendingHandoff.kept ?? []).length > 0
+        || (recovered.pendingHandoff.salvage ?? []).length > 0
+      )) {
         if (cancelled) return
         setPendingHandoff(recovered.pendingHandoff)
         setConfig(recovered)

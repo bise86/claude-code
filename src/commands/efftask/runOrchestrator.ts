@@ -281,9 +281,22 @@ export async function runOrchestrator(
       // status 先写下 completed 而集成分支还没处置,用户直接关终端就再也没人管那条分支
       // 了(reseat 只捞活动态节点,根节点已 ACCEPTED)。
       //
-      // commits === 0 时不留 —— 没有任何改动就没什么可收口的,留下它只会让下次 --resume
-      // 弹一个四选一去处置一条空分支。
-      if (h.commits > 0) {
+      /**
+       * **判据不能只看 `commits`。**
+       *
+       * `h.kept`(保留的工作区)和 `h.salvage`(抢救出来的提交)就在同一个对象里,
+       * 而它们和「集成分支上还剩几个提交」**没有关系** —— 逐任务合并全部落地的那一趟
+       * (`commits === 0`)照样可能留着 7 条 salvage 和 3 个保留工作区。
+       *
+       * 而 `scanStranded` 全仓库只有一个消费者(`mergeSubtree` 的 `m` 键),`m` 只能从
+       * 任务树进,任务树只能从关口/结束屏进。所以记录一旦不落盘,用户按 `q` 之后
+       * **再也没有任何一条路径提到它们**:`--resume` 什么都不弹,run.md 里一个字都没有。
+       *
+       * 原来的注释说「留下它只会让下次 --resume 弹一个四选一去处置一条空分支」—— 那半句
+       * 仍然对,所以关口那一侧要按 `commits === 0` 退化成「没有待合的提交,但还有 N 处
+       * 产出没送到」,而不是靠这里不落盘来回避。
+       */
+      if (h.commits > 0 || h.kept.length > 0 || h.salvage.length > 0) {
         // 降级放行的节点数一起带上 —— `planFinish` 靠它决定「跑完了但没通过判决,
         // 不自动合进用户的检出」。少了它,一次全靠降级放行推完的运行会以 completed
         // 的身份触发自动 merge(见 PendingHandoff.degradedNodes)。
