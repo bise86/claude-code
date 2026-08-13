@@ -1043,6 +1043,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const handoffRef = React.useRef<HandoffSummary | null>(null)
   // What the gate must SAY. Resolved before the gate opens; 'none' until then.
   const [isolation, setIsolation] = React.useState<'worktree' | 'none'>('none')
+  /**
+   * 这一趟是不是**共享目录 + 并发**(第三档)。
+   *
+   * `ref` 而不是 `state`:它的读者是 `startRun`(建编排器那一刻),而它在
+   * `applyStartupDecision` 之后**同步**写下 —— 中间没有一次渲染,state 那一份还没提交。
+   */
+  const sharedParallelRef = React.useRef(false)
   // 启动关口第三关 (spec §2). `approved` is the config as confirmed at gates 1+2 — held
   // because the root-plan gate sits BETWEEN that confirmation and the run, and the drafting
   // call needs the confirmed roster (the plan role) to draft with.
@@ -1317,7 +1324,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       const isoR = await makeWorktreePool(runId!, getCwd())
       poolRef.current = isoR.pool
       setIsolation(isoR.pool ? 'worktree' : 'none')
-      if (!isoR.pool && isoR.reason) withGuidance.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${isoR.reason}`)
+      if (!isoR.pool && isoR.reason) withGuidance.notices.push(`隔离不可用,执行阶段默认共享工作目录并串行(关口按 w 可改成并发): ${isoR.reason}`)
       // 隔离**是靠自愈才建起来的** —— 盘上被动过,必须说出口(见 makeWorktreePool.healed)。
       for (const h of isoR.healed ?? []) withGuidance.notices.push(`隔离工作区自愈: ${h}`)
       // 恢复关口原来只会说「这一趟没有可用的隔离工作区」,把真因扔了 —— 而真因
@@ -1393,7 +1400,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         setCanInitGit(iso.pool ? false : (iso.notARepo === true || iso.needsFirstCommit === true))
         // ALSO recorded in run.md. Replacing the notices.push with component state alone meant
         // the manifest stopped saying the run was un-isolated, while the resume path still did.
-        if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段将共享工作目录并串行: ${iso.reason}`)
+        if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段默认共享工作目录并串行(关口按 w 可改成并发): ${iso.reason}`)
         for (const h of iso.healed ?? []) cfg.notices.push(`隔离工作区自愈: ${h}`)
         // 配置文件那条录入口的诊断。放在**最前**:它讲的是用户写在盘上的东西哪里不对,
         // 比运行期的降级更该先看到。也一并落进 run.md —— notices 是持久的。
@@ -1537,6 +1544,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 同一个实例:面板按 x 取消的是它,适配器登记在飞调用的也是它。
         control: props.control,
         signal: props.signal, seed: rootSeed ?? seed ?? undefined, worktrees: pool,
+        // 第三档(共享目录 + 并发)。**唯一**能解开执行互斥的开关 —— 没有池子时
+        // orchestrator 默认把执行阶段串起来,因为大家写的是同一棵树。读 ref 不读 state:
+        // 它在 applyStartupDecision 里同步写下,中间没有一次渲染。
+        sharedParallel: sharedParallelRef.current,
         // 后台任务登记 (spec §10). Handed to runOrchestrator rather than wired here: that
         // module is importable by a test, this one is not, and the last two features wired
         // in this file were dead in production while every test passed over the severed wire.
@@ -2036,6 +2047,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       const res = await draftRootPlan({
         root, config: approved, runAgent: props.runAgent, signal: props.signal, feedback,
         worktrees: poolRef.current,
+        // 第三档:没有池子,但用户显式按 w 选了并发。见 orchestrator 的 serialiseExecute ——
+        // 它必须和上面那句「把池子放下」在同一处兑现。
+        sharedParallel: sharedParallelRef.current,
         // 第三关的窗口。整个运行里最长的单次调用之一,此前是纯黑屏。
         cwd: getCwd(),
         stream: streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '根方案', label: '主模型', round: redrafts + 1, pinned: true }),
@@ -2197,11 +2211,26 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
          * 集成分支,下一趟会原样接手 —— 这和用户在关口按 Esc 那条路的处置逐字相同
          * (见 makeWorktreePool 调用处的注释)。
          */
-        if (effectiveConfig.isolation === 'shared') {
+        /**
+         * **判据是「不等于 worktree」,不是「等于 shared」。**
+         *
+         * 漏掉第三档的后果特别隐蔽:池子留着 → 这一趟**其实是 worktree 隔离并发**,而关口
+         * 逐字承诺了「不建 worktree、不产生任何提交、直接在你当前目录」。两种情况下
+         * `serialiseExecute` 都是 false,**调度上完全看不出区别** —— 用户只会发现产出不在
+         * 自己的目录里。
+         */
+        if (effectiveConfig.isolation !== 'worktree') {
           poolRef.current = undefined
           // 状态也要跟着改口:它是「这一趟**实际**隔离了没有」,而运行视图的表头、
           // run.md 的那条 notice 都读它。留着 'worktree' 就是屏幕上说隔离、实际共享。
           setIsolation('none')
+          /**
+           * **和「把池子放下」在同一处兑现。**
+           *
+           * 见 `orchestrator.serialiseExecute`:两者分开的后果是「池子留着 + 互斥解开」,
+           * 而那恰好是关口承诺的反面。
+           */
+          sharedParallelRef.current = effectiveConfig.isolation === 'shared-parallel'
         }
         setApproved(effectiveConfig)
         // RESUME skips the third gate. Its tree already exists on disk — drafting a fresh
@@ -2674,7 +2703,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       cancelled: control.wasCancelled(target.id),
       finished: orchRef.current === null,
       // 和 orchestrator 的 `serialiseExecute` 同一份真相:没有池子 = 执行串行。
-      serialExecute: poolRef.current === undefined,
+      serialExecute: poolRef.current === undefined && !sharedParallelRef.current,
     })
     return (
       <ConfirmRecalcDeps
@@ -2756,7 +2785,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           return n !== undefined && notSchedulableReason(n, m, {
             inFlight: new Set(orchRef.current?.runningNodeIds() ?? []),
             // 共享工作树下第 2 个及以后的执行型节点只是**排队**,不是「马上就会被调度」。
-            serialExecute: poolRef.current === undefined,
+            serialExecute: poolRef.current === undefined && !sharedParallelRef.current,
           }) === undefined
         }}
         onCancelAsk={() => {
@@ -2790,7 +2819,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'running') {
-    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} serialExecute={poolRef.current === undefined}
+    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} serialExecute={poolRef.current === undefined && !sharedParallelRef.current}
       /**
        * 运行中按 f = 预先批准。**不在这里判能不能** —— 关口自己会按节点状态和本次配置
        * 算出可选的环节并逐条说明原因,而在这儿再判一次就是第二份判据。
@@ -2883,14 +2912,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         running: new Set(orchRef.current?.runningNodeIds() ?? []),
         cancelled: control.wasCancelled(node.id),
         finished: orchRef.current === null,
-        serialExecute: poolRef.current === undefined,
+        serialExecute: poolRef.current === undefined && !sharedParallelRef.current,
       }).ok === true}
       onRecalcDeps={node => {
         const why = recalcScope(node, new Map(nodes.map(n => [n.id, n] as [string, TaskNode])), {
           running: new Set(orchRef.current?.runningNodeIds() ?? []),
           cancelled: control.wasCancelled(node.id),
           finished: orchRef.current === null,
-          serialExecute: poolRef.current === undefined,
+          serialExecute: poolRef.current === undefined && !sharedParallelRef.current,
         })
         if (why.ok !== true) {
           return [why.reason, ...why.details.map(d => `· ${d}`)].join('\n')

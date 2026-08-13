@@ -1347,3 +1347,28 @@ describe('收尾时最终 manifest 无条件写', () => {
     expect(src).not.toContain('void queueManifest(liveNodes, pendingOutcome)')
   })
 })
+
+
+/**
+ * **共享目录两档下,验证指纹不许退回当前目录。**
+ *
+ * `?? ctx.cwd` 看上去是无害的兜底,而第三档(共享目录 + 并发)下 N 个执行者同时在同一个
+ * 目录里写,谁的 `git status` 都是所有人的改动之和:要么每一轮测试验证都被判成「验证者
+ * 动了工作区」而作废,要么把别人的改动当成本节点的证据。没有隔离时这道闸门本来就不成立。
+ */
+describe('verifySnapshot 的兜底禁令', () => {
+  const src = readFileSync(new URL('src/tools/efftask/pipeline.ts', ROOT), 'utf8')
+  const body = src.slice(src.indexOf('async function verifySnapshot'))
+    .slice(0, src.slice(src.indexOf('async function verifySnapshot')).indexOf('\n}\n'))
+
+  it('没有 worktree 就返回 undefined,不退回 ctx.cwd', () => {
+    expect(body).toContain('if (!wt || !ctx.worktrees?.statusFingerprint) return undefined')
+    // 注释里**要**出现 `?? ctx.cwd`(那是禁令本身),所以先把注释剥掉再看代码。
+    const code = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '')
+    expect(code).not.toContain('ctx.cwd')
+  })
+
+  it('禁令本身写在代码里(下一个人读得到为什么)', () => {
+    expect(src).toContain('这里永远不许加 `?? ctx.cwd` 兜底')
+  })
+})

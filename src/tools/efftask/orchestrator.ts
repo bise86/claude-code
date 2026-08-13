@@ -43,6 +43,12 @@ export interface OrchestratorDeps {
    * 而「静默清理和静默截断是同一类毛病」是这个仓库反复在修的那一条。
    */
   onBuildWipe?: PipelineCtx['onBuildWipe']
+  /**
+   * 这一趟是**共享目录 + 并发**吗(第三档)。
+   *
+   * 只有它能解开执行互斥。**必须和「把池子放下」在同一处算出来** —— 见 `serialiseExecute`。
+   */
+  sharedParallel?: boolean
   /** Run id, used only to write an actionable retry command into `blockedReason`. */
   runId?: string
   /**
@@ -383,6 +389,7 @@ export class EffTaskOrchestrator {
       onEscalate: this.deps.onEscalate,
       onBlocked: this.deps.onBlocked,
       onBuildWipe: this.deps.onBuildWipe,
+      sharedParallel: this.deps.sharedParallel,
       runId: this.deps.runId,
       openStream: this.deps.openStream,
       cwd: this.deps.cwd,
@@ -493,7 +500,17 @@ export class EffTaskOrchestrator {
       // Keyed on the POOL, not on config: a config flag could say "isolated" while every
       // acquire failed. With a pool present, stepExecute refuses to run any node it cannot
       // isolate, so "pool exists" really does mean "no two executors share a tree".
-      const serialiseExecute = kind === 'execute' && this.deps.worktrees === undefined
+      /**
+       * 第三档 `shared-parallel`:**没有池子,但用户显式选了并发**。
+       *
+       * 判据仍然**不读 config** —— 上面那句注释立的规矩没变(「a config flag could say
+       * isolated while every acquire failed」)。`sharedParallel` 是一个 **dep**,由命令层在
+       * `applyStartupDecision` 之后、建编排器之前算出来,和「把池子放下」在同一处兑现。
+       * 两者分开的后果是致命的:池子留着 + 互斥解开 = 这一趟其实是 worktree 隔离并发,
+       * 而关口逐字承诺了「不建 worktree、直接在你当前目录」,**调度上完全看不出区别**。
+       */
+      const serialiseExecute = kind === 'execute'
+        && this.deps.worktrees === undefined && this.deps.sharedParallel !== true
       const task = serialiseExecute ? (executeChain = executeChain.then(step, step)) : step()
       return task.finally(() => { inFlight.delete(n.id); this.inFlightIds.delete(n.id) })
     }

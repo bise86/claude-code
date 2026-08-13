@@ -70,6 +70,18 @@ export interface PipelineCtx {
    */
   onBuildWipe?: (e: { nodeId: string; title: string; outcome: BuildWipeOutcome }) => void
   /**
+   * 这一趟是**共享目录 + 并发**吗(第三档)。
+   *
+   * 这一份**只进提示词** —— 调度那一侧的判据住在 `OrchestratorDeps.sharedParallel`
+   * (见那里的注释:它必须和「把池子放下」在同一处兑现)。它存在的理由是:共享并发下
+   * **没有任何机制**能挡住两个执行者改同一个文件,而「只动属于本任务的文件」这句话
+   * 是它全部的安全网。
+   *
+   * 这条线是 `OrchestratorDeps → PipelineCtx → PlanPromptCtx → draftRootPlan`,
+   * 而**它已经断过三次**(`orchestrator.ts` 顶上那几段注释就是那三次的墓志铭)。
+   */
+  sharedParallel?: boolean
+  /**
    * 人工升级 (spec §8): a merge conflict the node could not resolve itself.
    *
    * A callback rather than a direct Feishu call, because the shared client lives in the
@@ -831,8 +843,23 @@ function promptTooLongRemedy(): string {
  * cwd」写的,而主工作树恰恰是**唯一看不到本次运行任何产出**的那棵树 —— 继续那么说等于
  * 把人从对的目录赶到错的目录去。禁令只剩共享的 `integration` 那一条,那条的成因没变。
  */
-function sharedTreeNote(isolated: boolean, own?: string): string {
-  if (!isolated) return ''
+/**
+ * 「你在哪、别碰什么」。
+ *
+ * **共享模式此前返回空串 = 执行者收到的约束是零**,而第三档(共享 + 并发)恰恰是唯一
+ * 一种「没有任何机制能挡住两个执行者改同一个文件」的运行 —— 那句约束是它全部的安全网。
+ */
+function sharedTreeNote(isolated: boolean, own?: string, sharedParallel?: boolean): string {
+  if (!isolated) {
+    return sharedParallel === true
+      ? '注意:本次运行**没有隔离**,而且**多个任务正在同一个目录里同时工作**。\n' +
+        '你只能创建/修改**属于本任务**的文件(方案与验收点里点名的那些);' +
+        '不要改别的任务的文件,也不要跑会全局改写的命令(整仓格式化、更新锁文件、' +
+        '`cargo fmt --all`、`git checkout .` 之类)—— 别人的产出就在同一棵树里,' +
+        '覆盖了不会有任何东西报错。\n'
+      : '注意:本次运行没有隔离,你直接在用户自己的工作目录里改代码,改动不会被自动提交。\n' +
+        '只动与本任务相关的文件。\n'
+  }
   return own
     ? `注意:你现在在**本节点专属**的隔离工作区 \`${quote(own)}\` 里,它已经落在集成分支的当前状态上 —— ` +
       '所有已通过验收的任务(包括本节点的依赖)的产出都在这里。读代码、跑构建/测试都请在这个目录里进行。\n' +
@@ -844,7 +871,7 @@ function sharedTreeNote(isolated: boolean, own?: string): string {
       '留在那里的未提交改动会让别的节点合并失败。要验证请在主工作树或你自己的工作区里跑。\n'
 }
 
-export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId' | 'worktrees'> & {
+export type PlanPromptCtx = Pick<PipelineCtx, 'config' | 'byId' | 'worktrees' | 'sharedParallel'> & {
   /**
    * 方案环节看到的工作目录。
    *
@@ -1205,7 +1232,20 @@ export function planPrompt(
     // 「在哪」和「可以看」。这两句缺席时,方案作者只能照着标题写一句正确的废话。
     (where ? `工作目录:${quote(where)}\n` : '') +
     `你有 Read / Glob / Grep,**先真的去看代码,再定方案** —— 不要只凭任务标题推测。\n` +
-    sharedTreeNote(isolated, node.worktree?.path) +
+    sharedTreeNote(isolated, node.worktree?.path, ctx.sharedParallel) +
+    /**
+     * **共享并发下,拆分方式本身就是安全机制。**
+     *
+     * 上面那句 `sharedTreeNote` 是给**执行者**的约束(「只动属于你的文件」),而这一句是给
+     * **拆分者**的:两个子任务如果注定要写同一个文件,那么无论执行者多守规矩都会互相覆盖 ——
+     * 而这一趟没有 git,连冲突都不会报。用户选这一档的前提逐字就是「任务是按照生成文件
+     * 来划分的」,所以这句话必须真的出现在决定怎么拆的那一次调用里。
+     */
+    (ctx.sharedParallel === true
+      ? '**本次运行是「共享目录 + 并发」**:子任务会在同一个目录里同时执行,而且没有 git 兜底。\n' +
+        '拆分时**必须按产出文件划分** —— 任意两个子任务不写同一个文件;做不到就不要拆成并行的两个,' +
+        '要么合并成一个,要么用 deps 让它们前后相继。\n'
+      : '') +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
     // The depth budget lives IN THE PROMPT so the model self-limits, instead of us
@@ -2162,6 +2202,17 @@ async function verifySnapshot(node: TaskNode, ctx: PipelineCtx): Promise<string 
   // !wt 是纵深防御:走到这里时 acquire 要么已经给了工作区、要么已经阻断了节点,
   // 所以它在 stepExecute 里不可达。留着是因为它一旦可达,后果是拿**用户主仓库**的
   // git status 当指纹 —— 他手头任何无关改动都会被算到验证者头上。
+  /**
+   * **这里永远不许加 `?? ctx.cwd` 兜底。**
+   *
+   * 看上去它只是「没有 worktree 时退而求其次比一比当前目录」,而在共享目录那两档下它是
+   * 错的,并且第三档(共享目录 + 并发)下错得最狠:N 个执行者同时在同一个目录里写,
+   * 谁的指纹都是所有人的改动之和 —— 于是每一轮测试验证都被判成「验证者动了工作区」而
+   * 作废,或者反过来把别人的改动算成本节点的证据。
+   *
+   * 没有隔离时这道闸门**本来就不成立**,返回 undefined 让调用方知道它这次没生效,
+   * 是唯一诚实的答案。
+   */
   const wt = node.worktree?.path
   if (!wt || !ctx.worktrees?.statusFingerprint) return undefined
   try { return await ctx.worktrees.statusFingerprint(wt) } catch { return undefined }

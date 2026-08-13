@@ -806,3 +806,66 @@ describe('回溯之后重新合并提交', () => {
     expect(acquires.filter(id => id === 'root').length).toBeGreaterThanOrEqual(2)
   })
 })
+
+/**
+ * **第三档:共享工作目录 + 并发。**
+ *
+ * 「没有池子」此前逐字等价于「执行阶段必须串行」—— 同一棵工作树里两个执行者会互相覆盖。
+ * 第三档把这个等价拆开:当任务是**按产出文件划分**的,共享目录里的并发既安全又快得多,
+ * 而这是用户显式在关口按 `w` 选的(用户原话:「w 显示选择」「如果显示选择了,是允许的」)。
+ *
+ * 判据故意是一个 **dep**(`deps.sharedParallel`)而不是读 config:配置可以写着「隔离」
+ * 而每一次 acquire 都失败,那种情形下执行**仍然**必须串行。
+ */
+describe('共享目录 + 并发(第三档)', () => {
+  /** 两个无依赖的叶子;执行环节报到之后一直挂着,直到测试放行。 */
+  const twoLeaves = (entered: string[], gate: Promise<void>): RunAgentFn => (async req => {
+    if (req.phase === 'plan') {
+      if (req.node.id === 'root') {
+        return '```json\n{"kind":"decompose","solution":"s","children":[{"title":"甲","deps":[]},{"title":"乙","deps":[]}]}\n```'
+      }
+      return '```json\n{"kind":"executable","solution":"leaf","acceptance":"跑 bun test 全绿"}\n```'
+    }
+    if (req.phase === 'execute') {
+      entered.push(req.node.title)
+      await gate
+      return '```json\n{"execStatus":"done"}\n```'
+    }
+    return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+  }) as RunAgentFn
+
+  /** 两个执行者同时在门口 = 互斥被解开了。 */
+  const bothInFlight = async (sharedParallel: boolean | undefined): Promise<number> => {
+    const entered: string[] = []
+    let open = (): void => {}
+    const gate = new Promise<void>(r => { open = r })
+    const orch = new EffTaskOrchestrator(
+      cfg(),
+      { ...deps(twoLeaves(entered, gate)), sharedParallel },
+      new AbortController().signal,
+    )
+    const run = orch.run()
+    // 让调度跑够多轮:方案/质疑修复都要先过,而它们本来就是并行的。
+    for (let i = 0; i < 60 && entered.length < 2; i++) await new Promise(r => setTimeout(r, 5))
+    const peak = entered.length
+    open()
+    await run
+    return peak
+  }
+
+  it('显式选了并发 → 两个执行者同时在飞', async () => {
+    expect(await bothInFlight(true)).toBe(2)
+  })
+
+  /**
+   * 反面必须一起钉:没选就是**串行**。默认打开等于替用户做一个不可逆的取舍 ——
+   * 这一档没有任何机制挡住两个任务改同一个文件,连冲突都不会报。
+   */
+  it('没选(默认)→ 执行仍然串行,一次只有一个在飞', async () => {
+    expect(await bothInFlight(undefined)).toBe(1)
+  })
+
+  it('显式选 false → 和默认一样串行', async () => {
+    expect(await bothInFlight(false)).toBe(1)
+  })
+})

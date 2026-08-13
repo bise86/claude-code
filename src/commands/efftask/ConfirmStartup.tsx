@@ -1,4 +1,5 @@
 import * as React from 'react'
+import type { IsolationChoice } from '../../tools/efftask/startupConfirm.js'
 import { Box, Text, useInput } from '../../ink.js'
 import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
@@ -10,6 +11,10 @@ import {
 
 export function ConfirmStartup(props: {
   config: EffTaskConfig
+  /**
+   * 这台机器上**能不能**隔离(池子建起来了没有),不是用户这一屏选了什么 ——
+   * 选择住在下面的 `iso`,而并行数那一行读的是**选择**(见 render 里的 `isoShown`)。
+   */
   isolation?: 'worktree' | 'none'
   /** 本次会话可用的 MCP 工具名。关口要说清它们在哪些环节可用、以及挡不住什么。 */
   mcpToolNames?: string[]
@@ -93,9 +98,26 @@ export function ConfirmStartup(props: {
    * 隔离**根本不可用**时钉死在 shared:那时候这不是一个选择(`isolationReason` 那一块
    * 单独解释为什么),而一个按了不动的开关比没有这个开关更糟。
    */
-  const forcedShared = props.isolationReason !== undefined
-  const [iso, setIso, isoRef] = useLiveState<'worktree' | 'shared'>(
-    forcedShared ? 'shared' : isolationChoice(props.config),
+  /**
+   * 隔离**根本不可用**时:worktree 那一档确实用不了,**但 `w` 键仍然要在**。
+   *
+   * 上一版把 `iso` 整个钉死在 `shared` 并摘掉键位,理由是「那时候这不是一个选择」——
+   * 而第三档(共享目录 + 并发)恰恰在这一格最有用:不是 git 仓库、也不需要 git,
+   * 用户要的正是速度。用户原话:「w 显示选择」「如果显示选择了,是允许的」。
+   *
+   * 所以变的是**选项集合**,不是键的存在与否:不可用时循环只在两档共享之间走。
+   */
+  const noWorktree = props.isolationReason !== undefined
+  const cycle: readonly IsolationChoice[] = noWorktree
+    ? ['shared', 'shared-parallel']
+    : ['worktree', 'shared', 'shared-parallel']
+  const [iso, setIso, isoRef] = useLiveState<IsolationChoice>(
+    // 不可用时,他此前选过的那一档如果还在候选里就留着 —— 否则退回 shared。
+    // **绝不默认落到 shared-parallel**:并发在这种模式下没有安全网,默认打开等于替他
+    // 做一个不可逆的取舍(用户明确要求「w 显示选择」)。
+    noWorktree
+      ? (isolationChoice(props.config) === 'shared-parallel' ? 'shared-parallel' : 'shared')
+      : isolationChoice(props.config),
   )
   const [push, setPush, pushRef] = useLiveState<boolean>(props.config.autoPush === true)
   const [editing, setEditing, editingRef] = useLiveState(false)
@@ -150,10 +172,12 @@ export function ConfirmStartup(props: {
      * 两个 git 开关(「收口方式」随分支开发一起去掉了 —— 只有主干开发)。**隔离不可用时 `w` 不接** —— 那时候屏幕上写的是「不是你选的」,
      * 而一个按了不动的键会让人以为是自己按错了。
      */
-    if (input.toLowerCase() === 'w' && !forcedShared) {
-      setIso(isoRef.current === 'worktree' ? 'shared' : 'worktree'); props.onEdited?.(); return
+    if (input.toLowerCase() === 'w') {
+      // 三档循环(隔离不可用时是两档)。用 indexOf 而不是三元链:加第四档时不会漏分支。
+      const i = cycle.indexOf(isoRef.current)
+      setIso(cycle[(i + 1) % cycle.length]!); props.onEdited?.(); return
     }
-    if (input.toLowerCase() === 'p' && isoRef.current === 'worktree' && !forcedShared) {
+    if (input.toLowerCase() === 'p' && isoRef.current === 'worktree' && !noWorktree) {
       setPush(!pushRef.current); props.onEdited?.(); return
     }
     // 「或初始化 git」 (spec §8). Only live when the caller supplied a handler AND isolation is
@@ -179,11 +203,24 @@ export function ConfirmStartup(props: {
   // 两个 git 开关同样要进 shown —— 屏幕上那几行读的是 shown,而按 y 送出去的是这两个 ref。
   // 两者读不同的来源,就是「显示一套、执行另一套」。
   const shown: EffTaskConfig = { ...props.config, phaseRoles: roster, skipSteps: skip, isolation: iso, autoPush: push }
+  /**
+   * 并行数那一行读的是**这一屏的选择**,不是 `props.isolation`(那只是「池子建起来了没有」)。
+   *
+   * 读 props 的后果是按 `w` 选到第三档之后,上面那行仍然写着「执行与叶子验收串行」——
+   * 而送出去的决策是共享目录**并发**。同一屏两句话打架,而这一串还会进飞书卡。
+   *
+   * `worktree` 这一档要和「池子真的在」取交集:候选集合已经排除了它,这里是第二道闩 ——
+   * 没有池子却印着「在各自的 worktree 中隔离、自动合并回当前分支」是最贵的一种谎。
+   */
+  const isoShown: 'worktree' | 'none' | 'shared-parallel'
+    = iso === 'shared-parallel' ? 'shared-parallel'
+    : iso === 'worktree' && props.isolation === 'worktree' ? 'worktree'
+    : 'none'
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 启动确认</Text>
       <Text>目标: {goalLine(props.config.goalPrompt)}</Text>
-      <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: props.isolation })}</Text>
+      <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: isoShown })}</Text>
       {/* git 那几行。**不是警告色** —— 这是用户要自己决定的取舍,不是「有一部分不会生效」。
           编辑名册时不画键位提示(那时候 w/m/p 归编辑器)。 */}
       {gitChoiceLines(shown, { editable: !editing, unavailable: props.isolationReason }).map(l => (
@@ -287,7 +324,7 @@ export function ConfirmStartup(props: {
           回车/y 开始 · r 编辑角色名册 · ←/→ 调整并行数
           {/* w/m/p 只在真的可切时才写 —— 隔离用不了的时候它们是死键,而一个按了没反应的
               键和一个不存在的键在排查时差别很大(这个仓库为这条付过好几次学费)。 */}
-          {forcedShared ? '' : ` · w 隔离方式${iso === 'worktree' ? ' · p 自动推送' : ''}`}
+          {` · w 隔离方式${iso === 'worktree' ? ' · p 自动推送' : ''}`}
           {props.isolationReason && props.onInitGit ? ' · g 初始化 git 并重试隔离' : ''}
           {' · Esc/n 取消'}
         </Text>

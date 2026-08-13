@@ -84,6 +84,17 @@ export async function draftRootPlan(args: {
    * without the constraint the run then enforces.
    */
   worktrees?: PlanPromptCtx['worktrees']
+  /**
+   * 这一趟是**共享目录 + 并发**吗(第三档)。
+   *
+   * **根方案起草者是这个模式安全性的第一责任人** —— 它决定这棵树怎么拆,而共享并发全部的
+   * 前提就是「任务按产出文件划分,任意两个子任务不写同一个文件」。它一个字都收不到的话,
+   * 拆出来的树没有任何理由满足那个前提,而运行时**没有任何机制**能挡住两个执行者改同一个
+   * 文件(没有 git,连冲突都不会报)。
+   *
+   * 这条线是 `OrchestratorDeps → PipelineCtx → PlanPromptCtx → 这里`,已经断过三次。
+   */
+  sharedParallel?: boolean
   /** 告诉方案作者「你在哪」。缺了它,它只能照着标题写一句正确的废话。 */
   cwd?: string
   /**
@@ -100,7 +111,10 @@ export async function draftRootPlan(args: {
   const tag = answerTag(ANSWER_TAGS.plan)
   // byId holds only the root: it has no deps and no children yet, so depsSection renders
   // empty — the same string the run's first plan call would produce.
-  const ctx = { config, byId: new Map([[root.id, root]]), worktrees: args.worktrees, cwd: args.cwd }
+  const ctx = {
+    config, byId: new Map([[root.id, root]]), worktrees: args.worktrees, cwd: args.cwd,
+    sharedParallel: args.sharedParallel,
+  }
   // 两次调用同一席 —— 取一次,免得重拟那次悄悄换了人。
   const seat = config.phaseRoles.plan[0] ?? null
   let text: string

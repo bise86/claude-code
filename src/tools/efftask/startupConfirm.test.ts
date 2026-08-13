@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, isSharedTree, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -1469,11 +1469,30 @@ describe('git 两个开关 —— 关口上要说出代价(收口方式已不是
     expect(gitChoiceLines(cfg({ autoPush: true })).join('\n')).toContain('当前分支')
   })
 
-  it('隔离根本不可用时说明「不是你选的」,而且不画键位', () => {
+  /**
+   * **隔离不可用时 `w` 键仍然要在** —— 这一条推翻了它的上一版。
+   *
+   * 上一版断言「不画键位」,理由是「那时候这不是一个选择」。而第三档(共享目录 + 并发)
+   * 恰恰在这一格最有用:不是 git 仓库、也不需要 git,而用户要的正是速度。
+   * 用户原话:「w 显示选择」「如果显示选择了,是允许的」。
+   *
+   * 变的只是**选项集合**:worktree 那一档确实用不了,而 shared ⇄ shared-parallel 之间
+   * 照样可以切。
+   */
+  it('隔离不可用时说明「不是你选的」,但 w 键仍然可以在两档共享之间切', () => {
     const l = gitChoiceLines(cfg(), { unavailable: '当前目录不是 git 仓库' }).join('\n')
     expect(l).toContain('不是你选的')
     expect(l).toContain('不是 git 仓库')
-    expect(l).not.toContain('(w 切换)')
+    expect(l).toContain('(w 切换)')
+  })
+
+  it('隔离不可用、而用户已经显式选了并发 → 不许再说「不是你选的」', () => {
+    const l = gitChoiceLines(
+      { ...cfg(), isolation: 'shared-parallel' },
+      { unavailable: '当前目录不是 git 仓库' },
+    ).join('\n')
+    expect(l).toContain('你选的')
+    expect(l).not.toContain('不是你选的')
   })
 
   it('editable: false 时不画键位 —— 编辑名册时 w/p 归编辑器', () => {
@@ -1543,5 +1562,64 @@ describe('完成即回收(caps.wipeOnAccept)', () => {
   it('共享工作树下一个字都不印', () => {
     expect(gitChoiceLines(cfg({ isolation: 'shared' })).some(l => l.includes('完成即回收'))).toBe(false)
     expect(gitChoiceLines(cfg(), { unavailable: '不是 git 仓库' }).some(l => l.includes('完成即回收'))).toBe(false)
+  })
+})
+
+/**
+ * **第三档:共享目录 + 并发。**
+ *
+ * 用户原话:「基于 worktree 的开发模式是否可以关闭,直接在当前目录下,也不要 git,
+ * 而且支持并发任务。当任务是按照生成文件来划分的,就可以这种,而且速度很快。」
+ * 后续补充:「w 显示选择」——**不做任何情况下的默认值**。
+ */
+describe('隔离方式第三档', () => {
+  const c = (iso: 'worktree' | 'shared' | 'shared-parallel'): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], isolation: iso,
+  })
+
+  it('选了第三档:说清是并发,而且逐条摆出代价', () => {
+    const l = gitChoiceLines(c('shared-parallel')).join('\n')
+    expect(l).toContain('并发')
+    // 唯一一条没有任何安全网的模式 —— 这句不许省。
+    expect(l).toContain('没有任何机制能挡住两个任务改同一个文件')
+    expect(l).toContain('按产出文件划分')
+    // 这一整轮做的那几个键在这一档下全都不适用,不说的话空清单读起来像「都送到了」。
+    expect(l).toContain('m(合并)')
+    expect(l).toContain('c(回收工作区)')
+  })
+
+  /** 零提交的模式里不许给「自动推送」开关 —— 那是承诺一件不会发生的事。 */
+  it('两档共享都不给自动推送开关', () => {
+    for (const iso of ['shared', 'shared-parallel'] as const) {
+      expect(gitChoiceLines(c(iso)).join('\n')).toContain('自动推送: 不适用')
+    }
+  })
+
+  /** 「完成即回收」只在有隔离工作区时才有意义。 */
+  /**
+   * 「完成即回收」是**隔离运行**才有的设置行(它清的是节点的隔离工作区)。
+   * 判据要锚到那一行本身,不能只搜四个字 —— 上面那句代价说明里也含着它
+   * (「…完成即回收 都不适用」),按四个字断言等于什么都没断言。
+   */
+  it('第三档不印「完成即回收」那一行设置', () => {
+    const l = gitChoiceLines(c('shared-parallel')).join('\n')
+    expect(l).not.toContain('完成即回收: 开')
+    expect(l).not.toContain('完成即回收: 关')
+  })
+
+  it('isolationChoice 认得出三档,isSharedTree 把两档共享归到一起', () => {
+    expect(isolationChoice(c('shared-parallel'))).toBe('shared-parallel')
+    expect(isSharedTree('shared-parallel')).toBe(true)
+    expect(isSharedTree('shared')).toBe(true)
+    expect(isSharedTree('worktree')).toBe(false)
+  })
+
+  /** 降级说明要把第三档指出来,而且不能再无条件说「强制串行」。 */
+  it('隔离不可用那一屏要把「并发」列成一条出路', () => {
+    const l = isolationChoiceLines('当前目录不是 git 仓库', false).join('\n')
+    expect(l).toContain('按 w 选')
+    expect(l).toContain('并发')
+    expect(l).toContain('默认继续')
   })
 })

@@ -1626,3 +1626,35 @@ describe('老 run 的 contributed 回填', () => {
     expect(node.contributed).toBe(true)
   })
 })
+
+/**
+ * **第三档必须读得回来 —— 漏掉它不是「降级」,是跳到光谱的另一端。**
+ *
+ * 落盘那一侧的判据是「不等于默认值就写」,所以 `shared-parallel` 会进 run.md;而白名单
+ * 不认它的话 `isolationChoice()` 回 `'worktree'`,于是第一次 `--resume` 之后这一趟变成
+ * **完整的隔离运行**:产出从用户目录搬进 `.efftask-worktrees/`,并开始产生提交。
+ * 而恢复关口没有 `w` 键,用户无法纠正。
+ */
+describe('隔离方式第三档的 round-trip', () => {
+  const md = (iso: string): string => [
+    '---', 'runId: 001', 'parallelism: 3', 'phaseRoles:', '  plan: []',
+    `isolation: ${iso}`, 'goalPrompt: 目标', '---', '', '# tree',
+  ].join('\n')
+
+  it('shared-parallel 读得回来', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md('shared-parallel') }), '/r')
+    expect(config.isolation).toBe('shared-parallel')
+    expect(degraded.join('\n')).not.toContain('isolation')
+  })
+
+  it('shared 照旧', async () => {
+    expect((await readRunManifest(fsWith({ '/r/run.md': md('shared') }), '/r')).config.isolation).toBe('shared')
+  })
+
+  /** 手改 run.md 绕开一切校验 —— 非法值要留降级说明,而且说清合法取值有哪几个。 */
+  it('非法值忽略并说清合法取值', async () => {
+    const { config, degraded } = await readRunManifest(fsWith({ '/r/run.md': md('yes') }), '/r')
+    expect(config.isolation).toBeUndefined()
+    expect(degraded.join('\n')).toContain('shared-parallel')
+  })
+})

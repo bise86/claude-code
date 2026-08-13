@@ -686,16 +686,112 @@ describe('启动关口的 git 三个开关', () => {
     expect(g.decisions[0]).not.toHaveProperty('finish')
   })
 
-  it('隔离用不了时 w 是死键 —— 而且键位提示里不写它', async () => {
-    // 一个按了不动的键比没有这个键更糟:用户会以为是自己按错了。
+  /**
+   * **隔离用不了时 `w` 仍然活着,只是选项少一档** —— 这一条推翻了它的上一版。
+   *
+   * 上一版断言「w 是死键、提示里不写它」,理由是「那时候这不是一个选择」。而第三档
+   * (共享目录 + 并发)恰恰在这一格最有用:不是 git 仓库、也不需要 git,用户要的正是速度。
+   * 用户原话:「w 显示选择」「如果显示选择了,是允许的」。
+   *
+   * 变的是**选项集合**:worktree 那一档确实按不出来,而 shared ⇄ shared-parallel 照样切。
+   */
+  it('隔离用不了时 w 在两档共享之间切,而且切不出 worktree', async () => {
     const g = await mountGate({ isolationReason: '当前目录不是 git 仓库' })
+    expect(g.lastFrame()).toContain('w 隔离方式')
+    g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
+    // 切到了第三档 —— 而 worktree 那一档按多少次都出不来。
+    expect(g.lastFrame()).toContain('并发')
+    expect(g.lastFrame()).not.toContain('worktree 隔离,可并行')
     g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
     expect(g.lastFrame()).not.toContain('worktree 隔离,可并行')
-    expect(g.lastFrame()).not.toContain('w 隔离方式')
     g.stdin.press('\r')
     await new Promise(r => setTimeout(r, 20))
     g.app.unmount()
     expect(g.decisions[0]).toMatchObject({ isolation: 'shared' })
+  })
+
+  /**
+   * **绝不默认落到第三档。** 并发在这种模式下没有任何安全网,默认打开等于替用户做一个
+   * 不可逆的取舍 —— 他要的是「w 显示选择」。
+   */
+  it('隔离用不了时的初值是串行那一档,不是并发', async () => {
+    const g = await mountGate({ isolationReason: '当前目录不是 git 仓库' })
+    expect(g.lastFrame()).toContain('强制串行')
+    g.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    g.app.unmount()
+    expect(g.decisions[0]).toMatchObject({ isolation: 'shared' })
+  })
+
+  /** 在**正常 git 仓库**里也能按出第三档 —— 用户原话:「如果显示选择了,是允许的」。 */
+  it('正常仓库里 w 三档循环:worktree → shared → 并发 → worktree', async () => {
+    const g = await mountGate({})
+    expect(g.lastFrame()).toContain('worktree 隔离,可并行')
+    g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
+    expect(g.lastFrame()).toContain('强制串行')
+    g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
+    expect(g.lastFrame()).toContain('并发')
+    // 代价必须和它一起出现在屏幕上。
+    expect(g.lastFrame()).toContain('没有任何机制能挡住两个任务改同一个文件')
+    g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
+    expect(g.lastFrame()).toContain('worktree 隔离,可并行')
+    g.stdin.press('\r')
+    await new Promise(r => setTimeout(r, 20))
+    g.app.unmount()
+    expect(g.decisions[0]).toMatchObject({ isolation: 'worktree' })
+  })
+
+  /**
+   * **并行数那一行读的是这一屏的选择,不是「池子建起来了没有」。**
+   *
+   * 它此前读 `props.isolation`(环境能力),于是按 `w` 选到第三档之后,上面写着
+   * 「执行与叶子验收串行(未启用隔离)」而送出去的决策是共享目录**并发** —— 同一屏
+   * 两句话打架,而这一串还会进飞书卡。
+   */
+  it('并行数那一行跟着 w 走:选到第三档就不能再写「串行」', async () => {
+    const g = await mountGate({ isolationReason: '当前目录不是 git 仓库' })
+    expect(g.lastFrame()).toContain('执行与叶子验收串行')
+    g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
+    // 渲染器只写**增量**,上一帧还留在 lastFrame 里 —— 所以断言落在改动那一行的
+    // 独有片段上,而且带上 `←/→ 调整` 把它锁死在「并行数」那一行(不是别处的同义句)。
+    expect(g.lastFrame()).toContain('同时**在你当前的目录里跑(没有隔离,也不产生提交)） · ←/→ 调整')
+    g.app.unmount()
+  })
+
+  /**
+   * 池子**真的在**的时候,worktree 那一档要印出它的全部代价 —— 尤其是「每个子任务完成时
+   * 自动合并回当前分支」:那是这一趟会对用户检出做的事。
+   */
+  it('池子在时,并行数那一行印出 worktree 和自动合并', async () => {
+    const g = await mountGate({ isolation: 'worktree' })
+    expect(g.lastFrame()).toContain('自动合并回当前分支')
+    g.app.unmount()
+  })
+
+  /**
+   * **第二道闩:选择说 worktree,而池子不在 → 印的必须是「未启用隔离」。**
+   *
+   * 候选集合已经排除了这一格,所以它只可能来自调用方传错(比如把「能不能」和「选了什么」
+   * 接反)。而印错的方向是最贵的那一个:用户读到「在各自的 worktree 中隔离、每个子任务
+   * 完成时自动合并回当前分支」,于是相信自己的工作目录不会被直接改。
+   */
+  it('选择是 worktree 而池子不在 → 印「未启用隔离」,不承诺自动合并', async () => {
+    const g = await mountGate({ isolation: 'none' })
+    expect(g.lastFrame()).toContain('执行与叶子验收串行(未启用隔离)')
+    expect(g.lastFrame()).not.toContain('自动合并回当前分支')
+    g.app.unmount()
+  })
+
+  /**
+   * 反向的那一半:**没有池子就绝不能印「在各自的 worktree 中隔离、自动合并回当前分支」**。
+   * 候选集合已经排除了 worktree,这里钉的是第二道闩。
+   */
+  it('隔离用不了时,并行数那一行不许承诺 worktree 和自动合并', async () => {
+    const g = await mountGate({ isolationReason: '当前目录不是 git 仓库' })
+    expect(g.lastFrame()).not.toContain('自动合并回当前分支')
+    g.stdin.press('w'); await new Promise(r => setTimeout(r, 20))
+    expect(g.lastFrame()).not.toContain('自动合并回当前分支')
+    g.app.unmount()
   })
 
   it('config 上已有的选择要当初值显示 —— --resume 恢复出来的那份不能被显示成默认', async () => {

@@ -113,7 +113,9 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
   it('未隔离这件事也要写进 run.md(新建和恢复两条路径都要)', () => {
     // 剪断它:新建 run 的 run.md 不再记录"本次未隔离",而恢复路径还在记 —— 同一件事在
     // 两条路径上的持久化记录不一致。同样必须计数:两条路径的这行字是逐字相同的。
-    expect(occurrences('notices.push(`隔离不可用,执行阶段将共享工作目录并串行')).toBe(2)
+    // 「按 w 可改成并发」也一并钉住:第三档存在之后,这两句还写死「将…并串行」就是把
+    // 用户唯一的出路从 run.md 里抹掉(而 run.md 正是他事后回看这一趟为什么这么慢的地方)。
+    expect(occurrences('notices.push(`隔离不可用,执行阶段默认共享工作目录并串行(关口按 w 可改成并发)')).toBe(2)
   })
 
   it('启动关口拿到了隔离不可用的原因和 git init 入口 (spec §8)', () => {
@@ -136,9 +138,21 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
   it('执行串行这件事流到了重算关口和「马上就会被调度」那一句', () => {
     // 三个 recalcScope 入口(关口自己的 scopeOpts、树上的 recalcAvailable、按 d 那一下)
     // 加上 schedulableNow —— 少一个都会让屏幕上写着的和按下去发生的分叉。
-    expect(occurrences('serialExecute: poolRef.current === undefined')).toBe(4)
+    expect(occurrences('serialExecute: poolRef.current === undefined && !sharedParallelRef.current')).toBe(4)
     // 表头那一行是同一个真相的另一个出口(它早就在了,一起钉住:两处说法必须同源)。
-    expect(SRC).toContain('serialExecute={poolRef.current === undefined}')
+    expect(SRC).toContain('serialExecute={poolRef.current === undefined && !sharedParallelRef.current}')
+    /**
+     * **第三档必须出现在这五处的每一处。**
+     *
+     * 「没有池子」曾经等价于「必须串行」—— 第三档(共享目录 + 用户显式按 w 选并发)
+     * 把这个等价拆开了。漏掉任何一处,屏幕上写着「执行阶段串行」而 orchestrator 正在
+     * 并发跑,或者关口把一堆 READY 说成「排队等前一个」而它们其实马上一起飞。
+     * 判据一律读 `sharedParallelRef`(同步写下的 ref),不读 config —— 和
+     * orchestrator 的 `deps.sharedParallel` 同源。
+     */
+    expect(occurrences('poolRef.current === undefined && !sharedParallelRef.current')).toBe(5)
+    // 反向:任何一处只写「没有池子」就算漏(第三档会被它当成串行)。
+    expect(SRC).not.toMatch(/poolRef\.current === undefined(?!\s*&&\s*!sharedParallelRef)/)
   })
 
 
@@ -695,7 +709,7 @@ describe('改回去要变红的四处', () => {
     expect(element('RunningView')).toContain('suspended={humanWait.waiting}')
     // 串行提示要真的按**池子在不在**来,写死 false 的话它永远不出现,
     // 而顶上那个「并行 1/5」会一直误导用户。
-    expect(element('RunningView')).toContain('serialExecute={poolRef.current === undefined}')
+    expect(element('RunningView')).toContain('serialExecute={poolRef.current === undefined && !sharedParallelRef.current}')
   })
   it('调并发度接的是 control,而且基准取它现在的值', () => {
     /**

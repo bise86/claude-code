@@ -88,6 +88,11 @@ export async function runOrchestrator(
     /** 运行中的人工干预面 —— 暂停 / 追加指令 / 取消单个节点。 */
     control?: RunControl
     worktrees?: WorktreePool
+    /**
+     * 第三档:**没有池子,但用户显式选了并发**。只有它能解开执行互斥。
+     * 见 orchestrator 的 serialiseExecute —— 判据刻意不读 config。
+     */
+    sharedParallel?: boolean
     /** 升级人工 (spec §8): a conflict the node could not resolve itself. */
     onEscalate?: PipelineCtx['onEscalate']
     /** 触阀升级 (spec §9/§11): a node stopped by a safety valve or a rework limit. */
@@ -411,6 +416,7 @@ export async function runOrchestrator(
         persist,
         now,
         worktrees: args.worktrees,
+        sharedParallel: args.sharedParallel,
         control: args.control,
         // So blockWithReason can write the REAL retry command into blockedReason (run.md is
         // where suppressed escalations have to remain actionable).

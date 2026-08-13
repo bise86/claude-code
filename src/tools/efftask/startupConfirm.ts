@@ -234,8 +234,21 @@ export function applyStartupDecision(config: EffTaskConfig, decision: StartupDec
 }
 
 /** 隔离方式的默认值 —— 没选过就是 worktree 隔离(可并行)。 */
-export function isolationChoice(config: EffTaskConfig): 'worktree' | 'shared' {
+export type IsolationChoice = 'worktree' | 'shared' | 'shared-parallel'
+/**
+ * 用户选的隔离方式。缺省 = `worktree`。
+ *
+ * 返回类型必须**放宽到三档** —— 上一版写死两档,而第三个值在运行时照样存在(它落进 run.md
+ * 也被读回),于是下游三处 `iso === …` 的比较全部落到 else 分支上,而 TypeScript 一个字
+ * 都不会说。
+ */
+export function isolationChoice(config: EffTaskConfig): IsolationChoice {
   return config.isolation ?? 'worktree'
+}
+
+/** 这一档是不是「不建工作区、直接在当前目录里跑」。两档共享都算。 */
+export function isSharedTree(iso: IsolationChoice): boolean {
+  return iso === 'shared' || iso === 'shared-parallel'
 }
 
 /**
@@ -261,11 +274,32 @@ export function gitChoiceLines(
       // 40 字砍在 `fatal: '/home/…/integration` 中间 —— 恰好把 `already exists`
       // (唯一能让人动手的那半句)切掉。这一行是整个关口上最该读全的一句,关口是整屏视图,
       // 换行没有代价;而它一旦被砍,用户能做的只剩「知道降级了」。
-      ? `隔离方式: 共享工作树(执行串行)—— 不是你选的,当前环境用不了隔离:${clip(opts.unavailable, 160)}`
+      ? (iso === 'shared-parallel'
+          // 隔离用不了,而他**显式选了**第三档 —— 这时候「不是你选的」那句就成了假话。
+          ? `隔离方式: 共享目录 + **并发**(你选的)—— 当前环境用不了隔离:${clip(opts.unavailable, 160)} ${key('w')}`
+          : `隔离方式: 共享工作树(执行串行)—— 不是你选的,当前环境用不了隔离:${clip(opts.unavailable, 160)} ${key('w')}`)
       : iso === 'worktree'
         ? `隔离方式: worktree 隔离,可并行执行 ${key('w')}`
-        : `隔离方式: 共享工作树 —— 执行者直接改你当前目录,而且执行阶段强制串行 ${key('w')}`,
+        : iso === 'shared-parallel'
+          ? `隔离方式: 共享目录 + **并发** —— 执行者直接改你当前目录,多个任务**同时**改 ${key('w')}`
+          : `隔离方式: 共享工作树 —— 执行者直接改你当前目录,而且执行阶段强制串行 ${key('w')}`,
   )
+  /**
+   * **第三档的代价必须逐条摆出来,而且这一段没有「只印非默认值」的余地。**
+   *
+   * 它是用户显式选的(`w` 键),而它买到的速度是用**唯一一道安全网**换的:
+   * 隔离运行里两个执行者写同一个文件会在合并时撞冲突并阻断;共享串行里互斥保证不会同时写;
+   * 而这一档两样都没有 —— 没有 git,连冲突都不会报,后写的直接盖掉先写的。
+   *
+   * 后面那三句同样重要:这一趟**不产生任何提交**,所以这一整轮做的 `m` / `c` / 收口合并 /
+   * 完成即回收 / 回溯的「删 target 重新同步」**全部不适用**。不说的话,用户跑完按 `m`
+   * 只会看到一屏空清单,而那读起来像「东西都送到了」。
+   */
+  if (iso === 'shared-parallel') {
+    out.push('⚠ 这一档没有任何机制能挡住两个任务改同一个文件 —— 没有 git,连冲突都不会报,后写的直接盖掉先写的。')
+    out.push('  它成立的前提是**任务按产出文件划分**;根方案会被要求照这条拆,但拆得对不对最终由你判断。')
+    out.push('  本趟不产生任何提交:m(合并)/ c(回收工作区)/ 收口合并 / 完成即回收 都不适用,产出直接就在你的目录里。')
+  }
   // 收口方式**不再是一个开关**:只有主干开发(用户:「不要什么分支开发」)。隔离运行下
   // 每个子任务通过验收就合回当前分支一次,所以这一行说的是「会发生什么」,不是「你选了什么」。
   if (iso === 'worktree' && !opts.unavailable) {
@@ -293,8 +327,10 @@ export function gitChoiceLines(
    * `if (!ctx.worktrees || !node.worktree) return true`),改动就摊在用户的工作目录里。
    * 这种时候还给一个「自动推送」开关,是承诺一件不会发生的事。
    */
-  if (iso === 'shared' || opts.unavailable) {
-    out.push('自动推送: 不适用 —— 共享工作树不产生任何提交,改动会直接留在你的工作目录里(要自己 commit)')
+  // **两档共享都不产生提交** —— 上一版只判 `=== 'shared'`,于是第三档会落到 else 分支,
+  // 在一个零提交的模式里给出「自动推送」开关(承诺一件不会发生的事)。
+  if (isSharedTree(iso) || opts.unavailable) {
+    out.push('自动推送: 不适用 —— 共享工作目录不产生任何提交,改动会直接留在你的工作目录里(要自己 commit)')
   } else {
     out.push(
       config.autoPush === true
@@ -804,7 +840,8 @@ export { MIN_PARALLELISM, MAX_PARALLELISM, clampParallelism } from './types.js'
  */
 export function parallelismLine(
   config: EffTaskConfig,
-  opts: { editable: boolean; isolation?: 'worktree' | 'none' },
+  // 第三档必须能传进来,否则它在类型上就落到「串行」那一句上(而运行时确实会)。
+  opts: { editable: boolean; isolation?: 'worktree' | 'none' | 'shared-parallel' },
 ): string {
   // What this run will ACTUALLY do. Isolation decides whether the execute phase can run in
   // parallel at all, so a fixed sentence is right for one kind of run and a lie for the
@@ -823,9 +860,15 @@ export function parallelismLine(
    * (产出只留在集成分支上,合并要他自己敲),所以不说就是让一次真实的、改动他工作区的
    * 操作凭空出现。
    */
+  /**
+   * **三档三句话。** 上一版只有两句,而第三档会落到「执行与叶子验收串行」那一句上 ——
+   * 于是同一屏里上面写着「共享目录 + 并发」、这里写着「串行」,而这一串还会进飞书卡。
+   */
   const scope = opts.isolation === 'worktree'
     ? '各阶段并行,执行任务在各自的 git worktree 中隔离;每个子任务完成时自动合并回当前分支(工作区不干净或撞冲突时跳过并说明,跑完再补一次)'
-    : '方案/质疑修复阶段并行;执行与叶子验收串行(未启用隔离)'
+    : opts.isolation === 'shared-parallel'
+      ? '各阶段并行,执行任务**同时**在你当前的目录里跑(没有隔离,也不产生提交)'
+      : '方案/质疑修复阶段并行;执行与叶子验收串行(未启用隔离)'
   const hint = opts.editable ? ' · ←/→ 调整' : ''
   return `并行数: ${config.parallelism}（${scope}）${hint}`
 }
@@ -1089,8 +1132,11 @@ export function runSpanLine(
 export function isolationChoiceLines(reason: string, canInitGit: boolean): string[] {
   return [
     `隔离不可用:${reason}`,
-    '继续的话,执行阶段会共享你当前的工作目录,并被强制串行(一次只有一个节点在改代码)。',
-    '方案/质疑修复阶段仍然并行;不会出现两个执行 agent 同时改同一份文件。',
+    // 这两句在**第三档下逐字为假**,所以措辞必须带上「默认」二字,并把另一条路指出来。
+    '默认继续的话,执行阶段会共享你当前的工作目录,并被强制串行(一次只有一个节点在改代码)。',
+    '那一档里方案/质疑修复仍然并行,而且不会出现两个执行 agent 同时改同一份文件。',
+    '想要**并发**又不要 git:按 w 选「共享目录 + 并发」—— 快得多,但没有任何机制挡住两个任务改同一个文件,',
+    '  它成立的前提是任务按产出文件划分。',
     // The `g` offer appears ONLY when the directory is not a repo at all. Every other pool
     // failure happens after that check passed — no commits yet, a branch-name clash, a
     // worktree already checked out — so the directory IS a repo, and `git init` there would

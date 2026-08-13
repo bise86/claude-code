@@ -1284,8 +1284,20 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
    * 的值不能被当成 'shared'(那会让整趟运行的执行方式变掉,而屏幕上写的是另一件事)。
    */
   if (fm.isolation !== undefined) {
-    if (fm.isolation === 'worktree' || fm.isolation === 'shared') base.isolation = fm.isolation
-    else degraded.push(`run.md 里的 isolation「${String(fm.isolation)}」不是合法取值(worktree / shared),已忽略,按 worktree 走`)
+    /**
+     * **白名单漏一个值的后果不是「降级」,是跳到光谱的另一端。**
+     *
+     * 落盘那一侧的判据是「不等于默认值就写」,所以 `shared-parallel` **会**进 run.md;
+     * 而这里不认它 → `base.isolation` 不赋值 → `isolationChoice()` 回 `'worktree'` →
+     * `efftask.tsx` 那句「不等于 worktree 才放下池子」不成立 → **第一次 `--resume` 之后
+     * 变成完整的隔离运行**:产出从用户目录搬进 `.efftask-worktrees/`,并开始产生提交和
+     * 集成分支。而恢复关口**没有 `w` 键**,他无法纠正。
+     */
+    if (fm.isolation === 'worktree' || fm.isolation === 'shared' || fm.isolation === 'shared-parallel') {
+      base.isolation = fm.isolation
+    } else {
+      degraded.push(`run.md 里的 isolation「${String(fm.isolation)}」不是合法取值(worktree / shared / shared-parallel),已忽略,按 worktree 走`)
+    }
   }
   /**
    * `finish`(收口方式)这个开关**已经不存在了** —— 只有主干开发。
