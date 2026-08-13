@@ -15,6 +15,7 @@
  *  - 结果自己上屏 —— 合并是静默的,没有这一屏用户分不清成功和一个都没合上。
  */
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import * as React from 'react'
 import { EventEmitter } from 'node:events'
 
@@ -452,5 +453,26 @@ describe('合并关口不认修饰键', () => {
     await new Promise(r => setTimeout(r, 80))
     app.unmount()
     expect(cancelled).toBe(1)
+  })
+})
+
+/**
+ * **第 2 跳没成时标题不许是绿色的「合并完成」。**
+ *
+ * 评审席点名:标题色只看 `failed`,而「产出合过去了,但把你未提交的改动放回来时撞了
+ * 冲突」那一种 `failed` 是空的 —— 而那几条恢复说明排在最末尾,矮终端上正是第一批被
+ * 折叠掉的。
+ */
+/**
+ * **第 2 跳没成时标题不许是绿色的「合并完成」。**
+ *
+ * 评审席点名:标题色只看 `failed`,而「产出合过去了,但把你未提交的改动放回来时撞了
+ * 冲突」那一种 `failed` 是空的。颜色在这个夹具里不进帧(fakeTty 会把 ANSI 抹掉),
+ * 所以判据钉在**源码**上 —— 和 wiringCoverage 里那批同一条路。
+ */
+describe('结果屏的标题色', () => {
+  it('判据同时看 failed 和第 2 跳', () => {
+    const src = readFileSync(new URL('./ConfirmMergeSubtree.tsx', import.meta.url), 'utf8')
+    expect(src).toContain("outcome?.failed.length || outcome?.trunk?.ok === false ? 'warning' : 'success'")
   })
 })

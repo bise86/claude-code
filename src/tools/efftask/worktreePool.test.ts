@@ -1915,3 +1915,36 @@ describe('discard 遇到嵌套 git 仓库', () => {
     expect(await exists(l.path)).toBe(false)
   })
 })
+
+/**
+ * **「已暂存」那一格:git 的保护不再是逐文件的。**
+ *
+ * 评审席真 git 实测:快进时索引脏不影响合并;而**真三方合并**(用户在 run 期间自己提交
+ * 过)时,索引里**任何一个**文件脏就整个被拒,而 git 点名的那个文件**这次合并根本没碰**。
+ * 上一版把那句英文原样转出去,用户会去看一个和本次合并无关的文件名。
+ */
+describe('索引脏 + 真三方合并', () => {
+  it('如实说是索引的问题,并给出能照做的下一步', async () => {
+    const p = pool()
+    await p.init()
+    // 用户在 run 期间自己提交过一笔 —— 这一步让第 2 跳变成真三方合并。
+    await writeFile(join(gitRoot, 'mine.txt'), '我自己的\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user'], gitRoot)
+    // 而且他手上还有**已暂存**的改动(和本次任务无关的文件)。
+    await writeFile(join(gitRoot, 'mine.txt'), '又改了\n')
+    await git(['add', 'mine.txt'], gitRoot)
+
+    const n = node('root/01-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'shipped.ts'), 'the work\n')
+    const res = await p.commitAndMerge(n) as { ok: true; trunk?: { advanced: boolean; reason?: string } }
+    if (res.trunk?.advanced === true) return // 这台 git 上没被拒,这一格不适用
+
+    const why = res.trunk?.reason ?? ''
+    expect(why).toContain('索引里有已暂存的改动')
+    expect(why).toContain('git stash')
+    // 用户的东西一个字节都没动。
+    expect(await readFile(join(gitRoot, 'mine.txt'), 'utf-8')).toContain('又改了')
+  })
+})

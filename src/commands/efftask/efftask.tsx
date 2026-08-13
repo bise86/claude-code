@@ -15,6 +15,7 @@ import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
 import { createRateLimitGate } from '../../tools/efftask/rateLimitGate.js'
 import { searchUnavailableReason } from '../../utils/ripgrep.js'
 import { SKILL_TOOL_NAME } from '../../tools/SkillTool/constants.js'
+import { sweepStashBackups } from '../../tools/efftask/stashGuard.js'
 import { runOrchestrator, type Outcome, type Phase } from './runOrchestrator.js'
 import type { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
@@ -2595,6 +2596,24 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
            *
            * `failed` 同理:一个解不掉冲突的节点被收进 `out.failed`,而第 2 跳照样会跑。
            */
+          /**
+           * **回收备份 ref —— 就在这一刻,而不是等收口。**
+           *
+           * 唯一会造出备份的路就是这个键(`m` + `s`),而它最典型的按法是**跑完之后在
+           * 结束屏上按** —— 那时 `reclaim` 早跑完了(它是整趟一次性的),收口那一次
+           * sweep 永远看不到这批 ref。评审席点名的时机错位。
+           *
+           * 判据在 `sweepStashBackups` 里:条目还在 = 他还没处理完,留着;不在 = 使命结束。
+           * 所以在这里扫是安全的 —— 刚撞冲突留下的那一条会被正确地留下。
+           */
+          if (poolRef.current?.gitRoot && runId) {
+            try {
+              const swept = await sweepStashBackups({ git: gitRunner, cwd: poolRef.current.gitRoot, runId })
+              for (const k of swept.kept) {
+                out.problems.push(`保留了一份你未提交改动的备份:${k.ref} —— ${k.why};取回:git stash apply ${k.ref}`)
+              }
+            } catch { /* 回收失败不该影响这次合并的结论 */ }
+          }
           const heldBack = (out.rescue?.hold.length ?? 0) + out.failed.length
           if (out.trunk?.ok === true && heldBack === 0) {
             setHandoffState('merged')

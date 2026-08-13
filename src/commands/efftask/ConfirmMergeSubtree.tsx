@@ -234,7 +234,14 @@ export function ConfirmMergeSubtree(props: {
         : '')
   return (
     <Box borderStyle="round" paddingX={1} flexDirection="column">
-      <Text bold color={mode === 'done' ? (outcome?.failed.length ? 'warning' : 'success') : 'warning'}>
+      {/**
+        * **标题色不能只看 `failed`。** 第 2 跳没成(含「产出合过去了,但把你的改动放回来时
+        * 撞了冲突」那一种)时 `failed` 是空的,而标题此前照样是绿色的「合并完成」——
+        * 而那几条恢复说明排在 `lines` 最末尾,矮终端上正是第一批被折叠掉的。
+        */}
+      <Text bold color={mode === 'done'
+        ? (outcome?.failed.length || outcome?.trunk?.ok === false ? 'warning' : 'success')
+        : 'warning'}>
         {mode === 'done' ? `合并完成 —— ${props.target.title}` : title}
       </Text>
       {shown.map((l, i) => (

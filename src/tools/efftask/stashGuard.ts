@@ -353,18 +353,29 @@ export async function sweepStashBackups(
   const kept: { ref: string; why: string }[] = []
   const listed = await git(['for-each-ref', '--format=%(refname) %(objectname)', `refs/et/stash-backup/${runId}`], cwd)
   if (listed.code !== 0) return { removed, kept }
-  const stashed = new Set(
-    (await git(['stash', 'list', '--format=%H'], cwd)).stdout.split('\n').map(l => l.trim()).filter(Boolean),
+  /**
+   * 现存 stash 条目的**内容指纹**(tree),不是它们的 commit sha —— `stash create` 和
+   * `stash push` 对同一批改动造出的是两个不同的 commit,而它们的 tree 相同。
+   */
+  const stashTrees = new Set(
+    (await git(['stash', 'list', '--format=%T'], cwd)).stdout.split('\n').map(l => l.trim()).filter(Boolean),
   )
   for (const line of listed.stdout.split('\n')) {
     const [ref, sha] = line.trim().split(/\s+/)
     if (!ref || !sha) continue
     /**
-     * ref 名的最后一段是**那条 stash 条目**的 sha 前缀(不是备份对象自己的 —— `stash create`
-     * 和 `stash push` 造的是两个不同的 commit,这一点实测过)。
+     * **判据落在「这份备份的内容还需不需要」上,而不是 ref 的名字。**
+     *
+     * 名字里那一段本该是 stash 条目的 sha 前缀,但它靠一次**尽力而为**的改名写上去
+     * (`update-ref` 失败就静默保留旧名),而且 P0 修复之前的旧格式 ref 压根没有这一段。
+     * 评审席在真 git 上复现:两种情况下 sweep 都会把**还活着的**备份直接删掉 —— 而屏幕
+     * 刚让用户敲 `git stash apply <那条 ref>`。
+     *
+     * 新判据用**内容**:备份对象的 tree 只要和任何一条现存 stash 条目的 tree 相同,
+     * 就说明那次撞冲突还没处理完(条目还在),留着。名字对不上也不影响。
      */
-    const entry = ref.slice(ref.lastIndexOf('/') + 1)
-    if ([...stashed].some(h => h.startsWith(entry))) {
+    const mine = (await git(['rev-parse', `${sha}^{tree}`], cwd)).stdout.trim()
+    if (mine.length > 0 && stashTrees.has(mine)) {
       kept.push({ ref, why: '那一次 pop 撞了冲突,而对应的 stash 条目还在 —— 你还没处理完它' })
       continue
     }

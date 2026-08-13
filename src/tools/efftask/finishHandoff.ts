@@ -24,7 +24,6 @@
 // 所以这里只做一件明确的事:**跑完了、而且干净,就合;否则不合、并且说清为什么**。
 // 关口原样留在 `--resume` 那条路上(用户清理完工作区再进来,四个选项一个不少)。
 import type { PendingHandoff } from './types.js'
-import { withStash } from './stashGuard.js'
 import {
   mergeLeftovers, runHandoffChoice, trackedChanges,
   type ConflictResolver, type GitFn, type HandoffResult,
@@ -186,13 +185,6 @@ export async function finishHandoff(deps: {
    */
   resolveConflict?: ConflictResolver
   /**
-   * 第 2 跳要不要「先 stash 再合、合完自动放回」。**默认关,由用户按一下打开** ——
-   * 这一档此前只接在 `m` 那条路上,而收口是默认落地的那一条(验收席点名的断线)。
-   */
-  stash?: boolean
-  /** 备份 ref 要按 run 命名 —— 见 stashGuard 的 P0 注释。 */
-  runId?: string
-  /**
    * **「先同步主干、再迭代解冲突」那条路。** 给了就用它来做收口那一次合并。
    *
    * 收口和 `m` 键面对的是**同一件事**(集成分支 → 用户当前分支),而在这之前只有 `m`
@@ -293,36 +285,28 @@ export async function finishHandoff(deps: {
         return { ok: r.ok, message: r.message, ...(r.followUps ? { followUps: r.followUps } : {}) }
       } : undefined,
     )
-    let stashLines: string[] = []
-    let res: Awaited<ReturnType<typeof runHandoffChoice>>
-    if (deps.stash === true && deps.runId) {
-      const guarded = await withStash({ git, cwd, runId: deps.runId }, doMerge)
-      stashLines = guarded.lines
-      if (guarded.failed === true) {
-        return {
-          merged: false,
-          result: { ok: false, message: '没有合并:先 stash 那一步没做成', followUps: stashLines },
-        }
-      }
-      res = guarded.result ?? await doMerge()
-      if (guarded.restored === false) {
-        return {
-          merged: true,
-          result: {
-            ok: false,
-            message: '⚠ 产出合回你的分支了,但把你未提交的改动放回来时撞了冲突 —— 改动一个字节都没丢',
-            followUps: stashLines,
-          },
-        }
-      }
-    } else {
-      res = await doMerge()
-    }
+    /**
+     * **这一路没有「先 stash 再合」那一档 —— 而且不许再放一段永不执行的分支在这里。**
+     *
+     * 上一版在这里写了完整的 `withStash` 分支,门是 `deps.stash === true && deps.runId`;
+     * 而唯一的生产调用者(`runOrchestrator` 的 finishHandoff 调用点)**两个都不传**,
+     * `ConfirmHandoff` 上也没有任何 `s` 键 —— 用户根本没有途径打开它。评审席把它逐条
+     * 变异过:整段改成 `if (false)` 全绿,连 dep 声明改名也全绿。
+     *
+     * 那正是这个仓库的招牌缺陷,而它出现在一次**专门用来修断线**的提交里。留着一段
+     * 永不执行的代码比没有它更糟:下一个人会以为这条路有保护。
+     *
+     * 真正的保护今天只在 `m` 那条**用户主动按**的路上(`mergeSubtree` 的第 2 跳)。
+     * 要把它接到收口这一路,得先给 `ConfirmHandoff` 一个 `s` 键并把它随决策传下来 ——
+     * 那是一件独立的事,没做就不许假装做了。
+     */
+    const res = await doMerge()
+
     if (res.ok) {
       // 合成功了才推当前分支 —— 没合的话,推上去的是一份不含本次产出的分支。
       const push = deps.autoPush === true ? await pushCurrent(git, cwd) : undefined
       // 降级放行那句话跟着**成功**这条路走(它现在是「合了但要说」,不是「不合」)。
-      const extra = [...(plan.warn ?? []), ...stashLines]
+      const extra = [...(plan.warn ?? [])]
       const withWarn = extra.length > 0 ? { ...res, followUps: [...extra, ...(res.followUps ?? [])] } : res
       return { merged: true, result: withWarn, ...(push ? { push } : {}) }
     }

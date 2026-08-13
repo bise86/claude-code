@@ -483,3 +483,114 @@ describe('回收接进了收口', () => {
     expect(SRC.slice(Math.max(0, i - 200), i)).toContain('try {')
   })
 })
+
+/**
+ * **回收的判据必须落在「内容」上,不是 ref 的名字。**
+ *
+ * 名字里那一段靠一次**尽力而为**的改名写上去(`update-ref` 失败就静默保留旧名),而
+ * P0 修复之前的旧格式 ref 压根没有这一段。评审席在真 git 上复现:两种情况下 sweep 都会
+ * 把**还活着的**备份直接删掉 —— 而屏幕刚让用户敲 `git stash apply <那条 ref>`。
+ */
+describe('回收不许被 ref 名字骗到', () => {
+  const refs = async (): Promise<string[]> =>
+    (await git(['for-each-ref', '--format=%(refname)', 'refs/et/stash-backup'], repo))
+      .stdout.split('\n').map(l => l.trim()).filter(Boolean)
+
+  const conflicted = async () => {
+    await git(['checkout', '-qb', 'other'], repo)
+    await writeFile(file('a.txt'), '来自 other\n')
+    await git(['commit', '-qam', 'other'], repo)
+    await git(['checkout', '-q', 'main'], repo)
+    await writeFile(file('a.txt'), '一整天的工作\n')
+    const out = await withStash(deps(), async () => { await git(['merge', '--no-edit', 'other'], repo) })
+    expect(out.restored).toBe(false)
+    return out
+  }
+
+  it('名字被改成对不上的样子,照样认得出它还活着', async () => {
+    const out = await conflicted()
+    const ref = (await refs())[0] as string
+    const sha = (await git(['rev-parse', ref], repo)).stdout.trim()
+    // 模拟「改名失败,留着 create-sha 的旧名」:换一个和 stash 条目对不上的名字。
+    const wrong = 'refs/et/stash-backup/001/ffffffffffff'
+    await git(['update-ref', wrong, sha], repo)
+    await git(['update-ref', '-d', ref], repo)
+
+    const swept = await sweepStashBackups(deps())
+    expect(swept.removed).toEqual([])
+    expect(swept.kept.map(k => k.ref)).toEqual([wrong])
+    expect(await refs()).toEqual([wrong])
+    expect(out.restored).toBe(false)
+  })
+
+  /** P0 修复之前的旧格式 ref(整段没有 sha)—— 同一个 run 跨版本升级就会有。 */
+  it('旧格式的 ref 也不许无条件删', async () => {
+    await conflicted()
+    const ref = (await refs())[0] as string
+    const sha = (await git(['rev-parse', ref], repo)).stdout.trim()
+    await git(['update-ref', '-d', ref], repo)
+    // 旧格式:refs/et/stash-backup/<runId>,最后一段就是 runId 本身。
+    await git(['update-ref', 'refs/et/stash-backup/001', sha], repo)
+
+    const swept = await sweepStashBackups(deps())
+    expect(swept.removed).toEqual([])
+    expect(await refs()).toEqual(['refs/et/stash-backup/001'])
+  })
+})
+
+
+/**
+ * **按操作类型 abort —— rebase / cherry-pick / revert 这一档此前一条探针都没有。**
+ *
+ * 代码里那段注释最斩钉截铁(「上一版一律发 `merge --abort`,治不了 —— 实测
+ * `.git/rebase-merge` 原样留着、`UU` 也还在,而屏幕却说合并做完了」),而评审席变异
+ * 实测:把它改回 `merge --abort`、甚至把那三个 ref 从表里删掉,**全绿**。
+ */
+describe('不是合并的那几种「没做完」', () => {
+  /** 造一次没做完的 rebase(会留下 REBASE_HEAD / .git/rebase-merge)。 */
+  const startRebase = async () => {
+    await git(['checkout', '-qb', 'other'], repo)
+    await writeFile(file('a.txt'), '来自 other\n')
+    await git(['commit', '-qam', 'other'], repo)
+    await git(['checkout', '-q', 'main'], repo)
+    await writeFile(file('a.txt'), '来自 main\n')
+    await git(['commit', '-qam', 'main'], repo)
+    const r = await git(['rebase', 'other'], repo)
+    expect(r.code).not.toBe(0)
+  }
+
+  it('卡在一次没做完的 rebase 里 → 这一档不许出现,而且说得出用哪条命令脱身', async () => {
+    await startRebase()
+    const a = await stashAvailability(deps())
+    expect(a.available).toBe(false)
+    expect(a.why ?? '').toContain('rebase')
+    // **不是 merge --abort** —— 那条治不了它。
+    expect(a.hint ?? '').toContain('git rebase --abort')
+  })
+
+  it('withStash 在这种状态下一步都不做', async () => {
+    await startRebase()
+    let ran = false
+    const out = await withStash(deps(), async () => { ran = true })
+    expect(ran).toBe(false)
+    expect(out.failed).toBe(true)
+    expect(await stashCount()).toBe(0)
+  })
+
+  /** fn 自己留下一次没做完的 rebase → 收尾要用 `rebase --abort`,pop 才做得成。 */
+  it('fn 留下没做完的 rebase → 用对的命令收拾,改动照样回来', async () => {
+    await git(['checkout', '-qb', 'other'], repo)
+    await writeFile(file('b.txt'), '来自 other\n')
+    await git(['commit', '-qam', 'other'], repo)
+    await git(['checkout', '-q', 'main'], repo)
+    await writeFile(file('b.txt'), '来自 main\n')
+    await git(['commit', '-qam', 'main'], repo)
+    await writeFile(file('a.txt'), '我正在改\n')
+
+    const out = await withStash(deps(), async () => { await git(['rebase', 'other'], repo) })
+    expect(await read('a.txt')).toBe('我正在改\n')
+    expect(out.restored).toBe(true)
+    // 现场收拾干净了 —— 用 merge --abort 的话这里会是 0。
+    expect((await git(['rev-parse', '-q', '--verify', 'REBASE_HEAD'], repo)).code).not.toBe(0)
+  })
+})

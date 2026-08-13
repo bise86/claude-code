@@ -315,7 +315,23 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      */
     const detail = (merge.stderr || merge.stdout).trim().split('\n')
       .map(l => l.trim()).filter(Boolean).slice(0, 4).join(' / ')
-    const what = left.length > 0
+    /**
+     * **「已暂存」那一格:git 的保护不再是逐文件的。**
+     *
+     * 真 git 实测(评审席):快进时索引脏不影响合并;而**真三方合并**(用户在 run 期间
+     * 自己提交过)时,索引里**任何一个**文件脏就整个被拒(`code 2` +
+     * `Merge with strategy ort failed.`),而它点名的那个文件**这次合并根本没碰**。
+     *
+     * 所以这一句不能只把 git 的原话转出去:用户会去看一个和本次合并无关的文件名,
+     * 而真正要他做的是把**索引**清空(提交或 `git stash`)。
+     */
+    const stagedBlocked = detail.includes('would be overwritten by merge')
+      && detail.includes('strategy ort failed')
+    const what = stagedBlocked
+      ? `没成功:你的**索引里有已暂存的改动**,而这次是一次真三方合并 —— git 在这种情况下` +
+        `会整个拒绝,并且点名的文件可能和本次合并无关(它点的是:${detail})。` +
+        `先 git commit 或 git stash 把索引清空,产出会在下一个子任务完成时自动送过来`
+      : left.length > 0
       ? `撞了冲突(${left.slice(0, 3).join('、')}${left.length > 3 ? ` 等 ${left.length} 个` : ''})`
       : `没成功:${detail || '未知原因'}`
     const why = restored

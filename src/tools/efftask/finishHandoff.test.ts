@@ -9,6 +9,7 @@
  * 报告错了更糟:屏幕上写「已合并」而代码根本不在他的分支上,他会照着这句话去做下一步。
  */
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
 
 import { finishHandoff, planFinish } from './finishHandoff.js'
 import type { GitFn } from './handoffActions.js'
@@ -396,34 +397,28 @@ describe('降级放行:照样合,但必须说出口', () => {
  * 它此前只接在 `m` 那条用户主动按的路上,而收口是**默认落地**的那一条 —— 同一件事
  * (第 2 跳)在两条路上有两种保护,正是验收席点名的断线。
  */
-describe('收口那一路的 stash 档', () => {
-  it('没开时一条 stash 命令都不跑', async () => {
-    const g = fakeGit()
+/**
+ * **收口这一路没有「先 stash 再合」那一档,而且不许再放一段永不执行的分支进去。**
+ *
+ * 上一版在 `finishHandoff` 里写了完整的 `withStash` 分支,而唯一的生产调用者两个 dep
+ * 都不传、`ConfirmHandoff` 上也没有 `s` 键 —— 评审席逐条变异过:整段改成 `if (false)`
+ * 全绿。那正是这个仓库的招牌缺陷,出现在一次**专门用来修断线**的提交里。
+ *
+ * 这一组钉的是「它真的不在」:留一段永不执行的代码比没有它更糟,下一个人会以为
+ * 这条路有保护。
+ */
+describe('收口这一路的 stash 档(还没有)', () => {
+  it('一条 stash 命令都不跑', async () => {
+    const g = fakeGit({ 'rev-parse -q --verify': { code: 1 } })
     await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo' })
     expect(g.calls.some(c => c[0] === 'stash')).toBe(false)
   })
 
-  it('开了就走 withStash(会先 stash create 备份)', async () => {
-    // 桩 git 默认对一切返回 0 —— 那会让 `rev-parse -q --verify MERGE_HEAD` 看起来成功,
-    // 于是 withStash 认为「你正卡在一次没做完的合并里」而拒绝。真仓库里那一问是 1。
-    const g = fakeGit({ 'rev-parse -q --verify': { code: 1 } })
-    await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', stash: true, runId: '001' })
-    expect(g.ran('stash create')).toBe(true)
-  })
-
-  /** 卡在一次没做完的合并里 → 这一档拒绝,而且**不许**退回去不带保护地合。 */
-  it('卡在一次没做完的合并里 → 不合,并说清怎么脱身', async () => {
-    const g = fakeGit()
-    const out = await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', stash: true, runId: '001' })
-    expect(out.merged).toBe(false)
-    expect(g.ran('merge --no-edit')).toBe(false)
-    expect((out.result?.followUps ?? []).join('\n')).toContain('--abort')
-  })
-
-  /** 没给 runId 就不能开 —— 备份 ref 要按 run 命名,不然认不出是哪一趟留下的。 */
-  it('缺 runId 时不开', async () => {
-    const g = fakeGit()
-    await finishHandoff({ handoff: h(), git: g.git, cwd: '/repo', stash: true })
-    expect(g.calls.some(c => c[0] === 'stash')).toBe(false)
+  /** 源码里也不许留着那段分支 —— 它是被删掉的,不是被关掉的。 */
+  it('finishHandoff 里没有 withStash', () => {
+    const src = readFileSync(new URL('./finishHandoff.ts', import.meta.url), 'utf8')
+    expect(src).not.toContain("from './stashGuard.js'")
+    // 但**理由要留在原地**,否则下一个人会再写一遍。
+    expect(src).toContain('这一路没有「先 stash 再合」那一档')
   })
 })

@@ -1057,6 +1057,13 @@ describe('手动合并子树的接线不能被静默剪断', () => {
      * (生产上最常见的是模型回 unsure,而没被模型提到的也算 unsure),`trunk.ok` 照样
      * 为真 —— 记录被抹掉,而那几条 ref 确实没被合回来,下一次 --resume 不再弹关口。
      */
+    /**
+     * **回收要在 `m` 跑完那一刻做,不是等收口。** 唯一会造出备份 ref 的就是这个键,
+     * 而它最典型的按法是跑完之后在结束屏上按 —— 那时 `reclaim` 早跑完了(整趟一次性),
+     * 收口那次 sweep 永远看不到这批 ref。
+     */
+    expect(el).toContain('const swept = await sweepStashBackups({ git: gitRunner, cwd: poolRef.current.gitRoot, runId })')
+    expect(SRC).toContain("import { sweepStashBackups } from '../../tools/efftask/stashGuard.js'")
     expect(el).toContain('const heldBack = (out.rescue?.hold.length ?? 0) + out.failed.length')
     expect(el).toContain('if (out.trunk?.ok === true && heldBack === 0)')
     expect(el).toContain("setHandoffState('merged')")
