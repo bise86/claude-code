@@ -558,6 +558,7 @@ describe('解冲突那次写代码的调用也要收到前言', () => {
       worktree: { branch: 'b', path: '/wt' },
     })
     let merges = 0
+    let fps = 0
     const ctx = ctxFor([n], (async (req: { phase: string; prompt: string }) => {
       prompts.push({ phase: req.phase, prompt: req.prompt })
       if (req.phase === 'execute') return '```json\n{"execStatus":"改好了"}\n```'
@@ -576,7 +577,9 @@ describe('解冲突那次写代码的调用也要收到前言', () => {
         conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/a.ts'] }),
         release: async () => ({ removed: true }),
         integrationBranchName: 'int',
-        statusFingerprint: async () => 'fp',
+        // **每次不同**:执行者在这一格里是真的写了代码,而「一轮没改任何文件」那道闸
+        // 判的正是执行前后的指纹 —— 恒定值会让它把这一轮判成无效轮、再跑一遍。
+        statusFingerprint: async () => `fp${++fps}`,
       } as any,
     })
     await stepExecute(n, ctx)

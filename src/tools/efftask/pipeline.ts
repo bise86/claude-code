@@ -4745,6 +4745,18 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // verify 和 accept 的**合并**日志,而两关各自计数,同一个 round 数会同时出现在两边。
       crossSeatNotice(execRework),
     )
+    /**
+     * **执行前后的工作区指纹** —— 「这一轮到底动没动文件」的唯一硬证据。
+     *
+     * 跑机实测(run 001):执行者把定向注入里的「只读 / 只探查下一层 / 少用工具」收敛成
+     * 「当前禁止调用工具」,写了 92 分钟分析、一个文件都没改,而 `execStatus` 洋洋洒洒 ——
+     * 于是「报告为空」那道闸照不到它,节点一路走到合并才被零贡献闸拦下。那时已经晚了:
+     * 这一趟的时间花光了,而父任务收到的是「子任务通过了」。
+     *
+     * 拍在这里而不是复用 `verifySnapshot`:那一份只在有池子且有本节点工作区时才有值,
+     * 语义正是我们要的 —— 拿不到就返回 undefined,而下面那条闸只在**两次都拿到**时才判。
+     */
+    const beforeExec = await verifySnapshot(node, ctx)
     const res = await runPhase(ctx, { phase: 'execute', node, role: execSeat, system: 'execute', prompt: executePrompt(node, ctx, execTag, feedback, syncNote, seatPreamble(ctx, execSeat, 'execute', node), execHistory), cwd: node.worktree?.path, signal: ctx.signal },
       // round 用的是 stepExecute 的局部轮次:返工每一轮都是一次独立的执行,合成一条流
       // 会让「第三轮才修好」读起来像「一直在改同一件事」。
@@ -4789,6 +4801,43 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
         return
       }
       feedback = '上一轮执行没有报告任何产出。请真正执行任务,并在 execStatus 里写明具体做了什么、结果如何。'
+      if (!(await commit(node, 'REWORK', ctx))) return
+      continue
+    }
+    /**
+     * **报告写满了,而一个文件都没动 —— 这不算一轮有效执行。**
+     *
+     * 「报告为空」那道闸判的是**有没有话说**,而这一道判的是**有没有干活**:run 001 的
+     * 那个节点两样正好相反(话很多、活没干)。判据是工作区指纹,不是执行者的自述 ——
+     * 自述正是这一格里不可信的那一样。
+     *
+     * 三条边界:
+     *  · 两次指纹**都拿得到**才判(没有池子 / 没有本节点工作区时它是 undefined,那时这道
+     *    闸本来就不成立,静默放行比假装判过好);
+     *  · 长子任务(`newChildren`)那一路照样落到这里 —— 一个只长树、不写码的回合同样
+     *    不算干活,理由和「报告为空」那道闸的注释逐字相同;
+     *  · 走**返工**而不是直接阻断:第一次很可能就是被提示词里那串限制吓住了,
+     *    而 feedback 里那句话正是解药。用尽迭代才停。
+     */
+    const afterExec = await verifySnapshot(node, ctx)
+    if (beforeExec !== undefined && afterExec !== undefined && beforeExec === afterExec) {
+      node.iteration.acceptance++
+      if (node.iteration.acceptance >= caps.maxIterations) {
+        await blockWithReason(
+          node,
+          `执行阶段连续没有改动任何文件(已达迭代上限 ${caps.maxIterations})—— 执行者报告了工作,` +
+          `但本任务工作区的 git 指纹在执行前后一模一样。` +
+          `常见成因:提示词里的「只读 / 只探查下一层 / 少用工具」被读成了「禁止调用工具」。`,
+          ctx,
+          'no-output',
+        )
+        return
+      }
+      feedback = '上一轮你**一个文件都没有改**(本任务工作区的 git 指纹在执行前后一模一样),'
+        + '而你的 execStatus 描述了工作 —— 这两件事对不上。' + String.fromCharCode(10)
+        + '再说一次:提示词里的「只读 / 只探查下一层 / 少用工具」约束的是你**读**代码的范围,'
+        + '**不解除你写代码的义务**,工具也没有被禁用。这一轮请真正把方案落到文件里。' + String.fromCharCode(10)
+        + '如果确实不该改任何文件,就在 execStatus 里说清原因并给出 newChildren 或阻断理由,不要交总结。'
       if (!(await commit(node, 'REWORK', ctx))) return
       continue
     }

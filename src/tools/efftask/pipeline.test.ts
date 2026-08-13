@@ -4037,7 +4037,9 @@ describe('测试修复环节(spec §7.1 的继任者)', () => {
   it('修复席位动了工作区 → 记下来,不作废、不返工', async () => {
     let calls = 0
     const pool = {
-      statusFingerprint: async () => { calls++; return calls <= 1 ? 'clean' : ' M src/a.ts' },
+      // 1/2 = 执行环节的前后(必须不同:否则「这一轮一个文件都没改」那道闸会判无效轮),
+      // 3/4 = 测试验证环节的前后(不同 → 本席改动了工作区)。
+      statusFingerprint: async () => { calls++; return `fp${calls}` },
       commitAndMerge: async () => ({ ok: true, merged: true }),
       release: async () => ({ removed: true }),
     }
@@ -4053,8 +4055,10 @@ describe('测试修复环节(spec §7.1 的继任者)', () => {
   })
 
   it('工作区没变时也照实说「未改动」', async () => {
+    let calls2 = 0
     const pool = {
-      statusFingerprint: async () => 'same',
+      // 执行那一对不同(有干活),验收那一对相同(修复席没动工作区)—— 这一格要测的是后者。
+      statusFingerprint: async () => { calls2++; return calls2 <= 1 ? 'before' : 'after' },
       commitAndMerge: async () => ({ ok: true, merged: true }),
       release: async () => ({ removed: true }),
     }
@@ -7039,5 +7043,82 @@ describe('执行提示词里的「必须真的改文件」', () => {
     const p = await execPromptWith('所有 MCP 只读且仅探查下一层,防止工具使用过多上下文')
     expect(p).toContain('所有 MCP 只读')
     expect(p.indexOf('所有 MCP 只读')).toBeLessThan(p.indexOf('本环节必须真的改文件'))
+  })
+})
+
+/**
+ * **报告写满了,而一个文件都没动 —— 不算一轮有效执行。**
+ *
+ * 跑机实测(run 001):执行者把「只读 / 只探查下一层 / 少用工具」收敛成「当前禁止调用
+ * 工具」,写了 92 分钟分析、一个文件没改,而 `execStatus` 洋洋洒洒 —— 「报告为空」那道闸
+ * 照不到它,节点一路走到合并才被零贡献闸拦下。那时已经晚了。
+ */
+describe('一轮没改任何文件的执行', () => {
+  const mkPool = (fps: string[]) => {
+    let i = 0
+    return {
+      statusFingerprint: async () => fps[Math.min(i++, fps.length - 1)] as string,
+      commitAndMerge: async () => ({ ok: true, merged: true }),
+      release: async () => ({ removed: true }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      // 第 2 轮开头会先从集成分支同步一次 —— 桩缺了它,返工那一路走不到。
+      refreshFromIntegration: async () => ({ ok: true, updated: false }),
+    }
+  }
+
+  it('指纹没变 → 走返工,并把「限制约束的是读」再说一遍', async () => {
+    const seen: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') seen.push(req.prompt)
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"我分析了很久,列出了完整方案"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.worktree = { branch: 'b', path: '/wt' }
+    // 每一轮的前后都一样 → 每一轮都无效,直到用尽迭代。
+    await stepExecute(n, { ...ctxFor([n], runAgent), worktrees: mkPool(['same']) as never })
+
+    expect(seen.length).toBeGreaterThan(1)
+    expect(seen[1] ?? '').toContain('一个文件都没有改')
+    expect(seen[1] ?? '').toContain('不解除你写代码的义务')
+    // 用尽迭代之后停下来,而且归 no-output 这一档(不是 rework)。
+    expect(n.status).toBe('BLOCKED')
+    expect(n.blockedReason).toContain('git 指纹在执行前后一模一样')
+    expect(n.blockedReason).toContain('禁止调用工具')
+  })
+
+  it('指纹变了 → 照常往下走', async () => {
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.worktree = { branch: 'b', path: '/wt' }
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"写了三个文件"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    await stepExecute(n, { ...ctxFor([n], runAgent), worktrees: mkPool(['a', 'b', 'b', 'b']) as never })
+    expect(n.status).toBe('ACCEPTED')
+  })
+
+  /**
+   * **拿不到指纹时这道闸不成立** —— 没有池子 / 没有本节点工作区(共享工作树那两档就是
+   * 这个形态)。那时静默放行,比假装判过好。
+   */
+  it('没有池子 → 这道闸整个不参与', async () => {
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    await stepExecute(n, ctxFor([n], runAgent))
+    expect(n.status).toBe('ACCEPTED')
   })
 })
