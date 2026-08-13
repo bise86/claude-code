@@ -137,6 +137,12 @@ function richNode(): TaskNode {
    */
   n.backtrack = { rounds: 2, at: '2026-08-13T00:00:00Z' }
   /**
+   * 「真的往集成分支放过东西」。写坏成假值的后果**方向朝坏**:
+   * 一次正常的 `--retry-blocked`(节点早就合过、这一次没有新东西)会被
+   * 「没有合并提交就不算完成」那条闸判成失败,而它明明是好的。
+   */
+  n.contributed = true
+  /**
    * 降级放行记录。**结构最深的一个持久字段**:数组里是对象,对象里还有一个字符串数组,
    * 而渲染层会 `d.advice.join()`、`degraded.length`。node.md 按设计可以手工编辑,
    * 崩在半路也会留下半条记录 —— 敌意值一路走到 commit() 抛 TypeError 就是永久死节点,

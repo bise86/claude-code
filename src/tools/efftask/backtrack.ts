@@ -72,10 +72,24 @@ export function lastIntegrateFailed(n: TaskNode): boolean {
   return false
 }
 
-/** 这个节点的产出**根本不在了** —— `mergeAndRelease` 自己写下的那句注记。 */
+/**
+ * 这个节点的产出**根本不在了** —— `mergeAndRelease` 自己写下的那句注记。
+ *
+ * 两种形态都要认,而它们来自同一件事的两个时代:
+ *
+ *  - **BLOCKED**:现在的行为。用户说「任务没有被合并提交,就不算完成吧」之后,
+ *    贡献为零的执行型节点**不再判通过**,而是带着这句话阻断 —— 这是主路径。
+ *  - **ACCEPTED**:老 run 的形态(以及那条闸放行的两种例外)。那时它照样判了通过,
+ *    只在 execStatus 上留一句注记。恢复一个旧 run 时这一格必须仍然认得出来,
+ *    否则「回溯」对着历史上最需要它的那批节点一条都扫不到。
+ */
 export const NO_CONTRIBUTION_NOTE = '没有向集成分支贡献任何改动'
+/** 阻断原因里那句话的抬头 —— 让阻断和 execStatus 上的注记能被同一条判据认出来。 */
+export const NO_CONTRIBUTION_LEAD = '该节点'
 export function outputMissing(n: TaskNode): boolean {
-  return n.status === 'ACCEPTED' && n.execStatus.includes(NO_CONTRIBUTION_NOTE)
+  if (!n.execStatus.includes(NO_CONTRIBUTION_NOTE) && !n.blockedReason.includes(NO_CONTRIBUTION_NOTE)) return false
+  // 还在跑的不算 —— 它本来就还没轮到贡献。
+  return n.status === 'ACCEPTED' || n.status === 'BLOCKED'
 }
 
 /** 一个要被回溯的父任务,以及它身上已经记下来的证据。 */

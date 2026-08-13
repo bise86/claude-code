@@ -11,6 +11,9 @@ import { depLabel } from './depsRecalc.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
 import type { BuildWipeOutcome } from './buildOutputs.js'
+// 「没有合并提交就不算完成」那句话的措辞与判据,和回溯那一侧**共用一份** ——
+// 各写一份的话,哪天改了措辞,回溯就再也扫不到它要处理的那批节点。
+import { NO_CONTRIBUTION_LEAD, NO_CONTRIBUTION_NOTE } from './backtrack.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, humanTimeoutRemedy, totalTimeoutRemedy, type BlockCategory } from './escalation.js'
 import { NodeCancelledError, PhaseTimeoutError, ProviderApiError, type TimeoutKind } from './runAgentAdapter.js'
@@ -4277,8 +4280,46 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
   // Discarding that answer let a node that wrote nothing — while reporting "已实现并自测通过"
   // — reach ACCEPTED with the integration branch byte-identical to base, and nothing anywhere
   // recorded it. Put it in the evidence the acceptance record keeps.
+  /**
+   * **合成功过 = 这个节点真的往集成分支上放过东西。** 记durable,理由见下一段。
+   */
+  if (res.merged) node.contributed = true
   if (!res.merged) {
-    node.execStatus = `${node.execStatus}\n(注:该节点没有向集成分支贡献任何改动)`
+    node.execStatus = `${node.execStatus}\n(注:该节点${NO_CONTRIBUTION_NOTE})`
+    /**
+     * **没合并提交,就不算完成。**(用户原话:「任务没有被合并提交,就不算完成吧」)
+     *
+     * 在这之前,一个**贡献为零**的节点照样走到 ACCEPTED,只在 execStatus 上留一句注记 ——
+     * 而那正是用户报的「有些生成不知道什么原因丢失」在盘上的样子:树上一片绿,集成分支
+     * 一个字节都没多。判成完成之后,父节点的集成验收拿着「子任务都通过了」去裁决,
+     * 而它要验的东西根本不在那儿。
+     *
+     * ## 判据必须窄,三种「零贡献」里只有一种是错的
+     *
+     *  - **拆分型节点**:活在子任务身上,它自己本来就不贡献 —— 而这一路根本到不了,
+     *    `releasePlanBase` 把它的 worktree 引用交回之后,上面那句
+     *    `!ctx.worktrees || !node.worktree` 早退了。判据仍然写明 `kind === 'executable'`,
+     *    因为「到不了」是别处的实现细节,不该被这里默默依赖。
+     *  - **重试**(`--retry-blocked` 打在一个其实早就合过的节点上):`isMerged` 为真 →
+     *    `merged: false`,而它**此前真的贡献过**。所以判据不是「这一次有没有合」,
+     *    而是 `node.contributed` —— 一个只增不减的持久标记。少了它,这条闸会把每一次
+     *    正常的重试都判成失败。
+     *  - **真的什么都没产出**:只有这一种该被拦下来。
+     *
+     * 拦下来之后走 `b` 回溯(它认的正是这条)或者 `r` 重做 —— 两条路都在,而且卡片要说清。
+     */
+    if (node.kind === 'executable' && node.contributed !== true) {
+      await blockWithReason(
+        node,
+        `${NO_CONTRIBUTION_LEAD}${NO_CONTRIBUTION_NOTE} —— 产出不在集成分支上,也不在任何别的地方。` +
+        `没有合并提交就不算完成,所以这里不判通过。` +
+        `按 b 回溯(会带着验收意见重新执行),或者按 r 重做本任务。`,
+        ctx,
+        // 不是基础设施故障、也不是触阀 —— 归 rework:它要人做的事就是让它重跑一次。
+        'rework',
+      )
+      return false
+    }
   }
   /**
    * **合并提交成功了 —— 立刻清掉这棵树里的构建产物。**

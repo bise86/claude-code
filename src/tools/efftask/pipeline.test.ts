@@ -1352,6 +1352,79 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     })
   })
 
+  /**
+   * **没有合并提交,就不算完成。**(用户原话:「任务没有被合并提交,就不算完成吧」)
+   *
+   * 在这之前,一个**贡献为零**的执行型节点照样走到 ACCEPTED,只在 execStatus 上留一句注记 ——
+   * 而那正是用户报的「有些生成不知道什么原因丢失」在盘上的样子:树上一片绿,集成分支一个
+   * 字节都没多,而父节点的集成验收拿着「子任务都通过了」去裁决一批根本不在那儿的东西。
+   */
+  describe('没合并提交就不算完成', () => {
+    it('执行型节点贡献为零 → 阻断,不判通过', async () => {
+      const n = root()
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        worktrees: fakePool({ commitAndMerge: async () => ({ ok: true, merged: false }) }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.status).toBe('BLOCKED')
+      expect(n.blockedReason).toContain('没有向集成分支贡献任何改动')
+      // 阻断卡要给得出能照做的下一步 —— 两条路都在。
+      expect(n.blockedReason).toContain('b 回溯')
+      expect(n.blockedReason).toContain('r 重做')
+    })
+
+    /**
+     * **此前贡献过的节点不许被这条闸误伤。**
+     *
+     * `--retry-blocked` 打在一个早就合过的节点上时,`isMerged` 为真 → `merged: false`,
+     * 而它**真的贡献过**。判据是持久标记 `node.contributed`,不是「这一次有没有合」——
+     * 少了它,每一次正常的重试都会被判成失败。
+     */
+    it('此前合过一次的节点,这一次没新东西也照样通过', async () => {
+      const n = root()
+      n.contributed = true
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        worktrees: fakePool({ commitAndMerge: async () => ({ ok: true, merged: false }) }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.status).toBe('ACCEPTED')
+    })
+
+    it('合成功过就把 contributed 记下来(下次重试才不会被误伤)', async () => {
+      const n = root()
+      const ctx = { ...ctxFor([n], okAgent()), worktrees: fakePool() as never }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.status).toBe('ACCEPTED')
+      expect(n.contributed).toBe(true)
+    })
+
+    /**
+     * 拆分型节点的活在子任务身上,它自己本来就不贡献。这一路实际到不了
+     * (`releasePlanBase` 交回引用之后 `!node.worktree` 早退),但判据仍然写明
+     * `kind === 'executable'` —— 「到不了」是别处的实现细节,不该被这里默默依赖。
+     */
+    it('拆分型节点不受这条闸影响', async () => {
+      const n = root()
+      n.kind = 'decompose'
+      n.worktree = { branch: 'b', path: '/wt/x' }
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        worktrees: fakePool({ commitAndMerge: async () => ({ ok: true, merged: false }) }) as never,
+      }
+      // 直接走合并那一步:拆分型节点的入口是集成验收,不是执行。
+      const okNow = await (async () => {
+        await stepStart(n, ctx)
+        return n.status
+      })()
+      expect(okNow).not.toBe('BLOCKED')
+    })
+  })
+
   it('a conflict gets ONE self-resolve attempt by the execute role, inside the worktree', async () => {
     // spec §8: 冲突 → 触发一次"合并解决"(由该节点 execute 角色在 worktree 内解决). The executor is
     // the only agent that knows what its own change meant, so it — not the user — goes first.
@@ -3965,7 +4038,7 @@ describe('测试修复环节(spec §7.1 的继任者)', () => {
     let calls = 0
     const pool = {
       statusFingerprint: async () => { calls++; return calls <= 1 ? 'clean' : ' M src/a.ts' },
-      commitAndMerge: async () => ({ ok: true }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
       release: async () => ({ removed: true }),
     }
     const n = ready([{ roleName: 'v' }])
@@ -3982,7 +4055,7 @@ describe('测试修复环节(spec §7.1 的继任者)', () => {
   it('工作区没变时也照实说「未改动」', async () => {
     const pool = {
       statusFingerprint: async () => 'same',
-      commitAndMerge: async () => ({ ok: true }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
       release: async () => ({ removed: true }),
     }
     const n = ready([{ roleName: 'v' }])
@@ -4333,7 +4406,7 @@ describe('测试修复不再有返工路径', () => {
     let fp = 0
     const pool = {
       statusFingerprint: async () => { fp++; return fp === 2 ? ' M a.ts' : 'clean' },
-      commitAndMerge: async () => ({ ok: true }), release: async () => ({ removed: true }),
+      commitAndMerge: async () => ({ ok: true, merged: true }), release: async () => ({ removed: true }),
       refreshFromIntegration: async () => ({ ok: true }),
     }
     let execRounds = 0
@@ -4406,7 +4479,7 @@ describe('工作区闸门:两个守卫各自守的是什么', () => {
     let calls = 0
     const pool = {
       statusFingerprint: async () => { calls++; if (calls === 2) throw new Error('git 挂了'); return 'clean' },
-      commitAndMerge: async () => ({ ok: true }), release: async () => ({ removed: true }),
+      commitAndMerge: async () => ({ ok: true, merged: true }), release: async () => ({ removed: true }),
     }
     const n = ready()
     n.worktree = { branch: 'b', path: '/wt' }
@@ -4649,7 +4722,7 @@ describe('环节跳过:七个都能跳,且跳过 ≠ 通过', () => {
     n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
     const pool = {
       acquire: async () => { acquired++; return { branch: 'b', path: '/wt' } },
-      release: async () => ({ removed: true }), commitAndMerge: async () => ({ ok: true }),
+      release: async () => ({ removed: true }), commitAndMerge: async () => ({ ok: true, merged: true }),
     }
     await stepExecute(n, { ...ctx(async req => { seen.push(req.phase); return ok(req) }), worktrees: pool as never })
     expect(seen).not.toContain('execute')
