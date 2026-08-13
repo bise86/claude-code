@@ -265,7 +265,15 @@ describe('确认屏', () => {
     const text = lines.join('\n')
     expect(text).toContain('重新执行')
     expect(text).toContain('完全重做')
-    expect(text).toContain('删除 2 个子任务')
+    /**
+     * **第 2 级点的是子任务,不是这个父任务。** 上一版按父节点渲染并印它的 childIds 数 ——
+     * 而执行时真正送去 `planRedo(entry:'plan')` 的是 suspects。验收实测:屏幕说
+     * 「删 root 的 3 个子任务」,实际删的是 c1 的 2 个。
+     */
+    expect(text).toContain('下的 1 个子任务')
+    expect(text).not.toContain('删除 2 个子任务')
+    // 这个数是估的,必须说出口:执行时主模型会重新圈一遍。
+    expect(text).toContain('可能和上面这份不同')
     expect(text).toContain('补 API 层')
     // 这个键和 r 最不一样的地方:它不开圆桌。
     expect(text).toContain('不会开新的圆桌')

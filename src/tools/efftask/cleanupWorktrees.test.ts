@@ -916,3 +916,78 @@ describe('未合入的绝对不能删(反向)', () => {
     expect(await exists(l.path)).toBe(true)
   })
 })
+
+/**
+ * **集成工作区那一桶必须走和别处同一个原语。**
+ *
+ * 验收在真 git 上量出三个后果 —— 每一个 `buildOutputs.ts` 的文件头都逐条写过,
+ * 而这一格此前自己写了一段裸的 `clean -X -d -f`,一条都没享受到:
+ *  1. 把 `/et` 自己的记录当构建产物删掉(`.claude/efftask/` 之所以被忽略,正是
+ *     `pool.init()` 自己往共享 `info/exclude` 写的那条,再被 git 折叠成 `.claude/`);
+ *  2. 嵌套 git 仓库被静默跳过而退出码是 0;
+ *  3. 释放量报的是承诺值不是测量值。
+ */
+describe('集成工作区那一桶', () => {
+  it('不许删掉 /et 自己的记录', async () => {
+    const p = pool()
+    await p.init()
+    const intPath = p.integrationPath
+    await mkdir(join(intPath, 'target'), { recursive: true })
+    await writeFile(join(intPath, 'target', 'big.o'), 'x'.repeat(4096))
+    await mkdir(join(intPath, '.claude', 'efftask', 'r1'), { recursive: true })
+    await writeFile(join(intPath, '.claude', 'efftask', 'r1', 'run.md'), 'runId: 001\n')
+
+    const deps = depsOf(p, { dirSizeKb: async () => 4, integrationPath: intPath })
+    const plan = await scanCleanup(deps, [], 'root')
+    // 确认屏承诺的条目里不该出现 .claude —— 它根本不该进这份计划。
+    expect(plan.integration?.entries.join(' ') ?? '').not.toContain('.claude')
+
+    await runCleanup(deps, plan, [])
+    expect(await exists(join(intPath, '.claude', 'efftask', 'r1', 'run.md'))).toBe(true)
+    expect(await exists(join(intPath, 'target'))).toBe(false)
+  })
+
+  it('嵌套 git 仓库被跳过要如实报,而不是算进腾出来的空间', async () => {
+    const p = pool()
+    await p.init()
+    const intPath = p.integrationPath
+    // .gitignore 在集成分支上,所以 vendored/ 真的被忽略。
+    await writeFile(join(gitRoot, '.gitignore'), 'target/\nvendored/\n')
+    await git(['add', '-A'], gitRoot); await git(['commit', '-qm', 'ignore'], gitRoot)
+    await git(['merge', '--ff-only', 'main'], intPath)
+    await mkdir(join(intPath, 'target'), { recursive: true })
+    await writeFile(join(intPath, 'target', 'a.o'), 'x')
+    const sub = join(intPath, 'vendored', 'subrepo')
+    await mkdir(sub, { recursive: true })
+    await git(['init', '-q', '-b', 'main', '.'], sub)
+    await git(['config', 'user.email', 's@s'], sub)
+    await git(['config', 'user.name', 's'], sub)
+    await writeFile(join(sub, 'mine.txt'), 'not pushed\n')
+    await git(['add', '-A'], sub); await git(['commit', '-qm', 'v'], sub)
+
+    const deps = depsOf(p, { dirSizeKb: async () => 4, integrationPath: intPath })
+    const out = await runCleanup(deps, await scanCleanup(deps, [], 'root'), [])
+    // 嵌套仓库原样还在,而且屏幕上要说。
+    expect(await exists(join(sub, 'mine.txt'))).toBe(true)
+    expect(out.problems.join('\n')).toContain('嵌套的 git 仓库')
+  })
+
+  /**
+   * **释放量按测量结算。** 扫描和真删之间隔着一整屏确认,拿 `plan.integration.kb` 顶替
+   * 就是把一句已经承诺过的数字当成一次测量。
+   */
+  it('扫描之后条目自己没了 → 腾出 0,不报计划里那个数', async () => {
+    const p = pool()
+    await p.init()
+    const intPath = p.integrationPath
+    await mkdir(join(intPath, 'target'), { recursive: true })
+    await writeFile(join(intPath, 'target', 'a.o'), 'x')
+    const deps = depsOf(p, { dirSizeKb: async () => 4, integrationPath: intPath })
+    const plan = await scanCleanup(deps, [], 'root')
+    expect(plan.integration?.kb).toBe(4)
+    await rm(join(intPath, 'target'), { recursive: true, force: true })
+    const out = await runCleanup(deps, plan, [])
+    expect(out.integrationFreedKb).toBe(0)
+    expect(out.integrationCleaned).toBe(false)
+  })
+})

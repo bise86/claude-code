@@ -221,6 +221,8 @@ export interface CleanupPlan {
     entries: string[]
     entryCount: number
     kb?: number
+    /** 真正要执行的那份计划 —— 扫描和执行**共用同一份**,不许各算一次。 */
+    plan?: BuildWipePlan
   }
   /**
    * **目录整个保留、只清里面构建产物**的那些(见 `CleanupBuildItem`)。
@@ -483,31 +485,33 @@ export async function scanCleanup(
    * 集成工作区的构建产物。**只问被忽略的那些**(`--ignored` 里 `!!` 打头的行)——
    * 未跟踪但没被忽略的文件不在其中,理由见 `CleanupDeps.integrationPath`。
    */
+  /**
+   * 集成工作区的构建产物。**走和别处同一个原语**(`scanBuildOutputs`)。
+   *
+   * 这一格此前是自己写的一段:`status --porcelain --ignored` 枚举 + 裸的
+   * `git clean -X -d -f` 执行。验收在真 git 上量出三个后果,每一个 `buildOutputs.ts`
+   * 的文件头都逐条写过、而这一格一条都没享受到:
+   *
+   *  1. **把 `/et` 自己的记录当构建产物删掉。** `.claude/efftask/` 之所以被忽略,
+   *     正是 `pool.init()` 自己往共享的 `info/exclude` 里写的那条;git 再把它折叠成
+   *     父目录 `.claude/`。实测:`.claude/efftask/r1/run.md` 被删掉了。
+   *  2. **嵌套 git 仓库被静默跳过而退出码是 0** —— 屏幕说腾出 596 KB,其中 184 KB
+   *     原地不动。
+   *  3. **释放量报的是承诺值不是测量值**(`plan.integration.kb`)。
+   */
   let integration: CleanupPlan['integration']
   if (deps.integrationPath) {
-    const st = await deps.git(
-      ['-c', 'core.quotepath=false', 'status', '--porcelain', '--ignored'],
+    const plan = await scanBuildOutputs(
+      { git: deps.git, ...(deps.dirSizeKb ? { dirSizeKb: deps.dirSizeKb } : {}) },
       deps.integrationPath,
     )
-    if (st.code === 0) {
-      const ignored = st.stdout
-        .split('\n')
-        .filter(l => l.startsWith('!!'))
-        .map(l => l.slice(2).trim())
-        .filter(Boolean)
-      if (ignored.length > 0) {
-        let kb: number | undefined = 0
-        for (const rel of ignored) {
-          const one = await deps.dirSizeKb?.(`${deps.integrationPath}/${rel}`).catch(() => undefined)
-          if (one === undefined) kb = undefined
-          else if (kb !== undefined) kb += one
-        }
-        integration = {
-          path: deps.integrationPath,
-          entries: ignored.slice(0, 3),
-          entryCount: ignored.length,
-          ...(kb === undefined ? {} : { kb }),
-        }
+    if (plan.error === undefined && plan.entries.length > 0) {
+      integration = {
+        path: deps.integrationPath,
+        entries: plan.entries.slice(0, 3).map(e => e.rel),
+        entryCount: plan.entries.length,
+        ...(plan.sizeKnown ? { kb: plan.totalKb } : {}),
+        plan,
       }
     }
   }
@@ -659,13 +663,22 @@ export async function runCleanup(
    */
   let integrationCleaned = false
   let integrationFreedKb = 0
-  if (plan.integration) {
-    const clean = await deps.git(['clean', '-X', '-d', '-f'], plan.integration.path)
-    if (clean.code === 0) {
-      integrationCleaned = true
-      integrationFreedKb = plan.integration.kb ?? 0
+  if (plan.integration?.plan) {
+    const out = await wipeBuildOutputs(
+      { git: deps.git, ...(deps.dirSizeKb ? { dirSizeKb: deps.dirSizeKb } : {}) },
+      plan.integration.plan,
+    )
+    if (out.error !== undefined) {
+      problems.push(`集成工作区的构建产物没清掉(${out.error})`)
     } else {
-      problems.push(`集成工作区的构建产物没清掉(${clean.stderr.trim() || `git clean 退出码 ${clean.code}`})`)
+      integrationCleaned = out.removed.length > 0
+      // **按测量结算**,不拿计划里那个已经在确认屏上承诺过的数字顶替。
+      integrationFreedKb = out.freedKb
+    }
+    for (const r of out.skippedRepos) {
+      // 嵌套仓库被 git 静默跳过而退出码是 0 —— 不报的话屏幕承诺的空间里有一部分
+      // 根本不会被腾出来。
+      problems.push(`集成工作区里的 ${r} 是嵌套的 git 仓库,git 跳过了它 —— 那部分空间没有被回收`)
     }
   }
 
@@ -834,7 +847,15 @@ export function cleanupLines(plan: CleanupPlan): string[] {
    * 不说的话,一个刚读完第 6 条那句保证的用户会以为这一屏什么工作都不会丢。
    */
   if (plan.items.some(i => i.leftoverCount > 0)) {
-    out.push('提示:上面那些未提交内容还没有被提交到任何分支上 —— 想留就先按 m 合并一次,再回来按 c。')
+    /**
+     * **这句指路不能许一个 `m` 兑现不了的承诺。**
+     *
+     * 上面那句「未提交内容」是**带 `--ignored`** 数出来的(见 leftoverCount),里面包含
+     * 构建产物;而 `m` 走的 `commitAndMerge` 第一句是 `git add -A`,**不暂存被忽略的
+     * 文件**。所以「先按 m 保住它们」对其中一部分逐字为假 —— 验收把这两屏并排读出来了。
+     */
+    out.push('提示:上面那些未提交内容还没有被提交到任何分支上。')
+    out.push('  **未被忽略的**那些可以先按 m 合并一次保住;而被 .gitignore 忽略的(构建产物)m 也提交不了 —— 它们只能被删。')
   }
   if (plan.absent > 0) out.push(`另有 ${plan.absent} 个已验收任务在盘上没有工作区目录(清过了,或那一趟没隔离)。`)
   // 集成工作区那句话分两半,而且两半都要说:**目录留着**(下一次收口和合并都在它里面

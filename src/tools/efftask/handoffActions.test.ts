@@ -228,18 +228,36 @@ describe('收口合并撞上冲突:先让模型解一次', () => {
     const calls: string[][] = []
     let statusIdx = 0
     const statuses = over.statuses ?? ['UU a.ts\n', '']
+    /**
+     * **一次成功的 abort 会让现场真的消失。**
+     *
+     * 假 git 原来对 `rev-parse MERGE_HEAD` 恒回 0、`status` 永远返回最后一条 ——
+     * 也就是说它模拟的 abort **什么都不做**。而生产代码的判据已经从「abort 的退出码」
+     * 换成了「收拾完之后现场还在不在」(那条换法的理由:没有合并可中止时 git 回 128
+     * 而树是干净的,按退出码判会报一句假的「还原失败」)。夹具不跟上,它就会对着一个
+     * 更严的实现报假失败 —— 而它本该是这条判据的证人。
+     */
+    let inMerge = true
     const git: GitFn = async args => {
       calls.push(args)
       const [a, b] = args
       if (a === 'diff' && args.includes('--quiet')) return { code: 0, stdout: '', stderr: '' }
+      if (a === 'rev-parse' && args.includes('MERGE_HEAD')) {
+        return inMerge ? { code: 0, stdout: 'mergehead\n', stderr: '' } : { code: 1, stdout: '', stderr: '' }
+      }
       if (a === 'rev-parse') return { code: 0, stdout: 'abc1234\n', stderr: '' }
-      if (a === 'merge' && b === '--abort') return { code: over.abortFails ? 1 : 0, stdout: '', stderr: '' }
+      if (a === 'merge' && b === '--abort') {
+        if (!over.abortFails) inMerge = false
+        return { code: over.abortFails ? 1 : 0, stdout: '', stderr: '' }
+      }
       if (a === 'merge') {
         return over.mergeFails === false
           ? { code: 0, stdout: '', stderr: '' }
           : { code: 1, stdout: '', stderr: 'CONFLICT (content): Merge conflict in a.ts' }
       }
       if (a === 'status') {
+        // abort 成功之后现场没了 —— 真 git 就是这样,而 restored 那条判据正是量它。
+        if (!inMerge) return { code: 0, stdout: '', stderr: '' }
         const out = statuses[Math.min(statusIdx, statuses.length - 1)] ?? ''
         statusIdx++
         return { code: 0, stdout: out, stderr: '' }

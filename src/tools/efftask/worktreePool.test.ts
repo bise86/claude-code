@@ -1837,3 +1837,49 @@ describe('discard —— 重做时把工作区整个删掉', () => {
     expect(await exists(p0.worktreePathOf(n))).toBe(true)
   })
 })
+
+/**
+ * **嵌套 git 仓库一律拒绝删除。**
+ *
+ * 验收在真 git 上量过不拒绝的后果:`add -A` 对它只记一个 gitlink,而
+ * `worktree remove --force` 把目录整个删掉 —— 对象库跟着没,存下来的抢救分支里是一个
+ * **悬空指针**,而屏幕照样念「已抢救,可用 git show 查看」。
+ */
+describe('discard 遇到嵌套 git 仓库', () => {
+  it('拒绝删除,并说清是哪几个目录', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/16-nested')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'work.ts'), 'x\n')
+    const sub = join(l.path, 'vendored')
+    await mkdir(sub, { recursive: true })
+    await git(['init', '-q', '-b', 'main', '.'], sub)
+    await git(['config', 'user.email', 's@s'], sub)
+    await git(['config', 'user.name', 's'], sub)
+    await writeFile(join(sub, 'secret.txt'), 'not pushed anywhere\n')
+    await git(['add', '-A'], sub)
+    await git(['commit', '-qm', 'v'], sub)
+
+    const r = await p.discard(n)
+    expect(r.removed).toBe(false)
+    expect(r.keptBecause).toContain('嵌套')
+    expect(r.keptBecause).toContain('vendored')
+    // 一个字节都没动:目录还在,里面那个仓库的提交也还在。
+    expect(await exists(join(sub, 'secret.txt'))).toBe(true)
+    expect(await exists(l.path)).toBe(true)
+  })
+
+  /** 没有嵌套仓库时照旧删 —— 这道闸不许把正常路径也挡住。 */
+  it('没有嵌套仓库时不受影响', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/17-plain')
+    const l = await p.acquire(n) as { path: string }
+    await mkdir(join(l.path, 'sub'), { recursive: true })
+    await writeFile(join(l.path, 'sub', 'a.ts'), 'x\n')
+    const r = await p.discard(n)
+    expect(r.removed).toBe(true)
+    expect(await exists(l.path)).toBe(false)
+  })
+})

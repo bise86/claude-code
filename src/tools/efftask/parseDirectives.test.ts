@@ -1,7 +1,7 @@
 // src/tools/efftask/parseDirectives.test.ts
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { parseDirectives } from './parseDirectives.js'
+import { applyCapsPatch, parseDirectives } from './parseDirectives.js'
 import type { RoleDef } from './roleDefs.js'
 import { PHASE_NAMES } from './types.js'
 import { DEFAULT_CAPS, MAX_NODES_CEILING } from './types.js'
@@ -681,5 +681,43 @@ describe('baseCaps:配置文件定起点,提示词逐字段覆盖', () => {
   it('没有 baseCaps 时逐字节等于默认值 —— 新参数不许改变老行为', async () => {
     const cfg = await parseDirectives('随便跑跑', { ...opts, modelJson: async () => '```json\n{}\n```' })
     expect(cfg.caps).toEqual(DEFAULT_CAPS)
+  })
+})
+
+/**
+ * **两个新旋钮必须有正常的录入口。**
+ *
+ * `applyCapsPatch` 是提示词和 `settings.json` 的 `efftaskCaps` **唯一**入口。它们不在其中的
+ * 后果被验收点名:关口上逐字印着「完成即回收: 开 / 关」,而用户**没有任何正常途径把它关掉**
+ * —— 一次默认开启、自动、不可逆的删除,配一个只在屏幕上存在的开关。
+ */
+describe('新增的两个安全阀能配进去', () => {
+  it('wipeOnAccept 收布尔', () => {
+    expect(applyCapsPatch(DEFAULT_CAPS, { wipeOnAccept: false }, '', []).wipeOnAccept).toBe(false)
+    expect(applyCapsPatch(DEFAULT_CAPS, { wipeOnAccept: true }, '', []).wipeOnAccept).toBe(true)
+  })
+
+  /**
+   * 只认真正的布尔 —— 字符串 `'false'` 是 truthy,误开一次就是一次真的删除。
+   * 判据是「**没改动 base**」,不是「undefined」:`applyCapsPatch` 从 base 起手,
+   * 而 `DEFAULT_CAPS.wipeOnAccept` 本来就是 true。
+   */
+  it('wipeOnAccept 写成字符串一律忽略', () => {
+    const out = applyCapsPatch({ ...DEFAULT_CAPS, wipeOnAccept: false }, { wipeOnAccept: 'false' }, '', [])
+    expect(out.wipeOnAccept).toBe(false)
+  })
+
+  it('trunkResolveRounds 收数字并夹取,越界要留提示', () => {
+    expect(applyCapsPatch(DEFAULT_CAPS, { trunkResolveRounds: 0 }, '', []).trunkResolveRounds).toBe(0)
+    const notices: string[] = []
+    expect(applyCapsPatch(DEFAULT_CAPS, { trunkResolveRounds: 999 }, '', notices).trunkResolveRounds).toBe(20)
+    expect(notices.join('\n')).toContain('手动合并解冲突轮数')
+  })
+
+  it('没写就不动 base 上原有的值', () => {
+    const base = { ...DEFAULT_CAPS, wipeOnAccept: false, trunkResolveRounds: 7 }
+    const out = applyCapsPatch(base, {}, '', [])
+    expect(out.wipeOnAccept).toBe(false)
+    expect(out.trunkResolveRounds).toBe(7)
   })
 })

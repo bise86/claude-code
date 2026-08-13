@@ -89,12 +89,25 @@ async function stageAt(
     if (add.code !== 0) return { ok: false, why: `建不出临时合并工作区: ${add.stderr.trim() || add.stdout.trim()}` }
     return { ok: true }
   }
-  // 复用。先把可能存在的半合并态收掉,再对齐到 tip。
+  /**
+   * 复用。**先收拾,再对齐** —— 顺序反了这棵树会被永久卡死。
+   *
+   * 验收在真 git 上复现过:`autoResolveMerge` 只 `git add -- <冲突文件>` 然后
+   * `commit --no-edit`(**没有 `-a`**)。解冲突模型顺手改了一个不在冲突列表里的受跟踪文件
+   * → 合并成功,而这棵树留着一个未暂存的改动。下一次进来时 `checkout --detach` 报
+   * 「Your local changes to the following files would be overwritten by checkout」并 return,
+   * 而收拾它的那两句 `reset --hard` / `clean -fd` **排在它下游,永远到不了**:
+   *
+   *     attempt 1..3: 临时合并工作区切不到集成分支: error: Your local changes …
+   *
+   * 从此 `m` 键的**捞回**和**合回主干**两条路全部永久失败,而报出去的错没有任何可操作的
+   * 下一步。所以 `reset --hard` 排第一 —— 它本来就能把 HEAD 挪到 tip,`checkout` 那一步
+   * 反而是多余的。这棵树是我们自己的、没有第二个读者,所以在这里 `reset` + `clean` 不伤人。
+   */
   const inMerge = await deps.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], path)
   if (inMerge.code === 0) await deps.git(['merge', '--abort'], path)
-  const co = await deps.git(['checkout', '--detach', tip], path)
-  if (co.code !== 0) return { ok: false, why: `临时合并工作区切不到集成分支: ${co.stderr.trim()}` }
-  await deps.git(['reset', '--hard', tip], path)
+  const reset = await deps.git(['reset', '--hard', tip], path)
+  if (reset.code !== 0) return { ok: false, why: `临时合并工作区对不齐集成分支: ${reset.stderr.trim()}` }
   await deps.git(['clean', '-fd'], path)
   return { ok: true }
 }
@@ -211,7 +224,20 @@ export async function mergeIntoIntegration(
     const sha = head.stdout.trim()
     const ff = await deps.withIntegrationLock(() =>
       deps.git(['merge', '--ff-only', '--no-verify', sha], deps.integrationPath))
-    if (ff.code === 0) return { ok: true, advanced: true, resolvedFiles, rounds: spent }
+    if (ff.code === 0) {
+      /**
+       * **合成了就把临时工作树收掉。**
+       *
+       * 它是一棵**完整检出**,建在 `.efftask-worktrees/merge-scratch`,而
+       * `cleanupWorktrees`(`c` 键)、`finishHandoff`、`dispose` 都不认识它 ——
+       * 验收点名:这一轮的起因就是跑机 916 G 撑满,而这个功能自己往那儿永久多放一份仓库。
+       *
+       * 只在**成功**这条路上收:失败时那棵树是现场(报错里指着它让人去处理)。
+       * 收不掉不算失败 —— 下一次进来 `stageAt` 会复用它。
+       */
+      await deps.git(['worktree', 'remove', '--force', path], deps.gitRoot)
+      return { ok: true, advanced: true, resolvedFiles, rounds: spent }
+    }
     /**
      * 快进不成立 = 这期间集成分支被推进过(编排器合了别的节点)。**回第 1 步重来**,
      * 而**绝不退回普通 merge** —— 那会在共享的集成工作区里造一次没人预料的三方合并,

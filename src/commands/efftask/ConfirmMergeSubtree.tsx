@@ -31,6 +31,33 @@ import { redoSummaryLines } from './ConfirmRedo.js'
  *
  * 判据和动作住在 `mergeSubtree.ts`(那里对着真 git 测),这一屏不认识 git。
  */
+/**
+ * **这一屏按下回车到底有没有事要做。**
+ *
+ * 判据必须**三跳全看**,而它此前只看了两跳:
+ *
+ *  1. `items` —— 有工作区目录、要逐个 commitAndMerge 的那些;
+ *  2. `trunk` —— 第二跳(集成分支 → 你当前的分支)。一个节点都不用合、而集成分支上压着
+ *     十个提交没送到,是这个键最典型的用法之一;
+ *  3. **`rescue`** —— 没有工作区目录的那几类(抢救分支、只剩分支的残留、认不回主的 ref)。
+ *
+ * 漏掉第 3 跳的后果在验收里被**真挂载复现**过:屏幕逐字印着「另外捞回 1 处没有工作区目录
+ * 的产出(共 4 个提交)」,而页脚是「回车 / q / Esc 返回」,回车走 `onCancel`,
+ * `onRun` **一次都没被调用**。而那恰恰是 `rescue.ts` 自己写的主场景 —— 跑机实测 32 条
+ * 工作树登记项里 **31 条**目录已不在:目录全清过、集成分支也已送达时前两跳都是空的,
+ * 于是那条捞回链路**永远执行不到**。
+ *
+ * **抽成一份**是因为这个判据有**两个**读者(按键处理和页脚文案),而这次漏掉 rescue
+ * 正是两处各写一份的直接后果。
+ */
+export function hasNothingToDo(p: SubtreeMergePlan): boolean {
+  const rescue = p.rescue
+  const hasRescue = rescue !== undefined && rescue.merge.length > 0
+  return p.items.length === 0
+    && (p.trunk.pending === 0 || p.trunk.blocked !== undefined)
+    && !hasRescue
+}
+
 export function ConfirmMergeSubtree(props: {
   target: TaskNode
   onScan: () => Promise<SubtreeMergePlan>
@@ -95,7 +122,7 @@ export function ConfirmMergeSubtree(props: {
      * 是这个键最典型的用法之一(逐任务合并那一路被脏树挡过)。只看 `items.length` 会把
      * 那一次变成死键,而屏幕上写着「回车 确认合并」。
      */
-    const nothing = !p || (p.items.length === 0 && (p.trunk.pending === 0 || p.trunk.blocked !== undefined))
+    const nothing = !p || hasNothingToDo(p)
     if (nothing) {
       if (key.return || k === 'y') props.onCancel()
       return
@@ -172,8 +199,7 @@ export function ConfirmMergeSubtree(props: {
     ? (outcome ? subtreeMergeResultLines(outcome) : ['(没有结果)'])
     : (plan ? subtreeMergeLines(plan) : ['(没有可合并的内容)'])
   const { shown, hidden } = redoSummaryLines(lines, rows, columns)
-  const nothing = mode === 'ready' && plan !== null
-    && plan.items.length === 0 && (plan.trunk.pending === 0 || plan.trunk.blocked !== undefined)
+  const nothing = mode === 'ready' && plan !== null && hasNothingToDo(plan)
   const footer = mode === 'done' || nothing
     ? '回车 / q / Esc 返回'
     : '回车 / y 确认合并(会在你的分支上产生真实提交) · q / Esc / n 取消'

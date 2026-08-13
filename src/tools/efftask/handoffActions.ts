@@ -86,8 +86,18 @@ export async function autoResolveMerge(deps: {
   const fail = async (why: string): Promise<{ ok: false; why: string; restored: boolean }> => {
     // 还原到合并前。git 在内容冲突时不回滚,不 abort 的话用户的工作区就停在半合并状态 ——
     // 而他没按过任何键,屏幕上一句「你的工作区未被改动」当场变成假话。
-    const ab = await git(['merge', '--abort'], cwd)
-    return { ok: false, why, restored: ab.code === 0 }
+    /**
+     * **判据看现场,不看 abort 的退出码。**
+     *
+     * 没有合并可中止时 `git merge --abort` 回 128 而树是干净的 —— 按退出码判会报一句
+     * 假的「自动还原失败」。而这个值有真实后果:`rescue.runRescue` 拿它决定要不要
+     * **break 掉整批捞回**,一次假的「还原失败」会让剩下的孤立产出一条都捞不了,
+     * 直接顶掉「必须保证全部捞回」。
+     */
+    await git(['merge', '--abort'], cwd)
+    const still = await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd)
+    const left = await mergeLeftovers(git, cwd)
+    return { ok: false, why, restored: still.code !== 0 && left.length === 0 }
   }
   try {
     // `note` 只在给了的时候才带上 —— 老调用方一个字都不变。
@@ -107,7 +117,14 @@ export async function autoResolveMerge(deps: {
   if (left.length > 0) return fail(`仍有未解决的冲突文件:${left.slice(0, 5).join('、')}`)
   const markers = await stagedMarkers(git, cwd, files)
   if (markers.length > 0) return fail(`解决结果里还留着冲突标记:${markers.slice(0, 5).join('、')}`)
-  const commit = await git(['commit', '--no-edit'], cwd)
+  /**
+   * **`--no-verify`。** 这是全仓最后一处漏掉它的 commit,而现在它的处境最糟:
+   * 迭代解冲突每一轮都调这里,跑在**我们自己的** `merge-scratch` 里、用的却是**用户的**
+   * 钩子(`core.hooksPath` 在共享 config 里)。一个失败的 pre-commit 会把
+   * `caps.trunkResolveRounds` 轮全部烧完,最后报「提交失败」—— 而重试永远不会收敛。
+   * `commitAndMerge` / `acquire` / `refreshFromIntegration` 早就为同一个理由带着它。
+   */
+  const commit = await git(['commit', '--no-edit', '--no-verify'], cwd)
   if (commit.code !== 0) return fail(`提交失败: ${oneLine(commit.stderr || commit.stdout) || '未知原因'}`)
   return { ok: true }
 }

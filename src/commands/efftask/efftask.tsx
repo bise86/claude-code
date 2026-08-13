@@ -1792,10 +1792,6 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * `runningNodeIds()` 是编排器对外的那条接缝(`inFlightIds` 是 private)。
        */
       inFlight: orchRef.current?.runningNodeIds() ?? [],
-      // 手动合并撞冲突时让模型解几轮。**不复用 mergeResolveAttempts** ——
-      // 那个数管的是节点自动解冲突(每次解完还要重跑验收),把它设成 0 的人不该
-      // 因此静默失去 m 键现有的解冲突能力。见 Caps.trunkResolveRounds。
-      ...(config?.caps?.trunkResolveRounds === undefined ? {} : { rounds: config.caps.trunkResolveRounds }),
       onError: e => logError(e),
     }
     // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for a mount
@@ -1846,6 +1842,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 不下判决(见 rescue.ts)—— 拿不准一律不合,而且要说出来。
        */
       ...(root ? { triage: makeRescueTriage({ runAgent: props.runAgent, node: root, signal }) } : {}),
+      /**
+       * 手动合并撞冲突时让模型解几轮。**不复用 `mergeResolveAttempts`** —— 那个数管的是
+       * 节点自动解冲突(每次解完还要重跑验收),把它设成 0 的人不该因此静默失去 `m` 键
+       * 现有的解冲突能力。见 `Caps.trunkResolveRounds`。
+       *
+       * ⚠ 这一行第一版**接错了对象**:它被展开进了隔壁的 `cleanupDeps`,而 `CleanupDeps`
+       * 根本没有 `rounds` 这个字段 —— 于是整条链恒取默认值 3,设 0 的人照样被派模型改代码。
+       * TypeScript 抓不到:`...(cond ? {x} : {})` 这种条件展开**不做多余属性检查**。
+       * 病根是我拿「两个 deps 里都存在的那一行」当锚做的插入,而 `String.replace` 只换第一处。
+       */
+      ...(config?.caps?.trunkResolveRounds === undefined ? {} : { rounds: config.caps.trunkResolveRounds }),
       onError: e => logError(e),
     }
     // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs / props.runAgent are stable for a mount

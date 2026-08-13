@@ -993,10 +993,55 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       // 目录本来就不在 = 这一步没什么可做的,不是失败。分支的事交给 acquire 的 reclaim。
       if (here.code !== 0) return { removed: true }
 
-      // 一、固化。`add -A` 之后没东西可提交时 commit 非零退出,那不是失败 —— 判据是
-      // 下一步的「HEAD 在不在集成分支里」,不是这次 commit 的退出码(acquire 为同一件事
-      // 写过一整段:执行者自己提交过的形态只有那一问答得对)。
+      /**
+       * **零、嵌套 git 仓库一律拒绝删除。**
+       *
+       * 验收在真 git 上量过不拒绝的后果:`git add -A` 对工作区里的嵌套仓库只记一个
+       * **gitlink**(git 自己在 stderr 里喊 `warning: adding embedded git repository`),
+       * 而第三步 `worktree remove --force` 把目录整个删掉 —— 对象库跟着没。于是:
+       *
+       *     $ git ls-tree <salvage> nested
+       *     160000 commit d5e9795…  nested          ← 存下来的是一个悬空指针
+       *     $ git show <salvage>:nested/secret.txt
+       *     fatal: path 'nested/secret.txt' does not exist
+       *
+       * 而屏幕(`redoCommit`)照样念「重做前的产出已抢救到分支 …(没有丢失,可用 git show
+       * 查看)」。这直接违反本函数第二步自己写的那句「**存不下来就整条放弃** —— 宁可这个
+       * 节点报错,不可静默丢掉一次执行的产出」:一个悬空的 gitlink 就是「存不下来」。
+       *
+       * 判据用**git 自己记下来的东西**:`add -A` 之后 `ls-files -s` 里那条 `160000`
+       * (gitlink 的模式位)。它就是让抢救变成悬空指针的那个条目 —— 精确、与 locale 无关。
+       *
+       * 实测过两条不能用的:
+       *  - 解析 `add` 的**警告文本**(`warning: adding embedded git repository`)——
+       *    那句话随 locale 变,而这个功能的现场恰恰是中文机器(第十八轮为同一件事付过账);
+       *  - 扫 `ls-files -o --exclude-standard` 找 `.git` —— git **不会 descend 进嵌套仓库**,
+       *    它只报一个 `vendored/`,里面的 `.git` 一个字都看不到(第一版就是这么写的,
+       *    对着真仓库一次都没命中)。
+       *
+       * 探到就**把索引还原回去**再拒绝:这一路承诺「一个字节都不动」,而 `add -A` 已经
+       * 动过暂存区了。
+       */
       await git(['add', '-A'], path)
+      const staged = await git(['ls-files', '-s'], path)
+      const nestedRepos = staged.stdout.split('\n')
+        .filter(l => l.startsWith('160000'))
+        .map(l => l.slice(l.indexOf('\t') + 1).trim())
+        .filter(Boolean)
+      if (nestedRepos.length > 0) {
+        await git(['reset'], path)
+        return {
+          removed: false,
+          keptBecause: `工作区里有嵌套的 git 仓库(${nestedRepos.slice(0, 3).join('、')}` +
+            `${nestedRepos.length > 3 ? ` 等 ${nestedRepos.length} 个` : ''})—— ` +
+            `它们的提交存不进抢救分支(git 只记一个 gitlink,内容留在那个目录自己的对象库里),` +
+            `删掉就真的没了。请自行处置那几个目录之后再重做。`,
+        }
+      }
+
+      // 一、固化(`add -A` 已在上面做过)。没东西可提交时 commit 非零退出,那不是失败 ——
+      // 判据是下一步的「HEAD 在不在集成分支里」,不是这次 commit 的退出码(acquire 为同一件事
+      // 写过一整段:执行者自己提交过的形态只有那一问答得对)。
       await git(['commit', '--no-verify', '-m', `efftask: 固化工作区残留 (${node.id})`], path)
 
       // 二、抢救。

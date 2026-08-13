@@ -191,7 +191,14 @@ export async function planRescue(
     const ev = await evidenceFor(deps, it.branch, {
       ...(it.nodeId ? { nodeId: it.nodeId } : {}),
       ...(it.title ? { title: it.title } : {}),
-      fate: it.kind === 'salvageOrphan' ? 'unknown' : 'still-open',
+      /**
+       * **来历由清单算出来,这里不许写死。**
+       *
+       * 上一版这里是 `it.kind === 'salvageOrphan' ? 'unknown' : 'still-open'` —— 于是
+       * `provenanceNote` 的 superseded 特判和分诊提示词里那句「被重做过」**永远不触发**,
+       * 而且把一句反过来的假事实交给了模型。验收在真 git 上跑出的结果是废稿被合进集成分支。
+       */
+      fate: it.fate ?? (it.kind === 'salvageOrphan' ? 'unknown' : 'still-open'),
     })
     if (!ev) {
       problems.push(`${it.branch}:探不出它相对集成分支带来了什么,没有分诊(git 失败)`)

@@ -348,3 +348,40 @@ describe('屏幕上说了什么', () => {
     expect(text).toContain('要返工的')
   })
 })
+
+/**
+ * **判据必须和回溯那一侧共用一份。**
+ *
+ * 验收实测抓到的:本轮把「贡献为零」的节点从 ACCEPTED 改成 **BLOCKED** 之后,这边那份
+ * 硬编码副本(只认 `ACCEPTED` + 字面量)**一件都扫不到**,而同一个节点在 `outputMissing()`
+ * 里判 true。同一个概念两份实现,只更新了其中一份 —— 而这一份正是「全部捞出来」的入口。
+ */
+describe('产出丢了:两种形态都要认', () => {
+  it('新形态(BLOCKED,原因写在 blockedReason 里)扫得到', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/miss-blocked', {
+      status: 'BLOCKED',
+      blockedReason: '该节点没有向集成分支贡献任何改动 —— 产出不在集成分支上。按 b 回溯',
+    })
+    const r = await scanStranded(depsOf(p), [n])
+    expect(kinds(r)).toContain('missing')
+  })
+
+  it('老形态(ACCEPTED,注记写在 execStatus 里)照样扫得到', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/miss-accepted', {
+      status: 'ACCEPTED', execStatus: '(注:该节点没有向集成分支贡献任何改动)',
+    })
+    const r = await scanStranded(depsOf(p), [n])
+    expect(kinds(r)).toContain('missing')
+  })
+
+  it('还在跑的不算 —— 它本来就还没轮到贡献', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/miss-running', {
+      status: 'EXECUTING', execStatus: '没有向集成分支贡献任何改动',
+    })
+    const r = await scanStranded(depsOf(p), [n])
+    expect(kinds(r)).not.toContain('missing')
+  })
+})

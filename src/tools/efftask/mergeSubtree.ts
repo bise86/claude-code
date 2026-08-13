@@ -4,7 +4,7 @@ import { writeNode, type FsLike } from './persistence.js'
 import { autoResolveMerge, trackedChanges, type ConflictResolver, type GitFn } from './handoffActions.js'
 import { syncTrunk } from './integrationMerge.js'
 import { scanStranded, STRANDED_KINDS } from './stranded.js'
-import { planRescue, runRescue, type RescuePlan, type RescueTriage } from './rescue.js'
+import { planRescue, rescueLines, runRescue, type RescuePlan, type RescueTriage } from './rescue.js'
 import type { MergeResult } from './worktreePool.js'
 import type { TaskNode } from './types.js'
 
@@ -729,6 +729,16 @@ async function noteMerged(deps: SubtreeMergeDeps, node: TaskNode, out: SubtreeMe
    * 叠出两句只有秒数不同的话,而读的人会以为发生了两件事(pipeline 的 noteOnNode 为
    * 同一件事写过注释)。
    */
+  /**
+   * **手动合过也算贡献过。**
+   *
+   * 少了这一句,「没有合并提交就不算完成」那道闸会把用户**亲手按 m 救回来**的节点判死:
+   * 合完之后 `--resume --retry-blocked` → 节点重跑、没有新产出 → `isMerged` 为真 →
+   * `{merged:false}` → `contributed !== true` → BLOCKED,理由逐字是
+   * 「该节点没有向集成分支贡献任何改动」。而它刚刚才贡献过,还是他自己按的。
+   * 这一条正顶在需求 8 和「没合并提交就不算完成」的接缝上。
+   */
+  node.contributed = true
   if (!node.execStatus.includes(MANUAL_MERGE_NOTE)) {
     node.execStatus = `${node.execStatus}${node.execStatus ? '\n' : ''}${line}`
   }
@@ -792,28 +802,29 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
    */
   if (plan.rescue === undefined) {
     out.push('⚠ 这一屏没有检查「没有工作区目录」的那几类(抢救分支、只剩分支的残留)—— 缺少扫描所需的信息。')
-  } else {
-    const r = plan.rescue
-    if (r.merge.length > 0) {
-      const total = r.merge.reduce((s, c) => s + c.evidence.commits, 0)
-      out.push(`另外捞回 ${r.merge.length} 处**没有工作区目录**的产出(共 ${total} 个提交):`)
-      for (const c of r.merge) {
-        out.push(`  · ${c.evidence.title ?? c.evidence.ref}(${c.evidence.fileCount} 个文件):${c.why}`)
-      }
-      out.push('  它们的分支合完照样保留 —— 捞是往集成分支加东西,不是清理。')
-    }
-    if (r.hold.length > 0) {
-      const unsure = r.hold.filter(c => c.verdict === 'unsure').length
-      // 「拿不准」和「判定不合」要分开数:前者是我们没把握,后者是有理由的排除。
-      out.push(`有 ${r.hold.length} 处孤立产出**不合**${unsure > 0 ? `(其中 ${unsure} 处拿不准)` : ''},只列出来:`)
-      for (const c of r.hold) out.push(`  · ${c.evidence.title ?? c.evidence.ref}:${c.why}`)
-    }
-    for (const o of r.orphanFiles) {
-      out.push(`孤儿目录 ${o.path} 里有 ${o.files.length} 个文件不在集成分支上。`)
-      // 它不是 git 工作树,合不进来 —— 不说的话用户以为按一下就收进去了。
-      out.push('  ⚠ 那个目录已经不是 git 工作树,没法合并;请自行确认后手工取用(目录不会被删)。')
-    }
-    for (const p of r.problems) out.push(`⚠ ${p}`)
+  } else if (plan.rescue.merge.length + plan.rescue.hold.length + plan.rescue.orphanFiles.length
+    + plan.rescue.problems.length > 0) {
+    /**
+     * **直接用 `rescueLines`,不另写一份。**
+     *
+     * 第一版在这里内联重写了一遍,而验收把两份逐字比过:活着的那一份**更差** ——
+     * 丢了每条 hold 的 `git log` / `git diff` 自查命令、丢了孤儿目录里
+     * 「集成分支上根本没有」和「内容不同」的拆分与文件清单。而那几样恰恰是用户唯一能
+     * 据以动手的东西。一个功能两份渲染,活着的那份总会先退化。
+     */
+    out.push(...rescueLines(plan.rescue))
+  }
+  /**
+   * **「所有未提交的都要提交」有个后半句,必须说出口。**
+   *
+   * `commitAndMerge` 第一句是 `git add -A`,而它**不暂存被忽略的文件** —— 于是
+   * `target/` 这些永远不会被提交。而 `c` 键的确认屏正让用户「想留就先按 m 合并一次,
+   * 再回来按 c」:他按了 m 会以为构建产物保住了,回来按 c 把它们删掉。
+   * **同一批东西,一屏承诺、另一屏兑现不了** —— 所以这一屏必须自己把边界讲清。
+   */
+  if (plan.items.some(i => i.loose > 0)) {
+    out.push('⚠ 被 .gitignore 忽略的文件(target/ 这些构建产物)**不会**被提交 —— `git add -A` 不暂存它们。')
+    out.push('  它们不是交付物;要腾空间请按 c,那一屏会逐个列出来。')
   }
   out.push('任务状态不会被改动:合并只动 git,节点的判决、评审与验收记录原样保留。')
   if (plan.runActive) {

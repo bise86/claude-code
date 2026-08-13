@@ -1,5 +1,5 @@
 // src/tools/efftask/parseDirectives.ts
-import { MAX_NODES_CEILING, clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, DEFAULT_PARALLELISM, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_ROLE_GUIDANCE, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
+import { MAX_NODES_CEILING, clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, MIN_TRUNK_RESOLVE, MAX_TRUNK_RESOLVE, DEFAULT_TRUNK_RESOLVE, DEFAULT_PARALLELISM, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_ROLE_GUIDANCE, PHASE_NAMES, PHASE_LABEL, STEP_ALIASES } from './types.js'
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { isStrictness, STRICTNESS_LEVELS } from './strictness.js'
 import { extractJsonBlock } from './parseOutput.js'
@@ -11,7 +11,7 @@ export type ModelJsonFn = (prompt: string) => Promise<string>
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
 { "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
   "skipSteps": ["要整个跳过的环节名"],
-  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化", "nodeTimeoutMs"?: number, "mergeResolveAttempts"?: number, "strictness"?: ${STRICTNESS_LEVELS.map(s => `"${s}"`).join('|')} },
+  "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化", "nodeTimeoutMs"?: number, "mergeResolveAttempts"?: number, "wipeOnAccept"?: boolean, "trunkResolveRounds"?: number, "strictness"?: ${STRICTNESS_LEVELS.map(s => `"${s}"`).join('|')} },
   "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }],
   "phaseGuidance": { "环节名": "指令里点名给这个环节的那几句话" },
   "roleGuidance": [{ "name": "角色名或员工名", "text": "指令里点名给这个人的那几句话" }] }
@@ -21,6 +21,8 @@ phaseRoles 的值是**员工名**数组(可派发的身份)。
 - 用户说**人数**(「至少 2 个人通过」「要 3 票」)→ caps.quorumSeats,就是那个人数。**不要**把人数写进 quorum:「至少 2 人」写成 quorum=2 的含义是 2%,等于 1 票就放行,和用户的意思正好相反。
 caps.maxDepth 是**任务树最多分几层**,caps.maxNodes 是**整棵树最多几个任务**。用户说「安全阀里允许最多 20 层、最多 20000 个节点」「别拆太深,三层就够」「任务别超过 200 个」→ 填这两个。取值范围分别是 1~20 和 1~20000,超出会被夹到边界(关口会说)。
 caps.maxSeatsPerPhase 是每个阶段最多几席。
+caps.wipeOnAccept:任务合并完成后**立即删掉**它工作区里被 .gitignore 忽略的构建产物,默认 true。用户说「别自动删构建产物」「重做时不要重编」→ false。
+caps.trunkResolveRounds:**手动合并**(m 键/捞回/合回主干)撞冲突时最多让模型解几轮,默认 3;0 = 撞冲突就停下来叫人。和 mergeResolveAttempts 是两条不同的路。
 caps.mergeResolveAttempts 是**一个节点的合并冲突最多让模型自动解几次**(每次解完都会重跑验收)。用户说「冲突多试几次」「解冲突给 10 次机会」「冲突别自动解、直接叫我」→ 填这里(最后那句 = 0)。默认 6。
 caps.nodeTimeoutMs 是**一次调用最多可以多久没有任何输出**(毫秒)。用户说「阶段超时 20 分钟」「每步最多等半小时」「模型慢,超时给久一点」→ 换算成毫秒填这里(20 分钟 = 1200000)。他说的是「多久没动静算卡死」,不是「一个节点最多跑多久」—— 一直在吐字就永远不算超时。
 skipSteps:用户说「跳过X」「不做X」「X就不用了」时,把那个环节名放进来。没说就省略。
@@ -99,6 +101,21 @@ export function applyCapsPatch(
    * 所以 clampInt 的 fallback 不能是 0:那样一个写坏的值(`"六次"`)会被静默解释成关掉功能,
    * 而用户写它的意图恰恰相反。回落到默认 6。
    */
+  /**
+   * **两个新旋钮必须有正常的录入口。**
+   *
+   * 验收点名:`applyCapsPatch` 是提示词和 `settings.json` 的 efftaskCaps **唯一**入口,
+   * 而这两个字段不在其中 —— 于是关口上逐字印着「完成即回收: 开 / 关」,而用户**没有任何
+   * 正常途径把它关掉**(只能手改 run.md 再 --resume)。一次默认开启、自动、不可逆的删除,
+   * 配一个只在屏幕上存在的开关,是这个仓库自己命名过的那种坑。
+   */
+  if (typeof patch.wipeOnAccept === 'boolean') out.wipeOnAccept = patch.wipeOnAccept
+  if (patch.trunkResolveRounds !== undefined) {
+    out.trunkResolveRounds = clampNoted(
+      patch.trunkResolveRounds, MIN_TRUNK_RESOLVE, MAX_TRUNK_RESOLVE,
+      DEFAULT_TRUNK_RESOLVE, tag('手动合并解冲突轮数:'), notices,
+    )
+  }
   if (patch.mergeResolveAttempts !== undefined) {
     out.mergeResolveAttempts = clampNoted(
       patch.mergeResolveAttempts, MIN_MERGE_RESOLVE, MAX_MERGE_RESOLVE,

@@ -277,16 +277,37 @@ export function backtrackLines(
     for (const t of lvl1) out.push(`  · ${t.node.title}:${clip(t.blocking)}`)
   }
   if (lvl2.length > 0) {
-    // 第 2 级会删子树,数量必须写出来 —— 「重做」两个字听起来像是可逆的。
-    out.push(`${lvl2.length} 个任务走**完全重做**(此前已经重新执行过一轮,仍然没通过):`)
+    /**
+     * **第 2 级点的是子任务,不是这个父任务。**
+     *
+     * 验收实测:上一版按 `t.node` 渲染并印它的 `childIds.length` —— 而 `runBacktrack`
+     * 真正送去 `planRedo(entry:'plan')` 的是它的 **suspects(子任务)**。屏幕说
+     * 「删 root 的 3 个子任务」,实际删的是 **c1 的 2 个**,root 的 3 个一个没动。
+     * 而这一段上面那句注释正写着「第 2 级会删子树,**数量必须写出来**」。
+     */
+    out.push(`${lvl2.length} 个任务下面的子任务走**完全重做**(此前已经重新执行过一轮,仍然没通过):`)
     for (const t of lvl2) {
-      out.push(`  · ${t.node.title}:重新分析并拆分,先删除 ${t.node.childIds.length} 个子任务`)
+      const kids = t.suspects.length > 0 ? t.suspects : [t.node.id]
+      out.push(`  · ${t.node.title} 下的 ${kids.length} 个子任务:重新分析并拆分(会先删掉它们各自的子任务)`)
       if (t.remedy.length > 0) {
         out.push(`    并重新武装补救拆分,集成验收提过的补救项:${t.remedy.slice(0, 3).join('、')}${t.remedy.length > 3 ? '…' : ''}`)
       }
     }
   }
-  out.push(`共重跑 ${entries.length} 个任务的执行阶段;它们的隔离工作区会被删掉并从集成分支最新状态重建。`)
+  /**
+   * **这个数是估的,必须说出口。**
+   *
+   * 屏幕算的是保守名单,而执行时**主模型会重新圈一遍**(它读的是已经写下来的验收意见)。
+   * 两边不一致不是缺陷 —— 缺陷是让用户以为它一致,而下游是 discard(删目录、删分支、
+   * 全量重编)。
+   */
+  const lvl2Ids = new Set(lvl2.flatMap(t => (t.suspects.length > 0 ? t.suspects : [t.node.id])))
+  const execCount = entries.filter(e => !lvl2Ids.has(e.nodeId)).length
+  out.push(
+    `按现在的证据算:${execCount} 个任务重跑执行阶段、${entries.length - execCount} 个完全重做;` +
+    `它们的隔离工作区会被删掉并从集成分支最新状态重建。`,
+  )
+  out.push('确认之后会先派主模型读一遍集成验收的意见,**具体重跑哪几个可能和上面这份不同**(它拿不到模型时就照这份走)。')
   // 这一句是这个键和 `r` 最不一样的地方:它**不开圆桌**,判决仍然由之后的集成验收给出。
   out.push('不会开新的圆桌:用的是集成验收**已经写下来**的意见;最终结论仍由子任务修完后的集成验收给出。')
   return out

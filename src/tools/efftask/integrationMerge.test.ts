@@ -420,3 +420,67 @@ describe('syncTrunk —— 先同步主干,再快进', () => {
     expect(await readFile(join(gitRoot, 'newfile.ts'), 'utf-8')).toBe('MY PRECIOUS\n')
   })
 })
+
+/**
+ * **复用临时工作树时,收拾必须排在对齐之前 —— 否则它会被永久卡死。**
+ *
+ * 验收在真 git 上复现的路径完全现实:`autoResolveMerge` 只 `git add -- <冲突文件>` 然后
+ * `commit --no-edit`(**没有 `-a`**)。解冲突模型顺手改了一个不在冲突列表里的受跟踪文件
+ * → 这一次合并成功,而临时树留着一个未暂存的改动。下一次进来时 `checkout --detach` 报
+ * 「local changes would be overwritten」并早退,而收拾它的 `reset --hard` / `clean -fd`
+ * 排在它下游 —— 从此 `m` 键的捞回和合回主干**两条路全部永久失败**。
+ */
+describe('临时工作树被上一轮弄脏之后', () => {
+  it('解冲突模型顺手改了别的受跟踪文件 → 下一次合并照样成功', async () => {
+    const p = pool(); await p.init()
+    const first = await clashingBranch(p, 'MINE\n', 'THEIRS\n')
+    const res1 = await mergeIntoIntegration(depsOf(p, {
+      resolve: async info => {
+        await writeFile(join(info.cwd, 'clash.ts'), 'RESOLVED\n')
+        // 不在冲突列表里的受跟踪文件 —— `git add -- <冲突文件>` 不会带上它,
+        // `commit --no-edit` 也不会(没有 -a),于是它留在树里没暂存。
+        await writeFile(join(info.cwd, 'base.txt'), 'model touched this too\n')
+      },
+    }), first)
+    expect(res1.ok).toBe(true)
+    /**
+     * 成功那条路现在会把临时树**收掉**(它是一棵完整检出,而这一轮的起因就是盘被撑满),
+     * 所以这里不能再拿「上一次留下的脏」当前提 —— 改成**显式造**一棵脏的复用它。
+     * 失败路径仍然会把它留在盘上(那是现场),复用逻辑照样要顶得住。
+     */
+    await git(['worktree', 'add', '--detach', join(worktreeRoot, 'merge-scratch'), p.integrationBranchName], gitRoot)
+    await writeFile(join(worktreeRoot, 'merge-scratch', 'base.txt'), 'left dirty by an earlier round\n')
+    const dirty = await git(['status', '--porcelain'], join(worktreeRoot, 'merge-scratch'))
+    expect(dirty.stdout.trim().length).toBeGreaterThan(0)
+
+    // 第二次合并:换一条干净的分支,不该受上一轮的残留影响。
+    const n = node('root/after-dirty')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'second.ts'), 'second work\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'second'], l.path)
+    const branch = p.worktreeBranchOf(n)
+    await rm(l.path, { recursive: true, force: true })
+    await git(['worktree', 'prune'], gitRoot)
+
+    const res2 = await mergeIntoIntegration(depsOf(p), branch)
+    expect(res2.ok).toBe(true)
+    expect((await git(['show', `${p.integrationBranchName}:second.ts`], gitRoot)).stdout).toBe('second work\n')
+  })
+
+  /** 半合并态残留同理:先 abort、再 reset,不能让它挡住后面的对齐。 */
+  it('上一轮留下半合并态时也能复用', async () => {
+    const p = pool(); await p.init()
+    const scratch = join(worktreeRoot, 'merge-scratch')
+    await git(['worktree', 'add', '--detach', scratch, p.integrationBranchName], gitRoot)
+    await writeFile(join(scratch, 'base.txt'), 'dirtied without staging\n')
+
+    const n = node('root/after-halfmerge')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'x.ts'), 'x\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'x'], l.path)
+    const res = await mergeIntoIntegration(depsOf(p), p.worktreeBranchOf(n))
+    expect(res.ok).toBe(true)
+  })
+})

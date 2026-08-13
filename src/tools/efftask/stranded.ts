@@ -1,4 +1,8 @@
 import { worktreeSlug } from './worktreeId.js'
+// 「产出丢了」和「集成验收没通过」这两条判据和回溯那一侧**共用一份**。
+// 验收实测过分家的后果:本轮把零贡献节点从 ACCEPTED 改成 BLOCKED 之后,这边那份
+// 硬编码副本(只认 ACCEPTED + 字面量)一件都扫不到,而同一个节点在回溯那边判 true。
+import { lastIntegrateFailed, outputMissing } from './backtrack.js'
 import { isTerminal } from './stateMachine.js'
 import type { TaskNode } from './types.js'
 
@@ -119,6 +123,19 @@ export interface StrandedItem {
   /** 这一条为什么还卡在这儿 —— 给人看的一句话。 */
   why: string
   /**
+   * **这条抢救出来的东西后来怎么样了。**
+   *
+   * 只有抢救那两格有。它是**调用方知道、而解冲突模型无从得知**的事实,也是这条路上唯一
+   * 能防住「废稿反向污染」的东西:一条被取代的抢救分支和集成分支在同一个文件上都有内容
+   * → add/add 冲突 → 一个不知情的解决者会尽力「保留双方的意图」,于是把废稿留了下来,
+   * 盖在已经修好的代码上。真 git 上验过这个形状。
+   *
+   * 判据:这个节点后来**已经把另一版产出送进集成分支了**(`contributed`),
+   * 或者它被回溯过(`backtrack`)—— 两者都意味着眼前这一版是旧的。
+   * 认不回主的那些只能是 `unknown`。
+   */
+  fate?: 'superseded' | 'still-open' | 'unknown'
+  /**
    * 探不明白。**和「这里没有东西」必须分开** —— 一个探测失败被写成跳过,在屏幕上和
    * 「干净」长得一模一样,而它们要用户做的事完全不同。
    */
@@ -237,7 +254,7 @@ export async function scanStranded(
      * 也就是「这个节点通过了验收,而它对集成分支的贡献是零」。这是「生成不知道什么原因
      * 丢失」在盘上唯一的硬证据,合并解决不了它,只能重新生成。
      */
-    if (n.status === 'ACCEPTED' && n.execStatus.includes('没有向集成分支贡献任何改动')) {
+    if (outputMissing(n)) {
       items.push({
         kind: 'missing', nodeId: n.id, title: n.title,
         why: '通过了验收,而它对集成分支的贡献是零 —— 产出不在任何地方,只能重新执行',
@@ -340,15 +357,27 @@ export async function scanStranded(
       const tail = ref.split('/').pop() ?? ''
       const slug = tail.replace(/-\d+$/, '')
       const owner = bySlug.get(slug)
+      /**
+       * **来历要算出来,不能写死。**
+       *
+       * 验收实测:这个字段此前在 `rescue.ts` 里被硬编码成 `still-open`,于是
+       * `provenanceNote` 的 superseded 特判、`makeRescueTriage` 提示词里那句
+       * 「这个任务后来:被重做过」**永远处于未武装状态** —— 而且更糟的是,它把一句
+       * 反过来的假事实(「还没有别的版本合入」)交给了分诊模型。
+       * 真 git 上跑出来的结果:废稿被合进了集成分支,盖在已修好的实现上。
+       */
+      const fate: 'superseded' | 'still-open' | 'unknown' = owner === undefined
+        ? 'unknown'
+        : (owner.contributed === true || owner.backtrack !== undefined) ? 'superseded' : 'still-open'
       items.push(owner
         ? {
-          kind: 'salvage', nodeId: owner.id, title: owner.title, branch: ref,
+          kind: 'salvage', nodeId: owner.id, title: owner.title, branch: ref, fate,
           ...(ahead === undefined ? {} : { commits: ahead }),
           ...(state === 'unknown' ? { unknown: true } : {}),
           why: '这个任务此前某一版的产出被抢救在这里,还没合进集成分支',
         }
         : {
-          kind: 'salvageOrphan', branch: ref,
+          kind: 'salvageOrphan', branch: ref, fate,
           ...(ahead === undefined ? {} : { commits: ahead }),
           ...(state === 'unknown' ? { unknown: true } : {}),
           why: '抢救出来的提交,但对应的任务已经不在树上了(重做或回溯改写过树)',
@@ -400,15 +429,6 @@ export async function scanStranded(
   return { items, counts, problems }
 }
 
-/** 上一条集成验收记录是不是判的不通过。 */
-function lastIntegrateFailed(n: TaskNode): boolean {
-  for (let i = n.acceptLog.length - 1; i >= 0; i--) {
-    const rec = n.acceptLog[i]
-    if (!rec || rec.step !== 'integrate') continue
-    return rec.synthesized.pass === false
-  }
-  return false
-}
 
 /**
  * 清单那一屏的每一行。**是数据,不是 JSX** —— 屏幕上到底说了什么要能被断言钉住。
