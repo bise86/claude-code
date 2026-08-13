@@ -90,3 +90,35 @@ describe('paginateHints', () => {
     expect(stringWidth('Esc/q 返回任务树')).toBe(16)
   })
 })
+
+/**
+ * **`m` 必须落在页脚的第 1 页。**
+ *
+ * 页脚是分页的(`?` 翻页),而 `paginateHints` 只把**首段**钉在每一页上。实测:排在动作
+ * 键之后时 80/100 列下 `m` 落到第 2 页 —— 而这个键存在的全部理由就是「从没宣告过它」。
+ *
+ * 判据是 8 格(4 个宽度 × runControl 有无),不是「出口没被挤出去」——后者是构造保证,
+ * 永远不会红,把它当验收就是自欺。
+ */
+describe('m 在页脚第 1 页', () => {
+  const segs = (runControl: boolean): string[] => [
+    'Esc/q 退出',
+    'm 合并/捞回未合入的产出',
+    ...(runControl ? ['p 暂停', 'i 追加指令', 'x 取消选中任务', '<> 严格度'] : []),
+    'r 重做', 'R 重做失败环节', 's 跳过它', 'f 强制通过它',
+    'c 清理工作区', 'b 回溯未通过的子任务',
+    '↑↓/jk 移动', 'PgUp/PgDn 翻页', '←/→ 折叠', '空格切换', '回车看详情',
+    '▣拆分 ▤执行 ▢待定',
+  ]
+
+  for (const cols of [80, 100, 113, 160]) {
+    for (const rc of [false, true]) {
+      it(`${cols} 列 · runControl ${rc ? '有' : '无'} → m 在第 1 页`, () => {
+        const first = paginateHints(segs(rc), cols - 4, 0)
+        expect(`${cols}/${rc}: ${first.text.includes('m 合并') ? '在' : '不在'}`).toBe(`${cols}/${rc}: 在`)
+        // 页数别爆 —— 翻十几页找一个键和找不到没区别。
+        expect(first.pages).toBeLessThanOrEqual(6)
+      })
+    }
+  }
+})

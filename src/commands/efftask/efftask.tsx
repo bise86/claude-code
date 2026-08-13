@@ -3239,6 +3239,20 @@ export function DoneView(props: {
   const ok = props.outcome?.status === 'completed'
   /** 还有多少提交没到用户的分支上 —— 结论行按它改口。见 `undeliveredCommits`。 */
   const undelivered = undeliveredCommits(props.handoff, props.handoffState)
+  /**
+   * **「没送到」不止 commits 一种。**
+   *
+   * `undeliveredCommits` 在 `state === 'merged'` 时恒返回 0,而保留的工作区和抢救出来的
+   * 提交**与收口结局无关** —— 它们按定义就不在集成分支上。跑机形态(run 001):逐任务
+   * 合并全部落地(commits 归零)而盘上仍有 7 条 salvage + 3 个保留工作区,这一屏印的却是
+   * 绿色的「✓ 高效任务完成」。
+   *
+   * **这是下界不是全集**:`orphanDir` / `branchOnly` 根本不在 `HandoffSummary` 里,
+   * 要按下 `m` 之后 `scanStranded` 才看得见。所以它为假只等于「我们没看见」,
+   * 不许拿它去印「没有遗留」这种话。
+   */
+  const strandedCount = (props.handoff?.kept.length ?? 0) + (props.handoff?.salvage.length ?? 0)
+  const hasUnmerged = undelivered > 0 || strandedCount > 0 || (props.handoff?.trunkSkips?.length ?? 0) > 0
   const handoff = props.handoff ? handoffLines(props.handoff, props.runId, props.handoffState) : []
   // 一次算好,两处用(占几行 / 画什么)—— 两处各算一次的话,它们迟早会不一致,
   // 而不一致的后果是详情页最底下那条页签条被顶出屏幕。
@@ -3288,13 +3302,17 @@ export function DoneView(props: {
           * 树能画多少行。窄终端上回流成两行会让树的最后一行被静默挤掉。截断只会吃掉
           * 「(N 个提交)」——那个数在底下的 handoffLines 里还会再说一遍。
           */}
-        <Text bold wrap="truncate-end" color={props.viewOnly ? 'warning' : ok ? (undelivered > 0 ? 'warning' : 'success') : 'error'}>
+        <Text bold wrap="truncate-end" color={props.viewOnly ? 'warning' : ok ? (hasUnmerged ? 'warning' : 'success') : 'error'}>
           {props.viewOnly
             ? '这个 run 没有继续执行(你在关口选了先看树)'
             : ok
               ? undelivered > 0
                 ? `⚠ 高效任务跑完了,但产出还没到你的分支(${undelivered} 个提交)`
-                : '✓ 高效任务完成'
+                : strandedCount > 0
+                  // 提交都送到了,但盘上还剩没合入的东西 —— 印绿色的「完成」是这一屏
+                  // 最贵的一句谎:用户会直接按 q,而那之后就没人再提起它们了。
+                  ? `⚠ 高效任务跑完了,但还有 ${strandedCount} 处产出没送到(按 m 捞回)`
+                  : '✓ 高效任务完成'
               : '✗ 高效任务被阻断'}
         </Text>
         {/* 这一趟是什么时候的事、跑了多久。排在结论下面第一行:一个隔天回来看的人,
@@ -3313,11 +3331,19 @@ export function DoneView(props: {
         {props.handoffResult?.followUps?.map(l => <Text key={l} dimColor>{l}</Text>) ?? null}
         {handoff.map(l => <Text key={l} dimColor>{l}</Text>)}
         {props.redoProblems?.map(l => <Text key={l} color="warning">⚠ {l}</Text>) ?? null}
-        <Text dimColor>
+        {/**
+          * `wrap="truncate-end"` **是必须的**:`doneSummaryRows` 把这一行按常数 1 行计,
+          * 而加了字之后它在窄终端上会回流成 2 行,把树的最后一行静默挤掉 —— 上面那条
+          * 结论行为同一件事写过同样的注释。
+          *
+          * `m` 排在「回车看节点详情」**之前**:截断先吃掉的是末尾,而它正是这一屏
+          * 最该被看见的键(屏幕上刚说完还有 N 处产出没送到)。
+          */}
+        <Text dimColor wrap="truncate-end">
           {/* 失败节点专属的那两个键**不在这里写** —— 它们只对 BLOCKED 节点有意义,
               而这一行不知道光标停在哪。树自己的页脚按光标所在的行写它们(见
               TaskTreePanel 的 failedKeysHint),那是唯一知道该不该写的地方。 */}
-          q / Esc 退出 · 回车看节点详情{props.onRedo ? ' · r 重做选中的任务' : ''}
+          q / Esc 退出{hasUnmerged && props.onMergeWorktrees ? ' · m 合并未合入的产出' : ''} · 回车看节点详情{props.onRedo ? ' · r 重做选中的任务' : ''}
         </Text>
       </Box>
     </Box>

@@ -417,6 +417,17 @@ export function TaskTreePanel(props: {
   useInput((input, key) => {
     const k = input.toLowerCase()
     /**
+     * **带修饰键的不算动作键 —— 两支共用这一份。**
+     *
+     * 只许逐条与,不许写成分支开头的早退:`key.meta` 对 **Escape 恒为真**
+     * (`input-event.ts` 的 `meta: keypress.meta || keypress.name === 'escape' || …`),
+     * 一句 `if (!plain) return` 会让 Esc 当场变死键,而「Esc / q 任何时候都是返回」是
+     * 这个面板立过的规矩。
+     *
+     * 提到这里之前它只在详情页那一支里,树那一支一个都没挡 —— 见下面那段注释里的实测。
+     */
+    const plain = key.ctrl !== true && key.meta !== true
+    /**
      * Shift+R —— **两种写法都要认**。
      *
      * kitty 键盘协议 / modifyOtherKeys 的终端送的是 `ESC[82;2u`,而仓库自己的 parse-keypress
@@ -451,10 +462,17 @@ export function TaskTreePanel(props: {
        * 一句 `if (!plain) return` 会让 Esc 当场变成死键 —— 而下面那句注释立的规矩正是
        * 「Esc / q 任何时候都是返回,返回这条路不许有死角」。
        *
-       * 树那一支(下面)不需要这一层:它的动作键走 `runControlAction`,那个函数第一句
-       * 就是 `if (key.ctrl || key.meta) return null`。
+       * **树那一支同样需要这一层 —— 上一版这里写着「不需要」,那是错的。**
+       * 只有 `runControlAction`(p/i/x/+=/-_/<>)第一句挡了 ctrl/meta;而 `s`/`f`/`r`/
+       * `R`/`q` 是裸的 `k === 'x'` 比较,一个都没挡。真渲染实测(运行中与结束屏一致):
+       * Ctrl+S → 跳过环节、Ctrl+F → 强制通过、Ctrl+R → 重做、Ctrl+Q → 退出。
+       * 而 `m`/`c`/`b` 提到树这一层之后更险:Ctrl+C 会打开「清理已完成工作区」关口 ——
+       * 这一屏唯一删目录的键,而本 fork 的 `internal_exitOnCtrlC` 是 false
+       * (`main.tsx` 的 `getRenderContext(false)`),Ctrl+C 被原样派发;Ctrl+B 会打开
+       * 回溯关口(重推一批子任务);kitty 键盘协议无条件开启(`ink.tsx` 的
+       * `ENABLE_KITTY_KEYBOARD`),于是 Ctrl+M 在 iTerm/kitty/WezTerm/ghostty/tmux/
+       * Windows Terminal 上会给出 `{name:'m', ctrl:true}` —— 而不少人拿 Ctrl+M 当回车。
        */
-      const plain = key.ctrl !== true && key.meta !== true
       // 详情页是判断「这个节点到底哪儿错了」的地方 —— 看完就想重做,最不该逼用户先退回
       // 树上再按一次 r。快速重做和跳过同理,而且更是:详情页正是他刚看完阻断原因的地方。
       //
@@ -530,7 +548,9 @@ export function TaskTreePanel(props: {
       if (key.return || key.escape || (plain && k === 'q')) setDetailId(null)
       return
     }
-    if (key.escape || k === 'q') { props.onExitKey?.(); return }
+    // Esc **不与 `plain`**:`key.meta` 对 Escape 恒为真,与上去它当场变死键(详情页
+    // 那一支的注释立过同一条规矩)。`q` 要与 —— 否则 Ctrl+Q 是一个没人宣告过的退出键。
+    if (key.escape || (plain && k === 'q')) { props.onExitKey?.(); return }
     if (rows.length === 0) return
     // 重做。放在方向键**之前**,因为它不依赖 rows 之外的任何东西,而且放后面会被
     // 下面那些 `return` 挡掉一半路径。
@@ -545,10 +565,29 @@ export function TaskTreePanel(props: {
       if (why !== undefined) setNotice({ nodeId: current.id, text: why, kind: 'action' })
       return true
     }
-    if (shiftR && props.onRedoFailed && current) { actHere(props.onRedoFailed); return }
-    if (k === 's' && props.onSkipFailed && current) { actHere(props.onSkipFailed); return }
-    if (k === 'f' && props.onForcePass && current) { actHere(props.onForcePass); return }
-    if (k === 'r' && props.onRedo && current) { actHere(props.onRedo); return }
+    if (plain && shiftR && props.onRedoFailed && current) { actHere(props.onRedoFailed); return }
+    if (plain && k === 's' && props.onSkipFailed && current) { actHere(props.onSkipFailed); return }
+    if (plain && k === 'f' && props.onForcePass && current) { actHere(props.onForcePass); return }
+    if (plain && k === 'r' && props.onRedo && current) { actHere(props.onRedo); return }
+    /**
+     * **`m` / `c` / `b` 在树这一层也要能按。**
+     *
+     * 它们此前只在详情页那一支里(要先回车进去)。跑机实测(qianbase-xtp run 001):
+     * 结束屏逐字写着「还有 607 个提交没合进来」「7 条抢救分支」「3 个保留工作区」,而
+     * 把它们捞回来的 `m` 在那一屏按不到、页脚也从没宣告过它。用户原话:「这些老是提示
+     * 这些进不去执行 m 键」。
+     *
+     * **不走 `actHere`**:那个签名是 `(n) => string | undefined`(拒绝时把话画到页脚),
+     * 而这三个 handler 是 `(n) => void` —— 它们的准入由各自的关口去说,和详情页那一支
+     * (`:493/:496`)逐字相同。
+     *
+     * `g`(修复损毁的任务)**不提上来**:它是节点级抢修,详情页正是判断「这个节点哪儿
+     * 坏了」的地方;而且多一项会把 100 列 + runControl 的页脚从 3 页推到 4 页。它的可见性
+     * 由详情页页脚承担(`canRepairNode`)。
+     */
+    if (plain && k === 'm' && props.onMergeWorktrees && current) { props.onMergeWorktrees(current); return }
+    if (plain && k === 'c' && props.onCleanupWorktrees && current) { props.onCleanupWorktrees(current); return }
+    if (plain && k === 'b' && props.onBacktrack && current) { props.onBacktrack(current); return }
     // 页脚提示翻页。放在方向键之前,和上面那几个键同一档。
     if (input === '?' && key.ctrl !== true && key.meta !== true) { setHintPage(x => x + 1); return }
     // 运行中的人工干预。同样放在方向键之前,同样的理由。
@@ -948,6 +987,18 @@ export function TaskTreePanel(props: {
              */
             : paginateHints([
               'Esc/q 退出',
+              /**
+               * **`m` 紧跟出口 —— 它必须落在第 1 页。**
+               *
+               * 页脚是分页的(`?` 翻页),而 `paginateHints` 只把**首段**钉在每一页上。
+               * 排在动作键之后的话,实测 80/100 列下 `m` 落到第 2 页 —— 而这个键存在的
+               * 全部理由就是「从没宣告过它」。实测:紧跟出口时 80/100/113/160 × runControl
+               * 有无共 8 格,`m` 一律在第 1 页,而且总页数和原来完全相同。
+               *
+               * 措辞**不写「工作区」**:它只覆盖三桶里的一桶(逐节点工作区按光标所在子树,
+               * 而抢救分支和「集成分支 → 你的分支」那一跳按整个 run)。
+               */
+              ...(props.onMergeWorktrees ? ['m 合并/捞回未合入的产出'] : []),
               ...(props.runControl
                 ? [
                   props.runControl.paused ? '⏸ 已暂停(p 恢复)' : 'p 暂停',
@@ -959,6 +1010,8 @@ export function TaskTreePanel(props: {
               ...(onFailedNode && props.onRedoFailed ? ['R 重做失败环节'] : []),
               ...(onFailedNode && props.onSkipFailed ? ['s 跳过它'] : []),
               ...(forcePassHint ? [forcePassHint.replace(' · ', '')] : []),
+              ...(props.onCleanupWorktrees ? ['c 清理工作区'] : []),
+              ...(props.onBacktrack ? ['b 回溯未通过的子任务'] : []),
               '↑↓/jk 移动', 'PgUp/PgDn 翻页', '←/→ 折叠', '空格切换', detailEntryHint(mouse),
               `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定`,
             ], rowWidth, hintPage).text}

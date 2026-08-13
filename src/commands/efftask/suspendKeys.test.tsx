@@ -220,3 +220,78 @@ describe('suspended 时面板不吃任何键', () => {
     expect(f).not.toContain('↑↓/jk 移动')
   })
 })
+
+/**
+ * **`m` / `c` / `b` 在树这一层也要能按,而带 Ctrl 的绝对不能。**
+ *
+ * 跑机实测(qianbase-xtp run 001):结束屏写着「607 个提交没合进来 / 7 条抢救分支 /
+ * 3 个保留工作区」,而 `m` 只在详情页那一支里,页脚也从没宣告过它。用户原话:
+ * 「这些老是提示这些进不去执行 m 键」。
+ *
+ * 反面同样要钉死:本 fork 的 `internal_exitOnCtrlC` 是 false,Ctrl+C 被原样派发;
+ * kitty 键盘协议无条件开启,Ctrl+M 会给出 `{name:'m', ctrl:true}`。不挡的话 Ctrl+C 就是
+ * 这一屏唯一删目录的键。
+ */
+describe('树这一层的 m / c / b', () => {
+  const spy = () => {
+    const hits: string[] = []
+    return { hits, on: (n: string) => (() => { hits.push(n) }) }
+  }
+
+  const mountTree = async (s: ReturnType<typeof spy>) => mount(
+    <TaskTreePanel
+      nodes={TREE()} runId="003" interactive
+      onMergeWorktrees={s.on('m')} onCleanupWorktrees={s.on('c')} onBacktrack={s.on('b')}
+      onExitKey={() => {}}
+    />,
+  )
+
+  it('裸按 m / c / b 都触发,不用先进详情页', async () => {
+    for (const key of ['m', 'c', 'b']) {
+      const s = spy()
+      const { t, app } = await mountTree(s)
+      t.stdin.press(key)
+      await new Promise(r => setTimeout(r, 20))
+      app.unmount()
+      expect(`${key}: ${s.hits.join(',')}`).toBe(`${key}: ${key}`)
+    }
+  })
+
+  /** Ctrl+C 打开删目录的关口是这一改动最贵的失手方式。 */
+  it('带 Ctrl 的一个都不许触发', async () => {
+    const s = spy()
+    const { t, app } = await mountTree(s)
+    // 传统终端的 Ctrl+C / Ctrl+B,以及 kitty 协议下的 Ctrl+M。
+    for (const seq of ['\x03', '\x02', '\x1b[109;5u']) {
+      t.stdin.press(seq)
+      await new Promise(r => setTimeout(r, 20))
+    }
+    app.unmount()
+    expect(s.hits).toEqual([])
+  })
+
+  it('页脚把这三个键写出来,而且 m 排在出口紧后面', async () => {
+    const s = spy()
+    const { t, app } = await mountTree(s)
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('m 合并/捞回未合入的产出')
+    // 「工作区」三个字不许出现在树层这句里 —— 它只覆盖三桶里的一桶。
+    expect(f).not.toContain('m 合并工作区到主干')
+    expect(f.indexOf('Esc/q 退出')).toBeLessThan(f.indexOf('m 合并'))
+  })
+
+  /** 没接 handler 的那一趟(共享工作树:没有池子)不许印这几个键。 */
+  it('没有 handler 就不印,也按不出来', async () => {
+    const s = spy()
+    const { t, app } = await mount(
+      <TaskTreePanel nodes={TREE()} runId="003" interactive onExitKey={() => {}} />,
+    )
+    t.stdin.press('m')
+    await new Promise(r => setTimeout(r, 20))
+    const f = t.lastFrame()
+    app.unmount()
+    expect(s.hits).toEqual([])
+    expect(f).not.toContain('m 合并')
+  })
+})

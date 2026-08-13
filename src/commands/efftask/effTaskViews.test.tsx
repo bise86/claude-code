@@ -316,3 +316,83 @@ describe('done 视图上的收口文案', () => {
     expect(f).toContain('--abort')
   })
 })
+
+/**
+ * **提交都送到了,不等于盘上没剩东西。**
+ *
+ * `undeliveredCommits` 在 `state === 'merged'` 时恒返回 0,而保留的工作区和抢救出来的
+ * 提交与收口结局无关 —— 它们按定义就不在集成分支上。跑机形态(run 001):逐任务合并全部
+ * 落地(commits 归零)而盘上仍有 7 条 salvage + 3 个保留工作区,这一屏印的却是绿色的
+ * 「✓ 高效任务完成」,而用户读的就是第一行,读完直接按 q —— 之后再没人提起它们。
+ */
+describe('结束屏 · 盘上还剩没合入的东西', () => {
+  const stranded = {
+    branch: 'efftask/007/integration', commits: 0,
+    kept: [{ path: '/wt/a', why: '未回收' }],
+    salvage: ['efftask/007/salvage/a', 'efftask/007/salvage/b'],
+  }
+  const frame = async (extra: Record<string, unknown> = {}): Promise<string> => {
+    const t = fakeTty(40)
+    const app = await render(
+      React.createElement(DoneView as never, {
+        nodes: [node({ id: 'root', title: '根任务' })] as never,
+        runId: '007', outcome: { status: 'completed' }, handoff: stranded,
+        handoffState: 'merged', onExit: () => {}, ...extra,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    return f
+  }
+
+  it('结论行不许写「✓ 完成」,而且要写出还剩几处', async () => {
+    const f = await frame()
+    expect(f).not.toContain('✓ 高效任务完成')
+    // 1 个保留工作区 + 2 条抢救分支。
+    expect(f).toContain('还有 3 处产出没送到')
+  })
+
+  it('接了 m 的话,页脚要把它指出来', async () => {
+    const f = await frame({ onMergeWorktrees: () => {} })
+    expect(f).toContain('m 合并未合入的产出')
+    // 排在「回车看节点详情」之前 —— 截断先吃掉的是末尾。
+    expect(f.indexOf('m 合并未合入的产出')).toBeLessThan(f.indexOf('回车看节点详情'))
+  })
+
+  /** 没接 m(共享工作树:没有池子)就别指一条按不出来的路。 */
+  /**
+   * **这一行必须只占一行。** `doneSummaryRows` 把它按常数 1 行计,回流成两行会把树的
+   * 最后一行静默挤掉 —— 上面那条结论行为同一件事写过同样的注释,而这一行此前没有 wrap。
+   */
+  it('窄终端上不换行(它被按常数 1 行计)', async () => {
+    // **列数要真的窄**:`fakeTty(40)` 的 40 是**行数**,列默认 120 —— 那个宽度下这一行
+    // 本来就放得下,拿它做判据等于什么都没测(实测:去掉 wrap 也不变红)。
+    const t = fakeTty(40, 44)
+    const app = await render(
+      React.createElement(DoneView as never, {
+        nodes: [node({ id: 'root', title: '根任务' })] as never,
+        runId: '007', outcome: { status: 'completed' }, handoff: stranded,
+        handoffState: 'merged', onExit: () => {}, onMergeWorktrees: () => {},
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    // 只认这一行独有的片段 —— 树自己的页脚里也有「退出」。
+    const lines = f.split('\n').filter(l => l.includes('回车看节点详情') || l.includes('m 合并未合入的产出'))
+    expect(`页脚占了 ${lines.length} 行`).toBe('页脚占了 1 行')
+  })
+
+  it('没接 m 就不印那一句', async () => {
+    expect(await frame()).not.toContain('m 合并未合入的产出')
+  })
+
+  it('盘上真的干净时照旧是「✓ 完成」', async () => {
+    const f = await frame({ handoff: { ...stranded, kept: [], salvage: [] } })
+    expect(f).toContain('✓ 高效任务完成')
+    expect(f).not.toContain('处产出没送到')
+  })
+})
