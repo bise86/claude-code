@@ -6988,3 +6988,56 @@ describe('零贡献阻断的措辞与类别', () => {
     expect(n.blockedReason).not.toContain('验收意见')
   })
 })
+
+/**
+ * **执行者必须被告知「限制约束的是读,不解除写的义务」。**
+ *
+ * 跑机实测(qianbase-xtp run 001):用户写给执行环节的定向注入里是一串关于工具的限制
+ * (「所有 MCP 只读且仅探查下一层」「防止工具使用过多上下文」「禁止使用 devenv」),
+ * 执行者把它们收敛成「当前禁止调用工具」「当前要求仅输出文本」,写了 92 分钟分析、
+ * 一个文件都没动 —— `execStatus` 结尾逐字是 `summary_only_blocked_no_tools_called`。
+ */
+describe('执行提示词里的「必须真的改文件」', () => {
+  const execPromptWith = async (guidance?: string): Promise<string> => {
+    let seen = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') seen = req.prompt
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    const base = ctxFor([n], runAgent)
+    await stepExecute(n, {
+      ...base,
+      ...(guidance ? { config: { ...base.config, phaseGuidance: { execute: guidance } } } : {}),
+    })
+    return seen
+  }
+
+  it('说清限制约束的是读,不解除写的义务', async () => {
+    const p = await execPromptWith()
+    expect(p).toContain('本环节必须真的改文件')
+    expect(p).toContain('不解除你写的义务'.replace('写的', '写代码的'))
+    expect(p).toContain('不表示工具被禁用')
+  })
+
+  it('也说清「真不该改时该怎么办」—— 不是交一篇总结', async () => {
+    const p = await execPromptWith()
+    expect(p).toContain('不要交一篇总结')
+    expect(p).toContain('一轮没有任何文件改动的执行不算完成')
+  })
+
+  /**
+   * **必须排在定向注入之后。** 用户那串限制就在 `guidanceSection` 里 —— 排在它前面
+   * 等于先说「必须写」再说「只读、少用工具」,而模型读到的最后一句是后者。
+   */
+  it('排在定向注入之后', async () => {
+    const p = await execPromptWith('所有 MCP 只读且仅探查下一层,防止工具使用过多上下文')
+    expect(p).toContain('所有 MCP 只读')
+    expect(p.indexOf('所有 MCP 只读')).toBeLessThan(p.indexOf('本环节必须真的改文件'))
+  })
+})

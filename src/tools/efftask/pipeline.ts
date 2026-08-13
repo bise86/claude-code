@@ -1631,6 +1631,24 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
     degradeSection(node) +
     depsSection(node, ctx) +
     guidanceSection(ctx) +
+    /**
+     * **排在 `guidanceSection` 之后,而且必须在这里。**
+     *
+     * 跑机实测(qianbase-xtp run 001):用户写给执行环节的定向注入里有一串**关于工具的
+     * 限制**——「所有 MCP 只读且仅探查下一层」「所有模型调用工具…防止工具使用过多上下文」
+     * 「禁止使用 devenv」——加上目标里的「分析/执行只探查下一层,避免深入」,执行者把它们
+     * 收敛成了「当前禁止调用工具」「当前要求仅输出文本」,于是写了 92 分钟的分析、一个
+     * 文件都没动,`execStatus` 结尾逐字是 `summary_only_blocked_no_tools_called`。
+     * 那一整条链上十几层父任务的集成验收意见全是 `MISSING .../src/...`。
+     *
+     * 所以这一句要**在那些限制之后**出现,并且把两件事分开:限制约束的是**读**的范围,
+     * 不解除写的义务;真觉得不该改任何文件时,正确做法不是交一篇总结。
+     */
+    '**本环节必须真的改文件。** 上面那些「只读 / 只探查下一层 / 少用工具」之类的限制,' +
+    '约束的是你**读**代码的范围,**不解除你写代码的义务**,也不表示工具被禁用 —— ' +
+    '你有写文件的工具,而且必须用它们把方案落到本任务工作区的文件里。\n' +
+    '如果你判断本任务确实不该改任何文件,**不要交一篇总结**:直接在 execStatus 里说清为什么,' +
+    '并给出 newChildren 或阻断理由 —— 一轮没有任何文件改动的执行不算完成,合并那一步会把它拦下来。\n' +
     // 跨分支依赖调度: what happened on the integration branch while this node worked. Told to
     // the executor rather than buried in execStatus, because it changes what it should DO —
     // re-read files that moved, or expect a conflict it will have to help resolve.
