@@ -96,6 +96,40 @@ describe('执行串行时顶上要说实话', () => {
     expect(f).toContain('执行串行(无隔离工作区)')
   })
 
+  /**
+   * **第三档整趟跑下来必须有一个标记 —— 它是最危险的那一档。**
+   *
+   * 实测过它此前和「worktree 隔离并发」在表头上逐字相同(两者 `serialExecute` 都是
+   * false、`pool` 都不画):唯一的标记给了最安全那一档,而多个执行者正在同时裸写用户
+   * 当前目录的那一趟,屏幕上一个字都没有。
+   */
+  it('共享目录 + 并发:说的是「没有安全网」,不是「慢」', async () => {
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive sharedParallel
+        pool={() => ({ inUse: 3, limit: 5 })} onExitKey={() => {}}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('并发直写当前目录(无隔离)')
+    // 两个标记是两件事,不能互相顶替。
+    expect(f).not.toContain('执行串行')
+  })
+
+  it('隔离并行那一趟两个标记都不画', async () => {
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        pool={() => ({ inUse: 3, limit: 5 })} onExitKey={() => {}}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).not.toContain('并发直写当前目录')
+    expect(f).not.toContain('执行串行')
+  })
+
   it('有隔离时不提 —— 那句话此时是假的', async () => {
     const { t, app } = await mount(
       <TaskTreePanel

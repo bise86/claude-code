@@ -5,7 +5,7 @@ import type { EffTaskConfig, PhaseName, RoleBinding, TaskNode } from '../../tool
 import { useLiveState } from './useLiveState.js'
 import { TaskTreePanel } from './TaskTreePanel.js'
 import {
-  capsLine, clampParallelism, gitChoiceLines, goalLine, noticeLines, parallelismLine, rosterLines, rosterEditorLines, toggleRole, resumeSummarySections,
+  capsLine, clampParallelism, gitChoiceLines, goalLine, isolationChoice, parallelismIsolation, parallelismLine, rosterLines, rosterEditorLines, splitNotices, toggleRole, resumeSummarySections,
   type ResumeSummary, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -126,6 +126,7 @@ export function ConfirmResume(props: {
     else if (key.escape || k === 'n') decide({ approved: false })
   })
   const sections = resumeSummarySections(props.summary)
+  const { records, requests } = splitNotices(props.config)
   // What the roster lines describe must be the EDITED roster, not what came off disk —
   // otherwise the gate shows one panel and resumes with another.
   const shown: EffTaskConfig = { ...props.config, phaseRoles: roster, skipSteps: skip }
@@ -133,7 +134,17 @@ export function ConfirmResume(props: {
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 恢复确认</Text>
       <Text>目标: {goalLine(props.config.goalPrompt)}</Text>
-      <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: props.isolation })}</Text>
+      {/**
+        * 并行数那一行读的是**这一趟的隔离方式**(run.md 读回来的那一档),不是
+        * 「池子建起来了没有」。两个方向都实测过:恢复一个 shared-parallel 的 run 时,
+        * 有池子会印成「在各自的 worktree 中隔离、每个子任务完成时自动合并回当前分支」,
+        * 没池子会印成「执行与叶子验收串行」—— 而这一趟真的是并发(恢复路径同样会写
+        * `sharedParallelRef`),后者更糟:恢复关口**没有 w 键**,用户无法纠正。
+        */}
+      <Text>{parallelismLine({ ...shown, parallelism }, {
+        editable: !editing,
+        isolation: parallelismIsolation(isolationChoice(shown), props.isolation === 'worktree'),
+      })}</Text>
       {/*
         * 安全阀那一行**恢复路径上也要印**。
         *
@@ -166,10 +177,23 @@ export function ConfirmResume(props: {
           <Text key={`ed-${i}`}>{'  '}{line}</Text>
         ))
         : rosterLines(shown).map(line => <Text key={line}>  {line}</Text>)}
-      {noticeLines(props.config).length > 0 && (
+      {/**
+        * **记录和「没生效的请求」分两块。**
+        *
+        * 「本次隔离方式: …」说的是已经定下来的执行方式,把它顶在「以下请求不会生效」这个
+        * 标题下面就是两次误导:它既不是一个请求,也没有「不生效」。而这一条恰恰是恢复
+        * 关口上最该被读到的一句 —— 这一屏**没有 w 键**,用户改不了,只能先看清。
+        */}
+      {records.length > 0 && (
+        <Box flexDirection="column">
+          <Text bold>本次的执行方式:</Text>
+          {records.map(l => <Text key={l}>  · {l}</Text>)}
+        </Box>
+      )}
+      {requests.length > 0 && (
         <Box flexDirection="column">
           <Text color="warning">以下请求不会生效:</Text>
-          {noticeLines(props.config).map(l => <Text key={l} color="warning">  · {l}</Text>)}
+          {requests.map(l => <Text key={l} color="warning">  · {l}</Text>)}
         </Box>
       )}
       {sections.map(sec => (

@@ -113,9 +113,26 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
   it('未隔离这件事也要写进 run.md(新建和恢复两条路径都要)', () => {
     // 剪断它:新建 run 的 run.md 不再记录"本次未隔离",而恢复路径还在记 —— 同一件事在
     // 两条路径上的持久化记录不一致。同样必须计数:两条路径的这行字是逐字相同的。
-    // 「按 w 可改成并发」也一并钉住:第三档存在之后,这两句还写死「将…并串行」就是把
-    // 用户唯一的出路从 run.md 里抹掉(而 run.md 正是他事后回看这一趟为什么这么慢的地方)。
-    expect(occurrences('notices.push(`隔离不可用,执行阶段默认共享工作目录并串行(关口按 w 可改成并发)')).toBe(2)
+    // 措辞住在 `ISOLATION_DEGRADE_PREFIX` 里(startupConfirm.ts),两侧共用一份:
+    // `applyStartupDecision` 关口之后要按前缀认出这两句并改写成真正选中的那一档 ——
+    // 命令层这里自己拼一份字符串的话,认不出来,run.md 里就会留下一句和 `isolation:`
+    // 字段矛盾的话(实测:一句说串行、字段写 shared-parallel,而真相是后者)。
+    expect(occurrences('notices.push(`${ISOLATION_DEGRADE_PREFIX}${')).toBe(2)
+  })
+
+  /**
+   * **池子放不放下,走的是 `poolDisposition` 那一份判据,不是命令层自己写的比较。**
+   *
+   * 这三行出过一次真回归:裸写 `effectiveConfig.isolation !== 'worktree'` 把 `undefined`
+   * (默认档)判成了「放下池子」,于是每一次 --resume 和每一次飞书批准都静默丢掉隔离 ——
+   * 而那两条路送来的决策本来就不带这个字段。这个文件挂不起组件,所以钉源码。
+   */
+  it('关口批准之后的池子处置走的是那一份判据 (需求1)', () => {
+    expect(SRC).toContain('const disposition = poolDisposition(effectiveConfig)')
+    expect(SRC).toContain('if (!disposition.keepPool) {')
+    expect(SRC).toContain('sharedParallelRef.current = disposition.sharedParallel')
+    // 反向:任何一处再拿 config.isolation 裸比较,就是那次回归本身。
+    expect(SRC).not.toMatch(/effectiveConfig.isolations*[!=]==s*'/)
   })
 
   it('启动关口拿到了隔离不可用的原因和 git init 入口 (spec §8)', () => {
@@ -141,6 +158,10 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     expect(occurrences('serialExecute: poolRef.current === undefined && !sharedParallelRef.current')).toBe(4)
     // 表头那一行是同一个真相的另一个出口(它早就在了,一起钉住:两处说法必须同源)。
     expect(SRC).toContain('serialExecute={poolRef.current === undefined && !sharedParallelRef.current}')
+    // 第三档在表头上的那个标记同样要接到运行视图 —— 它和上面那个是两件事(一个说慢,
+    // 一个说没安全网),而这一档整趟跑下来此前一个字都没有。
+    expect(element('RunningView')).toContain('sharedParallel={sharedParallelRef.current}')
+    expect(SRC).toContain('sharedParallel={props.sharedParallel}')
     /**
      * **第三档必须出现在这五处的每一处。**
      *

@@ -729,3 +729,92 @@ describe('恢复关口要显示这一趟的 git 开关', () => {
     expect(bf).toContain('不是你选的')
   })
 })
+
+/**
+ * **恢复关口的「并行数」那一行读的是这一趟选的档,不是「池子建起来了没有」。**
+ *
+ * 两个方向都实测过,而且更糟的是第二个:没有池子时它会印「执行与叶子验收串行
+ * (未启用隔离)」,而这一趟真的是并发(恢复路径同样会写 `sharedParallelRef`)——
+ * 用户据此以为有互斥,而恢复关口**没有 `w` 键**可以纠正。
+ */
+describe('恢复关口 · 第三档的并行数那一行', () => {
+  const cfg3: EffTaskConfig = { ...config, isolation: 'shared-parallel' }
+  const mount = async (over: Record<string, unknown>) => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config: cfg3, summary, onDecision: () => {}, ...over }),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    return { frame: t.lastFrame(), app }
+  }
+
+  it('池子这次建起来了,也不许把第三档印成 worktree 隔离', async () => {
+    const { frame, app } = await mount({ isolation: 'worktree' })
+    expect(frame).toContain('同时**在你当前的目录里跑')
+    expect(frame).not.toContain('自动合并回当前分支')
+    app.unmount()
+  })
+
+  it('池子没建起来时,不许把第三档印成串行', async () => {
+    const { frame, app } = await mount({ isolation: 'none' })
+    expect(frame).toContain('同时**在你当前的目录里跑')
+    expect(frame).not.toContain('执行与叶子验收串行')
+    app.unmount()
+  })
+
+  /** 反面:worktree 那一档在池子真的在的时候,该说的合并代价一句都不能少。 */
+  it('worktree 档 + 有池子 → 照旧说清「完成时自动合并回当前分支」', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config, summary, onDecision: () => {}, isolation: 'worktree' }),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).toContain('自动合并回当前分支')
+    app.unmount()
+  })
+})
+
+/**
+ * **恢复关口:记录不是「你的请求没生效」。**
+ *
+ * 「本次隔离方式: …」说的是已经定下来的执行方式。把它顶在「以下请求不会生效」这个标题
+ * 下面是两次误导 —— 它既不是一个请求,也没有「不生效」;而这一屏**没有 w 键**,用户改
+ * 不了,只能先看清。
+ */
+describe('恢复关口 · 记录与没生效的请求分两块', () => {
+  it('记录进「本次的执行方式」,别的 notice 留在原来的标题下', async () => {
+    const cfg: EffTaskConfig = {
+      ...config,
+      isolation: 'shared-parallel',
+      notices: ['角色 xxx 未配置', '本次隔离方式: 共享目录 + 并发(关口显式选的)—— 多个执行任务同时改你当前的工作目录,没有隔离、不产生任何提交'],
+    }
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config: cfg, summary, onDecision: () => {} }),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const frame = t.lastFrame()
+    expect(frame).toContain('本次的执行方式')
+    expect(frame).toContain('多个执行任务同时改你当前的工作目录')
+    expect(frame).toContain('以下请求不会生效')
+    expect(frame).toContain('角色 xxx 未配置')
+    // 顺序:记录在前(它说的是这一屏批准之后会发生什么)。
+    expect(frame.indexOf('本次的执行方式')).toBeLessThan(frame.indexOf('以下请求不会生效'))
+    app.unmount()
+  })
+
+  it('没有记录时不画那个空标题', async () => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(ConfirmResume, { config: { ...config, notices: ['角色 xxx 未配置'] }, summary, onDecision: () => {} }),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    expect(t.lastFrame()).not.toContain('本次的执行方式')
+    expect(t.lastFrame()).toContain('以下请求不会生效')
+    app.unmount()
+  })
+})

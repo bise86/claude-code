@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, isSharedTree, isolationChoiceLines, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, type IsolationChoice, ISOLATION_DEGRADE_PREFIX, reconcileIsolationNotices, splitNotices, isSharedTree, isolationChoiceLines, parallelismIsolation, poolDisposition, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -1621,5 +1621,215 @@ describe('隔离方式第三档', () => {
     expect(l).toContain('按 w 选')
     expect(l).toContain('并发')
     expect(l).toContain('默认继续')
+  })
+})
+
+/**
+ * **降级说明整块要跟着用户的选择换,不是加个「默认」了事。**
+ *
+ * 实测:按 `w` 选到第三档之后,顶上那行已经改口成「共享目录 + 并发(你选的)」,而这一
+ * 整块逐字不动 —— 里面「会被强制串行(一次只有一个节点在改代码)」「不会出现两个执行
+ * agent 同时改同一份文件」两句直接是反话,而「按 w 选『共享目录 + 并发』」指的还是他
+ * 已经在的那一档。用户从上往下读,最后一眼落在「强制串行」上。
+ */
+describe('隔离不可用那一块跟着选择走', () => {
+  const txt = (chosen?: IsolationChoice): string =>
+    isolationChoiceLines('当前目录不是 git 仓库', true, chosen).join('\n')
+
+  it('选了第三档 → 不许再说串行、不许再说「不会同时改同一份文件」', () => {
+    const t = txt('shared-parallel')
+    expect(t).not.toContain('强制串行')
+    expect(t).not.toContain('不会出现两个执行 agent 同时改同一份文件')
+    // 说的必须是他选的这一档真正会发生的事。
+    expect(t).toContain('执行阶段**同时**在你当前的工作目录里跑')
+    expect(t).toContain('后写的直接盖掉先写的')
+  })
+
+  it('选了第三档 → 指的出路是「切回串行」,不是他已经在的那一档', () => {
+    const t = txt('shared-parallel')
+    expect(t).toContain('按 w 切回')
+    expect(t).not.toContain('按 w 选「共享目录 + 并发」')
+  })
+
+  it('还在默认那一档 → 照旧说串行,并把并发指出来', () => {
+    for (const c of [undefined, 'shared' as const]) {
+      const t = txt(c)
+      expect(t).toContain('强制串行')
+      expect(t).toContain('按 w 选「共享目录 + 并发」')
+      expect(t).not.toContain('按 w 切回')
+    }
+  })
+
+  /** 原因和 `g` 那条出路两档都不能丢 —— 它们和选哪一档无关。 */
+  it('原因和 g 那条出路两档都在', () => {
+    for (const c of ['shared' as const, 'shared-parallel' as const]) {
+      const t = txt(c)
+      expect(t).toContain('隔离不可用:当前目录不是 git 仓库')
+      expect(t).toContain('按 g')
+    }
+  })
+})
+
+/**
+ * **`parallelismIsolation`:两个事实必须在这里合流。**
+ *
+ * 只读「选了什么」→ 没有池子却承诺 worktree 隔离和自动合并;
+ * 只读「池子在不在」→ 第三档被印成串行,而那是更糟的方向(用户据此以为有互斥)。
+ */
+describe('parallelismIsolation 的真值表', () => {
+  it('第三档永远是第三档 —— 池子在不在都一样', () => {
+    expect(parallelismIsolation('shared-parallel', true)).toBe('shared-parallel')
+    expect(parallelismIsolation('shared-parallel', false)).toBe('shared-parallel')
+  })
+
+  it('worktree 要和「池子真的在」取交集', () => {
+    expect(parallelismIsolation('worktree', true)).toBe('worktree')
+    expect(parallelismIsolation('worktree', false)).toBe('none')
+  })
+
+  it('串行那一档不受池子影响', () => {
+    expect(parallelismIsolation('shared', true)).toBe('none')
+    expect(parallelismIsolation('shared', false)).toBe('none')
+  })
+})
+
+/**
+ * **关口之前推的降级说明,关口之后就过期了。**
+ *
+ * 它是在池子建失败那一刻推进 `notices` 的,措辞是「默认…并串行(关口按 w 可改成并发)」,
+ * 而用户随后可能正好按了 w。这条会原样落进 run.md:同一份文件里一句说串行、一个字段写
+ * `isolation: shared-parallel`,而真相是后者。
+ */
+describe('关口之后把降级说明改写成记录', () => {
+  const degrade = `${ISOLATION_DEGRADE_PREFIX}当前目录不是 git 仓库`
+
+  it('选了第三档 → 那句「默认…并串行」不许留在 run.md 里', () => {
+    const out = reconcileIsolationNotices([degrade], 'shared-parallel') ?? []
+    expect(out.join('\n')).not.toContain('并串行')
+    expect(out.join('\n')).not.toContain('关口按 w')
+    // 原因是事实,是用户唯一能据此动手的东西 —— 必须留着。
+    expect(out.join('\n')).toContain('隔离不可用: 当前目录不是 git 仓库')
+    expect(out.join('\n')).toContain('多个执行任务同时改你当前的工作目录')
+  })
+
+  it('选了串行那一档 → 记的是串行', () => {
+    const out = (reconcileIsolationNotices([degrade], 'shared') ?? []).join('\n')
+    expect(out).toContain('共享目录 + 串行')
+    expect(out).not.toContain('并发')
+  })
+
+  /** 池子可用而用户仍然显式选了共享 —— 此前 run.md 上一个字都没有(只有一个 frontmatter 键)。 */
+  it('没有降级原因也要留下记录(用户在正常仓库里自己选的那一趟)', () => {
+    const out = (reconcileIsolationNotices([], 'shared-parallel') ?? []).join('\n')
+    expect(out).toContain('关口显式选的')
+  })
+
+  it('默认那一档不记 —— 它就是「什么都没变」', () => {
+    expect(reconcileIsolationNotices([], 'worktree')).toEqual([])
+    expect(reconcileIsolationNotices(undefined, 'worktree')).toBeUndefined()
+    // 但降级原因照旧要留(池子建失败而用户仍选 worktree:这一趟其实没有隔离)。
+    expect((reconcileIsolationNotices([degrade], 'worktree') ?? []).join('\n'))
+      .toContain('隔离不可用: 当前目录不是 git 仓库')
+  })
+
+  it('别人的 notice 一条都不能丢', () => {
+    const out = reconcileIsolationNotices(['角色 xxx 未配置', degrade], 'shared') ?? []
+    expect(out).toContain('角色 xxx 未配置')
+  })
+
+  /** 反复批准(终端改完再从飞书批一次)不许把记录叠成一堆。 */
+  it('幂等:再走一次关口不会累积记录', () => {
+    const once = reconcileIsolationNotices([degrade], 'shared-parallel') ?? []
+    const twice = reconcileIsolationNotices(once, 'shared-parallel') ?? []
+    expect(twice).toEqual(once)
+  })
+
+  it('改主意了:第二次选串行,第一次那条并发记录要被换掉', () => {
+    const once = reconcileIsolationNotices([degrade], 'shared-parallel') ?? []
+    const twice = (reconcileIsolationNotices(once, 'shared') ?? []).join('\n')
+    expect(twice).toContain('共享目录 + 串行')
+    expect(twice).not.toContain('共享目录 + 并发')
+  })
+
+  it('applyStartupDecision 真的调了它(两条批准路径都必经这里)', () => {
+    const cfg: EffTaskConfig = {
+      goalPrompt: 'g', parallelism: 3, phaseRoles: emptyPhaseRoles(),
+      caps: { ...DEFAULT_CAPS }, notices: [degrade],
+    }
+    const out = applyStartupDecision(cfg, { approved: true, parallelism: 3, isolation: 'shared-parallel' })
+    expect((out.notices ?? []).join('\n')).toContain('关口显式选的')
+    expect((out.notices ?? []).join('\n')).not.toContain('关口按 w')
+  })
+
+  /** 记录不是「你的请求没生效」—— 渲染侧要能把它分出去。 */
+  it('splitNotices 把记录和没生效的请求分开', () => {
+    const cfg: EffTaskConfig = {
+      goalPrompt: 'g', parallelism: 3, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS },
+      notices: reconcileIsolationNotices(['角色 xxx 未配置', degrade], 'shared-parallel'),
+    }
+    const { records, requests } = splitNotices(cfg)
+    expect(records).toHaveLength(1)
+    expect(records[0]).toContain('共享目录 + 并发')
+    expect(requests).toContain('角色 xxx 未配置')
+    expect(requests.join('\n')).toContain('隔离不可用')
+  })
+})
+
+/**
+ * **`undefined` 是默认档 worktree,不是「别的档」。**
+ *
+ * 裸比较 `config.isolation !== 'worktree'` 造成过一次真回归(实测):每一次 `--resume`
+ * 和每一次飞书批准都会静默放下池子 —— 那两个决策生产者根本不带这个字段,而
+ * `persistence` 的写条件是「不等于默认值才写」,所以普通隔离 run 的 run.md 里压根没有
+ * `isolation:` 这一行。屏幕上刚承诺完「各自的 worktree 中隔离、完成时自动合并回当前
+ * 分支」,恢复之后执行者直接写用户的检出、不产生提交,而且降级会再次落盘。
+ */
+describe('poolDisposition', () => {
+  const c = (iso?: string): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 3, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [],
+    ...(iso ? { isolation: iso as never } : {}),
+  })
+
+  it('没写 isolation(--resume / 飞书批准送来的那一份)→ 池子留着', () => {
+    expect(poolDisposition(c())).toEqual({ keepPool: true, sharedParallel: false })
+  })
+
+  it('显式 worktree → 池子留着', () => {
+    expect(poolDisposition(c('worktree'))).toEqual({ keepPool: true, sharedParallel: false })
+  })
+
+  it('共享串行 → 放下池子,互斥照旧', () => {
+    expect(poolDisposition(c('shared'))).toEqual({ keepPool: false, sharedParallel: false })
+  })
+
+  /**
+   * 第三档必须**同时**满足两条。分开的后果是「池子留着 + 互斥解开」——
+   * 那恰好是关口承诺的反面(产出跑去 .efftask-worktrees/,而且开始产生提交)。
+   */
+  it('第三档 → 放下池子,而且解开互斥', () => {
+    expect(poolDisposition(c('shared-parallel'))).toEqual({ keepPool: false, sharedParallel: true })
+  })
+})
+
+/**
+ * 第三档下「什么不适用」要列全 —— 不说的话用户跑完按 `m` 只会看到一屏空清单,
+ * 而那读起来像「东西都送到了」。
+ */
+describe('第三档的不适用清单', () => {
+  const t = (): string => gitChoiceLines(
+    { goalPrompt: 'g', parallelism: 3, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [], isolation: 'shared-parallel' },
+    { editable: false },
+  ).join('\n')
+
+  it('m / c / b 的重新同步 / 收口合并 / 完成即回收 都点了名', () => {
+    for (const k of ['m(合并)', 'c(回收工作区)', 'b(回溯)的重新同步', '收口合并', '完成即回收']) {
+      expect(t()).toContain(k)
+    }
+  })
+
+  /** 跑机实测 23 GB 就出在这里,而这一档下 `c` 键整个不存在(deps 建不出来)。 */
+  it('系统临时目录里的残留也说清没人回收', () => {
+    expect(t()).toContain('系统临时目录')
+    expect(t()).toContain('没有 c 键')
   })
 })

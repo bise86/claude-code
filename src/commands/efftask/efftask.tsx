@@ -68,6 +68,9 @@ import {
   exitReportLine,
   runSpanLine,
   applyStartupDecision,
+  ISOLATION_DEGRADE_PREFIX,
+  isolationChoice,
+  poolDisposition,
   applyRosterToNodes,
   rosterEquals,
   dispatchableRoles,
@@ -1324,7 +1327,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       const isoR = await makeWorktreePool(runId!, getCwd())
       poolRef.current = isoR.pool
       setIsolation(isoR.pool ? 'worktree' : 'none')
-      if (!isoR.pool && isoR.reason) withGuidance.notices.push(`隔离不可用,执行阶段默认共享工作目录并串行(关口按 w 可改成并发): ${isoR.reason}`)
+      if (!isoR.pool && isoR.reason) withGuidance.notices.push(`${ISOLATION_DEGRADE_PREFIX}${isoR.reason}`)
       // 隔离**是靠自愈才建起来的** —— 盘上被动过,必须说出口(见 makeWorktreePool.healed)。
       for (const h of isoR.healed ?? []) withGuidance.notices.push(`隔离工作区自愈: ${h}`)
       // 恢复关口原来只会说「这一趟没有可用的隔离工作区」,把真因扔了 —— 而真因
@@ -1400,7 +1403,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         setCanInitGit(iso.pool ? false : (iso.notARepo === true || iso.needsFirstCommit === true))
         // ALSO recorded in run.md. Replacing the notices.push with component state alone meant
         // the manifest stopped saying the run was un-isolated, while the resume path still did.
-        if (!iso.pool && iso.reason) cfg.notices.push(`隔离不可用,执行阶段默认共享工作目录并串行(关口按 w 可改成并发): ${iso.reason}`)
+        if (!iso.pool && iso.reason) cfg.notices.push(`${ISOLATION_DEGRADE_PREFIX}${iso.reason}`)
         for (const h of iso.healed ?? []) cfg.notices.push(`隔离工作区自愈: ${h}`)
         // 配置文件那条录入口的诊断。放在**最前**:它讲的是用户写在盘上的东西哪里不对,
         // 比运行期的降级更该先看到。也一并落进 run.md —— notices 是持久的。
@@ -2179,7 +2182,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // flipped to the next phase.
         if (winner === 'feishu' && decision.approved && terminalEdited.current) {
           onDone(
-            '注意: 本次启动由飞书批准,采用的是卡片上显示的并行数与角色名册;你在终端里未提交的修改没有生效。',
+            // **隔离方式也要点名。** 卡片上没有 `w` 这条通道,飞书赢下这一局时用户在终端
+            // 按过的那几下一起被丢掉 —— 而那一档决定的是「产出留在你目录里」还是「搬进
+            // .efftask-worktrees/ 并开始产生提交」,比并行数重得多。
+            '注意: 本次启动由飞书批准,采用的是卡片上显示的并行数、角色名册与隔离方式;你在终端里未提交的修改(含按 w 选的隔离方式)没有生效。',
             { display: 'system' },
           )
         }
@@ -2212,14 +2218,23 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
          * (见 makeWorktreePool 调用处的注释)。
          */
         /**
-         * **判据是「不等于 worktree」,不是「等于 shared」。**
+         * **判据是「不等于 worktree」,不是「等于 shared」;而且必须走 `isolationChoice`。**
          *
          * 漏掉第三档的后果特别隐蔽:池子留着 → 这一趟**其实是 worktree 隔离并发**,而关口
          * 逐字承诺了「不建 worktree、不产生任何提交、直接在你当前目录」。两种情况下
          * `serialiseExecute` 都是 false,**调度上完全看不出区别** —— 用户只会发现产出不在
          * 自己的目录里。
+         *
+         * 而**直接读 `effectiveConfig.isolation` 是一个回归**(实测):`undefined` 才是
+         * 默认档 worktree,它在裸比较里落进「放下池子」这一支。两个决策生产者根本不带这个
+         * 字段 —— `ConfirmResume`(每一次 --resume)和飞书批准卡 —— 而 `persistence` 的
+         * 写条件是「不等于默认值才写」,所以一个普通隔离 run 的 run.md 里压根没有
+         * `isolation:` 这一行。于是:屏幕上刚承诺完「各自的 worktree 中隔离、完成时自动
+         * 合并回当前分支」,恢复之后执行者直接写用户的检出、不产生提交、不合并,而且
+         * 降级会再次落盘 —— 恢复关口没有 `w` 键,永久且不可见。
          */
-        if (effectiveConfig.isolation !== 'worktree') {
+        const disposition = poolDisposition(effectiveConfig)
+        if (!disposition.keepPool) {
           poolRef.current = undefined
           // 状态也要跟着改口:它是「这一趟**实际**隔离了没有」,而运行视图的表头、
           // run.md 的那条 notice 都读它。留着 'worktree' 就是屏幕上说隔离、实际共享。
@@ -2230,7 +2245,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
            * 见 `orchestrator.serialiseExecute`:两者分开的后果是「池子留着 + 互斥解开」,
            * 而那恰好是关口承诺的反面。
            */
-          sharedParallelRef.current = effectiveConfig.isolation === 'shared-parallel'
+          sharedParallelRef.current = disposition.sharedParallel
         }
         setApproved(effectiveConfig)
         // RESUME skips the third gate. Its tree already exists on disk — drafting a fresh
@@ -2819,7 +2834,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     )
   }
   if (phase === 'running') {
-    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} serialExecute={poolRef.current === undefined && !sharedParallelRef.current}
+    return <RunningView nodes={nodes} runId={runId ?? ''} streams={streams.current} pool={poolRead.current ?? undefined} onAbort={props.abort} suspended={humanWait.waiting} serialExecute={poolRef.current === undefined && !sharedParallelRef.current} sharedParallel={sharedParallelRef.current}
       /**
        * 运行中按 f = 预先批准。**不在这里判能不能** —— 关口自己会按节点状态和本次配置
        * 算出可选的环节并逐条说明原因,而在这儿再判一次就是第二份判据。
@@ -3108,6 +3123,8 @@ export function RunningView(props: {
   nodes: TaskNode[]; runId: string; streams?: StreamStore
   pool?: () => { inUse: number; limit: number }
   onAbort: () => void; suspended?: boolean; serialExecute?: boolean
+  /** 第三档:共享目录 + 并发。表头上和 serialExecute 是两个独立的标记(一个说慢,一个说没安全网)。 */
+  sharedParallel?: boolean
   /** 运行中的人工干预:暂停 / 追加指令 / 取消单个节点。 */
   runControl?: React.ComponentProps<typeof TaskTreePanel>['runControl']
   /**
@@ -3154,7 +3171,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} sharedParallel={props.sharedParallel} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.

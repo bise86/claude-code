@@ -130,3 +130,50 @@ describe('组合警告两端都要有', () => {
     expect(text).toContain("跳过了执行但没跳验收:本次不会有任何代码改动,验收席位仍会照常开会,去核对一个空产出。判通过 = 给一个什么都没做的节点盖章并合进集成分支;判不通过 = 烧完验收迭代后阻断。要么一并跳过验收,要么别跳执行。")
   })
 })
+
+/**
+ * **飞书卡必须知道第三档 —— 竞速器的前提是两端说同一件事。**
+ *
+ * 卡上的 `isolation` 参数是「池子建起来了没有」,不是「这一趟选了哪一档」。上一版把它
+ * 直接喂给 `parallelismLine`,于是 shared-parallel 在卡上被印成「在各自的 git worktree
+ * 中隔离、每个子任务完成时自动合并回当前分支」(有池子)或「执行与叶子验收串行」
+ * (没池子)—— 两句对它都是假话,而 `--resume` 一个 shared-parallel 的 run 时必然触发。
+ */
+describe('启动卡 · 隔离方式', () => {
+  const base = {
+    goalPrompt: '打通登录', parallelism: 5, notices: [], mainModel: 'm',
+    caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 1 },
+    phaseRoles: { plan: [], review: [], execute: [], accept: [], observer: [] },
+  }
+  const text = (isolation: 'worktree' | 'none' | undefined, iso?: string): string => {
+    const card = buildStartupCard(
+      { ...base, ...(iso ? { isolation: iso } : {}) } as never, 'req-1', undefined, isolation,
+    ) as { elements: { text?: { content: string } }[] }
+    return card.elements.map(e => e.text?.content ?? '').join('\n')
+  }
+
+  it('第三档:池子在也好不在也好,都不许印成隔离或串行', () => {
+    for (const pool of ['worktree', 'none', undefined] as const) {
+      const t = text(pool, 'shared-parallel')
+      expect(t).toContain('执行任务**同时**在你当前的目录里跑')
+      expect(t).not.toContain('自动合并回当前分支')
+      expect(t).not.toContain('执行与叶子验收串行')
+    }
+  })
+
+  it('第三档的代价也要上卡 —— 批准的人看不到就等于没说', () => {
+    const t = text('none', 'shared-parallel')
+    expect(t).toContain('后写的直接盖掉先写的')
+    expect(t).toContain('本趟不产生任何提交')
+  })
+
+  /** 卡上按不了 `w`,印键位提示等于指一条这里不存在的路。 */
+  it('卡上不印键位提示', () => {
+    expect(text('none', 'shared-parallel')).not.toContain('(w 切换)')
+  })
+
+  it('默认那一档照旧:worktree + 有池子 → 说清自动合并', () => {
+    const t = text('worktree')
+    expect(t).toContain('自动合并回当前分支')
+  })
+})

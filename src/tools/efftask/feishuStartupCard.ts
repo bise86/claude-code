@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig, PendingHandoff } from './types.js'
-import { capsLine, costLine, guidanceLines, skipConflictLines, skipConsequenceLines, goalLine, noticeLines, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { capsLine, costLine, gitChoiceLines, guidanceLines, isolationChoice, skipConflictLines, skipConsequenceLines, goalLine, noticeLines, parallelismIsolation, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -26,13 +26,29 @@ function button(content: string, type: string, value: Record<string, unknown>) {
  * it a Feishu approver would sanction a resume seeing only a normal startup card — no counts,
  * no repairs — i.e. approving something different from what the terminal describes.
  */
+/**
+ * `isolation` 是**这台机器上池子建起来了没有**,不是这一趟选了哪一档 —— 选择住在
+ * `config.isolation` 里。两者在 `parallelismIsolation` 里合流(和两个终端关口同一个函数)。
+ *
+ * 上一版这个参数是两档,于是第三档(共享目录 + 并发)在卡上会被印成「在各自的 git
+ * worktree 中隔离、每个子任务完成时自动合并回当前分支」或者「执行与叶子验收串行」——
+ * 两句对它都是假话,而 `--resume` 一个 shared-parallel 的 run 时这条**必然**触发。
+ * 竞速器的前提是两端说同一件事:飞书上批准的人批的必须和终端上写的是同一个跑法。
+ */
 export function buildStartupCard(config: EffTaskConfig, requestId: string, resume?: ResumeSummary, isolation?: 'worktree' | 'none'): object {
   const goal = goalLine(config.goalPrompt)
   const body =
     `**目标**: ${goal}\n` +
     // Same sentence as the terminal, from the same function. A Feishu approver must not
     // be told something different about the run than the person at the keyboard.
-    `**${parallelismLine(config, { editable: false, isolation })}**\n` +
+    `**${parallelismLine(config, {
+      editable: false,
+      isolation: parallelismIsolation(isolationChoice(config), isolation === 'worktree'),
+    })}**\n` +
+    // 隔离方式/收口/推送那几行。**卡上此前一行都没有** —— 而它们说的正是这一趟会对
+    // 用户的工作目录做什么(第三档:直接改、多个任务同时改、不产生任何提交)。
+    // `editable: false`:卡上按不了 `w`,印键位提示等于指一条这里不存在的路。
+    `${gitChoiceLines(config, { editable: false }).map(l => `- ${l}`).join('\n')}\n` +
     // NOT "如需调整请在终端修改". This card's own approve button is the path that DISCARDS
     // terminal edits: the payload it claims with is {parallelism, approved} snapshotted when
     // the gate opened, and applyStartupDecision reads an absent roster as "unchanged". So a

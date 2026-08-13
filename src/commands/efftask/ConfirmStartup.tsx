@@ -5,7 +5,7 @@ import { useLiveState } from './useLiveState.js'
 import { PHASE_NAMES } from '../../tools/efftask/types.js'
 import type { EffTaskConfig, PhaseName, RoleBinding } from '../../tools/efftask/types.js'
 import {
-  capsLine, contextWindowNoticeLines, costLine, gitChoiceLines, guidanceLines, isolationChoice, mcpNoticeLines, proxyNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismLine, rosterEditorLines,
+  capsLine, contextWindowNoticeLines, costLine, gitChoiceLines, guidanceLines, isolationChoice, mcpNoticeLines, proxyNoticeLines, skipConflictLines, skipConsequenceLines, clampParallelism, goalLine, isolationChoiceLines, noticeLines, parallelismIsolation, parallelismLine, rosterEditorLines,
   rosterLines, toggleRole, type StartupDecision,
 } from '../../tools/efftask/startupConfirm.js'
 
@@ -212,10 +212,7 @@ export function ConfirmStartup(props: {
    * `worktree` 这一档要和「池子真的在」取交集:候选集合已经排除了它,这里是第二道闩 ——
    * 没有池子却印着「在各自的 worktree 中隔离、自动合并回当前分支」是最贵的一种谎。
    */
-  const isoShown: 'worktree' | 'none' | 'shared-parallel'
-    = iso === 'shared-parallel' ? 'shared-parallel'
-    : iso === 'worktree' && props.isolation === 'worktree' ? 'worktree'
-    : 'none'
+  const isoShown = parallelismIsolation(iso, props.isolation === 'worktree')
   return (
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 启动确认</Text>
@@ -304,7 +301,7 @@ export function ConfirmStartup(props: {
       {props.isolationReason && !editing && (
         <Box flexDirection="column">
           <Text color="warning">隔离并行不可用,本次将降级执行:</Text>
-          {isolationChoiceLines(props.isolationReason, props.onInitGit !== undefined).map(l => (
+          {isolationChoiceLines(props.isolationReason, props.onInitGit !== undefined, iso).map(l => (
             <Text key={l} color="warning">  · {l}</Text>
           ))}
         </Box>

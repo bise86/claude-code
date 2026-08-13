@@ -11,8 +11,10 @@
 >    本来就调 `mergeIntegrationIntoNode`(把集成分支合进节点工作区),那**就是**同步。
 >    需要额外 `integrationAhead` 判断的只有 `staged` 那一支,理由是它不能盲目提交一份
 >    已被否决的解决。**代码是对的,方案写错了。**
-> 4. **§E(第三档 `shared-parallel`,15 处判据)整节作废** —— 用户明确说需求 1 暂不做,
->    全仓 `grep -a "sharedParallel|shared-parallel"` 零命中,没有半成品。
+> 4. ~~**§E(第三档 `shared-parallel`,15 处判据)整节作废** —— 用户明确说需求 1 暂不做,
+>    全仓 `grep -a "sharedParallel|shared-parallel"` 零命中,没有半成品。~~
+>    **2026-08-13 反了**:用户回来把需求 1 做掉了(两个决策:`w` 显式选择、正常 git
+>    仓库里也允许选),第三档已落地并有真跑探针。
 > 5. **§F.4 的「显式 add[] + 抽出 createChildren 纯段」作废**:落地版是第 2 级解开父节点的
 >    `revised` 闩,让编排器自己那条已经测过的 `reviseDecomposition` 去长补救子任务。
 >    这一点验收判为**曲解**用户原话,已在确认屏上把它说清(见 `backtrackLines`)。

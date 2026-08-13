@@ -254,6 +254,15 @@ export function TaskTreePanel(props: {
    */
   serialExecute?: boolean
   /**
+   * 这一趟是不是**共享目录 + 并发**(第三档)。
+   *
+   * 单独一个标记,因为它和上面那个是两件事:`serialExecute` 说的是「慢」,这个说的是
+   * **没有安全网** —— 没有工作区隔离、没有 git、多个执行者同时改同一棵树。实测过它此前
+   * 在表头上和「worktree 隔离并发」逐字相同(两者 `serialExecute` 都是 false、`pool`
+   * 都不画),于是整趟跑下来最危险的那一档一个字都没有,而唯一的标记给了最安全的那一档。
+   */
+  sharedParallel?: boolean
+  /**
    * 详情页的 `m` 键:把这棵子树里还没合进主干的隔离工作区合掉(节点分支 → 集成分支 →
    * 你当前的分支),撞冲突派主模型解决。
    *
@@ -818,6 +827,9 @@ export function TaskTreePanel(props: {
           : null}
         {props.serialExecute === true
           ? <Text color="warning">{'  '}执行串行(无隔离工作区)</Text>
+          : null}
+        {props.sharedParallel === true
+          ? <Text color="warning">{'  '}并发直写当前目录(无隔离)</Text>
           : null}
         {/* 这一趟一共花了多少。表头是唯一一个「不用挑节点就看得到全局」的位置,而
             「这次跑掉了多少钱」正是一个人在树上第一眼想确认的事。空的时候整段不画 ——

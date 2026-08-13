@@ -48,7 +48,15 @@ export interface StartupDecision {
    * 没有这两个开关,而它是能赢下这场竞速的 —— 把缺省读成 false/默认值,等于让一次飞书批准
    * 静默推翻用户刚在终端上按过的选择。
    */
-  isolation?: 'worktree' | 'shared'
+  /**
+   * **三档,不是两档。** 关口送出来的就是 `IsolationChoice`(`isoRef.current`),而这里
+   * 写死两档的后果和 `isolationChoice` 返回值那次逐字相同:第三个值在运行时照样存在、
+   * 照样落进 run.md,只是所有 `=== …` 的比较悄悄落到 else 分支上,而 TypeScript 一个字
+   * 都不说(关口是组件,它的 props 类型在这个仓库里推不动)。
+   *
+   * 类型引用 `IsolationChoice` 而不是再抄一遍字面量联合:抄的那一份下次加档时不会跟着变。
+   */
+  isolation?: IsolationChoice
   autoPush?: boolean
 }
 
@@ -218,8 +226,21 @@ export function rosterEditorLines(
  * in production — left the entire suite green.
  */
 export function applyStartupDecision(config: EffTaskConfig, decision: StartupDecision): EffTaskConfig {
+  const iso = decision.isolation ?? config.isolation ?? 'worktree'
   return {
     ...config,
+    /**
+     * **关口之前推的那条降级说明,在关口之后就过期了。**
+     *
+     * 它是在池子建失败那一刻推进 `notices` 的,措辞是「执行阶段默认共享工作目录并串行
+     * (关口按 w 可改成并发)」—— 而用户随后可能正好按了 w。这条会原样落进 run.md,于是
+     * 同一份文件里一句说串行、一个字段写 `isolation: shared-parallel`,**真相是后者**。
+     * 用户事后回看 run.md(或 --resume 时在恢复关口上再读到它)只会被它带偏。
+     *
+     * 收在这里而不是在命令层:两条批准路径(终端 / 飞书)都必经这个函数,而 `notices`
+     * 的两个推入点在命令层是分开的两条路径(新建 / 恢复)。
+     */
+    notices: reconcileIsolationNotices(config.notices, iso),
     parallelism: decision.parallelism,
     // Absent means UNCHANGED, which is what a Feishu approval sends: that card has no channel
     // for a five-phase role table, so it must keep exactly the roster it displayed.
@@ -230,6 +251,66 @@ export function applyStartupDecision(config: EffTaskConfig, decision: StartupDec
     // 那会让一次飞书批准把用户在终端上刚打开的推送悄悄关掉。
     isolation: decision.isolation ?? config.isolation,
     autoPush: decision.autoPush ?? config.autoPush,
+  }
+}
+
+/**
+ * 关口之前推的降级说明的前缀 —— 关口之后要按真正选中的那一档改写它。
+ * 命令层推的那两句必须以它开头,否则这里认不出来(有计数断言钉住两侧)。
+ */
+export const ISOLATION_DEGRADE_PREFIX = '隔离不可用,执行阶段默认共享工作目录并串行(关口按 w 可改成并发): '
+/**
+ * 「这一趟怎么跑」的**记录**前缀。
+ *
+ * 记录不是「你的请求没生效」:两个关口把 `notices` 整块顶在「以下请求不会生效」这个标题
+ * 下面,而这几行说的是**已经定下来的执行方式**。渲染侧按这个前缀把它们分出去单独成块。
+ */
+export const ISOLATION_RECORD_PREFIX = '本次隔离方式: '
+
+/** 这一档用一句话说清「会对你的目录做什么」。 */
+function isolationRecord(iso: IsolationChoice): string {
+  if (iso === 'shared-parallel') {
+    return `${ISOLATION_RECORD_PREFIX}共享目录 + 并发(关口显式选的)—— 多个执行任务同时改你当前的工作目录,没有隔离、不产生任何提交`
+  }
+  if (iso === 'shared') {
+    return `${ISOLATION_RECORD_PREFIX}共享目录 + 串行 —— 执行者直接改你当前的工作目录(一次一个),不产生任何提交`
+  }
+  return `${ISOLATION_RECORD_PREFIX}worktree 隔离 —— 每个执行任务在自己的工作区里跑,完成时合并回你当前的分支`
+}
+
+/**
+ * 关口定下来之后,把 `notices` 里那条**过期的**降级说明换成一条记录。
+ *
+ * 两件事各归各:
+ *  · 降级的**原因**(不是 git 仓库 / 集成分支已存在 …)是事实,留着 —— 它是用户唯一
+ *    能据此动手的东西;
+ *  · 「默认…并串行(按 w 可改成并发)」是关口**之前**的预告,关口之后必须换成真正选中的
+ *    那一档,否则 run.md 里的记录和 `isolation:` 字段互相矛盾。
+ *
+ * 池子可用而用户仍然显式选了共享的那一趟,此前 run.md 上**一个字都没有**(只有一个
+ * frontmatter 键)—— 所以非默认档一律补一条记录。
+ */
+export function reconcileIsolationNotices(
+  notices: string[] | undefined, iso: IsolationChoice,
+): string[] | undefined {
+  if (notices === undefined && iso === 'worktree') return undefined
+  const rest = (notices ?? []).filter(n => !n.startsWith(ISOLATION_DEGRADE_PREFIX) && !n.startsWith(ISOLATION_RECORD_PREFIX))
+  const reasons = (notices ?? [])
+    .filter(n => n.startsWith(ISOLATION_DEGRADE_PREFIX))
+    .map(n => `隔离不可用: ${n.slice(ISOLATION_DEGRADE_PREFIX.length)}`)
+  // 默认那一档不用记 —— 它就是「什么都没变」。降级原因照旧要留。
+  const record = iso === 'worktree' ? [] : [isolationRecord(iso)]
+  return [...rest, ...reasons, ...record]
+}
+
+/**
+ * 把 `notices` 拆成「记录」和「没生效的请求」两堆 —— 两个关口和飞书卡的标题不一样。
+ */
+export function splitNotices(config: EffTaskConfig): { records: string[]; requests: string[] } {
+  const all = noticeLines(config)
+  return {
+    records: all.filter(n => n.startsWith(ISOLATION_RECORD_PREFIX)),
+    requests: all.filter(n => !n.startsWith(ISOLATION_RECORD_PREFIX)),
   }
 }
 
@@ -244,6 +325,41 @@ export type IsolationChoice = 'worktree' | 'shared' | 'shared-parallel'
  */
 export function isolationChoice(config: EffTaskConfig): IsolationChoice {
   return config.isolation ?? 'worktree'
+}
+
+/**
+ * 「并行数」那一行该按**哪一档**说话。
+ *
+ * 两个事实必须在这里合流,而它们此前在三个界面上各自为政:
+ *  · `choice` = 这一趟**选的**隔离方式(关口上是实时选择,恢复关口上是 run.md 读回来的);
+ *  · `poolAvailable` = 这台机器上池子**建起来了没有**。
+ *
+ * 只读前者:没有池子却印着「在各自的 worktree 中隔离、每个子任务完成时自动合并回当前
+ * 分支」—— 用户于是相信自己的工作目录不会被直接改。
+ * 只读后者:按 `w` 选到第三档之后仍然印「执行与叶子验收串行」,而真正发生的是 N 个
+ * 执行者同时在他目录里裸写 —— 这是更糟的那个方向,因为他会据此以为有互斥。
+ */
+export function parallelismIsolation(
+  choice: IsolationChoice, poolAvailable: boolean,
+): 'worktree' | 'none' | 'shared-parallel' {
+  if (choice === 'shared-parallel') return 'shared-parallel'
+  return choice === 'worktree' && poolAvailable ? 'worktree' : 'none'
+}
+
+/**
+ * 关口批准之后,这一趟对**已经建好的池子**怎么处置,以及执行阶段的互斥解不解开。
+ *
+ * 住在这里而不是命令层的一个 `if`:命令层挂不起来(组件无法 headless 挂载),而这三行
+ * 判据出过一次真回归 —— 裸比较 `config.isolation !== 'worktree'` 把 **`undefined`
+ * (也就是默认档 worktree)**判成了「放下池子」。两个决策生产者都不带这个字段
+ * (`ConfirmResume` 的每一次 --resume、飞书批准卡),而 `persistence` 的写条件是
+ * 「不等于默认值才写」,所以普通隔离 run 的 run.md 里根本没有 `isolation:` 这一行:
+ * 屏幕上刚承诺完隔离并行 + 自动合并,恢复之后执行者直接写用户的检出、不产生提交,
+ * 而且降级会再次落盘,恢复关口又没有 `w` 键可以纠正。
+ */
+export function poolDisposition(config: EffTaskConfig): { keepPool: boolean; sharedParallel: boolean } {
+  const iso = isolationChoice(config)
+  return { keepPool: iso === 'worktree', sharedParallel: iso === 'shared-parallel' }
 }
 
 /** 这一档是不是「不建工作区、直接在当前目录里跑」。两档共享都算。 */
@@ -298,7 +414,13 @@ export function gitChoiceLines(
   if (iso === 'shared-parallel') {
     out.push('⚠ 这一档没有任何机制能挡住两个任务改同一个文件 —— 没有 git,连冲突都不会报,后写的直接盖掉先写的。')
     out.push('  它成立的前提是**任务按产出文件划分**;根方案会被要求照这条拆,但拆得对不对最终由你判断。')
-    out.push('  本趟不产生任何提交:m(合并)/ c(回收工作区)/ 收口合并 / 完成即回收 都不适用,产出直接就在你的目录里。')
+    // 「回溯」也要点名:它的两级阶梯里有一步是「删 target 重新同步工作区」,而这一档
+    // 根本没有工作区可同步(`worktreesToRelease` 恒为空)。上面那段注释一直这么写,
+    // 而渲染出来的这一行里从来没有这两个字 —— 注释和代码漂移。
+    out.push('  本趟不产生任何提交:m(合并)/ c(回收工作区)/ b(回溯)的重新同步 / 收口合并 / 完成即回收 都不适用,产出直接就在你的目录里。')
+    // 系统临时目录里的残留同样没人回收:`c` 键的第三份名单挂在池子上(CleanupDeps 要
+    // gitRoot/pathFor 才建得出来),这一档下那个键整个不存在。跑机上它是 23 GB 的来源。
+    out.push('  子任务写到系统临时目录里的中间产物这一档也不回收(没有 c 键),需要时自己清。')
   }
   // 收口方式**不再是一个开关**:只有主干开发(用户:「不要什么分支开发」)。隔离运行下
   // 每个子任务通过验收就合回当前分支一次,所以这一行说的是「会发生什么」,不是「你选了什么」。
@@ -1129,14 +1251,36 @@ export function runSpanLine(
  * 串行化(orchestrator 的 serialiseExecute),所以慢,但不会有两个 executor 同时改同一份
  * 代码;而 §16 那条最大风险(worktree 合并冲突)在这种模式下根本不存在。
  */
-export function isolationChoiceLines(reason: string, canInitGit: boolean): string[] {
+export function isolationChoiceLines(
+  reason: string, canInitGit: boolean,
+  /**
+   * 用户此刻**选到哪一档了**。不传 = 还是默认那一档(串行)。
+   *
+   * 不接这个参数的后果是实测出来的:按 `w` 选到第三档之后,顶上那行已经改口成
+   * 「共享目录 + 并发(你选的)」,而这一整块逐字不动 —— 里面「会被强制串行(一次只有
+   * 一个节点在改代码)」「不会出现两个执行 agent 同时改同一份文件」两句直接是反话,
+   * 「按 w 选『共享目录 + 并发』」指的还是他已经在的那一档(再按一次反而切走)。
+   * 用户从上往下读,最后一眼落在「强制串行」上。
+   */
+  chosen: IsolationChoice = 'shared',
+): string[] {
+  const parallel = chosen === 'shared-parallel'
   return [
     `隔离不可用:${reason}`,
-    // 这两句在**第三档下逐字为假**,所以措辞必须带上「默认」二字,并把另一条路指出来。
-    '默认继续的话,执行阶段会共享你当前的工作目录,并被强制串行(一次只有一个节点在改代码)。',
-    '那一档里方案/质疑修复仍然并行,而且不会出现两个执行 agent 同时改同一份文件。',
-    '想要**并发**又不要 git:按 w 选「共享目录 + 并发」—— 快得多,但没有任何机制挡住两个任务改同一个文件,',
-    '  它成立的前提是任务按产出文件划分。',
+    // 这两句在**第三档下逐字为假** —— 所以它们整组要跟着 `chosen` 换,不是加个「默认」了事。
+    ...(parallel
+      ? [
+          '你选的这一档:执行阶段**同时**在你当前的工作目录里跑,没有隔离、不产生任何提交。',
+          '没有任何机制挡住两个任务改同一个文件 —— 没有 git,连冲突都不会报,后写的直接盖掉先写的。',
+          '它成立的前提是**任务按产出文件划分**;根方案会被要求照这条拆,但拆得对不对最终由你判断。',
+          '想要那条安全的慢路:按 w 切回「共享目录 + 串行」(一次只有一个节点在改代码)。',
+        ]
+      : [
+          '默认继续的话,执行阶段会共享你当前的工作目录,并被强制串行(一次只有一个节点在改代码)。',
+          '那一档里方案/质疑修复仍然并行,而且不会出现两个执行 agent 同时改同一份文件。',
+          '想要**并发**又不要 git:按 w 选「共享目录 + 并发」—— 快得多,但没有任何机制挡住两个任务改同一个文件,',
+          '  它成立的前提是任务按产出文件划分。',
+        ]),
     // The `g` offer appears ONLY when the directory is not a repo at all. Every other pool
     // failure happens after that check passed — no commits yet, a branch-name clash, a
     // worktree already checked out — so the directory IS a repo, and `git init` there would
