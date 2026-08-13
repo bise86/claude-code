@@ -539,3 +539,76 @@ describe('在不在飞', () => {
     expect(plan.skipped[0]!.why).toContain('拿不到')
   })
 })
+
+/**
+ * **算出来了就必须上屏。**
+ *
+ * 扫描找得到、执行会真的去合,而确认屏一个字都没有 —— 那是「静默动手」,和静默清理、
+ * 静默截断是同一类毛病。这一批尤其不能少:抢救分支和只剩分支的残留,用户多半根本不知道
+ * 它们存在。
+ */
+describe('捞回那一批要出现在确认屏上', () => {
+  it('要合的、不合的、以及孤儿目录各自成段', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/r-1', { title: '甲' })
+    const path = await work(pool, a, 'lost.ts', 'x\n')
+    await rm(path, { recursive: true, force: true })
+    await git(['worktree', 'prune'], gitRoot)
+    a.worktree = undefined
+
+    const deps = depsOf(pool, {
+      runId: '001',
+      triage: async ev => ev.map(e => ({ ref: e.ref, verdict: 'merge' as const, why: '独有产出' })),
+    })
+    const text = subtreeMergeLines(await scanSubtreeMerge(deps, [a], a.id)).join('\n')
+    expect(text).toContain('没有工作区目录')
+    expect(text).toContain('独有产出')
+    // 「合完分支照样保留」是这条路的承诺,不能只写在代码注释里。
+    expect(text).toContain('照样保留')
+  })
+
+  it('分诊拿不准的只列出来,而且要数出「拿不准」几处', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/r-2', { title: '乙' })
+    const path = await work(pool, a, 'lost.ts', 'x\n')
+    await rm(path, { recursive: true, force: true })
+    await git(['worktree', 'prune'], gitRoot)
+    a.worktree = undefined
+
+    // 不给 triage —— 全部落「拿不准」。
+    const text = subtreeMergeLines(await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)).join('\n')
+    expect(text).toContain('不合')
+    expect(text).toContain('拿不准')
+  })
+
+  /**
+   * **「没查」和「查过了没有」要说两句不同的话。** 空白冒充「没有」是这份清单最坏的读法
+   * —— 用户按 m 正是为了确认「还有没有东西没送到」。
+   */
+  it('缺少扫描所需信息时明说「这一格没查」', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/r-3', { title: '丙' })
+    // 不给 runId → rescue 是 undefined
+    const text = subtreeMergeLines(await scanSubtreeMerge(depsOf(pool), [a], a.id)).join('\n')
+    expect(text).toContain('没有检查')
+  })
+
+  /**
+   * 「查过了、确实没有」这一格要**每一样都给全**才成立 —— 少给一个接缝(例如目录探测),
+   * 屏幕会照实说那一格没查。第一版夹具就漏了 `exists`,于是它断言的是一件当时并不成立的事。
+   */
+  it('查过了、确实没有 → 不印那句警告,也不印空标题', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/r-4', { title: '丁' })
+    const deps = depsOf(pool, { runId: '001', exists: async () => false })
+    const text = subtreeMergeLines(await scanSubtreeMerge(deps, [a], a.id)).join('\n')
+    expect(text).not.toContain('没有检查')
+    // 锚要精确到**捞回那一段的抬头**:「没有工作区目录」这几个字在既有文案里也出现
+    // (「另有 N 个任务在盘上没有工作区目录」),按它断言等于什么都没断言。
+    expect(text).not.toContain('另外捞回')
+  })
+})

@@ -1,4 +1,5 @@
 import { autoResolveMerge, mergeLeftovers, type ConflictResolver, type GitFn } from './handoffActions.js'
+import { DEFAULT_TRUNK_RESOLVE } from './types.js'
 
 /**
  * **把一条 ref 合进集成分支,撞冲突就由解冲突的模型把它解掉。**
@@ -67,7 +68,7 @@ export type IntegrationMergeResult =
   }
 
 /** 这一趟允许模型解几轮。0 = 不自动解(撞冲突直接报告)。 */
-const DEFAULT_ROUNDS = 3
+const DEFAULT_ROUNDS = DEFAULT_TRUNK_RESOLVE
 
 /**
  * 让 `merge-scratch` 干干净净地停在 `tip` 上。

@@ -989,6 +989,21 @@ export interface Caps {
    */
   wipeOnAccept?: boolean
   /**
+   * **手动合并**(详情页 `m`、捞回孤立产出、合回你当前分支)撞上冲突时,最多让模型解几轮。
+   * 默认 3。
+   *
+   * ## 为什么不复用 `mergeResolveAttempts`
+   *
+   * 那个数的用户可见语义是「一个节点的合并冲突最多让模型自动解几次,**而且每次解完都会
+   * 重跑一次验收**」,`0` 的含义是「冲突别自动解,直接叫我」。而手动那几条路
+   * **今天根本不受它管**(`autoResolveMerge` 一律解一次)。直接复用的后果是:一个把
+   * `mergeResolveAttempts` 设成 0 的人会**静默失去 `m` 键现有的那一次解冲突能力** ——
+   * 正好顶掉用户第 8 条要的东西。两个数管的是两条路,不该共用一个旋钮。
+   *
+   * `0` 在这里同样合法,含义也一样:撞冲突就停下来如实报告,不派模型。
+   */
+  trunkResolveRounds?: number
+  /**
    * 严格度档位 —— 四个裁决环节「多好才算够」的那把尺子。见 `strictness.ts` 的文件头。
    *
    * **它是一个独立的枚举字段,数值在使用点派生,永不回写 `quorum` / `maxIterations`。**
@@ -1005,6 +1020,16 @@ export interface Caps {
    */
   strictness?: Strictness
 }
+/**
+ * `caps.trunkResolveRounds` 的合法区间与默认值。一份真相,`integrationMerge` /
+ * `parseDirectives` / `resumeCore` 共用 —— 各写一份的话,同一个数会在启动时被接受、
+ * 在 `--resume` 时被改写,而屏幕上没有任何东西解释它为什么变了(`MAX_NODES_CEILING`
+ * 的注释记着这条)。
+ */
+export const MIN_TRUNK_RESOLVE = 0
+export const MAX_TRUNK_RESOLVE = 20
+export const DEFAULT_TRUNK_RESOLVE = 3
+
 /** `caps.mergeResolveAttempts` 的合法区间。一份真相,parseDirectives / resumeCore 共用。 */
 export const MIN_MERGE_RESOLVE = 0
 /**

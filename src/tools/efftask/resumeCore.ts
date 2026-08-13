@@ -1,5 +1,5 @@
 import { parse as yamlParse } from 'yaml'
-import { MAX_DEPS_RECALC_RECORDS, MAX_NODES_CEILING, clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEGRADABLE_PHASES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
+import { MAX_DEPS_RECALC_RECORDS, MAX_NODES_CEILING, clampParallelism, createNode, emptyPhaseRoles, emptyPlan, BLOCK_CATEGORIES, DEGRADABLE_PHASES, DEFAULT_CAPS, MAX_GUIDANCE_CHARS, SKIPPABLE_PHASES, DEFAULT_MAX_SEATS_PER_PHASE, DEFAULT_PARALLELISM, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, MIN_TRUNK_RESOLVE, MAX_TRUNK_RESOLVE, DEFAULT_TRUNK_RESOLVE, NODE_STATUSES, PHASE_NAMES, STEP_ALIASES, ACTIVE_STATUSES } from './types.js'
 import type { Caps, DegradeRecord, DepsRecalcRecord, EffTaskConfig, NodeKind, NodePlan, PhaseName, ResumeRecord, RoleBinding, RoundtableRecord, TaskNode, ScoreRecord } from './types.js'
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
@@ -1128,6 +1128,32 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   if (caps.quorum !== undefined) rebuilt.quorum = clampInt(caps.quorum, 1, 100, 100)
   if (caps.quorumSeats !== undefined) rebuilt.quorumSeats = clampInt(caps.quorumSeats, 1, 20, 1)
   if (caps.planConverge === '圆桌' || caps.planConverge === '精化') rebuilt.planConverge = caps.planConverge
+  /**
+   * **「完成即回收构建产物」必须读得回来。**
+   *
+   * 它默认**开**,而它做的是一次自动的、不可逆的删除。逐字段重建的这一份漏掉它的后果是
+   * 单向的、而且方向朝坏:一个明确把它**关掉**的用户,第一次 `--resume` 就悄悄被打开 ——
+   * 而他关掉它多半正是因为不想让构建产物被删。反过来(开着的被关掉)只是少腾点空间。
+   *
+   * **只认真正的布尔**:run.md 是手工可编辑的,而字符串 `'false'` 是 truthy ——
+   * 误开一次就是一次真的删除(`autoPush` 为同一件事定过这条规矩)。
+   */
+  if (typeof caps.wipeOnAccept === 'boolean') rebuilt.wipeOnAccept = caps.wipeOnAccept
+  else if (caps.wipeOnAccept !== undefined) {
+    degraded.push(
+      `run.md 里的 caps.wipeOnAccept 不是布尔值(写的是 ${JSON.stringify(caps.wipeOnAccept)}),已忽略 —— ` +
+      `这一趟按默认走:任务合并完成后会立即清掉它工作区里被 .gitignore 忽略的构建产物`,
+    )
+  }
+  /**
+   * 手动合并的解冲突轮数。同样必须读得回来 —— 一个配了「冲突别自动解、直接叫我」
+   * (0)的用户,恢复之后会重新开始派模型改他的代码。
+   */
+  if (caps.trunkResolveRounds !== undefined) {
+    rebuilt.trunkResolveRounds = clampInt(
+      caps.trunkResolveRounds, MIN_TRUNK_RESOLVE, MAX_TRUNK_RESOLVE, DEFAULT_TRUNK_RESOLVE,
+    )
+  }
   /**
    * 严格度档位。照 `planConverge` 那一行的保守规矩:只认严格相等的四个字面量。
    *

@@ -1527,3 +1527,52 @@ describe('降级放行相关的字段必须读得回来', () => {
     expect(out2.nodes[0]!.iteration.verification).toBe(2)
   })
 })
+
+/**
+ * **caps 是逐字段重建的,所以每一个新字段都必须在这里被点名。**
+ *
+ * 这个仓库为「只写不读的字段在第一次 `--resume` 时清零」付过三次账。这两条的方向都朝坏:
+ *  - `wipeOnAccept` 默认**开**,而它做的是一次自动的、不可逆的删除 —— 一个明确关掉它的
+ *    用户,恢复之后会被悄悄打开;
+ *  - `trunkResolveRounds` 设成 0 的含义是「冲突别自动解、直接叫我」,清零之后恢复回来的
+ *    run 会重新开始派模型改他的代码。
+ */
+describe('新增的 caps 字段要读得回来', () => {
+  /** 只带 caps 的一份最小 run.md。 */
+  const withCaps = (lines: string[]): string => [
+    '---', 'runId: 001', 'parallelism: 3', 'phaseRoles:', '  plan: []', 'caps:', ...lines,
+    'goalPrompt: 目标', '---', '', '# tree',
+  ].join('\n')
+  const read = async (lines: string[]) => readRunManifest(fsWith({ '/r/run.md': withCaps(lines) }), '/r')
+
+  it('wipeOnAccept: false 恢复之后还是 false', async () => {
+    const { config } = await read(['  wipeOnAccept: false'])
+    expect(config.caps.wipeOnAccept).toBe(false)
+  })
+
+  it('wipeOnAccept: true 也照样带过来', async () => {
+    const { config } = await read(['  wipeOnAccept: true'])
+    expect(config.caps.wipeOnAccept).toBe(true)
+  })
+
+  /**
+   * **只认真正的布尔。** run.md 是手工可编辑的,而字符串 `'false'` 是 truthy ——
+   * 误开一次就是一次真的删除(`autoPush` 为同一件事定过这条规矩)。
+   */
+  it('wipeOnAccept 写成字符串 → 忽略并留下降级说明', async () => {
+    const { config, degraded } = await read(["  wipeOnAccept: 'false'"])
+    expect(config.caps.wipeOnAccept).toBeUndefined()
+    expect(degraded.join('\n')).toContain('wipeOnAccept')
+  })
+
+  it('trunkResolveRounds 带得过来,而且照样夹取', async () => {
+    expect((await read(['  trunkResolveRounds: 0'])).config.caps.trunkResolveRounds).toBe(0)
+    expect((await read(['  trunkResolveRounds: 999'])).config.caps.trunkResolveRounds).toBe(20)
+  })
+
+  it('老 run.md 里没有这两个字段时不凭空造值', async () => {
+    const { config } = await read(['  maxDepth: 4'])
+    expect(config.caps.wipeOnAccept).toBeUndefined()
+    expect(config.caps.trunkResolveRounds).toBeUndefined()
+  })
+})

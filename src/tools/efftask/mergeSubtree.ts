@@ -780,6 +780,41 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
      */
     out.push(`集成分支上也没有还没送到 ${plan.trunk.branch} 的提交 —— 这棵子树的产出都已经在你的分支上了。`)
   }
+  /**
+   * **没有工作区目录的那几类,必须自己上屏。**
+   *
+   * 扫描算得出来、执行会真的去合,而屏幕上一个字都没有 —— 那就是「静默动手」,
+   * 和静默清理、静默截断是同一类毛病(这个仓库为它修过三次)。而且这一批恰恰是用户最
+   * 意外的:抢救分支和只剩分支的残留他多半根本不知道存在。
+   *
+   * `undefined` 和空的**说两句不同的话**:前者是「这一格没查」(缺 runId / worktreeRoot),
+   * 后者是「查过了,没有」。空白冒充「没有」是这份清单最坏的读法。
+   */
+  if (plan.rescue === undefined) {
+    out.push('⚠ 这一屏没有检查「没有工作区目录」的那几类(抢救分支、只剩分支的残留)—— 缺少扫描所需的信息。')
+  } else {
+    const r = plan.rescue
+    if (r.merge.length > 0) {
+      const total = r.merge.reduce((s, c) => s + c.evidence.commits, 0)
+      out.push(`另外捞回 ${r.merge.length} 处**没有工作区目录**的产出(共 ${total} 个提交):`)
+      for (const c of r.merge) {
+        out.push(`  · ${c.evidence.title ?? c.evidence.ref}(${c.evidence.fileCount} 个文件):${c.why}`)
+      }
+      out.push('  它们的分支合完照样保留 —— 捞是往集成分支加东西,不是清理。')
+    }
+    if (r.hold.length > 0) {
+      const unsure = r.hold.filter(c => c.verdict === 'unsure').length
+      // 「拿不准」和「判定不合」要分开数:前者是我们没把握,后者是有理由的排除。
+      out.push(`有 ${r.hold.length} 处孤立产出**不合**${unsure > 0 ? `(其中 ${unsure} 处拿不准)` : ''},只列出来:`)
+      for (const c of r.hold) out.push(`  · ${c.evidence.title ?? c.evidence.ref}:${c.why}`)
+    }
+    for (const o of r.orphanFiles) {
+      out.push(`孤儿目录 ${o.path} 里有 ${o.files.length} 个文件不在集成分支上。`)
+      // 它不是 git 工作树,合不进来 —— 不说的话用户以为按一下就收进去了。
+      out.push('  ⚠ 那个目录已经不是 git 工作树,没法合并;请自行确认后手工取用(目录不会被删)。')
+    }
+    for (const p of r.problems) out.push(`⚠ ${p}`)
+  }
   out.push('任务状态不会被改动:合并只动 git,节点的判决、评审与验收记录原样保留。')
   if (plan.runActive) {
     out.push('⚠ 这一趟还在跑:合并会和编排器共用同一条集成分支,两边按顺序排队(可能要等在飞的那次合并让出来)。')

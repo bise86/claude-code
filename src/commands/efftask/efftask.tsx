@@ -1792,6 +1792,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * `runningNodeIds()` 是编排器对外的那条接缝(`inFlightIds` 是 private)。
        */
       inFlight: orchRef.current?.runningNodeIds() ?? [],
+      // 手动合并撞冲突时让模型解几轮。**不复用 mergeResolveAttempts** ——
+      // 那个数管的是节点自动解冲突(每次解完还要重跑验收),把它设成 0 的人不该
+      // 因此静默失去 m 键现有的解冲突能力。见 Caps.trunkResolveRounds。
+      ...(config?.caps?.trunkResolveRounds === undefined ? {} : { rounds: config.caps.trunkResolveRounds }),
       onError: e => logError(e),
     }
     // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for a mount
