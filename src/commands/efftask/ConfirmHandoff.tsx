@@ -32,16 +32,31 @@ export function ConfirmHandoff(props: {
   const settle = useSettleOnce()
 
   useInput((input, key) => {
+    /**
+     * **带修饰键的不算动作键。** 和 `TaskTreePanel` 那两支同一条规矩,理由在这一屏更硬:
+     * 这里的确认键会**产生真实提交 / 删目录 / 删分支**,而 `Ctrl+Y`、`Alt+y`、kitty 的
+     * `ESC[121;5u` 在没有这道闸时逐个都能按下去(验收席真按键实测)。本 fork 的
+     * `internal_exitOnCtrlC` 是 false,Ctrl 系列被原样派发。
+     *
+     * **只许逐条与,不许写成分支开头的早退**:`key.meta` 对 Escape 恒为真,那样写会把
+     * 「Esc 任何时候都是返回」这条规矩当场废掉。
+     */
+    const plain = key.ctrl !== true && key.meta !== true
     if (confirmRef.current) {
-      // 二次确认里,只有明确的 y/回车 才算数;其余任何键都退回选择列表。
-      if (key.return || input === 'y' || input === 'Y') { settle(() => props.onDecision('discard')); return }
+      /**
+       * 二次确认里,只有明确的 y/回车 才算数;其余任何键都退回选择列表。
+       *
+       * **必须与 `plain`**:这一下确认的是「丢弃」—— 删集成分支、删集成工作区。验收席
+       * 真按键实测,`Ctrl+Y` / `Alt+y` / kitty `ESC[121;5u` 四条全部按得下去。
+       */
+      if (plain && (key.return || input === 'y' || input === 'Y')) { settle(() => props.onDecision('discard')); return }
       setConfirming(false)
       return
     }
     if (key.escape) { settle(() => props.onSkip()); return }
     if (key.upArrow) { setIdx((idxRef.current + choices.length - 1) % choices.length); return }
     if (key.downArrow) { setIdx((idxRef.current + 1) % choices.length); return }
-    if (key.return) {
+    if (plain && key.return) {
       const c = choices[idxRef.current].key
       if (c === 'discard') { setConfirming(true); return }
       settle(() => props.onDecision(c))

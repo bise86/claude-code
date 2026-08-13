@@ -384,3 +384,73 @@ describe('合并关口的 s 键', () => {
     expect(f).not.toContain('已开')
   })
 })
+
+/**
+ * **带修饰键的不算动作键 —— 这一屏的确认键会产生真实提交。**
+ *
+ * 验收席真按键实测:C 节把 `s` 加进了唯一漏掉 `plain` 守卫的那一屏,而 `Ctrl+Y` /
+ * `Alt+y` / kitty `ESC[121;5u` 在这里全都按得下去 —— 那一下会真的开始合并。
+ */
+describe('合并关口不认修饰键', () => {
+  const ESC = String.fromCharCode(27)
+
+  it('Ctrl+Y / Alt+y / kitty C-y 都不许开始合并', async () => {
+    let ran = 0
+    const t = fakeTty()
+    const app = await render(
+      <ConfirmMergeSubtree
+        target={mk('root', { title: '根任务' })} onScan={async () => PLAN()}
+        onRun={async () => { ran++; return OUTCOME() }}
+        onDone={() => {}} onCancel={() => {}}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    for (const seq of ['\x19', `${ESC}y`, `${ESC}[121;5u`]) {
+      t.stdin.press(seq)
+      await tick()
+    }
+    app.unmount()
+    expect(ran).toBe(0)
+  })
+
+  it('Ctrl+S 不许拨动 stash 那一档', async () => {
+    const t = fakeTty()
+    const app = await render(
+      <ConfirmMergeSubtree
+        target={mk('root', { title: '根任务' })}
+        onScan={async () => PLAN({ trunk: { branch: 'main', pending: 3, dirty: ' M a.ts' } })}
+        onRun={async () => OUTCOME()} onDone={() => {}} onCancel={() => {}}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    for (const seq of ['\x13', `${ESC}s`, `${ESC}[115;5u`]) {
+      t.stdin.press(seq)
+      await tick()
+    }
+    expect(t.lastFrame()).not.toContain('已开')
+    // 裸 s 仍然要能拨。
+    t.stdin.press('s'); await tick()
+    expect(t.lastFrame()).toContain('已开')
+    app.unmount()
+  })
+
+  /** Esc 不许被守卫写死 —— `key.meta` 对 Escape 恒为真。 */
+  it('Esc 照旧是取消', async () => {
+    let cancelled = 0
+    const t = fakeTty()
+    const app = await render(
+      <ConfirmMergeSubtree
+        target={mk('root', { title: '根任务' })} onScan={async () => PLAN()}
+        onRun={async () => OUTCOME()} onDone={() => {}} onCancel={() => { cancelled++ }}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(ESC)
+    await new Promise(r => setTimeout(r, 80))
+    app.unmount()
+    expect(cancelled).toBe(1)
+  })
+})

@@ -396,3 +396,68 @@ describe('结束屏 · 盘上还剩没合入的东西', () => {
     expect(f).not.toContain('处产出没送到')
   })
 })
+
+/**
+ * **结论行的文字、颜色、和「按 m」这三件事必须同源。**
+ *
+ * 验收席真按键 + 原始 ANSI 实测:上一版颜色用 `hasUnmerged`(含 `trunkSkips`)、文字只看
+ * `strandedCount` —— 于是有 `trunkSkips` 而没有 salvage 的那一屏印出一个**黄色的**
+ * 「✓ 高效任务完成」,而下一行正说着东西没送到。另外树是空的时候(恢复路径上关口处置完
+ * 落到的那一屏)`m` 是死键,而结论行和摘要页脚都还在喊它。
+ */
+describe('结束屏 · 结论行不许自相矛盾', () => {
+  const frameWith = async (over: Record<string, unknown>): Promise<string> => {
+    const t = fakeTty(40)
+    const app = await render(
+      React.createElement(DoneView as never, {
+        nodes: [node({ id: 'root', title: '根任务' })] as never,
+        runId: '007', outcome: { status: 'completed' }, handoffState: 'merged',
+        onExit: () => {}, onMergeWorktrees: () => {}, ...over,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    return f
+  }
+
+  it('只有 trunkSkips(没有 salvage)→ 不许写「✓ 完成」', async () => {
+    const f = await frameWith({
+      handoff: {
+        branch: 'efftask/007/integration', commits: 0, kept: [], salvage: [],
+        trunkSkips: ['你的工作区有未提交的改动,跳过了逐任务合并'],
+      },
+    })
+    expect(f).not.toContain('✓ 高效任务完成')
+    expect(f).toContain('有东西没送到你的分支')
+  })
+
+  /** 树是空的 → `m` 是死键,结论行和页脚都不许喊它。 */
+  it('空树 → 不喊 m', async () => {
+    const f = await frameWith({
+      nodes: [],
+      handoff: { branch: 'efftask/007/integration', commits: 0, kept: [], salvage: ['a', 'b'] },
+    })
+    expect(f).toContain('处产出没送到')
+    expect(f).not.toContain('按 m 捞回')
+    expect(f).not.toContain('m 合并未合入的产出')
+  })
+
+  /** 没接 `onMergeWorktrees`(共享工作树,没有池子)同理。 */
+  it('没接 m → 不喊 m', async () => {
+    const f = await frameWith({
+      onMergeWorktrees: undefined,
+      handoff: { branch: 'efftask/007/integration', commits: 0, kept: [], salvage: ['a'] },
+    })
+    expect(f).toContain('处产出没送到')
+    expect(f).not.toContain('按 m 捞回')
+  })
+
+  it('树在、也接了 m → 照喊', async () => {
+    const f = await frameWith({
+      handoff: { branch: 'efftask/007/integration', commits: 0, kept: [], salvage: ['a'] },
+    })
+    expect(f).toContain('按 m 捞回')
+  })
+})

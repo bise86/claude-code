@@ -3266,6 +3266,11 @@ export function DoneView(props: {
    */
   const strandedCount = (props.handoff?.kept.length ?? 0) + (props.handoff?.salvage.length ?? 0)
   const hasUnmerged = undelivered > 0 || strandedCount > 0 || (props.handoff?.trunkSkips?.length ?? 0) > 0
+  /**
+   * `m` 现在**真按得到**吗。树层的按键分支在 `rows.length === 0` 时整个早退,而恢复路径上
+   * 关口处置完落到这一屏时 `nodes` 还是空的 —— 那时它是死键。
+   */
+  const canPressM = props.onMergeWorktrees !== undefined && props.nodes.length > 0
   const handoff = props.handoff ? handoffLines(props.handoff, props.runId, props.handoffState) : []
   // 一次算好,两处用(占几行 / 画什么)—— 两处各算一次的话,它们迟早会不一致,
   // 而不一致的后果是详情页最底下那条页签条被顶出屏幕。
@@ -3321,10 +3326,19 @@ export function DoneView(props: {
             : ok
               ? undelivered > 0
                 ? `⚠ 高效任务跑完了,但产出还没到你的分支(${undelivered} 个提交)`
-                : strandedCount > 0
+                : hasUnmerged
                   // 提交都送到了,但盘上还剩没合入的东西 —— 印绿色的「完成」是这一屏
                   // 最贵的一句谎:用户会直接按 q,而那之后就没人再提起它们了。
-                  ? `⚠ 高效任务跑完了,但还有 ${strandedCount} 处产出没送到(按 m 捞回)`
+                  /**
+                   * **文字和颜色必须同源。** 上一版颜色用 `hasUnmerged`(含 `trunkSkips`)、
+                   * 文字只看 `strandedCount` —— 于是有 `trunkSkips` 而没有 salvage 的那一屏
+                   * 印出一个**黄色的**「✓ 高效任务完成」,而下一行正说着东西没送到。
+                   *
+                   * 「按 m 捞回」只在**真按得到**时才说:树是空的(恢复路径上那一屏)或者没接
+                   * `onMergeWorktrees`(共享工作树)时它是一条按不到的指令 —— 这条规矩是
+                   * `exitReportLine` 立的,而这一屏自己违反过。
+                   */
+                  ? `⚠ 高效任务跑完了,但${strandedCount > 0 ? `还有 ${strandedCount} 处产出没送到` : '有东西没送到你的分支'}${canPressM ? '(按 m 捞回)' : ''}`
                   : '✓ 高效任务完成'
               : '✗ 高效任务被阻断'}
         </Text>
@@ -3356,7 +3370,7 @@ export function DoneView(props: {
           {/* 失败节点专属的那两个键**不在这里写** —— 它们只对 BLOCKED 节点有意义,
               而这一行不知道光标停在哪。树自己的页脚按光标所在的行写它们(见
               TaskTreePanel 的 failedKeysHint),那是唯一知道该不该写的地方。 */}
-          q / Esc 退出{hasUnmerged && props.onMergeWorktrees ? ' · m 合并未合入的产出' : ''} · 回车看节点详情{props.onRedo ? ' · r 重做选中的任务' : ''}
+          q / Esc 退出{hasUnmerged && canPressM ? ' · m 合并未合入的产出' : ''} · 回车看节点详情{props.onRedo ? ' · r 重做选中的任务' : ''}
         </Text>
       </Box>
     </Box>

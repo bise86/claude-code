@@ -64,22 +64,32 @@ export function ConfirmCleanup(props: {
 
   useInput((input, key) => {
     const k = input.toLowerCase()
+    /**
+     * **带修饰键的不算动作键。** 和 `TaskTreePanel` 那两支同一条规矩,理由在这一屏更硬:
+     * 这里的确认键会**产生真实提交 / 删目录 / 删分支**,而 `Ctrl+Y`、`Alt+y`、kitty 的
+     * `ESC[121;5u` 在没有这道闸时逐个都能按下去(验收席真按键实测)。本 fork 的
+     * `internal_exitOnCtrlC` 是 false,Ctrl 系列被原样派发。
+     *
+     * **只许逐条与,不许写成分支开头的早退**:`key.meta` 对 Escape 恒为真,那样写会把
+     * 「Esc 任何时候都是返回」这条规矩当场废掉。
+     */
+    const plain = key.ctrl !== true && key.meta !== true
     const m = modeRef.current
     // 删的过程中**一个键都不认**。半途的回车会再触发一次执行,而这一路是不可逆的。
     if (m === 'working') return
     if (m === 'done' || m === 'error') {
-      if (key.return || key.escape || k === 'q') props.onDone()
+      if (key.return || key.escape || (plain && k === 'q')) props.onDone()
       return
     }
-    if (key.escape || k === 'q' || k === 'n') { props.onCancel(); return }
+    if (key.escape || (plain && (k === 'q' || k === 'n'))) { props.onCancel(); return }
     if (m !== 'ready') return
     const p = planRef.current
     // 没有可删的东西时回车也是「知道了」,不是「执行一次空操作」—— 页脚写的就是这一句。
     if (!p || p.items.length === 0) {
-      if (key.return || k === 'y') props.onCancel()
+      if (plain && (key.return || k === 'y')) props.onCancel()
       return
     }
-    if (key.return || k === 'y') {
+    if (plain && (key.return || k === 'y')) {
       setMode('working')
       void props.onRun(p).then(
         o => { setOutcome(o); setMode('done') },

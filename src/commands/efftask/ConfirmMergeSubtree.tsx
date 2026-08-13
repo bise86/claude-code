@@ -106,21 +106,31 @@ export function ConfirmMergeSubtree(props: {
   stashRef.current = stash
   useInput((input, key) => {
     const k = input.toLowerCase()
+    /**
+     * **带修饰键的不算动作键。** 和 `TaskTreePanel` 那两支同一条规矩,理由在这一屏更硬:
+     * 这里的确认键会**产生真实提交 / 删目录 / 删分支**,而 `Ctrl+Y`、`Alt+y`、kitty 的
+     * `ESC[121;5u` 在没有这道闸时逐个都能按下去(验收席真按键实测)。本 fork 的
+     * `internal_exitOnCtrlC` 是 false,Ctrl 系列被原样派发。
+     *
+     * **只许逐条与,不许写成分支开头的早退**:`key.meta` 对 Escape 恒为真,那样写会把
+     * 「Esc 任何时候都是返回」这条规矩当场废掉。
+     */
+    const plain = key.ctrl !== true && key.meta !== true
     const m = modeRef.current
     if (m === 'working') {
       // 合并中途唯一认的键:请求「合完当前这个就停」。**不是立刻停** —— 一次 git merge
       // 被打断只会留下半合并状态,那正是这个功能要替用户避免的东西。
-      if ((key.escape || k === 'q') && props.onInterrupt && !stopping) {
+      if ((key.escape || (plain && k === 'q')) && props.onInterrupt && !stopping) {
         setStopping(true)
         props.onInterrupt()
       }
       return
     }
     if (m === 'done' || m === 'error') {
-      if (key.return || key.escape || k === 'q') props.onDone()
+      if (key.return || key.escape || (plain && k === 'q')) props.onDone()
       return
     }
-    if (key.escape || k === 'q' || k === 'n') { props.onCancel(); return }
+    if (key.escape || (plain && (k === 'q' || k === 'n'))) { props.onCancel(); return }
     if (m !== 'ready') return
     const p = planRef.current
     /**
@@ -132,7 +142,7 @@ export function ConfirmMergeSubtree(props: {
      */
     const nothing = !p || hasNothingToDo(p)
     if (nothing) {
-      if (key.return || k === 'y') props.onCancel()
+      if (plain && (key.return || k === 'y')) props.onCancel()
       return
     }
     /**
@@ -142,8 +152,8 @@ export function ConfirmMergeSubtree(props: {
      * 不会变的键,而那比没有这个键更糟。用户原话:「提供选项,但要你按一下」;
      * 「检测到脏就自动 stash」那一档他明确否决过,所以默认永远是关。
      */
-    if (k === 's' && p?.trunk.dirty !== undefined) { setStash(v => !v); return }
-    if (key.return || k === 'y') {
+    if (plain && k === 's' && p?.trunk.dirty !== undefined) { setStash(v => !v); return }
+    if (plain && (key.return || k === 'y')) {
       setMode('working')
       void props.onRun(p, stashRef.current, line => { if (alive.current) setProgress(cur => [...cur, line]) }).then(
         o => { if (alive.current) { setOutcome(o); setMode('done') } },
@@ -232,7 +242,10 @@ export function ConfirmMergeSubtree(props: {
         <Text key={i} wrap="truncate-end" color={l.startsWith('⚠') ? 'warning' : undefined}>{l}</Text>
       ))}
       {hidden > 0 ? <Text dimColor>…另有 {hidden} 条未显示(终端太矮);放大窗口再看</Text> : null}
-      <Text dimColor>{footer}</Text>
+      {/* `wrap` 必须有:`redoSummaryLines` 把这一行按常数 1 行预算,而开了 stash 之后
+          它在 120 列上就回流成 2 行 —— 矮终端上多出来的行会把最后一条内容行顶掉。
+          结束屏那一行刚为同一件事加过。 */}
+      <Text dimColor wrap="truncate-end">{footer}</Text>
     </Box>
   )
 }
