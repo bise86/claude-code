@@ -2584,7 +2584,19 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
            * 两者对用户是同一个事实。这条路合的是**整条集成分支**(不只是这棵子树),
            * 所以它和收口关口那次合并给出的是同一个结论。
            */
-          if (out.trunk?.ok === true) {
+          /**
+           * **清记录的判据不能只看第 2 跳。**
+           *
+           * 验收实测:`planRescue` 把若干 ref 判进 `hold` 时(生产上最常见的是模型回
+           * `unsure`,而**没被模型提到的也算 unsure**),`trunk.ok` 照样为真 —— 于是记录
+           * 被抹掉,而那几条 hold 住的 ref **确实没被合回来**(集成分支上找不到它们的文件)。
+           * 下一次 `--resume` 不再弹关口,`scanStranded` 又只有 `m` 这一个消费者,
+           * 它们就成了第二个「按 q 之后永久失联」。
+           *
+           * `failed` 同理:一个解不掉冲突的节点被收进 `out.failed`,而第 2 跳照样会跑。
+           */
+          const heldBack = (out.rescue?.hold.length ?? 0) + out.failed.length
+          if (out.trunk?.ok === true && heldBack === 0) {
             setHandoffState('merged')
             props.handoffStateOut.current = 'merged'
             await clearPendingHandoff()

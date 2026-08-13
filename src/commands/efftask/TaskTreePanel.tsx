@@ -998,7 +998,13 @@ export function TaskTreePanel(props: {
                * 措辞**不写「工作区」**:它只覆盖三桶里的一桶(逐节点工作区按光标所在子树,
                * 而抢救分支和「集成分支 → 你的分支」那一跳按整个 run)。
                */
-              ...(props.onMergeWorktrees ? ['m 合并/捞回未合入的产出'] : []),
+              /**
+               * **树是空的时候不许宣告它。** 树层的按键分支在 `rows.length === 0` 时整个
+               * 早退,于是这几个键那时是**死键** —— 而恢复路径上真有这么一屏(关口处置完
+               * 之后落到结束屏,那时 `nodes` 还是空的)。宣告一个按下去什么都不发生的键,
+               * 比没有这个键更糟。
+               */
+              ...(props.onMergeWorktrees && rows.length > 0 ? ['m 合并/捞回未合入的产出'] : []),
               ...(props.runControl
                 ? [
                   props.runControl.paused ? '⏸ 已暂停(p 恢复)' : 'p 暂停',
@@ -1010,8 +1016,8 @@ export function TaskTreePanel(props: {
               ...(onFailedNode && props.onRedoFailed ? ['R 重做失败环节'] : []),
               ...(onFailedNode && props.onSkipFailed ? ['s 跳过它'] : []),
               ...(forcePassHint ? [forcePassHint.replace(' · ', '')] : []),
-              ...(props.onCleanupWorktrees ? ['c 清理工作区'] : []),
-              ...(props.onBacktrack ? ['b 回溯未通过的子任务'] : []),
+              ...(props.onCleanupWorktrees && rows.length > 0 ? ['c 清理工作区'] : []),
+              ...(props.onBacktrack && rows.length > 0 ? ['b 回溯未通过的子任务'] : []),
               '↑↓/jk 移动', 'PgUp/PgDn 翻页', '←/→ 折叠', '空格切换', detailEntryHint(mouse),
               `${KIND_GLYPH.decompose}拆分 ${KIND_GLYPH.executable}执行 ${KIND_GLYPH.unknown}待定`,
             ], rowWidth, hintPage).text}

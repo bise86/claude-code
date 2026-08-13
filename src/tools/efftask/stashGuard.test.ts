@@ -98,7 +98,7 @@ describe('正常一趟', () => {
     expect(await read('a.txt')).toBe('我正在改\n')
     // 条目和备份 ref 都不该留下。
     expect(await stashCount()).toBe(0)
-    expect((await git(['rev-parse', '--verify', '--quiet', 'refs/et/stash-backup/001'], repo)).stdout.trim()).toBe('')
+    expect((await git(['for-each-ref', '--format=%(refname)', 'refs/et/stash-backup/001'], repo)).stdout.trim()).toBe('')
   })
 
   it('staged 的改动也一起来回', async () => {
@@ -245,10 +245,10 @@ describe('事情失败 / 现场没收拾干净', () => {
     expect(t).toContain('一个字节都没丢')
     expect(t).toContain('再 pop 一次会失败')
     expect(t).toContain('git stash drop')
-    expect(t).toContain('git stash apply refs/et/stash-backup/001')
+    expect(t).toContain('git stash apply refs/et/stash-backup/001/')
     // 两处都真的还在。
     expect(await stashCount()).toBe(1)
-    expect((await git(['rev-parse', '--verify', '--quiet', 'refs/et/stash-backup/001'], repo)).stdout.trim().length).toBeGreaterThan(0)
+    expect((await git(['for-each-ref', '--format=%(refname)', 'refs/et/stash-backup/001'], repo)).stdout.trim().length).toBeGreaterThan(0)
   })
 
   /**
@@ -263,5 +263,130 @@ describe('事情失败 / 现场没收拾干净', () => {
     expect(out.restored).toBe(true)
     expect(await read('a.txt')).toBe('我正在改\n')
     expect(out.lines.join('\n')).toContain('从备份恢复')
+  })
+})
+
+
+/**
+ * **验收席在真 git 上复现的 P0:第二次按键会静默删掉上一次留下的唯一一份备份。**
+ *
+ * 上一版 ref 名只有 runId,同一趟 run 里每次按键都是同一个名字,`update-ref` 覆盖时退出码
+ * 0、一个字都不说。而这一档最典型的用法恰恰会连按两次:第一次 pop 撞冲突 → 屏幕告诉用户
+ * 「解完冲突后 git stash drop,备份仍在」→ 他照做,此时**全世界只剩那一份备份** → 他继续
+ * 改、再按一次 → 覆盖 + 成功路径上的 `update-ref -d` → 一整天的工作变成不可达对象,
+ * 然后被 gc 掉。
+ */
+describe('备份 ref 不许被下一次按键覆盖', () => {
+  const refs = async (): Promise<string[]> =>
+    (await git(['for-each-ref', '--format=%(refname)', 'refs/et/stash-backup'], repo))
+      .stdout.split('\n').map(l => l.trim()).filter(Boolean)
+
+  it('第一次 pop 撞冲突留下备份,第二次按键不动它', async () => {
+    // 第一趟:造一次 pop 冲突(fn 里合进一个改了同一文件的分支)。
+    await git(['checkout', '-qb', 'other'], repo)
+    await writeFile(file('a.txt'), '来自 other\n')
+    await git(['commit', '-qam', 'other'], repo)
+    await git(['checkout', '-q', 'main'], repo)
+    await writeFile(file('a.txt'), '一整天的工作\n')
+
+    const first = await withStash(deps(), async () => {
+      await git(['merge', '--no-edit', 'other'], repo)
+    })
+    expect(first.restored).toBe(false)
+    const kept = await refs()
+    expect(kept).toHaveLength(1)
+    const keptSha = (await git(['rev-parse', kept[0] as string], repo)).stdout.trim()
+
+    // 用户照屏幕说的做:解冲突、丢掉那条 stash。现在全世界只剩这个备份。
+    await writeFile(file('a.txt'), '解完冲突\n')
+    await git(['add', 'a.txt'], repo)
+    await git(['stash', 'drop', '-q'], repo)
+    expect((await git(['stash', 'list'], repo)).stdout.trim()).toBe('')
+
+    // 他继续改,再按一次。
+    await writeFile(file('b.txt'), '第二天的工作\n')
+    const second = await withStash(deps(), async () => 'ok')
+    expect(second.restored).toBe(true)
+
+    // **第一份备份必须还在,而且内容没变。**
+    const now = await refs()
+    expect(now).toContain(kept[0] as string)
+    expect((await git(['rev-parse', kept[0] as string], repo)).stdout.trim()).toBe(keptSha)
+    expect((await git(['show', `${keptSha}:a.txt`], repo)).stdout).toContain('一整天的工作')
+  })
+})
+
+/**
+ * **失败和「没什么可 stash」是两件事。** 上一版把 `stash create` 的每一种失败都说成
+ * 「你的工作区已经不脏了」,把 git 的真实原因吞掉 —— 而调用方随后会在**没有任何保护**的
+ * 情况下把事情跑掉。
+ */
+describe('stash create 失败要如实说,并且标记 failed', () => {
+  it('UU 态(刚被自己 pop 冲突留下的)→ 说 git 的原话,并标 failed', async () => {
+    // 造一个没有 MERGE_HEAD 的 UU 态:stash pop 冲突之后就是这个形状。
+    await git(['checkout', '-qb', 'other'], repo)
+    await writeFile(file('a.txt'), '来自 other\n')
+    await git(['commit', '-qam', 'other'], repo)
+    await git(['checkout', '-q', 'main'], repo)
+    await writeFile(file('a.txt'), '我的\n')
+    await withStash(deps(), async () => { await git(['merge', '--no-edit', 'other'], repo) })
+    expect((await git(['status', '--porcelain'], repo)).stdout).toContain('UU')
+    expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], repo)).code).not.toBe(0)
+
+    let ran = false
+    const out = await withStash(deps(), async () => { ran = true })
+    expect(ran).toBe(false)
+    expect(out.failed).toBe(true)
+    expect(out.lines.join('\n')).not.toContain('已经不脏了')
+    expect(out.lines.join('\n')).toContain('git 拒绝了')
+  })
+
+  it('前置不可用(卡在一次没做完的合并里)也标 failed', async () => {
+    await git(['checkout', '-qb', 'other'], repo)
+    await writeFile(file('a.txt'), '来自 other\n')
+    await git(['commit', '-qam', 'other'], repo)
+    await git(['checkout', '-q', 'main'], repo)
+    await writeFile(file('a.txt'), '来自 main\n')
+    await git(['commit', '-qam', 'main'], repo)
+    await git(['merge', 'other'], repo)
+    const out = await withStash(deps(), async () => 'x')
+    expect(out.failed).toBe(true)
+  })
+
+  it('树本来就干净 → 不是失败(调用方该照常做事)', async () => {
+    const out = await withStash(deps(), async () => 'x')
+    expect(out.failed).toBeUndefined()
+  })
+})
+
+/** 暂存 / 未暂存的划分要尽量保住 —— 用户可能是 `git add -p` 一块一块挑出来的。 */
+describe('索引划分', () => {
+  it('一个文件暂存、另一个没暂存 → 划分原样回来', async () => {
+    await writeFile(file('a.txt'), '暂存的\n')
+    await git(['add', 'a.txt'], repo)
+    await writeFile(file('b.txt'), '没暂存的\n')
+    const before = (await git(['status', '--porcelain'], repo)).stdout.trim()
+    expect(before).toContain('M  a.txt')
+    expect(before).toContain(' M b.txt')
+
+    const out = await withStash(deps(), async () => 'x')
+    expect(out.restored).toBe(true)
+    expect((await git(['status', '--porcelain'], repo)).stdout.trim()).toBe(before)
+  })
+
+  /**
+   * 同一个文件既暂存又有工作区改动 —— 实测 `pop --index` **也还原得了**,划分完整保住。
+   * (方案里担心的「`--index` 在这种情况下会失败」在这一格上不成立;裸 pop 那条退路
+   * 仍然留着,它在别的形态下才会被用到,而那时会明说划分被拍平。)
+   */
+  it('同一个文件既暂存又有工作区改动 → 内容和划分都完整', async () => {
+    await writeFile(file('a.txt'), '第一版\n')
+    await git(['add', 'a.txt'], repo)
+    await writeFile(file('a.txt'), '第二版\n')
+    const before = (await git(['status', '--porcelain'], repo)).stdout.trim()
+    const out = await withStash(deps(), async () => 'x')
+    expect(out.restored).toBe(true)
+    expect(await read('a.txt')).toBe('第二版\n')
+    expect((await git(['status', '--porcelain'], repo)).stdout.trim()).toBe(before)
   })
 })

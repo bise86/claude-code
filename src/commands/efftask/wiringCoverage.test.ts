@@ -1052,7 +1052,13 @@ describe('手动合并子树的接线不能被静默剪断', () => {
     const el = element('ConfirmMergeSubtree')
     // 剪断任意一条,同一个事实就会在三个地方说三种话:结束屏继续写「产出还没到你的分支」、
     // 退出报告跟着错、下次 --resume 为一条已经合完的分支再弹一次四选一。
-    expect(el).toContain('if (out.trunk?.ok === true)')
+    /**
+     * **判据不能只看第 2 跳。** 验收实测:`planRescue` 把若干 ref 判进 `hold` 时
+     * (生产上最常见的是模型回 unsure,而没被模型提到的也算 unsure),`trunk.ok` 照样
+     * 为真 —— 记录被抹掉,而那几条 ref 确实没被合回来,下一次 --resume 不再弹关口。
+     */
+    expect(el).toContain('const heldBack = (out.rescue?.hold.length ?? 0) + out.failed.length')
+    expect(el).toContain('if (out.trunk?.ok === true && heldBack === 0)')
     expect(el).toContain("setHandoffState('merged')")
     expect(el).toContain("props.handoffStateOut.current = 'merged'")
     expect(el).toContain('await clearPendingHandoff()')

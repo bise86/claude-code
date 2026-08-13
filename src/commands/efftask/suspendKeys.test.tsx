@@ -295,3 +295,40 @@ describe('树这一层的 m / c / b', () => {
     expect(f).not.toContain('m 合并')
   })
 })
+
+/**
+ * **树是空的时候不许宣告 `m`/`c`/`b` —— 那时它们是死键。**
+ *
+ * 树层的按键分支在 `rows.length === 0` 时整个早退。而恢复路径上真有这么一屏:关口处置完
+ * 之后落到结束屏,那时 `nodes` 还是空的(树是 `loadRun` 之后才有的)—— 验收实测那一屏
+ * 是绿色的「✓ 高效任务完成」+ 空树 + 页脚宣告着 `m`。宣告一个按下去什么都不发生的键,
+ * 比没有这个键更糟。
+ */
+describe('空树上的键位提示', () => {
+  it('没有任何行时,m / c / b 一个都不印', async () => {
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={[]} runId="003" interactive
+        onMergeWorktrees={() => {}} onCleanupWorktrees={() => {}} onBacktrack={() => {}}
+        onExitKey={() => {}}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).not.toContain('m 合并/捞回未合入的产出')
+    expect(f).not.toContain('c 清理工作区')
+    expect(f).not.toContain('b 回溯未通过的子任务')
+  })
+
+  it('有行时照常印', async () => {
+    const { t, app } = await mount(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        onMergeWorktrees={() => {}} onExitKey={() => {}}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('m 合并/捞回未合入的产出')
+  })
+})

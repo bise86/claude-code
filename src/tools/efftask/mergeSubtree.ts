@@ -194,6 +194,11 @@ export interface SubtreeMergePlan {
 }
 
 export interface SubtreeMergeOutcome {
+  /**
+   * 这一趟的抢救计划。界面据它判「还有没有被扣下的」—— 清 `pendingHandoff` 的判据
+   * 不能只看第 2 跳成没成(见 efftask.tsx 那一段)。
+   */
+  rescue?: RescuePlan
   merged: { nodeId: string; title: string; commits: number; resolvedFiles?: string[] }[]
   failed: { nodeId: string; title: string; why: string; followUps: string[] }[]
   /** 第 2 跳的结果。`undefined` = 根本没走到那一步(中途被取消)。 */
@@ -658,6 +663,21 @@ export async function runSubtreeMerge(
    * 带来了什么」)在它跑完之后才是准的 —— 先捞的话,一条其实已经被本轮合并覆盖掉的
    * 抢救分支会被当成「有独有产出」送去合并。
    */
+  /**
+   * **`merge` 为空不等于「没什么要说」。**
+   *
+   * `runRescue` 是唯一把 `plan.problems` 抄进 `out.problems` 的地方,而它只在有东西要合
+   * 的时候才跑。于是全部落 `hold` 的那一趟(生产上最常见:模型回 unsure,而没被模型提到的
+   * 也算 unsure)结果屏是一句无保留的成功 —— G 节算出来的「产出丢了 / 集成验收没通过 /
+   * 降级放行 / 被你取消的 / 集成工作区脏 / 孤儿目录」**全部消失**,而记录正在这一刻被抹掉。
+   */
+  if (!out.aborted && plan.rescue && plan.rescue.merge.length === 0) {
+    out.problems.push(...plan.rescue.problems)
+    for (const h of plan.rescue.hold) {
+      const what = h.item.branch ?? h.item.path ?? h.item.title ?? '(未命名)'
+      out.problems.push(`${what}:没有自动合并(${h.why})—— 产出还在那里,一个字节都没丢`)
+    }
+  }
   if (!out.aborted && plan.rescue && plan.rescue.merge.length > 0) {
     note(`捞回 ${plan.rescue.merge.length} 处没有工作区目录的产出…`)
     const r = await runRescue({
@@ -685,6 +705,7 @@ export async function runSubtreeMerge(
     if (r.aborted) out.aborted = true
   }
 
+  if (plan.rescue) out.rescue = plan.rescue
   if (!out.aborted) {
     note('把集成分支合回你当前的分支…')
     out.trunk = await mergeToTrunk(deps)
@@ -823,12 +844,34 @@ async function mergeToTrunk(
     )
     stashLines = guarded.lines
     /**
-     * `result` 缺席 = **这一跳根本没跑**(树其实不脏、或者卡在一次没做完的合并里)。
-     * 那时要照常跑一次,而不是报「没有执行」—— 树干净本来就该直接合,而这一档的意义
-     * 只是「脏的时候多一条路」,不是「开了就换一套流程」。`stashLines` 仍然带上:
-     * 前置没过那一条里有用户能照做的下一步。
+     * **「树本来就干净」和「这一档自己失败了」要分开。**
+     *
+     * 前者:照常合一次 —— 这一档的意义只是「脏的时候多一条路」,不是「开了就换一套流程」。
+     * 后者(git 拒绝备份 / 卡在一次没做完的操作里):**绝不能照跑**。上一版一律
+     * `?? await runSync()`,于是用户明确按下的那层保护被静默取消,而 `syncTrunk` 随后
+     * 在一个已经出问题的仓库上重试三轮,最后报「你在同步期间反复提交,重试 3 次仍未合上」
+     * —— 正是 E 节点名要消灭的那句假原因,只是换了一格出现。
      */
+    if (guarded.failed === true) {
+      return {
+        ok: false,
+        message: '没有把产出合回你的分支:先 stash 那一步没做成,所以这一跳没有执行',
+        followUps: [...stashLines, `产出仍在集成分支 ${intBranch} 上,处理完之后可以再按一次 m`],
+      }
+    }
     res = guarded.result ?? await runSync()
+    /**
+     * **合上了 ≠ 这一趟没事。** pop 撞冲突时 `syncTrunk` 是成功的,而用户的检出里现在
+     * 带着冲突标记 —— 上一版只看 `res.ok`,于是面板标题是绿色的「合并完成」,而那六条
+     * 说明排在最末尾、既不是警告色、矮终端下最先被裁掉。
+     */
+    if (guarded.restored === false) {
+      return {
+        ok: false,
+        message: '⚠ 产出合回你的分支了,但把你未提交的改动放回来时撞了冲突 —— 改动一个字节都没丢',
+        followUps: stashLines,
+      }
+    }
   } else {
     res = await runSync()
   }

@@ -766,7 +766,7 @@ describe('第 2 跳的 stash 那一档', () => {
     expect(await readFile(join(gitRoot, 'a.txt'), 'utf-8')).toBe('hello\n')
     expect(await readFile(join(gitRoot, 'shared.txt'), 'utf-8')).toBe('我正在改\n')
     expect((await git(['stash', 'list'], gitRoot)).stdout.trim()).toBe('')
-    expect((await git(['rev-parse', '--verify', '--quiet', 'refs/et/stash-backup/001'], gitRoot)).stdout.trim()).toBe('')
+    expect((await git(['for-each-ref', '--format=%(refname)', 'refs/et/stash-backup/001'], gitRoot)).stdout.trim()).toBe('')
   })
 
   /**
@@ -780,14 +780,22 @@ describe('第 2 跳的 stash 那一档', () => {
     const deps = depsOf(pool, { runId: '001', stash: true })
     const out = await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [a], a.id), [a])
 
-    expect(out.trunk?.ok).toBe(true)
+    /**
+     * **不是绿色的「完成」。** 合并确实做完了,但用户的检出里现在带着冲突标记 ——
+     * 只看 `syncTrunk` 的成败会让面板标题变绿,而那六条说明排在最末尾、不是警告色、
+     * 矮终端下最先被裁掉。
+     */
+    expect(out.trunk?.ok).toBe(false)
+    expect(out.trunk?.message ?? '').toContain('撞了冲突')
+    expect(out.trunk?.message ?? '').toContain('一个字节都没丢')
     const t = (out.trunk?.followUps ?? []).join('\n')
     expect(t).toContain('一个字节都没丢')
     expect(t).toContain('git stash drop')
-    expect(t).toContain('git stash apply refs/et/stash-backup/001')
+    expect(t).toContain('git stash apply refs/et/stash-backup/001/')
     // 两处都真的在。
     expect((await git(['stash', 'list'], gitRoot)).stdout).toContain('et: 自动 stash(001)')
-    expect((await git(['rev-parse', '--verify', '--quiet', 'refs/et/stash-backup/001'], gitRoot)).stdout.trim().length).toBeGreaterThan(0)
+    // 备份 ref 现在带内容 sha(见 stashGuard 的 P0 注释),按前缀找。
+    expect((await git(['for-each-ref', '--format=%(refname)', 'refs/et/stash-backup/001'], gitRoot)).stdout.trim().length).toBeGreaterThan(0)
   })
 
   /** 不脏的那一趟开着它也无害:什么都没 stash,照常合。 */
@@ -850,5 +858,80 @@ describe('只剩构建产物的保留工作区', () => {
     const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
     expect(plan.ignoredOnly).toBe(0)
     expect(subtreeMergeLines(plan).join('\n')).not.toContain('只剩构建产物')
+  })
+})
+
+
+/**
+ * **「先 stash」那一步自己失败时,绝不能把合并照跑掉。**
+ *
+ * 用户按 `s` 表达的是「我要那层保护」。上一版一律 `?? await runSync()`,于是保护被静默
+ * 取消,而 `syncTrunk` 随后在一个已经出问题的仓库上重试三轮,最后报「你在同步期间反复
+ * 提交,重试 3 次仍未合上」—— 一句用户一次提交都没做过的假原因。
+ */
+describe('stash 那一步失败 → 这一跳不许执行', () => {
+  /**
+   * **判据接在哪一层要说清。** 「用户的检出卡在一次没做完的合并里」这个状态,在整条
+   * `runSubtreeMerge` 流水线上活不到第 2 跳(中间几步会把现场收拾掉),所以这一条把
+   * MERGE_HEAD 这一问**在 git 这一层注入**——它正是 `stashAvailability` 唯一读的东西。
+   * `withStash` 自己那一侧的真 git 覆盖在 `stashGuard.test.ts`(前置不可用 / create 失败)。
+   */
+  it('withStash 报 failed → 这一跳不执行,而且不许说「反复提交」', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+    const base = depsOf(pool, { runId: '001', stash: true })
+    const deps = {
+      ...base,
+      git: async (args: string[], cwd: string) =>
+        args[0] === 'rev-parse' && args.includes('MERGE_HEAD') && cwd === gitRoot
+          ? { code: 0, stdout: 'deadbeef\n', stderr: '' }
+          : base.git(args, cwd),
+    }
+    const out = await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [a], a.id), [a])
+    expect(out.trunk?.ok).toBe(false)
+    const t = `${out.trunk?.message ?? ''}\n${(out.trunk?.followUps ?? []).join('\n')}`
+    expect(t).toContain('没做完的合并')
+    expect(t).toContain('--abort')
+    // **那句假原因绝不许出现。**
+    expect(t).not.toContain('反复提交')
+    // 「没有执行」要说的是**这一跳**没跑,不是「产出没到」—— 逐任务自动投递可能早就把它
+    // 送过去了(E 节之后那条路不再被脏树挡住)。所以判据落在这一跳自己的措辞上。
+    expect(t).toContain('这一跳没有执行')
+  })
+})
+
+/**
+ * **被扣下的 ref 必须出现在结果屏上,而且要能被界面看见。**
+ *
+ * `runRescue` 是唯一把 `plan.problems` 抄进 `out.problems` 的地方,而它只在有东西要合的
+ * 时候才跑。于是全部落 `hold` 的那一趟(生产上最常见:模型回 unsure,而没被模型提到的
+ * 也算 unsure)结果屏是一句无保留的成功 —— 而记录正在这一刻被抹掉(见 efftask.tsx 的
+ * `heldBack`)。
+ */
+describe('全部被扣下时,结果屏不许是一句无保留的成功', () => {
+  it('hold 的每一条都念出来,而且 outcome 带得出 rescue 计划', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+    await pool.commitAndMerge(a)
+    // 造一条抢救分支:它不在集成分支上,而 triage 缺席 → 全部落 hold。
+    await git(['branch', 'efftask/001/salvage/x', pool.worktreeBranchOf(a)], gitRoot)
+    await git(['commit', '--allow-empty', '-qm', 'extra'], gitRoot)
+    await git(['branch', '-f', 'efftask/001/salvage/x', 'HEAD'], gitRoot)
+
+    const deps = depsOf(pool, { runId: '001' })
+    const plan = await scanSubtreeMerge(deps, [a], a.id)
+    const out = await runSubtreeMerge(deps, plan, [a])
+    if ((plan.rescue?.hold.length ?? 0) === 0) return // 这一趟没造出 hold,不做假断言
+    // 界面据它决定要不要留住 pendingHandoff —— 缺了它就是第二个「按 q 之后永久失联」。
+    expect(out.rescue?.hold.length).toBe(plan.rescue?.hold.length)
+    const t = subtreeMergeResultLines(out).join('\n')
+    for (const h of plan.rescue?.hold ?? []) {
+      expect(t).toContain(h.item.branch ?? h.item.path ?? h.item.title ?? '')
+    }
+    expect(t).toContain('一个字节都没丢')
   })
 })

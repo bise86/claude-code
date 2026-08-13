@@ -57,11 +57,12 @@ export type StashAvailability =
   /** 不能。`why` 是照着说给用户听的原话,`hint` 是他能照做的下一步。 */
   | { available: false; why: string; hint?: string }
 
-const IN_PROGRESS: readonly [string, string][] = [
-  ['MERGE_HEAD', '一次没做完的合并'],
-  ['REBASE_HEAD', '一次没做完的 rebase'],
-  ['CHERRY_PICK_HEAD', '一次没做完的 cherry-pick'],
-  ['REVERT_HEAD', '一次没做完的 revert'],
+/** ref、说给用户听的名字、以及**收拾它要用的子命令**(三者必须配套,见收尾那一段)。 */
+const IN_PROGRESS: readonly [string, string, string][] = [
+  ['MERGE_HEAD', '一次没做完的合并', 'merge'],
+  ['REBASE_HEAD', '一次没做完的 rebase', 'rebase'],
+  ['CHERRY_PICK_HEAD', '一次没做完的 cherry-pick', 'cherry-pick'],
+  ['REVERT_HEAD', '一次没做完的 revert', 'revert'],
 ]
 
 /**
@@ -71,13 +72,13 @@ const IN_PROGRESS: readonly [string, string][] = [
  * 「按下去会不会当场失败」,而唯一会当场失败的形态是仓库正卡在一次没做完的操作里。
  */
 export async function stashAvailability(deps: StashGuardDeps): Promise<StashAvailability> {
-  for (const [ref, what] of IN_PROGRESS) {
+  for (const [ref, what, cmd] of IN_PROGRESS) {
     const r = await deps.git(['rev-parse', '-q', '--verify', ref], deps.cwd)
     if (r.code === 0) {
       return {
         available: false,
         why: `你正卡在${what}里 —— 这种状态下 git 连 stash 都做不了(索引写不出去)`,
-        hint: `先把它解决掉(git status 看冲突文件),或者 git ${ref === 'MERGE_HEAD' ? 'merge' : ref === 'REBASE_HEAD' ? 'rebase' : ref === 'CHERRY_PICK_HEAD' ? 'cherry-pick' : 'revert'} --abort 回到之前的状态`,
+        hint: `先把它解决掉(git status 看冲突文件),或者 git ${cmd} --abort 回到之前的状态`,
       }
     }
   }
@@ -85,6 +86,13 @@ export async function stashAvailability(deps: StashGuardDeps): Promise<StashAvai
 }
 
 export interface StashOutcome<T> {
+  /**
+   * **这一档自己失败了**(不是「没什么可 stash」)。
+   *
+   * 调用方据此决定要不要退回「不带保护直接做」—— 树本来就干净时那样做是对的,而
+   * 「git 拒绝了 / 卡在一次没做完的操作里」时那样做等于把用户明确要的保护静默取消。
+   */
+  failed?: boolean
   /** 被包住的那件事的返回值。没跑成(前置失败)时缺席。 */
   result?: T
   /** 改动是不是已经原样回到工作区了。 */
@@ -114,11 +122,20 @@ export async function withStash<T>(
 ): Promise<StashOutcome<T>> {
   const { git, cwd, runId } = deps
   const lines: string[] = []
-  const backupRef = `refs/et/stash-backup/${runId}`
+  /**
+   * **备份 ref 的名字必须带上内容的 sha,不能只带 runId。**
+   *
+   * 验收席在真 git 上复现的 P0:同一趟 run 里每次按键都是同一个名字,`update-ref` 覆盖时
+   * 退出码 0、一个字都不说。而这一档最典型的用法恰恰会连按两次 —— 第一次 pop 撞冲突,
+   * 屏幕告诉用户「解完冲突后 `git stash drop`,备份仍在」;他照做之后**全世界只剩这一份
+   * 备份**;他继续改、再按一次 `m`+`s`,第二次的 `update-ref` 把它悄悄覆盖掉,而成功路径
+   * 上的 `update-ref -d` 又把它删了 —— 一整天的工作变成不可达对象,然后被 gc 掉。
+   */
+  let backupRef = `refs/et/stash-backup/${runId}`
 
   const avail = await stashAvailability(deps)
   if (!avail.available) {
-    return { restored: true, lines: [avail.why, ...(avail.hint ? [avail.hint] : [])] }
+    return { failed: true, restored: true, lines: [avail.why, ...(avail.hint ? [avail.hint] : [])] }
   }
 
   /**
@@ -128,10 +145,29 @@ export async function withStash<T>(
   deps.onProgress?.('把你的改动先备份一份…')
   const created = await git(['stash', 'create'], cwd)
   const bak = created.stdout.trim()
-  if (created.code !== 0 || bak.length === 0) {
-    // 干净树时 `stash create` 输出空且退出码 0 —— 这是「没什么可 stash」,不是错误。
+  /**
+   * **失败和「没什么可 stash」是两件事,退出码分得开。**
+   *
+   * 干净树:退出码 0 且输出空 —— 那是「没什么可 stash」。
+   * 而 `Cannot save the current index state`(刚被自己 pop 冲突留下的 `UU` 态)、
+   * `You do not have the initial commit yet`(空仓)都是**退出码 1**。上一版把它们一律
+   * 说成「你的工作区已经不脏了」,把 git 的真实原因吞掉,而调用方随后会在**没有任何
+   * 保护**的情况下把合并跑掉。
+   */
+  if (created.code !== 0) {
+    return {
+      failed: true,
+      restored: true,
+      lines: [
+        `没有执行:准备备份你的改动时 git 拒绝了 —— ${oneLine(created.stderr) || `退出码 ${created.code}`}`,
+        '先把工作区收拾到一个 git 能操作的状态(git status 看看),再按一次。',
+      ],
+    }
+  }
+  if (bak.length === 0) {
     return { restored: true, lines: [MSG.nothingToStash] }
   }
+  backupRef = `refs/et/stash-backup/${runId}/${bak.slice(0, 12)}`
   const ref = await git(['update-ref', backupRef, bak], cwd)
   if (ref.code !== 0) {
     return {
@@ -155,8 +191,10 @@ export async function withStash<T>(
    * 「即使将来有人把 create 那步挪走,也不会去 pop 用户自己那条 stash」。
    */
   if (push.code !== 0 || after === undefined || after === before) {
-    await git(['update-ref', '-d', backupRef], cwd)
+    const cur0 = await git(['rev-parse', '--verify', '--quiet', backupRef], cwd)
+    if (cur0.stdout.trim() === bak) await git(['update-ref', '-d', backupRef], cwd)
     return {
+      failed: push.code !== 0,
       restored: true,
       lines: push.code !== 0
         ? [`没有执行:收起改动失败(${oneLine(push.stderr) || `退出码 ${push.code}`})—— 什么都没动。`]
@@ -177,9 +215,13 @@ export async function withStash<T>(
    * 失败(`could not write index / needs merge`)。abort 的成败不看退出码 —— 没有合并在
    * 进行时它本来就非零;看**收拾完之后现场还在不在**。
    */
-  for (const [r] of IN_PROGRESS) {
+  /**
+   * **按操作类型 abort。** 上一版对 rebase / cherry-pick / revert 一律发 `merge --abort`,
+   * 治不了 —— 实测 `.git/rebase-merge` 原样留着、`UU` 也还在,而屏幕却说「合并做完了」。
+   */
+  for (const [r, , cmd] of IN_PROGRESS) {
     if ((await git(['rev-parse', '-q', '--verify', r], cwd)).code === 0) {
-      await git(['merge', '--abort'], cwd)
+      await git([cmd, '--abort'], cwd)
       break
     }
   }
@@ -195,9 +237,26 @@ export async function withStash<T>(
     lines.push(`备份仍在:git stash apply ${backupRef}`)
     return { restored: applied.code === 0, lines, backupRef, ...(threw ? {} : { result: result as T }) }
   }
-  const pop = await git(['stash', 'pop', entry], cwd)
+  /**
+   * **`pop --index` 先试**:裸 pop 会把「暂存 / 未暂存」的划分拍平(实测 `M ` 变成 ` M`),
+   * 而用户可能是 `git add -p` 一块一块挑出来的 —— 那份工作不可逆地没了,而屏幕说的是
+   * 「原样放回」。`--index` 在同一路径既有暂存又有工作区改动时会失败,那时退回裸 pop
+   * (内容仍然完整,只是划分丢了),并把这件事说出来。
+   */
+  let pop = await git(['stash', 'pop', '--index', entry], cwd)
+  let flattened = false
+  if (pop.code !== 0) {
+    const retry = await git(['stash', 'pop', entry], cwd)
+    if (retry.code === 0) { flattened = true }
+    pop = retry.code === 0 ? retry : pop
+  }
   if (pop.code === 0) {
-    await git(['update-ref', '-d', backupRef], cwd)
+    // **只删自己写进去的那一个。** ref 名带 sha,再比对一次:别人同名写过就不动它。
+    const cur = await git(['rev-parse', '--verify', '--quiet', backupRef], cwd)
+    if (cur.stdout.trim() === bak) await git(['update-ref', '-d', backupRef], cwd)
+    if (flattened) {
+      lines.push('注意:你的改动回来了,但**暂存 / 未暂存的划分被拍平了**(同一个文件两边都有改动时 git 还原不了索引)。')
+    }
     lines.push('你未提交的改动已经原样放回工作区。')
     if (threw) throw threw
     return { restored: true, lines, result: result as T }
