@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner } from './worktreePool.js'
-import { mergeIntoIntegration, type IntegrationMergeDeps } from './integrationMerge.js'
+import { mergeIntoIntegration, syncTrunk, type IntegrationMergeDeps } from './integrationMerge.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
 const git: GitRunner = (args, cwd) =>
@@ -294,5 +294,129 @@ describe('临时工作树', () => {
     // 散落文件被收掉了,而**集成分支上没有它** —— 它不该被一次捞回顺手提交进去。
     expect((await git(['show', `${p.integrationBranchName}:junk.txt`], gitRoot)).code).not.toBe(0)
     expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('base\n')
+  })
+})
+
+/**
+ * **需求 7:集成分支 → 你当前的分支,先同步主干再迭代解冲突。**
+ *
+ * 关键是方向:先把**用户的分支合进集成分支**(冲突在临时树里由模型解),之后回主干那一跳
+ * 自然是快进 —— 用户的检出一次三方合并都不会经历。`intoTrunk` 今天的做法是反的,
+ * 所以它撞冲突只能无条件 abort。
+ */
+describe('syncTrunk —— 先同步主干,再快进', () => {
+  const clean = async (): Promise<{ dirty: boolean }> => ({ dirty: false })
+
+  it('主干落后时直接快进', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/t1')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'out.ts'), 'produced\n')
+    await p.commitAndMerge(n)
+    // commitAndMerge 顺手送过一次,把主干退回去造出「没送到」的形状。
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+
+    const res = await syncTrunk({ ...depsOf(p), trackedDirty: clean })
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.advanced).toBe(true)
+    expect(await readFile(join(gitRoot, 'out.ts'), 'utf-8')).toBe('produced\n')
+  })
+
+  /**
+   * **这一条是整条改造的理由。** 用户自己提交过、而且和产出撞在同一个文件同一行上 ——
+   * 今天 `intoTrunk` 在这里只能 abort,产出永远送不到他的目录。
+   */
+  it('用户自己提交过且撞冲突:在临时树里解掉,他的检出全程干净', async () => {
+    const p = pool(); await p.init()
+    const base = (await git(['rev-parse', 'HEAD'], gitRoot)).stdout.trim()
+    const n = node('root/t2')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'clash.ts'), 'FROM RUN\n')
+    await p.commitAndMerge(n)
+    // 用户回到合并之前,自己在同一个文件上提交一笔 —— 真冲突。
+    await git(['reset', '--hard', base], gitRoot)
+    await writeFile(join(gitRoot, 'clash.ts'), 'FROM USER\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own work'], gitRoot)
+
+    const dirtyDuring: boolean[] = []
+    const res = await syncTrunk({
+      ...depsOf(p, {
+        resolve: async info => {
+          // 解冲突期间,用户的检出必须干净 —— 冲突现场在临时树里,不在他那儿。
+          const st = await git(['status', '--porcelain'], gitRoot)
+          dirtyDuring.push(st.stdout.split('\n').some(x => /^(UU|AA) /.test(x.trim())))
+          await writeFile(join(info.cwd, 'clash.ts'), 'FROM USER + FROM RUN\n')
+        },
+      }),
+      trackedDirty: clean,
+    })
+    expect(res.ok).toBe(true)
+    expect(dirtyDuring.every(d => d === false)).toBe(true)
+    // 两边的意图都落到了他的目录里。
+    expect(await readFile(join(gitRoot, 'clash.ts'), 'utf-8')).toBe('FROM USER + FROM RUN\n')
+    // 而且他的检出没有留下任何半合并态。
+    expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], gitRoot)).code).not.toBe(0)
+  })
+
+  it('脏树(已跟踪改动)先挡住,而且给得出能照做的下一步', async () => {
+    const p = pool(); await p.init()
+    /**
+     * **集成分支必须先领先一步,这条判据才轮得到。**
+     *
+     * 「已经是最新的」那条早退排在脏树之前(而且应该排在前面:没什么可合的时候,
+     * 用户脏不脏与他无关)。第一版夹具没造这一步,于是它断言的是一条**根本走不到**的分支
+     * —— 对着一个好的实现「失败」,而按它去改代码会把早退的顺序改错。
+     */
+    const n = node('root/t-dirty')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'out.ts'), 'produced\n')
+    await p.commitAndMerge(n)
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+
+    const res = await syncTrunk({
+      ...depsOf(p),
+      trackedDirty: async () => ({ dirty: true, detail: ' M src/a.ts' }),
+    })
+    expect(res.ok).toBe(false)
+    if (!res.ok) {
+      expect(res.why).toContain('未提交的改动')
+      expect(res.followUps.join('\n')).toContain('stash')
+    }
+  })
+
+  it('detached HEAD 不合', async () => {
+    const p = pool(); await p.init()
+    await git(['checkout', '--detach'], gitRoot)
+    const res = await syncTrunk({ ...depsOf(p), trackedDirty: clean })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.why).toContain('detached')
+  })
+
+  it('已经是最新的 → 报没前进,而不是报失败', async () => {
+    const p = pool(); await p.init()
+    const res = await syncTrunk({ ...depsOf(p), trackedDirty: clean })
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.advanced).toBe(false)
+  })
+
+  /**
+   * 未跟踪文件挡住那一种是**良性**的:git 拒绝并且一个字节都不动。它重试也不会好,
+   * 所以要认出来并如实说「你的文件原样保留」,而不是笼统报一句合并失败。
+   */
+  it('未跟踪文件会被覆盖时:如实说清楚,而文件原样保留', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/t3')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'newfile.ts'), 'from run\n')
+    await p.commitAndMerge(n)
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+    // 用户目录里有个同名的未跟踪文件。
+    await writeFile(join(gitRoot, 'newfile.ts'), 'MY PRECIOUS\n')
+
+    const res = await syncTrunk({ ...depsOf(p), trackedDirty: clean })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.why).toContain('原样保留')
+    expect(await readFile(join(gitRoot, 'newfile.ts'), 'utf-8')).toBe('MY PRECIOUS\n')
   })
 })

@@ -225,3 +225,138 @@ export async function mergeIntoIntegration(
     restored: true,
   }
 }
+
+export type TrunkSyncResult =
+  | { ok: true; advanced: boolean; message: string; resolvedFiles: string[] }
+  | { ok: false; why: string; followUps: string[] }
+
+/**
+ * **集成分支 → 你当前的分支。先同步主干,再迭代解冲突,最后快进。**
+ *
+ * 用户原话(需求 7):「合并冲突,要先同步主干,然后迭代解决冲突合并提交。」
+ *
+ * ## 方向是反的,而这正是关键
+ *
+ * 直觉写法是在 `gitRoot` 里 `git merge <集成分支>` —— 那是 `intoTrunk` 今天做的事,
+ * 而它撞冲突**只能无条件 abort**:冲突现场会落在**用户正在用的目录**里,那是唯一
+ * 不能拿来当解冲突现场的地方(他自己的编辑器、他自己的 git status 全在那儿)。
+ *
+ * 所以反过来做:**先把用户的分支合进集成分支**(在临时工作树里,模型在那儿解),
+ * 之后 `集成分支` 就包含了用户分支的全部提交 —— 回主干那一跳**自然成为快进**,
+ * 用户的检出一次三方合并都不会经历,更不会被留在半合并态。
+ *
+ * 顺带兑现的还有一件事:之后每个节点 `acquire` 出来的基线都含有用户自己那几笔提交,
+ * 而「任务开始先从主干同步」在他动过手之后一直是假的(`intoTrunk` 里那次反向 `--ff-only`
+ * 只在合成功时才跑,撞冲突就根本到不了)。
+ *
+ * ## 四条早退,判据与 `intoTrunk` 同源
+ *
+ * 屏幕上写着的「合不了,因为 X」必须就是一会儿真的会挡住它的那个 X。
+ */
+export async function syncTrunk(
+  deps: IntegrationMergeDeps & {
+    /** 用户的工作区脏不脏。判据只看**已跟踪**改动 —— 见 handoffActions.trackedChanges。 */
+    trackedDirty: () => Promise<{ dirty: boolean; detail?: string }>
+  },
+): Promise<TrunkSyncResult> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (deps.signal?.aborted) return { ok: false, why: '已中断', followUps: [] }
+
+    const head = await deps.git(['symbolic-ref', '--quiet', '--short', 'HEAD'], deps.gitRoot)
+    const branch = head.stdout.trim()
+    if (head.code !== 0 || branch.length === 0) {
+      return {
+        ok: false,
+        why: '当前是 detached HEAD(不在任何分支上)—— 合过去的提交不会留在任何分支上',
+        followUps: [`先 git switch 回你自己的分支,再试一次;产出仍在 ${deps.integrationBranch} 上`],
+      }
+    }
+    if (branch === deps.integrationBranch) {
+      return {
+        ok: false,
+        why: `你的主检出停在集成分支 ${branch} 上(集成工作区也占着它)`,
+        followUps: ['请先 git switch 回你自己的分支'],
+      }
+    }
+    // 已经是最新的 —— 没什么可合,而这不是失败。
+    const contained = await deps.git(['merge-base', '--is-ancestor', deps.integrationBranch, 'HEAD'], deps.gitRoot)
+    if (contained.code === 0) {
+      return { ok: true, advanced: false, message: `${branch} 上已经有集成分支的全部提交`, resolvedFiles: [] }
+    }
+    /**
+     * 脏树先挡。**只看已跟踪的改动** —— `/et` 自己就在用户检出里写 `.claude/efftask/`,
+     * 按 `status --porcelain` 判会让这个功能在正常仓库里一次都不发生
+     * (`trackedChanges` 为同一件事付过学费)。
+     */
+    const dirty = await deps.trackedDirty()
+    if (dirty.dirty) {
+      return {
+        ok: false,
+        why: '你的工作区有未提交的改动(已跟踪文件)—— 你的改动不该被一次合并卷进来',
+        followUps: [
+          '先提交或 stash,再试一次',
+          ...(dirty.detail ? [`改动:${dirty.detail}`] : []),
+        ],
+      }
+    }
+
+    /**
+     * **第一步:把主干合进集成分支。** 冲突(如果有)在临时工作树里由模型解掉,
+     * 用户的检出一个字节都不会被碰到。
+     */
+    const behind = await deps.git(['merge-base', '--is-ancestor', branch, deps.integrationBranch], deps.gitRoot)
+    let resolvedFiles: string[] = []
+    if (behind.code !== 0) {
+      deps.onProgress?.(`先把 ${branch} 同步进集成分支…`)
+      const sync = await mergeIntoIntegration(
+        deps, branch,
+        `正在合入的这一半是**用户自己的分支** ${branch} —— 他在这一趟运行期间自己提交的东西。` +
+        `冲突时两边都要保住:集成分支这一侧是本次运行产出的成果,他那一侧是他自己的工作,` +
+        `任何一边被丢掉都是数据丢失。`,
+      )
+      if (!sync.ok) {
+        return {
+          ok: false,
+          why: `把你的分支 ${branch} 同步进集成分支时失败:${sync.why}`,
+          followUps: sync.restored
+            ? [`集成分支和你的分支都原样保留,你的工作区没有被碰过`]
+            : [`临时合并工作区 ${deps.worktreeRoot}/merge-scratch 里留着一次没完成的合并,请去处理`],
+        }
+      }
+      resolvedFiles = sync.resolvedFiles
+    }
+
+    /**
+     * **第二步:快进。** 走到这里集成分支已经包含用户分支的全部提交,所以这是快进 ——
+     * 但**不是无条件的**:他完全可能在上一步那几分钟里又提交了一笔。
+     * 那时回第 1 步重来(有界),而**绝不退回普通 merge** —— 实测那条路会在他的检出里
+     * 留下 `UU` 和活的 MERGE_HEAD,而这整条改造存在的理由就是别让那件事发生。
+     */
+    const ff = await deps.git(['merge', '--ff-only', '--no-verify', deps.integrationBranch], deps.gitRoot)
+    if (ff.code === 0) {
+      return {
+        ok: true, advanced: true, resolvedFiles,
+        message: `已把集成分支合回 ${branch}${resolvedFiles.length > 0 ? `(解决了 ${resolvedFiles.length} 个冲突文件)` : ''}`,
+      }
+    }
+    /**
+     * 未跟踪文件挡住的那一种是**良性**的:实测 git 拒绝并且**一个字节都不动**
+     * (`error: The following untracked working tree files would be overwritten by merge`),
+     * 文件原样留在原处、树干净、没有半合并态。它重试也不会好,直接如实说。
+     */
+    const msg = ff.stderr.trim() || ff.stdout.trim()
+    if (msg.includes('untracked working tree files')) {
+      return {
+        ok: false,
+        why: '你的目录里有未跟踪的文件会被这次合并覆盖,git 拒绝了(你的文件原样保留,没有任何东西被改动)',
+        followUps: [msg.split('\n').slice(0, 5).join(' / ')],
+      }
+    }
+    deps.onProgress?.('你在这期间又提交了 —— 重新同步一次再合…')
+  }
+  return {
+    ok: false,
+    why: '你在同步期间反复提交,重试 3 次仍未合上',
+    followUps: ['等手上的提交告一段落再按一次;产出仍在集成分支上,一个字节都没丢'],
+  }
+}

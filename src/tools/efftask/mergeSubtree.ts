@@ -1,7 +1,10 @@
 import { descendantsOf } from './redo.js'
 import { isTerminal } from './stateMachine.js'
 import { writeNode, type FsLike } from './persistence.js'
-import { autoResolveMerge, runHandoffChoice, type ConflictResolver, type GitFn } from './handoffActions.js'
+import { autoResolveMerge, trackedChanges, type ConflictResolver, type GitFn } from './handoffActions.js'
+import { syncTrunk } from './integrationMerge.js'
+import { scanStranded, STRANDED_KINDS } from './stranded.js'
+import { planRescue, runRescue, type RescuePlan, type RescueTriage } from './rescue.js'
 import type { MergeResult } from './worktreePool.js'
 import type { TaskNode } from './types.js'
 
@@ -86,8 +89,32 @@ export interface SubtreeMergeDeps {
   signal?: AbortSignal
   /** 时间戳。注入是为了让注记那一行可断言。 */
   now?: () => string
+  /**
+   * 扫「没有工作区目录」那几类要用的东西。**给全了才扫** —— 缺一样就在屏幕上说
+   * 「这一格没查」,而不是渲染一个看起来干净的空清单。
+   */
+  runId?: string
+  worktreeRoot?: string
+  /** 主模型分诊:那条孤立的 ref 该不该合。见 `rescue.ts` —— 不给就全部落「拿不准」。 */
+  triage?: RescueTriage
+  /** 同一次合并最多让解冲突模型解几轮。见 `caps.trunkResolveRounds`。 */
+  rounds?: number
+  /** 目录存不存在(给孤儿目录那一格)。 */
+  exists?: (path: string) => Promise<boolean>
+  /** 孤儿目录里有哪些文件(相对路径,递归)。 */
+  listFiles?: (dir: string) => Promise<string[]>
   /** 编排器还在跑吗 —— 只影响确认屏上那句提醒。 */
   runActive?: boolean
+  /**
+   * 此刻真的有一步在跑的节点 id(`orchestrator.runningNodeIds()`)。
+   *
+   * 它替代了「状态是不是终态」那条判据 —— 见 `scanSubtreeMerge` 里那一段:
+   * 老判据把「引用已交回、目录留着」的那一类也挡掉了,而那正是用户点名的
+   * 「保留的工作区(仍有未合入的内容)」。
+   *
+   * 缺席 = 拿不到,退回老判据并在跳过理由里说明。
+   */
+  inFlight?: readonly string[]
 }
 
 /** 一个**要合**的工作区。 */
@@ -133,6 +160,19 @@ export interface SubtreeMergePlan {
   canResolve: boolean
   /** 编排器还在跑 —— 屏幕上要提醒:合并会和它抢同一条集成分支。 */
   runActive: boolean
+  /**
+   * **没有工作区目录、因此这个键在结构上看不见的那些产出。**
+   *
+   * `scanSubtreeMerge` 上面那一整段走的是 `childIds → pathFor(node)` —— 只要目录不在,
+   * 它一条都扫不到。而活恰恰最容易卡在没有目录的地方(来历见 `stranded.ts` 的分类表):
+   * 抢救分支(它正是在目录被毁那一刻建的)、只剩分支的残留(跑机实测 32 条登记项里 31 条
+   * 是这形状)、以及连是谁的都认不回来的抢救 ref。
+   *
+   * 它们走另一条路:`planRescue`(主模型分诊)+ `runRescue`(解冲突模型执行合并)。
+   * 空数组 = 这一趟真的没有;`undefined` = **没扫**(缺 runId / worktreeRoot 之类),
+   * 那时屏幕上必须说出来 —— 空白和「没有」长得一样。
+   */
+  rescue?: RescuePlan
 }
 
 export interface SubtreeMergeOutcome {
@@ -188,6 +228,8 @@ export async function scanSubtreeMerge(
   const skipped: SubtreeMergeSkip[] = []
   let alreadyMerged = 0
   let absent = 0
+  /** 此刻真的有一步在跑的节点。`undefined` = 拿不到,那时退回「非终态」这条老判据。 */
+  const inFlight = deps.inFlight === undefined ? undefined : new Set(deps.inFlight)
 
   for (const node of scope) {
     const path = pool.worktreePathOf(node)
@@ -202,7 +244,27 @@ export async function scanSubtreeMerge(
      * 把探测失败当成一个确定的答案,是在一个已经出问题的工作区上做写操作。
      */
     const merged = await git(['merge-base', '--is-ancestor', 'HEAD', pool.integrationBranchName], path)
-    if (merged.code === 0) { alreadyMerged++; continue }
+    if (merged.code === 0) {
+      /**
+       * **「已合入」不等于「没东西了」。**
+       *
+       * 这句早退原来排在数 loose 文件**之前**,于是整整一桶对 `m` 完全不可见:
+       * 提交全合入了、而目录里还躺着验收/测试席位产出的**未提交内容**的节点。
+       * 用户第 8 条那句「要保证所有未提交的都要提交,不能丢弃了」正正落在这个桶上,
+       * 而 `c` 键会把这些内容**连目录一起删掉**。
+       *
+       * `commitAndMerge` 自己是对的:它先 `add -A` + commit,提交之后分支就不再被包含,
+       * 于是照常合。坏的一直只是这里的扫描。
+       */
+      const st0 = await git(['-c', 'core.quotepath=false', 'status', '--porcelain'], path)
+      const loose0 = st0.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+      if (loose0.length === 0) { alreadyMerged++; continue }
+      items.push({
+        nodeId: node.id, title: node.title, status: node.status, path, branch,
+        commits: 0, loose: loose0.length,
+      })
+      continue
+    }
     if (merged.code !== 1) {
       skipped.push({
         nodeId: node.id, title: node.title,
@@ -221,10 +283,27 @@ export async function scanSubtreeMerge(
      * 判据是 `isTerminal`(ACCEPTED / BLOCKED),不是 `ACCEPTED`:被阻断的节点恰恰是这个
      * 键最主要的服务对象 —— 它的产出锁在自己的分支里,没有任何自动路径会再来合它。
      */
-    if (!isTerminal(node.status)) {
+    /**
+     * **判据是「此刻在不在飞」,不是「状态是不是终态」。**
+     *
+     * 要挡的东西没变:一棵**正被执行者写着**的树,`commitAndMerge` 第一句 `add -A` + commit
+     * 会把半句写到一半的代码带着一次真实的 merge commit 送进用户的分支。
+     *
+     * 但「非终态」把另一类也一起挡掉了,而那类正是用户第 8 条点名的「保留的工作区
+     * (仍有未合入的内容)」:`releasePlanBase` 把引用交回、目录留着的那种 ——
+     * `handoff().kept` 专门为它单开过一支。它们**不在飞**,只是状态非终态,而且没有任何
+     * 自动路径会再来合它们。
+     *
+     * 拿不到在飞集合(结束屏、`--resume` 之后编排器还没建起来)时退回老判据并说明 ——
+     * 那时「没有节点在飞」通常是真的,但我们没有把握,宁可保守。
+     */
+    const busy = inFlight === undefined ? !isTerminal(node.status) : inFlight.has(node.id)
+    if (busy) {
       skipped.push({
         nodeId: node.id, title: node.title,
-        why: `还没跑完(${node.status})—— 它的工作区正被执行者写着,跑完会自己合一次`,
+        why: inFlight === undefined
+          ? `还没跑完(${node.status}),而这一屏拿不到「谁正在跑」—— 保守起见没有动它`
+          : `正在运行 —— 它的工作区此刻正被执行者写着,跑完会自己合一次`,
       })
       continue
     }
@@ -284,8 +363,72 @@ export async function scanSubtreeMerge(
     trunk: await scanTrunk(deps),
     canResolve: deps.resolve !== undefined,
     runActive: deps.runActive === true,
+    ...(await scanRescue(deps, nodes)),
   }
 }
+
+/**
+ * 扫「没有工作区目录、因此上面那一整段结构上看不见」的那几类。
+ *
+ * **给全了才扫。** 缺 `runId` / `worktreeRoot` 时返回 `{}`(即 `rescue: undefined`),
+ * 而屏幕上会据此说「这一格没查」—— 渲染一个空清单等于告诉用户「没有」,而真相是「没看」。
+ */
+async function scanRescue(
+  deps: SubtreeMergeDeps, nodes: readonly TaskNode[],
+): Promise<{ rescue?: RescuePlan }> {
+  const { pool, git } = deps
+  if (deps.runId === undefined || deps.worktreeRoot === undefined) return {}
+  const report = await scanStranded({
+    git,
+    runId: deps.runId,
+    gitRoot: pool.gitRoot,
+    integrationBranch: pool.integrationBranchName,
+    integrationPath: pool.integrationPath,
+    pathFor: n => pool.worktreePathOf(n),
+    branchFor: n => pool.worktreeBranchOf(n),
+    ...(deps.inFlight ? { inFlight: deps.inFlight } : {}),
+    ...(deps.exists ? { exists: deps.exists } : {}),
+  }, nodes)
+  /**
+   * **只收上面那一段够不着的那几类。** `loose` / `unmerged` 已经由逐节点那条路处理
+   * (它复用 `commitAndMerge`,判据逐字就是自动路径那一份 —— `mergeSubtree` 的文件头
+   * 记着为什么不能另写一份);两边都收会让同一个节点被合两次。
+   */
+  const refOnly = report.items.filter(
+    i => i.kind === 'salvage' || i.kind === 'salvageOrphan' || i.kind === 'branchOnly' || i.kind === 'orphanDir',
+  )
+  const plan = await planRescue({
+    git,
+    gitRoot: pool.gitRoot,
+    integrationBranch: pool.integrationBranchName,
+    integrationPath: pool.integrationPath,
+    worktreeRoot: deps.worktreeRoot,
+    withIntegrationLock: fn => pool.withIntegrationRead(fn),
+    ...(deps.triage ? { triage: deps.triage } : {}),
+    ...(deps.resolve ? { resolve: deps.resolve } : {}),
+    ...(deps.rounds === undefined ? {} : { rounds: deps.rounds }),
+    ...(deps.onProgress ? { onProgress: deps.onProgress } : {}),
+    ...(deps.signal ? { signal: deps.signal } : {}),
+  }, refOnly, deps.listFiles)
+  // 扫描本身的问题(列不出抢救分支之类)要并进来 —— 它们是「这一格是空白,不是没有」。
+  plan.problems.push(...report.problems)
+  return { rescue: plan }
+}
+
+/**
+ * **这个键必须覆盖分类表里每一个 `action: 'merge'` 的格子。**
+ *
+ * 导出是为了让探针能对着它断言:分类表新增一格「能合的」而这个键没跟上时,它变红。
+ * 「全部捞回」的验收标准是一件都不漏,而漏项唯一的形态就是「新增了一类,没人认领」。
+ */
+export const MERGE_KEY_COVERS: readonly string[] = [
+  // 逐节点那条路(复用 commitAndMerge):工作区里未提交的、已提交没合入的。
+  'loose', 'unmerged',
+  // 捞那条路(主模型分诊 + 解冲突模型执行合并):没有工作区目录的那几类。
+  'salvage', 'salvageOrphan', 'branchOnly',
+  // 第二跳:集成分支 → 你当前的分支。
+  'trunk',
+]
 
 /**
  * 第 2 跳的现状。判据和 `intoTrunk` 逐字同源 —— 屏幕上写着的「合不了,因为 X」必须就是
@@ -408,6 +551,40 @@ export async function runSubtreeMerge(
     await noteMerged(deps, node, out)
   }
 
+  /**
+   * **没有工作区目录的那几类** —— 抢救分支、只剩分支的残留、认不回主的 ref。
+   *
+   * 排在逐节点之后:那条路会往集成分支上加东西,而分诊的证据(「这条 ref 相对集成分支
+   * 带来了什么」)在它跑完之后才是准的 —— 先捞的话,一条其实已经被本轮合并覆盖掉的
+   * 抢救分支会被当成「有独有产出」送去合并。
+   */
+  if (!out.aborted && plan.rescue && plan.rescue.merge.length > 0) {
+    note(`捞回 ${plan.rescue.merge.length} 处没有工作区目录的产出…`)
+    const r = await runRescue({
+      git: deps.git,
+      gitRoot: deps.pool.gitRoot,
+      integrationBranch: deps.pool.integrationBranchName,
+      integrationPath: deps.pool.integrationPath,
+      worktreeRoot: deps.worktreeRoot!,
+      withIntegrationLock: fn => deps.pool.withIntegrationRead(fn),
+      ...(deps.resolve ? { resolve: deps.resolve } : {}),
+      ...(deps.rounds === undefined ? {} : { rounds: deps.rounds }),
+      ...(deps.onProgress ? { onProgress: deps.onProgress } : {}),
+      ...(deps.signal ? { signal: deps.signal } : {}),
+    }, plan.rescue)
+    for (const m of r.merged) {
+      out.merged.push({
+        nodeId: m.ref, title: m.title ?? m.ref, commits: m.commits,
+        ...(m.resolvedFiles && m.resolvedFiles.length > 0 ? { resolvedFiles: m.resolvedFiles } : {}),
+      })
+    }
+    for (const f of r.failed) {
+      out.failed.push({ nodeId: f.ref, title: f.ref, why: f.why, followUps: [`产出仍在 ${f.ref} 上,一个字节都没丢`] })
+    }
+    out.problems.push(...r.problems)
+    if (r.aborted) out.aborted = true
+  }
+
   if (!out.aborted) {
     note('把集成分支合回你当前的分支…')
     out.trunk = await mergeToTrunk(deps)
@@ -497,41 +674,48 @@ async function mergeToTrunk(
   deps: SubtreeMergeDeps,
 ): Promise<{ ok: boolean; message: string; followUps: string[] }> {
   const { pool, git } = deps
-  const root = pool.gitRoot
   const intBranch = pool.integrationBranchName
-  const trunk = await scanTrunk(deps)
-  if (trunk.blocked !== undefined) {
+  /**
+   * **方向反过来了,而这正是用户第 7 条要的那件事。**
+   *
+   * 从前这一跳是在 `gitRoot` 里 `git merge <集成分支>` —— 撞冲突时现场落在**用户正在用的
+   * 目录**里,所以只能 abort,产出永远送不到他那儿。
+   *
+   * `syncTrunk` 反过来做:先把**他的分支**合进集成分支(在临时工作树里、由解冲突模型
+   * 迭代解),之后集成分支就包含了他的全部提交 —— 回主干那一跳**自然是快进**,
+   * 他的检出一次三方合并都不会经历。「先同步主干,然后迭代解决冲突合并提交」逐字兑现。
+   *
+   * 反向那次 `--ff-only` 也不必再补:同步那一步已经把他的提交带进集成分支了。
+   */
+  if (deps.worktreeRoot === undefined) {
     return {
       ok: false,
-      message: `没有把产出合回你的分支:${trunk.blocked}`,
-      followUps: [`产出仍在集成分支 ${intBranch} 上,处理完之后可以再按一次 m,或者自己 git merge ${intBranch}`],
+      message: '没有把产出合回你的分支:这一屏拿不到临时合并工作区的位置',
+      followUps: [`产出仍在集成分支 ${intBranch} 上,可以自己 git merge ${intBranch}`],
     }
   }
-  const contained = await git(['merge-base', '--is-ancestor', intBranch, 'HEAD'], root)
-  if (contained.code === 0) {
-    return { ok: true, message: `你的分支 ${trunk.branch} 上已经有集成分支的全部提交,不需要再合`, followUps: [] }
+  const res = await syncTrunk({
+    git,
+    gitRoot: pool.gitRoot,
+    integrationBranch: intBranch,
+    integrationPath: pool.integrationPath,
+    worktreeRoot: deps.worktreeRoot,
+    withIntegrationLock: fn => pool.withIntegrationRead(fn),
+    ...(deps.resolve ? { resolve: deps.resolve } : {}),
+    ...(deps.rounds === undefined ? {} : { rounds: deps.rounds }),
+    ...(deps.onProgress ? { onProgress: deps.onProgress } : {}),
+    ...(deps.signal ? { signal: deps.signal } : {}),
+    trackedDirty: () => trackedChanges(git, pool.gitRoot),
+  })
+  if (res.ok) return { ok: true, message: res.message, followUps: [] }
+  return {
+    ok: false,
+    message: `没有把产出合回你的分支:${res.why}`,
+    followUps: [
+      ...res.followUps,
+      `产出仍在集成分支 ${intBranch} 上,处理完之后可以再按一次 m`,
+    ],
   }
-  const res = await runHandoffChoice(
-    'merge',
-    {
-      branch: intBranch, commits: trunk.pending, kept: [], salvage: [],
-      outcome: 'completed', integrationPath: pool.integrationPath,
-    },
-    git, root, deps.resolve,
-  )
-  if (!res.ok) return { ok: false, message: res.message, followUps: res.followUps ?? [] }
-  /**
-   * 反向快进。`--ff-only`:集成分支此刻是用户分支的祖先(用户分支 = 集成 + 他自己那几笔的
-   * 合并),所以快进一定成立;万一不成立说明有人动过集成分支 —— 那就**什么都不做**,
-   * 而不是在共享的集成工作区里造一次没人预料的合并。锁着做:`intPath` 是共享的。
-   */
-  const behind = await git(['merge-base', '--is-ancestor', trunk.branch!, intBranch], root)
-  if (behind.code !== 0) {
-    await pool.withIntegrationRead(async () => {
-      await git(['merge', '--ff-only', trunk.branch!], pool.integrationPath)
-    })
-  }
-  return { ok: true, message: res.message, followUps: res.followUps ?? [] }
 }
 
 /** 盘上要留下「这次合并是人手动触发的」这个事实。写失败不影响合并本身,但**要说**。 */

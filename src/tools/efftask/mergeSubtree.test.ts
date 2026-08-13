@@ -16,8 +16,10 @@ import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner, type WorktreePool } from './worktreePool.js'
 import {
   runSubtreeMerge, scanSubtreeMerge, subtreeMergeLines, subtreeMergeResultLines, subtreeMergeScope,
+  MERGE_KEY_COVERS,
   type SubtreeMergeDeps,
 } from './mergeSubtree.js'
+ import { STRANDED_KINDS, STRANDED_KIND_LIST } from './stranded.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
 const git: GitRunner = (args, cwd) =>
@@ -62,7 +64,10 @@ async function freshRepo(): Promise<void> {
 const newPool = (): WorktreePool => createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot })
 
 const depsOf = (pool: WorktreePool, over: Partial<SubtreeMergeDeps> = {}): SubtreeMergeDeps => ({
-  pool, git, ...over,
+  // `worktreeRoot` 是第二跳的必需品:合回主干现在走 `syncTrunk`,而它要一棵**临时工作树**
+  // 来放冲突现场(见 integrationMerge.ts —— 模型调用一秒都不能待在 mergeLock 里)。
+  // 缺了它这一跳会如实早退,而不是悄悄不做。
+  pool, git, worktreeRoot, ...over,
 })
 
 /** 拿一个工作区、在里面写点东西并提交 —— 一个「跑完了但还没合」的节点长这样。 */
@@ -387,5 +392,150 @@ describe('落盘与中止', () => {
     expect(out.merged).toEqual([])
     expect(out.trunk).toBeUndefined()
     expect(subtreeMergeResultLines(out).some(l => l.includes('被中断了'))).toBe(true)
+  })
+})
+
+/**
+ * **「全部捞回」的验收标准是一件都不漏,而漏项唯一的形态是「新增了一类,没人认领」。**
+ *
+ * 用户原话:「必须保证全部捞回。」这一组把那句话变成可以变红的断言。
+ */
+describe('覆盖完整性', () => {
+  it('分类表里每一个「能合的」格子都有人认领', () => {
+    const shouldMerge = STRANDED_KIND_LIST.filter(k => STRANDED_KINDS[k].action === 'merge')
+    for (const k of shouldMerge) {
+      expect(MERGE_KEY_COVERS).toContain(k)
+    }
+  })
+
+  /** 反过来也要成立:认领表里不许出现分类表里没有的名字(改名之后会静默失联)。 */
+  it('认领表里没有分类表之外的名字', () => {
+    for (const k of MERGE_KEY_COVERS) expect(STRANDED_KIND_LIST).toContain(k)
+  })
+})
+
+/**
+ * **那些没有工作区目录、这个键在结构上看不见的产出。**
+ *
+ * `scanSubtreeMerge` 的主循环走 `childIds → pathFor(node)`,目录不在就一条都扫不到 ——
+ * 而活恰恰最容易卡在没有目录的地方。跑机实测(etcd3)32 条工作树登记项里 **31 条**目录已不在。
+ */
+describe('没有工作区目录的那几类', () => {
+  it('只剩分支的残留会被扫出来,并且合得回去', async () => {
+    const pool = newPool()
+    await pool.init()
+    const n = mk('root/x-branchonly')
+    const path = await work(pool, n, 'lost.ts', 'the lost work\n')
+    // 目录清掉、分支留着 —— 跑机上最常见的那一种形状。
+    await rm(path, { recursive: true, force: true })
+    await git(['worktree', 'prune'], gitRoot)
+    n.worktree = undefined
+
+    const deps = depsOf(pool, {
+      runId: '001',
+      triage: async ev => ev.map(e => ({ ref: e.ref, verdict: 'merge' as const, why: '独有产出' })),
+    })
+    const plan = await scanSubtreeMerge(deps, [n], n.id)
+    // 主循环看不见它(目录不在),它走的是捞那条路。
+    expect(plan.items).toHaveLength(0)
+    expect(plan.rescue?.merge.map(c => c.evidence.ref)).toEqual([pool.worktreeBranchOf(n)])
+
+    const out = await runSubtreeMerge(deps, plan, [n])
+    expect(out.failed).toEqual([])
+    expect((await git(['show', `${pool.integrationBranchName}:lost.ts`], gitRoot)).stdout).toBe('the lost work\n')
+  })
+
+  /**
+   * **缺料时要说「没查」,而不是渲染一个干净的空清单。**
+   *
+   * 空白和「没有」在屏幕上长得一模一样,而用户按 m 正是为了确认「还有没有东西没送到」。
+   */
+  it('没给 runId / worktreeRoot 时 rescue 是 undefined —— 那是「没查」', async () => {
+    const pool = newPool()
+    await pool.init()
+    const n = mk('root/x-noscan')
+    const plan = await scanSubtreeMerge(depsOf(pool), [n], n.id)
+    expect(plan.rescue).toBeUndefined()
+  })
+})
+
+/**
+ * **「已合入」不等于「没东西了」** —— 用户第 8 条那句「要保证所有未提交的都要提交」
+ * 正正落在这个桶上,而它此前对 `m` 完全不可见(`alreadyMerged` 那句早退排在数 loose 之前)。
+ */
+describe('已合入、但目录里还留着未提交内容', () => {
+  it('照样进名单,而且真的被提交并合入', async () => {
+    const pool = newPool()
+    await pool.init()
+    const n = mk('root/x-loose')
+    const path = await work(pool, n, 'a.ts', 'first\n')
+    expect((await pool.commitAndMerge(n)).ok).toBe(true)
+    // 验收/测试席位在这棵树里留下的东西 —— 还没有被提交到任何分支上。
+    await writeFile(join(path, 'left-behind.ts'), 'seat left this\n')
+
+    const deps = depsOf(pool)
+    const plan = await scanSubtreeMerge(deps, [n], n.id)
+    expect(plan.alreadyMerged).toBe(0)
+    expect(plan.items).toHaveLength(1)
+    expect(plan.items[0]!.loose).toBe(1)
+    expect(plan.items[0]!.commits).toBe(0)
+
+    const out = await runSubtreeMerge(deps, plan, [n])
+    expect(out.failed).toEqual([])
+    expect((await git(['show', `${pool.integrationBranchName}:left-behind.ts`], gitRoot)).stdout)
+      .toBe('seat left this\n')
+  })
+
+  it('目录干净、提交也全合入的才算「早就合过了」', async () => {
+    const pool = newPool()
+    await pool.init()
+    const n = mk('root/x-clean')
+    await work(pool, n, 'a.ts', 'x\n')
+    await pool.commitAndMerge(n)
+    const plan = await scanSubtreeMerge(depsOf(pool), [n], n.id)
+    expect(plan.alreadyMerged).toBe(1)
+    expect(plan.items).toEqual([])
+  })
+})
+
+/**
+ * **判据是「此刻在不在飞」,不是「状态是不是终态」。**
+ *
+ * 老判据把「引用已交回、目录留着」的那一类也挡掉了 —— 而那正是用户点名的
+ * 「保留的工作区(仍有未合入的内容)」,没有任何自动路径会再来合它们。
+ */
+describe('在不在飞', () => {
+  it('非终态但不在飞的节点照样合', async () => {
+    const pool = newPool()
+    await pool.init()
+    const n = mk('root/x-planbase')
+    n.status = 'PLANNING'
+    await work(pool, n, 'plan-leftover.ts', 'left by the planner\n')
+    const deps = depsOf(pool, { inFlight: [] })
+    const plan = await scanSubtreeMerge(deps, [n], n.id)
+    expect(plan.items).toHaveLength(1)
+    expect(plan.skipped).toEqual([])
+  })
+
+  it('此刻在飞的节点一个字节都不碰', async () => {
+    const pool = newPool()
+    await pool.init()
+    const n = mk('root/x-running')
+    n.status = 'EXECUTING'
+    await work(pool, n, 'half.ts', 'writing\n')
+    const plan = await scanSubtreeMerge(depsOf(pool, { inFlight: [n.id] }), [n], n.id)
+    expect(plan.items).toEqual([])
+    expect(plan.skipped[0]!.why).toContain('正在运行')
+  })
+
+  it('拿不到在飞集合时退回老判据,而且要说出来', async () => {
+    const pool = newPool()
+    await pool.init()
+    const n = mk('root/x-unknown')
+    n.status = 'EXECUTING'
+    await work(pool, n, 'half.ts', 'writing\n')
+    const plan = await scanSubtreeMerge(depsOf(pool), [n], n.id)
+    expect(plan.items).toEqual([])
+    expect(plan.skipped[0]!.why).toContain('拿不到')
   })
 })

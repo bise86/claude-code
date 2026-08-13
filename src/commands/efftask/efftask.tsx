@@ -27,7 +27,7 @@ import { runForcePass, runRedo, runSkip } from '../../tools/efftask/redoRun.js'
 import { liveRedoUnavailableReason } from '../../tools/efftask/liveRedo.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
 import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
-import { makeHandoffConflictResolver } from '../../tools/efftask/handoffResolve.js'
+import { makeHandoffConflictResolver, makeRescueTriage } from '../../tools/efftask/handoffResolve.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
 import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResumeArgs.js'
 import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resumeCore.js'
@@ -773,6 +773,26 @@ async function makeWorktreePool(
   const init = await pool.init()
   if (!init.ok) return { reason: init.reason }
   return { pool, ...(pool.healNotes().length > 0 ? { healed: pool.healNotes() } : {}) }
+}
+
+/**
+ * 一个目录下所有文件的相对路径(递归)。
+ *
+ * 给**孤儿目录**那一格用:`healIntegrationSlot` 挪走的 `.orphan` 目录已经不是 git 工作树,
+ * `git merge` 无从谈起,唯一能做的是逐文件比对(见 `rescue.orphanDirFindings`)。
+ *
+ * `.git` 跳过 —— 那是目录自己的元数据,不是产出,而且它可能有上万个文件。
+ * 读不出来就整条抛给调用方,由它记成一条 problem:静默返回空数组会让屏幕说「里面没东西」。
+ */
+async function listFilesUnder(dir: string, prefix = ''): Promise<string[]> {
+  const out: string[] = []
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    if (e.name === '.git') continue
+    const rel = prefix ? `${prefix}/${e.name}` : e.name
+    if (e.isDirectory()) out.push(...await listFilesUnder(`${dir}/${e.name}`, rel))
+    else if (e.isFile()) out.push(rel)
+  }
+  return out
 }
 
 function fsAdapter(): FsLike {
@@ -1793,6 +1813,28 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       signal,
       // 编排器还在跑吗 —— 只影响确认屏上那句「会和它抢同一条集成分支」的提醒。
       runActive: orchRef.current !== null,
+      /**
+       * **判据是「此刻在不在飞」,不是「状态是不是终态」。**
+       *
+       * 老判据把「引用已交回、目录留着」的那一类也挡掉了 —— 而那正是用户点名的
+       * 「保留的工作区(仍有未合入的内容)」,没有任何自动路径会再来合它们。
+       * 现读:扫描和真合之间隔着一整屏确认,在飞集合会变(`c` 键为同一件事各取一次 deps)。
+       */
+      inFlight: orchRef.current?.runningNodeIds() ?? [],
+      /**
+       * 「没有工作区目录」那几类要用的东西 —— 抢救分支、只剩分支的残留、认不回主的 ref、
+       * 孤儿目录。**给全了这一格才会被扫**;缺一样,确认屏会说「这一格没查」而不是渲染
+       * 一个看起来干净的空清单(空白和「没有」在屏幕上长得一样)。
+       */
+      ...(runId ? { runId } : {}),
+      worktreeRoot: `${pool.gitRoot}/.efftask-worktrees`,
+      exists: p => access(p).then(() => true, () => false),
+      listFiles: listFilesUnder,
+      /**
+       * 分诊:那条孤立的 ref 该不该合。**用的是同一个主模型接缝**,而它只圈范围、
+       * 不下判决(见 rescue.ts)—— 拿不准一律不合,而且要说出来。
+       */
+      ...(root ? { triage: makeRescueTriage({ runAgent: props.runAgent, node: root, signal }) } : {}),
       onError: e => logError(e),
     }
     // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs / props.runAgent are stable for a mount
