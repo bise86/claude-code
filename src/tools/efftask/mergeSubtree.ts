@@ -5,7 +5,7 @@ import { createNodeJournal } from './nodeJournal.js'
 import { autoResolveMerge, trackedChanges, type ConflictResolver, type GitFn } from './handoffActions.js'
 import { withStash } from './stashGuard.js'
 import { syncTrunk } from './integrationMerge.js'
-import { RESCUE_STRANDED_NOTE, strandedRefsOf } from './backtrack.js'
+import { backtrackCanClaim, RESCUE_STRANDED_NOTE, strandedRefsOf } from './backtrack.js'
 import type { CopyInto } from './backfill.js'
 import { scanStranded, STRANDED_KINDS } from './stranded.js'
 import { planRescue, rescueLines, runRescue, type RescueOutcome, type RescuePlan, type RescueTriage } from './rescue.js'
@@ -957,6 +957,20 @@ async function noteRescueStranded(
   for (const s of stranded) {
     const node = s.nodeId === undefined ? undefined : byId.get(s.nodeId)
     if (!node) { orphans.push(s); continue }
+    /**
+     * **写痕迹之前先问一句 `b` 认不认领 —— 判据和它用同一个。**
+     *
+     * 验收席实测:痕迹落在拆分型 / `kind: 'unknown'`(节点的出厂档)/ 有子任务的节点上时,
+     * 这一屏说「已经记在它们身上,按 b 回溯会把这些内容重新做出来」,而 `b` 那一屏说
+     * 「这棵子树里没有需要回溯的任务……m 也没有留下捞不回来的东西」。两块屏说反话,
+     * 而且那条痕迹**永远清不掉**(`markBacktracked` 只走 targets)。
+     *
+     * 认不了不等于瞒着:它和无主的那些走同一条出口,屏幕上点名说「这条没人接」。
+     */
+    if (!backtrackCanClaim(node)) {
+      orphans.push({ ...s, title: node.title })
+      continue
+    }
     const list = strandedRefsOf(node)
     // 同一条 ref 重按一次 `m` 不该叠出第二条 —— 判据是 ref,不是整行(它带时间戳)。
     const kept = list.filter(x => x.ref !== s.ref)
@@ -989,12 +1003,16 @@ async function noteRescueStranded(
   }
   for (const o of orphans) {
     /**
-     * **无主的不许假装有主。** `salvageOrphan` 按定义认不回是谁的,孤儿目录也没有节点。
-     * 把它挂到某个节点上会让 `b` 去重跑一个和它无关的任务;不说则是第二个「按 q 之后永久失联」。
+     * **无主的、以及有主而回溯认不了的,都不许假装有人接。**
+     *
+     * 两种来路:`salvageOrphan` / 孤儿目录按定义没有节点;拆分型和还没出方案的节点
+     * 有节点却没有执行环节(让 `b` 去重跑一个自己不干活的节点,除了删掉它健康的子树
+     * 什么都不会发生)。两种都只能如实说,并给一条用户自己动得了手的命令。
      */
+    const who = o.title !== undefined ? `「${o.title}」` : ''
     out.problems.push(
-      `⚠ ${o.ref} 还差 ${o.remaining} 处没捞回来,而它**没有对应的任务**(${o.why})—— `
-      + `回溯认不了它,只能你自己处置:git diff ${deps.pool.integrationBranchName} ${o.ref}`,
+      `⚠ ${o.ref} 还差 ${o.remaining} 处没捞回来,而**回溯接不了它**${who ? `(它属于 ${who},而那个任务自己没有执行环节)` : `(没有对应的任务:${o.why})`}`
+      + ` —— 只能你自己处置:git diff ${deps.pool.integrationBranchName} ${o.ref}`,
     )
   }
 }
@@ -1082,7 +1100,19 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
      * 用户按这个键多半是因为「我的产出不在目录里」,而这一格的真实答案是
      * 「它已经在了」,那和「有东西没合、只是我没告诉你」是两个完全不同的结论。
      */
-    out.push(`集成分支上也没有还没送到 ${plan.trunk.branch} 的提交 —— 这棵子树的产出都已经在你的分支上了。`)
+    /**
+     * **「都已经在你的分支上了」是这一屏最强的一句话,而它对「还有东西要捞」的那一趟是假的。**
+     *
+     * 逐节点那条路没事可做 ≠ 这次按键没事可做:抢救分支 / 只剩分支 / 孤儿目录那几类
+     * 结构上不经过 `plan.items`,而它们正是用户按这个键最想知道的东西。
+     */
+    const rescuePending = plan.rescue !== undefined && (
+      plan.rescue.merge.length + plan.rescue.backfill.length + plan.rescue.hold.length
+      + plan.rescue.orphanFiles.length > 0
+    )
+    out.push(rescuePending
+      ? `集成分支上没有还没送到 ${plan.trunk.branch} 的提交,但下面这几处**没有工作区目录**的产出还没进来。`
+      : `集成分支上也没有还没送到 ${plan.trunk.branch} 的提交 —— 这棵子树的产出都已经在你的分支上了。`)
   }
   /**
    * **没有工作区目录的那几类,必须自己上屏。**
@@ -1096,8 +1126,16 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
    */
   if (plan.rescue === undefined) {
     out.push('⚠ 这一屏没有检查「没有工作区目录」的那几类(抢救分支、只剩分支的残留)—— 缺少扫描所需的信息。')
-  } else if (plan.rescue.merge.length + plan.rescue.hold.length + plan.rescue.orphanFiles.length
-    + plan.rescue.problems.length > 0) {
+  } else if (plan.rescue.merge.length + plan.rescue.backfill.length + plan.rescue.hold.length
+    + plan.rescue.orphanFiles.length + plan.rescue.problems.length > 0) {
+    /**
+     * **`backfill` 必须在这道门里。**
+     *
+     * 漏掉它的后果验收席实测过:分诊全判 `unsure`、又没有别的 notices 时,这一屏逐字是
+     * 「这棵子树里没有需要合并的工作区 / 产出都已经在你的分支上了」—— 两句都是假的,
+     * 而按下 y 之后会往集成分支写提交。紧邻的那段注释正写着「扫描算得出来、执行会真的去合,
+     * 而屏幕上一个字都没有 —— 那就是静默动手,这个仓库为它修过三次」。
+     */
     /**
      * **直接用 `rescueLines`,不另写一份。**
      *

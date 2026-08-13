@@ -105,6 +105,23 @@ export function rescueStranded(n: TaskNode): boolean {
 }
 
 /**
+ * **这个节点身上的痕迹,`b` 认不认领。**
+ *
+ * 判据和 `backtrackScope` 是**同一个**,而且必须是同一个:写痕迹的一侧
+ * (`m`)和读痕迹的一侧(`b`)各自判一次的话,中间那道缝就是验收席实测到的形状 ——
+ * 痕迹落在拆分型 / `kind: 'unknown'`(节点的出厂档)/ 有子任务的节点上,
+ * `m` 的结果屏说「已经记在它们身上,按 b 回溯会把这些内容重新做出来」,而 `b` 那一屏说
+ * 「这棵子树里没有需要回溯的任务……m 也没有留下捞不回来的东西」。两块屏说反话,
+ * 而那条痕迹**永远清不掉**(`markBacktracked` 只走 targets)。
+ *
+ * 导出它是为了让 `m` 在落痕**之前**问一次:认不了的,老老实实说「这条没人接」,
+ * 而不是写一句谁都不会读的话。
+ */
+export function backtrackCanClaim(n: TaskNode): boolean {
+  return n.childIds.length === 0 && n.kind === 'executable'
+}
+
+/**
  * 载荷,**读出来一律校验**。
  *
  * `validateLoadedNodes` 不认识这个字段,一个手改坏的 node.md 上 `rescueStranded: boom`
@@ -179,7 +196,7 @@ export function backtrackScope(
      * (「本节点还没有方案,分析之后才知道它是拆分还是执行」),后果和拆分型一模一样。
      * 这个仓库两天前刚为「`!== 'worktree'` 把 `undefined` 判成反面」付过一次账。
      */
-    const stranded = rescueStranded(n) && n.childIds.length === 0 && n.kind === 'executable'
+    const stranded = rescueStranded(n) && backtrackCanClaim(n)
     if (!failed && !missing && !stranded) continue
     const rec = failed ? lastIntegrateRecord(n) : undefined
     const remedy: string[] = []
@@ -228,8 +245,26 @@ function whyWithoutVerdict(n: TaskNode, missing: boolean, stranded: boolean): st
   const detail = refs.length > 0
     ? refs.map(r => `${r.ref}(还差 ${r.remaining} 处:${r.why})`).join(';')
     : '(明细已经不在节点上了)'
-  return `这个任务此前某一版的产出躺在孤立的分支上,合并、加法补录都试过了,仍然没能全部捞回集成分支:${detail}。`
-    + '这一次要把那些内容重新做出来 —— 不要去合那条分支,它已经试过了。'
+  /**
+   * **抬头要跟着真实成因走。**
+   *
+   * 上一版无条件写「合并、加法补录**都试过了**」,而「被后来的版本取代」那一格两级都没试
+   * (取代过的那一版里「集成分支上没有」的文件,很可能正是后继版本故意删掉的)。
+   * 于是执行者拿到一句自相矛盾的话:「都试过了……(还差 N 处:**没有补录**)」。
+   */
+  const superseded = refs.some(r => r.why.includes('被后来的版本取代'))
+  const lead = superseded
+    ? '这个任务此前某一版的产出躺在孤立的分支上,而那一版已经被后来的版本取代,所以没有自动合、也没有补录'
+    : '这个任务此前某一版的产出躺在孤立的分支上,合并、加法补录都试过了,仍然没能全部捞回集成分支'
+  return `${lead}:${detail}。`
+    + '这一次要把那些内容**重新做出来**。'
+    /**
+     * **不许让他去合那条分支。** 那条路已经被判过了(合不上、或者判定不该合),
+     * 而一个执行者顺手 `git merge` 一条被取代的抢救分支,正是这条链最想避免的结局:
+     * 一份废稿盖到已经修好的代码上,而解冲突的人不知道右边那半是废稿。
+     */
+    + '**不要去 git merge / cherry-pick 那条分支** —— 它已经被判过了;'
+    + '要用的话只作为参考去读(git show),该怎么实现照这一次的方案来。'
 }
 
 function lastIntegrateRecord(n: TaskNode): TaskNode['acceptLog'][number] | undefined {
@@ -329,6 +364,16 @@ export function composeRedos(
  */
 export function markBacktracked(
   plan: RedoPlan, targets: readonly BacktrackTarget[], now: string,
+  /**
+   * 这一趟**真的被送去重跑**的节点 id。**只管清证据那一步。**
+   *
+   * 轮次和补救拆分的重新武装照旧落在 target(父任务)身上 —— 阶梯本来就是记在
+   * 「集成验收没通过的那个节点」身上的,而真正重跑的是它的子任务,两者本来就不是同一批。
+   * 但**证据**不一样:验收席实测过,主模型只点了别的子任务时,那个「捞不回来」的叶子
+   * 一次都没重跑,而它的注记被抹掉、载荷被 delete —— 下一次按 b 再也找不到它,
+   * 那条 ref 就此彻底失联。清证据的前提只有一个:这一趟真的重跑了它。
+   */
+  reran?: ReadonlySet<string>,
 ): { rearmed: string[] } {
   const rearmed: string[] = []
   for (const t of targets) {
@@ -343,14 +388,16 @@ export function markBacktracked(
      * 清的是**判据**(注记)和载荷两样:载荷留着而判据没了,下一次 `m` 又捞不回来时
      * 会重新写一份完整的。
      */
-    if (n.execStatus.includes(RESCUE_STRANDED_NOTE)) {
-      n.execStatus = n.execStatus.split('\n').filter(l => !l.includes(RESCUE_STRANDED_NOTE)).join('\n')
-    }
-    delete n.rescueStranded
     if (t.level === 2 && n.revised === true) {
       n.revised = false
       rearmed.push(n.id)
     }
+    // 清证据排在最后,而且带 `reran` 的闸 —— 上面两件事落在父任务身上,这一件不是。
+    if (reran !== undefined && !reran.has(n.id)) continue
+    if (n.execStatus.includes(RESCUE_STRANDED_NOTE)) {
+      n.execStatus = n.execStatus.split('\n').filter(l => !l.includes(RESCUE_STRANDED_NOTE)).join('\n')
+    }
+    delete n.rescueStranded
   }
   return { rearmed }
 }

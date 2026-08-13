@@ -356,3 +356,75 @@ describe('孤儿目录:此前唯一 0% 捞回的一格', () => {
     expect(await intFile('base.txt')).toBe('base\n')
   })
 })
+
+/**
+ * 验收席在真 git 上推翻的那几条 —— 每一条都配一条钉子。
+ */
+describe('验收推翻过的形状', () => {
+  it('文件名首尾带空格照样捞回来 —— -z 切完不许再 trim', async () => {
+    await onBranch('spacey', { ' lead.txt': 'L\n', 'trail.txt ': 'T\n', 'normal.txt': 'N\n' })
+    const res = await backfillFromRef(deps(), 'spacey', '来历')
+    expect(res.added.sort()).toEqual([' lead.txt', 'normal.txt', 'trail.txt '])
+    expect(await intFile(' lead.txt')).toBe('L\n')
+  })
+
+  /**
+   * **`merge-scratch` 是共享的,而这一段不在锁里。**
+   *
+   * 另一条流(第 1 级合并 / syncTrunk)在我们两批 checkout 之间做一次 stageAt + merge,
+   * 我们的补录提交就长在**它的合并提交**上,ff 会把整条废稿一起快进进集成分支。
+   * 上一版的复核基准是 scratch 的 HEAD,所以它一次都不响 —— 验收席实测到已经修好的
+   * 文件被废稿盖掉。判据换成 tip 之后,别人那次合并带进来的每一处都显形成 M/D。
+   */
+  it('临时工作区被别的流程挪走时:整笔作废,不提交', async () => {
+    const seen: string[][] = []
+    let head = 'tip1'
+    const res = await backfillFromRef({
+      git: async (args, _cwd) => {
+        seen.push(args)
+        if (args[0] === 'rev-parse' && args[1] === INT) return { code: 0, stdout: 'tip1\n', stderr: '' }
+        if (args[0] === 'diff' && args.includes('-z') && args[1] === '--name-only') return { code: 0, stdout: 'new.txt\0', stderr: '' }
+        if (args[0] === 'rev-parse' && args[1] === '--verify') return { code: args[3]?.startsWith('tip1:') ? 1 : 0, stdout: '', stderr: '' }
+        if (args[0] === 'rev-list') return { code: 0, stdout: '', stderr: '' }
+        if (args[0] === 'cat-file') return { code: 1, stdout: '', stderr: '' }
+        if (args[0] === 'ls-tree') return { code: 0, stdout: '100644 blob abc\tnew.txt\n', stderr: '' }
+        // checkout 之后,别人把这棵树挪到了自己的合并提交上。
+        if (args[0] === 'checkout') { head = 'someone-elses-merge'; return { code: 0, stdout: '', stderr: '' } }
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { code: 0, stdout: `${head}\n`, stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+      gitRoot: '/r', integrationBranch: INT, integrationPath: '/r/int', worktreeRoot: '/r/wt',
+      withIntegrationLock: fn => fn(),
+    }, 'draft', '来历')
+    expect(res.ok).toBe(false)
+    expect(res.why).toContain('被别的流程挪走')
+    expect(seen.some(a => a[0] === 'commit')).toBe(false)
+    // 而且**不许**去 ff:那一步会把别人那条合并一起快进进集成分支。
+    expect(seen.some(a => a[0] === 'merge' && a.includes('--ff-only'))).toBe(false)
+  })
+
+  /**
+   * **暂存区空了 ≠ 成功。** 上一版在这里 `return { ok: true }`,于是屏幕逐字说
+   * 「补录了 1 个集成分支缺失的文件」而集成分支一个字节都没动 —— 验收席实测到的假成功。
+   */
+  it('要补录的内容在提交前消失时,报失败而不是成功', async () => {
+    const res = await backfillFromRef({
+      git: async (args, _cwd) => {
+        if (args[0] === 'rev-parse' && args[1] === INT) return { code: 0, stdout: 'tip1\n', stderr: '' }
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { code: 0, stdout: 'tip1\n', stderr: '' }
+        if (args[0] === 'diff' && args[1] === '--name-only') return { code: 0, stdout: 'new.txt\0', stderr: '' }
+        // 暂存区两次询问都回空 —— 别人 reset --hard 过。
+        if (args[0] === 'diff' && args[1] === '--cached') return { code: 0, stdout: '', stderr: '' }
+        if (args[0] === 'rev-parse' && args[1] === '--verify') return { code: args[3]?.startsWith('tip1:') ? 1 : 0, stdout: '', stderr: '' }
+        if (args[0] === 'rev-list') return { code: 0, stdout: '', stderr: '' }
+        if (args[0] === 'cat-file') return { code: 1, stdout: '', stderr: '' }
+        if (args[0] === 'ls-tree') return { code: 0, stdout: '100644 blob abc\tnew.txt\n', stderr: '' }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+      gitRoot: '/r', integrationBranch: INT, integrationPath: '/r/int', worktreeRoot: '/r/wt',
+      withIntegrationLock: fn => fn(),
+    }, 'ref', '来历')
+    expect(res.ok).toBe(false)
+    expect(res.why).toContain('一个字节都没提交')
+  })
+})

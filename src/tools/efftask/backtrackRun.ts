@@ -193,7 +193,8 @@ export async function runBacktrack(
   }
 
   // 阶梯的痕迹要落在**合成之后的那棵树**上(它是马上要落盘的那一份)。
-  const { rearmed } = markBacktracked(computed, targets, now)
+  // 只对**真的被送去重跑**的那些记轮次、清证据 —— 见 markBacktracked 的 `reran`。
+  const { rearmed } = markBacktracked(computed, targets, now, new Set(entries.map(e => e.nodeId)))
 
   const { problems } = await deps.commit(computed, nodes)
   if (degraded) problems.unshift(`⚠ ${degraded}`)

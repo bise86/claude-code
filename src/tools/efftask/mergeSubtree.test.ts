@@ -1064,3 +1064,69 @@ describe('捞不回来的要在节点上留痕', () => {
     expect(out.problems.join('\n')).toContain('没有对应的任务')
   })
 })
+
+/**
+ * 验收席实测的两条:确认屏那道门漏了 backfill;落痕不看回溯认不认领。
+ */
+describe('只有补录的那一趟,和回溯接不了的那些', () => {
+  /**
+   * **确认屏对「只有补录」的一趟一个字都不说,而按 y 之后会往集成分支写提交。**
+   *
+   * 触发条件很常见:分诊全判 unsure、又没有别的 notices。上一版那道门是
+   * `merge + hold + orphanFiles + problems > 0` —— 漏了 `backfill`,于是这一屏逐字是
+   * 「这棵子树里没有需要合并的工作区 / 产出都已经在你的分支上了」,两句都是假的。
+   */
+  it('计划里只有加法补录时,确认屏必须说出来', () => {
+    const plan = {
+      items: [], skipped: [], alreadyMerged: 0, ignoredOnly: 0, absent: 0,
+      trunk: { branch: 'main', pending: 0 },
+      canResolve: false, canBackfillOrphan: false, runActive: false,
+      rescue: {
+        merge: [], hold: [], orphanFiles: [], problems: [],
+        backfill: [{
+          item: { kind: 'branchOnly', branch: 'b1', why: '' },
+          evidence: { ref: 'b1', commits: 1, files: ['a.ts'], fileCount: 1 },
+          verdict: 'unsure', why: '分诊没有覆盖这一条',
+        }],
+      },
+    } as unknown as Parameters<typeof subtreeMergeLines>[0]
+    const text = subtreeMergeLines(plan).join('\n')
+    expect(text).toContain('尽最大努力捞')
+    expect(text).toContain('b1')
+    // 而那句「都已经在你的分支上了」在这一屏就是假话。
+    expect(text).not.toContain('产出都已经在你的分支上了')
+  })
+
+  /**
+   * **写痕迹之前要问一句 `b` 认不认领 —— 判据和它用同一个。**
+   *
+   * 落在拆分型节点上的话,`m` 这一屏说「已经记在它们身上,按 b 回溯会把这些内容重新
+   * 做出来」,而 `b` 那一屏说「没有需要回溯的任务……m 也没有留下捞不回来的东西」。
+   * 两块屏说反话,而那条痕迹永远清不掉。
+   */
+  it('拆分型节点上的捞不回来:不落痕,如实说回溯接不了', async () => {
+    const pool = newPool()
+    await pool.init()
+    const parent = mk('root/s-p', { title: '父', kind: 'decompose', childIds: ['root/s-p/00'] })
+    const path = await work(pool, parent, 'shared.txt', 'REF SIDE\n')
+    await rm(path, { recursive: true, force: true })
+    await git(['worktree', 'prune'], gitRoot)
+    await writeFile(join(pool.integrationPath, 'shared.txt'), 'INTEGRATION SIDE\n')
+    await git(['add', '-A'], pool.integrationPath)
+    await git(['commit', '-qm', 'int side'], pool.integrationPath)
+    parent.worktree = undefined
+    const files = new Map<string, string>()
+    const fs = {
+      readFile: async (p: string) => files.get(p) ?? '',
+      writeFile: async (p: string, d: string) => { files.set(p, d) },
+      mkdir: async () => {}, readdir: async () => [],
+      exists: async (p: string) => files.has(p), rm: async () => {},
+      stat: async () => ({ mtimeMs: 0 }),
+    }
+    const deps = depsOf(pool, { runId: '001', persist: { fs: fs as never, runDir: '/run' }, now: () => 'T1' })
+    const out = await runSubtreeMerge(deps, await scanSubtreeMerge(deps, [parent], parent.id), [parent])
+    expect(rescueStranded(parent)).toBe(false)
+    expect(parent.rescueStranded).toBeUndefined()
+    expect(out.problems.join('\n')).toContain('回溯接不了它')
+  })
+})

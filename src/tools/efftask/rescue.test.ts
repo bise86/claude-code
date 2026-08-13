@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner } from './worktreePool.js'
-import { orphanDirFindings, planRescue, rescueLines, runRescue, type RescueDeps } from './rescue.js'
+import { orphanDirFindings, planRescue, remainingOnRef, rescueLines, runRescue, type RescueDeps } from './rescue.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 import type { StrandedItem } from './stranded.js'
 
@@ -433,5 +433,35 @@ describe('屏幕上说了什么', () => {
     const p = pool(); await p.init()
     const plan = await planRescue(depsOf(p), [])
     expect(rescueLines(plan)[0]).toContain('没有需要捞回来的东西')
+  })
+})
+
+/**
+ * **量「还剩多少」的那把尺,只能数 ref 这一侧真的有的路径。**
+ *
+ * 验收席实测:上一版直接数 `git diff --name-only <集成分支> <ref>` 的行数,而那份清单里
+ * 同样含着**集成分支自己独有**的路径(别的节点合进去的东西)。一条已经全捞回来的 ref
+ * 因此被算成「还差 2 处」→ 节点被落痕 → 屏幕承诺「按 b 回溯会把这些内容重新做出来」→
+ * `b` 去重跑一个已经完成的任务。只要树上不止一个节点(也就是永远),这把尺就一直偏。
+ */
+describe('还剩多少没捞回来', () => {
+  it('集成分支自己独有的路径不算「还差」', async () => {
+    const p = pool(); await p.init()
+    const { branch } = await strandedBranch(p, 'root/rm-1', 'mine.ts', 'M\n')
+    // 别的节点往集成分支上合了两个文件 —— 和这条 ref 毫无关系。
+    await writeFile(join(p.integrationPath, 'other1.ts'), 'O1\n')
+    await writeFile(join(p.integrationPath, 'other2.ts'), 'O2\n')
+    await git(['add', '-A'], p.integrationPath)
+    await git(['commit', '-qm', 'others'], p.integrationPath)
+    // 把这条 ref 自己那份也合进去 —— 它现在一个字都不差了。
+    await git(['merge', '--no-edit', '-q', branch], p.integrationPath)
+
+    expect(await remainingOnRef(depsOf(p), branch)).toBe(0)
+  })
+
+  it('ref 上真的还有没进去的内容时,数得出来', async () => {
+    const p = pool(); await p.init()
+    const { branch } = await strandedBranch(p, 'root/rm-2', 'mine.ts', 'M\n')
+    expect(await remainingOnRef(depsOf(p), branch)).toBe(1)
   })
 })

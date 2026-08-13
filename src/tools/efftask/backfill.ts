@@ -88,7 +88,12 @@ const FF_ATTEMPTS = 3
 /** 一条 pathspec,关掉通配符。见文件头第 2 条。 */
 const literal = (p: string): string => `:(literal)${p}`
 
-const splitZ = (s: string): string[] => s.split('\0').map(x => x.trim()).filter(Boolean)
+/**
+ * 按 NUL 切。**不许 `trim()`** —— 文件名首尾可以是空格,而 `-z` 存在的全部理由就是
+ * 「不要在这里做任何按字符的猜测」。上一版顺手 trim 了一下,于是 ` lead.txt` / `trail.txt `
+ * 既没被捞、也没进 skipped,验收席实测到的静默漏捞。
+ */
+const splitZ = (s: string): string[] => s.split('\0').filter(x => x.length > 0)
 
 /** 这个树对象上有没有这条路径。**gitlink 也算有** —— `cat-file -e` 在那一格是错的。 */
 async function existsAt(deps: BackfillDeps, tree: string, path: string): Promise<boolean> {
@@ -203,7 +208,7 @@ export async function candidatePaths(
 async function commitAndFf(
   deps: BackfillDeps, scratch: string, tip: string, message: string,
   stage: () => Promise<{ ok: true } | { ok: false; why: string }>,
-): Promise<{ ok: true; commit?: string } | { ok: false; why: string }> {
+): Promise<{ ok: true; commit?: string; added?: string[] } | { ok: false; why: string; retryable?: boolean }> {
   const staged = await stage()
   if (!staged.ok) {
     await deps.git(['reset', '--hard', tip], scratch)
@@ -214,11 +219,25 @@ async function commitAndFf(
    * **最后一道,也是唯一由 git 强制的那道。**
    *
    * 上面每一条判据都可能有我没想到的绕法(D/F 只是被抓到的那一个)。这一句问的是
-   * git 自己:相对 HEAD,这次暂存区里有没有**删除 / 修改 / 改名**。有 = 我们正在覆盖
-   * 什么东西 = 整笔作废。没有这一句,「只补录集成分支缺失的文件,没有覆盖任何东西」
-   * 就只是提交消息里的一句自述。
+   * git 自己:相对**集成分支的 tip**,这次暂存区里有没有删除 / 修改 / 改名。
+   *
+   * **基准是 `tip`,不是 HEAD** —— 验收席在真 git 上把上一版(裸 `diff --cached`)证伪了:
+   * `merge-scratch` 是**共享的**(第 1 级合并、`syncTrunk`、补录都用同一个目录),而这一段
+   * 不在锁里。另一条流的 `stageAt` + `git merge` 落在我们两批 checkout 之间时,我们的补录
+   * 提交长在**它的合并提交**上,ff 把整条废稿一起快进进集成分支 —— DMR 一次都没响,
+   * 因为它比的是 index 和一个**已经被挪走的 HEAD**。实测:已经修好的文件被废稿盖掉,
+   * 而且那一笔 revert 也退不掉(它只含补录的那些路径)。
+   *
+   * 换成 tip 之后,别人那次合并带进来的每一处改动都会显形成 M/D,当场作废;
+   * 而上面那句 HEAD 复核把「index 被别人 reset 掉」也一起接住。
    */
-  const dirty = await deps.git(['diff', '--cached', '--name-only', '-z', '--diff-filter=DMR'], scratch)
+  const headNow = await deps.git(['rev-parse', 'HEAD'], scratch)
+  if (headNow.code !== 0 || headNow.stdout.trim() !== tip) {
+    await deps.git(['reset', '--hard', tip], scratch)
+    await deps.git(['clean', '-fd'], scratch)
+    return { ok: false, why: '临时合并工作区在这期间被别的流程挪走了(它是共享的)—— 已还原,一个字节都没提交' }
+  }
+  const dirty = await deps.git(['diff', '--cached', '--name-only', '-z', '--diff-filter=DMR', tip], scratch)
   if (dirty.code !== 0 || splitZ(dirty.stdout).length > 0) {
     const names = splitZ(dirty.stdout).slice(0, 5).join('、')
     await deps.git(['reset', '--hard', tip], scratch)
@@ -230,8 +249,19 @@ async function commitAndFf(
         : `这次补录会改到集成分支上已有的内容(${names})—— 已还原,一个字节都没提交`,
     }
   }
-  const staged2 = await deps.git(['diff', '--cached', '--name-only', '-z'], scratch)
-  if (splitZ(staged2.stdout).length === 0) return { ok: true }
+  /**
+   * **暂存区空了 ≠ 成功。**
+   *
+   * 候选非空却什么都没暂存,只有一种成因:别的流程把这棵共享的树收拾过一遍
+   * (`stageAt` 的 `reset --hard` + `clean -fd`)。上一版在这里 `return { ok: true }`,
+   * 于是屏幕逐字说「补录了 1 个集成分支缺失的文件(lost.ts)」而集成分支一个字节都没动 ——
+   * 验收席实测到的**假成功**。`added` 是从候选清单抄的,不是量出来的,所以它不会自己露馅。
+   */
+  const staged2 = await deps.git(['diff', '--cached', '--name-only', '-z', tip], scratch)
+  const stagedNames = splitZ(staged2.stdout)
+  if (stagedNames.length === 0) {
+    return { ok: false, why: '要补录的内容在提交前消失了(临时合并工作区被别的流程收拾过)—— 一个字节都没提交' }
+  }
 
   const commit = await deps.git(['commit', '--no-verify', '-m', message], scratch)
   if (commit.code !== 0) {
@@ -244,8 +274,25 @@ async function commitAndFf(
   const sha = head.stdout.trim()
   const ff = await deps.withIntegrationLock(() =>
     deps.git(['merge', '--ff-only', '--no-verify', sha], deps.integrationPath))
-  if (ff.code !== 0) return { ok: false, why: `集成分支在这期间前进了,这一笔补录没能快进上去` }
-  return { ok: true, commit: sha }
+  if (ff.code !== 0) {
+    /**
+     * **失败原因由 git 说,不许写死。**
+     *
+     * 补录只加集成分支没有的路径,所以现实中最常见的失败根本不是「集成分支前进了」,
+     * 而是**集成工作区里有同名未跟踪文件**(验收席就在那棵树里跑构建)。上一版把这句话
+     * 写死,于是用户拿到一句假成因和零个下一步,而 git 的原话里就有可操作的那句。
+     */
+    const why = ff.stderr.trim() || ff.stdout.trim()
+    const advanced = /fast-forward|non-fast|not possible/i.test(why)
+    return {
+      ok: false,
+      why: advanced
+        ? `集成分支在这期间前进了,这一笔补录没能快进上去(${why})`
+        : `这一笔补录没能进集成分支:${why}`,
+      retryable: advanced,
+    }
+  }
+  return { ok: true, commit: sha, added: stagedNames }
 }
 
 /**
@@ -294,14 +341,13 @@ export async function backfillFromRef(
       return { ok: true }
     })
     if (res.ok) {
-      deps.onProgress?.(`补录 ${cand.take.length} 个文件(${ref})`)
-      return {
-        ok: true, added: cand.take, skipped: cand.skipped,
-        ...(res.commit ? { commit: res.commit } : {}),
-      }
+      // **报量出来的,不报打算做的。** `cand.take` 是候选清单,它不知道 git 最后收了什么。
+      const added = res.added ?? cand.take
+      deps.onProgress?.(`补录 ${added.length} 个文件(${ref})`)
+      return { ok: true, added, skipped: cand.skipped, ...(res.commit ? { commit: res.commit } : {}) }
     }
-    // 快进不成立 = 编排器在这期间合了别的东西。回第一步重算重来。
-    if (res.why.includes('快进')) {
+    // 只有「集成分支前进了」值得重来(而且要**重算候选**);别的原因重试只是重复同一次失败。
+    if (res.retryable === true) {
       deps.onProgress?.('集成分支在这期间前进了,重算补录清单后再试一次…')
       continue
     }
@@ -380,10 +426,11 @@ export async function backfillFromDir(
       return { ok: true }
     })
     if (res.ok) {
-      deps.onProgress?.(`从 ${dir} 补录 ${take.length} 个文件`)
-      return { ok: true, added: take, skipped, ...(res.commit ? { commit: res.commit } : {}) }
+      const added = res.added ?? take
+      deps.onProgress?.(`从 ${dir} 补录 ${added.length} 个文件`)
+      return { ok: true, added, skipped, ...(res.commit ? { commit: res.commit } : {}) }
     }
-    if (res.why.includes('快进')) continue
+    if (res.retryable === true) continue
     return { ok: false, added: [], skipped, why: res.why }
   }
   return { ok: false, added: [], skipped: [], why: '集成分支反复前进,补录重试 3 次仍没能落上去' }

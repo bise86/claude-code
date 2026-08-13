@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test'
 import {
   backtrackLines, backtrackScope, composeRedos, levelFor, markBacktracked, outputMissing,
-  NO_CONTRIBUTION_NOTE, RESCUE_STRANDED_NOTE, strandedRefsOf, type BacktrackTarget,
+  NO_CONTRIBUTION_NOTE, RESCUE_STRANDED_NOTE, backtrackCanClaim, rescueStranded, strandedRefsOf,
+  type BacktrackTarget,
 } from './backtrack.js'
 import { parseNodeFile, serializeNode } from './persistence.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
@@ -452,5 +453,82 @@ describe('捞不回来的产出要能被 b 认领', () => {
     expect(back?.execStatus).toContain(RESCUE_STRANDED_NOTE)
     expect(strandedRefsOf(back!)).toHaveLength(1)
     expect(strandedRefsOf(back!)[0]!.remaining).toBe(2)
+  })
+})
+
+/**
+ * 验收席实测推翻的那两条:写痕迹和读痕迹用同一把尺;没重跑过的证据不许被抹。
+ */
+describe('痕迹的写读对称与消费时机', () => {
+  const withNote = (id: string, over: Partial<TaskNode> = {}): TaskNode => mk(id, {
+    status: 'ACCEPTED', kind: 'executable',
+    execStatus: `做完了\n${RESCUE_STRANDED_NOTE}(${NOW}:r1,还差 1 处)`,
+    rescueStranded: [{ ref: 'r1', why: '两边都有而内容不同', at: NOW, remaining: 1 }],
+    ...over,
+  })
+
+  /**
+   * **写痕迹的一侧和读痕迹的一侧必须问同一个问题。**
+   *
+   * 各判各的后果是实测出来的:痕迹落在拆分型 / `kind: 'unknown'` / 有子任务的节点上时,
+   * `m` 的结果屏说「已经记在它们身上,按 b 回溯会把这些内容重新做出来」,而 `b` 那一屏说
+   * 「这棵子树里没有需要回溯的任务……m 也没有留下捞不回来的东西」。两块屏说反话。
+   */
+  it('backtrackCanClaim 就是 backtrackScope 的那条判据', () => {
+    const cases: [string, Partial<TaskNode>, boolean][] = [
+      ['执行型叶子', {}, true],
+      ['拆分型', { kind: 'decompose' }, false],
+      ['还没出方案', { kind: 'unknown' }, false],
+      ['有子任务', { childIds: ['x'] }, false],
+    ]
+    for (const [name, over, claim] of cases) {
+      const n = withNote('root', over)
+      expect(`${name}: ${backtrackCanClaim(n)}`).toBe(`${name}: ${claim}`)
+      expect(`${name} 进不进 targets: ${backtrackScope([n], 'root').targets.length > 0}`)
+        .toBe(`${name} 进不进 targets: ${claim}`)
+    }
+  })
+
+  /**
+   * **没被重跑就不许清证据。**
+   *
+   * 主模型只点了别的子任务时,那个「捞不回来」的叶子一次都没重跑,而上一版把它的注记
+   * 抹掉、载荷 delete —— 下一次按 b 再也找不到它,那条 ref 就此彻底失联。
+   */
+  it('这一趟没重跑的节点,证据原样留着', () => {
+    const a = withNote('root/00-a', { parentId: 'root' })
+    const b = mk('root/01-b', { parentId: 'root', status: 'BLOCKED', kind: 'executable' })
+    const root = mk('root', { childIds: ['root/00-a', 'root/01-b'], kind: 'decompose', status: 'WAITING_CHILDREN' })
+    const nodes = [root, a, b]
+    const plan = composeRedos(nodes, [{ nodeId: 'root/01-b', entry: 'execute' }], NOW)
+    if ('error' in plan) throw new Error(plan.error)
+    markBacktracked(plan, backtrackScope(nodes, 'root').targets, NOW, new Set(['root/01-b']))
+    const after = plan.nodes.find(n => n.id === 'root/00-a')!
+    expect(rescueStranded(after)).toBe(true)
+    expect(strandedRefsOf(after)).toHaveLength(1)
+    // 而真的重跑了的那一次,证据照旧被消费掉(否则永远重跑)。
+    const plan2 = composeRedos(nodes, [{ nodeId: 'root/00-a', entry: 'execute' }], NOW)
+    if ('error' in plan2) throw new Error(plan2.error)
+    markBacktracked(plan2, backtrackScope(nodes, 'root').targets, NOW, new Set(['root/00-a']))
+    expect(rescueStranded(plan2.nodes.find(n => n.id === 'root/00-a')!)).toBe(false)
+  })
+
+  /**
+   * **注入的那句话要跟着真实成因走,而且不许把他推去 merge 那条分支。**
+   *
+   * 「被后来的版本取代」那一格两级都没试过,上一版却无条件写「合并、加法补录都试过了」——
+   * 执行者拿到的是一句自相矛盾的话。而顺手 merge 一条被取代的抢救分支,
+   * 正是这条链最想避免的结局。
+   */
+  it('被取代那一格的注入语不许说「都试过了」,而且明说不要 merge', () => {
+    const n = mk('root', {
+      status: 'ACCEPTED', kind: 'executable',
+      execStatus: `${RESCUE_STRANDED_NOTE}(${NOW}:r9,还差 2 处)`,
+      rescueStranded: [{ ref: 'r9', why: '分诊拿不准,而这一版已经被后来的版本取代,没有补录', at: NOW, remaining: 2 }],
+    })
+    const blocking = backtrackScope([n], 'root').targets[0]!.blocking
+    expect(blocking).toContain('已经被后来的版本取代')
+    expect(blocking).not.toContain('都试过了')
+    expect(blocking).toContain('不要去 git merge')
   })
 })

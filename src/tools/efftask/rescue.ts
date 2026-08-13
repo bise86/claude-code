@@ -379,12 +379,7 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
   const out: RescueOutcome = {
     merged: [], backfilled: [], failed: [], stranded: [], problems: [...plan.problems], aborted: false,
   }
-  /** 这条 ref 相对集成分支还剩多少路径没进来。**捞完之后由 git 重新量**,不靠记账。 */
-  const remainingOf = async (ref: string): Promise<number> => {
-    const d = await deps.git(['diff', '--name-only', '-z', deps.integrationBranch, ref], deps.gitRoot)
-    if (d.code !== 0) return -1
-    return d.stdout.split('\0').map(s => s.trim()).filter(Boolean).length
-  }
+  const remainingOf = (ref: string): Promise<number> => remainingOnRef(deps, ref)
   /** 第 3 级:记一条「三级都试过、还是没回来」。`-1` = 连量都量不出来,那更要说。 */
   const strand = async (c: RescueCandidate, why: string): Promise<void> => {
     const remaining = await remainingOf(c.evidence.ref)
@@ -478,6 +473,31 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
 }
 
 /**
+ * 这条 ref 上**还有多少内容没进集成分支** —— 第 3 级(落痕 → 回溯)的唯一判据。
+ *
+ * **只数 ref 这一侧真的有的路径。** 上一版直接数 `git diff --name-only <集成分支> <ref>`
+ * 的行数,而那份清单里同样含着**集成分支自己独有**的路径(别的节点合进去的东西)。
+ * 验收席实测:一条已经全部捞回来的 ref 被算成「还差 2 处」,于是节点被落痕、屏幕承诺
+ * 「按 b 回溯会把这些内容重新做出来」,而 `b` 会去重跑一个**已经完成**的任务。
+ * 只要树上不止一个节点(也就是永远),这把尺就一直偏。
+ *
+ * 探不动回 -1:那是「量不出来」,和「量出来是 0」必须分开 —— 后者才允许不落痕。
+ */
+export async function remainingOnRef(deps: RescueDeps, ref: string): Promise<number> {
+  const d = await deps.git(
+    ['diff', '--name-only', '-z', deps.integrationBranch, ref], deps.gitRoot,
+  )
+  if (d.code !== 0) return -1
+  const paths = d.stdout.split('\0').filter(x => x.length > 0)
+  let n = 0
+  for (const path of paths) {
+    const onRef = await deps.git(['rev-parse', '--verify', '-q', `${ref}:${path}`], deps.gitRoot)
+    if (onRef.code === 0) n += 1
+  }
+  return n
+}
+
+/**
  * 降到第 2 级:加法补录,然后**用 git 重新量**还剩多少没进来。
  *
  * 补录成功 ≠ 全部捞回:一条 ref 上「两边都有、而内容不同」的文件按判据一个都不会进来
@@ -496,10 +516,7 @@ async function descend(
     ...(c.evidence.nodeId ? { nodeId: c.evidence.nodeId } : {}),
   })
   if (!res.ok && res.why !== undefined) out.problems.push(`${ref} 补录没成:${res.why}`)
-  const d = await deps.git(['diff', '--name-only', '-z', deps.integrationBranch, ref], deps.gitRoot)
-  const remaining = d.code !== 0
-    ? -1
-    : d.stdout.split('\0').map(s => s.trim()).filter(Boolean).length
+  const remaining = await remainingOnRef(deps, ref)
   if (remaining === 0) return
   out.stranded.push({
     ref, remaining,
