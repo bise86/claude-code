@@ -266,16 +266,34 @@ export const ISOLATION_DEGRADE_PREFIX = '隔离不可用,执行阶段默认共�
  * 下面,而这几行说的是**已经定下来的执行方式**。渲染侧按这个前缀把它们分出去单独成块。
  */
 export const ISOLATION_RECORD_PREFIX = '本次隔离方式: '
+/**
+ * 改写之后那条**原因**的前缀。
+ *
+ * 有它才认得出自己上一趟写过的那条 —— 没有的话每一次 `--resume` 都会再推一条新的降级
+ * 说明、再改写一次,而旧的留在 `rest` 里:实测连批三趟,run.md 里同一句原因堆了 3 条,
+ * 恢复关口用 `key={l}` 渲染它们,React 当场报 duplicate key,屏幕上同一行印 3 次。
+ */
+export const ISOLATION_REASON_PREFIX = '隔离不可用: '
 
-/** 这一档用一句话说清「会对你的目录做什么」。 */
-function isolationRecord(iso: IsolationChoice): string {
+/**
+ * 这一档用一句话说清「会对你的目录做什么」。**认不出的值返回 undefined,不编一句。**
+ *
+ * 上一版把 else 当成 worktree,于是一个手改 run.md 写出来的怪值会让这里印
+ * 「每个执行任务在自己的工作区里跑,完成时合并回你当前的分支」—— 前两个新判据
+ * (`parallelismIsolation` / `poolDisposition`)落到 else 是往**安全**方向倒,
+ * 这一个落到 else 是**说了一句假话**。
+ */
+function isolationRecord(iso: IsolationChoice): string | undefined {
   if (iso === 'shared-parallel') {
     return `${ISOLATION_RECORD_PREFIX}共享目录 + 并发(关口显式选的)—— 多个执行任务同时改你当前的工作目录,没有隔离、不产生任何提交`
   }
   if (iso === 'shared') {
     return `${ISOLATION_RECORD_PREFIX}共享目录 + 串行 —— 执行者直接改你当前的工作目录(一次一个),不产生任何提交`
   }
-  return `${ISOLATION_RECORD_PREFIX}worktree 隔离 —— 每个执行任务在自己的工作区里跑,完成时合并回你当前的分支`
+  if (iso === 'worktree') {
+    return `${ISOLATION_RECORD_PREFIX}worktree 隔离 —— 每个执行任务在自己的工作区里跑,完成时合并回你当前的分支`
+  }
+  return undefined
 }
 
 /**
@@ -294,13 +312,22 @@ export function reconcileIsolationNotices(
   notices: string[] | undefined, iso: IsolationChoice,
 ): string[] | undefined {
   if (notices === undefined && iso === 'worktree') return undefined
-  const rest = (notices ?? []).filter(n => !n.startsWith(ISOLATION_DEGRADE_PREFIX) && !n.startsWith(ISOLATION_RECORD_PREFIX))
-  const reasons = (notices ?? [])
-    .filter(n => n.startsWith(ISOLATION_DEGRADE_PREFIX))
-    .map(n => `隔离不可用: ${n.slice(ISOLATION_DEGRADE_PREFIX.length)}`)
+  const isIsolationLine = (n: string): boolean =>
+    n.startsWith(ISOLATION_DEGRADE_PREFIX) || n.startsWith(ISOLATION_RECORD_PREFIX) || n.startsWith(ISOLATION_REASON_PREFIX)
+  const rest = (notices ?? []).filter(n => !isIsolationLine(n))
+  /**
+   * 原因**去重**。这一份 notices 是从 run.md 读回来的:上一趟已经写进去的那条(带
+   * `ISOLATION_REASON_PREFIX`)和这一趟新推的那条(带 `ISOLATION_DEGRADE_PREFIX`)
+   * 说的是同一件事,不去重的话每 `--resume` 一次就多一条。
+   */
+  const reasons = [...new Set((notices ?? [])
+    .filter(n => n.startsWith(ISOLATION_DEGRADE_PREFIX) || n.startsWith(ISOLATION_REASON_PREFIX))
+    .map(n => `${ISOLATION_REASON_PREFIX}${n.startsWith(ISOLATION_DEGRADE_PREFIX)
+      ? n.slice(ISOLATION_DEGRADE_PREFIX.length)
+      : n.slice(ISOLATION_REASON_PREFIX.length)}`))]
   // 默认那一档不用记 —— 它就是「什么都没变」。降级原因照旧要留。
-  const record = iso === 'worktree' ? [] : [isolationRecord(iso)]
-  return [...rest, ...reasons, ...record]
+  const rec = iso === 'worktree' ? undefined : isolationRecord(iso)
+  return [...rest, ...reasons, ...(rec ? [rec] : [])]
 }
 
 /**

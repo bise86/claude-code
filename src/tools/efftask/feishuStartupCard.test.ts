@@ -177,3 +177,58 @@ describe('启动卡 · 隔离方式', () => {
     expect(t).toContain('自动合并回当前分支')
   })
 })
+
+/**
+ * **卡上也要说「隔离用不了」—— 否则批准的人批的是一个不存在的跑法。**
+ *
+ * 实测过池子建不起来的那一趟:卡上同屏印着「隔离方式: worktree 隔离,可并行执行」
+ * 「收口方式: 主干开发 —— 每个子任务完成时就把产出合回你当前的分支」「完成即回收: 开」,
+ * 而上面那行并行数写的是「未启用隔离」。两个终端关口都传了原因,唯独卡没传。
+ */
+describe('启动卡 · 隔离不可用', () => {
+  const base = {
+    goalPrompt: '打通登录', parallelism: 5, notices: [], mainModel: 'm',
+    caps: { maxDepth: 5, maxNodes: 100, maxIterations: 3, nodeTimeoutMs: 1 },
+    phaseRoles: { plan: [], review: [], execute: [], accept: [], observer: [] },
+  }
+  const text = (cfg: object, isolation?: 'worktree' | 'none', reason?: string): string => {
+    const card = buildStartupCard(cfg as never, 'req-1', undefined, isolation, reason) as { elements: { text?: { content: string } }[] }
+    return card.elements.map(e => e.text?.content ?? '').join('\n')
+  }
+
+  it('池子没建起来 → 不许再印 worktree 隔离和自动合并', () => {
+    const t = text(base, 'none', '当前目录不是 git 仓库')
+    expect(t).toContain('不是你选的')
+    expect(t).toContain('当前目录不是 git 仓库')
+    expect(t).not.toContain('worktree 隔离,可并行执行')
+    expect(t).not.toContain('每个子任务完成时就把产出合回你当前的分支')
+  })
+
+  /** `g` 和 `w` 在卡上都按不出来 —— 印键位提示等于指一条这里不存在的路。 */
+  it('卡上不指终端才有的键', () => {
+    const t = text(base, 'none', '当前目录不是 git 仓库')
+    expect(t).not.toContain('按 g')
+    expect(t).not.toContain('(w 切换)')
+  })
+
+  it('池子好好的时候一个字都不多说', () => {
+    expect(text(base, 'worktree')).not.toContain('隔离不可用')
+  })
+
+  /**
+   * 记录不是「你的请求没生效」。终端把它拆成「本次的执行方式」,卡上此前印在
+   * 「以下请求不会生效」下面 —— 两端对同一件事说反话。
+   */
+  it('记录和没生效的请求在卡上也分两块', () => {
+    const t = text({
+      ...base,
+      isolation: 'shared-parallel',
+      notices: ['角色 xxx 未配置', '本次隔离方式: 共享目录 + 并发(关口显式选的)—— 多个执行任务同时改你当前的工作目录'],
+    }, 'none')
+    expect(t).toContain('**本次的执行方式**')
+    expect(t).toContain('多个执行任务同时改你当前的工作目录')
+    expect(t).toContain('**以下请求不会生效**')
+    expect(t).toContain('角色 xxx 未配置')
+    expect(t.indexOf('本次的执行方式')).toBeLessThan(t.indexOf('以下请求不会生效'))
+  })
+})

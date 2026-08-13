@@ -11,7 +11,7 @@
 import type { FeishuClient } from '../../services/feishu/FeishuClient.js'
 import type { FeishuPermissionCallbacks } from '../../services/feishu/feishuPermissions.js'
 import type { EffTaskConfig, PendingHandoff } from './types.js'
-import { capsLine, costLine, gitChoiceLines, guidanceLines, isolationChoice, skipConflictLines, skipConsequenceLines, goalLine, noticeLines, parallelismIsolation, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
+import { capsLine, costLine, gitChoiceLines, guidanceLines, isolationChoice, isolationChoiceLines, splitNotices, skipConflictLines, skipConsequenceLines, goalLine, parallelismIsolation, parallelismLine, rosterLines, resumeSummarySections, type ConfirmWinner, type ResumeSummary, type StartupDecision, type SurfaceTeardown } from './startupConfirm.js'
 import { logError } from '../../utils/log.js'
 
 // Button shape MIRRORS src/services/feishu/cards.ts: the callback payload is
@@ -35,7 +35,18 @@ function button(content: string, type: string, value: Record<string, unknown>) {
  * 两句对它都是假话,而 `--resume` 一个 shared-parallel 的 run 时这条**必然**触发。
  * 竞速器的前提是两端说同一件事:飞书上批准的人批的必须和终端上写的是同一个跑法。
  */
-export function buildStartupCard(config: EffTaskConfig, requestId: string, resume?: ResumeSummary, isolation?: 'worktree' | 'none'): object {
+export function buildStartupCard(
+  config: EffTaskConfig, requestId: string, resume?: ResumeSummary, isolation?: 'worktree' | 'none',
+  /**
+   * 隔离**为什么**用不了。给了才说得出「不是你选的」那一句。
+   *
+   * 不给的后果是实测出来的:池子建不起来的那一趟,卡上同屏印着「隔离方式: worktree
+   * 隔离,可并行执行」「收口方式: 主干开发 —— 每个子任务完成时就把产出合回你当前的
+   * 分支」「完成即回收: 开」,而上面那行并行数写的是「未启用隔离」。批准的人被告知
+   * 有隔离、会合回分支、会产生可推的提交,而实际是直接写他的检出。
+   */
+  isolationReason?: string,
+): object {
   const goal = goalLine(config.goalPrompt)
   const body =
     `**目标**: ${goal}\n` +
@@ -48,7 +59,12 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
     // 隔离方式/收口/推送那几行。**卡上此前一行都没有** —— 而它们说的正是这一趟会对
     // 用户的工作目录做什么(第三档:直接改、多个任务同时改、不产生任何提交)。
     // `editable: false`:卡上按不了 `w`,印键位提示等于指一条这里不存在的路。
-    `${gitChoiceLines(config, { editable: false }).map(l => `- ${l}`).join('\n')}\n` +
+    `${gitChoiceLines(config, { editable: false, unavailable: isolationReason }).map(l => `- ${l}`).join('\n')}\n` +
+    // 降级那一块也要上卡:原因是用户唯一能据此动手的东西,而「按 w 切回/选并发」在卡上
+    // 按不出来 —— 所以只印前面几行,`canInitGit: false`(卡上也没有 `g` 键)。
+    (isolationReason
+      ? `${isolationChoiceLines(isolationReason, false, isolationChoice(config)).map(l => `- ${l}`).join('\n')}\n`
+      : '') +
     // NOT "如需调整请在终端修改". This card's own approve button is the path that DISCARDS
     // terminal edits: the payload it claims with is {parallelism, approved} snapshotted when
     // the gate opened, and applyStartupDecision reads an absent roster as "unchanged". So a
@@ -72,8 +88,14 @@ export function buildStartupCard(config: EffTaskConfig, requestId: string, resum
     (guidanceLines(config).length > 0
       ? `\n\n**以下几段会被定向送进对应环节/角色**:\n${guidanceLines(config).map(l => `- ${l}`).join("\n")}`
       : '') +
-    (noticeLines(config).length > 0
-      ? `\n\n**以下请求不会生效**:\n${noticeLines(config).map(l => `- ${l}`).join('\n')}`
+    // 记录和「没生效的请求」分两块 —— 和终端两个关口同一份 `splitNotices`。实测过
+    // 恢复卡把「本次隔离方式: 共享目录 + 并发…」印在「以下请求不会生效」下面:两端对
+    // 同一件事说反话,而这条恰恰是这一趟真正的执行方式。
+    (splitNotices(config).records.length > 0
+      ? `\n\n**本次的执行方式**:\n${splitNotices(config).records.map(l => `- ${l}`).join('\n')}`
+      : '') +
+    (splitNotices(config).requests.length > 0
+      ? `\n\n**以下请求不会生效**:\n${splitNotices(config).requests.map(l => `- ${l}`).join('\n')}`
       : '') +
     (resume
       ? '\n\n' + resumeSummarySections(resume)

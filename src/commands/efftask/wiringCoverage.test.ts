@@ -132,7 +132,9 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
     expect(SRC).toContain('if (!disposition.keepPool) {')
     expect(SRC).toContain('sharedParallelRef.current = disposition.sharedParallel')
     // 反向:任何一处再拿 config.isolation 裸比较,就是那次回归本身。
-    expect(SRC).not.toMatch(/effectiveConfig.isolations*[!=]==s*'/)
+    // 这条断言自己被验过一次:`\\s` 的反斜杠丢掉的话,它只拦得住不写空格的写法,
+    // 而回归本身写的是 `effectiveConfig.isolation !== 'worktree'`(带空格)—— 照样放行。
+    expect(SRC).not.toMatch(/effectiveConfig\.isolation\s*[!=]==\s*'/)
   })
 
   it('启动关口拿到了隔离不可用的原因和 git init 入口 (spec §8)', () => {
@@ -171,7 +173,14 @@ describe('efftask.tsx 的接线不能被静默剪断', () => {
      * 判据一律读 `sharedParallelRef`(同步写下的 ref),不读 config —— 和
      * orchestrator 的 `deps.sharedParallel` 同源。
      */
-    expect(occurrences('poolRef.current === undefined && !sharedParallelRef.current')).toBe(5)
+    // 6 = 四处重算/调度 + 运行视图表头 + 结束屏表头。结束屏是用户看得最久的一屏
+    // (跑完停在这儿翻树),而「刚才那一趟到底有没有隔离」正是他在这儿决定要不要按
+    // `m` / `c` 时要知道的事。
+    expect(occurrences('poolRef.current === undefined && !sharedParallelRef.current')).toBe(6)
+    expect(element('DoneView')).toContain('sharedParallel={sharedParallelRef.current}')
+    // 两处转发:运行视图的包装层、结束屏里的那棵树。少一处 = 标记在那一屏上没了,
+    // 而两屏的 props 都收到了值 —— 这种断线在类型上完全合法。
+    expect(occurrences('sharedParallel={props.sharedParallel}')).toBe(2)
     // 反向:任何一处只写「没有池子」就算漏(第三档会被它当成串行)。
     expect(SRC).not.toMatch(/poolRef\.current === undefined(?!\s*&&\s*!sharedParallelRef)/)
   })

@@ -1236,7 +1236,8 @@ export function planPrompt(
     /**
      * **共享并发下,拆分方式本身就是安全机制。**
      *
-     * 上面那句 `sharedTreeNote` 是给**执行者**的约束(「只动属于你的文件」),而这一句是给
+     * 上面那句 `sharedTreeNote` 是给**执行者**的约束(「只动属于你的文件」——
+     * `executePrompt` 里有同一句,两处都要有:方案作者据它写方案,执行者据它动手),而这一句是给
      * **拆分者**的:两个子任务如果注定要写同一个文件,那么无论执行者多守规矩都会互相覆盖 ——
      * 而这一趟没有 git,连冲突都不会报。用户选这一档的前提逐字就是「任务是按照生成文件
      * 来划分的」,所以这句话必须真的出现在决定怎么拆的那一次调用里。
@@ -1599,6 +1600,23 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
   return (
     brief +
     `按以下方案执行任务并完成实际改动。方案:\n${quote(JSON.stringify(node.plan))}\n` +
+    /**
+     * **「你在哪、别碰什么」——** 这句话此前只进方案提示词,**执行者一个字都收不到**。
+     *
+     * 而它整句话是写给执行者的:「只能创建/修改属于本任务的文件」「不要跑会全局改写的
+     * 命令(整仓格式化、更新锁文件、`cargo fmt --all`、`git checkout .`)」。第三档
+     * (共享目录 + 并发)下它**就是全部的安全网** —— 拆分侧的「按产出文件划分」只能保证
+     * 交付物不重叠,挡不住一句 `cargo fmt --all`;而这一趟没有 git,覆盖了不会有任何
+     * 东西报错。隔离档下它同样有用:那一支说的是「不要进共享的 integration 工作区跑构建」,
+     * 而留在那里的未提交改动会让**别的节点**合并失败。
+     *
+     * 位置在方案之后、`degradeSection` 之前:先说「做什么」,再说「在哪做、别碰什么」,
+     * 然后才是上游已知的坑。
+     */
+    sharedTreeNote(ctx.worktrees !== undefined, node.worktree?.path, ctx.sharedParallel) +
+    // 工作目录本身也要说 —— 隔离档下 `sharedTreeNote` 已经带了路径,共享档下带不了
+    // (那句话说的是「没有隔离」),而执行者需要知道对着哪个目录动手。
+    (node.worktree?.path === undefined && ctx.cwd ? `工作目录:${quote(ctx.cwd)}\n` : '') +
     /**
      * **降级放行带下来的那几条,给执行者。**
      *

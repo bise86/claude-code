@@ -6888,3 +6888,62 @@ describe('执行循环有绝对上限,不会无限烧钱', () => {
     expect(calls).toBeLessThan((DEFAULT_CAPS.maxIterations * 4 + 8) * 3)
   })
 })
+
+/**
+ * **「你在哪、别碰什么」必须送到执行者手上。**
+ *
+ * 这句话此前只进方案提示词,而它整句是写给执行者的:「只能创建/修改属于本任务的文件」
+ * 「不要跑会全局改写的命令(整仓格式化、更新锁文件、`cargo fmt --all`、`git checkout .`)」。
+ * 第三档(共享目录 + 并发)下它**就是全部的安全网** —— 拆分侧的「按产出文件划分」只能
+ * 保证交付物不重叠,挡不住一句 `cargo fmt --all`,而这一趟没有 git,覆盖了不会有任何
+ * 东西报错。断线时全仓 4228 个测试一个都不红。
+ */
+describe('执行者拿到「你在哪、别碰什么」', () => {
+  const execPrompt = async (over: Partial<PipelineCtx>): Promise<string> => {
+    let seen = ''
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') seen = req.prompt
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"做完了"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    await stepExecute(n, { ...ctxFor([n], runAgent), ...over })
+    return seen
+  }
+
+  it('第三档:点名「多个任务正在同一个目录里同时工作」和那几条全局改写命令', async () => {
+    const p = await execPrompt({ sharedParallel: true, cwd: '/work' })
+    expect(p).toContain('多个任务正在同一个目录里同时工作')
+    expect(p).toContain('不要改别的任务的文件')
+    expect(p).toContain('cargo fmt --all')
+    expect(p).toContain('git checkout .')
+    // 对着哪个目录动手也要说 —— 共享档下没有节点专属路径可印。
+    expect(p).toContain('工作目录:')
+  })
+
+  it('共享串行档:说清没有隔离、改动不会被自动提交', async () => {
+    const p = await execPrompt({ cwd: '/work' })
+    expect(p).toContain('本次运行没有隔离')
+    expect(p).toContain('改动不会被自动提交')
+    // 并发那一档的措辞不能漏进来 —— 这一档确实一次只有一个人在改。
+    expect(p).not.toContain('多个任务正在同一个目录里同时工作')
+  })
+
+  /** 隔离档下这句话说的是另一件事:别进共享的 integration 工作区跑构建。 */
+  it('隔离档:点名 integration 是共享的、不要在里面跑会改文件的命令', async () => {
+    const p = await execPrompt({
+      worktrees: {
+        acquire: async () => ({ path: '/wt/root', branch: 'b', gitRoot: '/repo' }),
+        commitAndMerge: async () => ({ ok: true, merged: true }),
+        release: async () => ({ removed: true }),
+        withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      } as never,
+    })
+    expect(p).toContain('.efftask-worktrees/integration')
+    expect(p).toContain('留在那里的未提交改动会让别的节点合并失败')
+  })
+})

@@ -2155,7 +2155,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     const { feishuClient, feishuPermissionCallbacks } = store.getState()
     if (feishuClient && feishuPermissionCallbacks) {
       const requestId = randomUUID()
-      const cardContent = buildStartupCard(config, requestId, summary ?? undefined, isolation)
+      const cardContent = buildStartupCard(config, requestId, summary ?? undefined, isolation, isolationReason ?? undefined)
       surfaces.push((claim, onTeardown) =>
         sendFeishuStartupCard(
           {
@@ -2989,6 +2989,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   return (
     <DoneView
       nodes={nodes} runId={runId ?? ''} streams={streams.current} outcome={outcome}
+      serialExecute={poolRef.current === undefined && !sharedParallelRef.current}
+      sharedParallel={sharedParallelRef.current}
       handoff={handoff} handoffResult={handoffResult} handoffState={handoffState}
       viewOnly={viewOnly} onExit={props.onExit}
       /**
@@ -3179,6 +3181,14 @@ export function DoneView(props: {
   nodes: TaskNode[]
   runId: string
   streams?: StreamStore
+  /**
+   * 这一趟怎么跑的 —— 表头上那两个标记。**结束屏此前一个都没有**。
+   *
+   * 它是用户看得最久的一屏(跑完之后停在这儿翻树),而「刚才那一趟到底有没有隔离」
+   * 正是他在这儿决定要不要按 `m` / `c` 时要知道的事。
+   */
+  serialExecute?: boolean
+  sharedParallel?: boolean
   outcome: Outcome | null
   handoff: HandoffSummary | null
   /**
@@ -3239,6 +3249,8 @@ export function DoneView(props: {
         nodes={props.nodes}
         runId={props.runId}
         interactive
+        serialExecute={props.serialExecute}
+        sharedParallel={props.sharedParallel}
         reservedRows={summaryRows}
         // "完成后保留最终输出" — the buffer outlives the run, so the done view keeps it.
         streams={props.streams}

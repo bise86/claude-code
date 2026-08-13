@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, type IsolationChoice, ISOLATION_DEGRADE_PREFIX, reconcileIsolationNotices, splitNotices, isSharedTree, isolationChoiceLines, parallelismIsolation, poolDisposition, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, type IsolationChoice, ISOLATION_DEGRADE_PREFIX, ISOLATION_REASON_PREFIX, ISOLATION_RECORD_PREFIX, reconcileIsolationNotices, splitNotices, isSharedTree, isolationChoiceLines, parallelismIsolation, poolDisposition, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -1831,5 +1831,47 @@ describe('第三档的不适用清单', () => {
   it('系统临时目录里的残留也说清没人回收', () => {
     expect(t()).toContain('系统临时目录')
     expect(t()).toContain('没有 c 键')
+  })
+})
+
+/**
+ * **每 `--resume` 一次就多一条重复原因 —— 实测三趟堆了 3 条。**
+ *
+ * 改写之后那条原因如果不带可识别前缀,下一趟又会被推一条新的降级说明、再改写一次,
+ * 而旧的留在 `rest` 里。后果不只是 run.md 变长:恢复关口用 `key={l}` 渲染这一列,
+ * React 当场报 duplicate key,屏幕上同一行印三次。
+ */
+describe('降级原因不许随 --resume 累积', () => {
+  const degrade = `${ISOLATION_DEGRADE_PREFIX}fatal: integration already exists`
+
+  it('连着三趟只留一条原因', () => {
+    let out = reconcileIsolationNotices([degrade], 'shared-parallel') ?? []
+    for (let i = 0; i < 2; i++) {
+      // 下一趟:命令层在关口之前又推了一条(池子照样建不起来)。
+      out = reconcileIsolationNotices([...out, degrade], 'shared-parallel') ?? []
+    }
+    expect(out.filter(n => n.startsWith(ISOLATION_REASON_PREFIX))).toHaveLength(1)
+    expect(out.filter(n => n.startsWith(ISOLATION_RECORD_PREFIX))).toHaveLength(1)
+    // 渲染侧靠整行做 key,所以整份清单必须没有重复行。
+    expect(new Set(out).size).toBe(out.length)
+  })
+
+  it('两个不同的原因都留着(它们不是同一件事)', () => {
+    const other = `${ISOLATION_DEGRADE_PREFIX}当前目录不是 git 仓库`
+    const out = reconcileIsolationNotices([degrade, other], 'shared') ?? []
+    expect(out.filter(n => n.startsWith(ISOLATION_REASON_PREFIX))).toHaveLength(2)
+  })
+
+  /**
+   * 认不出的档**不编一句**。前两个新判据落到 else 是往安全方向倒,这一个落到 else
+   * 是说了一句假话(手改 run.md 写出的怪值会被印成「每个执行任务在自己的工作区里跑,
+   * 完成时合并回你当前的分支」)。
+   */
+  it('怪值不编记录', () => {
+    const out = reconcileIsolationNotices([degrade], 'bogus' as never) ?? []
+    expect(out.filter(n => n.startsWith(ISOLATION_RECORD_PREFIX))).toHaveLength(0)
+    expect(out.join('\n')).not.toContain('worktree 隔离')
+    // 原因照旧留着 —— 它和档位无关。
+    expect(out.join('\n')).toContain(ISOLATION_REASON_PREFIX)
   })
 })
