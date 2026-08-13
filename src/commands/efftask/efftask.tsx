@@ -2607,6 +2607,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       <ConfirmBacktrack
         target={target}
         nodes={nodes}
+        // 池子在不在 —— 这一屏据它决定要不要承诺「删掉工作区并从集成分支重建」。
+        isolated={poolRef.current !== undefined}
         onRun={async onProgress => {
           if (!cfg || !dir) {
             onProgress('这一趟还没有 run 目录,回溯无处落盘')

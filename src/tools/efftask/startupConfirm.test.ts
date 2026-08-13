@@ -1875,3 +1875,35 @@ describe('降级原因不许随 --resume 累积', () => {
     expect(out.join('\n')).toContain(ISOLATION_REASON_PREFIX)
   })
 })
+
+/**
+ * **「不产生任何提交」不等于「盘上什么都没留下」。**
+ *
+ * 池子是在关口**打开之前**建的,选了共享之后它只是被放下(不删,下一趟接着用),于是
+ * 每跑一趟就留下一条 `efftask/<runId>/integration` 分支和一个常驻的
+ * `.efftask-worktrees/integration` 检出 —— 实测同一个仓库连跑两趟后 `git branch -a` 里
+ * 两条都在。而回收它们的 `c` / `m` 两个键恰恰因为池子被放下而整个消失。
+ */
+describe('共享档留在盘上的那两样', () => {
+  const t = (iso: string, unavailable?: string): string => gitChoiceLines(
+    { goalPrompt: 'g', parallelism: 3, phaseRoles: emptyPhaseRoles(), caps: { ...DEFAULT_CAPS }, notices: [], isolation: iso as never },
+    { editable: false, unavailable },
+  ).join('\n')
+
+  it('隔离本来可用时,两档共享都要说清它们留着,并给出清理命令', () => {
+    for (const iso of ['shared', 'shared-parallel']) {
+      expect(t(iso)).toContain('.efftask-worktrees/integration')
+      expect(t(iso)).toContain('git worktree remove')
+      expect(t(iso)).toContain('git branch -D')
+    }
+  })
+
+  /** 隔离用不了的那一趟池子根本没建起来 —— 盘上什么都没有,说了就是噪声。 */
+  it('隔离用不了时不说', () => {
+    expect(t('shared-parallel', '当前目录不是 git 仓库')).not.toContain('git worktree remove')
+  })
+
+  it('worktree 档不说 —— 那一档它们本来就是正常工作的一部分', () => {
+    expect(t('worktree')).not.toContain('git worktree remove')
+  })
+})

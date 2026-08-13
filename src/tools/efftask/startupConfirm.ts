@@ -449,6 +449,21 @@ export function gitChoiceLines(
     // gitRoot/pathFor 才建得出来),这一档下那个键整个不存在。跑机上它是 23 GB 的来源。
     out.push('  子任务写到系统临时目录里的中间产物这一档也不回收(没有 c 键),需要时自己清。')
   }
+  /**
+   * **池子是在这个关口打开之前就建好的。**
+   *
+   * 选了共享之后它只是被「放下」(不删 —— `init()` 可重入、从不移动已存在的集成分支,
+   * 下一趟原样接手,这和按 Esc 那条路的处置逐字相同),于是盘上留着一条
+   * `efftask/<runId>/integration` 分支和 `.efftask-worktrees/integration` 这个常驻检出。
+   * 严格说没有产生 commit,但产生了 ref 和一个检出 —— 对一个刚被承诺「不产生任何提交」
+   * 的用户,`git branch` 里冒出一堆 `efftask/*` 是意外。而回收它们的 `c` / `m` 两个键
+   * 恰恰因为池子被放下而整个消失。
+   *
+   * 只在**隔离本来可用**时说:用不了的时候池子根本没建起来,盘上什么都没有。
+   */
+  if (isSharedTree(iso) && !opts.unavailable) {
+    out.push(`  提醒: 集成分支 efftask/<run-id>/integration 和 .efftask-worktrees/integration 这个检出在关口之前就建好了,选了共享之后它们**留在盘上**(下一趟接着用);要清的话:git worktree remove .efftask-worktrees/integration && git branch -D efftask/<run-id>/integration。`)
+  }
   // 收口方式**不再是一个开关**:只有主干开发(用户:「不要什么分支开发」)。隔离运行下
   // 每个子任务通过验收就合回当前分支一次,所以这一行说的是「会发生什么」,不是「你选了什么」。
   if (iso === 'worktree' && !opts.unavailable) {

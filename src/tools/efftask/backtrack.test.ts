@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import {
   backtrackLines, backtrackScope, composeRedos, levelFor, markBacktracked, outputMissing,
-  NO_CONTRIBUTION_NOTE,
+  NO_CONTRIBUTION_NOTE, type BacktrackTarget,
 } from './backtrack.js'
 import { parseNodeFile, serializeNode } from './persistence.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
@@ -290,5 +290,38 @@ describe('确认屏', () => {
 
   it('一个都没有时说清楚,不印空标题', () => {
     expect(backtrackLines([], [])[0]).toContain('没有需要回溯的任务')
+  })
+})
+
+/**
+ * **没有隔离工作区的那两档,这一屏不许承诺删目录和重新同步。**
+ *
+ * 实测:共享目录下它无条件印「它们的隔离工作区会被删掉并从集成分支最新状态重建」——
+ * 那里既没有工作区也没有集成分支,而启动关口自己刚说过「b(回溯)的重新同步……不适用」。
+ * 而且这不只是文案:第 2 级「完全重做」在隔离档下靠 `discard()` 换来干净重编,共享档下
+ * `worktreesToRelease` 恒为空,上一轮写进用户目录的文件原样留着,重跑面对的是脏现场 ——
+ * 用户在按下这个**不可逆**动作之前读到的是相反的承诺。
+ */
+describe('确认屏 · 没有隔离工作区时', () => {
+  const targets = (): BacktrackTarget[] => [
+    { node: mk('b', { title: '乙' }), level: 1, blocking: '测试不全', remedy: [], suspects: [] },
+  ]
+  const entries = [{ nodeId: 'b', entry: 'execute' }]
+
+  it('不承诺删工作区,而且说清上一轮的文件原样留着', () => {
+    const text = backtrackLines(targets(), entries, false).join('\n')
+    expect(text).not.toContain('隔离工作区会被删掉')
+    expect(text).not.toContain('从集成分支最新状态重建')
+    expect(text).toContain('原样留着')
+  })
+
+  it('有隔离时照旧说清会删会重建 —— 那是这个键最贵的一半', () => {
+    const text = backtrackLines(targets(), entries, true).join('\n')
+    expect(text).toContain('隔离工作区会被删掉并从集成分支最新状态重建')
+  })
+
+  /** 不传 = 当成有隔离(既有调用点的语义不变)。 */
+  it('缺省当成有隔离', () => {
+    expect(backtrackLines(targets(), entries).join('\n')).toContain('隔离工作区会被删掉')
   })
 })

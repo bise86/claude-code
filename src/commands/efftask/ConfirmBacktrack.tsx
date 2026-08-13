@@ -34,6 +34,13 @@ import { redoSummaryLines } from './ConfirmRedo.js'
  * 它们都是这一屏的出口,发过一个就不该再发另一个。
  */
 export function ConfirmBacktrack(props: {
+  /**
+   * 这一趟有没有隔离工作区(池子在不在)。缺省当成有。
+   *
+   * 共享目录那两档下不传的话,这一屏会承诺「隔离工作区会被删掉并从集成分支最新状态
+   * 重建」—— 那里既没有工作区也没有集成分支,而重做面对的是上一轮留下的脏现场。
+   */
+  isolated?: boolean
   target: TaskNode
   nodes: readonly TaskNode[]
   /** 真的跑一次回溯。进度一条一条推回来 —— 主模型那一步是分钟级的。 */
@@ -117,7 +124,13 @@ export function ConfirmBacktrack(props: {
 
   const lines = mode === 'done'
     ? resultLines(outcome)
-    : backtrackLines(targets, targets.flatMap(t => (t.suspects.length > 0 ? t.suspects : [t.node.id])).map(id => ({ nodeId: id, entry: '' })))
+    : backtrackLines(
+        targets,
+        targets.flatMap(t => (t.suspects.length > 0 ? t.suspects : [t.node.id])).map(id => ({ nodeId: id, entry: '' })),
+        // 这一趟到底有没有工作区可删可同步。**判据是池子在不在**,不是配置里写着什么
+        // (配置可以写着隔离而每一次 acquire 都失败)。
+        props.isolated !== false,
+      )
   const { shown, hidden } = redoSummaryLines(lines, rows, columns)
   const footer = mode === 'done' || targets.length === 0
     ? '回车 / q / Esc 返回'

@@ -264,6 +264,18 @@ export function markBacktracked(
 /** 确认屏那几行。**是数据,不是 JSX**。 */
 export function backtrackLines(
   targets: readonly BacktrackTarget[], entries: readonly { nodeId: string; entry: string }[],
+  /**
+   * 这一趟**有没有隔离工作区**。缺省 true 是为了不动既有调用点的语义,但界面必须传。
+   *
+   * 不接这个参数的后果是实测出来的:共享目录那两档下,这一屏无条件承诺「它们的隔离
+   * 工作区会被删掉并从集成分支最新状态重建」—— 而那里既没有工作区也没有集成分支,
+   * 而且启动关口自己刚说过「b(回溯)的重新同步……不适用」,同一个产品对同一件事
+   * 说两套话。更要紧的是它不只是文案:第 2 级「完全重做」在隔离档下靠 `discard()`
+   * 换来干净重编,共享档下 `worktreesToRelease` 恒为空,上一轮写进用户目录的文件
+   * **原样留着**,重跑的子任务面对的是脏现场 —— 而用户在按下这个不可逆动作之前
+   * 读到的是相反的承诺。
+   */
+  isolated = true,
 ): string[] {
   const out: string[] = []
   if (targets.length === 0) {
@@ -315,7 +327,9 @@ export function backtrackLines(
   const execCount = entries.filter(e => !lvl2Ids.has(e.nodeId)).length
   out.push(
     `按现在的证据算:${execCount} 个任务重跑执行阶段、${entries.length - execCount} 个完全重做;` +
-    `它们的隔离工作区会被删掉并从集成分支最新状态重建。`,
+    (isolated
+      ? '它们的隔离工作区会被删掉并从集成分支最新状态重建。'
+      : '这一趟没有隔离工作区,所以**不会删任何目录、也没有重新同步这一步** —— 上一轮写进你工作目录的文件原样留着,重跑是在这些文件之上继续改。'),
   )
   out.push('确认之后会先派主模型读一遍集成验收的意见,**具体重跑哪几个可能和上面这份不同**(它拿不到模型时就照这份走)。')
   // 这一句是这个键和 `r` 最不一样的地方:它**不开圆桌**,判决仍然由之后的集成验收给出。
