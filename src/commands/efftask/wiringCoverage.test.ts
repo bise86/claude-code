@@ -1113,3 +1113,35 @@ describe('修复损毁的任务:g 键五跳都要接上', () => {
       .toBe('persist 带上了: true')
   })
 })
+
+/**
+ * **回溯(`b`)的接线不能被静默剪断。**
+ *
+ * 这一节存在的直接理由是一次现成的事故:写这个功能时 `runBacktrack` 在 `efftask.tsx` 里
+ * **用了但没导入**,而全套 3635 条测试照绿 —— 那个文件挂不起来,没有任何东西会加载它。
+ * 键位那一层有真按键探针(detailCtrlKeys),这里守的是它下游那几跳。
+ */
+describe('回溯键的接线', () => {
+  it('两个视图都接了 —— 只接一处等于功能一半不存在', () => {
+    // 主用例是「验收失败」,那通常发生在**结束屏**。
+    expect(SRC).toContain(`setBacktrackFrom('running'); setPhase('confirmBacktrack')`)
+    expect(SRC).toContain(`setBacktrackFrom('done'); setPhase('confirmBacktrack')`)
+  })
+
+  it('关口真的会去跑回溯,而且带着主模型那一步', () => {
+    expect(SRC).toContain('await runBacktrack(')
+    // 用了就必须导入 —— 那次事故的形状。
+    expect(SRC).toContain(`from '../../tools/efftask/backtrackRun.js'`)
+    expect(SRC).toContain('makeBacktrackMapper(')
+    expect(SRC).toContain(`from '../../tools/efftask/handoffResolve.js'`)
+  })
+
+  /**
+   * 主模型那一步是分钟级的。中止句柄要 chain 到 run 级 signal —— 少了它,Esc 关屏之后
+   * 那次调用还在烧钱(`d` 键为同一件事接过一次)。
+   */
+  it('主模型那一步可以被中止', () => {
+    expect(SRC).toContain('backtrackAbort')
+    expect(SRC).toContain(`props.signal.addEventListener('abort', onRunAbort, { once: true })`)
+  })
+})

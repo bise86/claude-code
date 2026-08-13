@@ -177,3 +177,69 @@ describe('详情页的动作键不许被 ctrl / meta 触发', () => {
     expect(log).toEqual([])
   })
 })
+
+/**
+ * **`b` 键要真的按得动,而且不许被修饰键触发。**
+ *
+ * 挂真组件、送真序列 —— 这条是唯一能证明「键接上了」的方式。写这个功能时踩过一次现成的
+ * 例子:`runBacktrack` 在 `efftask.tsx` 里**用了但没导入**,而全套测试照绿
+ * (那个文件挂不起来)。键位这一层挂得起来,就该在这里钉死。
+ */
+describe('回溯键 b', () => {
+  const mountWithBacktrack = async (log: string[]) => {
+    const t = fakeTty(120)
+    const app = await render(
+      <TaskTreePanel
+        nodes={TREE()} runId="003" interactive
+        onRedo={n => log.push(`redo:${n.id}`)}
+        onBacktrack={n => log.push(`backtrack:${n.id}`)}
+        onExitKey={() => log.push('exit')}
+      />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(ENTER); await tick()
+    return { t, app }
+  }
+
+  it('裸 b 触发回溯,带着当前节点', async () => {
+    const log: string[] = []
+    const { t, app } = await mountWithBacktrack(log)
+    t.stdin.press('b'); await tick()
+    app.unmount()
+    expect(log).toEqual(['backtrack:root'])
+  })
+
+  it('页脚要宣告它 —— 一个不被宣告的键等于不存在', async () => {
+    const log: string[] = []
+    const { t, app } = await mountWithBacktrack(log)
+    const frame = t.lastFrame()
+    app.unmount()
+    expect(frame).toContain('b 回溯')
+  })
+
+  it('没给回调时 b 是死键,而且页脚不宣告它', async () => {
+    const log: string[] = []
+    const t = fakeTty(120)
+    const app = await render(
+      <TaskTreePanel nodes={TREE()} runId="003" interactive onExitKey={() => log.push('exit')} />,
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    t.stdin.press(ENTER); await tick()
+    const frame = t.lastFrame()
+    t.stdin.press('b'); await tick()
+    app.unmount()
+    expect(log).toEqual([])
+    expect(frame).not.toContain('b 回溯')
+  })
+
+  /** 和 `c`/`q` 同一条规矩:带 ctrl 的那一下不算这里的动作键。 */
+  it('Ctrl+B 不触发回溯', async () => {
+    const log: string[] = []
+    const { t, app } = await mountWithBacktrack(log)
+    t.stdin.press('\x02'); await tick()
+    app.unmount()
+    expect(log).toEqual([])
+  })
+})

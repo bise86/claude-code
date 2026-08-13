@@ -14,6 +14,7 @@
 //
 // 所以这个文件只负责一件事:把「有冲突要解」翻译成一次带写工具的模型调用。
 import type { ConflictResolver } from './handoffActions.js'
+import type { BacktrackTarget } from './backtrack.js'
 import type { RescueTriage } from './rescue.js'
 import type { RunAgentFn } from './roundtable.js'
 import type { TaskNode } from './types.js'
@@ -125,18 +126,98 @@ export function makeRescueTriage(deps: {
 }
 
 /**
+ * **回溯的映射调用:哪几个子任务要重跑、各自补哪句话。**
+ *
+ * 用户原话:「优先触发相应任务重新执行阶段,**补进解决对应问题提示词**。」
+ * 「而不是再去开圆桌。」
+ *
+ * 所以这一次调用**不带判决**:没有席位、没有 quorum、不产出 pass/fail。它读的是集成验收
+ * **已经写下来**的 blocking 意见,做的只是「把意见对上具体的子任务」这一件事。最终那次
+ * 「合起来达没达成父目标」的结论仍由子任务修完之后的集成验收给出。
+ *
+ * 走**只读那一档**(`phase: 'plan'`):它要做的全部事情是读记录然后给名单;给它写工具,
+ * 一个「顺手帮你改一下」的模型就能绕开整条返工链。
+ *
+ * 解析失败回空数组,而**下游把空数组当降级**(退回保守名单并说出来)—— 所以这个方向是安全的。
+ */
+export function makeBacktrackMapper(deps: {
+  runAgent: RunAgentFn
+  node: TaskNode
+  signal: AbortSignal
+}): (targets: readonly BacktrackTarget[]) => Promise<{ nodeId: string; guidance?: string }[]> {
+  return async targets => {
+    if (targets.length === 0) return []
+    const list = targets.map(t =>
+      `## 任务 ${JSON.stringify(t.node.id)} —— ${t.node.title}\n` +
+      `集成验收没通过,它给的意见:\n${t.blocking || '(没有留下意见)'}\n` +
+      (t.remedy.length > 0 ? `它还提过这些补救项:${t.remedy.join('、')}\n` : '') +
+      `它的子任务:\n${t.node.childIds.map(id => `- ${JSON.stringify(id)}`).join('\n') || '(没有子任务)'}\n` +
+      (t.suspects.length > 0 ? `其中看起来有问题的:${t.suspects.map(s => JSON.stringify(s)).join('、')}\n` : ''),
+    ).join('\n')
+    const out = await deps.runAgent({
+      phase: 'plan',
+      node: deps.node,
+      role: null,
+      system: 'plan',
+      prompt:
+        `下面这些任务的**集成验收没有通过**。请把每一条意见对上**具体该重跑哪个子任务**,` +
+        `并给它一句针对性的修正要求。\n\n${list}\n\n` +
+        `规则:\n` +
+        `- 只能点上面列出来的任务 id(父任务自己或它的子任务),**不要编新的 id**;\n` +
+        `- 一个子任务只点一次;拿不准就点上面「看起来有问题的」那几个;\n` +
+        `- \`guidance\` 是要注入它**执行阶段**提示词的话 —— 写清「这次要补上什么」,` +
+        `不要写成对它的评价。\n\n` +
+        `只输出一个 JSON 数组,放在 \`\`\`json 代码块里,每项:\n` +
+        `{"nodeId":"...","guidance":"这次要补上什么"}`,
+      signal: deps.signal,
+    })
+    return parseBacktrackMap(out)
+  }
+}
+
+/**
+ * 从模型回复里抽出回溯名单。**看不懂的一律当作没说** —— 下游会退回保守名单并说出来,
+ * 所以这个方向是安全的(而「猜一个」会让一批不该重跑的任务被重跑)。
+ *
+ * 这里**不校验 id 落不落在血统里** —— 那道白名单在 `runBacktrack` 里,靠它自己算出来的
+ * 范围判。分两处的理由是这个函数拿不到那棵树,而把范围传进来只会造出第二个真相源。
+ */
+export function parseBacktrackMap(raw: string): { nodeId: string; guidance?: string }[] {
+  for (const b of fencedBlocks(raw).reverse()) {
+    try {
+      const parsed: unknown = JSON.parse(b.trim())
+      if (!Array.isArray(parsed)) continue
+      const out: { nodeId: string; guidance?: string }[] = []
+      for (const row of parsed) {
+        if (typeof row !== 'object' || row === null) continue
+        const r = row as { nodeId?: unknown; guidance?: unknown }
+        if (typeof r.nodeId !== 'string' || r.nodeId.length === 0) continue
+        out.push({ nodeId: r.nodeId, ...(typeof r.guidance === 'string' && r.guidance ? { guidance: r.guidance } : {}) })
+      }
+      if (out.length > 0) return out
+    } catch { /* 下一个围栏 */ }
+  }
+  return []
+}
+
+/** 回复里的围栏内容;一个都没有就把整段当一块试一次(**不做任何宽松修补**)。 */
+function fencedBlocks(raw: string): string[] {
+  const fence = /```(?:json)?\s*([\s\S]*?)```/g
+  const blocks: string[] = []
+  for (let m = fence.exec(raw); m !== null; m = fence.exec(raw)) if (m[1]) blocks.push(m[1])
+  return blocks.length > 0 ? blocks : [raw]
+}
+
+/**
  * 从模型回复里抽出分诊结果。**任何看不懂的东西都当作没说** ——
  * 下游把「没说」一律算「拿不准」,所以这个方向是安全的。
  */
 export function parseTriage(
   raw: string, known: ReadonlySet<string>,
 ): { ref: string; verdict: 'merge' | 'skip' | 'unsure'; why: string }[] {
-  const fence = /```(?:json)?\s*([\s\S]*?)```/g
-  const blocks: string[] = []
-  for (let m = fence.exec(raw); m !== null; m = fence.exec(raw)) if (m[1]) blocks.push(m[1])
-  // 没有围栏就拿整段试一次 —— 但**不做任何宽松修补**。
-  if (blocks.length === 0) blocks.push(raw)
-  for (const b of blocks.reverse()) {
+  // 围栏抽取和 `parseBacktrackMap` **共用一份**:两份实现会在「多个围栏取哪个」
+  // 这种细节上悄悄分叉,而那正好是模型改口时唯一起作用的地方。
+  for (const b of fencedBlocks(raw).reverse()) {
     try {
       const parsed: unknown = JSON.parse(b.trim())
       if (!Array.isArray(parsed)) continue

@@ -24,10 +24,11 @@ import { loadRun, sweepTempFiles, writeNode as writeNodeFile, writeRunManifest, 
 import { failedRedoTarget, forcePassFailedPhaseReason, redoContextOf, redoUnavailableReason, skipFailedPhaseReason, type RedoEntry, type RedoPlan } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
 import { runForcePass, runRedo, runSkip } from '../../tools/efftask/redoRun.js'
+import { runBacktrack } from '../../tools/efftask/backtrackRun.js'
 import { liveRedoUnavailableReason } from '../../tools/efftask/liveRedo.js'
 import { ConfirmHandoff } from './ConfirmHandoff.js'
 import { runHandoffChoice, type HandoffChoice, type HandoffResult } from '../../tools/efftask/handoffActions.js'
-import { makeHandoffConflictResolver, makeRescueTriage } from '../../tools/efftask/handoffResolve.js'
+import { makeBacktrackMapper, makeHandoffConflictResolver, makeRescueTriage } from '../../tools/efftask/handoffResolve.js'
 import type { PendingHandoff } from '../../tools/efftask/types.js'
 import { parseResumeArgs, type ResumeArgs } from '../../tools/efftask/parseResumeArgs.js'
 import { readRunManifest, validateLoadedNodes } from '../../tools/efftask/resumeCore.js'
@@ -84,6 +85,7 @@ import { getCwd } from '../../utils/cwd.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { createStreamStore, PRE_TREE_NODE, type StreamHandle, type StreamState, type StreamStore } from '../../tools/efftask/agentStream.js'
 import { createAgentLogWriter, readAgentLog, type AgentLogWriter } from '../../tools/efftask/agentLog.js'
+import { ConfirmBacktrack } from './ConfirmBacktrack.js'
 import { ConfirmRepair } from './ConfirmRepair.js'
 import { repairNode, scanRepair, type RepairDeps } from '../../tools/efftask/nodeRepairRun.js'
 import { AgentLogPane, useStreamTick } from './AgentLogPane.js'
@@ -989,6 +991,11 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   const [mergeTarget, setMergeTarget] = React.useState<TaskNode | null>(null)
   /** 详情页 `g`:要修的那个节点、从哪一屏进来的、以及这一次修复调用的 controller。 */
   const [repairTarget, setRepairTarget] = React.useState<TaskNode | null>(null)
+  /** 回溯(详情页 `b`)的目标,以及从哪一屏进来的 —— 确认完要原样回去。 */
+  const [backtrackTarget, setBacktrackTarget] = React.useState<TaskNode | null>(null)
+  const [backtrackFrom, setBacktrackFrom] = React.useState<'running' | 'done'>('done')
+  /** 回溯里那次主模型调用的中止句柄。Esc 关屏要停掉它,否则它还在烧钱。 */
+  const backtrackAbort = React.useRef<AbortController | null>(null)
   const [repairFrom, setRepairFrom] = React.useState<'running' | 'done'>('running')
   const repairAbort = React.useRef<AbortController | null>(null)
   const [mergeFrom, setMergeFrom] = React.useState<Phase>('done')
@@ -2496,6 +2503,56 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  if (phase === 'confirmBacktrack' && backtrackTarget) {
+    /**
+     * 回溯(详情页 `b`)。**会重启编排** —— 下游是 `startRun`,所以它和重做那几条是
+     * 同一形状,而不是 `c`/`m` 那种「只动磁盘/只动 git」的岔路。
+     *
+     * 判据和顺序全在 `backtrack.ts` / `backtrackRun.ts`(那里能被真的调用一次并断言);
+     * 这一屏只接线。主模型那一步的中止和 `d` 键同款:每次一个 controller,
+     * 并 chain 到 run 级 signal —— 否则 Esc 关屏之后调用还在烧钱。
+     */
+    const target = backtrackTarget
+    const cfg = config
+    const dir = runDir
+    const close = (): void => { backtrackAbort.current = null; setBacktrackTarget(null); setPhase(backtrackFrom) }
+    return (
+      <ConfirmBacktrack
+        target={target}
+        nodes={nodes}
+        onRun={async onProgress => {
+          if (!cfg || !dir) {
+            onProgress('这一趟还没有 run 目录,回溯无处落盘')
+            return undefined
+          }
+          const ac = new AbortController()
+          backtrackAbort.current = ac
+          const onRunAbort = (): void => ac.abort()
+          if (props.signal.aborted) ac.abort()
+          else props.signal.addEventListener('abort', onRunAbort, { once: true })
+          try {
+            const root = nodes.find(n => n.parentId === null) ?? nodes[0]
+            return await runBacktrack(
+              nodes, target.id, new Date().toISOString(),
+              {
+                ...redoDeps(cfg, dir, backtrackFrom === 'running' ? 'running' : 'done'),
+                onProgress,
+                // 主模型那一次**不带判决**:只把已经写下来的验收意见对上具体的子任务。
+                ...(root
+                  ? { map: makeBacktrackMapper({ runAgent: props.runRecalcAgent, node: root, signal: ac.signal }) }
+                  : {}),
+              },
+              n => phaseCtxOf(n, cfg),
+            )
+          } finally {
+            props.signal.removeEventListener('abort', onRunAbort)
+          }
+        }}
+        onDone={close}
+        onCancel={close}
+      />
+    )
+  }
   if (phase === 'confirmRepair' && repairTarget) {
     /**
      * 修复损毁的任务(详情页 `g`)。**不重启编排、不动别的节点** —— 它只把这一个节点
@@ -2763,6 +2820,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 执行者写着),关口自己会把「跳过 N 个还没跑完的任务」写在屏幕上。
        */
       onRepairNode={node => { setRepairTarget(node); setRepairFrom('running'); setPhase('confirmRepair') }}
+      onBacktrack={node => { setBacktrackTarget(node); setBacktrackFrom('running'); setPhase('confirmBacktrack') }}
       onMergeWorktrees={poolRef.current ? node => {
         setMergeTarget(node); setMergeFrom('running'); setPhase('confirmMerge')
       } : undefined}
@@ -2921,6 +2979,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 这个键不重开编排、不动任务树,只把已经跑完的东西送到他的分支上。
        */
       onRepairNode={node => { setRepairTarget(node); setRepairFrom('done'); setPhase('confirmRepair') }}
+      onBacktrack={node => { setBacktrackTarget(node); setBacktrackFrom('done'); setPhase('confirmBacktrack') }}
       onMergeWorktrees={poolRef.current ? node => {
         setMergeTarget(node); setMergeFrom('done'); setPhase('confirmMerge')
       } : undefined}
@@ -3007,6 +3066,8 @@ export function RunningView(props: {
   /** 给了才有 m 键(把这棵子树里还没合进主干的隔离工作区合掉,撞冲突派主模型解决)。 */
   onMergeWorktrees?: (node: TaskNode) => void
   onRepairNode?: (node: TaskNode) => void
+  /** 回溯:集成验收没通过的、以及产出丢了的任务重新推一遍。详情页 `b`。 */
+  onBacktrack?: (node: TaskNode) => void
   /**
    * 依赖重算(详情页 d 键)。**只有运行视图有** —— 它要 hold 住节点、还要叫醒调度,
    * 而结束屏没有编排器可以做这两件事。回一句话 = 准入没过、不切屏;undefined = 去调模型。
@@ -3021,7 +3082,7 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.
@@ -3061,6 +3122,8 @@ export function DoneView(props: {
   /** 给了才有 m 键(把这棵子树里还没合进主干的隔离工作区合掉,撞冲突派主模型解决)。 */
   onMergeWorktrees?: (node: TaskNode) => void
   onRepairNode?: (node: TaskNode) => void
+  /** 回溯:集成验收没通过的、以及产出丢了的任务重新推一遍。详情页 `b`。 */
+  onBacktrack?: (node: TaskNode) => void
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -3096,7 +3159,7 @@ export function DoneView(props: {
         onForcePass={props.onForcePass}
         onCleanupWorktrees={props.onCleanupWorktrees}
         onMergeWorktrees={props.onMergeWorktrees}
-        onRepairNode={props.onRepairNode}
+        onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">

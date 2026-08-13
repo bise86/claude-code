@@ -263,6 +263,11 @@ export function TaskTreePanel(props: {
   /** 详情页 `g`:修复一个损毁的任务文件(账 + 残骸 + 主模型协助)。 */
   onRepairNode?: (node: TaskNode) => void
   /**
+   * 回溯:把这棵子树里**集成验收没通过**的、以及**产出丢了**的任务重新推一遍。
+   * 详情页 `b` 键。
+   */
+  onBacktrack?: (node: TaskNode) => void
+  /**
    * 运行中的人工干预。给了才有 p / i / x 三个键。
    *
    * 只在运行视图给 —— 结束之后没有东西可以暂停或取消,而一个按了没反应的键比没有更糟。
@@ -489,6 +494,18 @@ export function TaskTreePanel(props: {
        * 含义靠页脚那行提示承载,而不是靠字母本身。
        */
       if (plain && k === 'g' && props.onRepairNode) { setDetailId(null); props.onRepairNode(detail); return }
+      /**
+       * 回溯:把这棵子树里**集成验收没通过**的、以及**产出丢了**的任务重新推一遍。
+       *
+       * 和 `c`/`m` 同一条规矩:关口自己会先把范围摊开再让用户确认,所以这里不判
+       * 「有没有可回溯的」——那要遍历 acceptLog,而按键处理里不该做这件事。
+       *
+       * **`b` 实测干净**:`sectionPaneAction` / `logPaneAction` / `runControlAction` 三张表
+       * 都不认它。先例引 `c`/`m` 而**不是** `g` —— `g` 恰恰是详情页唯一真撞车的字母
+       * (它和日志页卡的「跳到顶部」会同时触发,今天靠 `setDetailId(null)` 卸载日志窗掩盖)。
+       * 只用小写:Shift 的双写法坑记在本文件 `shiftR` 那一段。
+       */
+      if (plain && k === 'b' && props.onBacktrack) { setDetailId(null); props.onBacktrack(detail); return }
       // 依赖重算。**被拒时不清 detailId** —— 那是它最常见的结局,而被拒的语义是
       // 「什么都没发生」。拒绝理由渲染在详情页自己那一段里(见 onRecalcDeps)。
       if (plain && k === 'd' && props.onRecalcDeps) {
@@ -626,6 +643,9 @@ export function TaskTreePanel(props: {
         // 有没有工作区、是什么状态都不决定这件事。真正的范围由关口扫盘算出来。
         canMergeWorktrees={props.onMergeWorktrees !== undefined}
         canRepairNode={props.onRepairNode !== undefined}
+        // 和 c / m 同一条规矩:**不看节点状态**。范围是整棵子树里集成验收没通过的
+        // 那些,而父节点自己是什么状态不决定这件事 —— 真正的范围由关口现算。
+        canBacktrack={props.onBacktrack !== undefined}
         // 判据形状抄上面 canRedoFailed 那一条:回调给了 **且** 这个节点此刻真的能按。
         /**
    * 判据必须是**真的准入**,不是 `status === 'CREATED'`。

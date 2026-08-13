@@ -661,6 +661,8 @@ export function NodeDetail(props: {
    */
   canMergeWorktrees?: boolean
   canRepairNode?: boolean
+  /** 回溯:集成验收没通过的、以及产出丢了的任务重新推一遍。 */
+  canBacktrack?: boolean
   /**
    * 能不能按 d 重算依赖。只影响「依赖」段最后那一行提示 —— **不进段落标题**,
    * 理由见 depsBody 里那一段(标题是身份,而这个条件会被编排器自己 tick 掉)。
@@ -990,6 +992,9 @@ export function NodeDetail(props: {
     // 唯一读得到它的地方。写清目的地,别让人按完才知道东西落到哪儿了。
     props.canMergeWorktrees ? 'm 合并工作区到主干' : '',
     props.canRepairNode ? 'g 修复损毁的任务' : '',
+    // 「回溯」两个字不够:这个键会重跑一批任务、删它们的工作区、可能还删子树。
+    // 页脚是用户唯一读得到它的地方 —— 写清对象,别让人按完才知道动了什么。
+    props.canBacktrack ? 'b 回溯未通过的子任务' : '',
   ].filter(s => s.length > 0)
   /** 页脚的段落清单。第一段是出口,分页会把它钉在每一页上。 */
   const footerSegments = ((): string[] => {
