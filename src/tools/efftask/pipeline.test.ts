@@ -7088,7 +7088,10 @@ describe('一轮没改任何文件的执行', () => {
     // 用尽迭代之后停下来,而且归 no-output 这一档(不是 rework)。
     expect(n.status).toBe('BLOCKED')
     expect(n.blockedReason).toContain('git 指纹在执行前后一模一样')
-    expect(n.blockedReason).toContain('禁止调用工具')
+    // 阻断信息要摆**读数**,不是猜成因:工作区在哪、执行后的指纹是什么。
+    expect(n.blockedReason).toContain('工作区: /wt')
+    expect(n.blockedReason).toContain('执行后的指纹')
+    expect(n.blockedReason).toContain('git status --porcelain --ignored')
   })
 
   it('指纹变了 → 照常往下走', async () => {

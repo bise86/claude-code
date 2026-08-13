@@ -4825,9 +4825,19 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       if (node.iteration.acceptance >= caps.maxIterations) {
         await blockWithReason(
           node,
+          /**
+           * **把证据摆出来,别在这里猜成因。**
+           *
+           * 上一版列了三条「常见成因」,而排查时没有一条能被这段话证实或否掉。真正需要的
+           * 是那一刻的读数:工作区在哪、它此刻的 git 指纹是什么(空串 = 目录里真的干干净净,
+           * 非空 = 有改动但和执行前一模一样 —— 那是完全不同的两件事)。
+           */
           `执行阶段连续没有改动任何文件(已达迭代上限 ${caps.maxIterations})—— 执行者报告了工作,` +
-          `但本任务工作区的 git 指纹在执行前后一模一样。` +
-          `常见成因:提示词里的「只读 / 只探查下一层 / 少用工具」被读成了「禁止调用工具」。`,
+          `但本任务工作区的 git 指纹在执行前后一模一样。\n` +
+          `工作区: ${node.worktree?.path ?? '(本节点没有工作区)'}\n` +
+          `执行后的指纹: ${afterExec === '' ? '空 —— 目录里没有任何未提交改动(执行者确实一个文件都没写)' : `「${afterExec.split('\n').slice(0, 3).join(' / ')}」—— 有改动,但和执行前逐字相同`}\n` +
+          `下一步:到上面那个目录里跑 git status --porcelain --ignored 看它到底有没有东西;` +
+          `如果那里干干净净,就去查这一轮派给执行者的工具清单(日志窗口第一行「[工具 N 个 …]」)。`,
           ctx,
           'no-output',
         )
