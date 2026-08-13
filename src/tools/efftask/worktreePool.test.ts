@@ -362,6 +362,47 @@ describe('生命周期边界(验收员用真 pool + 真 pipeline 同进程时发
     expect(r.keptBecause).toContain('忽略')
   })
 
+  /**
+   * **合并完成即清构建产物** —— 用户第 9 条,打在真 git 上。
+   *
+   * 上面那条用例记着的正是这个功能存在的理由:一个只留下 `dist/` 的工作区,`release()`
+   * 因为「带 `--ignored` 的脏」拒绝删除 —— 于是跑机上每一个已完成节点的 `target/` 都留在盘上,
+   * 而 `c` 键的模块头写着「用户此刻还看得见的目录,恰恰全是 release 拒绝过的那些」。
+   *
+   * 先清再放之后,同一个工作区**当场变成可回收的**。这是这条功能顺带买到的东西,
+   * 不是它的目的 —— 但它得能被断言,否则谁都可以把顺序调回去而全套测试照绿。
+   */
+  it('wipeBuildOutputs 之后,原本被 release 拒绝的工作区当场可回收', async () => {
+    // .gitignore 必须在 init 之前落到集成分支上 —— 理由见上一条用例(否则 dist/ 根本不被
+    // 忽略,而删掉它是**正确**行为,用例会对着一个好的实现「失败」)。
+    await writeFile(join(gitRoot, '.gitignore'), 'dist/\n')
+    await git(['add', '-A'], gitRoot); await git(['commit', '-qm', 'ignore dist'], gitRoot)
+    const p = pool()
+    await p.init()
+
+    const n = node('root/09-w')
+    const l = await p.acquire(n) as { path: string }
+    // 真交付物(会被合走)+ 构建产物(被忽略,永远到不了集成分支)。
+    await writeFile(join(l.path, 'api.ts'), 'export const api = 1\n')
+    await mkdir(join(l.path, 'dist'), { recursive: true })
+    await writeFile(join(l.path, 'dist', 'bundle.js'), 'x'.repeat(4096))
+    expect((await p.commitAndMerge(n)).ok).toBe(true)
+
+    // 没清之前:release 拒绝,而且拒绝的理由恰恰是那个构建产物。
+    const before = await p.release(n)
+    expect(before.removed).toBe(false)
+    expect(before.keptBecause).toContain('忽略')
+
+    const wiped = await p.wipeBuildOutputs(n)
+    expect(wiped.error).toBeUndefined()
+    expect(wiped.removed).toEqual(['dist/'])
+    // 交付物一个字节都不许动:它是已跟踪、已提交的。
+    expect(await readFile(join(l.path, 'api.ts'), 'utf-8')).toBe('export const api = 1\n')
+
+    const after = await p.release(n)
+    expect(after.removed).toBe(true)
+  })
+
   it('salvages commits the executor made itself, not only uncommitted edits', async () => {
     // Measured: an executor that COMMITTED inside its worktree and was then interrupted had
     // those commits reset away by `checkout -B` — 0 refs contained them, the file was gone.
@@ -1656,5 +1697,143 @@ describe('acquire 撞上残留的节点分支', () => {
     const lease = await p.acquire(node('e3'))
     expect('error' in lease).toBe(false)
     expect(p.healNotes()).toEqual([])
+  })
+})
+
+/**
+ * **重做要求的那次销毁**(用户第 2、4 条)—— 打在真 git 上。
+ *
+ * 今天这条路走 `release()`,而它的判据是「干净(带 `--ignored`)+ 已合入」——
+ * `target/` 的存在必然让它拒绝。于是重做在真实运行里一个工作区都放不掉,而**执行者读到的
+ * 注记**逐字写着「隔离工作区已重置为集成分支最新状态」。
+ */
+describe('discard —— 重做时把工作区整个删掉', () => {
+  it('删掉目录、删掉分支,连被忽略的构建产物一起', async () => {
+    await writeFile(join(gitRoot, '.gitignore'), 'target/\n')
+    await git(['add', '-A'], gitRoot); await git(['commit', '-qm', 'ignore target'], gitRoot)
+    const p = pool()
+    await p.init()
+    const n = node('root/10-d')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'work.ts'), 'x\n')
+    await p.commitAndMerge(n)               // 产出已合入 → 没有东西要抢救
+    await mkdir(join(l.path, 'target'), { recursive: true })
+    await writeFile(join(l.path, 'target', 'big.o'), 'x'.repeat(4096))
+
+    const r = await p.discard(n)
+    expect(r.removed).toBe(true)
+    expect(r.salvaged).toBeUndefined()
+    expect(await exists(l.path)).toBe(false)
+    expect((await git(['rev-parse', '--verify', p.worktreeBranchOf(n)], gitRoot)).code).not.toBe(0)
+  })
+
+  /**
+   * **未提交的产出必须先被固化。**
+   *
+   * 评审在真 git 上量过不固化的后果:节点分支上一笔提交都没有(执行产出在
+   * `commitAndMerge` 之前一直是未提交的)时,抢救闸判「无需抢救」,删完
+   * `git fsck --lost-found` 无输出、文件无从恢复。用户第 8 条:不能丢弃了。
+   */
+  it('执行者还没提交的产出:先固化再抢救,删完仍然找得回来', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/11-loose')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'newfeature.ts'), 'the deliverable\n')  // 一笔提交都没有
+
+    const r = await p.discard(n)
+    expect(r.removed).toBe(true)
+    expect(r.salvaged).toBeDefined()
+    expect(await exists(l.path)).toBe(false)
+    // 内容逐字找得回来 —— 这条断言是这个功能存在的全部理由。
+    const show = await git(['show', `${r.salvaged}:newfeature.ts`], gitRoot)
+    expect(show.code).toBe(0)
+    expect(show.stdout).toBe('the deliverable\n')
+  })
+
+  /**
+   * **`branch -f` 会静默毁掉上一次的抢救** —— 名字必须唯一。
+   *
+   * 同一个节点被 discard 两次(重做 → 再执行 → 再重做),抢救名是 `hash(nodeId)`、不随时间变。
+   * 评审实测:第二次之后上一版落在**零个 ref** 上,而收口和 `m` 键都走 `for-each-ref`。
+   */
+  it('同一个节点抢救两次:第一版不会被第二版顶掉', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/12-twice')
+
+    const l1 = await p.acquire(n) as { path: string }
+    await writeFile(join(l1.path, 'v1.ts'), 'first version\n')
+    const r1 = await p.discard(n)
+    expect(r1.salvaged).toBeDefined()
+
+    const l2 = await p.acquire(n) as { path: string }
+    await writeFile(join(l2.path, 'v2.ts'), 'second version\n')
+    const r2 = await p.discard(n)
+    expect(r2.salvaged).toBeDefined()
+    // 两条不同的 ref —— 而且第一版的内容仍然读得出来。
+    expect(r2.salvaged).not.toBe(r1.salvaged)
+    expect((await git(['show', `${r1.salvaged}:v1.ts`], gitRoot)).stdout).toBe('first version\n')
+    expect((await git(['show', `${r2.salvaged}:v2.ts`], gitRoot)).stdout).toBe('second version\n')
+    // 两条都在 for-each-ref 里看得见(收口报告和 m 键读的就是它)。
+    const refs = await git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/efftask/001/salvage'], gitRoot)
+    expect(refs.stdout).toContain(r1.salvaged!)
+    expect(refs.stdout).toContain(r2.salvaged!)
+  })
+
+  /** 已经被新 tip 包含的那条**重用**,不在盘上堆一串互为祖先的 ref。 */
+  it('上一条抢救已被新 tip 包含时重用同一个名字', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/13-reuse')
+    const l1 = await p.acquire(n) as { path: string }
+    await writeFile(join(l1.path, 'a.ts'), 'a\n')
+    const r1 = await p.discard(n)
+    // 从抢救出来的那条继续往下做 —— 新 tip 包含旧 tip。
+    const add = await git(['worktree', 'add', '--detach', join(worktreeRoot, 'tmp13'), r1.salvaged!], gitRoot)
+    expect(add.code).toBe(0)
+    await writeFile(join(worktreeRoot, 'tmp13', 'b.ts'), 'b\n')
+    await git(['add', '-A'], join(worktreeRoot, 'tmp13'))
+    await git(['commit', '-qm', 'more'], join(worktreeRoot, 'tmp13'))
+    const tip = (await git(['rev-parse', 'HEAD'], join(worktreeRoot, 'tmp13'))).stdout.trim()
+    await git(['branch', '-f', p.worktreeBranchOf(n), tip], gitRoot)
+    await git(['worktree', 'remove', '--force', join(worktreeRoot, 'tmp13')], gitRoot)
+    // 重新造一个工作区,让 discard 走一次。
+    const l2 = await p.acquire(n) as { path: string }
+    void l2
+    await git(['reset', '--hard', tip], l2.path)
+    const r2 = await p.discard(n)
+    expect(r2.salvaged).toBe(r1.salvaged)
+  })
+
+  /** 目录本来就不在 = 没什么可做,不是失败。 */
+  it('目录已经不在时报成功而不是失败', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/14-absent')
+    const r = await p.discard(n)
+    expect(r.removed).toBe(true)
+  })
+
+  /**
+   * **探不明白就不动手。** 「你还有东西没合」和「我没探明白」要做的事不一样,
+   * 而这一步是不可逆的。
+   */
+  it('merge-base 探测失败时拒绝删除', async () => {
+    const p0 = pool()
+    await p0.init()
+    const n = node('root/15-unknown')
+    await p0.acquire(n)
+    // 只把那一问打成 128,别的 git 调用照常。
+    const broken = createWorktreePool({
+      runId: '001', gitRoot, worktreeRoot,
+      git: async (args, cwd) => (
+        args[0] === 'merge-base' ? { code: 128, stdout: '', stderr: 'fatal: 坏了' } : git(args, cwd)
+      ),
+    })
+    const r = await broken.discard(n)
+    expect(r.removed).toBe(false)
+    expect(r.keptBecause).toContain('无法判断')
+    expect(await exists(p0.worktreePathOf(n))).toBe(true)
   })
 })

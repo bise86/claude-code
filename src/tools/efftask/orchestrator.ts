@@ -35,6 +35,14 @@ export interface OrchestratorDeps {
    * whole feature is dead while its unit tests pass over a hand-built ctx.
    */
   onBlocked?: PipelineCtx['onBlocked']
+  /**
+   * 合并完成即清构建产物的**统计出口**。见 `PipelineCtx.onBuildWipe`。
+   *
+   * 这一路是自动的、不可逆的删除,而它**刻意不写 `execStatus`**(那个字段会被喂进之后
+   * 每一次验收提示词)。少了这条线,一次真实的删除对用户就是完全不可见的 ——
+   * 而「静默清理和静默截断是同一类毛病」是这个仓库反复在修的那一条。
+   */
+  onBuildWipe?: PipelineCtx['onBuildWipe']
   /** Run id, used only to write an actionable retry command into `blockedReason`. */
   runId?: string
   /**
@@ -374,6 +382,7 @@ export class EffTaskOrchestrator {
       worktrees: this.deps.worktrees,
       onEscalate: this.deps.onEscalate,
       onBlocked: this.deps.onBlocked,
+      onBuildWipe: this.deps.onBuildWipe,
       runId: this.deps.runId,
       openStream: this.deps.openStream,
       cwd: this.deps.cwd,

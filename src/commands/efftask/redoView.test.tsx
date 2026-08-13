@@ -271,7 +271,7 @@ describe('重做关口', () => {
     app.unmount()
     expect(f).toContain('删除 2 个子任务')
     expect(f).toContain('不会回滚')
-    expect(f).toContain('释放 1 个隔离工作区')
+    expect(f).toContain('删除 1 个隔离工作区的目录与分支')
   })
 
   // 「第二屏 Esc 退回第一屏」不在这里测:假 TTY 送裸 \x1b 时 useInput 收不到,

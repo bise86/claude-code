@@ -27,8 +27,23 @@ export interface RedoCommitDeps {
   fs: FsLike
   runDir: string
   config: EffTaskConfig
-  /** 隔离工作区池。没有隔离时是 undefined —— 那就没有工作区要放。 */
-  pool?: { release(node: TaskNode): Promise<{ removed: boolean; keptBecause?: string }> }
+  /**
+   * 隔离工作区池。没有隔离时是 undefined —— 那就没有工作区要放。
+   *
+   * **走 `discard` 而不是 `release`**(用户第 2、4 条):release 的判据是「干净(带
+   * `--ignored`)+ 已合入」,而 `target/` 的存在必然让它拒绝 —— 于是重做在真实运行里
+   * 一个工作区都放不掉,而执行者读到的 `REDO_NOTE_*` 逐字写着「隔离工作区已重置为集成
+   * 分支最新状态」。discard 先把未提交的固化+抢救,再把目录整个删掉,下一次 `acquire`
+   * 从集成分支 tip 重建 = 用户要的「删除其 target,要重新同步」。
+   *
+   * 老形状(只有 `release`)仍然收:测试和别处的调用方给的是它,而那时行为退回从前。
+   */
+  pool?: {
+    discard?(node: TaskNode): Promise<{
+      removed: boolean; keptBecause?: string; salvaged?: string; branchKept?: string
+    }>
+    release(node: TaskNode): Promise<{ removed: boolean; keptBecause?: string }>
+  }
   /** 重做**之前**的节点,release 要用它们算路径。 */
   before: readonly TaskNode[]
   /** 每一步的日志出口(落盘失败不阻断重做,但不能无声无息)。 */
@@ -43,10 +58,31 @@ export async function commitRedo(deps: RedoCommitDeps, plan: RedoPlan): Promise<
     const original = byId.get(w.nodeId)
     if (!original) continue
     try {
-      const r = await deps.pool?.release(original)
+      /**
+       * `discard` 优先(见 `RedoCommitDeps.pool`)。它做的是用户第 4 条要的那件事:
+       * 先把未提交的固化并抢救成一条唯一命名的 ref,再把目录**整个**删掉 ——
+       * 包括被 `.gitignore` 忽略的构建产物,而那正是第 2 条要的「重新编译」。
+       */
+      const r = deps.pool?.discard
+        ? await deps.pool.discard(original)
+        : await deps.pool?.release(original)
       // 池不存在时 r 是 undefined —— 那不是失败,是这次 run 本来就没隔离。
       if (r && !r.removed) {
         problems.push(`${w.nodeId} 的工作区保留在 ${w.path}:${r.keptBecause ?? '未知原因'}`)
+      }
+      /**
+       * 抢救出来的那条 ref **必须念给用户听**。
+       *
+       * 它是「这次重做把上一版产出放哪儿了」的唯一答案,而重做本身是用户主动按下的
+       * 不可逆动作 —— 静默保留和静默删除是同一类毛病的两面。
+       */
+      const salvaged = (r as { salvaged?: string } | undefined)?.salvaged
+      if (salvaged) {
+        problems.push(`${w.nodeId} 重做前的产出已抢救到分支 ${salvaged}(没有丢失,可用 git show 查看)`)
+      }
+      const branchKept = (r as { branchKept?: string } | undefined)?.branchKept
+      if (branchKept) {
+        problems.push(`${w.nodeId} 的工作区已删除,但分支 ${branchKept} 没删掉 —— 它会一直留在 git branch 里`)
       }
     } catch (e) {
       problems.push(`${w.nodeId} 的工作区未能释放: ${e instanceof Error ? e.message : String(e)}`)

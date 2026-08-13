@@ -1,4 +1,5 @@
 import { integrationBranch, worktreeBranch, worktreeSlug } from './worktreeId.js'
+import { EFFTASK_INTERNAL_PATHS, wipeBuildOutputsAt, type BuildWipeOutcome } from './buildOutputs.js'
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import type { TaskNode } from './types.js'
 
@@ -71,6 +72,13 @@ export interface WorktreePoolDeps {
   git: GitRunner
   /** Where per-node worktrees live. */
   worktreeRoot: string
+  /**
+   * 目录占用(KB)。只给 `wipeBuildOutputs` 用,好让「腾出多少」是量出来的。
+   *
+   * **可选,而且缺席时不许编 0** —— `du` 在 Windows / 精简容器里可能根本不存在,
+   * 那时屏幕说「大小未知」比说 0 诚实(`CleanupDeps.dirSizeKb` 为同一件事写过)。
+   */
+  dirSizeKb?: (path: string) => Promise<number | undefined>
 }
 
 /**
@@ -90,7 +98,7 @@ export interface WorktreePoolDeps {
 export type WorktreePool = ReturnType<typeof createWorktreePool>
 
 export function createWorktreePool(deps: WorktreePoolDeps) {
-  const { runId, gitRoot, git, worktreeRoot } = deps
+  const { runId, gitRoot, git, worktreeRoot, dirSizeKb } = deps
   const intBranch = integrationBranch(runId)
   /**
    * node id → the files git itself reported as conflicted by that node's local merge.
@@ -431,7 +439,12 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     await git(['worktree', 'prune'], gitRoot)
     const contained = await git(['merge-base', '--is-ancestor', branch, intBranch], gitRoot)
     if (contained.code !== 0) {
-      const salvage = `efftask/${runId}/salvage/${slugFor(node)}`
+      // 名字要唯一 —— `branch -f` 会把上一次的抢救打到零个 ref 上,见 salvageRefFor。
+      const salvage = await salvageRefFor(node, branch)
+      if (salvage === undefined) {
+        notes.push(`残留分支 ${branch} 上有没合进集成分支的提交,而抢救 ref 的名字全被占满了 —— 没有重置它`)
+        return { changed: false, notes }
+      }
       const saved = await git(['branch', '-f', salvage, branch], gitRoot)
       if (saved.code !== 0) {
         notes.push(`残留分支 ${branch} 上有没合进集成分支的提交,而它存不进 ${salvage}(${saved.stderr.trim()})—— 没有重置它`)
@@ -457,6 +470,44 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       notes.push(`并让占着它的自建工作树 ${holder.path} 切到 detached HEAD`)
     }
     return { changed: true, notes }
+  }
+
+  /**
+   * 这个节点这一次抢救该写到**哪条 ref** 上。
+   *
+   * ## `branch -f` 会静默毁掉上一次的抢救
+   *
+   * 抢救分支名是 `efftask/<runId>/salvage/<hash(nodeId)>` —— **不随时间变**。同一个节点被
+   * 抢救第二次(重做 → 再执行 → 再重做,或者 `acquire` 复用目录那条路走了两遍),
+   * `branch -f` 把它直接指到新 tip 上。评审在真 git 上量过后果:
+   *
+   *     $ git branch -f efftask/r1/salvage/aaa efftask/r1/node/aaa   # 第二次
+   *     $ git for-each-ref --contains <上一版的 sha> | wc -l
+   *     0
+   *
+   * 上一版落在**零个 ref** 上,只剩 branch reflog —— 而收口报告和 `m` 键都走
+   * `for-each-ref`,它们永远看不见它,gc 之后就真没了。这直接违反这个模块自己写了三遍的
+   * 那句「宁可保留垃圾,不可删掉工作」。
+   *
+   * ## 判据:同一条内容不占两个名字
+   *
+   * 已有的那条**已经被新 tip 包含**时(最常见:上一次抢救之后又提交了几笔),重用它零损失
+   * —— 每次都换新名字会在盘上堆一串互为祖先的 ref,而收口屏要把它们逐条念给用户听。
+   * 不是祖先才换名字,`-2`、`-3`…… 和 `freeName` 同一条思路(治过一次的仓库会治第二次)。
+   *
+   * 全都占满 → 返回 undefined,调用方**必须拒绝**这次重置(宁可这个节点报错)。
+   */
+  async function salvageRefFor(node: TaskNode, tip: string): Promise<string | undefined> {
+    const base = `efftask/${runId}/salvage/${slugFor(node)}`
+    for (let i = 1; i < 100; i++) {
+      const name = i === 1 ? base : `${base}-${i}`
+      const has = await git(['rev-parse', '--verify', '--quiet', name], gitRoot)
+      if (has.code !== 0) return name
+      // 已有的那条被新 tip 包含 = 重用它零损失。
+      const contained = await git(['merge-base', '--is-ancestor', name, tip], gitRoot)
+      if (contained.code === 0) return name
+    }
+    return undefined
   }
 
   /** 第一个还没被占用的名字。`.orphan`、`.orphan-2`、…… —— 治过一次的仓库会治第二次。 */
@@ -523,7 +574,12 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         await mkdir(info, { recursive: true })
         const excl = `${info}/exclude`
         const cur = await readFile(excl, 'utf-8').catch(() => '')
-        const want = ['.efftask-worktrees/', '.claude/efftask/'].filter(p => !cur.includes(p))
+        /**
+         * 从 `EFFTASK_INTERNAL_PATHS` 派生,**不写字面量**:`buildOutputs` 那一侧靠同一份
+         * 名单决定「清构建产物时不许碰哪些」。各写一份的话,哪天这里加了第三条,
+         * 那边就会开始删它 —— 而它是**用户的任务记录**。
+         */
+        const want = EFFTASK_INTERNAL_PATHS.map(p => `${p}/`).filter(p => !cur.includes(p))
         if (want.length > 0) {
           await writeFile(excl, `${cur}${cur.endsWith('\n') || cur === '' ? '' : '\n'}${want.join('\n')}\n`)
         }
@@ -622,7 +678,12 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
             if (sha.code === 0) {
               const contained = await git(['merge-base', '--is-ancestor', 'HEAD', intBranch], path)
               if (contained.code !== 0) {
-                await git(['branch', '-f', `efftask/${runId}/salvage/${slugFor(node)}`, sha.stdout.trim()], gitRoot)
+                // 名字要唯一。同一个节点走到这条路两次(重做 → 再执行 → 再重做)时,
+                // `branch -f` 会把上一版打到零个 ref 上,而收口和 `m` 键都走
+                // `for-each-ref` —— 它们永远看不见它。见 salvageRefFor。
+                const tip = sha.stdout.trim()
+                const ref = await salvageRefFor(node, tip)
+                if (ref !== undefined) await git(['branch', '-f', ref, tip], gitRoot)
               }
             }
           }
@@ -857,6 +918,132 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         }
         return { ok: false, kind: 'infra', message: merge.stderr.trim() || merge.stdout.trim() || '合并未生效' }
       })
+    },
+
+    /**
+     * 清掉这个节点工作区里的**构建产物**(被 `.gitignore` 忽略的那些)。
+     *
+     * 用户原话:「合并提交后,任务标记完成了,需要立马清理掉 worktree 下的 target 目录下的
+     * 编译产物这些」。调用点在 `mergeAndRelease` 里、`release()` 之前 —— 那一刻的事实是
+     * 逐字确定的:交付物已经 `add -A` + commit + 合进集成分支,而 `add -A` **从不暂存被
+     * 忽略的文件**,所以之后还留在这棵树里的被忽略文件在**任何路径上都到不了集成分支**
+     * (`refreshFromIntegration` 的 KNOWN GAP 段落已经把这条记死了)。它们不是交付物。
+     *
+     * 判据、以及为什么不是一句 `git clean -X -d -f`,全部在 `buildOutputs.ts` 的文件头
+     * (三条真 git 实测:嵌套仓库静默跳过而退出码是 0、`info/exclude` 对 linked worktree
+     * 生效、git 会把父目录折叠上来)。
+     *
+     * **不删目录** —— 用户要的是清产物,而目录还在是 `m` 键、重做、升级卡指路的前提。
+     * 顺带买到的是:清完之后 `release()` 的判据(干净带 `--ignored` + 已合入)在很多节点上
+     * 当场变成成立,于是收口时 `dispose()` 能真的回收它们,而不是像从前那样被 `target/`
+     * 一律拒绝。
+     */
+    wipeBuildOutputs(node: TaskNode): Promise<BuildWipeOutcome> {
+      return wipeBuildOutputsAt({ git, ...(dirSizeKb ? { dirSizeKb } : {}) }, pathFor(node))
+    },
+
+    /**
+     * **重做要求的那次销毁** —— 详情页 `r`「任务重做」以及任何会让执行者重跑工作的重做。
+     *
+     * 用户原话(第 4 条):「任务重做是要将其 worktree 工作区这些全部删除掉。」
+     * 而第 2 条给了理由:「除了合并重做外,其它重做意味着要重新编译这些。」
+     *
+     * ## 为什么不是 `release()`
+     *
+     * `release()` 的判据是「干净(带 `--ignored`)**且**已合入」,而 `target/` 的存在
+     * **必然**让它拒绝 —— 也就是说今天的重做在真实运行里一个工作区都放不掉,`problems` 里
+     * 留一条「工作区仍有未提交或被忽略的文件」,而**执行者读到的注记**(`REDO_NOTE_LOST` /
+     * `REDO_NOTE_MERGED`)逐字写着「隔离工作区已重置为集成分支最新状态」。那句话是假的。
+     *
+     * 这和 `cleanupWorktrees` 当初「必须不复用 `release()`」是**同一条判据**:
+     * release 的两条是池子对「什么时候可以自动动用户的目录」的承诺,而这里是**用户逐个
+     * 确认过**的另一套。两者不该共用一个函数名。
+     *
+     * ## 四步,顺序不可换
+     *
+     * 1. **先固化未提交的东西。** 评审在真 git 上量过不固化的后果:节点分支上一笔提交都
+     *    没有(执行产出在 `commitAndMerge` 之前一直是未提交的)时,下面那道抢救闸
+     *    `merge-base --is-ancestor` 判「无需抢救」,`worktree remove --force` 之后
+     *    `git fsck --lost-found` **无输出,文件无从恢复**。这正面撞用户第 8 条
+     *    「所有未提交的都要提交,不能丢弃了」。
+     *    ⚠ `add -A` **不暂存被忽略的文件** —— 那部分确实会随目录一起消失,而那正是第 2 条
+     *    要的「删掉 target 重新编译」。确认屏必须说出这半句。
+     * 2. **抢救,用唯一名**(见 `salvageRefFor`)。**存不下来就整条放弃** ——
+     *    宁可这个节点报错,不可静默丢掉一次执行的产出。
+     * 3. `worktree remove --force`,**一次**。真 git 实测:第二个 `--force` 是给**被锁**的
+     *    工作树用的(`fatal: cannot remove a locked working tree; use 'remove -f -f'`),
+     *    多加一次会把「有人锁住了它」这条该报的情况一起吞掉。
+     *    **不需要 `worktree prune`** —— 实测 remove 会连登记项一起清掉,连目录已被外部
+     *    `rm -rf` 的情况也照样 exit=0。
+     * 4. 目录删成了**才** `branch -D`(分支被工作树占着时 git 直接拒绝);
+     *    没删成就整条跳过,分支留着 —— 一个已经没了分支的残留工作区更难救。
+     */
+    async discard(node: TaskNode): Promise<{
+      removed: boolean
+      /** 没删成的原因。`removed: false` 时必有。 */
+      keptBecause?: string
+      /** 这次抢救出来的 ref(有没合入的提交时才有),要念给用户听。 */
+      salvaged?: string
+      /** 分支没删掉 —— 不影响腾空间,但它会一直躺在 `git branch` 里。 */
+      branchKept?: string
+    }> {
+      const path = pathFor(node)
+      const branch = branchFor(node)
+      const here = await git(['rev-parse', '--git-dir'], path)
+      // 目录本来就不在 = 这一步没什么可做的,不是失败。分支的事交给 acquire 的 reclaim。
+      if (here.code !== 0) return { removed: true }
+
+      // 一、固化。`add -A` 之后没东西可提交时 commit 非零退出,那不是失败 —— 判据是
+      // 下一步的「HEAD 在不在集成分支里」,不是这次 commit 的退出码(acquire 为同一件事
+      // 写过一整段:执行者自己提交过的形态只有那一问答得对)。
+      await git(['add', '-A'], path)
+      await git(['commit', '--no-verify', '-m', `efftask: 固化工作区残留 (${node.id})`], path)
+
+      // 二、抢救。
+      let salvaged: string | undefined
+      const sha = await git(['rev-parse', 'HEAD'], path)
+      if (sha.code === 0) {
+        const tip = sha.stdout.trim()
+        const contained = await git(['merge-base', '--is-ancestor', tip, intBranch], path)
+        if (contained.code === 1) {
+          const ref = await salvageRefFor(node, tip)
+          if (ref === undefined) {
+            return { removed: false, keptBecause: '有没合入集成分支的提交,而抢救 ref 的名字全被占满了 —— 没有删除它' }
+          }
+          const saved = await git(['branch', '-f', ref, tip], gitRoot)
+          if (saved.code !== 0) {
+            return {
+              removed: false,
+              keptBecause: `有没合入集成分支的提交,而它存不进 ${ref}(${saved.stderr.trim()})—— 没有删除它`,
+            }
+          }
+          salvaged = ref
+        } else if (contained.code !== 0) {
+          // 探不明白就不动手 —— 「你还有东西没合」和「我没探明白」要做的事不一样,
+          // 而这一步是不可逆的(`integrationAhead` 那条注释的又一次应验)。
+          return {
+            removed: false,
+            keptBecause: `无法判断提交是否已合入(git 探测失败:${contained.stderr.trim() || `退出码 ${contained.code}`})—— 没有删除它`,
+          }
+        }
+      }
+
+      // 三、删目录。
+      const rm = await git(['worktree', 'remove', '--force', path], gitRoot)
+      if (rm.code !== 0) {
+        return {
+          removed: false,
+          keptBecause: `移除失败: ${rm.stderr.trim() || rm.stdout.trim() || `退出码 ${rm.code}`}`,
+          ...(salvaged ? { salvaged } : {}),
+        }
+      }
+      // 四、删分支。
+      const del = await git(['branch', '-D', branch], gitRoot)
+      return {
+        removed: true,
+        ...(salvaged ? { salvaged } : {}),
+        ...(del.code !== 0 ? { branchKept: branch } : {}),
+      }
     },
 
     /**

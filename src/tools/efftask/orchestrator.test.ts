@@ -648,3 +648,81 @@ describe('运行中重做:别的任务照跑,失败的那个当场重开', () =>
     if (!applied.ok) expect(applied.reason).toContain('结束屏')
   })
 })
+
+/**
+ * **「任务完成即回收构建产物」的那条线,从编排器 dep 一路到 pipeline。**
+ *
+ * 这个仓库的原话:`openStream` 当初是「声明了、实现了、测过了,而生产上没有任何人传它」
+ * 的那条死线,详情页因此一条输出都没有。`onBuildWipe` 是同一个形状 —— 一个可选回调,
+ * 中间隔着 `OrchestratorDeps` → `ctx()` → `mergeAndRelease` 三跳,而**每一跳都能单独断掉**
+ * 且不产生任何报错。所以这里打真身:跑一棵真的树,断言回调带着真实节点身份到达。
+ */
+describe('构建产物回收的接线', () => {
+  const leafPlan = '```json\n{"kind":"executable","solution":"s","acceptance":"跑 bun test 全绿"}\n```'
+  const okAgent = (async (req: { phase: string; prompt: string }) => {
+    if (req.phase === 'plan') return leafPlan
+    if (req.phase === 'execute') return '```json\n{"execStatus":"做完"}\n```'
+    const tag = req.prompt.match(/语言标记\(fence info string\)写成 (accept[a-z]*|verify[a-z]*)/)?.[1] ?? 'accept'
+    return '```' + tag + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+  }) as RunAgentFn
+
+  it('onBuildWipe 带着节点身份走到编排器的调用方', async () => {
+    const seen: { nodeId: string; freedKb: number }[] = []
+    const pool = {
+      init: async () => ({ ok: true }),
+      acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b-' + n.id, gitRoot: '/repo' }),
+      commitAndMerge: async () => ({ ok: true, merged: true }),
+      wipeBuildOutputs: async () => ({
+        removed: ['target/'], skippedRepos: [], excluded: [], freedKb: 4096, sizeKnown: true,
+      }),
+      release: async () => ({ removed: true }),
+      dispose: async () => ({ kept: [] }),
+      withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
+      refreshFromIntegration: async () => ({ ok: true, updated: false }),
+      conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+      mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
+      integrationPath: '/wt/integration',
+      integrationBranchName: 'efftask/001/integration',
+    }
+    const orch = new EffTaskOrchestrator(
+      cfg(),
+      {
+        ...deps(okAgent),
+        worktrees: pool as never,
+        onBuildWipe: e => { seen.push({ nodeId: e.nodeId, freedKb: e.outcome.freedKb }) },
+      },
+      new AbortController().signal,
+    )
+    const res = await orch.run()
+    expect(res.status).toBe('completed')
+    // 身份要对得上:一个只数次数的断言在「回调传了个空对象」这条变异上照绿。
+    expect(seen).toEqual([{ nodeId: 'root', freedKb: 4096 }])
+  })
+
+  /** 池子没有这个方法(老 run、`--resume` 时接了个部分实现)不许把整趟跑炸掉。 */
+  it('池子不提供 wipeBuildOutputs 时照常跑完', async () => {
+    const orch = new EffTaskOrchestrator(
+      cfg(),
+      {
+        ...deps(okAgent),
+        worktrees: {
+          init: async () => ({ ok: true }),
+          acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b-' + n.id, gitRoot: '/repo' }),
+          commitAndMerge: async () => ({ ok: true, merged: true }),
+          release: async () => ({ removed: true }),
+          dispose: async () => ({ kept: [] }),
+          withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+          handoff: async () => ({ branch: 'b', commits: 0, kept: [], salvage: [] }),
+          refreshFromIntegration: async () => ({ ok: true, updated: false }),
+          conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
+          mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
+          integrationPath: '/wt/integration',
+          integrationBranchName: 'efftask/001/integration',
+        } as never,
+      },
+      new AbortController().signal,
+    )
+    expect((await orch.run()).status).toBe('completed')
+  })
+})

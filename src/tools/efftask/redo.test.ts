@@ -741,7 +741,9 @@ describe('redoSummary', () => {
     const lines = redoSummary(r, t[1]!, 'plan').join('\n')
     expect(lines).toContain('删除 1 个子任务')
     expect(lines).toContain('1 条依赖')
-    expect(lines).toContain('释放 1 个隔离工作区')
+    // 用户第 4 条:「任务重做是要将其 worktree 工作区这些全部删除掉」——
+    // 从前这里走 release(判据「干净 + 已合入」,target/ 一在就拒绝),现在走 discard。
+    expect(lines).toContain('删除 1 个隔离工作区的目录与分支')
     expect(lines).toContain('⚠')
   })
 
@@ -750,8 +752,9 @@ describe('redoSummary', () => {
     const r = ok(planRedo(t, 'a1', 'execute', 'T1'))
     const lines = redoSummary(r, t[2]!, 'execute', { seatCount: { verify: 1 } }).join('\n')
     expect(lines).toContain('执行 → 测试修复 → 验收')
-    // 执行重做不删任何东西、不改写任何依赖 —— 摘要里就不该出现这两句。
-    expect(lines).not.toContain('删除')
+    // 执行重做不删**子任务**、不改写任何依赖 —— 摘要里就不该出现这两句。
+    // (判据要点名到「子任务」:工作区那一行现在也叫「删除」,而它是**该**出现的。)
+    expect(lines).not.toContain('个子任务')
     expect(lines).not.toContain('依赖被改写')
     expect(lines).not.toContain('依赖被移除')
     /**
@@ -916,15 +919,29 @@ describe('确认屏要摊开的后果', () => {
     expect(redoSummary(p, t, 'execute').some(l => l.includes('不再算完成'))).toBe(false)
   })
 
-  it('「释放工作区」要说清脏改动会被固化到 salvage 分支 —— 那不是清理', () => {
-    // release 在工作区仍有未提交文件时拒删,下一次 acquire 走复用分支:add -A →
-    // commit --no-verify → branch -f efftask/<run>/salvage/… → checkout -B。
-    // 用户手改的东西被提交进一条他从没听说过的分支,目录被重置。
+  /**
+   * 「删除工作区」这三件事**都要说出口**,而且要分成三行。
+   *
+   * 用户第 4 条要的是删掉,第 2 条给的理由是重新编译。两条合起来的实际后果有三层,
+   * 而只说第一层就是拿半句真话换一次不可逆的按键:
+   *  1. 目录和分支**没了**(不是「释放」——那读起来像清理);
+   *  2. 未提交的改动被固化到一条他从没听说过的 salvage 分支 —— 不会丢,但不在原处;
+   *  3. **被忽略的构建产物不进 salvage**(`add -A` 不暂存它们),随目录一起消失。
+   *     这一层是唯一真正不可逆的,而它恰恰最容易被漏掉。
+   *
+   * 拆成三行还有一个量出来的理由:正文是 `wrap="truncate-end"`,一句长的在 80 列上
+   * 会被砍掉后半句。
+   */
+  it('「删除工作区」要说清:目录没了、未提交的进 salvage、被忽略的产物一起消失', () => {
     const t = node('x', { status: 'ACCEPTED', worktree: { branch: 'b', path: '/wt/x' } })
     const p = ok(planRedo([t], 'x', 'execute', 'T1'))
-    const line = redoSummary(p, t, 'execute').find(l => l.includes('释放'))!
-    expect(line).toContain('salvage')
-    expect(line).toContain('未提交')
+    const lines = redoSummary(p, t, 'execute')
+    expect(lines.find(l => l.includes('删除 1 个隔离工作区的目录与分支'))).toBeDefined()
+    const salvageLine = lines.find(l => l.includes('salvage'))!
+    expect(salvageLine).toContain('未提交')
+    const ignoredLine = lines.find(l => l.includes('.gitignore'))!
+    expect(ignoredLine).toContain('不进')
+    expect(ignoredLine).toContain('全量重编')
   })
 
   it('返工额度会重新给 —— 这是这次重做的直接成本', () => {

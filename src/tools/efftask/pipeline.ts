@@ -10,6 +10,7 @@ import { childId } from './persistence.js'
 import { depLabel } from './depsRecalc.js'
 import { hasCycle, isTerminal } from './stateMachine.js'
 import type { WorktreePool } from './worktreePool.js'
+import type { BuildWipeOutcome } from './buildOutputs.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, humanTimeoutRemedy, totalTimeoutRemedy, type BlockCategory } from './escalation.js'
 import { NodeCancelledError, PhaseTimeoutError, ProviderApiError, type TimeoutKind } from './runAgentAdapter.js'
@@ -55,6 +56,16 @@ export interface PipelineCtx {
    * them concurrently. That is the exact outcome isolation exists to prevent.
    */
   worktrees?: WorktreePool
+  /**
+   * 一个节点合并提交成功之后,它工作区里的构建产物被清掉了多少 —— **run 级统计的入口**。
+   *
+   * 为什么是回调而不是往 `execStatus` 上追一句:那个字段会被喂进之后每一次验收/集成验收的
+   * 提示词,每节点一句会把它撑成流水账(`worktreePool` 为逐任务合并定过同一条规矩:
+   * 「成功不写」)。而这件事**必须**有人看得见 —— 它是一次自动的、不可逆的删除。
+   *
+   * 可选:一次性抽取调用和绝大多数测试都不需要它。
+   */
+  onBuildWipe?: (e: { nodeId: string; title: string; outcome: BuildWipeOutcome }) => void
   /**
    * 人工升级 (spec §8): a merge conflict the node could not resolve itself.
    *
@@ -4268,6 +4279,49 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
   // recorded it. Put it in the evidence the acceptance record keeps.
   if (!res.merged) {
     node.execStatus = `${node.execStatus}\n(注:该节点没有向集成分支贡献任何改动)`
+  }
+  /**
+   * **合并提交成功了 —— 立刻清掉这棵树里的构建产物。**
+   *
+   * 用户原话:「合并提交后,任务标记完成了,需要立马清理掉 worktree 下的 target 目录下的
+   * 编译产物这些」。
+   *
+   * ## 为什么这一刻是安全的,而且只有这一刻是
+   *
+   * 交付物在上面那次 `commitAndMerge` 里已经 `add -A` + commit + 合进集成分支;而
+   * `add -A` **从不暂存被忽略的文件**,所以留在这棵树里的被忽略文件在**任何路径上都到不了
+   * 集成分支**(`refreshFromIntegration` 的 KNOWN GAP 段落记着这条实测)。它们按定义不是产出。
+   * 换个位置就不成立了:合并**之前**清,清掉的可能正是某个以 dist/ 为交付物的节点还没提交的东西。
+   *
+   * ## 排在 `release()` **之前**
+   *
+   * `release()` 的判据是「干净(带 `--ignored`)+ 已合入」—— 而 `target/` 的存在**必然**
+   * 让它拒绝。也就是说今天这一句在真实运行里几乎从不成功,`c` 键的模块头为同一件事写过
+   * 一整段。先清再放,很多节点的整个目录当场就能被正常回收。
+   *
+   * ## 三条不许省的诚实
+   *
+   *  1. **失败不影响判决** —— 清不掉是磁盘的事,不是「这个任务没通过」。
+   *  2. **成功不写 `execStatus`** —— 每节点一句会把它撑成流水账,而它会被喂进之后每一次
+   *     验收/集成验收的提示词(`res.trunk` 那条为同一条规矩只在失败时写)。统计走 run 级的
+   *     `onBuildWipe`。
+   *  3. **嵌套仓库被跳过要报出去** —— `git clean` 对它静默跳过而退出码仍是 0(实测),
+   *     不报的话屏幕会说「已回收 N GB」而盘上一个字节没少。
+   */
+  if (ctx.config.caps?.wipeOnAccept !== false && ctx.worktrees.wipeBuildOutputs) {
+    try {
+      const wiped = await ctx.worktrees.wipeBuildOutputs(node)
+      ctx.onBuildWipe?.({ nodeId: node.id, title: node.title, outcome: wiped })
+    } catch (e) {
+      // 清理是尽力而为的:抛出来不该把一个已经合并成功的节点变成失败。
+      ctx.onBuildWipe?.({
+        nodeId: node.id, title: node.title,
+        outcome: {
+          removed: [], skippedRepos: [], excluded: [], freedKb: 0, sizeKnown: false,
+          error: e instanceof Error ? e.message : String(e),
+        },
+      })
+    }
   }
   // 清理留痕已经在函数开头统一写过了(成功/失败共用一条),这里不再写第二遍。
   const rel = await ctx.worktrees.release(node)

@@ -80,6 +80,14 @@ export async function runOrchestrator(
     onEscalate?: PipelineCtx['onEscalate']
     /** 触阀升级 (spec §9/§11): a node stopped by a safety valve or a rework limit. */
     onBlocked?: PipelineCtx['onBlocked']
+    /**
+     * 合并完成即清构建产物的统计出口(用户第 9 条)。见 `PipelineCtx.onBuildWipe`。
+     *
+     * 这条线**必须一直接到界面**:那一路是自动的、不可逆的删除,而它刻意不写 `execStatus`
+     * (会被喂进之后每一次验收提示词)。断在这一层的话,一次真实的删除对用户完全不可见 ——
+     * `openStream` 当初就是「声明了、实现了、测过了,而生产上没有任何人传它」的那条死线。
+     */
+    onBuildWipe?: PipelineCtx['onBuildWipe']
     /** 子 agent 实时输出 (spec §10.2): streamed per node, for the detail view. */
     openStream?: PipelineCtx['openStream']
     cwd?: PipelineCtx['cwd']
@@ -364,6 +372,7 @@ export async function runOrchestrator(
         runId: args.taskEntry?.runId,
         onEscalate: args.onEscalate,
         onBlocked: args.onBlocked,
+        onBuildWipe: args.onBuildWipe,
         openStream: args.openStream,
         cwd: args.cwd,
         onUpdate: nodes => {

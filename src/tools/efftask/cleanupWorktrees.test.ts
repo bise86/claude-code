@@ -702,3 +702,217 @@ describe('用户实测的那个目录名', () => {
     expect(await exists(join(path, '.cargo-target-sql-restore'))).toBe(true)
   })
 })
+
+/**
+ * **用户第 5 条的另一半:目录必须留着的那两桶,它们的构建产物今天一个字节都清不到。**
+ *
+ * 用户是在 `7339528`(c 键管起 /tmp 与集成工作区)和 `6a3ffa7`(钉住 `.cargo-target-…`)
+ * **之后**又问了一遍「为什么按 c 键,target 没有完全清理掉」。而 `c` 键真正够得着的只有
+ * 「已验收 **且** 已合入」那一桶(整个目录删掉);另外两类它整个跳过:
+ *
+ *  - 有未合入提交的已验收节点(`kept`)—— 目录必须留(那是没人能替他决定的工作);
+ *  - 还没验收完的节点(`unfinished`,含被阻断的)—— 目录必须留(那是现场)。
+ *    跑机上「一个阻断、9 个兄弟依赖阻断」是常态,这一批攒得最久。
+ *
+ * 判据一句话:**清产物 ≠ 删目录。**
+ */
+describe('目录留着、只清构建产物', () => {
+  /** 造一个「已验收、但有一笔没合进集成分支的提交」的工作区。 */
+  async function keptNode(p: ReturnType<typeof pool>, id: string): Promise<{ n: TaskNode; path: string }> {
+    const n = node(id, { status: 'ACCEPTED' })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'own.ts'), 'executor committed this\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'own commit'], l.path)
+    await mkdir(join(l.path, 'target', 'debug'), { recursive: true })
+    await writeFile(join(l.path, 'target', 'debug', 'big.o'), 'x'.repeat(4096))
+    return { n, path: l.path }
+  }
+
+  it('有未合入提交的节点:目录、提交、未提交改动全保,只有 target/ 消失', async () => {
+    const p = pool()
+    await p.init()
+    const { n, path } = await keptNode(p, 'root/01-kept')
+    // 未提交的已跟踪改动 + 未跟踪未忽略的文件 —— 两样都必须活下来。
+    await writeFile(join(path, 'own.ts'), 'edited but not committed\n')
+    await writeFile(join(path, 'draft.ts'), 'not committed at all\n')
+
+    const deps = depsOf(p, { dirSizeKb: async () => 4 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    // 硬闸没变:它仍然在 kept 里,一个目录都不会被删。
+    expect(plan.items).toEqual([])
+    expect(plan.kept).toHaveLength(1)
+    // 而它进了新的那一桶。
+    expect(plan.buildOnly.map(b => b.nodeId)).toEqual([n.id])
+    expect(plan.buildOnly[0]!.plan.entries.map(e => e.rel)).toEqual(['target/'])
+
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.removed).toEqual([])
+    expect(out.buildOnlyCleaned).toBe(1)
+    expect(out.buildOnlyEntries).toBe(1)
+    expect(await exists(join(path, 'target'))).toBe(false)
+    // 用户第 6 条:未正常合并提交的绝对不能删除掉。逐一验。
+    expect(await exists(path)).toBe(true)
+    expect(await readFile(join(path, 'own.ts'), 'utf-8')).toBe('edited but not committed\n')
+    expect(await exists(join(path, 'draft.ts'))).toBe(true)
+    expect((await git(['rev-parse', '--verify', p.worktreeBranchOf(n)], gitRoot)).code).toBe(0)
+  })
+
+  it('还没验收完的节点(被阻断的现场)同样只清产物', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/02-blocked', { status: 'BLOCKED' })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'half.ts'), 'half done\n')
+    await mkdir(join(l.path, 'target'), { recursive: true })
+    await writeFile(join(l.path, 'target', 'a.o'), 'x'.repeat(4096))
+
+    const deps = depsOf(p, { dirSizeKb: async () => 4 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    // 它仍然算「还没验收」——那句「跳过 N 个」照旧,目录一个都不删。
+    expect(plan.unfinished).toBe(1)
+    expect(plan.items).toEqual([])
+    expect(plan.buildOnly.map(b => b.nodeId)).toEqual([n.id])
+
+    await runCleanup(deps, plan, [n])
+    expect(await exists(join(l.path, 'target'))).toBe(false)
+    // 现场一个字节都不动。
+    expect(await exists(join(l.path, 'half.ts'))).toBe(true)
+    expect(await exists(l.path)).toBe(true)
+  })
+
+  /**
+   * **在飞的节点一个字节都不碰。**
+   *
+   * 一次跑到一半的增量编译被抽掉产物,最好的结果是重编,最坏的结果是工具链拿着半个目录
+   * 报一堆看不懂的错 —— 而用户会以为是模型写坏了代码。
+   */
+  it('正在运行的节点整个跳过,而且要数出来', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/03-running', { status: 'EXECUTING' })
+    const l = await p.acquire(n) as { path: string }
+    await mkdir(join(l.path, 'target'), { recursive: true })
+    await writeFile(join(l.path, 'target', 'a.o'), 'x')
+
+    const deps = depsOf(p, { dirSizeKb: async () => 4, inFlight: [n.id] })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.buildOnly).toEqual([])
+    expect(plan.buildOnlyBusy).toBe(1)
+    await runCleanup(deps, plan, [n])
+    expect(await exists(join(l.path, 'target'))).toBe(true)
+  })
+
+  /**
+   * **「我没探明白」那一类整个不碰。**
+   *
+   * 「你还有东西没合」和「探测失败」要用户做的事不一样,而这里的差别不止是措辞:
+   * 在一个状态未知的仓库里跑 `git clean -f` 是这个功能最不该做的事。
+   */
+  it('merge-base 探测失败的节点不进「只清产物」那一桶', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/04-unknown', { status: 'ACCEPTED' })
+    const l = await p.acquire(n) as { path: string }
+    await mkdir(join(l.path, 'target'), { recursive: true })
+    await writeFile(join(l.path, 'target', 'a.o'), 'x')
+
+    const deps = depsOf(p, {
+      dirSizeKb: async () => 4,
+      // 只把那一问打成「我不知道」(128),别的 git 调用照常。
+      git: async (args, cwd) => (
+        args[0] === 'merge-base' ? { code: 128, stdout: '', stderr: 'fatal: 仓库出问题了' } : git(args, cwd)
+      ),
+    })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.kept).toHaveLength(1)
+    expect(plan.kept[0]!.unknown).toBe(true)
+    expect(plan.buildOnly).toEqual([])
+    await runCleanup(deps, plan, [n])
+    expect(await exists(join(l.path, 'target'))).toBe(true)
+  })
+
+  /** 没有产物可清的工作区不该在屏幕上占一行。 */
+  it('目录里没有构建产物时不进名单', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/05-clean', { status: 'BLOCKED' })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'src.ts'), 'x\n')
+    const plan = await scanCleanup(depsOf(p, { dirSizeKb: async () => 4 }), [n], n.id)
+    expect(plan.buildOnly).toEqual([])
+    expect(plan.buildOnlySizeKnown).toBe(false)
+  })
+
+  it('确认屏要说清:只删被忽略的产物、未被忽略的清不掉、被忽略的目录整个消失', async () => {
+    const p = pool()
+    await p.init()
+    const { n } = await keptNode(p, 'root/06-lines')
+    const plan = await scanCleanup(depsOf(p, { dirSizeKb: async () => 4 }), [n], n.id)
+    const text = cleanupLines(plan).join('\n')
+    expect(text).toContain('目录必须留着')
+    expect(text).toContain('一个字节都不动')
+    expect(text).toContain('清不掉')
+    expect(text).toContain('整个')
+    // 结果屏同样要说「目录、提交、未提交的改动都原样留着」。
+    const out = await runCleanup(depsOf(p, { dirSizeKb: async () => 4 }), plan, [n])
+    expect(cleanupResultLines(out).join('\n')).toContain('原样留着')
+  })
+})
+
+/**
+ * **用户第 6 条的反向探针 —— 今天零覆盖。**
+ *
+ * 「清理按键 c 触发后,未正常合并提交的绝对不能删除掉。」硬闸的正向行为有用例,
+ * 而「按下确认之后那个目录、那条分支、那些未提交内容**逐一**还在」从来没有被断言过 ——
+ * 而这是一次不可逆的动作。
+ */
+describe('未合入的绝对不能删(反向)', () => {
+  it('已验收但未合入:目录、分支、未提交内容逐一还在', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/07-unmerged', { status: 'ACCEPTED' })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'work.ts'), 'real work\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'unmerged work'], l.path)
+    await writeFile(join(l.path, 'loose.ts'), 'uncommitted\n')
+
+    const deps = depsOf(p, { dirSizeKb: async () => 4 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.items).toEqual([])
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.removed).toEqual([])
+    expect(await exists(l.path)).toBe(true)
+    expect(await exists(join(l.path, 'work.ts'))).toBe(true)
+    expect(await exists(join(l.path, 'loose.ts'))).toBe(true)
+    expect((await git(['rev-parse', '--verify', p.worktreeBranchOf(n)], gitRoot)).code).toBe(0)
+    // 那笔提交仍然找得回来 —— 「删了就真的没了」这句话的反面。
+    expect((await git(['log', '--oneline', p.worktreeBranchOf(n)], gitRoot)).stdout).toContain('unmerged work')
+  })
+
+  /**
+   * `runCleanup` **只对 `plan.items` 做 `worktree remove`**。
+   *
+   * 今天靠代码结构成立,没有任何断言 —— 而这是不可逆动作。手工把一个 kept 节点塞进
+   * 一个**空的** items 名单里跑一遍,证明它不会顺着别的名单去删东西。
+   */
+  it('只对 items 动 worktree remove,别的名单一个目录都不删', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/08-only-items', { status: 'ACCEPTED' })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'work.ts'), 'x\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'w'], l.path)
+    await mkdir(join(l.path, 'target'), { recursive: true })
+    await writeFile(join(l.path, 'target', 'a.o'), 'x')
+
+    const deps = depsOf(p, { dirSizeKb: async () => 4 })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.items).toEqual([])          // 未合入 → 不在 items 里
+    expect(plan.buildOnly).toHaveLength(1)  // 只在「清产物」那一桶
+    await runCleanup(deps, plan, [n])
+    expect(await exists(l.path)).toBe(true)
+  })
+})

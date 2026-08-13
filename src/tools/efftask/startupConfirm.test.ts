@@ -1505,3 +1505,43 @@ describe('applyStartupDecision 对两个开关的「缺省 = 不变」', () => {
     expect(out.autoPush).toBe(true)
   })
 })
+
+/**
+ * **「任务完成即回收构建产物」必须印在关口上,而且印的是「开」那一档。**
+ *
+ * 这一条故意违反本文件其余各行「只印非默认值」的惯例。惯例的目的是少印噪声,而这一格
+ * 不是噪声:它是一次**自动的、不可逆的删除**,默认发生,而用户在关口上唯一需要确认的
+ * 就是「我按下回车之后,谁会在什么时候删我盘上的东西」。
+ */
+describe('完成即回收(caps.wipeOnAccept)', () => {
+  const cfg = (over: Partial<EffTaskConfig> = {}): EffTaskConfig => ({
+    goalPrompt: 'g', parallelism: 5, phaseRoles: emptyPhaseRoles(),
+    caps: { ...DEFAULT_CAPS }, notices: [], isolation: 'worktree', ...over,
+  })
+
+  it('默认(开)也要印,而且要同时说出代价', () => {
+    const lines = gitChoiceLines(cfg())
+    const line = lines.find(l => l.includes('完成即回收'))
+    expect(line).toBeDefined()
+    expect(line).toContain('开')
+    // 收益和代价必须在同一句里 —— 只说腾出空间是拿半句真话换一次按键。
+    expect(line).toContain('全量重编')
+    expect(line).toContain('.gitignore')
+  })
+
+  it('关掉时要说清东西留在哪、谁来处理', () => {
+    const line = gitChoiceLines(cfg({ caps: { ...DEFAULT_CAPS, wipeOnAccept: false } }))
+      .find(l => l.includes('完成即回收'))
+    expect(line).toContain('关')
+    expect(line).toContain('c 键')
+  })
+
+  /**
+   * 共享工作树下**根本没有隔离工作区**,也就没有「它的构建产物」这回事 ——
+   * 印出来就是承诺一件不会发生的事(自动推送那一行为同一件事分过支)。
+   */
+  it('共享工作树下一个字都不印', () => {
+    expect(gitChoiceLines(cfg({ isolation: 'shared' })).some(l => l.includes('完成即回收'))).toBe(false)
+    expect(gitChoiceLines(cfg(), { unavailable: '不是 git 仓库' }).some(l => l.includes('完成即回收'))).toBe(false)
+  })
+})

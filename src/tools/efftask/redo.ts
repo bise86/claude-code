@@ -1671,17 +1671,29 @@ export function redoSummary(
   if (removed.length > 0) lines.push(`${removed.length} 条依赖被移除(下游可能比预期更早起跑)`)
   if (plan.worktreesToRelease.length > 0) {
     /**
-     * 「释放」读起来像清理,而对一个**脏的**工作区它不是。
+     * 「释放」读起来像清理,而这条路做的事比清理重 —— 它是**删除**。
      *
-     * release 在工作区仍有未提交/被忽略的文件时会拒删(keptBecause),目录留在原地;
-     * 下一次 acquire 走复用分支:`git add -A` → `commit --no-verify` →
-     * `branch -f efftask/<run>/salvage/<节点>` → `checkout -B <分支> <集成分支>`。
-     * 也就是说用户手改的东西被提交进一条他从没听说过的分支,目录被重置 —— 不会丢,
-     * 但也不在原处了。屏幕只写「释放 N 个」的话,这件事按下去之前完全看不见。
+     * 用户第 4 条:「任务重做是要将其 worktree 工作区这些全部删除掉。」于是这条路从
+     * `release()`(判据「干净 + 已合入」,`target/` 一在就拒绝)换成了 `discard()`:
+     * 先 `add -A` + commit 固化、再存一条**唯一命名**的 salvage ref、再
+     * `worktree remove --force` 把目录整个删掉、最后删分支。
+     *
+     * 三句话拆成三行,不写成一句长的:正文是 `wrap="truncate-end"`,80 列上一句 60 个
+     * 全角字会被砍掉可操作的后半句(这个仓库为「113 列以下 `r 重做本任务` 一个字都画不出来」
+     * 修过一次)。
+     *
+     * 第二行那句**必须**说被忽略的文件会跟着没:`git add -A` 不暂存被忽略的文件,所以
+     * `target/` 这些**不进** salvage,而是随目录一起消失 —— 那正是用户第 2 条要的
+     * 「重新编译」,但它同时也是这一屏唯一真正不可逆的部分。
      */
     lines.push(
-      `释放 ${plan.worktreesToRelease.length} 个隔离工作区;里面**未提交**的改动会先被固化到 ` +
-      `efftask/<run>/salvage/… 分支再重置目录 —— 不会丢,但不在原处了`,
+      `删除 ${plan.worktreesToRelease.length} 个隔离工作区的目录与分支(下次执行会从集成分支最新状态重建)`,
+    )
+    lines.push(
+      '  · 里面**未提交**的改动会先被固化到 efftask/<run>/salvage/… —— 不会丢,但不在原处了',
+    )
+    lines.push(
+      '  · 被 .gitignore 忽略的构建产物(target/ 这些)**不进** salvage,随目录一起删掉,下次全量重编',
     )
   }
   /**

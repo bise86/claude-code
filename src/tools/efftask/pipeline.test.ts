@@ -1230,6 +1230,128 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     expect(n.execStatus).toContain('集成工作区')
   })
 
+  /**
+   * **合并提交、判 ACCEPTED 的那一刻立即清掉构建产物。**
+   *
+   * 用户原话:「合并提交后,任务标记完成了,需要立马清理掉 worktree 下的 target 目录下的
+   * 编译产物这些」。判据全在 `buildOutputs.ts` 与 `mergeAndRelease` 的注释里;这几条钉的是
+   * **接线**——那一段在 `mergeAndRelease` 里,而这个仓库为「代码在、调用点没接上」付过账。
+   */
+  describe('合并完成即清构建产物', () => {
+    it('合并成功之后调一次,而且排在 release 之前', async () => {
+      const order: string[] = []
+      const n = root()
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        worktrees: fakePool({
+          commitAndMerge: async () => { order.push('MERGE'); return { ok: true, merged: true } },
+          wipeBuildOutputs: async () => {
+            order.push('WIPE')
+            return { removed: ['target/'], skippedRepos: [], excluded: [], freedKb: 2048, sizeKnown: true }
+          },
+          release: async () => { order.push('RELEASE'); return { removed: true } },
+        }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.status).toBe('ACCEPTED')
+      // 排在 release 之前不是审美:release 的判据是「干净(带 --ignored)+ 已合入」,
+      // 而 target/ 的存在必然让它拒绝 —— 先清再放,目录才有机会被正常回收。
+      expect(order).toEqual(['MERGE', 'WIPE', 'RELEASE'])
+    })
+
+    it('统计走 onBuildWipe,一个字都不写进 execStatus', async () => {
+      // execStatus 会被喂进之后每一次验收/集成验收的提示词。每节点追一句「已清 2 GB」
+      // 就是把它撑成流水账,而 worktreePool 为逐任务合并定过同一条规矩:成功不写。
+      const seen: { nodeId: string; title: string }[] = []
+      const n = root()
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        onBuildWipe: (e: { nodeId: string; title: string }) => { seen.push({ nodeId: e.nodeId, title: e.title }) },
+        worktrees: fakePool({
+          wipeBuildOutputs: async () => ({
+            removed: ['target/'], skippedRepos: [], excluded: [], freedKb: 2048, sizeKnown: true,
+          }),
+        }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(seen).toEqual([{ nodeId: 'root', title: 'r' }])
+      expect(n.execStatus).not.toContain('构建产物')
+      expect(n.execStatus).not.toContain('target/')
+    })
+
+    it('caps.wipeOnAccept === false 时一次都不调', async () => {
+      let called = 0
+      const n = root()
+      const base = ctxFor([n], okAgent())
+      const ctx = {
+        ...base,
+        config: { ...base.config, caps: { ...base.config.caps, wipeOnAccept: false } },
+        worktrees: fakePool({ wipeBuildOutputs: async () => { called++; return { removed: [], skippedRepos: [], excluded: [], freedKb: 0, sizeKnown: false } } }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.status).toBe('ACCEPTED')
+      expect(called).toBe(0)
+    })
+
+    /**
+     * **字段缺席 = 开。** `Caps` 有三条来源(DEFAULT_CAPS / settings.json / 提示词逐字段覆盖),
+     * 而 `--resume` 读回来的那份可能整个字段不在。判据写成 `!== false` 而不是读默认对象,
+     * 就是为了让缺席的答案是「开」——这个仓库为「只写不读的字段在第一次 --resume 时清零」
+     * 付过三次账。
+     */
+    it('caps 里根本没有这个字段时照样清', async () => {
+      let called = 0
+      const n = root()
+      const base = ctxFor([n], okAgent())
+      const caps = { ...base.config.caps } as Record<string, unknown>
+      delete caps.wipeOnAccept
+      const ctx = {
+        ...base,
+        config: { ...base.config, caps: caps as never },
+        worktrees: fakePool({ wipeBuildOutputs: async () => { called++; return { removed: ['target/'], skippedRepos: [], excluded: [], freedKb: 1, sizeKnown: true } } }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(called).toBe(1)
+    })
+
+    /** 清理抛异常不能把一个**已经合并成功**的节点变成失败 —— 清不掉是磁盘的事。 */
+    it('清理抛异常:节点照样 ACCEPTED,而失败要走到统计口', async () => {
+      const seen: { outcome: { error?: string } }[] = []
+      const n = root()
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        onBuildWipe: (e: { outcome: { error?: string } }) => { seen.push(e) },
+        worktrees: fakePool({ wipeBuildOutputs: async () => { throw new Error('磁盘满') } }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.status).toBe('ACCEPTED')
+      expect(seen[0]?.outcome.error).toContain('磁盘满')
+    })
+
+    /** 合并**没成功**时一个字节都不许碰 —— 那棵树是现场。 */
+    it('合并撞冲突时不清', async () => {
+      let called = 0
+      const n = root()
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        worktrees: fakePool({
+          commitAndMerge: async () => ({ ok: false, kind: 'conflict', files: ['src/a.ts'] }),
+          mergeIntegrationIntoNode: async () => ({ ok: false, message: '重现不了' }),
+          wipeBuildOutputs: async () => { called++; return { removed: [], skippedRepos: [], excluded: [], freedKb: 0, sizeKnown: false } },
+        }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.status).toBe('BLOCKED')
+      expect(called).toBe(0)
+    })
+  })
+
   it('a conflict gets ONE self-resolve attempt by the execute role, inside the worktree', async () => {
     // spec §8: 冲突 → 触发一次"合并解决"(由该节点 execute 角色在 worktree 内解决). The executor is
     // the only agent that knows what its own change meant, so it — not the user — goes first.

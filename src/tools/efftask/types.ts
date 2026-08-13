@@ -950,6 +950,22 @@ export interface Caps {
    */
   mergeResolveAttempts?: number
   /**
+   * 一个任务**合并提交、判 ACCEPTED 的那一刻**,立即清掉它工作区里被 `.gitignore` 忽略的
+   * 构建产物。默认 **true**(用户原话:「合并提交后,任务标记完成了,需要立马清理掉
+   * worktree 下的 target 目录下的编译产物这些」)。
+   *
+   * 为什么默认开:跑机上这一趟停在盘 100% 满上(916G 用了 869G,`/` 只剩 1.7 MB,日志里
+   * 84 次 `ENOSPC`)。而这一刻清掉的东西**在任何路径上都到不了集成分支**(`add -A` 从不
+   * 暂存被忽略的文件),所以它不是交付物。
+   *
+   * 为什么仍然要给一个关:这是一次**自动的、不可逆的**删除,而且被忽略的目录是**整个**
+   * 消失的(实测:手工放在 `target/NOTES.md` 的东西随 `Removing target/` 一起没了)。
+   * 关掉它 = 回到从前(留着,由 `c` 键或 `dispose()` 事后处理)。
+   *
+   * 代价要在启动关口上说出口:**重做那个任务会全量重编**。
+   */
+  wipeOnAccept?: boolean
+  /**
    * 严格度档位 —— 四个裁决环节「多好才算够」的那把尺子。见 `strictness.ts` 的文件头。
    *
    * **它是一个独立的枚举字段,数值在使用点派生,永不回写 `quorum` / `maxIterations`。**
@@ -995,6 +1011,14 @@ export const DEFAULT_CAPS: Caps = {
   maxDepth: 5, maxNodes: 100, maxIterations: 3,
   // 6 次自动解冲突。理由见 Caps.mergeResolveAttempts —— 关键是「叫醒人」的代价。
   mergeResolveAttempts: 6,
+  /**
+   * 合并完成即清构建产物。**默认开**,理由见 `Caps.wipeOnAccept`。
+   *
+   * 判据写成 `!== false` 而不是读这个默认值,是因为 `Caps` 有三条来源(DEFAULT_CAPS、
+   * settings.json 的 efftaskCaps、提示词逐字段覆盖),而 `--resume` 读回来的那份可能
+   * 整个字段缺席 —— 缺席时的正确答案是「开」,不是「按默认对象里恰好写了什么」。
+   */
+  wipeOnAccept: true,
   // 静默 10 分钟 = 挂死。作为「一条消息都不吐」的判据,这个数已经很宽松了。
   nodeTimeoutMs: 600_000,
   // 7 天。人不在键盘前是常态。

@@ -226,3 +226,93 @@ describe('commitRedo 报出来的问题', () => {
     expect(errs.map(e => e.message)).toContain('run.md 写不动')
   })
 })
+
+/**
+ * **重做走 `discard`,不走 `release`**(用户第 2、4 条)。
+ *
+ * `release()` 的判据是「干净(带 `--ignored`)+ 已合入」—— `target/` 的存在必然让它拒绝。
+ * 于是重做在真实运行里一个工作区都放不掉,而**执行者读到的注记**(`REDO_NOTE_LOST` /
+ * `REDO_NOTE_MERGED`,redo.ts:492)逐字写着「隔离工作区已重置为集成分支最新状态」。
+ * 那句话是说给一个带写工具的模型听的,而它是假的 —— 它会在树里找到自己上一轮的产出。
+ */
+describe('重做时销毁工作区', () => {
+  it('池子提供 discard 时优先走它,一次 release 都不调', async () => {
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
+    const { fs } = fakeFs()
+    const calls: string[] = []
+    await commitRedo({
+      fs, runDir: '/run', config: CONFIG, before,
+      pool: {
+        async discard(n) { calls.push(`discard ${n.id}`); return { removed: true } },
+        async release(n) { calls.push(`release ${n.id}`); return { removed: true } },
+      },
+    }, plan)
+    expect(calls.some(c => c.startsWith('discard '))).toBe(true)
+    expect(calls.some(c => c.startsWith('release '))).toBe(false)
+  })
+
+  /** 老形状(只有 release)仍然收 —— 那时行为退回从前,而不是整条不做。 */
+  it('池子没有 discard 时退回 release', async () => {
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
+    const { fs } = fakeFs()
+    const calls: string[] = []
+    await commitRedo({
+      fs, runDir: '/run', config: CONFIG, before,
+      pool: { async release(n) { calls.push(`release ${n.id}`); return { removed: true } } },
+    }, plan)
+    expect(calls.some(c => c.startsWith('release '))).toBe(true)
+  })
+
+  /**
+   * **抢救出来的 ref 必须念给用户听。**
+   *
+   * 它是「这次重做把上一版产出放哪儿了」的唯一答案,而重做是用户主动按下的不可逆动作。
+   * 不说 = 用户以为那一版没了(而它其实在),或者反过来以为还在(而它其实没了)——
+   * 两种误解都源自同一处沉默。
+   */
+  it('抢救分支要出现在 problems 里,带得上分支名', async () => {
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
+    const { fs } = fakeFs()
+    const { problems } = await commitRedo({
+      fs, runDir: '/run', config: CONFIG, before,
+      pool: {
+        async discard() { return { removed: true, salvaged: 'efftask/001/salvage/abcd1234' } },
+        async release() { return { removed: true } },
+      },
+    }, plan)
+    expect(problems.join('\n')).toContain('efftask/001/salvage/abcd1234')
+    expect(problems.join('\n')).toContain('没有丢失')
+  })
+
+  it('目录删了而分支没删掉 —— 也要说', async () => {
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
+    const { fs } = fakeFs()
+    const { problems } = await commitRedo({
+      fs, runDir: '/run', config: CONFIG, before,
+      pool: {
+        async discard() { return { removed: true, branchKept: 'worktree-efftask-001-abcd' } },
+        async release() { return { removed: true } },
+      },
+    }, plan)
+    expect(problems.join('\n')).toContain('worktree-efftask-001-abcd')
+  })
+
+  /** discard 拒绝(抢救存不下来 / 探不明白)时的原因要原样带出去。 */
+  it('discard 拒绝时把原因带出来,而不是静默当成功', async () => {
+    const before = TREE()
+    const plan = ok(planRedo(before, 'root', 'plan', 'T1'))
+    const { fs } = fakeFs()
+    const { problems } = await commitRedo({
+      fs, runDir: '/run', config: CONFIG, before,
+      pool: {
+        async discard() { return { removed: false, keptBecause: '无法判断提交是否已合入' } },
+        async release() { return { removed: true } },
+      },
+    }, plan)
+    expect(problems.join('\n')).toContain('无法判断提交是否已合入')
+  })
+})

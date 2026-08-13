@@ -934,11 +934,23 @@ describe('清理已完成工作区的接线不能被静默剪断', () => {
      */
     expect(SRC).toContain('scratch: tmpScratch')
     expect(SRC).toContain('integrationPath: pool.integrationPath')
+    /**
+     * 「只清产物」那一桶的硬闸(用户第 5 条的另一半)。剪断它,`c` 会对一个**正在跑**的
+     * 节点的工作区跑 `git clean` —— 一次跑到一半的增量编译被抽掉产物,而用户会以为是
+     * 模型写坏了代码。判据在 cleanupWorktrees.ts 里被真 git 测过,这一行是它的电源。
+     */
+    expect(SRC).toContain('inFlight: orchRef.current?.runningNodeIds() ?? []')
   })
 
   it('确认之后真的会去扫、去删,并把结果推回界面', () => {
-    expect(element('ConfirmCleanup')).toContain('scanCleanup(deps, nodes, cleanupTarget.id)')
-    expect(element('ConfirmCleanup')).toContain('runCleanup(deps, plan, nodes)')
+    /**
+     * **扫描和真删各取一次 deps。**
+     *
+     * 两次之间隔着一整屏确认(用户可能看很久),而 `inFlight` 是这期间唯一会变的东西。
+     * 共用渲染那一刻的快照 = 拿一个过期的答案去对一个此刻正在跑的工作区动手。
+     */
+    expect(element('ConfirmCleanup')).toContain('scanCleanup(cleanupDeps()!, nodes, cleanupTarget.id)')
+    expect(element('ConfirmCleanup')).toContain('runCleanup(cleanupDeps()!, plan, nodes)')
     // 剪断这一句:工作区没了,而详情页的「隔离工作区」那一段还画着那条路径。
     expect(element('ConfirmCleanup')).toContain('setNodes([...nodes])')
   })

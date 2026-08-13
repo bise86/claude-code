@@ -45,6 +45,7 @@ import { recalcScope, type RecalcPlan } from '../../tools/efftask/depsRecalc.js'
 import { notSchedulableReason } from '../../tools/efftask/scheduler.js'
 import { applyRecalc, askRecalc, type RecalcApply, type RecalcAsk } from '../../tools/efftask/depsRecalcRun.js'
 import { runCleanup, scanCleanup, type CleanupDeps } from '../../tools/efftask/cleanupWorktrees.js'
+import { buildWipeLines, emptyBuildWipeTally, noteBuildWipe, type BuildWipeTally } from '../../tools/efftask/buildWipeTally.js'
 import { runSubtreeMerge, scanSubtreeMerge, type SubtreeMergeDeps } from '../../tools/efftask/mergeSubtree.js'
 import { ConfirmMergeSubtree } from './ConfirmMergeSubtree.js'
 import { ConfirmResume } from './ConfirmResume.js'
@@ -448,6 +449,14 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   // escalation cards were dropped.
   const cardLimitOut: { current: number } = { current: 0 }
   /**
+   * 「任务完成即回收构建产物」这一趟一共清掉了什么(用户第 9 条)。
+   *
+   * 和上面几个同一套理由(onExit 跑在 `call()` 的作用域里),但它多一条自己的理由:
+   * 这一路是**自动的、不可逆的**删除,而退出报告比 done 视图活得久 —— 一次删了 20 GB
+   * 的运行,用户最有可能在对话记录里回头找它。
+   */
+  const buildWipeOut: { current: BuildWipeTally } = { current: emptyBuildWipeTally() }
+  /**
    * 组件挂载后填进来的「有人在等确认」通知口。
    *
    * 必须是 ref 而不是闭包:runAgent 在 `call()` 里就构造好了(它要交给 orchestrator),
@@ -513,6 +522,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       handoffOut={handoffOut}
       handoffStateOut={handoffStateOut}
       cardLimitOut={cardLimitOut}
+      buildWipeOut={buildWipeOut}
       humanWaitOut={humanWaitOut}
       control={control}
       // The transcript is the only durable trace once the panel is gone: say how the run
@@ -538,6 +548,15 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
           const suppressed = dropped > 0
             ? `\n(另有 ${dropped} 条升级通知因数量上限未发送;被阻断的节点见 run.md 的任务树,未阻断的见对应节点的 node.md)`
             : ''
+          /**
+           * 「任务完成即回收构建产物」这一趟到底删了什么。
+           *
+           * **必须进退出报告**,不能只画在 done 视图上:那一屏一按键就没了,而这是一次
+           * 自动的、不可逆的删除 —— 用户回头找它的地方是对话记录。
+           * 一条都没清时 `buildWipeLines` 返回空数组,这里跟着一个字都不印。
+           */
+          const wiped = buildWipeLines(buildWipeOut.current)
+          const wipedLine = wiped.length > 0 ? `\n${wiped.join('\n')}` : ''
           onDone(
             exitReportLine({
               runId, how, resumed, withPath,
@@ -545,7 +564,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
               // 「完成」那一格才需要被限定成「完成,但产出还没到你的分支」——
               // 被阻断 / 已取消的行本来就没在声称成功。
               completed: outcome?.status === 'completed',
-            }) + suppressed,
+            }) + suppressed + wipedLine,
             { display: 'system' },
           )
         }
@@ -745,7 +764,12 @@ async function makeWorktreePool(
   if (head.code !== 0) {
     return { reason: '这个 git 仓库还没有任何提交,建不出集成分支', needsFirstCommit: true, gitRoot }
   }
-  const pool = createWorktreePool({ runId, gitRoot, git: gitRunner, worktreeRoot: `${gitRoot}/.efftask-worktrees` })
+  const pool = createWorktreePool({
+    runId, gitRoot, git: gitRunner, worktreeRoot: `${gitRoot}/.efftask-worktrees`,
+    // 「腾出多少」必须是量出来的。`du` 不在时 duKb 回 undefined,而屏幕跟着说
+    // 「大小未知」——比一个 0 诚实得多(`CleanupDeps.dirSizeKb` 的同一条规矩)。
+    dirSizeKb: duKb,
+  })
   const init = await pool.init()
   if (!init.ok) return { reason: init.reason }
   return { pool, ...(pool.healNotes().length > 0 ? { healed: pool.healNotes() } : {}) }
@@ -825,6 +849,13 @@ type RunnerProps = {
   onTornDown: () => void
   /** call()-scoped holder for the handoff, read by onExit. See exitReportLine. */
   handoffOut: { current: HandoffSummary | null }
+  /**
+   * 「任务完成即回收构建产物」的账,同样由 `call()` 持有、由 onExit 读。
+   *
+   * 就地累加(编排器每合并成功一个节点调一次),所以它是**同一个对象**从头用到尾 ——
+   * 换成 state 会让一次几百个节点的运行重渲染几百次整棵树,而唯一的读者是收尾那一次。
+   */
+  buildWipeOut: { current: BuildWipeTally }
   handoffStateOut: { current: HandoffState | undefined }
   /** call()-scoped count of escalation cards the limiter dropped, read by onExit. */
   cardLimitOut: { current: number }
@@ -999,6 +1030,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // Per-run escalation budget (see createEscalationLimiter). A ref, not state: it must not
   // reset on re-render, and nothing renders from it.
   const cardLimit = React.useRef(createEscalationLimiter())
+  /**
+   * 「任务完成即回收构建产物」的账(用户第 9 条)。
+   *
+   * `useRef` 而不是 state:编排器每合并成功一个节点就调一次,一次几百个节点的运行会
+   * 重渲染几百次整棵树,而唯一的读者是收尾那一次(`buildWipeLines`)。
+   * **种子取自 props 那一份**,不是新建 —— 两份账会让退出报告和 done 视图各说各的。
+   */
+  const buildWipe = React.useRef(props.buildWipeOut.current ?? emptyBuildWipeTally())
   /**
    * 事件流的落盘出口与读回口。
    *
@@ -1541,6 +1580,16 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
             logError(err instanceof Error ? err : new Error(String(err)))
           })
         },
+        /**
+         * 合并完成即清构建产物(用户第 9 条)—— **统计的落点**。
+         *
+         * 就地累加进一个 ref 而不是 setState:这一路在一次跑里会被调几百次,每次都重渲染
+         * 整棵树是白付的钱;而它唯一的读者是收口屏(`buildWipeLines`),那时候读一次就够。
+         */
+        onBuildWipe: e => {
+          noteBuildWipe(buildWipe.current, e)
+          props.buildWipeOut.current = buildWipe.current
+        },
       },
       setNodes,
       recordOutcome,
@@ -1708,6 +1757,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       // 集成工作区的**构建产物**归这个键管(目录本身永远留着,见 CleanupDeps.integrationPath)。
       // 跑机上它一个人就是 22 GB。
       integrationPath: pool.integrationPath,
+      /**
+       * 此刻真的有一步在跑的节点 —— 「只清产物」那一桶的硬闸(见 `CleanupDeps.inFlight`)。
+       *
+       * 每次调用 `cleanupDeps()` 现取一份(调用方在扫描和真删时各调一次,不共用渲染时
+       * 那一份)—— 两次之间隔着一整屏确认,期间完全可能又有节点被派出去。
+       * `runningNodeIds()` 是编排器对外的那条接缝(`inFlightIds` 是 private)。
+       */
+      inFlight: orchRef.current?.runningNodeIds() ?? [],
       onError: e => logError(e),
     }
     // biome-ignore lint/correctness/useExhaustiveDependencies: props.fs is stable for a mount
@@ -2301,10 +2358,17 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return (
       <ConfirmCleanup
         target={cleanupTarget}
-        onScan={() => (deps ? scanCleanup(deps, nodes, cleanupTarget.id) : noPool())}
+        /**
+         * 扫描和真删**各取一次 deps**,而不是共用渲染时那一份。
+         *
+         * `inFlight` 是这两次之间唯一会变的东西,而它是「只清产物」那一桶的硬闸:
+         * 两次之间隔着一整屏确认(用户可能看很久),期间完全可能又有节点被派出去。
+         * 拿渲染那一刻的快照去删,就是拿一个过期的答案对一个正在跑的增量编译动手。
+         */
+        onScan={() => (deps ? scanCleanup(cleanupDeps()!, nodes, cleanupTarget.id) : noPool())}
         onRun={async plan => {
           if (!deps) return noPool()
-          const out = await runCleanup(deps, plan, nodes)
+          const out = await runCleanup(cleanupDeps()!, plan, nodes)
           // `runCleanup` 是**就地**清掉 node.worktree 的(界面和编排器持有的是同一批
           // 节点对象),所以这里只要推一份新数组让 React 重画。
           if (out.removed.length > 0) setNodes([...nodes])

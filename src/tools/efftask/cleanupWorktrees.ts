@@ -1,6 +1,7 @@
 import { descendantsOf } from './redo.js'
 import { AGENT_LOG_NAME } from './agentLog.js'
 import { writeNode, type FsLike } from './persistence.js'
+import { scanBuildOutputs, wipeBuildOutputs, type BuildWipePlan } from './buildOutputs.js'
 import type { TaskNode } from './types.js'
 
 /**
@@ -101,6 +102,16 @@ export interface CleanupDeps {
    * 正在进行的冲突解决留下的现场,而它和构建产物长得完全不一样。
    */
   integrationPath?: string
+  /**
+   * 此刻**真的有一步在跑**的节点 id(`orchestrator.runningNodeIds()`)。
+   *
+   * 只给「清构建产物」那两桶用,而且是硬闸:一个正在被执行者写着的工作区,连它的
+   * `target/` 都不能动 —— 一次跑到一半的增量编译被抽掉产物,最好的结果是重编,
+   * 最坏的结果是工具链拿着半个目录报一堆看不懂的错,而用户会以为是模型写坏了代码。
+   *
+   * 拿不到(结束屏、`--resume` 之后编排器还没建起来)= 空数组 = 没有节点在飞,那是真的。
+   */
+  inFlight?: readonly string[]
   onError?: (e: Error) => void
 }
 
@@ -124,6 +135,47 @@ export interface CleanupKept {
   title: string
   path: string
   why: string
+  /**
+   * 这个理由是不是「我没探明白」(`merge-base` 非 0 非 1)。
+   *
+   * **必须和「你还有东西没合」分开**,而且不只是措辞:一个状态未知的仓库里跑
+   * `git clean -f` 是这个功能最不该做的事,所以只有**探明白了**的那一类才进 `keptBuild`。
+   * (`integrationAhead` 那条注释的第三次应验。)
+   */
+  unknown?: boolean
+}
+
+/**
+ * 一个**目录整个保留、只清里面构建产物**的工作区。
+ *
+ * ## 为什么需要这一档
+ *
+ * 用户第 5 条问的是「为什么按 c 键,worktree 的 target 没有完全清理掉」,而他是在
+ * `7339528` / `6a3ffa7` 两个修复**之后**又问的一遍。今天 `c` 键真正够得着的只有
+ * 「已验收 **且** 已合入」那一桶(整个目录删掉);另外两类工作区它一个字节都碰不到:
+ *
+ *  - **有未合入提交的已验收节点**(`kept`)—— 目录必须留,那是没人能替他决定的工作;
+ *  - **还没验收完的节点**(`unfinished`,含被阻断的)—— 目录必须留,那是现场。
+ *    而跑机上「一个节点阻断、9 个兄弟依赖阻断」是常态,它们的 `target/` 攒得最久。
+ *
+ * 两类的共同点是**目录不能删**,而 `target/` 和「保护工作」「保护现场」都没有关系。
+ * 判据一句话:**清产物 ≠ 删目录。**
+ *
+ * ## 边界(每一条都在确认屏上说出口)
+ *
+ *  - 只清**被 .gitignore 忽略的**。未跟踪但没被忽略的可能是执行者刚生成、还没提交的
+ *    交付物 —— 而这两桶恰恰是「工作还没合走」的桶。用户点名的 `.cargo-target-sql-restore`
+ *    就属于这一类,它清不掉,这件事要说,不是假装没有。
+ *  - 被忽略的**目录是整个消失的**,包括手工放在里面的文件(真 git 实测)。
+ *  - **在飞的节点一个字节都不动**(见 `CleanupDeps.inFlight`)。
+ */
+export interface CleanupBuildItem {
+  nodeId: string
+  title: string
+  path: string
+  /** 这个工作区为什么只清产物、不删目录 —— 给确认屏分组用。 */
+  why: string
+  plan: BuildWipePlan
 }
 
 export interface CleanupPlan {
@@ -170,6 +222,22 @@ export interface CleanupPlan {
     entryCount: number
     kb?: number
   }
+  /**
+   * **目录整个保留、只清里面构建产物**的那些(见 `CleanupBuildItem`)。
+   *
+   * 第四份名单,范围和前三份都不一样:它收的是 `kept`(已验收但没合入)与
+   * `unfinished`(还没验收完、且此刻不在飞)两类 —— 也就是今天 `c` 键完全够不着的那部分。
+   */
+  buildOnly: CleanupBuildItem[]
+  buildOnlyKb: number
+  buildOnlySizeKnown: boolean
+  /**
+   * 会被 git 静默跳过的嵌套仓库(`clean` 对它退出码仍是 0)。
+   * 不报出来,屏幕就会承诺一份根本不会被腾出来的空间。
+   */
+  buildOnlySkippedRepos: string[]
+  /** 因为节点此刻**在飞**而整个不碰的工作区数。 */
+  buildOnlyBusy: number
 }
 
 export interface CleanupOutcome {
@@ -186,6 +254,13 @@ export interface CleanupOutcome {
   /** 集成工作区的构建产物清掉了没有(没给路径 / 没东西可清 = false)。 */
   integrationCleaned: boolean
   integrationFreedKb: number
+  /** 「只清产物」那一桶:清过东西的工作区数、条目数、实测释放量。 */
+  buildOnlyCleaned: number
+  buildOnlyEntries: number
+  buildOnlyFreedKb: number
+  buildOnlySizeKnown: boolean
+  /** 真删那一遍里被 git 跳过的嵌套仓库(带节点标题,好让人找得到)。 */
+  buildOnlySkipped: { title: string; path: string }[]
   freedKb: number
   sizeKnown: boolean
 }
@@ -199,15 +274,24 @@ export function cleanupScope(nodes: readonly TaskNode[], targetId: string): {
   /** 血统里已验收的那些,目标节点自己排第一(如果它也已验收)。 */
   done: TaskNode[]
   unfinished: number
+  /**
+   * 血统里**还没验收完**的那些节点本身,不只是个数。
+   *
+   * 从前这里只回一个计数,因为它们整个不在范围内。现在它们进「只清产物」那一桶:
+   * 目录仍然一个都不删(那是现场),但 `target/` 和保护现场没有关系 —— 而跑机上
+   * 「一个阻断、9 个兄弟依赖阻断」是常态,这一批的构建产物攒得最久,`c` 键从来碰不到。
+   */
+  unfinishedNodes: TaskNode[]
 } {
   const byId = new Map(nodes.map(n => [n.id, n]))
   const target = byId.get(targetId)
-  if (!target) return { done: [], unfinished: 0 }
+  if (!target) return { done: [], unfinished: 0, unfinishedNodes: [] }
   // 自己 + 全部后代。descendantsOf 自带环保护,并且只收**真实存在**的后代 ——
   // childIds 是可手工编辑的,一个自指的条目会让这里死循环,而它跑在按键处理里。
   const scope = [target, ...descendantsOf(target, byId).map(id => byId.get(id)!).filter(Boolean)]
   const done = scope.filter(n => n.status === 'ACCEPTED')
-  return { target, done, unfinished: scope.length - done.length }
+  const unfinishedNodes = scope.filter(n => n.status !== 'ACCEPTED')
+  return { target, done, unfinished: unfinishedNodes.length, unfinishedNodes }
 }
 
 /**
@@ -221,12 +305,19 @@ export function cleanupScope(nodes: readonly TaskNode[], targetId: string): {
 export async function scanCleanup(
   deps: CleanupDeps, nodes: readonly TaskNode[], targetId: string,
 ): Promise<CleanupPlan> {
-  const { done, unfinished } = cleanupScope(nodes, targetId)
+  const { done, unfinished, unfinishedNodes } = cleanupScope(nodes, targetId)
   const items: CleanupItem[] = []
   const kept: CleanupKept[] = []
   let absent = 0
   let totalKb = 0
   let sizeKnown = true
+  /**
+   * 「目录留着、只清产物」那一桶。收两类,而两类都要**先确认它不在飞**。
+   *
+   * 攒在这里、循环之后统一探盘 —— `kept` 是在下面那个循环里才产生的,而 `unfinished`
+   * 根本不在那个循环里。
+   */
+  const buildTargets: { node: TaskNode; path: string; why: string }[] = []
 
   for (const node of done) {
     const path = deps.pathFor(node)
@@ -250,13 +341,27 @@ export async function scanCleanup(
         nodeId: node.id, title: node.title, path,
         why: `仍有未合入集成分支 ${deps.integrationBranch} 的提交 —— 删了就真的没了`,
       })
+      /**
+       * 目录保住了,**但它里面的构建产物和「保护工作」没有任何关系**。
+       *
+       * 用户第 6 条要的是「未正常合并提交的绝对不能删除掉」—— 那说的是提交和目录。
+       * 而第 5 条问的是 target 为什么没清干净,这一桶正是答案的一半。
+       */
+      buildTargets.push({ node, path, why: '有未合入集成分支的提交,目录必须留着' })
       continue
     }
     if (merged.code !== 0) {
       kept.push({
-        nodeId: node.id, title: node.title, path,
+        nodeId: node.id, title: node.title, path, unknown: true,
         why: `无法判断提交是否已合入(git 探测失败:${merged.stderr.trim() || `退出码 ${merged.code}`})`,
       })
+      /**
+       * **这一类刻意不进 `buildTargets`。**
+       *
+       * 「你还有东西没合」和「我没探明白」要用户做的事不一样(`integrationAhead` 那条注释
+       * 的第三次应验),而这里的差别不止是措辞:在一个**状态未知**的仓库里跑 `git clean -f`
+       * 是这个功能最不该做的事。探不明白就整个不碰。
+       */
       continue
     }
     /**
@@ -278,6 +383,48 @@ export async function scanCleanup(
       leftovers: lines.slice(0, 3),
       leftoverCount: lines.length,
     })
+  }
+
+  /**
+   * **还没验收完的那些节点** —— 用户第 5 条最可能的真凶。
+   *
+   * 它们的目录一个都不删(那是现场:升级卡逐字在教用户去那里解冲突),但 `target/` 与
+   * 保护现场无关。跑机上「一个节点阻断、9 个兄弟依赖阻断」是常态,而这一批的构建产物
+   * 从 `c` 键第一版起就一个字节都碰不到 —— `cleanupScope` 把它们整个算进 `unfinished`
+   * 然后跳过。
+   */
+  for (const node of unfinishedNodes) {
+    buildTargets.push({ node, path: deps.pathFor(node), why: `还没验收完(${node.status}),目录是现场` })
+  }
+
+  /**
+   * 「只清产物」那一桶的实际探盘。
+   *
+   * **在飞的节点一个字节都不动**,而且判据放在这里(而不是上面各自的分支里)—— 一处判、
+   * 一处计数,少一个地方漏判就是一次打在正在跑的增量编译上的 `git clean`。
+   */
+  const busy = new Set(deps.inFlight ?? [])
+  const buildOnly: CleanupBuildItem[] = []
+  let buildOnlyKb = 0
+  let buildOnlySizeKnown = true
+  let buildOnlyBusy = 0
+  const buildOnlySkippedRepos: string[] = []
+  for (const t of buildTargets) {
+    if (busy.has(t.node.id)) { buildOnlyBusy++; continue }
+    const there = await deps.git(['rev-parse', '--git-dir'], t.path)
+    if (there.code !== 0) continue
+    const plan = await scanBuildOutputs(
+      { git: deps.git, ...(deps.dirSizeKb ? { dirSizeKb: deps.dirSizeKb } : {}) }, t.path,
+    )
+    // 探不动、或者根本没有产物可清 —— 都不该在屏幕上占一行。
+    if (plan.error !== undefined || plan.entries.length === 0) {
+      for (const r of plan.skippedRepos) if (!buildOnlySkippedRepos.includes(r)) buildOnlySkippedRepos.push(r)
+      continue
+    }
+    if (!plan.sizeKnown) buildOnlySizeKnown = false
+    buildOnlyKb += plan.totalKb
+    for (const r of plan.skippedRepos) if (!buildOnlySkippedRepos.includes(r)) buildOnlySkippedRepos.push(r)
+    buildOnly.push({ nodeId: t.node.id, title: t.node.title, path: t.path, why: t.why, plan })
   }
 
   /**
@@ -371,6 +518,11 @@ export async function scanCleanup(
     logs, logKb, logSizeKnown: logSizeKnown && logs.length > 0,
     scratch, scratchKb, scratchSizeKnown: scratchSizeKnown && scratch.length > 0,
     ...(integration ? { integration } : {}),
+    buildOnly, buildOnlyKb,
+    // 和别处同一条规矩:一条都没有时报 `true` 会让屏幕印「共 0 KB」,而真实的意思是
+    // 「没东西可清」。
+    buildOnlySizeKnown: buildOnlySizeKnown && buildOnly.length > 0,
+    buildOnlySkippedRepos, buildOnlyBusy,
   }
 }
 
@@ -517,11 +669,46 @@ export async function runCleanup(
     }
   }
 
+  /**
+   * 「目录留着、只清产物」那一桶。
+   *
+   * **排在最后**,和事件日志、临时目录同一条规矩:它清不掉不影响这次回收的主要目的
+   * (删工作区),把它算成失败会让屏幕上那句「回收了 N 个工作区」变成红的。
+   *
+   * **绝不 `worktree remove`** —— 这一桶存在的全部理由就是目录必须留着
+   * (未合入的提交 / 还没验收完的现场)。用户第 6 条:「未正常合并提交的绝对不能删除掉」。
+   */
+  let buildOnlyCleaned = 0
+  let buildOnlyEntries = 0
+  let buildOnlyFreedKb = 0
+  let buildOnlySizeKnown = true
+  const buildOnlySkipped: { title: string; path: string }[] = []
+  for (const b of plan.buildOnly ?? []) {
+    const out = await wipeBuildOutputs(
+      { git: deps.git, ...(deps.dirSizeKb ? { dirSizeKb: deps.dirSizeKb } : {}) }, b.plan,
+    )
+    if (out.error !== undefined) {
+      problems.push(`${b.title}:构建产物没清掉(${out.error})`)
+      continue
+    }
+    for (const r of out.skippedRepos) {
+      if (!buildOnlySkipped.some(x => x.path === r)) buildOnlySkipped.push({ title: b.title, path: r })
+    }
+    if (out.removed.length === 0) continue
+    buildOnlyCleaned++
+    buildOnlyEntries += out.removed.length
+    buildOnlyFreedKb += out.freedKb
+    if (!out.sizeKnown) buildOnlySizeKnown = false
+  }
+
   return {
     removed, failed, problems, freedKb, sizeKnown: sizeKnown && removed.length > 0,
     logsRemoved, logsFreedKb,
     scratchRemoved, scratchFreedKb,
     integrationCleaned, integrationFreedKb,
+    buildOnlyCleaned, buildOnlyEntries, buildOnlyFreedKb,
+    buildOnlySizeKnown: buildOnlySizeKnown && buildOnlyCleaned > 0,
+    buildOnlySkipped,
   }
 }
 
@@ -597,6 +784,37 @@ export function cleanupLines(plan: CleanupPlan): string[] {
     out.push(`并清掉集成工作区里 ${plan.integration.entryCount} 项构建产物(${plan.integration.entries.join('、')}${plan.integration.entryCount > plan.integration.entries.length ? '…' : ''})${plan.integration.kb === undefined ? '(量不到大小)' : `,共 ${formatSize(plan.integration.kb)}`}。`)
     out.push('⚠ 它们是被 .gitignore 忽略的构建产物,删掉不丢任何产出,但下一次集成验收会全量重编。')
   }
+  /**
+   * **目录留着、只清里面构建产物**的那一桶(用户第 5 条的另一半)。
+   *
+   * 拆成好几个 `out.push` 而不是一句长的:正文是 `wrap="truncate-end"`,80 列上一句
+   * 60 个全角字会被砍掉可操作的后半句(集成工作区那一段就是这个范式:一句陈述 + 一句 ⚠ 代价)。
+   */
+  const buildOnly = plan.buildOnly ?? []
+  if (buildOnly.length > 0) {
+    const bsize = plan.buildOnlySizeKnown
+      ? `,共 ${formatSize(plan.buildOnlyKb ?? 0)}`
+      : (plan.buildOnlyKb ?? 0) > 0 ? `,至少 ${formatSize(plan.buildOnlyKb ?? 0)}` : '(量不到大小)'
+    out.push(`另有 ${buildOnly.length} 个**目录必须留着**的工作区,只清掉它们里面的构建产物${bsize}:`)
+    for (const b of buildOnly) {
+      const kb = b.plan.sizeKnown ? formatSize(b.plan.totalKb) : '大小未知'
+      const head = b.plan.entries.slice(0, 3).map(e => e.rel).join('、')
+      out.push(`  · ${b.title}(${b.why})— ${kb}:${head}${b.plan.entries.length > 3 ? '…' : ''}`)
+    }
+    out.push('⚠ 这些工作区的目录、提交、未提交的改动一个字节都不动 —— 只删被 .gitignore 忽略的产物。')
+    // 用户点名过 `.cargo-target-sql-restore`(点开头、**未被忽略**)。它清不掉,
+    // 而这件事必须说,不能让人按完发现盘没腾出来。
+    out.push('  没有被 .gitignore 忽略的构建目录(例如 .cargo-target-… 这种)不在其中,清不掉。')
+    out.push('  被忽略的目录会被**整个**删掉,包括你手工放在里面的东西。')
+  }
+  if ((plan.buildOnlySkippedRepos ?? []).length > 0) {
+    // `git clean` 对嵌套仓库静默跳过而**退出码仍是 0**(真 git 实测)。不说的话,
+    // 屏幕承诺的空间里有一部分根本不会被腾出来。
+    out.push(`⚠ 其中 ${plan.buildOnlySkippedRepos!.length} 处是嵌套的 git 仓库,git 会跳过它们(${plan.buildOnlySkippedRepos!.slice(0, 2).join('、')}${plan.buildOnlySkippedRepos!.length > 2 ? '…' : ''})。`)
+  }
+  if ((plan.buildOnlyBusy ?? 0) > 0) {
+    out.push(`另有 ${plan.buildOnlyBusy} 个任务此刻正在运行,它们的工作区一个字节都不碰。`)
+  }
   // 措辞逐条点名,不说「任务记录不受影响」那种笼统话:现在**确实**有一样记录会被删,
   // 而一句笼统的保证配上一次真实的删除,就是这一屏最坏的读法。
   out.push('不会动的:node.md(基本信息、状态、方案、评审与验收记录)和 state.jsonl(状态账)一个字节都不碰。')
@@ -606,6 +824,17 @@ export function cleanupLines(plan: CleanupPlan): string[] {
   }
   if (plan.unfinished > 0) {
     out.push(`跳过 ${plan.unfinished} 个还没验收的任务 —— 它们的工作区正是现场,不在本次范围。`)
+  }
+  /**
+   * **`c` 和 `m` 的正面冲突,必须自己占一行。**
+   *
+   * 用户同一轮里既说「未正常合并提交的绝对不能删除掉」(第 6 条),又说「要保证所有
+   * 未提交的都要提交,不能丢弃了」(第 8 条)。而 items 那一桶里的未提交内容,`c` 会
+   * **连目录一起删掉**。两句话都对,冲突在于**顺序**:先合再清。
+   * 不说的话,一个刚读完第 6 条那句保证的用户会以为这一屏什么工作都不会丢。
+   */
+  if (plan.items.some(i => i.leftoverCount > 0)) {
+    out.push('提示:上面那些未提交内容还没有被提交到任何分支上 —— 想留就先按 m 合并一次,再回来按 c。')
   }
   if (plan.absent > 0) out.push(`另有 ${plan.absent} 个已验收任务在盘上没有工作区目录(清过了,或那一趟没隔离)。`)
   // 集成工作区那句话分两半,而且两半都要说:**目录留着**(下一次收口和合并都在它里面
@@ -647,6 +876,17 @@ export function cleanupResultLines(out: CleanupOutcome): string[] {
   }
   if (out.integrationCleaned) {
     lines.push(`已清掉集成工作区的构建产物${out.integrationFreedKb > 0 ? `,腾出 ${formatSize(out.integrationFreedKb)}` : ''} —— 下一次集成验收会全量重编。`)
+  }
+  // 同上:0 个时一个字都不印。
+  if ((out.buildOnlyCleaned ?? 0) > 0) {
+    const size = out.buildOnlySizeKnown
+      ? `,腾出 ${formatSize(out.buildOnlyFreedKb ?? 0)}`
+      : (out.buildOnlyFreedKb ?? 0) > 0 ? `,至少腾出 ${formatSize(out.buildOnlyFreedKb ?? 0)}` : ''
+    lines.push(`已清掉 ${out.buildOnlyCleaned} 个保留工作区里的 ${out.buildOnlyEntries} 项构建产物${size} —— 目录、提交、未提交的改动都原样留着。`)
+  }
+  for (const s of out.buildOnlySkipped ?? []) {
+    // 指名道姓:用户能做的事(自己去看那个 vendored checkout)只有知道路径才做得了。
+    lines.push(`⚠ ${s.title}:${s.path} 是嵌套的 git 仓库,git 跳过了它 —— 那部分空间没有被回收。`)
   }
   for (const f of out.failed) lines.push(`⚠ ${f.title} 没删掉:${f.why}`)
   for (const p of out.problems) lines.push(`⚠ ${p}`)
