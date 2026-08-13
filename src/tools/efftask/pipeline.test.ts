@@ -4558,7 +4558,16 @@ describe('分析环节:圆桌(各自出稿 → 融合成一份)', () => {
     // 「不是选一份的老规矩已作废:直接挑你觉得最好的那一稿原样交出来」也含这五个字 ——
     // 融合当场退化成选优,alternatives 变成噪音,216 条测试全绿。
     expect(fusePrompt).toContain('是取各稿之长合成一份')
-    expect(fusePrompt).not.toContain('原样交出')
+    /**
+     * **反向断言钉错了词,于是它从落地那天起就是空转的。**
+     *
+     * 「原样交出」这四个字在整个仓库里一次都没出现过 —— 它断的是一句谁都没写过的话。
+     * 真正会和「取各稿之长合成一份」打架的是 `planPrompt` 的
+     * 「上一版里**没有被质疑到的部分尽量原样保留**」,而融合席位正是靠
+     * `keepUnchallenged=false` 把它关掉的。那个开关被人翻回 true 时,
+     * 融合当场退化成「照抄上一稿」,而上一版的反向断言照样绿。
+     */
+    expect(fusePrompt).not.toContain('原样保留')
   })
 
   it('单席位时不走圆桌,也不多花那次融合调用', async () => {
@@ -5378,7 +5387,16 @@ describe('方案提示词里那段「四个字段都不许留空」', () => {
     }
     // 「你在哪」和「可以看」那两句同样零覆盖过
     expect(body).toContain('工作目录')
-    expect(body).toContain('先真的去看代码')
+    expect(body).toContain('先真的去打开代码看')
+    /**
+     * **不许在这里枚举工具。**
+     *
+     * 七个环节共用同一份工具池(见 `makeRunAgentFn`),所以「你有 Read / Glob / Grep」
+     * 既漏说了它实际有的,又把一份并不存在的「方案环节工具档」讲得像真的 ——
+     * 而隔壁 `reviewFixPrompt` 写着另一份更长的清单,两处不一致本身就是它们都在猜。
+     * 要求必须写成**行为**,工具由环境说了算。
+     */
+    // 反向断言在 rootPlan.test.ts 的渲染用例里(源文的注释本身含这句话,断源文会永远红)。
   })
 })
 
@@ -7010,7 +7028,24 @@ describe('零贡献阻断的措辞与类别', () => {
  * 一个文件都没动 —— `execStatus` 结尾逐字是 `summary_only_blocked_no_tools_called`。
  */
 describe('执行提示词里的「必须真的改文件」', () => {
-  const execPromptWith = async (guidance?: string): Promise<string> => {
+  /** 只够让 `ctx.worktrees !== undefined` 成立并让这一步跑完 —— 这一组断言不看池子行为。 */
+  const isolatedPool = {
+    acquire: async (n: TaskNode) => ({ path: `/repo/.efftask-worktrees/${n.id}`, branch: `worktree-${n.id}`, gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: true, merged: true }),
+    release: async () => ({ removed: true }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    refreshFromIntegration: async () => ({ ok: true, updated: false }),
+    integrationAhead: async () => false,
+    integrationPath: '/repo/.efftask-worktrees/integration',
+    integrationBranchName: 'efftask/001/integration',
+  }
+
+  /**
+   * `isolated` 不是可选装饰:事故那一趟就是隔离档,而**隔离那一支才是出事的那一支**
+   * (「不要在这些目录里跑构建/测试或任何会改动文件的命令」只在它里面渲染)。
+   * 不带这个开关的话,下面那份禁语清单看的是另一条分支,对真正的病灶恒绿。
+   */
+  const execPromptWith = async (guidance?: string, isolated = false): Promise<string> => {
     let seen = ''
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'execute') seen = req.prompt
@@ -7022,9 +7057,11 @@ describe('执行提示词里的「必须真的改文件」', () => {
     n.kind = 'executable'
     n.status = 'READY'
     n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    if (isolated) n.worktree = { branch: 'wt-b', path: '/repo/.efftask-worktrees/efftask-001-abcd' }
     const base = ctxFor([n], runAgent)
     await stepExecute(n, {
       ...base,
+      ...(isolated ? { worktrees: isolatedPool as never } : {}),
       ...(guidance ? { config: { ...base.config, phaseGuidance: { execute: guidance } } } : {}),
     })
     return seen
@@ -7051,6 +7088,100 @@ describe('执行提示词里的「必须真的改文件」', () => {
     const p = await execPromptWith('所有 MCP 只读且仅探查下一层,防止工具使用过多上下文')
     expect(p).toContain('所有 MCP 只读')
     expect(p.indexOf('所有 MCP 只读')).toBeLessThan(p.indexOf('本环节必须真的改文件'))
+  })
+
+  /**
+   * **禁语清单 —— 这一条是拿一次真实事故换来的,而当时没有任何探针会红。**
+   *
+   * 跑机 run 001:一段写给**方案作者**的话(「不要在这些目录里跑构建/测试或任何会改动
+   * 文件的命令」——对他准确,他只读不写)被接进了执行提示词,而执行者的 cwd 正是那些目录。
+   * 它读成「不要在你现在这个目录里改文件」,写了 92 分钟分析、一个文件没动,
+   * `execStatus` 逐字是「当前禁止调用工具」。整条链上十几层父任务因此反复追加
+   * 「补齐未产出」子任务,树被推到 18 层深。
+   *
+   * 当时那 28 条提示词断言**全部是「这个字符串出现了」**,没有一条问「这话对他说得通吗」。
+   * 送达 ≠ 说得通,而反向断言是唯一能把这半边钉住的东西:下面每一句话,只要有人把它
+   * (或者一段会被读成它的话)加回执行提示词,这一条就变红。
+   *
+   * 清单里的每一条都是**执行者读得到的全局禁令**形状,不是随便挑的措辞:
+   * 前两条是那次事故的原话,后几条是同一个坑最容易复现的几种写法。
+   */
+  const FORBIDDEN_IN_EXECUTE = [
+    // 事故那句的原话。复数「这些目录」正是病灶:它把执行者自己的工作区一起圈了进去。
+    '不要在这些目录里跑',
+    '禁止调用工具',
+    '不要改动文件',
+    '只输出文本',
+    '只需给出分析',
+    '不要写文件',
+    '本环节不要改代码',
+  ]
+
+  /**
+   * **「不许说」不够,还得「说了必须带范围」。**
+   *
+   * 这条清单第一版把「任何会改动文件的命令」整句列成禁语,而它当场把**正确**的那一句
+   * 也判红了 —— 隔离档确实有一个真禁区(所有节点共享的 `integration` 工作区,进去跑
+   * devenv/cargo/npm 会改写锁文件)。差别不在有没有这句话,在**它指向哪里**:
+   * 指向 integration 是必需的安全网,不指名就会被读成「你现在这个目录也别动」。
+   *
+   * 所以判据是语义的:凡是出现这半句的行,同一行里必须点名 `integration`。
+   */
+  const scopeChecked = (p: string): string[] =>
+    p.split('\n').filter(l => l.includes('会改动文件的命令') && !l.includes('integration'))
+
+  for (const [name, isolated] of [['共享档', false], ['隔离档', true]] as const) {
+    it(`执行提示词里不许出现会被读成「别动手」的话 —— ${name}`, async () => {
+      const p = await execPromptWith(undefined, isolated)
+      for (const bad of FORBIDDEN_IN_EXECUTE) {
+        expect(`${name}的执行提示词里出现了「${bad}」: ${p.includes(bad)}`)
+          .toBe(`${name}的执行提示词里出现了「${bad}」: false`)
+      }
+      // 禁令必须带范围:不点名 integration 的那种会被读成全局禁令。
+      expect(scopeChecked(p)).toEqual([])
+      expect(p).toContain('本环节必须真的改文件')
+    })
+  }
+
+  /**
+   * **危险的那一支渲染不出来,不等于它不存在。**
+   *
+   * 事故那句「不要在**这些目录**里跑构建/测试或任何会改动文件的命令」住在
+   * `sharedTreeNote` 的 `own === undefined` 分支里 —— 上面两条用例的节点都有自己的
+   * 工作区,所以走的是另一支,对它恒绿。而受众一旦接错(执行者拿到写给方案作者的那一份),
+   * 复数的「这些目录」会把他自己的工作区一起圈进去,这正是 92 分钟一个文件没写的原话。
+   *
+   * 所以直接钉源文:**给执行者的那一段里,不许出现不指名的复数禁令**。
+   */
+  it('给执行者的那一段源文里没有「这些目录」式的禁令', () => {
+    const SRC = readFileSync(new URL('./pipeline.ts', import.meta.url), 'utf8')
+    const fn = SRC.slice(SRC.indexOf('function sharedTreeNote('))
+    const body = fn.slice(0, fn.indexOf('\nexport type PlanPromptCtx'))
+    // 执行受众那一段:从 `audience === 'execute'` 到它 return 结束。
+    const start = body.indexOf("if (audience === 'execute')")
+    expect(start).toBeGreaterThan(-1)
+    const execBranch = body.slice(start, body.indexOf('\n  /**', start))
+    expect(execBranch).not.toContain('不要在这些目录里跑')
+    // 而它必须仍然点名那个真禁区 —— 把整句删掉不算修好。
+    expect(execBranch).toContain('integration')
+    expect(execBranch).toContain('你必须真的改文件')
+  })
+
+  /**
+   * 用户自己写的限制**照旧原样送达**(那是他的话,不许我们篡改),而我们**自己**拼进去的
+   * 每一段都不许长成禁令。所以这一条只查用户那串之外的部分。
+   */
+  it('用户写了「只读」时,我们自己拼的部分照样不许出现禁令', async () => {
+    const guidance = '所有 MCP 只读且仅探查下一层;禁止调用工具'
+    const p = await execPromptWith(guidance)
+    const ours = p.split(guidance).join('')
+    for (const bad of FORBIDDEN_IN_EXECUTE) {
+      expect(`我们自己拼的部分出现了「${bad}」: ${ours.includes(bad)}`)
+        .toBe(`我们自己拼的部分出现了「${bad}」: false`)
+    }
+    expect(scopeChecked(ours)).toEqual([])
+    // 而且那句反声明必须还在 —— 少了它,上面这条清单空着也能绿。
+    expect(p).toContain('本环节必须真的改文件')
   })
 })
 

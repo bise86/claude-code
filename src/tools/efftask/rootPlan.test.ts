@@ -581,7 +581,15 @@ describe('空方案自动重拟一次', () => {
       runAgent: async req => { if (!seen) seen = req.prompt; return FULL },
     })
     expect(seen).toContain('/home/me/3d-print-web')
-    expect(seen).toContain('先真的去看代码')
+    expect(seen).toContain('先真的去打开代码看')
+    /**
+     * **不许枚举工具。** 七个环节共用同一份工具池(见 `makeRunAgentFn`),
+     * 「你有 Read / Glob / Grep」既漏说了它实际有的(Bash 等),又把一份并不存在的
+     * 「方案环节工具档」讲得像真的 —— 而隔壁 `reviewFixPrompt` 写着另一份更长的清单,
+     * 两处不一致本身就是它们都在猜的证据。断在**渲染结果**上:源文的注释为了记住这件事
+     * 本来就含着那句话。
+     */
+    expect(seen).not.toContain('你有 Read')
   })
 })
 

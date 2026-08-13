@@ -1272,7 +1272,15 @@ export function planPrompt(
     `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
     // 「在哪」和「可以看」。这两句缺席时,方案作者只能照着标题写一句正确的废话。
     (where ? `工作目录:${quote(where)}\n` : '') +
-    `你有 Read / Glob / Grep,**先真的去看代码,再定方案** —— 不要只凭任务标题推测。\n` +
+    /**
+     * **不要在这里枚举工具。**
+     *
+     * 上一版写的是「你有 Read / Glob / Grep」,而七个环节**共用同一份工具池**
+     * (见 `makeRunAgentFn`)—— 这句话既漏说了它实际有的(Bash 等),又把一份并不存在的
+     * 「方案环节工具档」讲得像真的。隔壁 `reviewFixPrompt` 还写着另一份更长的清单,
+     * 两处不一致本身就是它们都在猜的证据。要求写成**行为**,工具由环境说了算。
+     */
+    `**先真的去打开代码看,再定方案** —— 不要只凭任务标题推测(读文件、按名字找、按内容搜都可以)。\n` +
     sharedTreeNote(isolated, node.worktree?.path, ctx.sharedParallel) +
     /**
      * **共享并发下,拆分方式本身就是安全机制。**
@@ -3006,8 +3014,9 @@ export function seatPreamble(
   for (const p of phasesToShow) {
     if (seen.has(p)) continue
     seen.add(p)
-    const label = p === phase ? `针对「${PHASE_LABEL[p]}」的额外要求(来自本次任务提示词):`
-      : `用户对「${PHASE_LABEL[p]}」环节提的额外要求(执行侧已收到,你按补充后的意图判):`
+    const label = p === phase
+      ? `针对「${PHASE_LABEL[p]}」的额外要求(来自本次任务提示词):`
+      : `用户对「${PHASE_LABEL[p]}」环节提的额外要求(${crossNote(p, judging)}):`
     out.push(guidanceBlock(label, ctx.config.phaseGuidance?.[p]))
   }
   // 角色定向:名字对得上这一席的(角色名或员工名 —— 用户两种说法都用)。
@@ -3032,7 +3041,7 @@ export function seatPreamble(
       if (seatMatchesName(seat, g.name)) continue
       if (!crossSeats.some(s => seatMatchesName(s, g.name))) continue
       out.push(guidanceBlock(
-        `用户点名给「${g.name}」(负责${PHASE_LABEL[cross]})的额外要求(它已收到,你按补充后的意图判):`,
+        `用户点名给「${g.name}」(负责${PHASE_LABEL[cross]})的额外要求(${crossNote(cross, judging)}):`,
         g.text,
       ))
     }
@@ -3048,7 +3057,7 @@ export function seatPreamble(
       seenNode.add(p)
       const label = p === phase
         ? `用户对本任务的「${PHASE_LABEL[p]}」这一步补充的指引:`
-        : `用户对本任务的「${PHASE_LABEL[p]}」这一步补充的指引(执行侧已收到,你按补充后的意图判):`
+        : `用户对本任务的「${PHASE_LABEL[p]}」这一步补充的指引(${crossNote(p, judging)}):`
       out.push(guidanceBlock(label, node.guidance[p]))
     }
   }
@@ -3130,6 +3139,21 @@ function isFinished(node: TaskNode): boolean {
 function judgeGuidance(ctx: Pick<PipelineCtx, 'config' | 'control'>): string {
   const g = guidanceSection(ctx)
   return g ? g + JUDGE_NOTE : ''
+}
+
+/**
+ * 转发别的环节那句话时,括号里该写什么。**两个变量,而上一版两个都写死了。**
+ *
+ * 1. **哪一侧收到了。** 写死的是「执行侧」,而 `CROSS.review = 'plan'` 那一支转发的是
+ *    **方案侧**的话。评审席读到「执行侧已收到」时,那时一行代码都还没写。
+ * 2. **收信人拿它干什么。** 写死的是「你按补充后的意图**判**」,而 `verify` 这一席
+ *    **已经被移出 `JUDGING_PHASES`**(它自己动手改,不裁决)。对一个要动手的席位说
+ *    「你按它判」,最坏的读法正是「那就别改了」—— 和 `JUDGE_NOTE` 发给验证修复席
+ *    是同一个坑,这个仓库刚为它付过一次账(执行环节 92 分钟一个文件没写)。
+ */
+function crossNote(cross: PhaseName, judging: boolean): string {
+  const side = `${PHASE_LABEL[cross]}侧已收到`
+  return judging ? `${side},你按补充后的意图判` : `${side},你按补充后的意图做`
 }
 
 const JUDGE_NOTE =
@@ -4800,9 +4824,12 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     const execHistory = planFeedbackPrompt(
       feedbackItems(execRework),
       '验收',
+      // 收信人是**执行者**,他手上没有方案可改 —— 要改的是这次的产出。
+      // 这个位置参数上一版没有,于是他读到的是「把验收提的这几条在方案里解决」。
       // 跨席位互斥提醒。`crossSeatNotice` 自己按 (step, round) 分组 —— 这里传进去的是
       // verify 和 accept 的**合并**日志,而两关各自计数,同一个 round 数会同时出现在两边。
       crossSeatNotice(execRework),
+      '这次的改动',
     )
     /**
      * **执行前后的工作区指纹** —— 「这一轮到底动没动文件」的唯一硬证据。

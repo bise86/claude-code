@@ -133,7 +133,17 @@ describe('地板与档位无关', () => {
       }
       // 质疑修复跟着**方案侧**走(它的产物是一份方案),测试修复跟着**执行侧**走。
       expect(strictnessBlock(s, 'review')).toBe(strictnessBlock(s, 'plan'))
-      expect(strictnessBlock(s, 'verify')).toBe(strictnessBlock(s, 'execute'))
+      /**
+       * **测试修复那一席看不到 keyPoints,所以那三个字不许出现在它眼前。**
+       *
+       * 两关共用执行侧文本是对的(都要动手改代码),但初级那一段点名了「方案的验收点
+       * **与重点(keyPoints)**」,而 `verifyFixPrompt` 只渲染 `plan.acceptance` ——
+       * 指着一份收信人手上没有的清单说「一件都不能少」,他只能猜。
+       * 除了这一处,两边必须仍然逐字相同(整段分家会立刻漂移)。
+       */
+      expect(strictnessBlock(s, 'verify')).not.toContain('keyPoints')
+      expect(strictnessBlock(s, 'verify'))
+        .toBe(strictnessBlock(s, 'execute').replace('与重点(keyPoints)', ''))
     }
   })
   test('地板不出现在执行侧 —— 那是给裁决者的判据,不是给执行者的', () => {

@@ -476,7 +476,16 @@ export function strictnessBlock(
    * schema 里根本没这个字段)。
    */
   if (phase === 'plan' || phase === 'review') return PLAN_SIDE[s] + yieldNote
-  if (phase === 'execute' || phase === 'verify') return EXEC_SIDE[s] + yieldNote
+  /**
+   * **测试修复那一席看不到 keyPoints。**
+   *
+   * 两关共用 `EXEC_SIDE` 是对的(都要动手改代码),但初级那一段点名了「方案的验收点
+   * **与重点(keyPoints)**」,而 `verifyFixPrompt` 只渲染 `plan.acceptance`,keyPoints
+   * 一个字都不在它眼前。指着一份收信人手上没有的清单说「一件都不能少」,他只能猜 ——
+   * 而这个仓库刚为「送达 ≠ 说得通」付过一次账。执行那一关渲染 plan 全文,所以照旧。
+   */
+  if (phase === 'verify') return EXEC_SIDE[s].replace('与重点(keyPoints)', '') + yieldNote
+  if (phase === 'execute') return EXEC_SIDE[s] + yieldNote
   if (!STRICTNESS_JUDGING.has(phase)) return ''
   const extra = PHASE_EXTRA[phase]?.[s] ?? ''
   return `本次运行的严格度:**${s}**。\n` + extra + FLOOR + yieldNote
