@@ -1089,7 +1089,13 @@ describe('手动合并子树的接线不能被静默剪断', () => {
      */
     expect(el).toContain('const swept = await sweepStashBackups({ git: gitRunner, cwd: poolRef.current.gitRoot, runId })')
     expect(SRC).toContain("import { sweepStashBackups } from '../../tools/efftask/stashGuard.js'")
-    expect(el).toContain('const heldBack = (out.rescue?.hold.length ?? 0) + out.failed.length')
+    /**
+     * **判据已经提成纯函数 `mergeHeldBack`** —— 它此前住在这个回调里,而那里断言不到:
+     * 变异测试实测「把收尾复核结果从判据里拿掉」全套照绿。这里断言的是**接线还在**
+     * (函数被 import、被调用),判据本身的四项由 `mergeSubtree.test.ts` 逐项打中。
+     */
+    expect(SRC).toContain("import { mergeHeldBack, runSubtreeMerge, scanSubtreeMerge")
+    expect(el).toContain('const heldBack = mergeHeldBack(out)')
     expect(el).toContain('if (out.trunk?.ok === true && heldBack === 0)')
     expect(el).toContain("setHandoffState('merged')")
     expect(el).toContain("props.handoffStateOut.current = 'merged'")

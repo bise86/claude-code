@@ -1111,6 +1111,109 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     expect(kept.find(k => k.path === l.path)?.why).toContain('分析/质疑讨论')
   })
 
+  /**
+   * **只剩被忽略的构建产物 → 不报。**
+   *
+   * 跑机实测:11 个保留工作区里 8 个的全部「内容」就是 Rust 的 target 目录,
+   * 而它们一个提交都没有、`m` 也合不了(那一屏把它们记进 `ignoredOnly`)。
+   * 旧判据带 `--ignored`,于是收口屏说「有 8 处产出没送到」,而实际是 0 处。
+   */
+  /**
+   * **构建产物要进 `.git/info/exclude` —— 这是 2 681 个文件进版本库的事前那一半。**
+   *
+   * 跑机 .30 实测:master 上被跟踪的构建产物 2 608 个文件 / 52.86 GiB,而项目
+   * `.gitignore` 里一条相关规则都没有。来历是执行者自建 `.cargo-target-<名字>` 当 cargo
+   * 的 target 目录,`commitAndMerge` 的 `add -A` 照单全收。写 `info/exclude` 而不是改
+   * 用户的 `.gitignore`(那是被跟踪的文件,替他改并提交是越权),而它对 linked worktree
+   * 同样生效 —— 正是需要的那一侧。
+   */
+  it('init 把构建产物模式写进 .git/info/exclude(执行者的 add -A 才带不走它们)', async () => {
+    const p = pool()
+    await p.init()
+    const excl = await readFile(join(gitRoot, '.git/info/exclude'), 'utf-8')
+    for (const want of ['.cargo-target-', '.cargo-task-', 'target/', '.rlib', '.rmeta']) {
+      expect(excl).toContain(want)
+    }
+    // 老两条不许被挤掉 —— 它们治的是「用户的 git status 里有没有我们留下的垃圾」。
+    expect(excl).toContain('.claude/efftask/')
+    expect(excl).toContain('.efftask-worktrees/')
+    // 真闸:节点工作区里建一个 target 目录,git 必须看不见它。
+    const n = node('root/09-x')
+    const l = await p.acquire(n) as { path: string }
+    await mkdir(join(l.path, '.cargo-target-probe'), { recursive: true })
+    await writeFile(join(l.path, '.cargo-target-probe', 'a.bin'), 'x')
+    const st = await git(['status', '--porcelain'], l.path)
+    expect(st.stdout).not.toContain('.cargo-target-probe')
+  })
+
+  it('交回之后只剩被忽略的构建产物 → 不报(那是 c 键的事,不是「产出没送到」)', async () => {
+    // 忽略规则先进**基线提交**,这样节点工作区一建出来就带着它,而 .gitignore 自己
+    // 是被跟踪的 —— 目录里唯一剩下的就是被忽略的产物,正是跑机上那 8 个的形态。
+    await writeFile(join(gitRoot, '.gitignore'), 'build-out/\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'ignore build-out'], gitRoot)
+    const p = pool()
+    await p.init()
+    const n = node('root/03-c')
+    const l = await p.acquire(n) as { path: string }
+    await mkdir(join(l.path, 'build-out'), { recursive: true })
+    await writeFile(join(l.path, 'build-out', 'app.o'), 'binary\n')
+    // 反证一次:带 --ignored 时 git 确实看得见它(否则这条探针什么都没测)。
+    const withIgnored = await git(['status', '--porcelain', '--ignored'], l.path)
+    expect(withIgnored.stdout).toContain('build-out')
+    expect((await p.handoff([n])).kept).toEqual([])
+  })
+
+  /**
+   * **「仍有未合入的内容」有两半,而干净的树只考得到一半。**
+   *
+   * 判据是「工作区脏 **或** 分支上有集成分支没有的提交」。变异测试实测:把 `|| ahead`
+   * 拿掉之后全套照绿 —— 因为没有一条用例造过「树是干净的、活全在提交里」这个形状,
+   * 而它恰恰是执行者**已经 commit、但合并没成**时的常态(跑机上那 3 个
+   * `commits_ahead_of_int=3` 的工作区就是它)。
+   */
+  it('工作区干净、但分支上有未合入的提交 → 仍然算「仍有未合入的内容」', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/04-d')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'done.txt'), 'work\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'executor committed'], l.path)
+    // 树干净了(全提交了),而这一笔还没合进集成分支。
+    expect((await git(['status', '--porcelain'], l.path)).stdout.trim()).toBe('')
+    const kept = (await p.handoff([n])).kept
+    // 引用在不在只影响措辞;「有没有东西没送到」这个结论必须一样。
+    expect(kept.map(k => k.path)).toContain(l.path)
+    expect(kept.find(k => k.path === l.path)?.why).not.toBe('未回收')
+  })
+
+  /**
+   * **已经合进集成分支的抢救分支不再列。**
+   *
+   * `rescue.ts` 写死「成功不删分支」,而这里原来是一句裸 `for-each-ref` —— 于是一条抢救
+   * 分支一旦建出来就永久出现在每一次收口屏上,而屏幕紧跟着那行「⚠ …不在集成分支上,
+   * git merge 捞不到它们」在合过之后逐字是假话。
+   */
+  it('抢救分支合进集成分支之后就不再出现在收口屏上', async () => {
+    const p = pool()
+    await p.init()
+    // 造一条真的抢救分支:从集成分支拉出去、加一笔提交。
+    const int = 'efftask/001/integration'
+    await git(['branch', `efftask/001/salvage/aa11bb22`, int], gitRoot)
+    expect((await p.handoff([])).salvage).toEqual([])   // 与集成分支同点 = 已包含
+    // 让它真的领先一笔 —— 这时才该被列出来。
+    const wt = join(worktreeRoot, 'probe')
+    await git(['worktree', 'add', '-q', wt, 'efftask/001/salvage/aa11bb22'], gitRoot)
+    await writeFile(join(wt, 'salvaged.txt'), 'work\n')
+    await git(['add', '-A'], wt)
+    await git(['commit', '-qm', 'salvaged'], wt)
+    expect((await p.handoff([])).salvage).toEqual(['efftask/001/salvage/aa11bb22'])
+    // 合进集成分支之后又该消失。
+    await git(['merge', '--no-verify', '--no-edit', '-q', 'efftask/001/salvage/aa11bb22'], p.integrationPath)
+    expect((await p.handoff([])).salvage).toEqual([])
+  })
+
   it('交回之后目录是干净的 → 不报(干净目录出现在收口屏上纯属噪音)', async () => {
     const p = pool()
     await p.init()

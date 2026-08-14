@@ -251,6 +251,15 @@ export interface SubtreeMergeOutcome {
   failed: { nodeId: string; title: string; why: string; followUps: string[] }[]
   /** 第 2 跳的结果。`undefined` = 根本没走到那一步(中途被取消)。 */
   trunk?: { ok: boolean; message: string; followUps: string[] }
+  /**
+   * **收尾复核:这一趟碰过的每条 ref,现在真的在 HEAD 里了吗。**
+   *
+   * 不复用任何过程结论,直接问 git(`merge-base --is-ancestor <ref> HEAD`)。
+   * 用户原话:「不要出现捞回了,却不能合并到主干的事情。」`missing` 非空 = 这一趟
+   * **没有收干净**,界面不许说完成、`pendingHandoff` 也不许清。
+   * `undefined` = 没走到那一步(中途被取消)。
+   */
+  verify?: { checked: number; landed: number; missing: string[] }
   /** 合是合了,但别的地方没做干净(集成工作区被清掉的东西、注记没写回)。 */
   problems: string[]
   /** 被 Esc / run 级中止打断,后面的节点没动。 */
@@ -863,8 +872,68 @@ export async function runSubtreeMerge(
   if (!out.aborted) {
     note('把集成分支合回你当前的分支…')
     out.trunk = await mergeToTrunk(deps)
+    out.verify = await verifyDelivered(deps, plan)
   }
   return out
+}
+
+/**
+ * **收尾复核:刚才碰过的每一条 ref,现在真的是 HEAD 的祖先了吗。**
+ *
+ * 用户原话:「一定要确保所有能够捞回的,都尽最大努力捞回了,而且合并到主干了。
+ * 不要出现捞回了,却不能合并到主干的事情。」
+ *
+ * 在它之前,这个键的「成功」是由**过程**拼出来的:每条 ref 各自报了 ok、第 2 跳报了 ok。
+ * 而两跳之间隔着集成工作区、临时合并工作树、用户自己的检出,任何一处半路失手都不会让
+ * 前面那些 ok 变成 not-ok。跑机 .13 那一趟就是这个结局:收口说成功,而 67 条抢救分支
+ * 一次都没进过主干。
+ *
+ * 所以这里**不复用任何过程结论**,直接问 git 一句话:`merge-base --is-ancestor <ref> HEAD`。
+ * 这是唯一一个「代码到没到用户的工作目录」的判据 —— 也是清 `pendingHandoff` 该看的那个。
+ *
+ * 三条判据:
+ *  1. **在 `gitRoot` 里问**,不是集成工作区 —— 目标是用户 checkout 着的那条分支;
+ *  2. `--is-ancestor` 的 0/1/其它三态要分开:>1 是命令自己出错,那时**算没送到**
+ *     (状态未知的时候宁可多说一句,和 `trackedChanges` 探不出来按脏算同一条纪律);
+ *  3. 只复核**这一趟碰过的**(计划里的节点分支 + 抢救计划里的 ref)。整棵树全扫一遍是
+ *     另一个功能(`scanStranded`),而且会把「本来就不归这次管」的东西算到这次头上。
+ */
+async function verifyDelivered(
+  deps: SubtreeMergeDeps, plan: SubtreeMergePlan,
+): Promise<{ checked: number; landed: number; missing: string[] }> {
+  const refs: string[] = []
+  for (const it of plan.items) if (!refs.includes(it.branch)) refs.push(it.branch)
+  for (const c of plan.rescue?.merge ?? []) if (!refs.includes(c.evidence.ref)) refs.push(c.evidence.ref)
+  const missing: string[] = []
+  for (const ref of refs) {
+    const r = await deps.git(['merge-base', '--is-ancestor', ref, 'HEAD'], deps.pool.gitRoot)
+    if (r.code !== 0) missing.push(ref)
+  }
+  return { checked: refs.length, landed: refs.length - missing.length, missing }
+}
+
+/**
+ * **这一趟到底收干净了没有 —— 清 `pendingHandoff` 的唯一判据。**
+ *
+ * 提成纯函数是因为它此前住在 `efftask.tsx` 的一个回调里,而那里断言不到:变异测试实测
+ * 「把复核结果从判据里拿掉」全套照绿。这个仓库的规矩是判据要能被单独调用
+ * (`cleanupScope`、`conservativeEntries` 都为同一条被导出过)。
+ *
+ * 四项都要数,而它们**互不覆盖**:
+ *  - `rescue.hold` —— 分诊判「拿不准」的(生产上最常见的是模型没提到,那也算 unsure);
+ *  - `failed` —— 解不掉冲突的节点;
+ *  - `stranded` —— 三级都试过、由 git 量出来还差的那些;
+ *  - `verify.missing` —— **收尾复核**:不看任何过程结论,直接问 git「这条 ref 是不是
+ *    HEAD 的祖先」。前三项都为空而它非空,是完全可能的(两跳之间隔着三棵工作树)。
+ *
+ * 返回 0 **不等于**可以清记录 —— 调用方还要看第 2 跳成没成(`trunk.ok`)。
+ * 两件事分开:这个函数回答「还有多少被扣下」,`trunk` 回答「送出去那一下成没成」。
+ */
+export function mergeHeldBack(out: SubtreeMergeOutcome): number {
+  return (out.rescue?.hold.length ?? 0)
+    + out.failed.length
+    + (out.stranded?.length ?? 0)
+    + (out.verify?.missing.length ?? 0)
 }
 
 /** 集成工作区里被 `clean -fd` 抹掉的东西 —— **每一条出口都要留痕**,静默清理和静默截断同类。 */
@@ -1377,6 +1446,26 @@ export function subtreeMergeResultLines(out: SubtreeMergeOutcome): string[] {
   if (out.trunk) {
     lines.push(out.trunk.ok ? out.trunk.message : `⚠ ${out.trunk.message}`)
     for (const f of out.trunk.followUps) lines.push(`  · ${f}`)
+  }
+  /**
+   * **收尾复核那一行 —— 排在第 2 跳后面,因为它推翻得了第 2 跳。**
+   *
+   * 上面那句可能刚说完「已合并回你当前的分支」,而复核是直接问 git「这一趟碰过的每条 ref
+   * 现在是不是 HEAD 的祖先」。两者不一致时,用户该读到的是**后者**(用户原话:
+   * 「不要出现捞回了,却不能合并到主干的事情」)。
+   *
+   * 全部落地时也印一行:这一趟的价值就是那个数,而一句不说等于让用户自己去 git 里数。
+   */
+  if (out.verify && out.verify.checked > 0) {
+    const v = out.verify
+    if (v.missing.length === 0) {
+      lines.push(`✓ 复核通过:${v.checked} 条分支的产出现在都在你当前分支上。`)
+    } else {
+      lines.push(`⚠ 复核没通过:${v.checked} 条里有 ${v.missing.length} 条**还不在你当前分支上** —— 上面那句「合并完成」对它们不成立。`)
+      for (const r of v.missing.slice(0, 5)) lines.push(`  · ${r}`)
+      if (v.missing.length > 5) lines.push(`  · …另 ${v.missing.length - 5} 条`)
+      lines.push('  这一趟没有收干净,待收口记录**保留**着,可以再按一次 m。')
+    }
   }
   for (const f of out.failed) {
     lines.push(`⚠ ${f.title} 没合上:${f.why}`)

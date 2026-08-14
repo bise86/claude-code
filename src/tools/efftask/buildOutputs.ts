@@ -228,6 +228,136 @@ export async function wipeBuildOutputs(
   }
 }
 
+/**
+ * **cargo 在每个 target 目录里放的那个标记文件的签名。**
+ *
+ * 这一串是 cargo 写死的(`CACHEDIR.TAG` 首行 `Signature: <32 位十六进制>`),
+ * 跑机上逐字取到过。拿它当判据的意义在于:**「这个目录是不是构建产物」变成可证明的**,
+ * 而不是按名字猜 —— 跑机上那 135 个目录叫 `.cargo-target-opt-skeleton`、
+ * `.cargo-target-geo-four`、`.cargo-task-verify`、`.opt-memo-integration-cargo-target`…
+ * 没有一条命名规律能覆盖全,而误删一个真源码目录是不可逆的。
+ */
+export const CARGO_CACHEDIR_SIGNATURE = 'Signature: 8a477f597d28d172789f06886806bc55'
+
+/** 名字**像**构建产物、但拿不出签名的。默认不选,要用户单独按一下 —— 见 `TrackedBuildPlan`。 */
+const SUSPECT_RE = /^\.cargo-target-|^\.cargo-task-|^\.allocator-|-cargo-target\/|^target\/|\.rmeta$|\.rlib$|-cargo-check.*\.log$|-check\.short\.log$/
+
+/** 两桶里出现这些扩展名 = 整桶拒绝。源码混进产物清单是这条路上唯一不可逆的错。 */
+const SOURCE_RE = /\.(rs|go|ts|tsx|js|py|java|c|h|cpp|toml|md|ya?ml)$/
+/** …除了这几种:它们**长得像**源码,但按定义就住在 target 目录里。 */
+const NOT_REALLY_SOURCE_RE = /\/\.fingerprint\/|\/incremental\/|\.rustc_info\.json$/
+
+export interface TrackedBuildPlan {
+  /** 签名证明过的:这些目录下的**全部**被跟踪文件。默认勾选。 */
+  proven: string[]
+  /** 只是名字像的。**默认不选** —— 「很可能」不等于「证明了」。 */
+  suspected: string[]
+  /** 签名命中的目录(给屏幕上说清「凭什么判定」)。 */
+  provenDirs: string[]
+  /** 两桶里混进来的源码文件。非空 = **整个不做**,并把它们列出来。 */
+  danger: string[]
+  error?: string
+}
+
+/**
+ * **已经被提交进版本库的构建产物。**
+ *
+ * 用户原话:「构建产物要放入版本吗,如果不要,直接删除掉」+「删除产物可以放到 c 键啊」。
+ *
+ * `scanBuildOutputs`(这个文件上半部分)扫的是**被忽略的**未跟踪文件 —— `clean -X`。
+ * 它对**已经被跟踪**的产物一个都碰不到,而那恰恰是跑机上最贵的一类:.30 的 master 上
+ * 2 608 个文件 / 52.86 GiB,集成分支合回来时逐个 add/add 撞冲突,把 643 个提交卡了好几天。
+ * 来历是执行者自建 target 目录 + `commitAndMerge` 的 `add -A`(那时 `.gitignore` 里
+ * 一条相关规则都没有;`init()` 现在往 `info/exclude` 写了,那是**事前**那一半)。
+ *
+ * ## 判据:按签名,不按名字
+ *
+ * 见 `CARGO_CACHEDIR_SIGNATURE`。跑机实测覆盖率:master 115 个目录 / 2 383 个文件被证明,
+ * 剩下 259 个只能靠名字命中 —— 所以分两桶,第二桶默认不选。
+ *
+ * ## 一道硬闸
+ *
+ * 任一桶里出现源码扩展名就**整个不做**并列出来。跑机实测两桶都干净(`DANGER=0`),
+ * 但闸要留:这条路会 `git rm` 掉真文件,而它是这一整套里唯一不可逆的动作。
+ */
+export async function scanTrackedBuildOutputs(
+  deps: BuildWipeDeps, path: string, ref = 'HEAD',
+): Promise<TrackedBuildPlan> {
+  const empty: TrackedBuildPlan = { proven: [], suspected: [], provenDirs: [], danger: [] }
+  const ls = await deps.git(['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', ref], path)
+  if (ls.code !== 0) {
+    return { ...empty, error: ls.stderr.trim() || ls.stdout.trim() || `git ls-tree 退出码 ${ls.code}` }
+  }
+  const all = ls.stdout.split('\n').map(s => s.trim()).filter(Boolean)
+  const provenDirs: string[] = []
+  for (const f of all) {
+    if (!f.endsWith('/CACHEDIR.TAG')) continue
+    const blob = await deps.git(['show', `${ref}:${f}`], path)
+    if (blob.code !== 0) continue
+    if (!blob.stdout.split('\n')[0]?.includes(CARGO_CACHEDIR_SIGNATURE)) continue
+    provenDirs.push(f.slice(0, -'CACHEDIR.TAG'.length))
+  }
+  const proven: string[] = []
+  const suspected: string[] = []
+  for (const f of all) {
+    if (provenDirs.some(d => f.startsWith(d))) { proven.push(f); continue }
+    if (SUSPECT_RE.test(f)) suspected.push(f)
+  }
+  const danger = [...proven, ...suspected]
+    .filter(f => SOURCE_RE.test(f) && !NOT_REALLY_SOURCE_RE.test(f))
+  return { proven, suspected, provenDirs, danger }
+}
+
+/**
+ * 取消跟踪 + 删盘上的那一份。**盘上也删** —— 用户原话「如果不要,直接删除掉」,
+ * 而留着的话它们只是从「被跟踪」变成「被忽略」,50 GB 一个字节都没少。
+ *
+ * `git rm -r --cached` + 盘上删分两步做不到原子,所以直接用 `git rm -r`(索引和盘上
+ * 一起)。按**顶层条目**删而不是逐个路径:跑机上 2 681 个路径,逐条 pathspec 会把命令行
+ * 撑爆,而顶层条目只有 133 个。前提是「这个顶层条目底下全是产物」—— 由调用方在确认屏
+ * 之前验过(见 `mixedTops`)。
+ */
+export async function untrackBuildOutputs(
+  deps: BuildWipeDeps, path: string, files: readonly string[],
+): Promise<{ removed: number; error?: string }> {
+  if (files.length === 0) return { removed: 0 }
+  const tops = [...new Set(files.map(f => f.split('/')[0] ?? f))]
+  for (let i = 0; i < tops.length; i += 100) {
+    const res = await deps.git(
+      ['-c', 'core.quotepath=false', 'rm', '-r', '-q', '--ignore-unmatch', '--', ...tops.slice(i, i + 100)],
+      path,
+    )
+    if (res.code !== 0) {
+      return { removed: 0, error: res.stderr.trim() || res.stdout.trim() || `git rm 退出码 ${res.code}` }
+    }
+  }
+  return { removed: files.length }
+}
+
+/**
+ * 一个顶层条目底下**混着非产物**吗 —— 整目录删之前的那道自检。
+ *
+ * 手工收口那次它真的拦下过一次:`.opt-memo-integration-cargo-target/` 既没有被提交的
+ * `CACHEDIR.TAG`、名字又不以 `.cargo-target` 开头,于是两个桶都漏了它,而它下面的文件
+ * 又确确实实是产物 —— 自检报出来之后才发现是**清单不全**,不是规则误伤。
+ */
+export function mixedTops(
+  allTracked: readonly string[], artifacts: readonly string[],
+): { top: string; strays: string[] }[] {
+  const art = new Set(artifacts)
+  const byTop = new Map<string, string[]>()
+  for (const f of artifacts) {
+    const t = f.split('/')[0] ?? f
+    if (!byTop.has(t)) byTop.set(t, [])
+  }
+  for (const f of allTracked) {
+    const t = f.split('/')[0] ?? f
+    if (!byTop.has(t) || art.has(f)) continue
+    byTop.get(t)!.push(f)
+  }
+  return [...byTop.entries()].filter(([, s]) => s.length > 0).map(([top, strays]) => ({ top, strays }))
+}
+
 /** 扫 + 删一次做完。给不需要先摆给人看的调用者(合并完成那一刻)。 */
 export async function wipeBuildOutputsAt(
   deps: BuildWipeDeps, path: string,

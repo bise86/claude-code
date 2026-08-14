@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner, type WorktreePool } from './worktreePool.js'
 import {
-  runSubtreeMerge, scanSubtreeMerge, subtreeMergeLines, subtreeMergeResultLines, subtreeMergeScope,
+  mergeHeldBack, runSubtreeMerge, scanSubtreeMerge, subtreeMergeLines, subtreeMergeResultLines, subtreeMergeScope,
   MERGE_KEY_COVERS,
   MERGE_KEY_REPORTS,
   type SubtreeMergeDeps,
@@ -308,6 +308,90 @@ describe('合并到主干', () => {
     expect(await readFile(join(gitRoot, 'a.txt'), 'utf-8')).toBe('hello\n')
     const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD'], gitRoot)
     expect(branch.stdout.trim()).toBe('main')
+    // 收尾复核:不看过程结论,直接问 git「这条 ref 现在是不是 HEAD 的祖先」。
+    expect(out.verify).toEqual({ checked: 1, landed: 1, missing: [] })
+  })
+
+  /**
+   * **复核要能推翻「合并完成」—— 这是「不要出现捞回了却合不到主干」的机器判据。**
+   *
+   * 造法:两跳都真的做完(`trunk.ok === true`),然后在**复核之前**没有任何东西能发现
+   * 用户那条分支其实没拿到 —— 所以这里直接把用户的检出回退掉,再单独跑一次复核。
+   * 跑机 .13 那一趟就是这个结局:过程结论全绿,而 67 条抢救分支一次都没进过主干。
+   */
+  it('产出进了集成分支、却没到用户分支时,复核要点名它', async () => {
+    const pool = newPool()
+    await pool.init()
+    const a = mk('root/00-a', { title: '甲' })
+    await work(pool, a, 'a.txt', 'hello\n')
+
+    /**
+     * **detached HEAD** = 第 2 跳按判据不该做(那是唯一一条「合成功了、代码却不在任何
+     * 分支上」的路)。于是节点分支进得了集成分支、进不了用户的 HEAD —— 正是跑机 .13
+     * 那一趟的形状:过程结论全绿,而产出没到用户手里。
+     */
+    const head = await git(['rev-parse', 'HEAD'], gitRoot)
+    await git(['checkout', '-q', '--detach', head.stdout.trim()], gitRoot)
+
+    const deps = depsOf(pool)
+    const plan = await scanSubtreeMerge(deps, [a], a.id)
+    const out = await runSubtreeMerge(deps, plan, [a])
+
+    // 第 1 跳成了(产出在集成分支上),第 2 跳没成。
+    expect(out.merged.map(m => m.nodeId)).toEqual([a.id])
+    expect(out.trunk?.ok).toBe(false)
+    // 而这条才是判据:复核直接问 git,点名那条没落地的分支。
+    expect(out.verify?.checked).toBe(1)
+    expect(out.verify?.landed).toBe(0)
+    expect(out.verify?.missing).toEqual([pool.worktreeBranchOf(a)])
+  })
+
+  /**
+   * **清 `pendingHandoff` 的判据 —— 四项互不覆盖,少数一项就是一次谎报收干净。**
+   *
+   * 它此前住在 `efftask.tsx` 的回调里,变异测试实测「把复核结果从判据里拿掉」全套照绿。
+   * 提成纯函数就是为了让这四项各自能被打中。
+   */
+  it('mergeHeldBack 把四项都数上(任一非空 = 没收干净)', () => {
+    const base = { merged: [], failed: [], problems: [], aborted: false }
+    expect(mergeHeldBack({ ...base })).toBe(0)
+    expect(mergeHeldBack({
+      ...base, verify: { checked: 3, landed: 2, missing: ['efftask/001/salvage/aa'] },
+    })).toBe(1)
+    expect(mergeHeldBack({
+      ...base, failed: [{ nodeId: 'x', title: 'x', why: 'w', followUps: [] }],
+    })).toBe(1)
+    expect(mergeHeldBack({ ...base, stranded: [{ nodeId: 'x', ref: 'r', why: 'w' }] as never })).toBe(1)
+    expect(mergeHeldBack({
+      ...base,
+      rescue: { merge: [], backfill: [], hold: [{}] as never, orphanFiles: [], problems: [] },
+    })).toBe(1)
+    // 前三项全空、只有复核不通过 —— 这正是两跳之间失手的那个形状。
+    expect(mergeHeldBack({
+      ...base,
+      rescue: { merge: [], backfill: [], hold: [], orphanFiles: [], problems: [] },
+      verify: { checked: 2, landed: 0, missing: ['a', 'b'] },
+    })).toBe(2)
+  })
+
+  /** 结果屏必须把复核结论说出来 —— 不说等于让用户自己去 git 里数。 */
+  it('结果屏印复核那一行,而且没通过时要盖过上面那句「合并完成」', () => {
+    const ok = subtreeMergeResultLines({
+      merged: [], failed: [], problems: [], aborted: false,
+      trunk: { ok: true, message: '已合并回你当前的分支', followUps: [] },
+      verify: { checked: 3, landed: 3, missing: [] },
+    }).join('\n')
+    expect(ok).toContain('复核通过')
+    expect(ok).toContain('3 条分支')
+
+    const bad = subtreeMergeResultLines({
+      merged: [], failed: [], problems: [], aborted: false,
+      trunk: { ok: true, message: '已合并回你当前的分支', followUps: [] },
+      verify: { checked: 3, landed: 1, missing: ['efftask/001/salvage/aa', 'worktree-efftask-001-bb'] },
+    }).join('\n')
+    expect(bad).toContain('复核没通过')
+    expect(bad).toContain('efftask/001/salvage/aa')
+    expect(bad).toContain('待收口记录**保留**着')
   })
 
   it('一个节点都不用合时,仍然把卡在集成分支上的东西送到你的分支', async () => {

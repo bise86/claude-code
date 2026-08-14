@@ -397,6 +397,36 @@ describe('退出报告里的收口那几行', () => {
     expect(t).toContain('稍后收口: /et --resume 009')
   })
 
+  /**
+   * **`commits === 0` 而抢救分支还在 —— 这一行以前逐字说「完成」。**
+   *
+   * 跑机 .13 那一趟就是这个形态:集成分支已全部合进用户分支(commits 归零),
+   * 而 67 条抢救分支、373 个文件、43 991 行新增躺在旁边一次都没被捞过。
+   * 结束屏那一侧早就在 `undelivered + strandedCount` 上判,而这一行只看提交数 ——
+   * 同一个 run 两个结局,活得更久的恰恰是说错的那一份。
+   */
+  it('提交都合完了、抢救分支还在 → 结论行不许说完成', () => {
+    const t = exitReportLine({
+      runId: '013', how: '完成', resumed: false, withPath: false, completed: true,
+      handoff: {
+        branch: 'efftask/013/integration', commits: 0, kept: [],
+        salvage: ['efftask/013/salvage/aa', 'efftask/013/salvage/bb'],
+      },
+    })
+    expect(t).toContain('产出还没到你的分支')
+    expect(t).toContain('2 处待收口')
+    // 不许说成「2 个提交」—— `git merge <集成分支>` 捞不到抢救分支。
+    expect(t).not.toContain('2 个提交待收口')
+  })
+
+  /** 只有提交没送到时,措辞保持原样(它可以照着 git merge 做)。 */
+  it('只有提交没送到 → 仍然说「N 个提交待收口」', () => {
+    const t = exitReportLine({
+      runId: '009', how: '完成', resumed: false, withPath: false, completed: true, handoff: h,
+    })
+    expect(t).toContain('4 个提交待收口')
+  })
+
   it('撞冲突 → 记录里也要说清工作区里留着一次未完成的合并', () => {
     expect(line('conflicted')).toContain('未完成的合并')
   })

@@ -1251,7 +1251,15 @@ export function runSpanLine(
   const ms = (v: string | undefined): number => (typeof v === 'string' ? Date.parse(v) : NaN)
   const starts = nodes.map(n => ms(n.createdAt)).filter(Number.isFinite)
   if (starts.length === 0) return ''
-  const start = Math.min(...starts)
+  /**
+   * **不用 `Math.min(...starts)`** —— 展开的是**节点数**,而这一行跑在退出报告上。
+   *
+   * V8 在 ~12 万个实参上抛 `RangeError: Maximum call stack size exceeded`;今天最大的 run
+   * 是 2238 个节点,离那个坎还远,但代价不对等:省下的是一次 reduce,赔上的是**整屏
+   * 退出报告**(它进对话记录,是面板关掉之后用户唯一能回看的东西)。同文件下面那个
+   * `Math.max(...ends)` 同理。
+   */
+  const start = starts.reduce((a, b) => (b < a ? b : a), starts[0] as number)
   const unfinished = nodes.some(n => n.status !== 'ACCEPTED' && n.status !== 'BLOCKED')
   /**
    * 终点:优先 `finishedAt`,拿不到就退回**最后一次落盘时刻**。
@@ -1264,7 +1272,10 @@ export function runSpanLine(
    */
   const stamps = nodes.map(n => ms(n.finishedAt)).filter(Number.isFinite)
   const ends = stamps.length > 0 ? stamps : nodes.map(n => ms(n.updatedAt)).filter(Number.isFinite)
-  const end = unfinished || ends.length === 0 ? undefined : Math.max(...ends)
+  // 同上:按节点数展开,而这一行在退出报告上。
+  const end = unfinished || ends.length === 0
+    ? undefined
+    : ends.reduce((a, b) => (b > a ? b : a), ends[0] as number)
   const stamp = (t: number): string => {
     const d = new Date(t)
     const p2 = (v: number): string => String(v).padStart(2, '0')
@@ -1487,11 +1498,26 @@ export function exitReportLine(args: {
    *
    * 这行字进的是对话记录,面板关掉之后用户能回看的只剩它 —— 而一句光秃秃的
    * 「高效任务 003 完成」会让人以为代码已经在手上了(底下那几行 handoffLines 说的是
-   * 反话,但结论在第一行)。判据与结束屏共用 `undeliveredCommits`。
+   * 反话,但结论在第一行)。
+   *
+   * **判据是三格的和,不是只看提交数。** 结束屏那一侧早就在 `undelivered + strandedCount`
+   * 上判(`efftask.tsx` 的 `hasUnmerged`),而这一行只看 `undeliveredCommits` ——
+   * 于是跑机 .13 那种形态(集成分支已全部合入 → `commits === 0`,而 67 条抢救分支、
+   * 43 991 行躺在旁边)在对话记录里逐字是一句「高效任务 001 完成」。同一个 run 在两处
+   * 有两个结局,而活得更久的恰恰是说错的那一份。
    */
-  const left = undeliveredCommits(args.handoff, args.handoffState)
+  const left = undeliveredPlaces(args.handoff, args.handoffState)
+  const commitsLeft = undeliveredCommits(args.handoff, args.handoffState)
+  /**
+   * 措辞按「哪一格有东西」分:只有提交没送到时仍然说「N 个提交」(它可以照着
+   * `git merge` 做);带着抢救分支/保留工作区时必须换词 —— 那几处 `git merge <集成分支>`
+   * **捞不到**,说成「提交」会把用户指上一条捞不全的路(handoffLines 里为同一件事
+   * 无条件追加过一行警告)。
+   */
   const how = args.completed === true && left > 0
-    ? `${args.how}(产出还没到你的分支:${left} 个提交待收口)`
+    ? left === commitsLeft
+      ? `${args.how}(产出还没到你的分支:${left} 个提交待收口)`
+      : `${args.how}(产出还没到你的分支:${left} 处待收口,其中 ${commitsLeft} 个提交在集成分支上)`
     : args.how
   return `高效任务 ${args.runId} ${verb}${how}${path}${where}`
 }
@@ -1531,6 +1557,32 @@ export type HandoffState = 'merged' | 'conflicted'
  * 永远完不成。而且「还在运行中」本身是假的 —— 没有任何 agent 在跑。真实状态是
  * 「做完了,但没送到」,那是一个**投递**状态,住在这一层。
  */
+/**
+ * **这一趟还有多少「处」产出没送到 —— 提交、抢救分支、保留工作区,一起数。**
+ *
+ * `undeliveredCommits` 只数集成分支上的提交,而那是**三条路里的一条**。跑机 .13 那一趟
+ * 把这个缺口摆到了最纯的形态:`commits === 0`(集成分支已经全部合进用户分支)、
+ * 收口报告说完成 —— 而 **67 条抢救分支、373 个文件、43 991 行新增**躺在旁边,一次都没
+ * 被捞过。「完成」和「产出没送到」同时为真且互不矛盾,因为没有任何一处判据把两者连起来。
+ *
+ * 用户原话:「我们的最终目的都是要合并到主干,代码出现在当前的工作目录下。」
+ * 所以结论行的判据必须是这三格的**和**,而不只是第一格。
+ *
+ * 分开导出而不是改 `undeliveredCommits` 的返回值:那个函数的名字说的就是「提交数」,
+ * 而 `handoffLines` 里有好几处按「还剩几个**提交**」措辞(「分支 X 上还有 N 个提交没合
+ * 进来」)。让它继续只回答提交数,由这一个函数回答「这一趟收没收干净」。
+ */
+export function undeliveredPlaces(
+  h: Pick<HandoffSummary, 'commits' | 'kept' | 'salvage'> | null | undefined,
+  state?: HandoffState,
+): number {
+  if (!h) return 0
+  // 合成功 = 集成分支已经在 HEAD 里,`commits` 不再成立;而 kept/salvage **照旧成立**
+  // (它们进清单的前提就是「不在集成分支上」,合集成分支捞不到它们)。
+  const commits = state === 'merged' ? 0 : Math.max(0, h.commits)
+  return commits + (h.kept?.length ?? 0) + (h.salvage?.length ?? 0)
+}
+
 export function undeliveredCommits(
   h: Pick<HandoffSummary, 'commits'> | null | undefined,
   state?: HandoffState,

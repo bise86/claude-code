@@ -143,4 +143,26 @@ describe('makeHandoffConflictResolver', () => {
     await r({ files: ['a.ts'], branch: 'b', cwd: '/tmp/x' })
     expect(seen[0]).not.toContain('用户自己的工作目录')
   })
+
+  /**
+   * **「同一源文件不同区间」那条判据要真的在提示词里。**
+   *
+   * 手工收口那次实测:`pkg/sql/sem/tree/eval.rs` 一侧是「eval.go 前段」、另一侧是
+   * 「第 3669–6516 行」,各 100 / 105 个顶层定义 —— 取任一边丢一半。而「保留双方的意图」
+   * 那句通则挡不住它:一个尽责的解决者仍然会去「融合」两份看起来在写同一件事的代码。
+   * 后半句(撞名要停下来说)同样是实测:那次并集里 11 个顶层符号撞名,
+   * 而两个同名定义放进同一个文件是编译错误。
+   */
+  it('提示词里有「不同区间 → 并集」和「撞名要停下来说」', async () => {
+    const { seen, agent } = capture()
+    const r = makeHandoffConflictResolver({ runAgent: agent, node: node(), signal: new AbortController().signal })
+    await r({ files: ['eval.rs'], branch: 'b', cwd: '/tmp/x' })
+    const p = seen[0]!
+    expect(p).toContain('不同区间')
+    expect(p).toContain('并集')
+    expect(p).toContain('同名')
+    expect(p).toContain('停下来')
+    // 排在通则之后:通则先立,这一条是它盖不住的那个具体形状。
+    expect(p.indexOf('保留双方的意图')).toBeLessThan(p.indexOf('不同区间'))
+  })
 })

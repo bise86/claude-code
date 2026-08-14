@@ -154,7 +154,15 @@ function renderToken(t: Token, theme: ThemeName, width: number): string {
      * 退回原文不是认输:模型写的那份 `| a | b |` 本来就是对齐的,而且**一定不比对齐版宽**。
      */
     const aligned = formatToken(t, theme, 0, null, null, null)
-    const widest = Math.max(...aligned.split('\n').map(l => stringWidth(stripAnsi(l))), 0)
+    /**
+     * **不用 `Math.max(...)`** —— 展开的是**渲染行数**,而这一层渲染的是 node.md 的正文
+     * (执行状态里贴一段十万行的日志就够了)。V8 在 ~12 万个实参上抛 RangeError,
+     * 而这里抛出去等于详情页整个白屏。reduce 没有这个上限。
+     */
+    const widest = aligned.split('\n').reduce((m, l) => {
+      const w = stringWidth(stripAnsi(l))
+      return w > m ? w : m
+    }, 0)
     return widest <= width ? aligned : raw0
   }
   if (t.type === 'list' && hasTaskItem(t)) {

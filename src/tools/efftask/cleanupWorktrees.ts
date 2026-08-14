@@ -2,7 +2,10 @@ import { descendantsOf } from './redo.js'
 import { AGENT_LOG_NAME } from './agentLog.js'
 import { writeNode, type FsLike } from './persistence.js'
 import { createNodeJournal } from './nodeJournal.js'
-import { scanBuildOutputs, wipeBuildOutputs, type BuildWipePlan } from './buildOutputs.js'
+import {
+  mixedTops, scanBuildOutputs, scanTrackedBuildOutputs, untrackBuildOutputs, wipeBuildOutputs,
+  type BuildWipePlan,
+} from './buildOutputs.js'
 import type { TaskNode } from './types.js'
 
 /**
@@ -241,6 +244,35 @@ export interface CleanupPlan {
   buildOnlySkippedRepos: string[]
   /** 因为节点此刻**在飞**而整个不碰的工作区数。 */
   buildOnlyBusy: number
+  /**
+   * **已经被提交进版本库的构建产物**(用户:「构建产物要放入版本吗,如果不要,直接删除掉」
+   * +「删除产物可以放到 c 键啊」)。
+   *
+   * 第五份名单,而它和前四份**在结构上不同**:前四份清的都是未跟踪/被忽略的文件,
+   * 这一份要 `git rm` —— 它会产生提交。跑机 .30 实测这一类是最贵的:master 上
+   * 2 608 个文件 / 52.86 GiB,而 `clean -X` 对它们一个都碰不到(它们从来没被忽略过),
+   * 后果是集成分支合回主干时逐个 add/add 撞冲突,把 643 个提交卡了好几天。
+   *
+   * `undefined` = 这一格没查(没给 `gitRoot`);两桶都空 = 查了,没有。
+   */
+  tracked?: {
+    /** 签名证明过的(cargo 的 `CACHEDIR.TAG`)。默认勾选。 */
+    proven: string[]
+    /** 只是名字像的。**默认不选,要用户单独按一下** —— 「很可能」不等于「证明了」。 */
+    suspected: string[]
+    /** 签名命中的目录数 —— 屏幕上要说清「凭什么判定」。 */
+    provenDirs: number
+    /**
+     * 拦下来的原因,非空 = **这一格整个不做**。两种:桶里混进了源码,
+     * 或者某个顶层条目底下混着非产物(整目录删之前的自检,手工收口那次真的拦下过一次)。
+     */
+    blocked: string[]
+  }
+  /**
+   * 用户在确认屏上按下过「疑似那一桶也删」吗。**默认 false** ——
+   * 「很可能是产物」和「证明了是产物」在一次不可逆的删除面前不是同一件事。
+   */
+  includeSuspected?: boolean
 }
 
 export interface CleanupOutcome {
@@ -248,6 +280,12 @@ export interface CleanupOutcome {
   failed: { nodeId: string; title: string; path: string; why: string }[]
   /** 删掉了工作区、但别的地方没做干净(分支没删掉、记录没写回)。每一条都要上屏。 */
   problems: string[]
+  /**
+   * 取消跟踪掉的构建产物。`undefined` = 这一格没做(没查 / 被闸挡下 / 两桶都空)。
+   * `committed: false` = 索引和磁盘都动了、但提交没成 —— 这两件事必须分开报,
+   * 因为「删了没提交」需要用户自己收尾。
+   */
+  trackedUntracked?: { files: number; committed: boolean }
   /** 真的被删掉的事件日志数,以及它们腾出来的 KB。 */
   logsRemoved: number
   logsFreedKb: number
@@ -517,8 +555,41 @@ export async function scanCleanup(
     }
   }
 
+  /**
+   * **已经被提交进版本库的构建产物。**
+   *
+   * 扫的是**集成分支**,不是用户的分支:这个键属于某一趟 run,而它有权处置的是这一趟
+   * 自己造出来的东西。用户分支上的那份会随着集成分支合过去时一并消失(两边都删了 =
+   * 合并时无冲突,手工收口那次实测过这个形状)。
+   *
+   * 两道闸,任一非空就整格不做:①桶里混进源码;②某个顶层条目底下混着非产物。
+   * 第二道在手工收口那次真的拦下过一次 —— 报出来之后才发现是**清单不全**,不是规则误伤。
+   */
+  let tracked: CleanupPlan['tracked']
+  try {
+    const tp = await scanTrackedBuildOutputs({ git: deps.git }, deps.gitRoot, deps.integrationBranch)
+    if (tp.error === undefined) {
+      const all = await deps.git(
+        ['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', deps.integrationBranch], deps.gitRoot,
+      )
+      const allFiles = all.code === 0 ? all.stdout.split('\n').map(s => s.trim()).filter(Boolean) : []
+      const mixed = mixedTops(allFiles, [...tp.proven, ...tp.suspected])
+      const blocked: string[] = []
+      if (tp.danger.length > 0) {
+        blocked.push(`产物清单里混进了 ${tp.danger.length} 个源码文件(${tp.danger.slice(0, 3).join('、')}…)—— 这一格整个不做`)
+      }
+      for (const m of mixed.slice(0, 3)) {
+        blocked.push(`${m.top}/ 底下还有 ${m.strays.length} 个不是产物的被跟踪文件(${m.strays.slice(0, 2).join('、')})—— 这一格整个不做`)
+      }
+      tracked = {
+        proven: tp.proven, suspected: tp.suspected, provenDirs: tp.provenDirs.length, blocked,
+      }
+    }
+  } catch (e) { deps.onError?.(e instanceof Error ? e : new Error(String(e))) }
+
   return {
     targetId, items, kept, unfinished, absent, totalKb,
+    ...(tracked ? { tracked } : {}),
     sizeKnown: sizeKnown && items.length > 0,
     logs, logKb, logSizeKnown: logSizeKnown && logs.length > 0,
     scratch, scratchKb, scratchSizeKnown: scratchSizeKnown && scratch.length > 0,
@@ -571,6 +642,44 @@ export async function runCleanup(
   const problems: string[] = []
   let freedKb = 0
   let sizeKnown = true
+
+  /**
+   * **取消跟踪那些已经被提交进版本库的构建产物 —— 排在最前面。**
+   *
+   * 顺序有理由:它产生一次提交,而下面那些 `worktree remove` 会改动同一个仓库的登记项。
+   * 先把提交做掉,失败时后面那些照常跑(它们互不依赖),而反过来「先删目录再提交」
+   * 会让一次失败的提交留在一个已经被改过的仓库上。
+   *
+   * **两道闸都在 `scanCleanup` 里判完了**(`tracked.blocked` 非空 = 整格不做),
+   * 这里不重判 —— 用户是照着确认屏按的,而屏幕上印的就是那两道闸的结论。
+   * 这个仓库为「两边各算一次」付过账:`cleanupScope`、`backtrackCanClaim` 都写过同一条。
+   *
+   * `suspected` 那一桶**只在用户明确打开时才动**(`plan.includeSuspected`)——
+   * 「很可能是产物」和「证明了是产物」在一次不可逆的删除面前不是同一件事。
+   */
+  let trackedUntracked: CleanupOutcome['trackedUntracked']
+  const tr = plan.tracked
+  if (tr && tr.blocked.length === 0) {
+    const files = [...tr.proven, ...(plan.includeSuspected === true ? tr.suspected : [])]
+    if (files.length > 0) {
+      const res = await untrackBuildOutputs({ git: deps.git }, deps.gitRoot, files)
+      if (res.error !== undefined) {
+        problems.push(`取消跟踪构建产物失败:${res.error} —— 版本库里那份原样留着`)
+        trackedUntracked = { files: 0, committed: false }
+      } else {
+        const c = await deps.git(
+          ['-c', 'core.quotepath=false', 'commit', '--no-verify', '-q', '-m',
+            `chore(efftask): 构建产物不入版本库 —— 取消跟踪 ${res.removed} 个文件`],
+          deps.gitRoot,
+        )
+        // 提交不成也要如实说:`git rm` 已经动了索引和盘上的文件,而那**不是**一次空操作。
+        if (c.code !== 0) {
+          problems.push(`构建产物已从索引和磁盘上删除,但提交没成:${(c.stderr || c.stdout).trim().split('\n')[0] ?? '未知原因'} —— 索引里留着这批删除,请自己 git commit`)
+        }
+        trackedUntracked = { files: res.removed, committed: c.code === 0 }
+      }
+    }
+  }
 
   for (const item of plan.items) {
     const rm = await deps.git(['worktree', 'remove', '--force', item.path], deps.gitRoot)
@@ -721,6 +830,7 @@ export async function runCleanup(
 
   return {
     removed, failed, problems, freedKb, sizeKnown: sizeKnown && removed.length > 0,
+    ...(trackedUntracked === undefined ? {} : { trackedUntracked }),
     logsRemoved, logsFreedKb,
     scratchRemoved, scratchFreedKb,
     integrationCleaned, integrationFreedKb,
@@ -803,6 +913,29 @@ export function cleanupLines(plan: CleanupPlan): string[] {
     out.push('⚠ 它们是被 .gitignore 忽略的构建产物,删掉不丢任何产出,但下一次集成验收会全量重编。')
   }
   /**
+   * **已经被提交进版本库的那一类 —— 和上面几段在性质上不同,所以单独一段。**
+   *
+   * 上面清的都是未跟踪/被忽略的文件,这一段要 `git rm` 并产生一次提交。跑机 .30 实测
+   * 它是最贵的一类(2 608 个文件 / 52.86 GiB),而 `clean -X` 对它们一个都碰不到。
+   *
+   * 三件事必须说全:**凭什么判定**(cargo 的 CACHEDIR.TAG 签名,不是按名字猜)、
+   * **哪一桶默认不选**、以及**会产生一次提交**。少说最后一句的话,用户按下的是一次
+   * 他不知道会改历史的动作。
+   */
+  const tr = plan.tracked
+  if (tr && (tr.proven.length > 0 || tr.suspected.length > 0)) {
+    if (tr.blocked.length > 0) {
+      out.push(`⚠ 版本库里有构建产物,但这一格**这次不做**:`)
+      for (const b of tr.blocked) out.push(`  · ${b}`)
+    } else {
+      out.push(`并从版本库里删除 ${tr.proven.length} 个已被提交的构建产物文件(${tr.provenDirs} 个目录,按 cargo 的 CACHEDIR.TAG 签名判定,不是按名字猜)。`)
+      out.push('⚠ 这一项会**产生一次提交**(git rm),盘上那份也一起删 —— 它们可以重新编译出来。')
+      if (tr.suspected.length > 0) {
+        out.push(`另有 ${tr.suspected.length} 个文件**名字像**产物但拿不出签名,默认不动;要一起删请按 t。`)
+      }
+    }
+  }
+  /**
    * **目录留着、只清里面构建产物**的那一桶(用户第 5 条的另一半)。
    *
    * 拆成好几个 `out.push` 而不是一句长的:正文是 `wrap="truncate-end"`,80 列上一句
@@ -881,6 +1014,17 @@ export function cleanupResultLines(out: CleanupOutcome): string[] {
    * —— 后面那几条 ⚠ 才是这一屏的主语。判据只看 `removed`:失败与否不改变「没删掉任何
    * 东西」这个事实。
    */
+  /**
+   * 取消跟踪那一项排在最前:它是这一屏里唯一**改了版本库历史**的动作,
+   * 而下面几段说的都是磁盘。「提交没成」必须单独说 —— 那时索引里留着一批删除,
+   * 需要用户自己收尾,而一句笼统的「已清理」会让他完全不知道。
+   */
+  if (out.trackedUntracked) {
+    const t = out.trackedUntracked
+    if (t.files === 0) lines.push('⚠ 版本库里的构建产物一个都没删掉(见下面的原因)。')
+    else if (t.committed) lines.push(`已从版本库里删除 ${t.files} 个构建产物文件,并提交。`)
+    else lines.push(`⚠ 已从索引和磁盘上删除 ${t.files} 个构建产物文件,但**提交没成** —— 请自己 git commit。`)
+  }
   if (out.removed.length === 0) {
     lines.push('没有删除任何工作区。')
   } else {

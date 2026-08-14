@@ -13,7 +13,9 @@ import type { GitFn, HandoffResult } from '../../tools/efftask/handoffActions.js
 import { finishHandoff } from '../../tools/efftask/finishHandoff.js'
 import { trackedChanges } from '../../tools/efftask/handoffActions.js'
 import { syncTrunk } from '../../tools/efftask/integrationMerge.js'
-import { makeHandoffConflictResolver } from '../../tools/efftask/handoffResolve.js'
+import { makeHandoffConflictResolver, makeRescueTriage } from '../../tools/efftask/handoffResolve.js'
+import { scanStranded, STRANDED_KINDS } from '../../tools/efftask/stranded.js'
+import { planRescue, rescueLines, runRescue } from '../../tools/efftask/rescue.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { finishEffTaskRun, markEffTaskPendingHandoff, registerEffTaskRun, updateEffTaskRun } from '../../tasks/EffTaskTask/EffTaskTask.js'
 import type { SetAppState } from '../../Task.js'
@@ -363,6 +365,123 @@ export async function runOrchestrator(
    * try/catch)—— 这个 finally 里每一句都是被保护的,一个逃出去的异常会让
    * `setPhase('done')` 永不执行,界面永久停在「运行中」而 Esc 毫无反应。
    */
+  /**
+   * **收口之前先把散在外面的产出捞回集成分支。**
+   *
+   * 用户原话:「一定要确保所有能够捞回的,都尽最大努力捞回了,而且合并到主干了。」
+   *
+   * 在它之前,整条捞回链只有**一个入口** —— 详情页的 `m` 键(`scanStranded` 全仓库只有
+   * `mergeSubtree` 一个消费者)。于是它只在用户想起来按的时候才发生,而收口这条全自动的
+   * 路径从头到尾不知道抢救分支存在。跑机两趟实测:.30 有 74 条抢救分支 / 342 095 行新增
+   * 一次都没被捞过(盘上零条捞回痕迹);.13 更纯 —— 集成分支已经全部合进用户分支
+   * (`commits === 0`、收口报告说成功),而 67 条 ref / 43 991 行躺在旁边。
+   *
+   * ## 三条判据
+   *
+   * 1. **只捞进集成分支,不碰用户的分支。** `runRescue` 走的是 `mergeIntoIntegration` ——
+   *    内部动作。回主干那一跳仍然由紧随其后的 `finishHandoff`/`planFinish` 按结局把关
+   *    (被阻断/取消的 run 不自动对外)。所以这里**不按 outcome 早退**:一趟被阻断的运行
+   *    恰恰最可能有散在外面的产出,而把它们收进集成分支不会造成任何对外后果。
+   * 2. **排在 `finishHandoff` 之前、`reclaim` 之后。** 之前的话池子还没结算;之后的话
+   *    那一跳带不上刚捞回来的提交。捞完**重算一次 `handoff()`** —— `pendingHandoff` 是
+   *    「还有什么没送到」的唯一真相,不重算就会拿着捞回之前的快照去做判断和渲染。
+   * 3. **拿不到接缝就整个不做,而且要说出来。** 缺池子(共享工作树)= 根本没有集成分支;
+   *    缺根节点 = 分诊没有 `RunAgentFn` 可用,那时 `planRescue` 会把每一条都判 `unsure`
+   *    (默认朝安全那一侧),白跑一趟还占着收口的时间。静默退回是这个仓库的招牌缺陷。
+   */
+  const autoRescue = async (root: TaskNode | undefined): Promise<void> => {
+    const pool = args.worktrees
+    if (!pool || !args.git || !args.taskEntry?.runId) return
+    /**
+     * 说明走 `trunkSkips`,不另开通道。那一栏的语义逐字就是「有东西没送到你的目录,
+     * 原因如下」,而结束屏、退出报告、收口关口读的都是它 —— 上面那段回收 stash 备份
+     * 为同一件事写过:「另起一个字段等于再造一条只有一个消费者的通道」。
+     */
+    const notes: string[] = []
+    /** 捞完(或捞不成)都要重算一次 handoff,并把说明并进去。 */
+    const settleNotes = async (): Promise<void> => {
+      try {
+        const fresh = await pool.handoff(liveNodes)
+        const merged = notes.length > 0
+          ? { ...fresh, trunkSkips: [...(fresh.trunkSkips ?? []), ...notes] }
+          : fresh
+        if (args.config.pendingHandoff) {
+          args.config.pendingHandoff = {
+            ...args.config.pendingHandoff,
+            commits: merged.commits, kept: merged.kept, salvage: merged.salvage,
+          }
+        }
+        onHandoff?.(merged)
+      } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
+    }
+    try {
+      const worktreeRoot = `${pool.gitRoot}/.efftask-worktrees`
+      const report = await scanStranded({
+        git: args.git as never,
+        gitRoot: pool.gitRoot,
+        integrationBranch: pool.integrationBranchName,
+        integrationPath: pool.integrationPath,
+        runId: args.taskEntry.runId,
+        worktreeRoot,
+        worktreePathOf: n => pool.worktreePathOf(n),
+        worktreeBranchOf: n => pool.worktreeBranchOf(n),
+      } as never, liveNodes)
+      /**
+       * 只有 `action: 'merge'` 那几格谈得上自动捞(工作区里没提交的、已提交没合入的、
+       * 抢救分支、只剩分支的)。`backtrack` / 需要人处置的那几格照原样留给 `m` 和 `b` ——
+       * 判据用 `STRANDED_KINDS[kind].action`,和 `mergeSubtree` 那一侧同一份表。
+       */
+      const claimable = report.items.filter(i => STRANDED_KINDS[i.kind]?.action === 'merge')
+      if (claimable.length === 0) return
+      if (!root) {
+        notes.push(`盘上还有 ${claimable.length} 处产出没进集成分支,而这一趟拿不到主模型做分诊 —— 没有自动捞,请进任务详情页按 m`)
+        await settleNotes()
+        return
+      }
+      const plan = await planRescue({
+        git: args.git as never,
+        gitRoot: pool.gitRoot,
+        integrationBranch: pool.integrationBranchName,
+        integrationPath: pool.integrationPath,
+        worktreeRoot,
+        withIntegrationLock: fn => pool.withIntegrationRead(fn),
+        triage: makeRescueTriage({ runAgent: args.runAgent, node: root, signal: args.signal }),
+        resolve: makeHandoffConflictResolver({ runAgent: args.runAgent, node: root, signal: args.signal }),
+        ...(args.config.caps?.trunkResolveRounds === undefined
+          ? {}
+          : { rounds: args.config.caps.trunkResolveRounds }),
+        signal: args.signal,
+      } as never, claimable)
+      const res = await runRescue({
+        git: args.git as never,
+        gitRoot: pool.gitRoot,
+        integrationBranch: pool.integrationBranchName,
+        integrationPath: pool.integrationPath,
+        worktreeRoot,
+        withIntegrationLock: fn => pool.withIntegrationRead(fn),
+        resolve: makeHandoffConflictResolver({ runAgent: args.runAgent, node: root, signal: args.signal }),
+        ...(args.config.caps?.trunkResolveRounds === undefined
+          ? {}
+          : { rounds: args.config.caps.trunkResolveRounds }),
+        signal: args.signal,
+      } as never, plan)
+      /**
+       * **捞完必须重算 `handoff()`。** 它是「还有什么没送到」的唯一真相,而收口那一跳、
+       * 结束屏、退出报告、`/tasks` 那一行读的都是它。不重算的话,刚合进集成分支的提交
+       * 不会进 `commits`(于是回主干那一跳带不上它们),而已经捞掉的抢救分支照样列在
+       * `salvage` 上 —— 屏幕逐字说着一件已经不成立的事。
+       */
+      for (const l of rescueLines(plan, false, pool.integrationBranchName)) notes.push(l)
+      for (const p of res.problems ?? []) notes.push(p)
+      await settleNotes()
+    } catch (e) {
+      // 捞回失败不该把收口带走 —— 但**要说**,静默退回正是这条链此前的样子。
+      logError(e instanceof Error ? e : new Error(String(e)))
+      notes.push(`自动捞回没跑成:${e instanceof Error ? e.message : String(e)} —— 进任务详情页按 m 可以手动来一次`)
+      await settleNotes()
+    }
+  }
+
   const onHandoffResult = args.onHandoffResult
   let handoffDone = false
   const handOff = async (): Promise<void> => {
@@ -376,6 +495,7 @@ export async function runOrchestrator(
      * 收口退回「留下冲突现场」的老行为。
      */
     const root = liveNodes.find(n => n.id === 'root')
+    await autoRescue(root)
     const out = await finishHandoff({
       handoff: args.config.pendingHandoff,
       git: args.git,

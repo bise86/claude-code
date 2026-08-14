@@ -49,7 +49,7 @@ import { notSchedulableReason } from '../../tools/efftask/scheduler.js'
 import { applyRecalc, askRecalc, type RecalcApply, type RecalcAsk } from '../../tools/efftask/depsRecalcRun.js'
 import { runCleanup, scanCleanup, type CleanupDeps } from '../../tools/efftask/cleanupWorktrees.js'
 import { buildWipeLines, emptyBuildWipeTally, noteBuildWipe, type BuildWipeTally } from '../../tools/efftask/buildWipeTally.js'
-import { runSubtreeMerge, scanSubtreeMerge, type SubtreeMergeDeps } from '../../tools/efftask/mergeSubtree.js'
+import { mergeHeldBack, runSubtreeMerge, scanSubtreeMerge, type SubtreeMergeDeps } from '../../tools/efftask/mergeSubtree.js'
 import { ConfirmMergeSubtree } from './ConfirmMergeSubtree.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
@@ -2638,7 +2638,22 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
            * 漏掉它的后果和当初漏掉 `hold` 一样 —— 记录被抹掉、下次 `--resume` 不再弹关口,
            * 而那些内容确实还没进用户的分支。
            */
-          const heldBack = (out.rescue?.hold.length ?? 0) + out.failed.length + (out.stranded?.length ?? 0)
+          /**
+           * **`verify` 是最后一道,而且它推翻得了前面全部结论。**
+           *
+           * 上面那些都是**过程**结论(每条 ref 报了 ok、第 2 跳报了 ok),而两跳之间隔着
+           * 集成工作区、临时合并工作树、用户自己的检出 —— 任何一处半路失手都不会让前面
+           * 那些 ok 变回 not-ok。跑机 .13 那一趟正是这个结局:收口说成功,而 67 条抢救
+           * 分支一次都没进过主干。
+           *
+           * `verifyDelivered` 不复用任何过程结论,直接问 git「这条 ref 是不是 HEAD 的
+           * 祖先」。它说还有没落地的,就**不许**清 `pendingHandoff` —— 清了的话下一次
+           * `--resume` 不再弹关口,而 `scanStranded` 只有 `m` 这一个消费者,那些内容
+           * 就成了第三个「按 q 之后永久失联」。
+           *
+           * 拿不到 `verify`(中途被取消)时按老判据走:那时第 2 跳本来也没跑。
+           */
+          const heldBack = mergeHeldBack(out)
           if (out.trunk?.ok === true && heldBack === 0) {
             setHandoffState('merged')
             props.handoffStateOut.current = 'merged'

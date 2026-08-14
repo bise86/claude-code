@@ -633,7 +633,32 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
          * 名单决定「清构建产物时不许碰哪些」。各写一份的话,哪天这里加了第三条,
          * 那边就会开始删它 —— 而它是**用户的任务记录**。
          */
-        const want = EFFTASK_INTERNAL_PATHS.map(p => `${p}/`).filter(p => !cur.includes(p))
+        /**
+         * **构建产物也写进来 —— 这是 2 681 个文件进版本库的真正来源。**
+         *
+         * 跑机 .30 实测:master 上被跟踪的构建产物 **2 608 个文件 / 52.86 GiB**,
+         * 而项目的 `.gitignore` 里一条相关规则都没有。来历是每个执行者自己建一个
+         * `.cargo-target-<名字>/` 当 cargo 的 target 目录,然后 `commitAndMerge` 的
+         * `add -A` 照单全收 —— `clean -X` 也清不到它们(它们从来没被忽略过)。
+         * 后果是集成分支合回 master 时逐个 add/add 撞冲突,643 个提交卡了好几天。
+         *
+         * 写 `info/exclude` 而不是改用户的 `.gitignore`:后者是**被跟踪的文件**,
+         * 替他改并提交是越权(上面那两条为同一个理由写在这里)。而 `info/exclude`
+         * 对 linked worktree 同样生效(`buildOutputs.ts` 文件头第二条实测),
+         * 所以节点工作区里的 `add -A` 也会跳过它们 —— 正是需要的那一侧。
+         *
+         * **只写产物,不写 `target/` 之外的通配**:这份名单里的每一条都要能说出
+         * 「它只可能是构建产物」。`.cargo-target-*` / `.cargo-task-*` / `*-cargo-target/`
+         * 是 efftask 执行者自己造的命名;`target/` 是 cargo 默认;`*.rlib`/`*.rmeta`
+         * 是编译产物的扩展名。**不写 `.cargo-*`** —— 那会命中 `.cargo/config.toml`,
+         * 一个真会被提交的配置文件。
+         */
+        const BUILD_OUTPUT_EXCLUDES: readonly string[] = [
+          '.cargo-target-*/', '.cargo-task-*/', '*-cargo-target/', 'target/',
+          '*-cargo-check.log', '*-check.short.log', '.cargo-check-*.log', '*.rlib', '*.rmeta',
+        ]
+        const want = [...EFFTASK_INTERNAL_PATHS.map(p => `${p}/`), ...BUILD_OUTPUT_EXCLUDES]
+          .filter(p => !cur.includes(p))
         if (want.length > 0) {
           await writeFile(excl, `${cur}${cur.endsWith('\n') || cur === '' ? '' : '\n'}${want.join('\n')}\n`)
         }
@@ -1252,9 +1277,27 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       const trunkLanded = produced.code === 0
         ? Math.max(0, (Number.parseInt(produced.stdout.trim(), 10) || 0) - commits)
         : trunkMerged
-      const salv = await git(
+      /**
+       * **抢救分支要判「合没合进去」,不能裸列。**
+       *
+       * 这里原来是一句裸的 `for-each-ref`,而 `rescue.ts` 写死了「成功不删分支」
+       * (有道理:那条 ref 是那一版产出唯一的落脚点)。两条加起来 = **一条抢救分支
+       * 一旦建出来,就永久出现在每一次收口屏上**,哪怕它早就被 `m` 合进去了。
+       * 更糟的是屏幕上紧跟着那行「⚠ 上面这 N 条抢救分支**不在集成分支上**,
+       * git merge 捞不到它们」—— 合过之后它逐字是假话。
+       *
+       * 判据和 `stranded.ts` 那一侧对齐(`containedIn === 'yes' → 跳过`):同一件事
+       * 两套判据是这个仓库的固定病灶。`--is-ancestor` 的约定:0 = 是祖先,1 = 不是,
+       * >1 = 命令自己出错 —— **探不出来的照旧列出来**,状态未知时宁可多说一句。
+       */
+      const salvAll = await git(
         ['for-each-ref', '--format=%(refname:short)', `refs/heads/efftask/${runId}/salvage`], gitRoot,
       )
+      const salvKept: string[] = []
+      for (const ref of salvAll.stdout.split('\n').map(s => s.trim()).filter(Boolean)) {
+        const inInt = await git(['merge-base', '--is-ancestor', ref, intBranch], gitRoot)
+        if (inInt.code !== 0) salvKept.push(ref)
+      }
       const kept: { path: string; why: string }[] = []
       for (const n of nodes) {
         /**
@@ -1268,16 +1311,50 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
          * 只报**真的还有东西**的:干净目录出现在收口屏上纯属噪音。
          */
         const path = n.worktree?.path ?? pathFor(n)
-        const st = await git(['status', '--porcelain', '--ignored'], path)
+        /**
+         * **判据分成两问,而且都不再数被忽略的文件。**
+         *
+         * 这里原来一律 `status --porcelain --ignored` 非空就报「仍有未合入的内容」。
+         * `--ignored` 把**构建产物**也算进去 —— Rust 项目每个节点工作区里躺着一个
+         * `target/`,于是跑机上 11 个保留工作区里 8 个的全部「内容」就是编译产物,
+         * 而它们**一个提交都没有**、`m` 也合不了(那一屏把它们记进 `ignoredOnly`)。
+         * 用户读到的是「有 8 处产出没送到」,而实际是 0 处。
+         *
+         * 换成:①这条分支上还有没有集成分支没有的**提交**;②工作区里还有没有
+         * git 看得见的改动。两问都为否 = 真的没东西了,只是目录还占着盘 ——
+         * 那是 `c` 键的事,不该在收口屏上冒充「产出没送到」。
+         *
+         * **去掉的只有 `--ignored`,不是 `-u`。** 探针当场把第一版顶红了:方案席留下的
+         * 一个 `调研笔记.md` 是**未跟踪但没被忽略**的,目录一删就真没了 —— 那正是这一格
+         * 存在的理由。plain `--porcelain` 恰好是「显示未跟踪、不显示被忽略」。
+         */
+        const st = await git(['status', '--porcelain'], path)
         if (st.code !== 0) continue
-        if (n.worktree) kept.push({ path, why: st.stdout.trim() ? '仍有未合入的内容' : '未回收' })
-        else if (st.stdout.trim()) kept.push({ path, why: '分析/质疑讨论阶段留下的文件,未回收' })
+        const dirty = st.stdout.trim().length > 0
+        /**
+         * **分支按 `branchFor(n)` 算,不看 `n.worktree` 还在不在。**
+         *
+         * 探针抓到过:挂在 `n.worktree?.branch` 上的话,「引用已交回、而提交还在分支上」
+         * 那一类整个漏掉 —— 而它正是执行者**已经 commit、合并却没成**时的常态
+         * (跑机上那三个 `commits_ahead_of_int=3` 的工作区就是它)。分支名是
+         * `hash(nodeId)` 算出来的,不随引用在不在而变,所以这里可以直接问。
+         *
+         * 分支不存在时 `rev-list` 非 0 → `ahead` 为假,和「没有未合入的提交」同一个结论。
+         */
+        const c = await git(['rev-list', '--count', `${intBranch}..${branchFor(n)}`], gitRoot)
+        const ahead = c.code === 0 && (Number.parseInt(c.stdout.trim(), 10) || 0) > 0
+        if (dirty || ahead) {
+          kept.push({
+            path,
+            why: n.worktree ? '仍有未合入的内容' : '分析/质疑讨论阶段留下的文件,未回收',
+          })
+        } else if (n.worktree) kept.push({ path, why: '未回收' })
       }
       return {
         branch: intBranch,
         commits,
         kept,
-        salvage: salv.stdout.split('\n').map(s => s.trim()).filter(Boolean),
+        salvage: salvKept,
         // Reported because the branch above CANNOT BE DELETED while this worktree holds it,
         // and nothing ever reclaims it: `dispose()` walks only the NODES it is handed, and
         // the next run deliberately re-adopts this one rather than rebuilding it. The exit

@@ -686,7 +686,22 @@ describe('用户实测的那个目录名', () => {
   })
 
   /** 反向:**没验收**的节点,同一个目录一个字节都不许动 —— 那是现场。 */
-  it('节点还没验收时,这些目录原样留着', async () => {
+  /**
+   * **这条探针的前提被本轮改动翻了面,所以它换了断言的对象。**
+   *
+   * 从前 `.cargo-target-sql-restore` 是「未跟踪、但**没被忽略**」的,于是 `clean -X`
+   * 够不着它 —— 这条用例断言的正是那个缺口的后果。本轮 `init()` 把
+   * `.cargo-target-` 那一族(带尾斜杠的目录通配)一并写进了 `.git/info/exclude`
+   * (病根:执行者自建 target 目录被
+   * `add -A` 提交,跑机上 2 608 个文件 / 52.86 GiB),于是它成了正常的构建产物,
+   * 落进 `buildOnly` 那一桶 —— 而那一桶按设计就收「还没验收完、且此刻不在飞」的节点。
+   *
+   * 所以该断言的不再是「产物还在」,而是**这两条**:
+   *  1. 工作区目录本身不许被删(清产物 ≠ 删目录);
+   *  2. 真正挡住「正在编译的节点被抽掉产物」的是 `inFlight` 那道硬闸,不是「没被忽略」
+   *     这个巧合 —— 后者从来就不是一道闸,只是那时候恰好没生效。
+   */
+  it('节点还没验收时:工作区目录留着,产物按 buildOnly 那一桶清', async () => {
     const p = pool()
     await p.init()
     const n = node('root/01-a', { status: 'EXECUTING' })
@@ -697,7 +712,23 @@ describe('用户实测的那个目录名', () => {
 
     const deps = depsOf(p, { dirSizeKb: async () => 8 })
     const plan = await scanCleanup(deps, [n], n.id)
-    expect(plan.items).toEqual([])
+    expect(plan.items).toEqual([])            // 工作区不在删除名单里
+    await runCleanup(deps, plan, [n])
+    expect(await exists(path)).toBe(true)     // ① 目录本身留着
+  })
+
+  /** ② 在飞的节点**一个字节都不动** —— 这才是那道闸。 */
+  it('节点在飞时,连它的构建产物都不碰', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a', { status: 'EXECUTING' })
+    const lease = await p.acquire(n)
+    const path = (lease as { path: string }).path
+    await mkdir(join(path, '.cargo-target-sql-restore'), { recursive: true })
+    await writeFile(join(path, '.cargo-target-sql-restore', 'big.bin'), 'x')
+
+    const deps = depsOf(p, { dirSizeKb: async () => 8, inFlight: [n.id] })
+    const plan = await scanCleanup(deps, [n], n.id)
     await runCleanup(deps, plan, [n])
     expect(await exists(join(path, '.cargo-target-sql-restore'))).toBe(true)
   })
