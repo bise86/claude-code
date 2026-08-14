@@ -237,9 +237,46 @@ export async function mergeIntoIntegration(
       return { ok: false, why: `读不出临时合并工作区的 HEAD: ${head.stderr.trim()}`, conflicted: false, restored: true }
     }
     const sha = head.stdout.trim()
+    /**
+     * **HEAD 还是不是我们刚才那次合并 —— 不问就会报一句假的「已捞回」。**
+     *
+     * `merge-scratch` 是**共享**的(第 1 级合并、`syncTrunk`、加法补录同一个目录),而
+     * 从上面那句 `git merge` 到这里不在任何锁里。数据安全席在真 git 上复现:另一条流的
+     * `stageAt`(`reset --hard <tip>`)落在这中间时,`sha` 读到的就是 `tip` 本身,接着
+     * `merge --ff-only <tip>` 回一句 **`Already up to date`、退出码 0** —— 这条路把它
+     * 当成成功,`out.merged` 多一条、`noteMerged` 写 `contributed = true`、屏幕说
+     * 「捞回了 N 个提交」,而集成分支**一个字节都没动**。更远的一环:`contributed` 一旦为真,
+     * 那个节点全部抢救 ref 在下一趟被判成「已被取代」,而第 3 级(落痕 → `b`)因此永远
+     * 不会为这条 ref 触发 —— 一次假成功把三级递降整条关掉。
+     *
+     * 这和 `backfill.ts` 那道 `HEAD === tip` 复核是同一件事的两张脸,那边修了、这边没有。
+     * 判据同样是**相对一个不会变的值**:`sha` 等于我们进来时那个 `tip`,就说明我们的合并
+     * 不在了。重来一趟(候选、tip、合并全部重算),而不是报成功。
+     */
+    if (sha === tip) {
+      deps.onProgress?.('临时合并工作区被别的流程收拾过,这次合并没留下来 —— 重做一遍…')
+      continue
+    }
     const ff = await deps.withIntegrationLock(() =>
       deps.git(['merge', '--ff-only', '--no-verify', sha], deps.integrationPath))
     if (ff.code === 0) {
+      /**
+       * **「合进去了」由 git 证明,不由 ff 的退出码证明。**
+       *
+       * `--ff-only` 对一个**已经是祖先**的 sha 也回 0(`Already up to date`)。上面那道
+       * `sha !== tip` 挡住了已知的那一种成因,而这一句问的是唯一真正要紧的事实:
+       * 这条 ref 现在到底在不在集成分支里。答案是「不在」的话,后面每一环
+       * (`contributed`、落痕、下一趟的分诊)都会建在一个假前提上。
+       */
+      const landed = await deps.git(['merge-base', '--is-ancestor', ref, deps.integrationBranch], deps.gitRoot)
+      if (landed.code !== 0) {
+        return {
+          ok: false,
+          why: `快进报了成功,而 ${ref} 仍然不在集成分支里 —— 这一趟没有合进去任何东西(临时合并工作区是共享的,可能被别的流程收拾过)`,
+          conflicted: false,
+          restored: true,
+        }
+      }
       /**
        * **合成了就把临时工作树收掉。**
        *

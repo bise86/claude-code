@@ -244,6 +244,85 @@ describe('合并关口', () => {
     expect(ran).toBe(1)
   })
 
+  /**
+   * **只剩「加法补录」和「孤儿目录」时,回车也必须能执行。**
+   *
+   * 上一轮把这个判据从「只看 items」修成「三跳全看」,而第 3 跳只补了 `rescue.merge`。
+   * 执行侧(`runSubtreeMerge`)认的是三样:`merge` / `backfill` / 孤儿目录里的 `absent`。
+   * 于是分诊回「拿不准」(模型没提到的也算)时,屏幕逐字印着「会尽最大努力捞」「会被
+   * **补录**进集成分支」,而回车走 `onCancel` —— 第 2 级和孤儿目录那一格**在生产上
+   * 一次都没跑过**。这两条探针钉的就是那两格。
+   */
+  const RESCUE = (over: Partial<NonNullable<SubtreeMergePlan['rescue']>> = {}): NonNullable<SubtreeMergePlan['rescue']> => ({
+    merge: [], backfill: [], hold: [], orphanFiles: [], problems: [], ...over,
+  })
+  const CAND = (ref: string): NonNullable<SubtreeMergePlan['rescue']>['backfill'][number] => ({
+    item: { kind: 'salvage', branch: ref, why: '抢救出来的' },
+    evidence: { ref, commits: 2, files: ['a.ts'], fileCount: 1 },
+    verdict: 'unsure', why: '分诊拿不准',
+  })
+  const nothingElse = { items: [], trunk: { branch: 'main', pending: 0 } } as const
+
+  it('只有「加法补录」时,回车要能执行', async () => {
+    let ran = 0
+    const { t, app } = await mount(
+      <ConfirmMergeSubtree
+        target={target}
+        onScan={async () => PLAN({ ...nothingElse, rescue: RESCUE({ backfill: [CAND('efftask/001/salvage/ab12')] }) })}
+        onRun={async () => { ran++; return OUTCOME({ merged: [] }) }}
+        onDone={() => {}} onCancel={() => {}}
+      />,
+    )
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    app.unmount()
+    expect(ran).toBe(1)
+  })
+
+  it('只有孤儿目录、而且有拷贝接缝时,回车要能执行', async () => {
+    let ran = 0
+    const { t, app } = await mount(
+      <ConfirmMergeSubtree
+        target={target}
+        onScan={async () => PLAN({
+          ...nothingElse, canBackfillOrphan: true,
+          rescue: RESCUE({ orphanFiles: [{ path: '/w/int.orphan', files: [{ rel: 'lost.ts', kind: 'absent' }] }] }),
+        })}
+        onRun={async () => { ran++; return OUTCOME({ merged: [] }) }}
+        onDone={() => {}} onCancel={() => {}}
+      />,
+    )
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    app.unmount()
+    expect(ran).toBe(1)
+  })
+
+  /** 反过来:**没有**拷贝接缝时那一格只列不捞,那时回车不该假装有活干。 */
+  it('孤儿目录没有拷贝接缝时,不算有活', async () => {
+    let ran = 0
+    let cancelled = 0
+    const { t, app } = await mount(
+      <ConfirmMergeSubtree
+        target={target}
+        onScan={async () => PLAN({
+          ...nothingElse, canBackfillOrphan: false,
+          rescue: RESCUE({ orphanFiles: [{ path: '/w/int.orphan', files: [{ rel: 'lost.ts', kind: 'absent' }] }] }),
+        })}
+        onRun={async () => { ran++; return OUTCOME() }}
+        onDone={() => {}} onCancel={() => { cancelled++ }}
+      />,
+    )
+    await tick()
+    t.stdin.press('\r')
+    await tick()
+    app.unmount()
+    expect(ran).toBe(0)
+    expect(cancelled).toBe(1)
+  })
+
   it('扫描还没回来时回车不执行 —— 那一下不该落在一个还不存在的清单上', async () => {
     let ran = 0
     let release = (): void => {}

@@ -1079,9 +1079,12 @@ describe('收口撞上冲突:模型先解一次(用户要求的那件事)', () =
      * 改成「解完之前一直有冲突」—— 那才是真 git 的行为。
      */
     let resolved = false
+    /** 解完之后那次提交 —— 它之后「用户分支已经进了集成分支」才成立。 */
+    let committedInScratch = false
     const git = async (args: string[]) => {
       calls.push(args)
       const [a, b] = args
+      if (a === 'commit') committedInScratch = true
       if (a === 'diff') return { code: 0, stdout: '', stderr: '' }
       if (a === 'symbolic-ref') return { code: 0, stdout: 'main\n', stderr: '' }
       /**
@@ -1090,12 +1093,27 @@ describe('收口撞上冲突:模型先解一次(用户要求的那件事)', () =
        * 模型也就永远不会被派出去,而这条用例要钉的正是那次派发。
        */
       if (a === 'merge-base') {
-        // 集成分支还没进用户分支 = 有东西要送;用户分支也还没进集成分支 = 要先同步。
+        /**
+         * 集成分支还没进用户分支 = 有东西要送;用户分支也还没进集成分支 = 要先同步。
+         *
+         * **但同步做完之后要改口。** `mergeIntoIntegration` 快进成功后会再问一次
+         * 「这条 ref 现在到底在不在集成分支里」—— 那道闸挡的是「`--ff-only` 回了 0
+         * 而什么都没合」的假成功。一个恒答「不在」的替身会让那道闸对**每一次**合并
+         * 都喊失败,而真 git 在这一刻答的是「在」。替身钝了要磨,不是把闸拆掉。
+         */
+        if (args[2] === 'main' && committedInScratch) return { code: 0, stdout: '', stderr: '' }
         return { code: 1, stdout: '', stderr: '' }
       }
       if (a === 'worktree') return { code: 0, stdout: '', stderr: '' }
       if (a === 'reset' || a === 'clean' || a === 'checkout') return { code: 0, stdout: '', stderr: '' }
-      if (a === 'rev-parse') return { code: 0, stdout: 'cafe123\n', stderr: '' }
+      /**
+       * **临时工作树的 HEAD 和集成分支的 tip 不是同一个 sha。**
+       *
+       * 恒回同一个值的替身会让「合完之后 HEAD 还等于 tip」这个**只可能由事故造成**的
+       * 形状变成常态(真 git 里合并总会产生一个新提交),于是那道防假成功的闸对每一次
+       * 正常合并都开火。
+       */
+      if (a === 'rev-parse') return { code: 0, stdout: `${b === 'HEAD' ? 'head456' : 'cafe123'}\n`, stderr: '' }
       if (a === 'merge' && b === '--abort') return { code: 0, stdout: '', stderr: '' }
       // **快进不会冲突** —— 只有三方合并会。原来对所有 merge 一律回冲突,于是解完之后
       // 那次把产出送到用户目录的快进也被当成冲突,整条路退回「反复重试仍未合上」。

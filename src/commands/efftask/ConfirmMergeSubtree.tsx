@@ -2,7 +2,7 @@ import * as React from 'react'
 
 import { Box, Text, useInput } from '../../ink.js'
 import {
-  subtreeMergeLines, subtreeMergeResultLines,
+  rescueHasWork, subtreeMergeLines, subtreeMergeResultLines,
   type SubtreeMergeOutcome, type SubtreeMergePlan,
 } from '../../tools/efftask/mergeSubtree.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
@@ -49,10 +49,18 @@ import { redoSummaryLines } from './ConfirmRedo.js'
  *
  * **抽成一份**是因为这个判据有**两个**读者(按键处理和页脚文案),而这次漏掉 rescue
  * 正是两处各写一份的直接后果。
+ *
+ * ## 而「抽成一份」上一次只抽了一半
+ *
+ * 上面那段修的是**这一屏内部**的两个读者,第三个读者(`runSubtreeMerge` 里决定跑不跑
+ * `runRescue` 的那个判据)仍然自己写了一份 —— 于是同一个 bug 换了一格复发:这里只认
+ * `rescue.merge`,而执行侧认三样(`merge` / `backfill` / 孤儿目录)。后果和上次逐字相同,
+ * 只是受害的换成了第 2 级补录和孤儿目录:**它们从落地那天起在生产上一次都没执行过**。
+ *
+ * 所以判据现在住在 `mergeSubtree.rescueHasWork`,和执行侧**同一个函数**。
  */
 export function hasNothingToDo(p: SubtreeMergePlan): boolean {
-  const rescue = p.rescue
-  const hasRescue = rescue !== undefined && rescue.merge.length > 0
+  const hasRescue = rescueHasWork(p)
   return p.items.length === 0
     && (p.trunk.pending === 0 || p.trunk.blocked !== undefined)
     && !hasRescue

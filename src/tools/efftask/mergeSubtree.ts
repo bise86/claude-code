@@ -204,6 +204,30 @@ export interface SubtreeMergePlan {
   canBackfillOrphan?: boolean
 }
 
+/**
+ * **这一趟的「捞」到底有没有活。判据只有这一份。**
+ *
+ * 三个读者:执行侧决定跑不跑 `runRescue`、确认屏决定回车是执行还是取消、页脚文案。
+ * 上一轮为「两处各写一份」付过一次账,修的时候只补了 `merge` 那一格,于是
+ * **第 2 级补录和孤儿目录从落地那天起在生产上一次都没执行过**:
+ *
+ * `hasNothingToDo` 只看 `rescue.merge.length > 0`,而 `runSubtreeMerge` 认三样。
+ * 目录都清过了(`items` 空)、集成分支已送达(`trunk.pending === 0`)、分诊回 `unsure`
+ * (**模型没提到的也算 `unsure`**)—— 这三条在跑机上同时成立是常态,那时确认屏逐字印着
+ * 「会被**补录**进集成分支」,而回车走 `onCancel`,`runSubtreeMerge` 一次都不会被调用。
+ * 一屏承诺,一个键都兑现不了。
+ *
+ * 所以判据抽成这一个函数,两侧都从这里读 —— 再新增一级递降时,漏掉一处的成本是
+ * 「做完的东西执行不到」,而它不会有任何测试变红,除非判据只有一份。
+ */
+export function rescueHasWork(plan: SubtreeMergePlan): boolean {
+  const r = plan.rescue
+  if (r === undefined) return false
+  return r.merge.length > 0 || r.backfill.length > 0
+    // 孤儿目录那一格要有拷贝接缝才真的动手 —— 没有接缝时它只列不捞,那不算「有活」。
+    || (plan.canBackfillOrphan === true && r.orphanFiles.some(o => o.files.some(f => f.kind === 'absent')))
+}
+
 export interface SubtreeMergeOutcome {
   /**
    * 这一趟的抢救计划。界面据它判「还有没有被扣下的」—— 清 `pendingHandoff` 的判据
@@ -711,10 +735,8 @@ export async function runSubtreeMerge(
         : `${what}:拿不准、而且已经被后来的版本取代(${h.why})—— 连补录都没做,产出还在那里,一个字节都没丢`)
     }
   }
-  const rescueWork = plan.rescue !== undefined && (
-    plan.rescue.merge.length > 0 || plan.rescue.backfill.length > 0
-    || (deps.copyInto !== undefined && plan.rescue.orphanFiles.some(o => o.files.some(f => f.kind === 'absent')))
-  )
+  // 判据只有一份(`rescueHasWork`)—— 这里和确认屏读同一个函数,见它的文件内注释。
+  const rescueWork = rescueHasWork(plan)
   if (!out.aborted && plan.rescue && rescueWork) {
     note(`捞回 ${plan.rescue.merge.length + plan.rescue.backfill.length} 处没有工作区目录的产出…`)
     const r = await runRescue({

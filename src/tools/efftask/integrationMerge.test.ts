@@ -273,6 +273,89 @@ describe('集成分支在解冲突期间前进了', () => {
   })
 })
 
+/**
+ * **临时合并工作区是共享的,而从 `git merge` 到读 HEAD 这一段不在任何锁里。**
+ *
+ * 数据安全席在真 git 上复现:另一条流的 `stageAt`(`reset --hard <tip>`)落在这中间时,
+ * 读到的 HEAD 就是 `tip` 本身,接着 `merge --ff-only <tip>` 回一句 `Already up to date`、
+ * **退出码 0** —— 这条路把它当成成功,而集成分支一个字节都没动。
+ *
+ * 这里用真 git + 一个会在指定时刻插一脚的 runner 复现那一刻。判据不是「报了什么」,
+ * 是**集成分支上到底有没有那个文件**。
+ */
+describe('别的流程在中途收拾了临时合并工作区', () => {
+  /** 造一条有产出、目录已经不在的分支 —— `m` 键那条路上最常见的形状。 */
+  async function branchWithWork(p: ReturnType<typeof pool>, id: string, file: string): Promise<string> {
+    const n = node(id)
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, file), 'work\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'w'], l.path)
+    const branch = p.worktreeBranchOf(n)
+    await rm(l.path, { recursive: true, force: true })
+    await git(['worktree', 'prune'], gitRoot)
+    return branch
+  }
+
+  it('合完之后 HEAD 被挪回 tip:不许报成功,重来一趟并真的合上', async () => {
+    const p = pool(); await p.init()
+    const branch = await branchWithWork(p, 'root/10', 'rescued.ts')
+    const scratch = join(worktreeRoot, 'merge-scratch')
+    let intruded = 0
+    // 只插一脚:第一次读 scratch 的 HEAD 之前,模拟另一条流的 stageAt 把它 reset 回 tip。
+    const meddling: GitRunner = async (args, cwd) => {
+      if (cwd === scratch && args[0] === 'rev-parse' && args[1] === 'HEAD' && intruded === 0) {
+        intruded += 1
+        const tip = (await git(['rev-parse', p.integrationBranchName], gitRoot)).stdout.trim()
+        await git(['reset', '--hard', tip], scratch)
+      }
+      return git(args, cwd)
+    }
+    const res = await mergeIntoIntegration(depsOf(p, { git: meddling }), branch)
+    expect(intruded).toBe(1)
+    expect(res.ok).toBe(true)
+    // **判据落在集成分支上,不落在返回值上** —— 假成功那一版这里是 code !== 0。
+    expect((await git(['show', `${p.integrationBranchName}:rescued.ts`], gitRoot)).code).toBe(0)
+  })
+
+  it('每一趟都被挪走:如实报失败,而不是报一句假的「已捞回」', async () => {
+    const p = pool(); await p.init()
+    const branch = await branchWithWork(p, 'root/11', 'rescued.ts')
+    const scratch = join(worktreeRoot, 'merge-scratch')
+    const meddling: GitRunner = async (args, cwd) => {
+      if (cwd === scratch && args[0] === 'rev-parse' && args[1] === 'HEAD') {
+        const tip = (await git(['rev-parse', p.integrationBranchName], gitRoot)).stdout.trim()
+        await git(['reset', '--hard', tip], scratch)
+      }
+      return git(args, cwd)
+    }
+    const res = await mergeIntoIntegration(depsOf(p, { git: meddling }), branch)
+    expect(res.ok).toBe(false)
+    expect((await git(['show', `${p.integrationBranchName}:rescued.ts`], gitRoot)).code).not.toBe(0)
+  })
+
+  /**
+   * **「合进去了」由 git 证明,不由 `--ff-only` 的退出码证明。**
+   *
+   * 上面那道 `sha !== tip` 挡的是已知的一种成因。这条探针把闸单独拎出来:让快进这一句
+   * **假装**成功(退出码 0、什么都不做),看这条路认不认。这个仓库为「前面的判据把兜底
+   * 闸遮住了、反转它测试全绿」付过账,所以兜底闸要能被单独证明。
+   */
+  it('快进报了 0 而 ref 并没进集成分支 → 判失败', async () => {
+    const p = pool(); await p.init()
+    const branch = await branchWithWork(p, 'root/12', 'rescued.ts')
+    const lying: GitRunner = async (args, cwd) => {
+      if (cwd === p.integrationPath && args[0] === 'merge' && args[1] === '--ff-only') {
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      return git(args, cwd)
+    }
+    const res = await mergeIntoIntegration(depsOf(p, { git: lying }), branch)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.why).toContain('仍然不在集成分支里')
+  })
+})
+
 describe('临时工作树', () => {
   /** 复用时必须先收掉上一趟留下的半合并态和散落文件,否则这一次的 merge 起不来。 */
   it('复用一棵留着散落文件的临时工作树', async () => {
