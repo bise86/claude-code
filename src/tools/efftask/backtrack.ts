@@ -494,10 +494,14 @@ export function composeRedos(
       skip(e.nodeId, '这棵树里找不到这个节点')
       continue
     }
-    // `preCloned`:第一条之外的每一条都跑在**上一条刚交出来的那棵新树**上,而那棵树是
-    // 我们自己的。少了它,N 条 entry = N 次全树 `structuredClone` —— .13 那个 run 的
-    // node.md 合计 86 MiB、2215 个节点,而符合回溯条件的有 834 个:在 root 上按一次 `b`
-    // 就是几百次全树深拷贝,同步跑在按键处理里,界面当场僵住几分钟。
+    /**
+     * `preCloned`:第一条之外的每一条都跑在**上一条刚交出来的那棵新树**上,而那棵树是
+     * 我们自己的。少了它,N 条 entry = N 次全树 `structuredClone`。
+     *
+     * **实测**(.13 qianbase-xtp run 001 的真实 2215 个 node.md,在 root 上按一次 `b`
+     * = 823 条 entry):复用 **448 ms**,每条重新克隆 **70 987 ms**。后者同步跑在按键
+     * 处理里 —— 用户按下 `b` 之后终端整整僵 71 秒,而这期间界面连一帧都不会重画。
+     */
     const one = planRedo(tree, e.nodeId, e.entry, now, ctxFor?.(node), { preCloned: applied > 0 })
     /**
      * **算不出来的那一条跳过,不再整条不做。**
