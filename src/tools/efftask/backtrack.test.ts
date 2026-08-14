@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import {
-  backtrackLines, backtrackScope, composeRedos, conservativeEntries, entryFor, integrateFeedback,
+  backtrackLines, backtrackScope, composeRedos, conservativeEntries, entryFor, integrateFeedback, staleRound,
   levelFor, markBacktracked, outputMissing, selfReportedUndone, undoneOf,
   NO_CONTRIBUTION_NOTE, RESCUE_STRANDED_NOTE, backtrackCanClaim, rescueStranded, strandedRefsOf,
   type BacktrackTarget,
@@ -337,6 +337,89 @@ describe('确认屏', () => {
     expect(text).toContain('由那一轮决定')
     // 这个键和 r 最不一样的地方:它不开圆桌。
     expect(text).toContain('不会开新的圆桌')
+  })
+
+  /**
+   * **「凭什么是第 2 级」要印出来。**
+   *
+   * 用户真的问过这一句:屏幕上只有「N 个任务要完全重做」,而他没有任何办法知道这个级别
+   * 是怎么来的(来自 `backtrack.rounds >= 1`,也就是此前按过一次 `b`)。第 2 级会删整片
+   * 子树、重新拆分 —— 要用户按下它,判据必须摆在眼前。
+   */
+  it('第 2 级要印出依据(上一次回溯是什么时候)', () => {
+    const a = mk('a', {
+      title: '甲', childIds: ['a/1'],
+      backtrack: { rounds: 1, at: '2026-08-13T10:49:50.354Z' },
+      updatedAt: '2026-08-14T02:00:00.000Z',   // 那次之后动过 = 第 1 级真的跑了
+    })
+    const text = backtrackLines(
+      [{ node: a, level: 2, blocking: '', remedy: [], suspects: [] }],
+      [{ nodeId: 'a', entry: 'plan' }],
+    ).join('\n')
+    expect(text).toContain('第 2 级的依据')
+    expect(text).toContain('2026-08-13T10:49:50.354Z')
+    // 真跑过的**不许**报空推警告 —— 那会让用户去清一个有依据的标记。
+    expect(text).not.toContain('空推')
+  })
+
+  /**
+   * **空推上去的那一级要单独警告。**
+   *
+   * 跑机 .30 实测:217 个带 `rounds: 1` 的节点(全是同一个时间戳,一次按下打的一批)里
+   * **183 个的 `updatedAt` 比那个标记还早** —— 那一轮从来没真的重跑过它们,而这一次按 `b`
+   * 会把它们直接推到「完全重做」。用户按下的是这套东西里最贵、最不可逆的一步。
+   */
+  it('标记之后再没被写过 → 警告这一级是空推上去的', () => {
+    const a = mk('a', {
+      title: '甲', childIds: ['a/1'],
+      backtrack: { rounds: 1, at: '2026-08-13T10:49:50.354Z' },
+      updatedAt: '2026-08-12T15:55:38.914Z',   // 比标记还早
+    })
+    const text = backtrackLines(
+      [{ node: a, level: 2, blocking: '', remedy: [], suspects: [] }],
+      [{ nodeId: 'a', entry: 'plan' }],
+    ).join('\n')
+    expect(text).toContain('再没有被写过一次')
+    expect(text).toContain('空推')
+    // 要给得出能照做的下一步。
+    expect(text).toContain('先清掉它的 backtrack 记录')
+  })
+
+  /**
+   * **第 2 级但拿不到时间戳时,那一行整个不印 —— 不许印出 `undefined`。**
+   *
+   * 形态是真的:node.md 可以被手工编辑(`backtrack:` 只剩 `rounds`),而调用方也能
+   * 直接传 `level: 2`。变异测试实测:把守卫改成恒真,屏幕上会出现
+   * 「第 2 级的依据:此前回溯过一次(undefined)」—— 一句用户完全没法据以动手的话,
+   * 而它出现在一个不可逆按键的确认屏上。
+   */
+  it('第 2 级但没有 backtrack.at → 不印那一行,更不许印 undefined', () => {
+    const a = mk('a', { title: '甲', childIds: ['a/1'] })   // 完全没有 backtrack 字段
+    const text = backtrackLines(
+      [{ node: a, level: 2, blocking: '', remedy: [], suspects: [] }],
+      [{ nodeId: 'a', entry: 'plan' }],
+    ).join('\n')
+    expect(text).toContain('完全重做')        // 这一段照常渲染
+    expect(text).not.toContain('第 2 级的依据')
+    expect(text).not.toContain('undefined')
+  })
+
+  /** 时间戳解析不出来就**一个字都不说** —— 少说一句永远比说错一句便宜。 */
+  it('时间戳坏了就不报空推(宁可不说)', () => {
+    expect(staleRound(mk('a', { backtrack: { rounds: 1, at: '不是时间' }, updatedAt: 'T0' }))).toBe(false)
+    // `updatedAt` 缺席(老 node.md)同样是「算不出来」——**不是**「没动过」。
+    expect(staleRound(mk('a', {
+      backtrack: { rounds: 1, at: '2026-08-13T10:49:50.354Z' }, updatedAt: '' as never,
+    }))).toBe(false)
+    // 没有 backtrack 的节点根本谈不上这件事。
+    expect(staleRound(mk('a', { updatedAt: '2026-08-12T00:00:00.000Z' }))).toBe(false)
+    // 正反两面都要钉:早于 → true,晚于 → false。
+    expect(staleRound(mk('a', {
+      backtrack: { rounds: 1, at: '2026-08-13T10:00:00.000Z' }, updatedAt: '2026-08-12T10:00:00.000Z',
+    }))).toBe(true)
+    expect(staleRound(mk('a', {
+      backtrack: { rounds: 1, at: '2026-08-13T10:00:00.000Z' }, updatedAt: '2026-08-14T10:00:00.000Z',
+    }))).toBe(false)
   })
 
   it('一个都没有时说清楚,不印空标题', () => {

@@ -223,6 +223,36 @@ export function integrateFeedback(n: TaskNode): string {
 const MAX_FEEDBACK_ITEMS = 12
 const clipItem = (s: string): string => (s.length > 600 ? `${s.slice(0, 600)}…` : s)
 
+/**
+ * **这个节点的「回溯过一轮」是不是空推上去的。**
+ *
+ * 判据:它的 `updatedAt` **早于** `backtrack.at` —— 打了那个标记之后,这个节点再没有
+ * 被写过一次。而重跑一个节点必然会写它(状态迁移、execStatus、phaseMs 都过 `commit`),
+ * 所以「之后一次都没写过」等于「那一轮没有真的重跑它」。
+ *
+ * 跑机 .30 实测:217 个带 `rounds: 1` 的节点里 183 个是这形状(标记时间戳全部相同,
+ * 一次按下打的一批;`updatedAt` 停在前一天)。成因是那一次跑的二进制还没有
+ * `markBacktracked` 的 `reran` 闸 —— 闸现在有了,但盘上的陈旧标记不会自己消失。
+ *
+ * **两个时间戳里任意一个解析不出来就返回 false**:这条判据只用来在确认屏上多说一句话,
+ * 而「少说一句」永远比「说错一句」便宜。用 `Date.parse` 而不是字符串比较 ——
+ * node.md 是可手工编辑的,两个字段的写法不一定同源。
+ */
+export function staleRound(n: TaskNode): boolean {
+  const at = Date.parse(n.backtrack?.at ?? '')
+  const upd = Date.parse(n.updatedAt ?? '')
+  /**
+   * **今天这一句是等价的,仍然留着 —— 写清楚免得下一个人补一条假探针。**
+   *
+   * `Date.parse` 解析失败返回 NaN,而 `NaN < x` 恒假 —— 所以去掉这一行,下面那句
+   * 在坏时间戳上给出的结果**逐字相同**(变异测试实测:剪掉它,两个测试文件全绿)。
+   * 留着是因为它把「算不出来 → 什么都不说」这条意图写在了脸上:
+   * 下一个人如果把返回值改成 `upd <= at` 或者换一种比较,NaN 那条路就不再自动安全了。
+   */
+  if (!Number.isFinite(at) || !Number.isFinite(upd)) return false
+  return upd < at
+}
+
 export function outputMissing(n: TaskNode): boolean {
   if (!n.execStatus.includes(NO_CONTRIBUTION_NOTE) && !n.blockedReason.includes(NO_CONTRIBUTION_NOTE)) return false
   /**
@@ -780,6 +810,30 @@ export function backtrackLines(
     for (const t of lvl2) {
       const kids = t.suspects.length > 0 ? t.suspects : [t.node.id]
       out.push(`  · ${t.node.title} 下的 ${kids.length} 个子任务:重新分析并拆分(会先删掉它们各自的子任务)`)
+      /**
+       * **「凭什么是第 2 级」要印出来。**
+       *
+       * 用户真的问过这一句:屏幕上只有「N 个任务要完全重做」,而他没有任何办法知道这个级别
+       * 是怎么来的 —— 它来自 `node.backtrack.rounds >= 1`,也就是**此前按过一次 `b`**。
+       * 而第 2 级会删整片子树、重新拆分,是这套东西里最贵也最不可逆的一步:
+       * 要用户按下它,判据必须摆在他眼前,而不是藏在一句「此前已经重新执行过一轮」里。
+       *
+       * `staleRound` 那一条更要紧,它是实测出来的:跑机 .30 上 217 个节点带着
+       * `rounds: 1`(全是同一个时间戳,一次按下打的一批),而其中 **183 个的
+       * `updatedAt` 比那个标记还早** —— 那一轮从来没有真的重跑过它们,阶梯是被**空推**
+       * 上去的,于是这一次按 `b` 会把它们直接推到「完全重做」。
+       * (病根是那次跑的二进制还没有 `markBacktracked` 的 `reran` 闸;闸现在有了,
+       *  但盘上的陈旧标记不会自己消失,而屏幕此前对此一个字都没有。)
+       */
+      const at = t.node.backtrack?.at
+      if (at !== undefined && at.length > 0) {
+        out.push(`    第 2 级的依据:此前回溯过一次(${at});再按一次就是阶梯顶端。`)
+        if (staleRound(t.node)) {
+          out.push('    ⚠ 但这个任务在那次回溯之后**再没有被写过一次**('
+            + `updatedAt ${t.node.updatedAt})—— 那一轮很可能没有真的重跑它,`
+            + '这一级是被空推上去的。想让它只重做执行阶段,先清掉它的 backtrack 记录。')
+        }
+      }
       /**
        * **「加新任务」到底是什么,必须在**按下之前**说清。**
        *
