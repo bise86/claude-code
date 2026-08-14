@@ -13,6 +13,7 @@ import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner } from './worktreePool.js'
 import { scanStranded, STRANDED_KINDS, STRANDED_KIND_LIST, type StrandedDeps } from './stranded.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
+import { pinSnapshot } from './snapshot.js'
 
 const git: GitRunner = (args, cwd) =>
   new Promise(resolve => {
@@ -482,5 +483,65 @@ describe('悬空提交', () => {
 
     const r = await scanStranded(depsOf(p), [node('root', { status: 'ACCEPTED' })])
     expect(r.items.some(i => i.kind === 'dangling' && i.branch === sha)).toBe(false)
+  })
+
+  /**
+   * **「不在任何分支上」的判据是「任何 ref 都够不着」,不是「我随手挑的两个 ref 够不着」。**
+   *
+   * 上一版给了 `fsck` 显式 head(`HEAD` + 集成分支),于是别的 ref 不再算根 ——
+   * 数据安全席实测:一条**活着的抢救分支的 tip** 被列成悬空。同一份产出在屏幕上出现两次,
+   * 而其中一次说的是「gc 之后就真没了」,那是假的。
+   */
+  it('活着的抢救分支不许被当成悬空提交', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/alive', { status: 'ACCEPTED' })
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'v1.ts'), 'first\n')
+    const d = await p.discard(n)
+    const sha = (await git(['rev-parse', d.salvaged!], gitRoot)).stdout.trim()
+    // 这一次**不删** ref —— 它活着,而且 salvage 那一格已经在列它了。
+    const r = await scanStranded(depsOf(p), [node('root', { status: 'ACCEPTED' })])
+    expect(r.items.some(i => i.kind === 'dangling' && i.branch === sha)).toBe(false)
+  })
+})
+
+/**
+ * **用户自己的东西,和我们替他钉的快照。**
+ *
+ * 这两格此前不在这份「不许漏项」的穷举表里,而 `stashBackup` 装的是四类里唯一
+ * **不属于这一趟产出**的东西:他自己没提交的改动。
+ */
+describe('refs/et 下那两格', () => {
+  it('我们钉的快照要被列出来,而且不许被当成悬空提交', async () => {
+    const p = pool(); await p.init()
+    // **改一个已跟踪的文件** —— `stash create` 拿不到未跟踪的那些(实测 -u 对它静默无效)。
+    await writeFile(join(p.integrationPath, 'base.txt'), 'base\n席位在这里跑过构建\n')
+    const snap = await pinSnapshot({ git, gitRoot, runId: '001' }, p.integrationPath)
+    expect(snap.ref).toBeDefined()
+
+    const r = await scanStranded(depsOf(p), [node('root', { status: 'ACCEPTED' })])
+    const it0 = r.items.find(i => i.kind === 'rescued')
+    expect(it0?.branch).toBe(snap.ref!)
+    expect(it0?.why).toContain('git stash apply')
+    // 它是一条 ref 的 tip,而 fsck 拿所有 ref 当根 —— 不该同时出现在悬空那一格里。
+    expect(r.items.some(i => i.kind === 'dangling')).toBe(false)
+  })
+
+  /**
+   * **按 runId 切这张表,「穷举」这个词就是假的。**
+   *
+   * 每一处 ref 扫描都拼了 runId,`sweepStashBackups` 也只管本 run —— 于是**上一趟**崩掉的
+   * run 留下的东西对每一个扫描器永久隐形,而「上一趟留下的」正是用户已经忘掉的那一份。
+   */
+  it('别的 run 留下的 stash 备份照样列,并且点明不是这一趟的', async () => {
+    const p = pool(); await p.init()
+    await writeFile(join(gitRoot, 'base.txt'), 'base\n他自己改了一天的东西\n')
+    const sha = (await git(['stash', 'create', 'his work'], gitRoot)).stdout.trim()
+    await git(['update-ref', 'refs/et/stash-backup/999/abcdef', sha], gitRoot)
+
+    const r = await scanStranded(depsOf(p), [node('root', { status: 'ACCEPTED' })])
+    const it0 = r.items.find(i => i.kind === 'stashBackup')
+    expect(it0?.branch).toBe('refs/et/stash-backup/999/abcdef')
+    expect(it0?.why).toContain('另一趟')
   })
 })

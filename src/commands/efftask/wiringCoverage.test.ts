@@ -1040,6 +1040,31 @@ describe('手动合并子树的接线不能被静默剪断', () => {
     expect(element('ConfirmMergeSubtree')).toContain('onInterrupt={() => mergeAbort.current?.abort()}')
   })
 
+  /**
+   * **「捞」那一整条链的六条缝,一条都不许断。**
+   *
+   * 它们全是**可选字段**,而 `...(cond ? {x} : {})` 这种条件展开 TypeScript **不做多余属性
+   * 检查** —— 删掉任何一行都不会有类型错误,也不会有任何一条既有测试变红,只会让对应的
+   * 那一格静默退回「只列不捞 / 这一格没查」。这个仓库的招牌缺陷,而上一轮有三个注入点
+   * 正是评审当场点出来才补上的:补上了,但没上锁。
+   *
+   * 每一行后面写清楚**剪掉它会静默失去什么**,而不是只写「必须有」。
+   */
+  it('捞回那条链的六条缝都真的注入了', () => {
+    const deps = SRC.slice(SRC.indexOf('const mergeDeps ='), SRC.indexOf('const applyRedo ='))
+    // 缺任意一样 → `scanRescue` 直接返回 `{}`,四类没有工作区目录的产出一格都不扫。
+    expect(deps).toContain('...(runId ? { runId } : {})')
+    expect(deps).toContain('worktreeRoot: `${pool.gitRoot}/.efftask-worktrees`')
+    // 孤儿目录那一格靠它探;缺了它那一格恒为空,而空白和「没有孤儿目录」长得一样。
+    expect(deps).toContain('exists: p => access(p).then(() => true, () => false)')
+    // 缺了它,孤儿目录里有什么根本不比对。
+    expect(deps).toContain('listFiles: listFilesUnder')
+    // 缺了它,四类里此前唯一 0% 捞回的那一格**静默**退回「只列不捞」。
+    expect(deps).toContain('copyInto: async (from, to) =>')
+    // 缺了它,每一条孤立 ref 都落「拿不准」——第 1 级(整条合并)整个消失。
+    expect(deps).toContain('triage: makeRescueTriage({ runAgent: props.runAgent, node: root, signal })')
+  })
+
   it('确认之后真的会去扫、去合,并把结果推回界面', () => {
     expect(element('ConfirmMergeSubtree')).toContain('scanSubtreeMerge(deps, nodes, mergeTarget.id)')
     // `stash` 也要流进去 —— 用户在这一屏按的那一下 s,是它唯一的来源。

@@ -8,6 +8,7 @@ import { syncTrunk } from './integrationMerge.js'
 import { backtrackCanClaim, RESCUE_STRANDED_NOTE, strandedRefsOf } from './backtrack.js'
 import type { CopyInto } from './backfill.js'
 import { scanStranded, STRANDED_KINDS } from './stranded.js'
+import { pinSnapshot, snapshotLines } from './snapshot.js'
 import { planRescue, rescueLines, runRescue, type RescueOutcome, type RescuePlan, type RescueTriage } from './rescue.js'
 import type { MergeResult } from './worktreePool.js'
 import type { TaskNode } from './types.js'
@@ -556,6 +557,14 @@ export const MERGE_KEY_REPORTS: readonly string[] = [
    * 自动合就是把「拿不准一律不合」翻面。给 sha、给命令,由用户自己判。
    */
   'dangling',
+  /**
+   * **用户自己的东西,和我们替他钉的快照 —— 只念,永远只念。**
+   *
+   * `stashBackup` 装的是他没提交的改动(一次 pop 撞冲突留下的);`rescued` 是 `m` 动手前
+   * 给集成工作区拍的快照。两格都不许自动动:前者根本不属于这一趟的产出,后者是**现场**,
+   * 用户看过之后才知道要不要取回。
+   */
+  'stashBackup', 'rescued',
   // 合并解决不了,要按 b 回溯:产出丢了 / 集成验收没通过。
   'missing', 'integrateFail',
   // 这两格的 action 是 'report',但 `refOnly` **也会真的去合它们**(它们有 ref 或目录)——
@@ -632,6 +641,29 @@ export async function runSubtreeMerge(
   const byId = new Map(nodes.map(n => [n.id, n]))
   const out: SubtreeMergeOutcome = { merged: [], failed: [], problems: [], aborted: false }
   const note = (s: string): void => deps.onProgress?.(s)
+
+  /**
+   * **动手之前,先把集成工作区里的未提交内容钉成一条耐久 ref。**
+   *
+   * 位置就是这里,不能往后挪:抹掉它的是下面 `pool.commitAndMerge` 里合并失败那条路上的
+   * `reset --hard` + `clean -fd`,而 `recordCleaned` 只留下**名字**。等循环跑完再钉,
+   * 钉到的是一棵已经被收拾干净的树。
+   *
+   * 这一格(`integrationDirty`)在分类表里的 `action` 是 `report` —— 那说的是「该不该动
+   * 是你的决定」,不是「它可以被无声抹掉」。钉一条 ref 不动那棵树的任何一个字节,
+   * 而它把「下一次合并会先把它清掉」从一句警告变成一件可撤销的事。
+   *
+   * 中断之后不再开始:这是一次写操作,Esc 之后不该发生。
+   */
+  if (!deps.signal?.aborted && deps.runId !== undefined) {
+    const snap = await pinSnapshot(
+      { git: deps.git, gitRoot: deps.pool.gitRoot, runId: deps.runId }, deps.pool.integrationPath,
+    )
+    out.problems.push(...snapshotLines('集成工作区', snap))
+  } else if (deps.runId === undefined) {
+    // 缺席**要说**:静默退回正是这个仓库的招牌缺陷。
+    out.problems.push('⚠ 这一趟不知道 run 的编号,集成工作区里的未提交内容没有被钉成 ref —— 下一次合并失败会把它清掉')
+  }
 
   for (const item of plan.items) {
     if (deps.signal?.aborted) { out.aborted = true; break }

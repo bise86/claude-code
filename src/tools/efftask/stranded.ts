@@ -1,4 +1,5 @@
 import { worktreeBranch, worktreeSlug } from './worktreeId.js'
+import { RESCUED_REF_PREFIX } from './snapshot.js'
 // 「产出丢了」和「集成验收没通过」这两条判据和回溯那一侧**共用一份**。
 // 验收实测过分家的后果:本轮把零贡献节点从 ACCEPTED 改成 BLOCKED 之后,这边那份
 // 硬编码副本(只认 ACCEPTED + 字面量)一件都扫不到,而同一个节点在回溯那边判 true。
@@ -112,6 +113,29 @@ export const STRANDED_KINDS = {
      * `fsck --unreachable`。命名唯一化之后新的 run 不再产生,但已经发生的从来没人捞过。
      */
     how: '老 run 的 branch -f 覆盖过一次抢救 ref,或者集成分支被重置过 —— gc 之后就真没了',
+  },
+  stashBackup: {
+    label: '你自己没提交的改动,还锁在一次 stash 备份里',
+    action: 'report',
+    /**
+     * `withStash` 的耐久备份(`refs/et/stash-backup/*`)只在**一种**情况下留下来:
+     * pop 撞了冲突。那一刻用户改了一天的东西同时在 stash 条目和这条 ref 上,而屏幕
+     * 让他二选一去取 —— 取完没取完,只有他自己知道。
+     *
+     * 这一格此前**不在这份「不许漏项」的穷举表里**,而它装的是四类里唯一**不属于这一趟
+     * 产出**的东西:用户自己的工作。所以 `action` 只能是 `report`,一个字节都不许自动动。
+     */
+    how: '合回你分支之前先把你的改动收起来,放回去时撞了冲突 —— 备份留着,等你处置',
+  },
+  rescued: {
+    label: '我们替你钉住的现场快照(未提交内容)',
+    action: 'report',
+    /**
+     * `pinSnapshot` 在每一次可能抹掉东西的动作**之前**钉的(见 `snapshot.ts`)。
+     * 它存在的全部意义就是被人看见:钉了而没人列,等于把东西存进一个谁都不知道的地方 ——
+     * 这个仓库的招牌缺陷换个方向复发。
+     */
+    how: 'm 键动手前给集成工作区拍的快照 —— 那棵树随后可能被 reset --hard / clean -fd 收拾过',
   },
   cancelled: {
     label: '被你按 x 取消的任务',
@@ -507,15 +531,34 @@ export async function scanStranded(
    * `--no-reflogs` 是刻意的:带 reflog 的话,**每一次**正常的 `reset --hard` 都会冒出来,
    * 清单会被自己的日常操作淹掉,而「一份没人看的清单」和「没有清单」是同一件事。
    */
+  /**
+   * **不给显式 head —— 让 git 拿「所有 ref」当根。**
+   *
+   * 上一版写的是 `fsck --unreachable … HEAD <集成分支>`,而给了显式对象之后,**别的 ref
+   * 不再算根**。数据安全席实测出的三个后果,方向各不相同:
+   *
+   *  · 一条**活着的抢救分支的 tip** 被列成「不在任何分支上」—— 它同时是 `salvage`,
+   *    于是同一份产出在屏幕上出现两次,而其中一次说的是「gc 之后就真没了」(假的);
+   *  · 我们自己刚钉的 `refs/et/rescued/*` 也会被列进来;
+   *  · 去掉显式 head 之后,同一个仓库上 fsck **只报真正丢的那几个**,一个假阳性都没有。
+   *
+   * 「不在任何分支上」这句话的判据本来就该是「**任何 ref 都够不着**」,而不是
+   * 「这两个我随手挑的 ref 够不着」。
+   */
   const dangling = await deps.git(
-    ['fsck', '--unreachable', '--no-reflogs', '--no-progress', 'HEAD', deps.integrationBranch],
+    ['fsck', '--unreachable', '--no-reflogs', '--no-progress'],
     deps.gitRoot,
   )
   if (dangling.code !== 0) {
     problems.push(`列不出悬空提交(${dangling.stderr.trim().split('\n')[0] ?? `退出码 ${dangling.code}`})—— 这一格这次是空白,不代表没有`)
   } else {
+    /**
+     * `{7,64}` 而不是 `{7,40}`:SHA-256 仓库的对象名是 **64 位**,而 40 位的正则会把它
+     * 截成前 40 位。截出来的缩写照样能喂给 `git log`,所以**不会报错**,只会让后面每一处
+     * 按 sha 比对的判据静默失效 —— 正是「一条判据看起来无懈可击,而它一次都没响」那个形状。
+     */
     const shas = dangling.stdout.split('\n')
-      .map(l => /^unreachable commit ([0-9a-f]{7,40})/.exec(l.trim())?.[1])
+      .map(l => /^unreachable commit ([0-9a-f]{7,64})/.exec(l.trim())?.[1])
       .filter((x): x is string => x !== undefined)
     /**
      * 只留**看起来是这一趟产出**的:提交信息以 `efftask:` 开头。
@@ -540,6 +583,38 @@ export async function scanStranded(
     }
     if (shas.length > MAX_DANGLING) {
       problems.push(`悬空提交超过 ${MAX_DANGLING} 个(共 ${shas.length} 个),只列了前 ${MAX_DANGLING} 个;全部:git fsck --unreachable --no-reflogs`)
+    }
+  }
+
+  /**
+   * ── `refs/et/*`:用户自己的 stash 备份,以及我们替他钉的快照 ────────
+   *
+   * **这两格刻意不按 runId 过滤。**
+   *
+   * 上面每一处 ref 扫描(抢救分支、工作树分支)都拼了 `deps.runId`,`sweepStashBackups`
+   * 也只管本 run。规范席点名:于是**上一趟**崩掉的 run 留下的东西 —— 包括用户自己那份
+   * 没提交的改动 —— 对每一个扫描器永久隐形,而「上一趟留下的」正是他已经忘掉的那一份。
+   * 一份自称「不许漏项」的穷举表按 run 切,「穷举」这个词就是假的。
+   *
+   * 别的 run 的**清理**仍然不归这里管(那要它自己判),这里只负责**列出来**。
+   */
+  for (const { prefix, kind, hint } of [
+    { prefix: 'refs/et/stash-backup', kind: 'stashBackup' as const, hint: '你自己没提交的改动' },
+    { prefix: RESCUED_REF_PREFIX, kind: 'rescued' as const, hint: '我们替你钉住的现场快照' },
+  ]) {
+    const refs = await deps.git(['for-each-ref', '--format=%(refname)', prefix], deps.gitRoot)
+    if (refs.code !== 0) {
+      problems.push(`列不出 ${prefix}(${refs.stderr.trim() || `退出码 ${refs.code}`})—— 这一格这次是空白,不代表没有`)
+      continue
+    }
+    for (const ref of refs.stdout.split('\n').map(s => s.trim()).filter(Boolean)) {
+      // `refs/et/<类>/<runId>/<...>` —— 认不出 runId 的按「别的 run」处理(保守方向)。
+      const mine = ref.startsWith(`${prefix}/${deps.runId}/`) || ref === `${prefix}/${deps.runId}`
+      items.push({
+        kind, branch: ref,
+        why: `${hint}${mine ? '' : '(**另一趟**运行留下的)'} —— 先看:git show --stat ${ref};`
+          + `确认要取回时在你自己的检出里(工作区干净的前提下)git stash apply ${ref}`,
+      })
     }
   }
 
