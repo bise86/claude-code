@@ -154,10 +154,16 @@ export function doneSummaryRows(a: {
   redoProblems: number
   /** 「起 … 止 … 共 …」那一行(runSpanLine)。空串时不画,也就不占行。 */
   hasRunSpan?: boolean
+  /**
+   * 「这一屏没检查那几类,按 m 扫一遍」那一行。**按一行计** —— 它带
+   * `wrap="truncate-end"`,所以窄终端上也不会回流成两行(邻居那条为同一件事立过这条规矩)。
+   */
+  hasScanHint?: boolean
 }): number {
   return (
     4 +
     (a.hasRunSpan === true ? 1 : 0) +
+    (a.hasScanHint === true ? 1 : 0) +
     (a.viewOnly ? 1 : 0) +
     // 仅查看时不显示 reason —— 那会把用户自己按的一下退出报成一次失败。
     (!a.viewOnly && a.hasReason ? 1 : 0) +
@@ -3308,6 +3314,11 @@ export function DoneView(props: {
    * 关口处置完落到这一屏时 `nodes` 还是空的 —— 那时它是死键。
    */
   const canPressM = props.onMergeWorktrees !== undefined && props.nodes.length > 0
+  /**
+   * 一次算好,两处用(占几行 / 画不画)。两处各算一次的话它们迟早不一致,
+   * 而不一致的后果是详情页最底下那条页签条被顶出屏幕 —— 邻居那条注释记的就是这件事。
+   */
+  const showScanHint = !props.viewOnly && ok && !hasUnmerged && canPressM
   const handoff = props.handoff ? handoffLines(props.handoff, props.runId, props.handoffState) : []
   // 一次算好,两处用(占几行 / 画什么)—— 两处各算一次的话,它们迟早会不一致,
   // 而不一致的后果是详情页最底下那条页签条被顶出屏幕。
@@ -3315,6 +3326,7 @@ export function DoneView(props: {
   const summaryRows = doneSummaryRows({
     viewOnly: props.viewOnly === true,
     hasRunSpan: runSpan.length > 0,
+    hasScanHint: showScanHint,
     hasReason: Boolean(props.outcome?.reason),
     hasHandoffResult: Boolean(props.handoffResult),
     followUps: props.handoffResult?.followUps?.length ?? 0,
@@ -3383,6 +3395,27 @@ export function DoneView(props: {
             第一个要确认的就是屏幕上这棵树是不是刚才那一次。节点和阶段各自的时刻在
             详情页里(时间线那一段)。 */}
         {runSpan ? <Text dimColor>{runSpan}</Text> : null}
+        {/**
+          * **「✓ 完成」是一句我们没有资格说的话 —— 除非有人真的查过。**
+          *
+          * `strandedCount` 只数 `HandoffSummary` 里的 `kept + salvage`,而上面那段注释自己
+          * 写着:`orphanDir` / `branchOnly` 根本不在里面,要按下 `m` 之后 `scanStranded` 才
+          * 看得见,「它为假只等于**我们没看见**」。而下一行照样印了绿色的「✓ 高效任务完成」。
+          *
+          * 这一句是整条捞回链的**入口**:`scanStranded` 全仓库只有一个消费者(`m`),
+          * `m` 只能从任务树进。用户在这一屏按 `q`,那之后**再也没有任何一条路径提起它们**。
+          * 捞得再全,没人按也白搭 —— 所以在他最可能按 q 的这一刻,把那个键说出来。
+          *
+          * 只在**真按得到**时说(树非空且接了回调),而且只在「看起来什么都不缺」时说 ——
+          * 上面那一支已经在喊「按 m 捞回」了,两句一起出现是噪音。
+          */}
+        {showScanHint
+          ? (
+            <Text dimColor wrap="truncate-end">
+              未检查抢救分支 / 只剩分支的残留 / 孤儿目录(它们不在收口摘要里)—— 按 m 扫一遍
+            </Text>
+          )
+          : null}
         {props.viewOnly
           ? <Text dimColor>树和这一屏的按键都照常可用;想让它继续跑: /et --resume {props.runId}</Text>
           : null}

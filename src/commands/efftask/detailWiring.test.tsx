@@ -110,6 +110,11 @@ describe('完成视图那个总结框占几行 —— 生产者也要被钉住',
     expect(doneSummaryRows({ ...base, followUps: 3 })).toBe(7)
     expect(doneSummaryRows({ ...base, handoffLines: 2 })).toBe(6)
     expect(doneSummaryRows({ ...base, redoProblems: 4 })).toBe(8)
+    /**
+     * 「那几类没查过,按 m 扫一遍」那一行也占一行。**不算进去的后果是把树顶出屏幕**——
+     * 而这一行恰恰只在「看起来什么都不缺」时出现,也就是用户最不会怀疑版面的那一次。
+     */
+    expect(doneSummaryRows({ ...base, hasScanHint: true })).toBe(5)
     // 全都有的时候要累加,不是取最大。
     expect(doneSummaryRows({ viewOnly: false, hasReason: true, hasHandoffResult: true, followUps: 3, handoffLines: 2, redoProblems: 4 })).toBe(15) // 4+1+1+3+2+4
   })

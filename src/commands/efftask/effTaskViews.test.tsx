@@ -287,6 +287,54 @@ describe('done 视图上的收口文案', () => {
     expect(f).not.toContain('还没到你的分支')
   })
 
+  /**
+   * **「✓ 完成」是一句我们没有资格说的话 —— 除非有人真的查过。**
+   *
+   * `strandedCount` 只数 `HandoffSummary` 里的 `kept + salvage`,而 `orphanDir` /
+   * `branchOnly` / `dangling` / `stashBackup` **根本不在里面**(那一段注释自己写着
+   * 「它为假只等于我们没看见」)。而这一屏照样印绿色的「✓ 高效任务完成」。
+   *
+   * 这一句是整条捞回链的**入口**:`scanStranded` 全仓库只有一个消费者(`m` 键),
+   * 而 `m` 只能从任务树进。用户在这一屏按 `q`,那之后再也没有任何一条路径提起它们 ——
+   * 捞得再全,没人按也白搭。所以在他最可能按 q 的这一刻,把那个键说出来。
+   */
+  /** 宽一点的帧:这一行带 `truncate-end`,40 列下会被截掉一半,那测的就不是它说了什么。 */
+  const wideFrame = async (extra: Record<string, unknown>): Promise<string> => {
+    const t = fakeTty(120)
+    const app = await render(
+      React.createElement(DoneView as never, {
+        nodes: [node({ id: 'root', title: '根任务' })] as never,
+        runId: '007', outcome: { status: 'completed' }, handoff: summary, onExit: () => {}, ...extra,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const fr = t.lastFrame()
+    app.unmount()
+    return fr
+  }
+
+  it('看起来什么都不缺时,也要说清「那几类没查过,按 m 扫一遍」', async () => {
+    const f = await wideFrame({
+      handoffState: 'merged', handoffResult: { ok: true, message: '已合并 3 个提交' },
+      onMergeWorktrees: () => {},
+    })
+    expect(f).toContain('按 m 扫一遍')
+    expect(f).toContain('孤儿目录')
+  })
+
+  /**
+   * 反面:`m` 按不到的时候不许说 —— 一条按不了的指令比没有更糟。
+   * (共享工作树没有 `onMergeWorktrees`;恢复路径上那一屏 `nodes` 是空的。)
+   */
+  it('m 按不到时不提这一句', async () => {
+    const f = await wideFrame({
+      handoffState: 'merged', handoffResult: { ok: true, message: '已合并 3 个提交' },
+      // **不传** onMergeWorktrees —— 共享工作树运行时就是这个形状。
+    })
+    expect(f).not.toContain('按 m 扫一遍')
+  })
+
   it('被阻断的 run 不叠第二句 —— 那一行本来就没在声称成功', async () => {
     const t = fakeTty(40)
     const app = await render(
