@@ -1356,6 +1356,43 @@ describe('合并撞上被弄脏的集成工作区:洗掉重试,而不是把整�
     // 节点的成果没有被清理顺手吞掉
     const merged = await git(['show', 'efftask/001/integration:devenv.lock'], gitRoot)
     expect(merged.stdout.trim()).toBe('v2-node')
+
+    /**
+     * **`cleaned` 只是一份讣告 —— 名字救不回任何东西。**
+     *
+     * 这条路是**自动跑**的主路径,而它此前对那棵共享的树零保护:席位在里面跑过构建、
+     * 手工解过一半的冲突,`reset --hard` + `clean -fd` 一过就一个字节都不剩,
+     * 屏幕上只有一串文件名。判据落在「**取不取得回来**」上,不落在返回值上。
+     */
+    expect(res.pinned).toBeDefined()
+    /**
+     * **判据落在未跟踪那一格上** —— 这棵树上最常见的一份丢失就是它(席位跑构建留下的
+     * 产物),而 `git stash create` 拿不到未跟踪文件。只验已跟踪的那半等于只证明了容易的一半。
+     *
+     * 取内容用 `^3`:未跟踪的文件住在 stash 的**第三个父提交**里,主树上没有它。
+     * (用户那条 `git stash apply` 在这里会报 “already exists” —— 因为合并之后同名文件
+     * 已经回来了。那是 git 的正常行为,而这条探针要问的是「内容还在不在」。)
+     */
+    const back = await git(['show', `${res.pinned}^3:devenv.lock`], gitRoot)
+    expect(back.code).toBe(0)
+    expect(back.stdout.trim()).toBe('v1-dirtied-by-a-reviewer')
+    // 而**用户自己的** stash 列表不许因此多出一条 —— refs/stash 是整个仓库共享的。
+    expect((await git(['stash', 'list'], gitRoot)).stdout.trim()).toBe('')
+  })
+
+  /** 树本来就干净时不许写 ref —— 正常路径上这个原语必须是零成本、零噪音的。 */
+  it('集成工作区干净时,不留下任何快照 ref', async () => {
+    const p = pool()
+    expect(await p.init()).toEqual({ ok: true })
+    const n = node('clean-one')
+    const lease = await p.acquire(n)
+    if ('error' in lease) throw new Error(lease.error)
+    n.worktree = { branch: lease.branch, path: lease.path }
+    await writeFile(join(lease.path, 'ok.txt'), 'fine\n')
+    const res = await p.commitAndMerge(n)
+    expect(res.ok).toBe(true)
+    const refs = await git(['for-each-ref', '--format=%(refname)', 'refs/et/rescued'], gitRoot)
+    expect(refs.stdout.trim()).toBe('')
   })
 
   it('未跟踪文件挡路时同样能过 —— clean -fd 那一半也要有测试', async () => {

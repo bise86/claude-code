@@ -205,6 +205,34 @@ describe('扫描', () => {
    * 验收席逐字抄回来的对撞:同一屏上「产出都已经在你的分支上了」和「产出不在任何地方,
    * 只能重新执行」;假的那句排在前面、没有 ⚠(所以不上色)、矮终端下最后才被裁。
    */
+  /**
+   * **别的 run 留下的:看得见,但不许自动合。**
+   *
+   * 扫描不再按 runId 切(上一趟崩掉的 run 留下的产出此前对每个扫描器永久隐形),而
+   * 「看得见」不等于「该自动合」:那是**另一棵任务树**的产出,和这一趟的目标没有关系,
+   * 分诊手上也没有它的来历(`fate` 只能是 unknown)。判据反了的后果是把一份不相干的
+   * 旧产出合进这一趟的集成分支 —— 比不捞它坏得多。
+   */
+  it('别的 run 的抢救分支只上屏,不进自动合那一桶', async () => {
+    const pool = newPool()
+    await pool.init()
+    // 上一趟(run 000)留下的抢救 ref,内容不在集成分支里。
+    await writeFile(join(gitRoot, 'old.txt'), '上一趟的产出\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'efftask: 固化工作区残留 (root/old)'], gitRoot)
+    const sha = (await git(['rev-parse', 'HEAD'], gitRoot)).stdout.trim()
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+    await git(['update-ref', 'refs/heads/efftask/000/salvage/deadbeef', sha], gitRoot)
+
+    const a = mk('root/00-a', { title: '甲' })
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
+    const refs = [...(plan.rescue?.merge ?? []), ...(plan.rescue?.backfill ?? []), ...(plan.rescue?.hold ?? [])]
+      .map(c => c.evidence.ref)
+    expect(refs).not.toContain('efftask/000/salvage/deadbeef')
+    // 而它必须**上屏** —— 挡在自动合之外不等于当它不存在。
+    expect((plan.rescue?.problems ?? []).join('\n')).toContain('efftask/000/salvage/deadbeef')
+  })
+
   it('只有 problems 时,不许说「产出都已经在你的分支上了」', () => {
     const plan = {
       targetId: 'root', items: [], skipped: [], alreadyMerged: 0, absent: 0, ignoredOnly: 0,

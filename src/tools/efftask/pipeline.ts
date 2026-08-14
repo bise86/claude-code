@@ -4072,6 +4072,19 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
     )
   }
   /**
+   * **被抹掉的东西钉在哪儿 —— 这一句和上面那句是一对。**
+   *
+   * `cleaned` 只是一份讣告:它告诉用户丢了哪几个文件,而救不回任何一个。自动跑这条路上
+   * 没有人在旁边看屏幕,所以这条 ref 必须落在 **node.md** 上 —— 它是事后唯一还查得到的地方。
+   * 判据独立于 `cleaned`:树干净时压根不写 ref,那时这一句本来就不该出现。
+   */
+  if (res.pinned !== undefined) {
+    node.execStatus = `${node.execStatus}\n` + capText(
+      `(被清理的内容已经钉在 ${res.pinned} 上,没有丢:git stash apply ${res.pinned})`,
+      MAX_SUMMARY_CHARS,
+    )
+  }
+  /**
    * 「这个子任务的产出**没有**送进你当前的目录」——只在没送成时写。
    *
    * 送成了不写:那是正常路径,每个节点都追一句只会把 execStatus 撑成流水账(而它会被

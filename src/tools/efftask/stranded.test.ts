@@ -528,6 +528,29 @@ describe('refs/et 下那两格', () => {
   })
 
   /**
+   * **上一趟崩掉的 run 留下的**产出**也要看得见 —— 但只列不合。**
+   *
+   * 每一处 ref 扫描此前都拼了 runId,于是别的 run 的抢救分支对每个扫描器永久隐形。
+   * 而「看得见」不等于「该自动合」:那是另一棵任务树的产出,分诊手上也没有它的来历。
+   */
+  it('别的 run 的抢救分支要列出来,而且标成只列不合', async () => {
+    const p = pool(); await p.init()
+    // 造一条上一趟(run 000)留下的抢救 ref,内容不在集成分支里。
+    await writeFile(join(gitRoot, 'old.txt'), '上一趟的产出\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'efftask: 固化工作区残留 (root/old)'], gitRoot)
+    const sha = (await git(['rev-parse', 'HEAD'], gitRoot)).stdout.trim()
+    await git(['reset', '--hard', 'HEAD~1'], gitRoot)
+    await git(['update-ref', 'refs/heads/efftask/000/salvage/deadbeef', sha], gitRoot)
+
+    const r = await scanStranded(depsOf(p), [node('root', { status: 'ACCEPTED' })])
+    const it0 = r.items.find(i => i.branch === 'efftask/000/salvage/deadbeef')
+    expect(it0).toBeDefined()
+    expect(it0?.otherRun).toBe(true)
+    expect(it0?.why).toContain('另一趟')
+  })
+
+  /**
    * **按 runId 切这张表,「穷举」这个词就是假的。**
    *
    * 每一处 ref 扫描都拼了 runId,`sweepStashBackups` 也只管本 run —— 于是**上一趟**崩掉的

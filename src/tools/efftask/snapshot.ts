@@ -158,6 +158,88 @@ const first = (r: { code: number; stdout: string; stderr: string }): string =>
   (r.stderr.trim() || r.stdout.trim()).split('\n')[0]?.trim() || `退出码 ${r.code}`
 
 /**
+ * **同上,但用在「这棵树下一行就要被抹掉」的地方 —— 于是可以连未跟踪文件一起救。**
+ *
+ * `pinSnapshot` 的硬伤是 `git stash create` **拿不到未跟踪文件**(`-u` 对它静默无效),
+ * 而 `clean -fd` 恰恰专删未跟踪的那些。跑机上最典型的一份丢失就长这样:席位在集成工作区
+ * 里跑了构建、留下一堆未跟踪产物,一次合并失败把它们全清了。
+ *
+ * 在**即将被 `reset --hard` + `clean -fd` 抹掉**的树上,这个取舍是白给的:`git stash push -u`
+ * 会动工作区(它把东西收走),而下一行本来就要把同样的东西**删掉**。收走严格优于删掉。
+ *
+ * 三步,每一步都有它自己的理由:
+ *
+ *  1. `stash push -u` —— 一次拿走已跟踪的改动**和**未跟踪的文件;
+ *  2. 把那个 stash 提交钉成 `refs/et/rescued/*` —— stash 列表会被 pop/drop/gc 影响,
+ *     而 ref 不会。**耐久**这两个字靠的是这一步;
+ *  3. **把 stash 条目 drop 掉** —— `refs/stash` 是**整个仓库共享**的,用户自己的
+ *     `git stash list` 不该因为我们清理了一次集成工作区而多出一条。按 **sha** 定位再删,
+ *     不按下标(中途有别的东西 stash 的话下标会漂,`stashGuard` 为这条付过账)。
+ *
+ * 撞冲突态时 `stash push` 本身会失败(实测 `Cannot save the current index state`),
+ * 那时退回 `pinSnapshot`(至少把已跟踪的那半钉住),并如实说未跟踪的没保住。
+ */
+export async function pinAndClear(deps: SnapshotDeps, cwd: string): Promise<SnapshotResult> {
+  const st = await deps.git(['-c', 'core.quotepath=false', 'status', '--porcelain', '-uall'], cwd)
+  if (st.code !== 0) return { ok: false, why: `看不出 ${cwd} 里有没有未提交的内容(${first(st)})` }
+  const lines = st.stdout.split('\n').map(l => l.trimEnd()).filter(l => l.trim().length > 0)
+  if (lines.length === 0) return { ok: true }
+
+  /**
+   * **判据是前后比较,不是「push 回了 0」。**
+   *
+   * `git stash push` 无事可做时退出码也是 0,而 `refs/stash` 那时指向的是**用户自己**
+   * 那条 stash —— 照着它去钉、去 drop,删掉的就是他的东西。`stashGuard` 的文件头为这条
+   * 记过一次真 git 实测。
+   */
+  const before = (await deps.git(['rev-parse', '-q', '--verify', 'refs/stash'], cwd)).stdout.trim()
+  const pushed = await deps.git(['stash', 'push', '-u', '-m', `efftask 抢救快照(${deps.runId})`], cwd)
+  const after = (await deps.git(['rev-parse', '-q', '--verify', 'refs/stash'], cwd)).stdout.trim()
+  if (pushed.code !== 0 || after.length === 0 || after === before) {
+    const fallback = await pinSnapshot(deps, cwd)
+    const untracked = lines.filter(l => l.startsWith('??')).map(l => l.slice(3))
+    return {
+      ...fallback,
+      ...(untracked.length > 0 ? { untracked } : {}),
+      ...(fallback.why === undefined && pushed.code !== 0
+        ? { why: `没能把未跟踪的内容一起收走(${first(pushed)})` } : {}),
+    }
+  }
+
+  const pinnedRef = await pinCommit(deps, after)
+  /**
+   * **钉住之后才 drop。** 顺序反了就是「先把唯一的落脚点删掉,再去钉一个已经不存在的东西」。
+   * 钉不住时**保留** stash 条目 —— 那时它是唯一的副本,清干净屏幕不值这个价。
+   */
+  if (pinnedRef !== undefined) {
+    const top = await deps.git(['stash', 'list', '--format=%H %gd'], cwd)
+    for (const line of top.stdout.split('\n')) {
+      const [sha, gd] = line.trim().split(/\s+/)
+      if (sha === after && gd) { await deps.git(['stash', 'drop', gd], cwd); break }
+    }
+  }
+  return pinnedRef === undefined
+    ? { ok: false, changes: lines.length, why: '内容已经收进 git stash,但没能钉成一条耐久 ref —— 请用 git stash list 取回' }
+    : { ok: true, ref: pinnedRef, changes: lines.length }
+}
+
+/** 把一个 stash 提交钉成 `refs/et/rescued/<runId>/<tree12>`。命名与幂等的理由见文件头。 */
+async function pinCommit(deps: SnapshotDeps, sha: string): Promise<string | undefined> {
+  const tree = await deps.git(['rev-parse', `${sha}^{tree}`], deps.gitRoot)
+  if (tree.code !== 0) return undefined
+  const base = `${RESCUED_REF_PREFIX}/${deps.runId}/${tree.stdout.trim().slice(0, 12)}`
+  let ref = base
+  for (let i = 0; i < 5; i++) {
+    const created = await deps.git(['update-ref', ref, sha, ''], deps.gitRoot)
+    if (created.code === 0) return ref
+    const cur = await deps.git(['rev-parse', '--verify', '-q', ref], deps.gitRoot)
+    if (cur.code === 0 && cur.stdout.trim() === sha) return ref
+    ref = `${base}-${i + 2}`
+  }
+  return undefined
+}
+
+/**
  * 一次快照该怎么上屏。**是数据,不是 JSX。**
  *
  * 三件事必须**分开说**,因为它们要用户做的事完全不同:钉住了 / 没钉住 / 钉不了。

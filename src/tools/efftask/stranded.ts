@@ -144,6 +144,9 @@ export const STRANDED_KINDS = {
   },
 } as const
 
+/** `refs/et/*` 那两格最多各列几条。它们没有自动回收者(每一条都可能是唯一副本),所以会增长。 */
+const MAX_ET_REFS = 8
+
 /** 悬空提交最多列几条 —— 一个 gc 没跑过的老仓库能有几百个,而清单要能读得完。 */
 const MAX_DANGLING = 10
 
@@ -184,6 +187,15 @@ export interface StrandedItem {
    * 「干净」长得一模一样,而它们要用户做的事完全不同。
    */
   unknown?: boolean
+  /**
+   * **这是别的一趟运行留下的。**
+   *
+   * 列出来是必须的(上一趟崩掉的 run 留下的产出对每个扫描器此前永久隐形),而**自动合它
+   * 不行**:那是另一棵任务树的产出,和这一趟的目标没有关系,分诊手上也没有它的来历
+   * (`fate` 只能是 unknown)。所以这一格走「给路径、给命令,不替你按」那一档 ——
+   * `mergeSubtree` 据这个字段把它挡在 `refOnly` 之外。
+   */
+  otherRun?: boolean
 }
 
 export interface StrandedGit {
@@ -383,14 +395,26 @@ export async function scanStranded(
   }
 
   // ── 抢救分支 ────────────────────────────────────────────────────
+  /**
+   * **不按 runId 切。**
+   *
+   * 上一版拼的是 `refs/heads/efftask/<runId>/salvage` —— 于是**上一趟崩掉的 run** 留下的
+   * 节点产出对每一个扫描器永久隐形,而那正是用户已经忘掉、最需要被提醒的那一份。
+   * (`refs/et/*` 那两格上一轮已经解绑了,而真正装着**产出**的这一格没有。)
+   *
+   * 别的 run 的**只列不合**:那是另一棵任务树的产出,分诊手上也没有它的来历。见 `otherRun`。
+   */
   const salv = await deps.git(
-    ['for-each-ref', '--format=%(refname:short)', `refs/heads/efftask/${deps.runId}/salvage`],
+    // 前缀式,**不用通配符**:for-each-ref 的 `*` 不跨 `/`(实测 `efftask/*/salvage*` 一条都不匹配),
+    // 而抢救 ref 是 `efftask/<runId>/salvage/<slug>` —— 中间隔着两层。筛选放到下面用代码做。
+    ['for-each-ref', '--format=%(refname:short)', 'refs/heads/efftask'],
     deps.gitRoot,
   )
   if (salv.code !== 0) {
     problems.push(`列不出抢救分支(${salv.stderr.trim() || `退出码 ${salv.code}`})—— 这一格这次是空白,不代表没有`)
   } else {
     for (const ref of salv.stdout.split('\n').map(s => s.trim()).filter(Boolean)) {
+      if (!ref.includes('/salvage/')) continue
       const state = await containedIn(deps, ref)
       if (state === 'yes') continue
       const ahead = await aheadOf(deps, ref)
@@ -398,6 +422,8 @@ export async function scanStranded(
        * 认回是谁的:ref 的最后一段是 slug(可能带 `-2`/`-3` 后缀,见 `salvageRefFor`)。
        * 认不回来的**不是跳过** —— 它进 `salvageOrphan` 并如实说「对应的任务已不在树上」。
        */
+      /** `refs/heads/efftask/<runId>/salvage/<slug>` —— 第 2 段就是它属于哪一趟。 */
+      const mine = ref.startsWith(`efftask/${deps.runId}/salvage`)
       const tail = ref.split('/').pop() ?? ''
       const slug = tail.replace(/-\d+$/, '')
       let owner = bySlug.get(slug)
@@ -461,7 +487,7 @@ export async function scanStranded(
       const fate: 'superseded' | 'still-open' | 'unknown' = owner === undefined
         ? 'unknown'
         : owner.contributed === true ? 'superseded' : 'still-open'
-      items.push(owner
+      items.push(owner && mine
         ? {
           kind: 'salvage', nodeId: owner.id, title: owner.title, branch: ref, fate,
           ...(ahead === undefined ? {} : { commits: ahead }),
@@ -472,9 +498,12 @@ export async function scanStranded(
           kind: 'salvageOrphan', branch: ref, fate,
           ...(ahead === undefined ? {} : { commits: ahead }),
           ...(state === 'unknown' ? { unknown: true } : {}),
-          why: hintedId === undefined
-            ? '抢救出来的提交,但对应的任务已经不在树上了(重做或回溯改写过树)'
-            : `抢救出来的提交,它属于「${hintedId}」—— 那个任务已经不在树上了(重做或回溯改写过树)`,
+          ...(mine ? {} : { otherRun: true }),
+          why: !mine
+            ? `**另一趟**运行留下的抢救提交,里面可能有那一趟的产出 —— 只列不合(它属于另一棵任务树);想看:git log ${ref}`
+            : hintedId === undefined
+              ? '抢救出来的提交,但对应的任务已经不在树上了(重做或回溯改写过树)'
+              : `抢救出来的提交,它属于「${hintedId}」—— 那个任务已经不在树上了(重做或回溯改写过树)`,
         })
     }
   }
@@ -489,8 +518,9 @@ export async function scanStranded(
    *
    * 判据只有一条:名字对得上这个 run 的工作树分支前缀,而**没有任何现存节点认领它**。
    */
+  // 同上:不按 runId 切,别的 run 的标出来、只列不合。
   const wtRefs = await deps.git(
-    ['for-each-ref', '--format=%(refname:short)', `refs/heads/${worktreeBranch(`efftask-${deps.runId}-`)}*`],
+    ['for-each-ref', '--format=%(refname:short)', `refs/heads/${worktreeBranch('efftask-')}*`],
     deps.gitRoot,
   )
   if (wtRefs.code !== 0) {
@@ -502,11 +532,15 @@ export async function scanStranded(
       const state = await containedIn(deps, ref)
       if (state === 'yes') continue
       const ahead = await aheadOf(deps, ref)
+      const mine = ref.startsWith(worktreeBranch(`efftask-${deps.runId}-`))
       items.push({
         kind: 'salvageOrphan', branch: ref, fate: 'unknown',
         ...(ahead === undefined ? {} : { commits: ahead }),
         ...(state === 'unknown' ? { unknown: true } : {}),
-        why: '一条工作树分支,而树上已经没有认领它的任务了(重做或回溯删过子树)',
+        ...(mine ? {} : { otherRun: true }),
+        why: mine
+          ? '一条工作树分支,而树上已经没有认领它的任务了(重做或回溯删过子树)'
+          : `**另一趟**运行留下的工作树分支,里面可能有那一趟的产出 —— 只列不合;想看:git log ${ref}`,
       })
     }
   }
@@ -613,14 +647,38 @@ export async function scanStranded(
       problems.push(`列不出 ${prefix}(${refs.stderr.trim() || `退出码 ${refs.code}`})—— 这一格这次是空白,不代表没有`)
       continue
     }
-    for (const ref of refs.stdout.split('\n').map(s => s.trim()).filter(Boolean)) {
+    const all = refs.stdout.split('\n').map(s => s.trim()).filter(Boolean)
+    /**
+     * **本 run 的排前面,再按名字定序。**
+     *
+     * 下面要截断,而截断只有在「先列最相关的」时才不伤人。定序也让同一份仓库两次扫出来的
+     * 顺序一样 —— 不可复现的顺序会让「上次列的这次没了」变成没人能解释的事。
+     */
+    const mineOf = (ref: string): boolean =>
+      ref.startsWith(`${prefix}/${deps.runId}/`) || ref === `${prefix}/${deps.runId}`
+    all.sort((a, b) => (mineOf(a) === mineOf(b) ? (a < b ? -1 : a > b ? 1 : 0) : mineOf(a) ? -1 : 1))
+    for (const ref of all.slice(0, MAX_ET_REFS)) {
       // `refs/et/<类>/<runId>/<...>` —— 认不出 runId 的按「别的 run」处理(保守方向)。
-      const mine = ref.startsWith(`${prefix}/${deps.runId}/`) || ref === `${prefix}/${deps.runId}`
+      const mine = mineOf(ref)
       items.push({
         kind, branch: ref,
+        ...(mine ? {} : { otherRun: true }),
         why: `${hint}${mine ? '' : '(**另一趟**运行留下的)'} —— 先看:git show --stat ${ref};`
           + `确认要取回时在你自己的检出里(工作区干净的前提下)git stash apply ${ref}`,
       })
+    }
+    /**
+     * **截断提示在被截断的那一段外面。**
+     *
+     * 这些 ref **故意没有自动回收者**:每一条都可能是某份内容唯一的副本,而这个功能的
+     * 全部立场就是「不替你删」。代价是它们会随按键次数增长 —— 所以这里夹一个上限,
+     * 并给出**自己清**的那条命令。夹了不说等于把「还没捞回来」这份清单悄悄削短。
+     */
+    if (all.length > MAX_ET_REFS) {
+      problems.push(
+        `${prefix} 下有 ${all.length} 条,只列了前 ${MAX_ET_REFS} 条(本趟的排在前面)。`
+        + `全部:git for-each-ref ${prefix};确认不需要了可以自己删:git update-ref -d <ref>`,
+      )
     }
   }
 

@@ -1,4 +1,5 @@
 import { integrationBranch, worktreeBranch, worktreeSlug } from './worktreeId.js'
+import { pinAndClear } from './snapshot.js'
 import { EFFTASK_INTERNAL_PATHS, wipeBuildOutputsAt, type BuildWipeOutcome } from './buildOutputs.js'
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import type { TaskNode } from './types.js'
@@ -33,6 +34,11 @@ export type TrunkSync =
 
 export type MergeResult =
   /**
+   * `pinned`:抹掉之前把那些内容钉成的耐久 ref(见 `snapshot.ts`)。
+   *
+   * `cleaned` 只留下**名字**,而名字救不回任何东西。这条 ref 才是「被抹掉的东西还能取回来」
+   * 那句话的兑现物 —— 少了它,`cleaned` 就只是一份讣告。
+   *
    * `cleaned`:合并失败后从集成工作区里被 `reset --hard` / `clean -fd` 抹掉的路径。
    *
    * 必须报出去。那个目录是产品**主动告诉用户可以复用**的(启动关口上印着「集成工作区
@@ -41,9 +47,9 @@ export type MergeResult =
    *
    * `trunk`:紧跟着这次合并做的「合回用户当前分支」。只在 `merged: true` 时出现。
    */
-  | { ok: true; merged: boolean; cleaned?: string[]; trunk?: TrunkSync }
-  | { ok: false; kind: 'conflict'; files: string[]; cleaned?: string[] }
-  | { ok: false; kind: 'infra'; message: string; cleaned?: string[] }
+  | { ok: true; merged: boolean; cleaned?: string[]; pinned?: string; trunk?: TrunkSync }
+  | { ok: false; kind: 'conflict'; files: string[]; cleaned?: string[]; pinned?: string }
+  | { ok: false; kind: 'infra'; message: string; cleaned?: string[]; pinned?: string }
 
 /**
  * Serialises an async section. `acquire` and `merge` each need one: measured, 5 concurrent
@@ -100,6 +106,29 @@ export type WorktreePool = ReturnType<typeof createWorktreePool>
 export function createWorktreePool(deps: WorktreePoolDeps) {
   const { runId, gitRoot, git, worktreeRoot, dirSizeKb } = deps
   const intBranch = integrationBranch(runId)
+
+  /**
+   * **抹掉集成工作区之前,把里面的未提交内容钉成一条耐久 ref。**
+   *
+   * 这条路(合并失败 → `reset --hard` + `clean -fd`)是**自动跑**的主路径,而它此前
+   * 对那棵共享的树零保护:`cleaned` 只报名字,内容没了。`m` 键那边已经在动手前钉一次,
+   * 自动跑这边一次都没有 —— 同一个原语接一条路,「通用」就是半句话。
+   *
+   * 只读那棵树:`git stash create` 实测不动工作区、不动 index;树干净时连 ref 都不写,
+   * 正常路径上零成本。**失败不影响合并本身** —— 钉不住是坏消息,不是拒绝干活的理由,
+   * 但它要能被看见,所以返回 ref 名(拿不到就 undefined,由调用方照实上屏)。
+   */
+  const pinBeforeWipe = async (): Promise<string | undefined> => {
+    try {
+      // `pinAndClear` 而不是 `pinSnapshot`:下一行就要 clean -fd,而 `stash create` 拿不到
+      // 未跟踪文件 —— 而那正是这棵树上最常见的一份丢失(席位在里面跑过构建)。
+      const res = await pinAndClear({ git, gitRoot, runId }, intPath)
+      return res.ref
+    } catch {
+      // 钉快照永远不许把一次合并变成一次崩溃。
+      return undefined
+    }
+  }
   /**
    * node id → the files git itself reported as conflicted by that node's local merge.
    *
@@ -874,9 +903,21 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
         // that race unreachable within a run, so swapping this back to `merge --abort` leaves
         // the suite green. It is defence for a state the current design prevents — keep it,
         // but do not claim it is tested.
+        /**
+         * **抹掉之前先钉住。**
+         *
+         * 上面那句 `cleaned` 只留下**名字**,而名字救不回任何东西 —— 席位在这棵树里跑过
+         * 构建、手工解过一半的冲突,下面这两句一过就一个字节都不剩。这条路是**自动跑**
+         * 的主路径(`pipeline` 每个节点合一次),它此前对集成工作区零保护。
+         *
+         * `pinSnapshot` 只读那棵树(`git stash create` 实测不动工作区、不动 index),
+         * 树干净时连 ref 都不写 —— 正常路径上零成本。它拿不到未跟踪文件,那一格由它自己
+         * 如实报告(见 `snapshot.ts`)。
+         */
+        const pinned = await pinBeforeWipe()
         await git(['reset', '--hard'], intPath)
         await git(['clean', '-fd'], intPath)
-        if (files.length > 0) return { ok: false, kind: 'conflict', files }
+        if (files.length > 0) return { ok: false, kind: 'conflict', files, ...(pinned ? { pinned } : {}) }
         /**
          * 洗完**重试一次**。
          *
@@ -907,7 +948,7 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
           const on = head.stdout.trim()
           if (head.code !== 0 || on !== intBranch) {
             return {
-              ok: false, kind: 'infra', cleaned,
+              ok: false, kind: 'infra', cleaned, ...(pinned ? { pinned } : {}),
               message: `集成工作区 ${intPath} 当前在 ${on || '(未知)'} 上,不是集成分支 ${intBranch};` +
                 `拒绝在它上面重试合并(那会把本节点的提交合进别的分支)。` +
                 `请把它切回 ${intBranch},或删掉该目录让下次运行重建。`,
@@ -916,19 +957,29 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
           const again = await git(['merge', '--no-edit', branch], intPath)
           // 洗完重试成功也是一次真的合入 —— 同样要往主干送一次(漏了这条出口的话,
           // 「每个子任务完成就合」在这条路上就是假的)。
-          if (await isMerged(branch)) return { ok: true, merged: true, cleaned, trunk: await intoTrunk() }
+          if (await isMerged(branch)) {
+            return { ok: true, merged: true, cleaned, ...(pinned ? { pinned } : {}), trunk: await intoTrunk() }
+          }
           const retryConflicts = await git(['diff', '--name-only', '--diff-filter=U'], intPath)
           const retryFiles = retryConflicts.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+          // 同上:这一处也在抹东西(重试撞了冲突之后的现场),同样先钉。
+          const pinned2 = await pinBeforeWipe()
           await git(['reset', '--hard'], intPath)
           await git(['clean', '-fd'], intPath)
           /**
            * `cleaned` 要跟着**每一条**出口走。验收实测:只有成功那条带它,而失败那两条
            * 恰恰是用户最需要知道「我刚才丢了什么」的时刻 —— 一个未跟踪的用户文件被
            * clean -fd 抹掉、重试又撞冲突,node.md / 阻断卡 / run.md 里一个字都没有。
+           *
+           * **`pinned` 是同一条规矩**,而且比 `cleaned` 更该跟到底:名字只是讣告,ref 才是
+           * 能取回来的那个东西。第二次钉的优先(它是离用户最近的那次现场),第一次兜底。
            */
-          if (retryFiles.length > 0) return { ok: false, kind: 'conflict', files: retryFiles, cleaned }
+          const kept = pinned2 ?? pinned
+          if (retryFiles.length > 0) {
+            return { ok: false, kind: 'conflict', files: retryFiles, cleaned, ...(kept ? { pinned: kept } : {}) }
+          }
           return {
-            ok: false, kind: 'infra', cleaned,
+            ok: false, kind: 'infra', cleaned, ...(kept ? { pinned: kept } : {}),
             /**
              * **别把 git 的成功输出当失败原因念给用户听。**
              *

@@ -486,8 +486,17 @@ async function scanRescue(
    * (它复用 `commitAndMerge`,判据逐字就是自动路径那一份 —— `mergeSubtree` 的文件头
    * 记着为什么不能另写一份);两边都收会让同一个节点被合两次。
    */
+  /**
+   * **别的 run 留下的只列不合。**
+   *
+   * 扫描现在不按 runId 切了(上一趟崩掉的 run 留下的产出此前对每个扫描器永久隐形),
+   * 而「看得见」不等于「该自动合」:那是另一棵任务树的产出,和这一趟的目标没有关系,
+   * 分诊手上也没有它的来历(`fate` 只能是 unknown)。走「给路径、给命令,不替你按」那一档 ——
+   * 它们照样进 `notices`,屏幕上点名说是**另一趟**的。
+   */
   const refOnly = report.items.filter(
-    i => i.kind === 'salvage' || i.kind === 'salvageOrphan' || i.kind === 'branchOnly' || i.kind === 'orphanDir',
+    i => i.otherRun !== true
+      && (i.kind === 'salvage' || i.kind === 'salvageOrphan' || i.kind === 'branchOnly' || i.kind === 'orphanDir'),
   )
   /**
    * **「只摆出来」那一桶也要真的摆出来。**
@@ -847,6 +856,16 @@ export async function runSubtreeMerge(
 function recordCleaned(out: SubtreeMergeOutcome, title: string, res: MergeResult): void {
   if (res.cleaned && res.cleaned.length > 0) {
     out.problems.push(`${title}:合并前集成工作区有未提交改动,已清理后重试(被清理的:${res.cleaned.join('、')})`)
+  }
+  /**
+   * **钉了没人说等于没钉。**
+   *
+   * `cleaned` 只是一份讣告 —— 名字救不回任何东西。这条 ref 才是「被抹掉的东西还能取回来」
+   * 的兑现物,而它只有出现在屏幕上才算数(这个仓库为「写进去了、而没有任何一屏读它」
+   * 付过账)。判据和 `cleaned` 分开:树干净时不写 ref,那时这一句本来就不该出现。
+   */
+  if (res.pinned !== undefined) {
+    out.problems.push(`  被清理的内容已经钉在 ${res.pinned} 上,没有丢:git stash apply ${res.pinned}(先看:git show --stat ${res.pinned})`)
   }
 }
 
