@@ -172,7 +172,17 @@ async function evidenceFor(
   const files = diff.code === 0
     ? diff.stdout.split('\n').map(l => l.trim()).filter(Boolean)
     : []
-  return { ref, commits, files: files.slice(0, 20), fileCount: files.length, ...over }
+  /**
+   * **截断要让读它的人知道。**
+   *
+   * 这份 `files` 直接进分诊提示词,而模型据它判「合 / 不合 / 拿不准」。一份被悄悄截到
+   * 20 条的清单会让它以为自己看到了全部 —— 被截掉的正好是关键那几个文件时,它给出的
+   * 是一个**基于残缺证据**的判决,而屏幕上看不出任何异常。
+   * `fileCount` 一直都在,但那要读的人自己去比;直接写在清单里才是说出来。
+   */
+  const shown = files.slice(0, EVIDENCE_FILES)
+  if (files.length > shown.length) shown.push(`……(共 ${files.length} 个文件,这里只列了前 ${shown.length} 个)`)
+  return { ref, commits, files: shown, fileCount: files.length, ...over }
 }
 
 /**
@@ -323,6 +333,11 @@ export async function planRescue(
 
   return { merge, backfill, hold, orphanFiles, problems }
 }
+
+/** 进分诊提示词的文件清单最多列几条 —— 再多会把提示词撑爆,而截断本身要写在清单里。 */
+const EVIDENCE_FILES = 20
+/** 孤儿目录在确认屏上最多列几个文件。后面那句「另有 N 个」在这一段**外面**。 */
+const ORPHAN_FILES_SHOWN = 5
 
 /** 落痕里最多带几个文件名。够执行者动手,又不至于把 node.md 撑爆。 */
 export const MAX_STRANDED_PATHS = 12
@@ -639,6 +654,14 @@ export function rescueLines(plan: RescuePlan, canBackfillOrphan = false): string
         out.push(`  · ${c.evidence.title ?? c.evidence.ref}:${c.why}`)
         out.push(`    不同意这个判断的话,自己来:git merge ${c.evidence.ref}(先看:git diff <集成分支> ${c.evidence.ref})`)
       }
+      /**
+       * **「到此为止」说的是这一趟,不是永远 —— 这句话必须说出来。**
+       *
+       * 上面那句「自动的路不会再碰它们」读起来像终局,而 `planRescue` **每次按 `m` 都
+       * 重跑一遍分诊**:分支还在、证据还在,下一趟它会被重新判一次。少了这一句,
+       * 用户以为唯一的出路是自己 `git merge`,于是要么冒险合、要么就此放弃。
+       */
+      out.push('  这几条也不是永久的:分支一个字节都没动,**下次按 m 会重新分诊一遍**。')
     }
     if (superseded.length > 0) {
       out.push(`拿不准、而且这一版已经被后来的版本取代 ${superseded.length} 处 —— **连补录都不做**`
@@ -652,8 +675,12 @@ export function rescueLines(plan: RescuePlan, canBackfillOrphan = false): string
   for (const o of plan.orphanFiles) {
     const absent = o.files.filter(f => f.kind === 'absent').length
     out.push(`孤儿目录 ${o.path} 里有 ${o.files.length} 个文件不在集成分支上(${absent} 个是集成分支根本没有的):`)
-    for (const f of o.files.slice(0, 5)) {
+    for (const f of o.files.slice(0, ORPHAN_FILES_SHOWN)) {
       out.push(`  · ${f.rel}(${f.kind === 'absent' ? '集成分支上没有' : '内容不同'})`)
+    }
+    // 截断提示要在**被截断的那一段外面** —— 放进循环里,它自己会先被截掉。
+    if (o.files.length > ORPHAN_FILES_SHOWN) {
+      out.push(`  ……以及另外 ${o.files.length - ORPHAN_FILES_SHOWN} 个(全部:ls -R ${o.path})`)
     }
     /**
      * 它**不是** git 工作树,所以合不进来 —— 但「合不进来」不等于「捞不回来」。

@@ -799,7 +799,16 @@ export async function runSubtreeMerge(
         out.problems.push(`${b.title ?? b.ref}:补录了 ${b.added.length} 个集成分支缺失的文件(${b.added.slice(0, 3).join('、')}${b.added.length > 3 ? '…' : ''})`)
       }
       // 被判据挡下来的那些是「捞不回来」的明细 —— 最大努力的另一半是说清哪几条没捞到。
-      for (const s of b.skipped.slice(0, 5)) out.problems.push(`  · 没补录 ${s.path}:${s.why}`)
+      for (const s of b.skipped.slice(0, SKIPPED_SHOWN)) out.problems.push(`  · 没补录 ${s.path}:${s.why}`)
+      /**
+       * **「还有 N 条没显示」必须在被截断的那一段外面。**
+       *
+       * 逐条降级落地之后 `skipped` 会显著变长(每一条被 .gitignore 挡下的路径都进去),
+       * 而少了这一句,用户读到的是「只有 5 条没捞到」—— 一句精确的假话。
+       */
+      if (b.skipped.length > SKIPPED_SHOWN) {
+        out.problems.push(`  · ……以及另外 ${b.skipped.length - SKIPPED_SHOWN} 条没补录的(完整清单在 ${b.ref} 上:git diff ${deps.pool.integrationBranchName} ${b.ref})`)
+      }
     }
     // `runRescue` 的 problems 是拿 `plan.problems` 起头的,上面那一支已经抄过一遍。
     out.problems.push(...r.problems.filter(p => !plan.rescue!.problems.includes(p)))
@@ -989,6 +998,9 @@ async function mergeToTrunk(
     ],
   }
 }
+
+/** 结果屏上每条 ref 最多列几条「没补录」的明细。后面那句「另有 N 条」在这一段**外面**。 */
+const SKIPPED_SHOWN = 5
 
 /** 同一个节点上最多记几条捞不回来的 ref。`m` 可以被反复按,不夹就是 node.md 无界增长。 */
 const MAX_STRANDED_PER_NODE = 20
@@ -1253,8 +1265,14 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
    * node.md 上写两样东西 —— 手动合并的注记(早就有)和「有产出没能捞回来」的痕迹(新的)。
    * 后者还会改变按 `b` 之后对这些节点做什么。承诺「状态不会被改动」就是假话。
    */
-  out.push('不会改动任何判决:节点的评审、验收记录原样保留。'
-    + '(合过的任务会记一句手动合并的注记;三级都捞不回来的会记一句痕迹,好让 b 回溯认得到它。)')
+  /**
+    * 「判决」说的是**评审和验收的结论**,而这一跳确实会在盘上写两样东西 —— 还会把合进去的
+    * 节点标成「它的产出已经进了集成分支」(`contributed`)。那不是判决,但它**会影响下一趟**
+    * 的分诊(这个节点旧的抢救 ref 从此按「已被取代」处理),所以要说出来。
+    */
+  out.push('不会改动任何**验收判决**:节点的评审、验收记录原样保留。'
+    + '(合过的任务会记一句手动合并的注记、并记下「它的产出已经进了集成分支」;'
+    + '三级都捞不回来的会记一句痕迹,好让 b 回溯认得到它。)')
   if (plan.runActive) {
     out.push('⚠ 这一趟还在跑:合并会和编排器共用同一条集成分支,两边按顺序排队(可能要等在飞的那次合并让出来)。')
   }

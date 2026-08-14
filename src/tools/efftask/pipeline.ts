@@ -3048,7 +3048,7 @@ export function seatPreamble(
   }
   // 节点定向:重做/跳过时用户补给这个节点的话。
   if (node?.guidance) {
-    out.push(guidanceBlock('用户对本任务补充的指引(优先级高于原方案的枝节):', node.guidance.all))
+    out.push(guidanceBlock('对本任务补充的指引(优先级高于原方案的枝节):', node.guidance.all))
     // 和上面 CROSS 同一份规则 —— 节点级和 run 级的指引没有理由走两套分流。
     const nodePhases: PhaseName[] = cross ? [phase, cross] : [phase]
     const seenNode = new Set<string>()
