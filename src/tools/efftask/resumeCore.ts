@@ -7,7 +7,7 @@ import type { Caps, DegradeRecord, DepsRecalcRecord, EffTaskConfig, NodeKind, No
 import type { FsLike } from './persistence.js'
 import type { RoleDef } from './roleDefs.js'
 import { isStrictness } from './strictness.js'
-import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS } from './parseOutput.js'
+import { capBlockingList, capText, MAX_BLOCKING_CHARS, MAX_BLOCKING_ITEMS, MAX_FIELD_CHARS, MAX_SUMMARY_CHARS, parseRemedy } from './parseOutput.js'
 import { sanitizeUsage } from './usage.js'
 
 // Exported because they ARE the post-condition: whatever this module hands back, every reader
@@ -232,6 +232,24 @@ function verdictArray(v: unknown, onDrop?: () => void): RoundtableRecord['verdic
         ...(Array.isArray(x.advice) && strArray(x.advice).length > 0
           ? { advice: capBlockingList(strArray(x.advice), '修改建议') }
           : {}),
+        /**
+         * `remedy` —— **补救子任务的提案**,死在同一行上的第三个字段。
+         *
+         * 跑机实测(.13 qianbase-xtp run 001):2215 个 node.md 里 `remedy:` 出现 **0 次**,
+         * 而同一个 run 真的发生过 **76 次**「已追加补救子任务」。也就是说提案确实产生过、
+         * 也确实落过盘,是每一次 `--resume` 把它们从盘上抹掉的 —— 逐字段重建的清单里没有它,
+         * 读回来是 undefined,下一次 persist 又把抹掉的结果写回去。
+         *
+         * 后果不是「少一个字段」:
+         *  - 回溯(`backtrackScope`)的 `remedy` 是**从盘上读**的,于是「集成验收此前提过的
+         *    补救项」这一段对任何恢复过的 run **恒为空** —— 而「加新任务」正是用户按 `b` 时
+         *    要的那件事;
+         *  - `reviseDecomposition` 现在跨轮取并集(见 pipeline),取的也是盘上这份账。
+         *
+         * 走 `parseRemedy` 的**同一道**形状校验和上限:node.md 是可以手工编辑的,而这是
+         * 进入这个字段的另一道门(和 blocking 走同一对上限是同一条理由)。
+         */
+        ...(Array.isArray(x.remedy) && parseRemedy(x).length > 0 ? { remedy: parseRemedy(x) } : {}),
         ...(x.timeoutKind === 'human' || x.timeoutKind === 'stall' || x.timeoutKind === 'total'
           ? { timeoutKind: x.timeoutKind }
           : {}),

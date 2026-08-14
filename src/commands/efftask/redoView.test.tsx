@@ -19,6 +19,7 @@ import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/
 import { ConfirmRedo } from './ConfirmRedo.js'
 import { ConfirmSkip } from './ConfirmSkip.js'
 import { ConfirmForcePass } from './ConfirmForcePass.js'
+import { ConfirmBacktrack, resultLines } from './ConfirmBacktrack.js'
 import { DoneView } from './efftask.js'
 
 const NOW = new Date().toISOString()
@@ -634,5 +635,67 @@ describe('关口的出口只走一次', () => {
     await tick()
     app.unmount()
     expect(picks.length).toBe(1)
+  })
+})
+
+/**
+ * **回溯关口:真组件、真键、真帧。**
+ *
+ * 这一屏是「按下确认之后到底发生了什么」的唯一出口,而它此前一条组件级用例都没有 ——
+ * 而同一个功能的接线层曾经造出 14 条存活变异,每一条的用户可见后果都是
+ * 「按下确认之后界面纹丝不动」。
+ */
+describe('回溯关口', () => {
+  const NOW2 = '2026-08-14T00:00:00.000Z'
+  const bt = (id: string, over: Partial<TaskNode> = {}): TaskNode => ({
+    ...createNode({ id, title: id, parentId: null, deps: [], depth: 0, phaseRoles: emptyPhaseRoles(), now: NOW2 }),
+    ...over,
+  })
+  /** 子任务全绿的父任务 —— 跑机上 34 个,而它此前会让整次回溯变成一行「回溯未执行」。 */
+  const judgeOnlyTree = (): TaskNode[] => [
+    bt('P', {
+      kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01'],
+      acceptLog: [{
+        round: 3, step: 'integrate',
+        verdicts: [{ role: '集成官', pass: false, blocking: ['datum.rs 不在集成工作区'], comments: '' }],
+        synthesized: { pass: false, blockingSummary: 'datum.rs 不在集成工作区' },
+      }],
+    }),
+    bt('P/01', { parentId: 'P', kind: 'executable', status: 'ACCEPTED', execStatus: '做完了' }),
+  ]
+
+  it('确认之前就说清:这一格是「重新裁决 + 重新开放补救拆分」,不是重跑执行', async () => {
+    const nodes = judgeOnlyTree()
+    const { t, app } = await mount(
+      <ConfirmBacktrack
+        target={nodes[0]} nodes={nodes}
+        onRun={async () => undefined} onDone={() => {}} onCancel={() => {}}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('重新裁决')
+    expect(f).toContain('补救拆分')
+    // 「N 个任务重跑执行阶段」这句话对这一格是假的 —— 一个执行者都不会被派出去。
+    expect(f).toContain('0 个任务重跑执行阶段')
+  })
+
+  it('结果屏把「跳过了哪几个」印出来 —— 不许只报成功的那几个', () => {
+    const lines = resultLines({
+      entries: [{ nodeId: 'P/02', entry: 'execute' }, { nodeId: 'P', entry: 'integrate' }],
+      skipped: ['P/09:这是拆分任务,它自己没有执行环节'],
+      rearmed: ['P'],
+    })
+    const s = lines.join('\n')
+    expect(s).toContain('已重跑 2 个任务')
+    expect(s).toContain('只重新裁决集成验收')
+    expect(s).toContain('P/09')
+    expect(s).toContain('重新武装了补救拆分')
+  })
+
+  it('一个都没跑成时不说「已重跑 0 个」', () => {
+    const s = resultLines({ entries: [], skipped: [], rearmed: [] }).join('\n')
+    expect(s).toContain('没有重跑任何任务')
+    expect(s).not.toContain('已重跑 0')
   })
 })

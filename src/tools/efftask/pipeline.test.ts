@@ -7361,3 +7361,103 @@ describe('测试修复席位的反声明', () => {
     expect(await verifyPrompt()).not.toContain('用户补充的约束**优先于原方案的枝节**')
   })
 })
+
+/**
+ * **执行者自陈没做的那几件** —— 跑机 .13 run 001 上 610 个节点写过它,607 个已 ACCEPTED,
+ * 而全仓库没有一处代码读过这句话。
+ */
+describe('自陈未做', () => {
+  const execReply = (status: string) => (req: { prompt: string }) =>
+    '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+    '\n' + JSON.stringify({ execStatus: status }) + '\n```'
+
+  it('执行完落到 node.undone 上', async () => {
+    const n = root(); n.status = 'READY'; n.kind = 'executable'
+    n.plan.acceptance = '创建 datum.rs'
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'execute'
+        ? execReply('已登记依赖。\n本轮未做:创建 datum.rs(原因:被限制为纯文本回复)')(req)
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    await stepExecute(n, ctxFor([n], runAgent))
+    expect(n.undone).toEqual(['创建 datum.rs(原因:被限制为纯文本回复)'])
+  })
+
+  /**
+   * **做完了要清掉。** 只写不清是这个仓库反复付账的那一类:一个第 2 轮补完了的节点会
+   * 永远挂着第 1 轮的欠账,而回溯据此把它拉回来重跑,一轮一轮出不去。
+   */
+  it('下一轮补完了 → 字段回到 undefined', async () => {
+    const n = root(); n.status = 'READY'; n.kind = 'executable'
+    n.undone = ['上一轮的欠账']
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'execute'
+        ? execReply('全部完成,cargo check 退出码 0')(req)
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    await stepExecute(n, ctxFor([n], runAgent))
+    expect(n.undone).toBeUndefined()
+  })
+
+  /**
+   * 集成验收的证据段必须**单独**印它:`capText` 砍的是尾巴,而按提示词的要求
+   * 「本轮未做」写在报告末尾 —— 一份长报告里最该被这一关看见的几行最先被砍掉。
+   */
+  it('集成验收的子任务证据里单独一行', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'
+    child.execStatus = '做了一点'
+    child.undone = ['创建 datum.rs']
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      prompts.push(req.prompt)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    expect(prompts[0]).toContain('自己声明未做')
+    expect(prompts[0]).toContain('创建 datum.rs')
+  })
+})
+
+/**
+ * **补救拆分的提案跨轮取并集。**
+ *
+ * 触顶那一轮恰恰最可能什么都没提:.13 上 242 个集成验收判不通过的节点里,222 个的
+ * 最后一轮是一次协议失败(裁决没按格式返回)。只看那一轮 = 前几轮认真提过的补救项全部作废,
+ * 而这条路以前还是**静默**的(`revise.note` 的位置一直留着,从不填)。
+ */
+describe('补救拆分:跨轮取并集', () => {
+  const withRemedy = (title: string) => JSON.stringify({
+    pass: false, blocking: ['缺 datum'], comments: '', remedy: [{ title, deps: [] }],
+  })
+
+  it('第 1 轮提过、最后一轮没提 → 照样长出补救子任务', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = 'Y'
+    let round = 0
+    const runAgent: RunAgentFn = async req => {
+      round++
+      // 第 1 轮给 remedy,之后每一轮都不给(最后一轮是协议失败的那种形状)。
+      return round === 1
+        ? vtag(req) + '\n' + withRemedy('补齐 sem/tree/datum.rs') + '\n```'
+        : vtag(req) + '\n{"pass":false,"blocking":["缺 datum"],"comments":""}\n```'
+    }
+    const ctx = ctxFor([n, child], runAgent)
+    await stepIntegrate(n, ctx)
+    expect(n.revised).toBe(true)
+    expect(n.childIds).toHaveLength(2)
+    expect(n.status).toBe('WAITING_CHILDREN')
+    expect(n.execStatus).toContain('补齐 sem/tree/datum.rs')
+    // 没有降级放行:它真的还能往前走一步。
+    expect(n.degraded ?? []).toHaveLength(0)
+  })
+
+  it('历次都没提过 → 降级理由要说清补救拆分为什么没发生', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = 'Y'
+    const runAgent: RunAgentFn = async req => vtag(req) + '\n{"pass":false,"blocking":["缺 datum"],"comments":""}\n```'
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    expect(n.degraded?.[0]?.reason).toContain('补救拆分未能进行')
+  })
+})

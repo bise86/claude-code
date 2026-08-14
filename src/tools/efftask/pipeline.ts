@@ -4,7 +4,7 @@ import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { adviceOf, crossSeatNotice, degradeCarryPrompt, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
-import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, undoneItems, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { depLabel } from './depsRecalc.js'
@@ -13,7 +13,7 @@ import type { WorktreePool } from './worktreePool.js'
 import type { BuildWipeOutcome } from './buildOutputs.js'
 // 「没有合并提交就不算完成」那句话的措辞与判据,和回溯那一侧**共用一份** ——
 // 各写一份的话,哪天改了措辞,回溯就再也扫不到它要处理的那批节点。
-import { NO_CONTRIBUTION_LEAD, NO_CONTRIBUTION_NOTE } from './backtrack.js'
+import { NO_CONTRIBUTION_LEAD, NO_CONTRIBUTION_NOTE, undoneOf } from './backtrack.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, humanTimeoutRemedy, totalTimeoutRemedy, type BlockCategory } from './escalation.js'
 import { NodeCancelledError, PhaseTimeoutError, ProviderApiError, type TimeoutKind } from './runAgentAdapter.js'
@@ -1110,6 +1110,10 @@ function answerRule(tag: string): string {
   // leaving it unsaid would reject a reply for a constraint it was never told about.
   return `\n\n严格要求:回复的最后必须是一个代码块,它的语言标记(fence info string)写成 ${tag},` +
     `块内是本次回答的 JSON;整条回复里只能有这一个 ${tag} 块。` +
+    // 病因治第三遍(解析侧见 parseOutput.taggedFromOpening):跑机上 145 个真裁决被读成
+    // 「没答」,唯一的成因是模型把起始标记**接在上一句话屁股后面**。解析层现在认得出来,
+    // 这里仍然说一句 —— 两道锁,便宜的那道也一起上。措辞里不出现反引号,理由同上。
+    `代码块的起始标记要**单独占一行**:它前面不能有正文,它后面直接换行写 JSON。` +
     // 病因治两遍:上面去掉了示范,这里明说「别把围栏写进 JSON」。实测那次事故里模型
     // 想说的是「我照做了」,而它表达这件事的方式就是引用围栏。给它一个不带反引号的说法。
     `JSON 字符串内部不要写三个连续的反引号 —— 要提到代码块就写「代码块」三个字。`
@@ -2214,6 +2218,20 @@ function integratePrompt(
             : ''}\n` +
           ((c.degraded ?? []).flatMap(d => d.advice).length > 0
             ? `- 该子任务未落实的修改建议: ${quote((c.degraded ?? []).flatMap(d => d.advice).join(' / '))}\n`
+            : '') +
+          /**
+           * **执行者自己说没做的那几件,单独一行。**
+           *
+           * 它本来就在 `execStatus` 里,但那一段有两个真实的失效路径,而这一行两条都躲开:
+           *  1. `capText` 砍的是**尾巴**,而提示词要求「本轮未做」写在报告末尾 ——
+           *     一份长报告里,最该被这一关看见的几行恰恰最先被砍掉;
+           *  2. 它混在几百行自述中间,而这一关要判的正是「合起来达没达成父目标」。
+           * 跑机实测:datum 那个子任务的报告里白纸黑字写着「本轮未做:创建 datum.rs」,
+           * 而它 `status: ACCEPTED` —— 集成验收连着三轮点名这个文件不在,一次都没有
+           * 被告知「它自己承认没做」。
+           */
+          (undoneOf(c).length > 0
+            ? `- ⚠ 该子任务**自己声明未做**: ${quote(undoneOf(c).join(' / '))}\n`
             : '') +
           `- 执行状态: ${quote(c.execStatus) || '(无)'}\n- 验收点: ${quote(c.plan.acceptance) || '(无)'}`
         : `### ${quote(id)}\n- 状态: (节点缺失,无法核实其结果)`
@@ -4957,6 +4975,16 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // 后,node.md 里搜不到「质疑讨论环节已跳过」。
     const keptNotes = node.execStatus.split('\n').filter(l => l.startsWith(ORCHESTRATOR_NOTE))
     node.execStatus = [reported, ...keptNotes].join('\n')
+    /**
+     * **执行者自陈没做的那几件,结构化钉在节点上**(见 `TaskNode.undone`)。
+     *
+     * 写在这里而不是解析层:`reported` 是**这一轮**的自述,而这个字段的含义是「按现在
+     * 这一版产出,他自己说还欠什么」。所以每一轮都重写,**做完了就写回 undefined** ——
+     * 只写不清是这个仓库反复付账的那一类:一个第 2 轮补完了的节点会永远挂着第 1 轮的欠账,
+     * 而回溯据此把它拉回来重跑。
+     */
+    const undone = undoneItems(reported)
+    node.undone = undone.length > 0 ? undone : undefined
 
     // 动态生长(spec §4):honoured AFTER the empty-report gate, so a reply that grafts nodes
     // but evidences no work still counts as an empty round rather than buying a free pass.
@@ -5418,16 +5446,35 @@ async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: P
   // ambiguous) — and the revision would be silently abandoned precisely when two roles agreed.
   const seen = new Set<string>()
   const specs: { title: string; deps: string[] }[] = []
-  for (const v of rec.verdicts) {
-    for (const c of v.remedy ?? []) {
-      if (seen.has(c.title)) continue
-      seen.add(c.title)
-      specs.push(c)
+  /**
+   * **跨轮取并集,新的在前。**
+   *
+   * 只看触顶那一轮是这个功能最容易空转的地方,而跑机数据把它量了出来:触顶那一轮**恰恰
+   * 最可能什么都没提** —— .13 上 242 个集成验收判不通过的节点里,222 个的最后一轮是
+   * 「未按要求输出本轮的裁决代码块」(一次协议失败,verdicts 里连 blocking 都是补的,
+   * 更不会有 remedy)。前两轮认真提过的补救项,就因为最后一轮没答上格式而全部作废,
+   * 而这一格的下场是**静默**返回 `{kind:'no'}`:降级理由里连一句「为什么没长出补救子任务」
+   * 都没有(那一句 `revise.note` 的位置一直留着,只是这条路从不填它)。
+   *
+   * 新的在前:后一轮看到的是更新的证据。老轮次只用来**补足**名额,不覆盖新的。
+   * 去重仍然按标题(`createChildren` 用标题解析兄弟依赖,重名会让整批被拒)。
+   */
+  const rounds = [rec, ...node.acceptLog.filter(r => r.step === 'integrate').slice().reverse()]
+  for (const r of rounds) {
+    for (const v of r.verdicts) {
+      for (const c of v.remedy ?? []) {
+        if (seen.has(c.title)) continue
+        seen.add(c.title)
+        specs.push(c)
+        if (specs.length >= MAX_REMEDY_CHILDREN) break
+      }
       if (specs.length >= MAX_REMEDY_CHILDREN) break
     }
     if (specs.length >= MAX_REMEDY_CHILDREN) break
   }
-  if (specs.length === 0) return { kind: 'no' }
+  // 说出口。这条路以前是静默的,于是「补救拆分为什么没发生」在 node.md 上无从追溯 ——
+  // 而它是「不失败」这套东西里唯一还能真正推进一步的手段。
+  if (specs.length === 0) return { kind: 'no', note: '集成验收历次裁决都没有提出可追加的补救子任务' }
   // The depth valve. NOT announced on its own card: this branch is immediately followed by a
   // block, and a `stopped:false` card reading 本次运行没有停 in front of a stop contradicts
   // itself — the cap-depth wording additionally claims the refused work was folded into the

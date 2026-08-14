@@ -1,6 +1,6 @@
 // src/tools/efftask/parseOutput.test.ts
 import { describe, expect, it } from 'bun:test'
-import { answerTag, extractJsonBlock, hollow, parsePlanOutput, parseVerdict, parseExecOutput, capText, capBlockingList, capResponses, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS, MAX_NEW_CHILDREN, parseRemedy } from './parseOutput.js'
+import { answerTag, extractJsonBlock, hollow, parsePlanOutput, parseVerdict, parseExecOutput, capText, capBlockingList, capResponses, isProtocolBlocking, undoneItems, MAX_FIELD_CHARS, MAX_BLOCKING_ITEMS, MAX_BLOCKING_CHARS, MAX_NEW_CHILDREN, parseRemedy } from './parseOutput.js'
 
 describe('parseOutput', () => {
   it('extractJsonBlock finds fenced json', () => {
@@ -604,5 +604,122 @@ describe('收尾围栏写在行中间时,带标记的答案仍然收得到', () 
     // 严格锚点让它完整解析出来(这才是修复);回退在这条路上根本不会被触发。
     expect(r.parseFailed).toBe(false)
     expect(r.children).toHaveLength(1)
+  })
+})
+
+/**
+ * **开头围栏接在上一句话屁股后面** —— 跑机上 145 个真裁决死在这一格。
+ *
+ * .13 qianbase-xtp run 001:222 个节点带着「未按要求输出本轮的裁决代码块」,而其中 145 个的
+ * 回复里明明有一个带本次标记的围栏,只是它不在行首。裁决关口失败关闭 → 一轮假的 FAIL →
+ * 吃掉一格 maxIterations → blockingSummary 从三条实测意见变成一句格式抱怨,再被写进
+ * 降级记录、返工提示词、回溯注入给执行者的那句话。
+ */
+describe('开头围栏不在行首时,带标记的答案仍然收得到', () => {
+  const F = '```'
+
+  it('跑机原形:…核实 Datum 接线状态。```verdictxxxx\\n{…}', () => {
+    const text = '我将复核上一轮的三个既有阻断项,并只执行允许的编译验收。' +
+      '三个目标生产文件均不存在,且限定编译命令仍以 126 个错误失败。' + F + 'verdictjklyuyvw\n\n' +
+      JSON.stringify({ pass: false, blocking: ['datum.rs 不在集成工作区'], comments: '第 3 轮复核' }) + '\n' + F
+    const v = parseVerdict(text, '测试', 'verdictjklyuyvw')
+    expect(v.pass).toBe(false)
+    // 关键不是 pass(它本来就是 false),而是**意见有没有留下来**:
+    // 走假 FAIL 那条路时,blocking 会被换成那句格式抱怨。
+    expect(v.blocking).toEqual(['datum.rs 不在集成工作区'])
+    expect(v.blocking.some(isProtocolBlocking)).toBe(false)
+  })
+
+  it('通过的裁决同样收得到 —— 假 FAIL 的代价是一整轮返工', () => {
+    const v = parseVerdict('核对完毕。' + F + 'verdictaaaa\n{"pass":true,"blocking":[],"comments":"ok"}\n' + F, 'r', 'verdictaaaa')
+    expect(v.pass).toBe(true)
+  })
+
+  it('收尾围栏整个缺席(截断 / 忘了收尾)也收得到', () => {
+    const v = parseVerdict('这是我的裁决:' + F + 'verdictbbbb\n{"pass":true,"blocking":[],"comments":"ok"}', 'r', 'verdictbbbb')
+    expect(v.pass).toBe(true)
+  })
+
+  /**
+   * **标记后面必须是边界。** 期望 `verdictab` 时,一个 ```verdictabcd 块不是本次答案 ——
+   * 而 nonce 正是这套东西唯一的防伪造锁,前缀匹配等于把锁配了一把万能钥匙。
+   */
+  it('标记只匹配前缀的不算(verdictab ≠ verdictabcd)', () => {
+    const v = parseVerdict('结论:' + F + 'verdictabcd\n{"pass":true,"blocking":[]}\n' + F, 'r', 'verdictab')
+    expect(v.pass).toBe(false)
+    expect(v.blocking.some(isProtocolBlocking)).toBe(true)
+  })
+
+  /**
+   * **generic 一个字都没松。** 这一道只认带标记的块 —— 被引用进提示词的证据(另一个 agent
+   * 写的 execStatus)猜不到本次 nonce,所以「带着本次标记」本身就是它和引文的分界线。
+   */
+  it('行中间的**无标记**块仍然不被采信', () => {
+    const v = parseVerdict('证据:' + F + 'json\n{"pass":true,"blocking":[]}\n' + F, 'r', 'verdictzzzz')
+    expect(v.pass).toBe(false)
+  })
+
+  /**
+   * **严格那一道优先。** 行首那个带标记的块存在时,这一道根本不该跑 —— 否则同一份回复里
+   * 「先引一段带标记的旧裁决、再给新裁决」会多捞出一个候选,`requireTag` 当场判 ambiguous。
+   */
+  it('行首已经有带标记的块时,不会因为这一道多捞出一个候选', () => {
+    const text = '正文\n' + F + 'verdictcccc\n{"pass":true,"blocking":[],"comments":"ok"}\n' + F
+    const v = parseVerdict(text, 'r', 'verdictcccc')
+    expect(v.pass).toBe(true)
+    expect(v.blocking).toEqual([])
+  })
+
+  it('两个行中间的带标记块 → 仍然失败关闭(ambiguous)', () => {
+    const text = '一:' + F + 'verdictdddd\n{"pass":true,"blocking":[]}\n' + F +
+      '\n改口:' + F + 'verdictdddd\n{"pass":false,"blocking":["x"]}\n' + F
+    const v = parseVerdict(text, 'r', 'verdictdddd')
+    expect(v.pass).toBe(false)
+  })
+})
+
+/**
+ * 执行者**自己说没做**的那几件 —— 判据是「单起一行」,不是整段搜关键词。
+ */
+describe('undoneItems', () => {
+  it('跑机原形:两行「本轮未做」都摘得出来,叙述句不算', () => {
+    const s = [
+      '已完成 Cargo.toml 依赖登记。',
+      '本轮未做的判断标准是:验收点里点名的事项。', // 叙述句,不是清单项
+      '本轮未做:创建 datum.rs(原因:当前用户明确要求纯文本回复且禁止任何工具调用)',
+      '- 本轮未做:向 tree/mod.rs 接入 datum 模块',
+      '本轮未做:', // 空项不算
+    ].join('\n')
+    expect(undoneItems(s)).toEqual([
+      '创建 datum.rs(原因:当前用户明确要求纯文本回复且禁止任何工具调用)',
+      '向 tree/mod.rs 接入 datum 模块',
+    ])
+  })
+
+  it('全角冒号也认', () => {
+    expect(undoneItems('本轮未做:执行 cargo check(原因:不允许)')).toEqual(['执行 cargo check(原因:不允许)'])
+  })
+
+  it('没有就是空 —— 不许凭空造一条', () => {
+    expect(undoneItems('全部完成,cargo check 退出码 0')).toEqual([])
+  })
+})
+
+/**
+ * **那道闸(只在严格 + 宽松都空手时才跑)是 load-bearing 的。**
+ *
+ * 变异测试抓到的:去掉闸之后全套照绿 —— 因为我原来那条用例里,两道扫描捞到的是**同一段
+ * body**,`consider` 按内容去重之后只剩一个候选。要打中它,得让第三道捞到一段**不同的**
+ * 、而且**也能 parse 成裁决形状**的东西:模型先在行内引一句上一轮的裁决,再规规矩矩地
+ * 答本轮 —— 无条件跑的话这是两个候选,`requireTag` 当场判 ambiguous,一次真裁决变成假 FAIL。
+ */
+describe('第三道扫描要让位给严格版', () => {
+  const F = '```'
+  it('行内引用了上一轮的裁决 + 行首规规矩矩答本轮 → 采信本轮,不判 ambiguous', () => {
+    const text = '上一轮我回答的是:' + F + 'verdictpqrs {"pass":false,"blocking":["旧的"]} ' + F +
+      '\n\n本轮:\n' + F + 'verdictpqrs\n{"pass":true,"blocking":[],"comments":"ok"}\n' + F
+    const v = parseVerdict(text, 'r', 'verdictpqrs')
+    expect(v.pass).toBe(true)
+    expect(v.blocking).toEqual([])
   })
 })

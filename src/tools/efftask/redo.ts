@@ -1131,8 +1131,22 @@ export function planRedo(
   // 和菜单**同一份** ctx。不传的话「屏幕上禁用、planRedo 放行」就成立了 ——
   // 一旦 disabled 依赖席位数(测试验证/观察就是这么判的),两条路会给出不同的答案。
   ctx?: RedoContext,
+  /**
+   * `preCloned: true` —— **调用方保证 `input` 已经是它自己的一棵新树,可以就地改。**
+   *
+   * 唯一的合法用法是把多次 `planRedo` **串起来**(`composeRedos`):第 2 条起,输入正是
+   * 上一条刚交出来的 `plan.nodes`,那棵树是这次计算过程中新造的,没有任何人还持有它。
+   * 默认仍然克隆 —— 这个函数对外的承诺是「不改传进来的数组」,而调用点有十几处。
+   *
+   * 为什么值得开这个口子:`structuredClone` 是**全树**深拷贝。.13 那个 run 的 node.md
+   * 合计 86 MiB / 2215 个节点,而符合回溯条件的有 834 个 —— 在 root 上按一次 `b`
+   * 就是几百次全树深拷贝,同步跑在按键处理里。
+   */
+  opts?: { preCloned?: boolean },
 ): RedoPlan | { error: string } {
-  const nodes = input.map(n => structuredClone(n) as TaskNode)
+  const nodes = opts?.preCloned === true
+    ? (input as TaskNode[])
+    : input.map(n => structuredClone(n) as TaskNode)
   const byId = new Map(nodes.map(n => [n.id, n]))
   const target = byId.get(targetId)
   if (!target) return { error: `节点不存在: ${targetId}` }

@@ -1517,6 +1517,47 @@ describe('降级放行相关的字段必须读得回来', () => {
     expect(out1.nodes[0]!.acceptLog[0]!.verdicts[0]!.advice).toEqual(['把 X 改成 Y'])
   })
 
+  /**
+   * **`Verdict.remedy` —— 「加新任务」唯一的载荷,而它在跑机上已经被抹了无数次。**
+   *
+   * .13 qianbase-xtp run 001 的实测:2215 个 node.md 里 `remedy:` 出现 **0 次**,
+   * 而同一个 run 真的发生过 **76 次**「已追加补救子任务」—— 提案产生过、落过盘,
+   * 是每一次 `--resume` 把它从盘上抹掉的(逐字段重建的清单里没有它,读回来是 undefined,
+   * 下一次 persist 又把抹掉的结果写回去)。
+   *
+   * 两个消费者都因此变成空操作:回溯屏那句「集成验收此前提过的补救项」,
+   * 以及 `reviseDecomposition` 的跨轮并集。
+   */
+  it('Verdict.remedy 逐字还在 —— 它是「加新任务」唯一的载荷', () => {
+    const raw = [{
+      ...mk({ id: 'r' }),
+      acceptLog: [{
+        round: 3, step: 'integrate',
+        verdicts: [{
+          role: '集成官', pass: false, blocking: ['缺 datum'], comments: '',
+          remedy: [{ title: '补齐 sem/tree/datum.rs', deps: [] }],
+        }],
+        synthesized: { pass: false, blockingSummary: '缺 datum' },
+      }],
+    }] as unknown as TaskNode[]
+    const out = validateLoadedNodes(raw, OPTS)
+    expect(out.nodes[0]!.acceptLog[0]!.verdicts[0]!.remedy).toEqual([{ title: '补齐 sem/tree/datum.rs', deps: [] }])
+  })
+
+  it('remedy 走 parseRemedy 的同一道校验 —— node.md 是可手工编辑的', () => {
+    const raw = [{
+      ...mk({ id: 'r2' }),
+      acceptLog: [{
+        round: 1, step: 'integrate',
+        verdicts: [{ role: 'x', pass: false, blocking: ['b'], comments: '', remedy: 'boom' }],
+        synthesized: { pass: false, blockingSummary: 'b' },
+      }],
+    }] as unknown as TaskNode[]
+    const out = validateLoadedNodes(raw, OPTS)
+    // 不抛、不留半个坏值:认不出来就当没有(空数组不落字段,老 node.md 逐字不变)。
+    expect(out.nodes[0]!.acceptLog[0]!.verdicts[0]!.remedy).toBeUndefined()
+  })
+
   it('iteration.verification 读的是盘上那个数,不是恒 0', () => {
     const raw = [{
       ...mk({ id: 'b' }),

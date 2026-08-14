@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from 'bun:test'
 import { runBacktrack, type BacktrackRunDeps } from './backtrackRun.js'
-import { NO_CONTRIBUTION_NOTE } from './backtrack.js'
+import { NO_CONTRIBUTION_NOTE, RESCUE_STRANDED_NOTE } from './backtrack.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 import type { RedoPlan } from './redo.js'
 
@@ -265,5 +265,184 @@ describe('落盘', () => {
     const { deps, problems } = spyDeps({ commit: async () => ({ problems: ['工作区没删掉'] }) })
     await runBacktrack(tree(), 'root', NOW, deps)
     expect(problems[0]!.join('\n')).toContain('工作区没删掉')
+  })
+})
+
+/**
+ * **datum 那一格,端到端。**
+ *
+ * 跑机 .13 run 001 的真实形状:父任务的集成验收连着三轮点名 `datum.rs` 不在集成工作区,
+ * 主模型也正确地点了写 datum 的那个子任务 —— 而它 `status: ACCEPTED`、改过一行
+ * Cargo.toml 所以「有贡献」,不在按状态算出来的保守名单里,于是被当成**幻觉 id 丢掉**,
+ * 屏幕上印「主模型点了 1 个不在这棵子树里的任务,已忽略」(一句假话),名单退回保守版,
+ * 重跑了三个不相干的兄弟,真凶一次都没动。
+ */
+describe('主模型点名的 ACCEPTED 子任务', () => {
+  const datumTree = (): TaskNode[] => [
+    mk('P', {
+      kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01', 'P/02', 'P/03'],
+      acceptLog: [{
+        round: 3, step: 'integrate',
+        verdicts: [{ role: '测试', pass: false, blocking: ['datum.rs 不在集成工作区'], comments: '' }],
+        synthesized: { pass: false, blockingSummary: 'datum.rs 不在集成工作区' },
+      }],
+    }),
+    mk('P/01', { parentId: 'P', kind: 'executable', status: 'ACCEPTED', execStatus: '做完了' }),
+    mk('P/02', {
+      parentId: 'P', kind: 'executable', status: 'ACCEPTED',
+      execStatus: '已登记依赖。\n本轮未做:创建 datum.rs',
+      undone: ['创建 datum.rs'],
+    }),
+    mk('P/03', { parentId: 'P', kind: 'executable', status: 'ACCEPTED', execStatus: `(注:该节点${NO_CONTRIBUTION_NOTE})` }),
+  ]
+
+  it('它在这棵子树里,就不许被当成幻觉丢掉', async () => {
+    const { deps, problems } = spyDeps({
+      map: async () => [{ nodeId: 'P/02', guidance: '这次真的把 datum.rs 写出来' }],
+    })
+    const out = await runBacktrack(datumTree(), 'P', NOW, deps)
+    expect(out?.entries.map(e => e.nodeId)).toEqual(['P/02'])
+    expect(out?.degraded).toBeUndefined()
+    expect(problems.flat().join('\n')).not.toContain('不在这棵子树里')
+  })
+
+  it('模型缺席时,保守名单也收得到它(自陈未做那条判据)', async () => {
+    const { deps } = spyDeps()
+    const out = await runBacktrack(datumTree(), 'P', NOW, deps)
+    expect(out?.entries.map(e => e.nodeId).sort()).toEqual(['P/02', 'P/03'])
+  })
+
+  it('编出来的 id 照旧丢掉 —— 白名单一个字没松', async () => {
+    const { deps, problems } = spyDeps({ map: async () => [{ nodeId: '别的树/x' }] })
+    const out = await runBacktrack(datumTree(), 'P', NOW, deps)
+    expect(out?.entries.map(e => e.nodeId)).not.toContain('别的树/x')
+    expect(problems.flat().join('\n')).toContain('改用保守名单')
+  })
+})
+
+/**
+ * **子任务全绿的父任务** —— 跑机上 34 个。此前这一格会让整次回溯变成一行
+ * 「回溯未执行:这是拆分任务,它自己没有执行环节」,同一批里真正该重跑的一个都不动。
+ */
+describe('拆分型目标 + 空保守名单', () => {
+  const t = (): TaskNode[] => [
+    mk('R', { kind: 'decompose', status: 'WAITING_CHILDREN', childIds: ['R/P1', 'R/P2'] }),
+    mk('R/P1', {
+      parentId: 'R', kind: 'decompose', status: 'ACCEPTED', childIds: ['R/P1/a'],
+      acceptLog: [integrateFail('合起来没达成父目标')], revised: true,
+    }),
+    mk('R/P1/a', { parentId: 'R/P1', kind: 'executable', status: 'ACCEPTED', execStatus: '做完了' }),
+    mk('R/P2', { parentId: 'R', kind: 'decompose', status: 'ACCEPTED', childIds: ['R/P2/a'], acceptLog: [integrateFail('缺 X')] }),
+    mk('R/P2/a', { parentId: 'R/P2', kind: 'executable', status: 'ACCEPTED', execStatus: `(注:该节点${NO_CONTRIBUTION_NOTE})` }),
+  ]
+
+  it('不再掀翻整批:P1 走重新裁决,P2 的子任务照样重跑', async () => {
+    const { deps } = spyDeps()
+    const out = await runBacktrack(t(), 'R', NOW, deps)
+    expect(out?.entries.sort((a, b) => a.nodeId.localeCompare(b.nodeId))).toEqual([
+      { nodeId: 'R/P1', entry: 'integrate' },
+      { nodeId: 'R/P2/a', entry: 'execute' },
+    ])
+    expect(out?.skipped).toEqual([])
+  })
+
+  it('重新开放补救拆分 —— 这才是这一格买到的「加新任务」', async () => {
+    const { deps, started } = spyDeps()
+    const out = await runBacktrack(t(), 'R', NOW, deps)
+    expect(out?.rearmed).toContain('R/P1')
+    expect(started[0].find(n => n.id === 'R/P1')?.revised).toBe(false)
+  })
+})
+
+/**
+ * 算不出来的那一条:**跳过 + 说出来**,而不是整批放弃,也不是静默。
+ */
+describe('部分跳过', () => {
+  /**
+   * 真实的「算不出来」是**本次配置**造成的:`redoOptions` 的 `runsNothing` 会把一条
+   * 「本次跳过了这个环节」的入口整个禁用,而 `planRedo` 照同一份判据拒绝。
+   * 这一趟(.13 run 001)就跳过了质疑修复/测试验证/验收/观察四关。
+   */
+  it('一条算不出来 → 跳过它并说出来,其余照做', async () => {
+    const nodes = [
+      mk('root', { childIds: ['root/00-a', 'root/01-b'], status: 'BLOCKED', kind: 'decompose', acceptLog: [integrateFail()] }),
+      mk('root/00-a', { parentId: 'root', status: 'BLOCKED', kind: 'executable' }),
+      // 这一个的 kind 还是 unknown → entryFor 给 'plan',而下面的 ctx 说这一趟不跑分析。
+      mk('root/01-b', { parentId: 'root', status: 'BLOCKED', kind: 'unknown' }),
+    ]
+    const { deps, problems } = spyDeps()
+    const out = await runBacktrack(
+      nodes, 'root', NOW, deps,
+      n => (n.id === 'root/01-b' ? { skipSteps: ['plan'] as const } : undefined),
+    )
+    expect(out?.entries.map(e => e.nodeId)).toEqual(['root/00-a'])
+    expect(out?.skipped.join()).toContain('root/01-b')
+    // 说出来:这条规矩的全部前提。commitRedo 不看 plan.warnings,所以必须由这里推上去。
+    expect(problems.flat().join('\n')).toContain('root/01-b')
+  })
+})
+
+/**
+ * 变异测试补上的两条 —— 我原来的探针没打在点上。
+ */
+describe('变异测试补漏', () => {
+  /**
+   * **血统 = 整棵子树。** 上一版探针只造了「模型点的正好也在保守名单里」那种输入,
+   * 于是把 `descendantsOf` 那一行剪掉之后全套照绿。真实形状是模型点了一个**更深的**
+   * 节点:集成验收的意见里点名的是文件,而那个文件属于孙子节点。
+   */
+  it('模型点名一个更深的、干干净净的孙子节点 —— 不许当幻觉丢掉', async () => {
+    const nodes = [
+      mk('P', {
+        kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01'],
+        acceptLog: [{
+          round: 1, step: 'integrate',
+          verdicts: [{ role: 'r', pass: false, blocking: ['pgwire/types.rs 不在集成工作区'], comments: '' }],
+          synthesized: { pass: false, blockingSummary: 'pgwire/types.rs 不在集成工作区' },
+        }],
+      }),
+      // 中间那层干干净净:它不在 suspects 里。
+      mk('P/01', { parentId: 'P', kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01/aa'], execStatus: '做完了' }),
+      // 孙子:同样已验收、同样有贡献 —— 只有集成验收的意见知道是它。
+      mk('P/01/aa', { parentId: 'P/01', kind: 'executable', status: 'ACCEPTED', execStatus: '做完了' }),
+    ]
+    const { deps, problems } = spyDeps({ map: async () => [{ nodeId: 'P/01/aa', guidance: '把 types.rs 写出来' }] })
+    const out = await runBacktrack(nodes, 'P', NOW, deps)
+    expect(out?.entries.map(e => e.nodeId)).toEqual(['P/01/aa'])
+    expect(problems.flat().join('\n')).not.toContain('不在这棵子树里')
+  })
+
+  /**
+   * **被跳过的节点不许清证据。** `markBacktracked` 的 `reran` 闸就是为这件事存在的:
+   * 一条捞不回来的 ref,证据被抹掉之后下一次按 `b` 再也找不到它,那条 ref 就此彻底失联。
+   * 上一版探针里被跳过的那个节点身上根本没有证据,所以剪掉闸也没人红。
+   */
+  it('算不出来而被跳过的节点,身上的「捞不回来」证据要原样留着', async () => {
+    const stranded = {
+      execStatus: `做完了\n(注:该节点${RESCUE_STRANDED_NOTE}(还差 2 处))`,
+      rescueStranded: [{ ref: 'efftask/001/salvage/ab12', why: '合不上', at: NOW, remaining: 2 }],
+    }
+    const nodes = [
+      mk('root', {
+        childIds: ['root/00-a', 'root/01-b'], status: 'BLOCKED', kind: 'decompose',
+        acceptLog: [integrateFail()],
+      }),
+      mk('root/00-a', { parentId: 'root', status: 'BLOCKED', kind: 'executable' }),
+      /**
+       * 它自己就是一个 target(捞不回来 —— 而 `backtrackCanClaim` 要求执行型叶子,
+       * 探针第一版写成 `kind:'unknown'`,于是它根本不是 target,变异照样活着)。
+       * 这一趟它算不出来:本次配置跳过了执行环节 → `planRedo` 判 disabled。
+       */
+      mk('root/01-b', { parentId: 'root', status: 'ACCEPTED', kind: 'executable', ...stranded }),
+    ]
+    const { deps, started } = spyDeps()
+    const out = await runBacktrack(
+      nodes, 'root', NOW, deps,
+      n => (n.id === 'root/01-b' ? { skipSteps: ['execute'] as const } : undefined),
+    )
+    expect(out?.skipped.join()).toContain('root/01-b')
+    const after = started[0].find(n => n.id === 'root/01-b')!
+    expect(after.rescueStranded).toBeDefined()
+    expect(after.execStatus).toContain(RESCUE_STRANDED_NOTE)
   })
 })

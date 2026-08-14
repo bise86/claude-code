@@ -158,6 +158,58 @@ function fixEscapes(s: string): string {
  */
 const LENIENT_FENCE_RE = /(?:^|\n)[ \t]*```([A-Za-z]+)?[ \t]*\r?\n?([\s\S]*?)\n?[ \t]*```/g
 
+/** 正则里的元字符。tag 由调用方给,不假定它一定是 `[a-z]+`。 */
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/**
+ * **开头围栏不在行首的那一档 —— 从标记本身起扫。**
+ *
+ * 跑机实测(.13 qianbase-xtp run 001,2215 个节点):222 个节点身上留着
+ * 「未按要求输出本轮的裁决代码块;按不通过处理」,而其中 **145 个的回复里明明就有**
+ * 一个带本次标记的围栏 —— 只是模型把它接在上一句话屁股后面:
+ *
+ *     …我将读取模块根以核实 Datum 接线状态。```verdictjklyuyvw
+ *     {"pass":false,"blocking":[…]}
+ *
+ * `FENCE_RE` 和 `LENIENT_FENCE_RE` 的开头都锚在行首(`(?:^|\n)[ \t]*`),两道都扫不到它。
+ * 而裁决关口是 `requireTag` **失败关闭**的,于是一次**真实的、内容完整的**裁决被读成
+ * 「他没答」:那一轮照样算 FAIL、照样吃掉一格 `maxIterations`,而 `blockingSummary` 从
+ * 三条实测出来的阻断意见变成一句格式抱怨 —— 它随后被写进降级记录、写进返工提示词、
+ * 写进回溯注入给执行者的那句话。一个正则的锚点,污染了整条链上的每一份证据。
+ *
+ * ## 为什么放开开头锚点是安全的,而当初锚它是对的
+ *
+ * 锚开头治的是**配对**:全局扫描下,回复里任何一个游离的 ``` 都会和答案自己的开头围栏
+ * 配成一对,把答案吞掉(注释见 FENCE_RE 上方)。这一道不做全局配对 —— 它**从标记本身
+ * 起扫**,而标记是这次调用一次性的、不可猜的 nonce(`answerTag`)。防伪造的那道锁一直是
+ * nonce,不是行首:被引用进提示词的证据(别的 agent 写的 execStatus)猜不到这一串,
+ * 所以「带着本次标记」这件事本身就把它和引文分开了。
+ *
+ * 三条边界:
+ *  - **只在严格 + 宽松两道都没捞到 tagged 块时才跑**(和 LENIENT 那一道同一个闸);
+ *  - **只认带标记的**,generic 一概不碰 —— 宽松化 generic 正是当年被 JSON 里的裸围栏骗到的那个;
+ *  - 标记后面必须是**边界**(`(?![A-Za-z0-9_])`):否则期望 `verdictab` 时,
+ *    一个 ```verdictabcd 块会被当成本次答案。
+ *
+ * 顺带把**收尾围栏整个缺席**那一档也收进来(截断、或模型忘了收尾):从标记之后一直取到
+ * 文末,交给 `consider` 去 parse —— 它要么 parse 得出一个平衡的对象,要么原样丢弃。
+ * 这一档不额外放松任何判据:`sliceTopLevelObject` 的「不许从数组里挖元素」照样管着。
+ */
+function taggedFromOpening(text: string, tag: string): string[] {
+  const open = new RegExp('```[ \\t]*' + escapeRe(tag) + '(?![A-Za-z0-9_])[ \\t]*\\r?\\n?', 'gi')
+  // 收尾的判据和 FENCE_RE 逐字一致:行首(可缩进)或行尾。两边共用一个含义,
+  // 各写一份的话,哪天改了其中一处,这一道会和主路径对同一份回复给出不同的边界。
+  const close = /(?:\r?\n[ \t]*```|[ \t]*```[ \t]*(?=\r?\n|$))/g
+  const out: string[] = []
+  for (const m of text.matchAll(open)) {
+    const start = m.index + m[0].length
+    close.lastIndex = start
+    const c = close.exec(text)
+    out.push(text.slice(start, c ? c.index : text.length))
+  }
+  return out
+}
+
 function collectCandidates(text: string, preferTag?: string): Candidate[] {
   const tagged: string[] = []
   const generic: string[] = []
@@ -175,6 +227,9 @@ function collectCandidates(text: string, preferTag?: string): Candidate[] {
       if ((m[1] ?? '').toLowerCase() === preferTag.toLowerCase()) tagged.push(m[2])
     }
   }
+  // 两道都没捞到带标记的块 → 从标记本身起扫(开头围栏不在行首 / 收尾围栏缺席)。
+  // 见 taggedFromOpening:跑机上 145 个节点的真裁决死在这一格。
+  if (preferTag && tagged.length === 0) tagged.push(...taggedFromOpening(text, preferTag))
   const out: Candidate[] = []
   const seen = new Set<string>()
   const consider = (raw: string, isTagged: boolean): void => {
@@ -432,6 +487,31 @@ export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
   return { kind, plan, children, parseFailed: obj === null && taggedBlockBroken(text, tag), structured: obj !== null }
 }
 
+/**
+ * **协议失败**那两条 blocking —— 它们说的是「这份回复没按格式答」,不是「这份产出哪里不对」。
+ *
+ * 提成常量是因为下游要按它们分流,而各写一份字面量的后果是现成的:哪天改一个字,
+ * 下游那条过滤就静默失效,而它挡的正是「把一句格式抱怨当成整改要求发给执行者」。
+ *
+ * 跑机实测(.13 run 001):242 个集成验收判不通过的节点里,**222 个**的最后一条记录是
+ * `PROTOCOL_NO_BLOCK`,于是降级理由、返工提示词、回溯注入的那句话全都变成了
+ * 「未按要求输出本轮的裁决代码块」—— 而真正的三条阻断意见还躺在前几轮的记录里。
+ */
+export const PROTOCOL_NO_BLOCK = '未按要求输出本轮的裁决代码块;按不通过处理'
+export const PROTOCOL_AMBIGUOUS = '回复中有多个裁决块,无法判定哪个是本轮结论;请只输出一个本轮要求的裁决块'
+/**
+ * 这一条意见是不是「协议失败」而不是对产出的判断。
+ *
+ * **按包含判,不是相等判**,而这不是宽松、是必需:`synthesizeVerdicts` 合成出来的
+ * `blockingSummary` 会给每一条加上席位抬头(跑机上逐字是
+ * `[测试] 未按要求输出本轮的裁决代码块;按不通过处理`)。按相等判的话,这个函数对
+ * **真实数据里最常见的那一条**恒为假 —— 而那正是它要挡的东西。
+ * 反过来的误伤面很窄:一条把这句话原样抄进去的意见,本身讲的也是格式。
+ */
+export function isProtocolBlocking(s: string): boolean {
+  return s.includes(PROTOCOL_NO_BLOCK) || s.includes(PROTOCOL_AMBIGUOUS)
+}
+
 export function parseVerdict(text: string, role: string, tag?: string): Verdict {
   // FAIL CLOSED. A verdict is the one output where guessing wrong in the "pass"
   // direction lets unfinished work through, so anything short of one unmistakable
@@ -451,7 +531,7 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
       pass: false,
       // Do NOT name the tag here: this string becomes blockingSummary, which the rework
       // prompt shows the EXECUTOR. Handing it a live tag is handing it the forgery key.
-      blocking: ['未按要求输出本轮的裁决代码块;按不通过处理'],
+      blocking: [PROTOCOL_NO_BLOCK],
       comments: capText(text.trim(), 2000),
     }
   }
@@ -459,7 +539,7 @@ export function parseVerdict(text: string, role: string, tag?: string): Verdict 
     return {
       role,
       pass: false,
-      blocking: ['回复中有多个裁决块,无法判定哪个是本轮结论;请只输出一个本轮要求的裁决块'],
+      blocking: [PROTOCOL_AMBIGUOUS],
       comments: capText(text.trim(), 2000),
     }
   }
@@ -661,6 +741,40 @@ export function parseNewChildren(o: Record<string, unknown>): NewChildSpec[] {
       deps: Array.isArray(c.deps) ? c.deps.filter((d): d is string => typeof d === 'string').slice(0, MAX_NEW_CHILDREN).map(d => capText(d, 200)) : [],
     }))
     .filter(c => c.title.length > 0)
+}
+
+/**
+ * 执行者自陈没做的那几件,从 `execStatus` 里逐行摘出来。
+ *
+ * 措辞由 `strictness.ts` 的执行侧那一段规定:「不做的每一件,在 execStatus 里**单起一行**写
+ * 『本轮未做:…(原因)』」。所以这里按行认,而不是在整段里搜关键词 —— 后者会把
+ * 「本轮未做的判断标准是…」这种叙述句也收进来。
+ *
+ * 两条容错都是照着真实回复加的(.13 run 001,610 个节点写过这几行):
+ *  - 冒号半角/全角都认(实测同一份报告里两种都出现);
+ *  - 允许 markdown 列表前缀(`- 本轮未做:…`)—— 提示词说「单起一行」,没说不许带项目符号。
+ *
+ * 走 `capBlockingList` 的同一对上限:这份清单每次 commit 都会被写进 node.md,
+ * 而它的来源是模型自由文本。
+ */
+export const UNDONE_PREFIX = '本轮未做'
+export function undoneItems(execStatus: string): string[] {
+  const out: string[] = []
+  for (const raw of execStatus.split('\n')) {
+    const line = raw.trim().replace(/^[-*·•]\s*/, '')
+    if (!line.startsWith(UNDONE_PREFIX)) continue
+    /**
+     * **冒号是必需的,不是可选的。** 探针第一版就抓到了:「本轮未做**的判断标准是**:…」
+     * 这种叙述句同样以这四个字开头,而按前缀切会把它收成一条「未做项」,内容是
+     * 「的判断标准是:…」—— 它随后会被印进集成验收的证据段,并让回溯把这个节点拉回来重跑。
+     */
+    const rest = line.slice(UNDONE_PREFIX.length)
+    const m = /^[ \t]*[:：][ \t]*/.exec(rest)
+    if (!m) continue
+    const item = rest.slice(m[0].length).trim()
+    if (item.length > 0) out.push(item)
+  }
+  return capBlockingList(out, '自陈未做')
 }
 
 export function parseExecOutput(

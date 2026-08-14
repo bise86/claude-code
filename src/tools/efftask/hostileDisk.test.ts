@@ -143,6 +143,12 @@ function richNode(): TaskNode {
    */
   n.rescueStranded = [{ ref: 'efftask/1/salvage/ab12cd34', why: '还差 2 处', at: '2026-08-13T00:00:00Z', remaining: 2 }]
   /**
+   * 执行者自陈没做的那几件。写坏成非数组的后果和 `rescueStranded` 同因,而消费者更靠前:
+   * `integratePrompt` 渲染子任务证据时会 `.join(' / ')`,那是**每一次集成验收的必经之路**
+   * —— 一个 `undone: boom` 会让整棵子树的最终裁决在恢复之后当场抛。
+   */
+  n.undone = ['创建 datum.rs(原因:被限制为纯文本回复)']
+  /**
    * 「真的往集成分支放过东西」。写坏成假值的后果**方向朝坏**:
    * 一次正常的 `--retry-blocked`(节点早就合过、这一次没有新东西)会被
    * 「没有合并提交就不算完成」那条闸判成失败,而它明明是好的。

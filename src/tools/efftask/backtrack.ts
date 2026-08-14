@@ -1,3 +1,4 @@
+import { isProtocolBlocking } from './parseOutput.js'
 import { attachGuidance, descendantsOf, planRedo, type RedoContext, type RedoPlan } from './redo.js'
 import type { TaskNode } from './types.js'
 
@@ -146,6 +147,76 @@ export function strandedRefsOf(
     }))
 }
 
+/**
+ * 这个节点**自己说**还欠哪几件(`TaskNode.undone`)。载荷,读出来一律校验 ——
+ * 和 `strandedRefsOf` 同一条理由:`validateLoadedNodes` 不认识这个字段,一个手改坏的
+ * node.md 上 `undone: boom` 会让 `.map` 当场抛在恢复链路里。
+ */
+export function undoneOf(n: TaskNode): string[] {
+  const raw: unknown = n.undone
+  if (!Array.isArray(raw)) return []
+  return raw.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+}
+
+/** 执行者自陈还欠东西 —— 「有贡献」不等于「做完了」。 */
+export function selfReportedUndone(n: TaskNode): boolean {
+  return undoneOf(n).length > 0
+}
+
+/**
+ * **这个节点的集成验收到底说了什么** —— 一段能直接注入执行提示词的整改要求。
+ *
+ * 判据从「最后一条记录的 `blockingSummary`」换成**跨轮汇总**,理由是跑机上量出来的:
+ * 那 222 个节点的最后一条记录逐字是「未按要求输出本轮的裁决代码块」(一次协议失败),
+ * 而真正的意见 —— 「datum.rs 不在集成工作区」「cargo check 126 errors」—— 躺在前几轮里,
+ * 以及 `degraded[].advice` 里。照旧只读最后一条的话,回溯注入给执行者的第一句话是
+ * 一句**关于回复格式的抱怨**,而他手上根本没有那份回复。
+ *
+ * 优先级(先具体、后概括;新的在前):
+ *  1. 各轮 `verdicts[].blocking` —— 剔掉协议失败那两条(见 `isProtocolBlocking`);
+ *  2. 各轮 `verdicts[].advice`(「接下来该怎么改」);
+ *  3. `degraded[].advice`(降级放行时随节点带下去的那一份,phase = integrate);
+ *  4. 一条都凑不出来时,才退回 `blockingSummary` —— 哪怕它是句格式抱怨,
+ *     也好过给执行者一句空话。
+ */
+export function integrateFeedback(n: TaskNode): string {
+  const out: string[] = []
+  const push = (s: string): void => {
+    const t = s.trim()
+    if (t.length === 0 || isProtocolBlocking(t) || out.includes(t)) return
+    out.push(t)
+  }
+  const records = n.acceptLog.filter(r => r.step === 'integrate').slice().reverse()
+  for (const rec of records) for (const v of rec.verdicts) for (const b of v.blocking) push(b)
+  for (const rec of records) for (const v of rec.verdicts) for (const a of v.advice ?? []) push(a)
+  for (const d of n.degraded ?? []) if (d.phase === 'integrate') for (const a of d.advice) push(a)
+  if (out.length === 0) {
+    /**
+     * 各轮的 blocking/advice 都空(老记录常常只有一句合成摘要)—— 那句摘要仍然是真意见,
+     * 照发。**只有它本身就是协议失败时才不发**:见下面那一段。
+     */
+    const summary = (lastIntegrateRecord(n)?.synthesized.blockingSummary ?? '').trim()
+    if (summary.length > 0 && !isProtocolBlocking(summary)) return clipItem(summary)
+    /**
+     * **一条真意见都没凑出来。**
+     *
+     * 到这里只剩两种可能:记录里全是协议失败(那 222 个节点的形状),或者裁决根本没留下
+     * 内容。两种都**不能**把 `blockingSummary` 原样发出去 —— 「未按要求输出本轮的裁决
+     * 代码块」发给一个执行者,他手上根本没有那份回复,读到的是一句他无法照做的话
+     * (探针第一版试过发空串,那更糟:屏幕承诺「把意见注入执行提示词」而注入的是空气)。
+     *
+     * 给一句**他能照做**的:回到父目标的验收点上逐条自查。
+     */
+    return '上一次集成验收没有留下可用的整改意见(那几轮的裁决没有按格式返回,内容没能保存下来)。'
+      + '这一次请对照父任务的验收点逐条自查,把还没落到文件里的那几项做出来。'
+  }
+  // 有界:这一段会被逐字塞进执行提示词,而它的来源是 N 轮 × M 席的自由文本。
+  return out.slice(0, MAX_FEEDBACK_ITEMS).map(s => clipItem(s)).join('\n')
+}
+/** 注入执行提示词的那一段,最多几条、每条多长。 */
+const MAX_FEEDBACK_ITEMS = 12
+const clipItem = (s: string): string => (s.length > 600 ? `${s.slice(0, 600)}…` : s)
+
 export function outputMissing(n: TaskNode): boolean {
   if (!n.execStatus.includes(NO_CONTRIBUTION_NOTE) && !n.blockedReason.includes(NO_CONTRIBUTION_NOTE)) return false
   // 还在跑的不算 —— 它本来就还没轮到贡献。
@@ -219,21 +290,92 @@ export function backtrackScope(
        * 是这件事试过一遍,不是这个节点这辈子被回溯过几次。
        */
       level: !failed && !missing ? 1 : levelFor(n),
-      blocking: rec?.synthesized.blockingSummary ?? whyWithoutVerdict(n, missing, stranded),
+      /**
+       * 意见走 `integrateFeedback` 的跨轮汇总,不再只取最后一条 `blockingSummary` ——
+       * 那一条在跑机上 222 次是「未按要求输出本轮的裁决代码块」。
+       */
+      blocking: failed ? integrateFeedback(n) : whyWithoutVerdict(n, missing, stranded),
       remedy,
       /**
-       * 保守名单:**没验收通过的子任务** + **产出丢了的子任务**。
+       * 保守名单:**没验收通过的** + **产出丢了的** + **自己说还没做完的**子任务。
        *
-       * 刻意**不**收「已验收但工作区已不在」—— 那正是按过 `c` 键之后的**正常**状态,
-       * 收进来会把一大片健康的子树重执行一遍。
+       * 第三条是这次补上的,而它正是 datum 那一格:子任务 `status: ACCEPTED`、
+       * 改过一行 `Cargo.toml` 所以「有贡献」、`acceptLog` 空(这一趟按用户要求关掉了验收),
+       * 而它自己的 execStatus 写着「本轮未做:创建 datum.rs」—— 任务的全部内容。
+       * 前两条判据一条都认不出它,于是父任务的集成验收连着三轮点名 datum.rs 不在,
+       * 而回溯的保守名单里**没有它**。
+       *
+       * 只在这里收(而不是把「自陈未做」升格成 target 判据):它的血统限定在
+       * 「父任务的集成验收已经判过不通过」之内。全 run 有 610 个节点自陈未做、607 个
+       * 已 ACCEPTED,升格的话按一次 `b` 会把它们连同健康的子树一起重执行一遍 ——
+       * 而初级档**明确允许**「验收点之外的边界、额外测试、重构这一轮不做」。
+       *
+       * 刻意**不**收「已验收但工作区已不在」—— 那正是按过 `c` 键之后的**正常**状态。
        */
       suspects: n.childIds.filter(id => {
         const c = byId.get(id)
-        return c !== undefined && (c.status !== 'ACCEPTED' || outputMissing(c))
+        return c !== undefined && (c.status !== 'ACCEPTED' || outputMissing(c) || selfReportedUndone(c))
       }),
     })
   }
   return { target, targets }
+}
+
+/** 回溯能派出去的三种重入点。 */
+export type BacktrackEntry = 'execute' | 'plan' | 'integrate'
+
+/**
+ * **这个节点该从哪一关重来 —— 按它的形态定,不按位置定。**
+ *
+ * 这一段以前是一行 `level === 2 ? 'plan' : 'execute'`,而它在跑机上有 **34 个**节点会当场
+ * 掀翻整次回溯:一个「集成验收没通过、子任务却全绿」的拆分节点,兜底名单里只剩它自己,
+ * `planRedo(entry:'execute')` 对拆分任务判 disabled,`composeRedos` 一错**整条不做** ——
+ * 屏幕上一行「回溯未执行:这是拆分任务,它自己没有执行环节」,同一批里那些真正该重跑的
+ * 节点**一个都没动**。
+ *
+ * 三条对应关系,每一条都对着 `redoOptions` 的 disabled 判据:
+ *  - **执行型** → `execute`:重跑执行环节并注入意见,这是阶梯第 1 级的本义;
+ *  - **拆分型(有子任务)** → `integrate`:它自己不干活,能重来的只有那次裁决。
+ *    单独重判一次并不会改变证据(`reviseDecomposition` 的注释里写着这件事),所以调用方
+ *    **必须同时解开 `revised` 闩** —— 那才是这一格真正买到的东西:下一轮触顶时可以
+ *    **长出补救子任务**,也就是用户要的「加新任务」;
+ *  - **没有子任务的非执行型**(`kind: 'unknown'`,或子任务被删光的拆分节点)→ `plan`:
+ *    它连方案都还没有,`execute`/`integrate` 两条都是 disabled 的。
+ *
+ * 第 2 级恒走 `plan`(完全重做并重新拆分)—— 那是阶梯的终点,再往上没有更贵的手段。
+ */
+export function entryFor(node: TaskNode, level: BacktrackLevel): BacktrackEntry {
+  if (level === 2) return 'plan'
+  if (node.kind === 'executable' && node.childIds.length === 0) return 'execute'
+  if (node.childIds.length > 0) return 'integrate'
+  return 'plan'
+}
+
+/**
+ * **保守名单**:主模型缺席(或它一条有效的都没给)时,这一趟按谁来跑。
+ *
+ * 每个目标 = 它的 suspects;一个 suspect 都没有的目标(叶子,或者子任务全绿的父任务)
+ * 就是它自己。重入点由 `entryFor` 按形态定。
+ *
+ * **导出它是为了让确认屏和执行侧共用同一份**。这个仓库为「两边各算一次」付过账:
+ * 用户是照着屏幕按下的确认,而实际发生的可以是另一回事(`cleanupWorktrees`、
+ * `backtrackCanClaim` 都为同一条规矩写过注释)。
+ */
+export function conservativeEntries(
+  targets: readonly BacktrackTarget[], byId: ReadonlyMap<string, TaskNode>,
+): { nodeId: string; entry: BacktrackEntry; level: BacktrackLevel }[] {
+  const out: { nodeId: string; entry: BacktrackEntry; level: BacktrackLevel }[] = []
+  const seen = new Set<string>()
+  for (const t of targets) {
+    for (const id of t.suspects.length > 0 ? t.suspects : [t.node.id]) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      const n = byId.get(id)
+      if (!n) continue
+      out.push({ nodeId: id, entry: entryFor(n, t.level), level: t.level })
+    }
+  }
+  return out
 }
 
 /**
@@ -308,14 +450,33 @@ function lastIntegrateRecord(n: TaskNode): TaskNode['acceptLog'][number] | undef
  * 定序按 id 升序:顺序来自模型返回的数组,而 `reopenPropagatedBlocks` 是全树不动点 ——
  * 同一份名单换个顺序会得到不同的树,那是不可测的。
  */
+/**
+ * 合成的结果 = 一份 `RedoPlan`,外加**这一趟哪几条没派出去**。
+ *
+ * 单独一个字段而不是让调用方去 `warnings` 里认字符串:`markBacktracked` 的 `reran` 闸
+ * 要靠它 —— 给一个**没有被重跑**的节点清掉证据(`rescueStranded` 的注记和载荷),
+ * 那条 ref 就此彻底失联,而这正是那个闸当初存在的理由。
+ */
+export interface ComposedRedo extends RedoPlan {
+  skipped: { nodeId: string; reason: string }[]
+}
+
 export function composeRedos(
   nodes: readonly TaskNode[],
-  entries: readonly { nodeId: string; entry: 'execute' | 'plan'; guidance?: string }[],
+  entries: readonly { nodeId: string; entry: BacktrackEntry; guidance?: string }[],
   now: string,
   ctxFor?: (node: TaskNode) => RedoContext | undefined,
-): RedoPlan | { error: string } {
+): ComposedRedo | { error: string } {
   const ordered = [...entries].sort((a, b) => (a.nodeId < b.nodeId ? -1 : a.nodeId > b.nodeId ? 1 : 0))
   let tree: TaskNode[] = [...nodes]
+  /** 已经算成功过几条 —— 决定「一条都没成」时报错还是「部分成功」时带着警告继续。 */
+  let applied = 0
+  const skipped: { nodeId: string; reason: string }[] = []
+  /** 跳过一条:警告给人看,结构化那份给 `markBacktracked` 的 `reran` 闸用。 */
+  const skip = (nodeId: string, reason: string): void => {
+    skipped.push({ nodeId, reason })
+    merged.warnings.push(`跳过 ${nodeId}:${reason}`)
+  }
   const merged: RedoPlan = {
     nodes: tree,
     deleted: [],
@@ -329,20 +490,42 @@ export function composeRedos(
   }
   for (const e of ordered) {
     const node = tree.find(n => n.id === e.nodeId)
-    if (!node) return { error: `节点不存在: ${e.nodeId}` }
-    const one = planRedo(tree, e.nodeId, e.entry, now, ctxFor?.(node))
+    if (!node) {
+      skip(e.nodeId, '这棵树里找不到这个节点')
+      continue
+    }
+    // `preCloned`:第一条之外的每一条都跑在**上一条刚交出来的那棵新树**上,而那棵树是
+    // 我们自己的。少了它,N 条 entry = N 次全树 `structuredClone` —— .13 那个 run 的
+    // node.md 合计 86 MiB、2215 个节点,而符合回溯条件的有 834 个:在 root 上按一次 `b`
+    // 就是几百次全树深拷贝,同步跑在按键处理里,界面当场僵住几分钟。
+    const one = planRedo(tree, e.nodeId, e.entry, now, ctxFor?.(node), { preCloned: applied > 0 })
     /**
-     * **任何一次算不出来,整条不做。**
+     * **算不出来的那一条跳过,不再整条不做。**
      *
-     * `planRedo` 是纯函数,到这里盘上一个字节都没动过。做半套的后果是一棵**部分回溯**的树
-     * 落了盘,而屏幕上那份清单说的是全部 —— 用户没有任何办法知道少了哪几个。
+     * 原来的规矩是「任何一次出错整条不做」,理由是「做半套 → 一棵部分回溯的树落了盘,
+     * 而屏幕上那份清单说的是全部」。那个理由成立,但它要的是**说出来**,不是全盘放弃 ——
+     * 而全盘放弃在跑机上是有代价的:34 个「集成验收没通过、子任务却全绿」的拆分节点里
+     * 只要有一个落进这一批,同一批里所有真正该重跑的节点**一个都不会动**,
+     * 用户看到的只有一行「回溯未执行」。
+     *
+     * 所以改成:**跳过这一条 + 逐条记进 warnings**(它会一路上到确认屏和问题列表),
+     * 而「一条都没成功」仍然是错误 —— 那种情况下没有任何东西可以落盘。
      */
-    if ('error' in one) return { error: `${e.nodeId}: ${one.error}` }
+    if ('error' in one) {
+      skip(e.nodeId, one.error)
+      continue
+    }
+    applied++
     if (e.guidance && e.guidance.trim().length > 0) {
       const t = one.nodes.find(n => n.id === e.nodeId)
       // 找不到在这条路上不可达(planRedo 成功就意味着它在),但静默丢掉注入的那句话
       // 是这个仓库反复付过代价的那一类。
-      if (t) attachGuidance(t, 'execute', e.guidance)
+      //
+      // **写到哪个键上跟着入口走**,判据和 `guidanceScopeFor` 逐字相同(任务重做是整节点、
+      // 阶段重做是那个环节)。原来无条件写 `'execute'`,而这三条入口现在各不相同:
+      // 一个走 `integrate` 的拆分节点自己**不跑执行环节**,那句意见就此谁也读不到 ——
+      // 而它恰恰是要发给集成验收席位的整改要求。
+      if (t) attachGuidance(t, e.entry === 'plan' ? 'all' : e.entry, e.guidance)
       else merged.warnings.push(`${e.nodeId} 的补充提示词没能写上:回溯后的树里找不到它`)
     }
     tree = one.nodes
@@ -361,7 +544,20 @@ export function composeRedos(
     for (const a of one.reopenedAncestors) if (!merged.reopenedAncestors.includes(a)) merged.reopenedAncestors.push(a)
     for (const w of one.warnings) if (!merged.warnings.includes(w)) merged.warnings.push(w)
   }
-  return merged
+  /**
+   * **一条都没算成 = 错误**,而不是「一次成功的空回溯」。
+   *
+   * 这一格不是理论上的:入口全被本次配置跳过(`runsNothing`)、名单里全是拆分节点、
+   * 树对不上 —— 三条都会走到这里。返回一份空 plan 的话,调用方会照常落盘、上屏、重启,
+   * 而屏幕上写着「已回溯 N 个」。第一条 warning 带着真原因交出去。
+   */
+  // 空名单**不是错误**:纯函数收到「没有要做的事」就原样交回去(老契约,别处也依赖它)。
+  // 「给了名单、一条都没算成」才是错误 —— 那时没有任何东西可以落盘,而调用方会照常
+  // 落盘、上屏、重启编排器,屏幕上写着「已重跑 N 个」。
+  if (applied === 0 && entries.length > 0) {
+    return { error: skipped[0] !== undefined ? `${skipped[0].nodeId}: ${skipped[0].reason}` : '没有一个任务能被重新派出去' }
+  }
+  return { ...merged, skipped }
 }
 
 /**
@@ -402,7 +598,19 @@ export function markBacktracked(
      * 清的是**判据**(注记)和载荷两样:载荷留着而判据没了,下一次 `m` 又捞不回来时
      * 会重新写一份完整的。
      */
-    if (t.level === 2 && n.revised === true) {
+    /**
+     * **有子任务的目标一律重新武装补救拆分,不再只有第 2 级。**
+     *
+     * 用户要的是「优先触发相应任务重新执行阶段……如果不行,可以完全重做任务**和加新任务**」。
+     * 而「加新任务」在这套东西里只有一条实现:`reviseDecomposition` 在集成验收触顶时追加
+     * 补救子任务,**每个节点一辈子一次**。把重新武装绑在第 2 级上,等于「加新任务」要
+     * 按两次 `b` 才可能发生 —— 而第 1 级(重跑子任务)本来就要重新走一次集成验收,
+     * 那正是它该被允许长出补救子任务的时刻。
+     *
+     * 闸是 `childIds.length > 0`:`reviseDecomposition` 只在 `stepIntegrate` 里调用,
+     * 而没有子任务的节点根本不走那一关,给它解闩是一次没有意义的字段写入。
+     */
+    if (n.revised === true && n.childIds.length > 0) {
       n.revised = false
       rearmed.push(n.id)
     }
@@ -418,7 +626,7 @@ export function markBacktracked(
 
 /** 确认屏那几行。**是数据,不是 JSX**。 */
 export function backtrackLines(
-  targets: readonly BacktrackTarget[], entries: readonly { nodeId: string; entry: string }[],
+  targets: readonly BacktrackTarget[], entries: readonly { nodeId: string; entry: BacktrackEntry | '' }[],
   /**
    * 这一趟**有没有隔离工作区**。缺省 true 是为了不动既有调用点的语义,但界面必须传。
    *
@@ -455,6 +663,20 @@ export function backtrackLines(
   if (lvl1.length > 0) {
     out.push(`${lvl1.length} 个任务走**重新执行**:把集成验收的意见注入执行提示词,重跑一遍。`)
     for (const t of lvl1) out.push(`  · ${t.node.title}:${clip(t.blocking)}`)
+    /**
+     * **子任务全绿的那些父任务,买到的是另一样东西 —— 要在按下之前说清。**
+     *
+     * 它们没有可以重跑的子任务(保守名单为空),而它们自己是拆分型、没有执行环节。
+     * 这一格发生的是「重新裁决一次 + 重新开放补救拆分」,也就是用户说的「加新任务」那条路。
+     * 不说的话,屏幕承诺的是「重跑一遍执行」,而实际一个执行者都不会被派出去。
+     */
+    const judgeOnly = lvl1.filter(t => t.suspects.length === 0 && t.node.childIds.length > 0)
+    if (judgeOnly.length > 0) {
+      out.push(
+        `  其中 ${judgeOnly.length} 个的子任务**全部已验收**:没有可重跑的子任务,` +
+        '它们走的是「重新裁决一次集成验收」+ **重新开放补救拆分**(下一轮可以给它加新的子任务)。',
+      )
+    }
   }
   if (lvl2.length > 0) {
     /**
@@ -491,10 +713,17 @@ export function backtrackLines(
    * 两边不一致不是缺陷 —— 缺陷是让用户以为它一致,而下游是 discard(删目录、删分支、
    * 全量重编)。
    */
-  const lvl2Ids = new Set(lvl2.flatMap(t => (t.suspects.length > 0 ? t.suspects : [t.node.id])))
-  const execCount = entries.filter(e => !lvl2Ids.has(e.nodeId)).length
+  /**
+   * 三类分开数。原来只有「重跑执行 / 完全重做」两个数,而它是按 `lvl2Ids` **反推**的 ——
+   * 拆分型节点走的那条「只重新裁决」被算进了「重跑执行阶段」,屏幕上承诺的执行者
+   * 一个都不会被派出去。现在的 `entry` 是 `entryFor` 给的真值(和执行侧同一份),直接数。
+   */
+  const execCount = entries.filter(e => e.entry === 'execute').length
+  const planCount = entries.filter(e => e.entry === 'plan').length
+  const judgeCount = entries.filter(e => e.entry === 'integrate').length
   out.push(
-    `按现在的证据算:${execCount} 个任务重跑执行阶段、${entries.length - execCount} 个完全重做;` +
+    `按现在的证据算:${execCount} 个任务重跑执行阶段、${planCount} 个完全重做` +
+    (judgeCount > 0 ? `、${judgeCount} 个只重新裁决集成验收(并重新开放补救拆分)` : '') + ';' +
     (isolated
       ? '它们的隔离工作区会被删掉并从集成分支最新状态重建。'
       : '这一趟没有隔离工作区,所以**不会删任何目录、也没有重新同步这一步** —— 上一轮写进你工作目录的文件原样留着,重跑是在这些文件之上继续改。'),

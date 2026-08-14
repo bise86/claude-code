@@ -1,6 +1,6 @@
-import { backtrackScope, composeRedos, markBacktracked, type BacktrackTarget } from './backtrack.js'
+import { backtrackScope, composeRedos, conservativeEntries, entryFor, markBacktracked, type BacktrackEntry, type BacktrackTarget } from './backtrack.js'
 import { affectedByRedo } from './liveRedo.js'
-import type { RedoContext, RedoPlan } from './redo.js'
+import { descendantsOf, type RedoContext, type RedoPlan } from './redo.js'
 import type { TaskNode } from './types.js'
 
 /**
@@ -53,8 +53,15 @@ export interface BacktrackRunDeps {
 
 export interface BacktrackOutcome {
   /** 真的被重跑的节点。 */
-  entries: { nodeId: string; entry: 'execute' | 'plan' }[]
-  /** 第 2 级重新武装了补救拆分的父节点。 */
+  entries: { nodeId: string; entry: BacktrackEntry }[]
+  /**
+   * 算得出来、但**这一趟没能派出去**的那几条(`composeRedos` 跳过的)。
+   *
+   * 结果屏必须印它:一次「重跑了 5 个、跳过了 2 个」和一次「重跑了 5 个」对用户
+   * 是两件事,而他点进这一屏往往正是为了那 2 个里的某一个。
+   */
+  skipped: string[]
+  /** 重新武装了补救拆分的父节点(下一轮集成验收可以给它们加新的子任务)。 */
   rearmed: string[]
   /** 主模型那一步没用上(没给 / 调用失败),走的是保守名单。 */
   degraded?: string
@@ -101,11 +108,25 @@ export async function runBacktrack(
    * 名单。模型给的**必须落在血统里**(白名单不是黑名单:一个编出来的 id 会被送去
    * `planRedo`,而那会改一整棵树);它一条都没给出有效项时,同样退回保守名单 ——
    * 「模型答了但全是无效的」和「没答」对用户是同一个结果,不该一个静默一个说话。
+   *
+   * ## 血统 = 目标的**整棵子树**,不是「目标 ∪ 保守名单」
+   *
+   * 这里原来收的是 `targets ∪ suspects`,而那两样是按**状态**算出来的(没验收通过的、
+   * 产出丢了的)。于是白名单和证据用的是两条不同的判据,后果在跑机上量得到:
+   * datum 那个父任务的集成验收白纸黑字点着 `datum.rs` 不在集成工作区,主模型也正确地
+   * 点了写 datum 的那个子任务 —— 而它 `status: ACCEPTED`、改过一行 Cargo.toml 所以
+   * 「有贡献」,不在 suspects 里,于是被当成**幻觉 id 丢掉**,屏幕上印的是
+   * 「主模型点了 1 个不在这棵子树里的任务,已忽略」—— 一句假话:它就在这棵子树里。
+   * 名单退回保守版,重跑了三个不相干的兄弟,真凶一次都没动。
+   *
+   * 防幻觉的目的由「必须是这棵子树里真实存在的节点」承担,这一条一个字没松。
    */
+  const byId = new Map(nodes.map(n => [n.id, n]))
   const inScope = new Set<string>()
   for (const t of targets) {
     inScope.add(t.node.id)
     for (const s of t.suspects) inScope.add(s)
+    for (const d of descendantsOf(t.node, byId)) inScope.add(d)
   }
   const guidanceOf = new Map<string, string>()
   let ids: string[] = []
@@ -123,13 +144,10 @@ export async function runBacktrack(
   }
   if (ids.length === 0) {
     /**
-     * 保守名单 = 每个目标自己的 `suspects`(没验收通过的、产出丢了的子任务);
-     * 一个子任务都没有的目标(叶子)就回溯它自己。
+     * 保守名单 —— **和确认屏共用同一份实现**(`conservativeEntries`),否则用户是照着
+     * 一份名单按的确认,而跑的是另一份。
      */
-    for (const t of targets) {
-      if (t.suspects.length > 0) ids.push(...t.suspects.filter(s => !ids.includes(s)))
-      else if (!ids.includes(t.node.id)) ids.push(t.node.id)
-    }
+    for (const e of conservativeEntries(targets, byId)) if (!ids.includes(e.nodeId)) ids.push(e.nodeId)
   }
 
   /**
@@ -159,15 +177,34 @@ export async function runBacktrack(
     if (!fallbackOf.has(t.node.id)) fallbackOf.set(t.node.id, t.blocking)
     for (const s of t.suspects) if (!fallbackOf.has(s)) fallbackOf.set(s, t.blocking)
   }
-  const entries = ids.map(id => {
+  /**
+   * 每个被点到的节点从哪一关重来,由 `entryFor` **按它自己的形态**决定 —— 见那个函数:
+   * 写死 `execute` 会让拆分型节点上的这一条必然算不出来,而那一条以前会把整次回溯带走。
+   *
+   * 名单里可能有主模型点的、也可能有保守名单里的,两种都要过同一道 —— 所以这里
+   * 现查 `byId`,拿不到节点的直接跳过(它在 `inScope` 里说明存在过,但树是可变的)。
+   */
+  const entries = ids.flatMap(id => {
+    const node = byId.get(id)
+    if (!node) return []
     const guidance = guidanceOf.get(id) ?? fallbackOf.get(id)
-    return {
+    return [{
       nodeId: id,
-      entry: (levelOfChild.get(id) === 2 ? 'plan' : 'execute') as 'execute' | 'plan',
+      entry: entryFor(node, levelOfChild.get(id) === 2 ? 2 : 1),
       ...(guidance !== undefined && guidance.trim().length > 0 ? { guidance } : {}),
-    }
+    }]
   })
 
+  /**
+   * 名单空掉是**可达**的:targets 都在,而它们的 suspects 在树里一个都查不到(手改过的
+   * childIds、或者刚被别的操作删掉)。`composeRedos` 对空名单原样返回一份没变的树 ——
+   * 照常走下去会落盘、重启编排器,而结果屏说「没有重跑任何任务」。当场说清并停下。
+   */
+  if (entries.length === 0) {
+    deps.onProblems(['回溯未执行:这棵子树里没有一个可以重新派出去的任务'])
+    deps.onDone()
+    return undefined
+  }
   const computed = composeRedos(nodes, entries, now, n => ctxFor?.(n))
   if ('error' in computed) {
     // 纯函数,到这里盘上一个字节都没动过 —— 说清原因、关掉关口,用户可以换个节点再试。
@@ -177,12 +214,18 @@ export async function runBacktrack(
   }
 
   /**
+   * 这一趟**真的**被派出去的那些。被 `composeRedos` 跳过的一条都不算 —— 下面三件事
+   * 全都挂在这份名单上:扣押集、痕迹/证据的清理、以及结果屏印的数字。
+   */
+  const skippedIds = new Set(computed.skipped.map(s => s.nodeId))
+  const applied = entries.filter(e => !skippedIds.has(e.nodeId))
+  /**
    * 扣押集取**全集**。`affectedByRedo` 是单 plan 单 target 的,所以逐个算再并 ——
    * 少了并集,共同祖先会漏出去,而它此刻是 `WAITING_CHILDREN`,调度循环当场可以把它
    * 派去集成验收。
    */
   const affected = [...new Set([
-    ...entries.flatMap(e => affectedByRedo(computed, e.nodeId)),
+    ...applied.flatMap(e => affectedByRedo(computed, e.nodeId)),
     ...targets.map(t => t.node.id),
   ])]
   const blocked = deps.canApply?.(affected)
@@ -194,9 +237,18 @@ export async function runBacktrack(
 
   // 阶梯的痕迹要落在**合成之后的那棵树**上(它是马上要落盘的那一份)。
   // 只对**真的被送去重跑**的那些记轮次、清证据 —— 见 markBacktracked 的 `reran`。
-  const { rearmed } = markBacktracked(computed, targets, now, new Set(entries.map(e => e.nodeId)))
+  const { rearmed } = markBacktracked(computed, targets, now, new Set(applied.map(e => e.nodeId)))
 
   const { problems } = await deps.commit(computed, nodes)
+  /**
+   * **算不出来而被跳过的那几条,必须自己上屏。**
+   *
+   * `composeRedos` 现在跳过算不出来的那一条而不是整条不做,那条规矩的全部前提就是
+   * 「跳过了什么要说出来」—— 而 `commitRedo` 只报落盘阶段的问题,`plan.warnings`
+   * 一个字都不看。少了这一句,用户会拿着一份「已重跑 N 个」的结果屏,而他点的那个
+   * 节点恰恰在被跳过的那几条里。
+   */
+  for (const w of computed.warnings) problems.push(`⚠ ${w}`)
   if (degraded) problems.unshift(`⚠ ${degraded}`)
   deps.onProblems(problems)
   // 历史运行记录跟着节点一起走,**排在 onNodes 之前** —— 那一句会让界面立刻用新树重画,
@@ -205,5 +257,12 @@ export async function runBacktrack(
   deps.onNodes(computed.nodes)
   // 落盘在前、重启在后:反过来编排器会在一棵还没写下去的树上开跑。
   deps.start(computed.nodes, affected)
-  return { entries: entries.map(e => ({ nodeId: e.nodeId, entry: e.entry })), rearmed, ...(degraded ? { degraded } : {}) }
+  return {
+    // **只报真的派出去的那些。** 把跳过的也算进去,结果屏那句「已重跑 N 个」就是假的,
+    // 而用户按下这个键往往正是为了其中某一个。
+    entries: applied.map(e => ({ nodeId: e.nodeId, entry: e.entry })),
+    skipped: computed.skipped.map(s => `${s.nodeId}:${s.reason}`),
+    rearmed,
+    ...(degraded ? { degraded } : {}),
+  }
 }

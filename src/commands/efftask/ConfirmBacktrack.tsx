@@ -1,7 +1,7 @@
 import * as React from 'react'
 
 import { Box, Text, useInput } from '../../ink.js'
-import { backtrackLines, backtrackScope, type BacktrackTarget } from '../../tools/efftask/backtrack.js'
+import { backtrackLines, backtrackScope, conservativeEntries, type BacktrackTarget } from '../../tools/efftask/backtrack.js'
 import type { BacktrackOutcome } from '../../tools/efftask/backtrackRun.js'
 import type { TaskNode } from '../../tools/efftask/types.js'
 import { useModalOrTerminalSize } from '../../context/modalContext.js'
@@ -136,7 +136,12 @@ export function ConfirmBacktrack(props: {
     ? resultLines(outcome)
     : backtrackLines(
         targets,
-        targets.flatMap(t => (t.suspects.length > 0 ? t.suspects : [t.node.id])).map(id => ({ nodeId: id, entry: '' })),
+        /**
+         * 预览用的名单和执行侧的兜底名单**是同一份实现**(`conservativeEntries`)。
+         * 各算一次的后果是现成的:屏幕按 `t.suspects` 数出「N 个重跑执行阶段」,而拆分型
+         * 节点上真正发生的是「只重新裁决」—— 用户是照着这一屏按下确认的。
+         */
+        conservativeEntries(targets, new Map(props.nodes.map(n => [n.id, n]))),
         // 这一趟到底有没有工作区可删可同步。**判据是池子在不在**,不是配置里写着什么
         // (配置可以写着隔离而每一次 acquire 都失败)。
         props.isolated !== false,
@@ -174,13 +179,28 @@ export function resultLines(out: BacktrackOutcome | null): string[] {
   } else {
     const again = out.entries.filter(e => e.entry === 'execute').length
     const redo = out.entries.filter(e => e.entry === 'plan').length
+    const judge = out.entries.filter(e => e.entry === 'integrate').length
     lines.push(
       `已重跑 ${out.entries.length} 个任务` +
-      `(${again} 个重新执行${redo > 0 ? `、${redo} 个完全重做` : ''})—— 它们已经回到队列里。`,
+      `(${again} 个重新执行${redo > 0 ? `、${redo} 个完全重做` : ''}` +
+      // 「只重新裁决」和「重新执行」是两件事:前者一个执行者都不会被派出去,
+      // 它买到的是那一次集成验收 + 补救拆分的机会。混成一句话就是谎报。
+      `${judge > 0 ? `、${judge} 个只重新裁决集成验收` : ''})—— 它们已经回到队列里。`,
     )
   }
   if (out.rearmed.length > 0) {
     lines.push(`${out.rearmed.length} 个任务重新武装了补救拆分:下一轮集成验收可以给它们加新的子任务。`)
+  }
+  /**
+   * **跳过的要单独说,而且要说是哪几个。**
+   *
+   * `composeRedos` 现在跳过算不出来的那一条(而不是整批放弃),这一屏是那条规矩的兑现点:
+   * 用户按 `b` 往往正是为了名单里的某一个,而「已重跑 5 个」读起来像全都跑了。
+   */
+  if (out.skipped.length > 0) {
+    lines.push(`⚠ 另有 ${out.skipped.length} 个没能派出去:`)
+    for (const s of out.skipped.slice(0, 5)) lines.push(`  · ${s}`)
+    if (out.skipped.length > 5) lines.push(`  …另有 ${out.skipped.length - 5} 条,见任务树上的提示`)
   }
   // 降级要单独说,而且要说清用的是什么名单 —— 它决定了这次重跑的范围对不对。
   if (out.degraded) lines.push(`⚠ ${out.degraded}`)

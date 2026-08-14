@@ -950,3 +950,34 @@ describe('确认屏要摊开的后果', () => {
     expect(redoSummary(p, t, 'execute').some(l => l.includes('返工计数清零'))).toBe(true)
   })
 })
+
+/**
+ * `preCloned` —— 调用方保证输入已经是它自己的一棵新树。**只有串接多次 planRedo 时才合法**
+ * (`composeRedos`),而默认那条路的承诺(不改传进来的数组)一个字没变。
+ */
+describe('planRedo preCloned', () => {
+  const NOW = 'T1'
+  const t = (): TaskNode[] => [
+    node('root', { childIds: ['root/00-a'], status: 'ACCEPTED', kind: 'decompose' }),
+    node('root/00-a', { parentId: 'root', status: 'ACCEPTED', kind: 'executable' }),
+  ]
+
+  it('默认(不传)不改传进来的节点对象', () => {
+    const input = t()
+    const r = planRedo(input, 'root/00-a', 'execute', NOW)
+    if ('error' in r) throw new Error(r.error)
+    expect(input[1].status).toBe('ACCEPTED')
+    expect(r.nodes.find(n => n.id === 'root/00-a')!.status).toBe('READY')
+  })
+
+  it('preCloned:true 就地改传进来的那批对象(省掉一次全树深拷贝)', () => {
+    const input = t()
+    const r = planRedo(input, 'root/00-a', 'execute', NOW, undefined, { preCloned: true })
+    if ('error' in r) throw new Error(r.error)
+    // 就地:同一个对象,状态已经被改了。这一条钉住的是「省下来的那次拷贝真的省了」——
+    // 剪掉这个分支的话,input 会保持 ACCEPTED,而 .13 那个 run 上按一次 b 要多做几百次
+    // 全树深拷贝(界面同步僵住)。
+    expect(input[1].status).toBe('READY')
+    expect(r.nodes.find(n => n.id === 'root/00-a')).toBe(input[1])
+  })
+})

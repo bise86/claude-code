@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 import {
-  backtrackLines, backtrackScope, composeRedos, levelFor, markBacktracked, outputMissing,
+  backtrackLines, backtrackScope, composeRedos, conservativeEntries, entryFor, integrateFeedback,
+  levelFor, markBacktracked, outputMissing, selfReportedUndone, undoneOf,
   NO_CONTRIBUTION_NOTE, RESCUE_STRANDED_NOTE, backtrackCanClaim, rescueStranded, strandedRefsOf,
   type BacktrackTarget,
 } from './backtrack.js'
+import { PROTOCOL_NO_BLOCK } from './parseOutput.js'
 import { parseNodeFile, serializeNode } from './persistence.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
@@ -115,21 +117,30 @@ describe('阶梯', () => {
   })
 
   /**
-   * 第 2 级要**解开 `revised` 闩** —— 它默认「每个节点一辈子只补救一次」,而这个闩正是
-   * 这次人工干预要解开的东西:让编排器自己那条已经测过的 `reviseDecomposition` 能在下一轮
-   * 集成验收里用真 ctx 把补救子任务长出来。
+   * **解开 `revised` 闩的判据是「有没有子任务」,不是「第几级」。**
+   *
+   * 它默认「每个节点一辈子只补救一次」,而这个闩正是人工干预要解开的东西 —— 让
+   * `reviseDecomposition` 能在下一轮集成验收里用真 ctx 把补救子任务长出来,也就是用户
+   * 说的「加新任务」。绑在第 2 级上的话,加新任务要按**两次** `b` 才可能发生,而第 1 级
+   * 本来就要重新走一次集成验收,那正是它该被允许长出补救子任务的时刻。
+   *
+   * 没有子任务的节点不解:`reviseDecomposition` 只在 `stepIntegrate` 里调用,而它根本
+   * 不走那一关 —— 解了也是一次没有意义的字段写入。
    */
-  it('第 2 级重新武装补救拆分,第 1 级不动它', () => {
-    const a = mk('a', { revised: true })
-    const b = mk('b', { revised: true })
-    const plan = { nodes: [a, b], deleted: [], dependencyRewrites: [], worktreesToRelease: [], seatedAt: 'READY' as const, reopenedAncestors: [], warnings: [] }
+  it('有子任务的目标一律重新武装补救拆分,叶子不动它', () => {
+    const a = mk('a', { revised: true, childIds: ['a/00-x'] })
+    const b = mk('b', { revised: true, childIds: ['b/00-y'] })
+    const leaf = mk('c', { revised: true })
+    const plan = { nodes: [a, b, leaf], deleted: [], dependencyRewrites: [], worktreesToRelease: [], seatedAt: 'READY' as const, reopenedAncestors: [], warnings: [] }
     const { rearmed } = markBacktracked(plan, [
       { node: a, level: 2, blocking: '', remedy: [], suspects: [] },
       { node: b, level: 1, blocking: '', remedy: [], suspects: [] },
+      { node: leaf, level: 1, blocking: '', remedy: [], suspects: [] },
     ], NOW)
-    expect(rearmed).toEqual(['a'])
+    expect(rearmed.sort()).toEqual(['a', 'b'])
     expect(a.revised).toBe(false)
-    expect(b.revised).toBe(true)
+    expect(b.revised).toBe(false)
+    expect(leaf.revised).toBe(true)
   })
 })
 
@@ -224,18 +235,37 @@ describe('composeRedos', () => {
   })
 
   /**
-   * **任何一次算不出来,整条不做。**
+   * **算不出来的那一条跳过,其余照做 —— 但必须说出来。**
    *
-   * 做半套的后果是一棵**部分回溯**的树落了盘,而屏幕上那份清单说的是全部 ——
-   * 用户没有任何办法知道少了哪几个。
+   * 老规矩是「任何一次出错整条不做」,它的理由(不许让用户对着一份说全做了的清单)成立,
+   * 而它要的是**说出来**,不是全盘放弃:跑机上 34 个「集成验收没通过、子任务却全绿」的
+   * 拆分节点里只要有一个落进这一批,同一批里所有真正该重跑的节点一个都不会动。
    */
-  it('其中一个节点不存在 → 整条返回 error,不返回半套', () => {
+  it('其中一个节点不存在 → 跳过它,其余照做,并逐条记进 warnings/skipped', () => {
     const r = composeRedos(tree(), [
       { nodeId: 'root/00-a', entry: 'execute' },
       { nodeId: '不存在', entry: 'execute' },
     ], NOW)
+    if ('error' in r) throw new Error(r.error)
+    // 好的那条真的做了:工作区被交回去、节点回到 READY。
+    expect(r.worktreesToRelease.map(w => w.nodeId)).toEqual(['root/00-a'])
+    expect(r.nodes.find(n => n.id === 'root/00-a')!.status).toBe('READY')
+    // 坏的那条两处都留了痕:给人看的 warnings,和给 `reran` 闸用的结构化 skipped。
+    expect(r.skipped.map(s => s.nodeId)).toEqual(['不存在'])
+    expect(r.warnings.join('\n')).toContain('不存在')
+  })
+
+  /**
+   * **一条都没算成 = 错误。** 这一格不是理论上的:名单里全是拆分型节点(跑机上 34 个)
+   * 时就会走到。返回一份空 plan 的话,调用方会照常落盘、上屏、重启编排器,
+   * 而屏幕上写着「已重跑 N 个」。
+   */
+  it('给了名单、一条都没算成 → error(不是一次成功的空回溯)', () => {
+    const r = composeRedos(tree(), [
+      { nodeId: '不存在', entry: 'execute' },
+      { nodeId: 'root', entry: 'execute' }, // 拆分型:没有执行环节
+    ], NOW)
     expect('error' in r).toBe(true)
-    if ('error' in r) expect(r.error).toContain('不存在')
   })
 
   it('补充提示词写在对应节点的执行环节上', () => {
@@ -530,5 +560,316 @@ describe('痕迹的写读对称与消费时机', () => {
     expect(blocking).toContain('已经被后来的版本取代')
     expect(blocking).not.toContain('都试过了')
     expect(blocking).toContain('不要去 git merge')
+  })
+})
+
+/**
+ * **datum 那一格** —— 跑机 .13 qianbase-xtp run 001 上真实存在的形状,而且它此前对
+ * 回溯**完全不可见**:
+ *
+ *  - 子任务 `status: ACCEPTED`(这一趟按用户要求关掉了验收环节,`acceptLog` 是空的);
+ *  - 它改过一行 `Cargo.toml`,所以 `mergeAndRelease` 的字节级判据认为它「有贡献」——
+ *    `outputMissing` 为假;
+ *  - 而它自己的 execStatus 写着「本轮未做:创建 datum.rs」—— 任务的全部内容;
+ *  - 父任务的集成验收连着三轮点名 datum.rs 不在集成工作区,最后按迭代上限降级放行。
+ *
+ * 三条判据(没通过 / 产出丢了 / 捞不回来)一条都认不出它。
+ */
+describe('自陈未做的子任务:datum 那一格', () => {
+  const NOTE = NO_CONTRIBUTION_NOTE
+  const tree = (): TaskNode[] => [
+    mk('P', {
+      kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01', 'P/02', 'P/03'],
+      acceptLog: [{
+        round: 3, step: 'integrate',
+        verdicts: [{ role: '测试', pass: false, blocking: ['datum.rs 不在集成工作区'], comments: '' }],
+        synthesized: { pass: false, blockingSummary: 'datum.rs 不在集成工作区' },
+      }],
+    }),
+    // 干干净净做完的兄弟。
+    mk('P/01', { parentId: 'P', kind: 'executable', status: 'ACCEPTED', execStatus: '做完了' }),
+    // 真凶:有贡献、已验收、自己说没做。
+    mk('P/02', {
+      parentId: 'P', kind: 'executable', status: 'ACCEPTED',
+      execStatus: '已登记依赖。\n本轮未做:创建 datum.rs(原因:被限制为纯文本回复)',
+      undone: ['创建 datum.rs(原因:被限制为纯文本回复)'],
+    }),
+    // 老判据认得出的那种。
+    mk('P/03', { parentId: 'P', kind: 'executable', status: 'ACCEPTED', execStatus: `(注:该节点${NOTE})` }),
+  ]
+
+  it('保守名单收得到它 —— 而 status/贡献两条判据都认不出', () => {
+    const { targets } = backtrackScope(tree(), 'P')
+    const t = targets.find(x => x.node.id === 'P')!
+    expect(outputMissing(tree()[2])).toBe(false)
+    expect(t.suspects).toContain('P/02')
+    expect(t.suspects).toContain('P/03')
+    expect(t.suspects).not.toContain('P/01')
+  })
+
+  it('自陈未做本身不立 target —— 全 run 610 个节点自陈未做,升格会把健康子树一起重跑', () => {
+    // 同一个节点,父任务的集成验收**通过**时:自陈未做的 P/02 不该被这个键认领,
+    // 而带着零贡献注记的 P/03 照旧认(那是它自己的判据)。
+    const ok = tree().map(n => (n.id === 'P' ? { ...n, acceptLog: [] } : n))
+    const ids = backtrackScope(ok, 'P').targets.map(t => t.node.id)
+    expect(ids).not.toContain('P/02')
+    expect(ids).not.toContain('P')
+    expect(ids).toEqual(['P/03'])
+  })
+
+  it('undoneOf 只认长得对的 —— 手改坏的 node.md 不许抛在恢复链路里', () => {
+    expect(undoneOf(mk('x', { undone: ['a', '', 'b'] }))).toEqual(['a', 'b'])
+    expect(undoneOf(mk('x', { undone: 'boom' as never }))).toEqual([])
+    expect(undoneOf(mk('x', { undone: [1, { a: 2 }] as never }))).toEqual([])
+    expect(selfReportedUndone(mk('x'))).toBe(false)
+  })
+})
+
+/**
+ * **从哪一关重来,按节点形态定。**
+ *
+ * 写死 `execute` 时,一个「集成验收没通过、子任务却全绿」的拆分节点会让 `planRedo` 判
+ * disabled —— 跑机上有 34 个这种节点,而当时的规矩是「一条错整条不做」。
+ */
+describe('entryFor', () => {
+  it('执行型叶子 → execute', () => {
+    expect(entryFor(mk('x', { kind: 'executable' }), 1)).toBe('execute')
+  })
+  it('拆分型(有子任务)→ integrate:它自己没有执行环节,能重来的只有那次裁决', () => {
+    expect(entryFor(mk('x', { kind: 'decompose', childIds: ['x/1'] }), 1)).toBe('integrate')
+  })
+  it('长了子任务的执行型 → 同样是 integrate(redoOptions 的 isDecomposed 判据一致)', () => {
+    expect(entryFor(mk('x', { kind: 'executable', childIds: ['x/1'] }), 1)).toBe('integrate')
+  })
+  it('kind 还是 unknown 的叶子 → plan(execute/integrate 两条都被禁用)', () => {
+    expect(entryFor(mk('x', { kind: 'unknown' }), 1)).toBe('plan')
+  })
+  it('第 2 级恒走 plan', () => {
+    expect(entryFor(mk('x', { kind: 'executable' }), 2)).toBe('plan')
+    expect(entryFor(mk('x', { kind: 'decompose', childIds: ['x/1'] }), 2)).toBe('plan')
+  })
+})
+
+/**
+ * **注入执行提示词的那段意见,不能是一句关于回复格式的抱怨。**
+ */
+describe('integrateFeedback', () => {
+  const protocolRound = {
+    round: 3, step: 'integrate' as const,
+    verdicts: [{ role: '测试', pass: false, blocking: [PROTOCOL_NO_BLOCK], comments: '' }],
+    synthesized: { pass: false, blockingSummary: PROTOCOL_NO_BLOCK },
+  }
+  const realRound = {
+    round: 1, step: 'integrate' as const,
+    verdicts: [{
+      role: '测试', pass: false,
+      blocking: ['datum.rs 不在集成工作区', 'cargo check 126 errors'],
+      comments: '', advice: ['先补 sem/tree/datum.rs 并接进 mod.rs'],
+    }],
+    synthesized: { pass: false, blockingSummary: '两条' },
+  }
+
+  it('最后一轮是协议失败时,取前几轮的真意见', () => {
+    const s = integrateFeedback(mk('x', { acceptLog: [realRound, protocolRound] }))
+    expect(s).toContain('datum.rs 不在集成工作区')
+    expect(s).toContain('cargo check 126 errors')
+    expect(s).toContain('先补 sem/tree/datum.rs')
+    expect(s).not.toContain('裁决代码块')
+  })
+
+  it('降级放行时随节点带下去的建议也算', () => {
+    const s = integrateFeedback(mk('x', {
+      acceptLog: [protocolRound],
+      degraded: [{ phase: 'integrate', round: 3, reason: '集成验收迭代超限(3)', advice: ['完成并接线 datum.rs'], at: NOW }],
+    }))
+    expect(s).toContain('完成并接线 datum.rs')
+  })
+
+  it('别的环节的降级建议不算 —— 闩要闩住的是集成验收那一关', () => {
+    const s = integrateFeedback(mk('x', {
+      acceptLog: [protocolRound],
+      degraded: [{ phase: 'review', round: 3, reason: '方案评审迭代超限(3)', advice: ['方案要写验收点'], at: NOW }],
+    }))
+    expect(s).not.toContain('方案要写验收点')
+  })
+
+  /**
+   * 一条真意见都凑不出来时,给的既不是空串(屏幕承诺「注入意见」而注入了空气),
+   * 也不是那句格式抱怨(执行者手上根本没有那份回复,无法照做)。
+   */
+  it('一条真意见都没有时,给一句他能照做的,而不是格式抱怨', () => {
+    const s = integrateFeedback(mk('x', { acceptLog: [protocolRound] }))
+    expect(s).not.toContain('裁决代码块;按不通过处理')
+    expect(s.length).toBeGreaterThan(20)
+    expect(s).toContain('验收点')
+  })
+
+  it('去重,而且不会把同一条印两遍', () => {
+    const dup = { ...realRound, round: 2 }
+    const s = integrateFeedback(mk('x', { acceptLog: [realRound, dup] }))
+    expect(s.split('\n').filter(l => l.includes('cargo check 126 errors'))).toHaveLength(1)
+  })
+})
+
+/**
+ * **确认屏和执行侧共用同一份名单**。各算一次的话,用户是照着一份按的确认,跑的是另一份。
+ */
+describe('conservativeEntries', () => {
+  const nodes = (): TaskNode[] => [
+    mk('P', { kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01'], acceptLog: [integrateFail()] }),
+    mk('P/01', { parentId: 'P', kind: 'executable', status: 'ACCEPTED', execStatus: '做完了' }),
+    mk('Q', { kind: 'decompose', status: 'ACCEPTED', childIds: ['Q/01'], acceptLog: [integrateFail()] }),
+    mk('Q/01', { parentId: 'Q', kind: 'executable', status: 'BLOCKED' }),
+  ]
+  it('子任务全绿的目标 → 它自己走 integrate;有问题子任务的目标 → 子任务走 execute', () => {
+    const list = nodes()
+    const byId = new Map(list.map(n => [n.id, n]))
+    const { targets } = backtrackScope(list, 'P')
+    expect(conservativeEntries(targets, byId)).toEqual([{ nodeId: 'P', entry: 'integrate', level: 1 }])
+    const q = backtrackScope(list, 'Q')
+    expect(conservativeEntries(q.targets, byId)).toEqual([{ nodeId: 'Q/01', entry: 'execute', level: 1 }])
+  })
+})
+
+/**
+ * **N 条 entry ≠ N 次全树深拷贝。**
+ *
+ * `planRedo` 第一行是 `input.map(structuredClone)`,而 .13 那个 run 的 node.md 合计
+ * 86 MiB / 2215 个节点、符合回溯条件的有 834 个 —— 在 root 上按一次 `b` 就是几百次
+ * 全树深拷贝,同步跑在按键处理里。串接时第 2 条起复用上一条刚交出来的那棵树。
+ *
+ * 但**对调用方的承诺一个字不能变**:传进去的那份数组和里面的节点对象都不许被改。
+ */
+describe('composeRedos 的拷贝纪律', () => {
+  const t = (): TaskNode[] => [
+    mk('root', { childIds: ['root/00-a', 'root/01-b'], status: 'ACCEPTED', kind: 'decompose' }),
+    mk('root/00-a', { parentId: 'root', status: 'ACCEPTED', kind: 'executable', worktree: { branch: 'ba', path: '/wt/a' } }),
+    mk('root/01-b', { parentId: 'root', status: 'ACCEPTED', kind: 'executable', worktree: { branch: 'bb', path: '/wt/b' } }),
+  ]
+
+  it('两条 entry 之后,传进去的那棵树一个字节都没变', () => {
+    const before = t()
+    const snapshot = JSON.stringify(before)
+    const r = composeRedos(before, [
+      { nodeId: 'root/00-a', entry: 'execute' },
+      { nodeId: 'root/01-b', entry: 'execute' },
+    ], NOW)
+    if ('error' in r) throw new Error(r.error)
+    // 这一条是 `commitRedo(plan, before)` 的前提:`before` 要如实描述回溯**之前**的状态。
+    expect(JSON.stringify(before)).toBe(snapshot)
+    // 而返回的那棵树两个节点都真的被重置了(串接生效)。
+    expect(r.nodes.filter(n => n.status === 'READY').map(n => n.id).sort())
+      .toEqual(['root/00-a', 'root/01-b'])
+    expect(r.worktreesToRelease.map(w => w.nodeId).sort()).toEqual(['root/00-a', 'root/01-b'])
+  })
+
+  it('返回的节点对象和传进去的不是同一批', () => {
+    const before = t()
+    const r = composeRedos(before, [{ nodeId: 'root/00-a', entry: 'execute' }], NOW)
+    if ('error' in r) throw new Error(r.error)
+    expect(r.nodes.find(n => n.id === 'root/00-a')).not.toBe(before[1])
+  })
+})
+
+/**
+ * 变异测试补上的四条 —— 每一条都是「我原来的探针没打在点上」。
+ */
+describe('变异测试补漏', () => {
+  /**
+   * `isProtocolBlocking` 必须按**包含**判:`synthesizeVerdicts` 合成的摘要带席位抬头
+   * (跑机上逐字是 `[测试] 未按要求输出本轮的裁决代码块;按不通过处理`)。
+   * 按相等判的话,这个函数对**真实数据里最常见的那一条**恒为假。
+   */
+  it('带席位抬头的协议失败也要认出来(跑机上就是这个形状)', () => {
+    const prefixed = `[测试] ${PROTOCOL_NO_BLOCK}`
+    const n = mk('x', {
+      status: 'ACCEPTED',
+      acceptLog: [{
+        round: 3, step: 'integrate',
+        verdicts: [{ role: '测试', pass: false, blocking: [prefixed], comments: '' }],
+        synthesized: { pass: false, blockingSummary: prefixed },
+      }],
+    })
+    const s = integrateFeedback(n)
+    expect(s).not.toContain('裁决代码块')
+    expect(s).toContain('验收点')
+  })
+
+  /**
+   * **意见是从 `integrateFeedback` 来的,不是从最后一条 `blockingSummary` 来的。**
+   * 这一条钉的是**接线**:上面那些用例只测了函数本身,而 `backtrackScope` 完全可以
+   * 绕过它去读 `rec.synthesized.blockingSummary`(变异测试实测存活)。
+   */
+  it('target.blocking 走跨轮汇总 —— 最后一轮是协议失败时不许把它交给执行者', () => {
+    const prefixed = `[集成官] ${PROTOCOL_NO_BLOCK}`
+    const n = mk('x', {
+      status: 'ACCEPTED', kind: 'executable',
+      acceptLog: [
+        {
+          round: 1, step: 'integrate',
+          verdicts: [{ role: '集成官', pass: false, blocking: ['datum.rs 不在集成工作区'], comments: '' }],
+          synthesized: { pass: false, blockingSummary: '[集成官] datum.rs 不在集成工作区' },
+        },
+        {
+          round: 3, step: 'integrate',
+          verdicts: [{ role: '集成官', pass: false, blocking: [prefixed], comments: '' }],
+          synthesized: { pass: false, blockingSummary: prefixed },
+        },
+      ],
+    })
+    const t = backtrackScope([n], 'x').targets[0]!
+    expect(t.blocking).toContain('datum.rs 不在集成工作区')
+    expect(t.blocking).not.toContain('裁决代码块')
+  })
+
+  /**
+   * **补充提示词写在哪个键上跟着入口走。** 一个走 `integrate` 的拆分节点自己不跑执行环节,
+   * 把意见写到 `execute` 键上 = 那句整改要求谁也读不到(变异测试实测存活)。
+   */
+  it('integrate 入口的意见写在 integrate 键上,plan 入口写在 all 上', () => {
+    const nodes = [
+      mk('P', { kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01'] }),
+      mk('P/01', { parentId: 'P', kind: 'executable', status: 'ACCEPTED' }),
+    ]
+    const a = composeRedos(nodes, [{ nodeId: 'P', entry: 'integrate', guidance: '重点看 datum.rs' }], NOW)
+    if ('error' in a) throw new Error(a.error)
+    expect(a.nodes.find(n => n.id === 'P')!.guidance?.integrate).toContain('datum.rs')
+    expect(a.nodes.find(n => n.id === 'P')!.guidance?.execute).toBeUndefined()
+
+    const b = composeRedos(nodes, [{ nodeId: 'P/01', entry: 'plan', guidance: '整个重做' }], NOW)
+    if ('error' in b) throw new Error(b.error)
+    expect(b.nodes.find(n => n.id === 'P/01')!.guidance?.all).toContain('整个重做')
+  })
+
+  /**
+   * **N 条 entry 只克隆一次全树。**
+   *
+   * 这是一条纯代价的变异(行为不变),所以只能量它:数 `structuredClone` 的调用次数。
+   * 少了串接复用,.13 那个 run(2215 节点 / 86 MiB / 834 个符合条件)按一次 `b`
+   * 就是几百次全树深拷贝,同步跑在按键处理里 —— 界面僵住几分钟。
+   */
+  it('三条 entry 的全树深拷贝次数 = 一棵树的节点数,不是三倍', () => {
+    const nodes = [
+      mk('root', { childIds: ['root/00-a', 'root/01-b', 'root/02-c'], status: 'ACCEPTED', kind: 'decompose' }),
+      mk('root/00-a', { parentId: 'root', status: 'ACCEPTED', kind: 'executable' }),
+      mk('root/01-b', { parentId: 'root', status: 'ACCEPTED', kind: 'executable' }),
+      mk('root/02-c', { parentId: 'root', status: 'ACCEPTED', kind: 'executable' }),
+    ]
+    const real = globalThis.structuredClone
+    let calls = 0
+    globalThis.structuredClone = ((v: unknown) => { calls++; return real(v) }) as typeof structuredClone
+    try {
+      const r = composeRedos(nodes, [
+        { nodeId: 'root/00-a', entry: 'execute' },
+        { nodeId: 'root/01-b', entry: 'execute' },
+        { nodeId: 'root/02-c', entry: 'execute' },
+      ], NOW)
+      if ('error' in r) throw new Error(r.error)
+      // 三条都真的做了(别让这条用例在一次空回溯上「省」出好成绩)。
+      expect(r.nodes.filter(n => n.status === 'READY')).toHaveLength(3)
+    } finally {
+      globalThis.structuredClone = real
+    }
+    expect(calls).toBe(nodes.length)
   })
 })
