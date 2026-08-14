@@ -233,6 +233,29 @@ describe('扫描', () => {
     expect((plan.rescue?.problems ?? []).join('\n')).toContain('efftask/000/salvage/deadbeef')
   })
 
+  /**
+   * **同一个东西不许在一屏上出现两次,而且说两句相反的话。**
+   *
+   * `salvageOrphan` / `orphanDir` 的 action 是 `report`,而 `refOnly` **也会真的去处置它们** ——
+   * 上一版两张表都收,于是同一个孤儿目录一次说「会被**补录**进集成分支」,
+   * 一次说「确认无用后请自行删除」。
+   */
+  it('会被真的处置的那些,不再当成「你自己处置」念一遍', async () => {
+    const pool = newPool()
+    await pool.init()
+    const gone = mk('root/09-gone', { title: '没了' })
+    await work(pool, gone, 'v1.ts', 'first\n')
+    await pool.discard(gone)
+    // 树上没有这个节点了 —— 它的抢救 ref 变成 salvageOrphan,而 refOnly 会去处置它。
+    const a = mk('root/00-a', { title: '甲' })
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
+    const claimed = [...(plan.rescue?.merge ?? []), ...(plan.rescue?.backfill ?? []), ...(plan.rescue?.hold ?? [])]
+    expect(claimed.length).toBeGreaterThan(0)
+    const ref = claimed[0]!.evidence.ref
+    // 它已经在会被处置的那一桶里 —— 就不该再出现在「该不该动是你的决定」那一堆。
+    expect((plan.rescue?.problems ?? []).some(p => p.includes(ref))).toBe(false)
+  })
+
   it('只有 problems 时,不许说「产出都已经在你的分支上了」', () => {
     const plan = {
       targetId: 'root', items: [], skipped: [], alreadyMerged: 0, absent: 0, ignoredOnly: 0,

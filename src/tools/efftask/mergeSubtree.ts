@@ -7,7 +7,7 @@ import { withStash } from './stashGuard.js'
 import { syncTrunk } from './integrationMerge.js'
 import { backtrackCanClaim, RESCUE_STRANDED_NOTE, strandedRefsOf } from './backtrack.js'
 import type { CopyInto } from './backfill.js'
-import { scanStranded, STRANDED_KINDS } from './stranded.js'
+import { scanStranded, STRANDED_KINDS, type StrandedItem } from './stranded.js'
 import { pinSnapshot, snapshotLines } from './snapshot.js'
 import { planRescue, rescueLines, runRescue, type RescueOutcome, type RescuePlan, type RescueTriage } from './rescue.js'
 import type { MergeResult } from './worktreePool.js'
@@ -517,8 +517,16 @@ async function scanRescue(
    * `stranded.ts` 自己在文件头写着「漏一格就是『全部捞出来』这句话变成假的」,而这里
    * 恰好漏了两格 —— 而且是用户三段要求里的第三段。
    */
+  /**
+   * **已经进了 `refOnly` 的不再念一遍。**
+   *
+   * `salvageOrphan` / `orphanDir` 的 action 是 `report`,而 `refOnly` **也会真的去处置它们** ——
+   * 于是同一个孤儿目录在一屏上出现两次,一次说「这 N 个会被**补录**进集成分支」,
+   * 一次说「确认无用后请自行删除」。同一个目录,两句相反的话,验收席逐字抄回来的。
+   */
+  const claimed = new Set<StrandedItem>(refOnly)
   const notices = report.items
-    .filter(i => STRANDED_KINDS[i.kind].action !== 'merge')
+    .filter(i => !claimed.has(i) && STRANDED_KINDS[i.kind].action !== 'merge')
     .map(i => `${i.title ?? i.path ?? i.branch ?? STRANDED_KINDS[i.kind].label}:${i.why}`)
   /** 这几项**合并解决不了**,得按 `b` 回溯 —— 屏幕上要分开说,别混进「摆出来」那一堆。 */
   /**
