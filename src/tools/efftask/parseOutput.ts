@@ -779,7 +779,7 @@ export function undoneItems(execStatus: string): string[] {
 
 export function parseExecOutput(
   text: string, tag: string = ANSWER_TAGS.exec,
-): { execStatus: string; newChildren: NewChildSpec[]; responses: string[] } {
+): { execStatus: string; newChildren: NewChildSpec[]; responses: string[]; undone: string[] } {
   const { obj } = pickAnswer(text, tag, o => typeof o.execStatus === 'string')
   // newChildren is read from a SEPARATE, tag-REQUIRED pick. Grafting nodes onto the tree is
   // a structural change, and the lenient pick above matches any same-shaped object anywhere
@@ -789,13 +789,31 @@ export function parseExecOutput(
   // responses 走**宽松**的那次 pick,和 execStatus 同源 —— 它不是结构性变更(不动树、
   // 不放行任何东西),只是一段给下一关读的说明。绑到 tagged 上的话,一个漏打标签的
   // 回复会把自述留下、把回应丢掉,而裁决员看到的是「他一条都没回应」。
-  if (obj) return { execStatus: str(obj.execStatus), newChildren: tagged ? parseNewChildren(tagged) : [], responses: capResponses(obj.responses) }
+  /**
+   * **「本轮未做」要在截断**之前**摘出来。**
+   *
+   * 规范席实测到的:`str()` 在解析边界就 `capText(…, 8000)` 了,而这几行按提示词的要求
+   * 写在报告**末尾** —— 一份 8000 字以上的报告里,`node.undone` 恒空。而 `TaskNode.undone`
+   * 立项的第一条理由逐字就是「`capText` 砍的是尾巴,最该被看见的几行最先被砍掉」:
+   * 从截断**之后**的字符串里摘,等于这条理由一次都没兑现。
+   *
+   * 两条路都要摘:结构化那条从 `obj.execStatus` 原值摘;无标记兜底那条从**整段原始回复**摘。
+   */
+  if (obj) {
+    const raw = typeof obj.execStatus === 'string' ? obj.execStatus : ''
+    return {
+      execStatus: str(obj.execStatus),
+      newChildren: tagged ? parseNewChildren(tagged) : [],
+      responses: capResponses(obj.responses),
+      undone: undoneItems(raw),
+    }
+  }
   // Untagged fallback: the whole reply becomes the status. A growth request must NOT be
   // honoured from untagged text — grafting nodes onto the tree is a structural change, and
   // the tag is the only thing separating "my answer" from text quoted into the prompt.
   // Capped like every other field: this fallback is the single biggest contributor to
   // node.md's size, because it takes the model's ENTIRE reply verbatim.
-  return { execStatus: capText(text.trim()), newChildren: [], responses: [] }
+  return { execStatus: capText(text.trim()), newChildren: [], responses: [], undone: undoneItems(text) }
 }
 
 /**

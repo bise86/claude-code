@@ -4,7 +4,7 @@ import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { adviceOf, crossSeatNotice, degradeCarryPrompt, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
-import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, undoneItems, MAX_REMEDY_CHILDREN } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { depLabel } from './depsRecalc.js'
@@ -2229,9 +2229,23 @@ function integratePrompt(
            * 跑机实测:datum 那个子任务的报告里白纸黑字写着「本轮未做:创建 datum.rs」,
            * 而它 `status: ACCEPTED` —— 集成验收连着三轮点名这个文件不在,一次都没有
            * 被告知「它自己承认没做」。
+           *
+           * ## 措辞是中性的,而且这一条是**规范席实测**逼出来的
+           *
+           * 上一版写的是 `⚠ 该子任务**自己声明未做**`。而**初级档的执行侧提示词
+           * 强制**执行者为「验收点之外的边界、额外测试、重构」写「本轮未做:…」
+           * (`strictness.ts` 的 EXEC_SIDE 初级),同一档的裁决侧又明说「验收点之外的不要求」——
+           * 于是一个 ⚠ 加粗的「自己声明未做」递到一个被告知「不要求这些」的裁决员面前,
+           * 就是一道**软闸**:它会让本档明确允许的省略变成不通过。跑机上这一趟正是初级档,
+           * 610 个节点写过这几行。
+           *
+           * 所以:**事实照给,判据不给**。这个字段的定位从一开始就是「证据,不是判据」
+           * (见 `TaskNode.undone`),这一行的措辞必须和那句话一致 —— 括号里那句
+           * 把裁决权明确交还给本档的判据。
            */
           (undoneOf(c).length > 0
-            ? `- ⚠ 该子任务**自己声明未做**: ${quote(undoneOf(c).join(' / '))}\n`
+            ? `- 该子任务自报「本轮未做」的事项: ${quote(undoneOf(c).join(' / '))}` +
+              `(是不是影响父目标,按本次严格度的判据自己判)\n`
             : '') +
           `- 执行状态: ${quote(c.execStatus) || '(无)'}\n- 验收点: ${quote(c.plan.acceptance) || '(无)'}`
         : `### ${quote(id)}\n- 状态: (节点缺失,无法核实其结果)`
@@ -2297,7 +2311,17 @@ function integratePrompt(
     // —— 集成验收两轮之间子任务证据逐字节不变,「改了就该判通过」在这一关前提为假。
     (notice ? repeatRule(strict, round, false) : '') +
     EVIDENCE_RULE +
-    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD}${ADVICE_FIELD} }。` +
+    /**
+     * **`remedy` 要出现在这一行,而不只是上面那段散文里。**
+     *
+     * 规范席点名:这一行是**权威 schema** —— 模型照着它填字段,而上面那句「不通过时可以给
+     * remedy」在它眼里是可选的建议。跑机上 2215 个 node.md 里 `remedy` 出现 **0 次**,
+     * 而「加新任务」这条路(`reviseDecomposition`)的输入**只有**它。
+     * 恢复链路那条(`resumeCore` 逐字段重建时漏了它)已经修好,但那一条只解释「写下去又被抹掉」,
+     * 解释不了「一次都没写下来」—— 两条各修各的,不许拿一条去顶另一条。
+     */
+    `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD}${ADVICE_FIELD}` +
+    `, "remedy"?:{"title":string,"deps":string[]}[] }。` +
     answerRule(tag)
   )
 }
@@ -4978,13 +5002,14 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     /**
      * **执行者自陈没做的那几件,结构化钉在节点上**(见 `TaskNode.undone`)。
      *
-     * 写在这里而不是解析层:`reported` 是**这一轮**的自述,而这个字段的含义是「按现在
-     * 这一版产出,他自己说还欠什么」。所以每一轮都重写,**做完了就写回 undefined** ——
-     * 只写不清是这个仓库反复付账的那一类:一个第 2 轮补完了的节点会永远挂着第 1 轮的欠账,
-     * 而回溯据此把它拉回来重跑。
+     * 每一轮都重写,**做完了就写回 undefined** —— 只写不清是这个仓库反复付账的那一类:
+     * 一个第 2 轮补完了的节点会永远挂着第 1 轮的欠账,而回溯据此把它拉回来重跑。
+     *
+     * 取的是 `out.undone`(解析层从**未截断**的原文摘的),**不是** `undoneItems(reported)`:
+     * `reported` 已经过了 `capText(…, 8000)`,而这几行按提示词的要求写在报告末尾 ——
+     * 规范席实测过,8000 字以上的报告在那条路上恒空。
      */
-    const undone = undoneItems(reported)
-    node.undone = undone.length > 0 ? undone : undefined
+    node.undone = out.undone.length > 0 ? out.undone : undefined
 
     // 动态生长(spec §4):honoured AFTER the empty-report gate, so a reply that grafts nodes
     // but evidences no work still counts as an empty round rather than buying a free pass.
@@ -5435,7 +5460,12 @@ type ReviseOutcome =
  * decision about cost, not a defect to fix quietly.
  */
 async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: PipelineCtx): Promise<ReviseOutcome> {
-  if (node.revised === true) return { kind: 'no' }
+  /**
+   * 一辈子只补救一次,而**这条路以前是静默的** —— 它恰恰是最常见的那个原因,
+   * 于是降级理由里看不出「为什么没长出补救子任务」。
+   * 说出口,并且指出出路:详情页 `b`(回溯)会把这个闩重新解开。
+   */
+  if (node.revised === true) return { kind: 'no', note: '这个节点的补救拆分机会已经用掉了(按 b 回溯可以重新开放)' }
   // Proposals come only from verdicts that FAILED — parseVerdict drops `remedy` on a pass —
   // and are deduped by title across roles. Exact-title agreement between roles is NOT
   // required: with the common single-role roster it would never fire, which would make the

@@ -175,7 +175,17 @@ export async function runBacktrack(
   for (const t of targets) {
     if (t.blocking.trim().length === 0) continue
     if (!fallbackOf.has(t.node.id)) fallbackOf.set(t.node.id, t.blocking)
-    for (const s of t.suspects) if (!fallbackOf.has(s)) fallbackOf.set(s, t.blocking)
+    /**
+     * **铺到整棵子树,和 `inScope` 同一个范围。**
+     *
+     * 两处范围必须一样,而放宽 `inScope` 的那一次没带上这里 —— 规范席实测出的后果:
+     * 主模型点了一个**合法但不在保守名单里**的后代(那正是放宽 inScope 要救的那种节点),
+     * 它被接受、被重跑,却**一句意见都拿不到** —— 同样的提示词、同样的模型,
+     * 凭什么这次会不一样。而确认屏承诺的是「把集成验收的意见注入执行提示词」。
+     */
+    for (const s of [...t.suspects, ...descendantsOf(t.node, byId)]) {
+      if (!fallbackOf.has(s)) fallbackOf.set(s, t.blocking)
+    }
   }
   /**
    * 每个被点到的节点从哪一关重来,由 `entryFor` **按它自己的形态**决定 —— 见那个函数:

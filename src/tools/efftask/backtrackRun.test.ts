@@ -446,3 +446,32 @@ describe('变异测试补漏', () => {
     expect(after.execStatus).toContain(RESCUE_STRANDED_NOTE)
   })
 })
+
+/**
+ * **兜底注入的范围要和 `inScope` 一样宽。**
+ *
+ * 放宽 `inScope` 到整棵子树的那一次没带上 `fallbackOf` —— 规范席实测:主模型点了一个
+ * 合法但不在保守名单里的后代(那正是放宽要救的那种节点),它被接受、被重跑,
+ * 却**一句意见都拿不到**,而确认屏承诺的是「把集成验收的意见注入执行提示词」。
+ */
+describe('兜底注入的范围', () => {
+  it('主模型点的后代没给 guidance 时,也拿得到盘上那句意见', async () => {
+    const nodes = [
+      mk('P', {
+        kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01'],
+        acceptLog: [{
+          round: 1, step: 'integrate',
+          verdicts: [{ role: 'r', pass: false, blocking: ['types.rs 不在集成工作区'], comments: '' }],
+          synthesized: { pass: false, blockingSummary: 'types.rs 不在集成工作区' },
+        }],
+      }),
+      mk('P/01', { parentId: 'P', kind: 'decompose', status: 'ACCEPTED', childIds: ['P/01/aa'], execStatus: '做完了' }),
+      mk('P/01/aa', { parentId: 'P/01', kind: 'executable', status: 'ACCEPTED', execStatus: '做完了' }),
+    ]
+    // 模型只给 id,不给 guidance(`parseBacktrackMap` 允许)。
+    const { deps, started } = spyDeps({ map: async () => [{ nodeId: 'P/01/aa' }] })
+    await runBacktrack(nodes, 'P', NOW, deps)
+    const n = started[0].find(x => x.id === 'P/01/aa')!
+    expect(JSON.stringify(n.guidance ?? {})).toContain('types.rs 不在集成工作区')
+  })
+})

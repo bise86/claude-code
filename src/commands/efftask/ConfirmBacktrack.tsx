@@ -145,6 +145,8 @@ export function ConfirmBacktrack(props: {
         // 这一趟到底有没有工作区可删可同步。**判据是池子在不在**,不是配置里写着什么
         // (配置可以写着隔离而每一次 acquire 都失败)。
         props.isolated !== false,
+        // 名单印标题而不是 id —— id 是全路径,在这一屏上会把整行占满并被截断。
+        id => props.nodes.find(n => n.id === id)?.title,
       )
   const { shown, hidden } = redoSummaryLines(lines, rows, columns)
   const footer = mode === 'done' || targets.length === 0
@@ -189,7 +191,15 @@ export function resultLines(out: BacktrackOutcome | null): string[] {
     )
   }
   if (out.rearmed.length > 0) {
-    lines.push(`${out.rearmed.length} 个任务重新武装了补救拆分:下一轮集成验收可以给它们加新的子任务。`)
+    /**
+     * **「什么时候」必须说准。** `reviseDecomposition` 只在 `iteration.integration >= maxIterations`
+     * 那一刻调用,而这次回溯刚把那个计数清零(`reopenAncestor`)—— 所以不是「下一轮」,
+     * 是**再次连续判不通过、到达迭代上限的那一轮**。规范席实测:默认档下中间还隔着 3 轮。
+     */
+    lines.push(
+      `${out.rearmed.length} 个任务重新武装了补救拆分:之后集成验收再次连续判不通过、` +
+      `到达迭代上限的那一轮,可以给它们加新的子任务。`,
+    )
   }
   /**
    * **跳过的要单独说,而且要说是哪几个。**

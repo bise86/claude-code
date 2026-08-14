@@ -873,3 +873,53 @@ describe('变异测试补漏', () => {
     expect(calls).toBe(nodes.length)
   })
 })
+
+/**
+ * 规范席验收提出的三条,各自钉住。
+ */
+describe('规范席验收补漏', () => {
+  /**
+   * **确认屏点名的必须是真的会被重跑的那个。** 第 1 级真正送去 planRedo 的是 suspects,
+   * 而上一版按 `t.node.title` 渲染 —— datum 场景下屏幕写「· P:datum.rs 不在集成工作区」,
+   * 而 P 是拆分型节点,一个执行者都不会被派给它。
+   */
+  it('第 1 级印的是子任务(而且能印标题)', () => {
+    const t: BacktrackTarget = {
+      node: mk('P', { title: '父任务', childIds: ['P/01', 'P/02'] }),
+      level: 1, blocking: 'datum.rs 不在集成工作区', remedy: [], suspects: ['P/02'],
+    }
+    const lines = backtrackLines([t], [{ nodeId: 'P/02', entry: 'execute' }], true,
+      id => (id === 'P/02' ? '完整迁移 datum.go' : undefined)).join('\n')
+    expect(lines).toContain('完整迁移 datum.go')
+    expect(lines).toContain('1 个子任务')
+    // 没有 titleOf 时退回印 id,而不是印成 undefined。
+    const noTitle = backtrackLines([t], [{ nodeId: 'P/02', entry: 'execute' }], true).join('\n')
+    expect(noTitle).toContain('P/02')
+    expect(noTitle).not.toContain('undefined')
+  })
+
+  /**
+   * **一条都没派出去的目标不许推进阶梯。** 第 2 级是不可逆的(删整片子树),
+   * 而「跳过算不出来的那一条」造出了这条新路径。
+   */
+  it('这个目标名下一条都没派出去 → 轮次不加、闩不解', () => {
+    const a = mk('a', { revised: true, childIds: ['a/00-x'] })
+    const b = mk('b', { revised: true, childIds: ['b/00-y'] })
+    const plan = { nodes: [a, b], deleted: [], dependencyRewrites: [], worktreesToRelease: [], seatedAt: 'READY' as const, reopenedAncestors: [], warnings: [] }
+    const { rearmed } = markBacktracked(plan, [
+      { node: a, level: 1, blocking: '', remedy: [], suspects: ['a/00-x'] },
+      { node: b, level: 1, blocking: '', remedy: [], suspects: ['b/00-y'] },
+    ], NOW, new Set(['a/00-x']))   // 只有 a 名下那个真的被派出去了
+    expect(a.backtrack).toEqual({ rounds: 1, at: NOW })
+    expect(b.backtrack).toBeUndefined()
+    expect(rearmed).toEqual(['a'])
+    expect(b.revised).toBe(true)
+  })
+
+  it('目标自己被派出去(叶子)也算', () => {
+    const leaf = mk('c', { kind: 'executable' })
+    const plan = { nodes: [leaf], deleted: [], dependencyRewrites: [], worktreesToRelease: [], seatedAt: 'READY' as const, reopenedAncestors: [], warnings: [] }
+    markBacktracked(plan, [{ node: leaf, level: 1, blocking: '', remedy: [], suspects: [] }], NOW, new Set(['c']))
+    expect(leaf.backtrack).toEqual({ rounds: 1, at: NOW })
+  })
+})

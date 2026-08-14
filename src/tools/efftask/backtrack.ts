@@ -26,13 +26,19 @@ import type { TaskNode } from './types.js'
  *
  * | 级 | 做什么 | 什么时候 |
  * |---|---|---|
- * | 1 | 被点到的子任务 `planRedo(entry='execute')`,把 blocking 意见**逐条注入它的执行提示词** | 默认 |
- * | 2 | 那个子任务 `planRedo(entry='plan')`(重新分析并拆分)+ **重新武装补救拆分** | 第 1 级已经试过、而集成验收仍然不通过 |
+ * | 1 | 被点到的节点按**形态**重入(执行型 `execute` / 拆分型 `integrate`,见 `entryFor`),把 blocking 意见**逐条注入它的提示词** | 默认 |
+ * | 2 | 那个节点 `planRedo(entry='plan')`(重新分析并拆分) | 第 1 级已经试过、而集成验收仍然不通过 |
+ *
+ * **重新武装补救拆分不分级**:只要目标有子任务就解闩(见 `markBacktracked`)——
+ * 「加新任务」是用户明确要的,而第 1 级本来就要重新走一次集成验收,那正是它该被允许
+ * 长出补救子任务的时刻;绑在第 2 级上等于要按两次 `b` 才可能发生。
  *
  * 第 2 级为什么不自己去建子任务:`createChildren` 要一个 `PipelineCtx`(`reserveNodes` 的
  * **原子**预留),而按键处理里够不着 —— 手搓一个就等于把 `maxNodes` 上限静默关掉。
  * 所以改成把父节点的 `revised` 闩解开,让编排器自己那条**已经测过**的
- * `reviseDecomposition` 在下一轮集成验收里用真 ctx 把补救子任务长出来。
+ * `reviseDecomposition` 用真 ctx 把补救子任务长出来 —— 时机是**集成验收再次连续判不通过、
+ * 到达迭代上限的那一轮**(不是「下一轮」:`planRedo`/`reopenAncestor` 刚把
+ * `iteration.integration` 清零,默认档下还要再失败满 3 轮)。
  * (它默认**每个节点一辈子只补救一次**,而这个闩正是这次人工干预要解开的东西。)
  *
  * ## 不开圆桌
@@ -445,7 +451,13 @@ function lastIntegrateRecord(n: TaskNode): TaskNode['acceptLog'][number] | undef
  *    **恒空** → 共同祖先不在扣押集里,而它此刻是 `WAITING_CHILDREN`,调度循环当场可以
  *    把它派去集成验收。
  *
- * 所以规矩逐条写死:**定序 → 串接 → side-lists 逐项取并集 → 任何一次出错整条不做**。
+ * 所以规矩逐条写死:**定序 → 串接 → side-lists 逐项取并集**。
+ *
+ * 「任何一次出错整条不做」那一条**已经被推翻**(见下面 `skip()` 那一段):它的理由
+ * (不许让用户对着一份说全做了的清单)成立,但要的是**说出来**,不是全盘放弃 ——
+ * 跑机上 34 个「集成验收没通过、子任务却全绿」的拆分节点里只要有一个落进这一批,
+ * 同一批里真正该重跑的节点一个都不会动。现在改成:逐条跳过 + 逐条记进 `skipped`/`warnings`,
+ * **一条都没成才是错误**。
  *
  * 定序按 id 升序:顺序来自模型返回的数组,而 `reopenPropagatedBlocks` 是全树不动点 ——
  * 同一份名单换个顺序会得到不同的树,那是不可测的。
@@ -573,8 +585,11 @@ export function composeRedos(
  *     `Object.keys` 的增量,三条路都不需要额外登记。**但这件事必须有探针钉住**:
  *     这个仓库为「只写不读的字段在第一次 `--resume` 时清零」付过三次账,而这里清零的后果
  *     是阶梯**悄悄退回第 1 级**,屏幕上却写着第 2 级。
- *  2. **第 2 级解开 `revised` 闩** —— 让编排器自己那条已经测过的 `reviseDecomposition`
- *     能在下一轮集成验收里用真 ctx 把补救子任务长出来(它默认每个节点一辈子只补救一次)。
+ *  2. **解开 `revised` 闩**(任何一级,只要目标有子任务)—— 让编排器自己那条已经测过的
+ *     `reviseDecomposition` 能在**集成验收再次连续判不通过、到达迭代上限的那一轮**用真 ctx
+ *     把补救子任务长出来(它默认每个节点一辈子只补救一次)。
+ *
+ *  两件事都只落在**这一趟真的有东西被派出去**的目标身上 —— 见 `reran`。
  */
 export function markBacktracked(
   plan: RedoPlan, targets: readonly BacktrackTarget[], now: string,
@@ -593,6 +608,20 @@ export function markBacktracked(
   for (const t of targets) {
     const n = plan.nodes.find(x => x.id === t.node.id)
     if (!n) continue
+    /**
+     * **这个目标名下一条都没派出去,就不许推进阶梯。**
+     *
+     * 轮次决定下一次走第几级,而第 2 级是**不可逆**的(删整片子树、重新拆分)。
+     * 「跳过算不出来的那一条」这个新行为造出了一条新路径:目标 A 的名单全被跳过、
+     * 目标 B 成功,而 A 照样 +1 —— 用户下一次按 `b`,A 直接跳到第 2 级,
+     * 而它第一次其实**什么都没发生**。(规范席实测)
+     *
+     * 判据是「它自己或它名下任意一个 suspect 真的被派出去了」。`reran` 不传时(老调用点)
+     * 逐字保持旧行为。
+     */
+    const dispatched = reran === undefined
+      || reran.has(n.id) || t.suspects.some(s => reran.has(s))
+    if (!dispatched) continue
     n.backtrack = { rounds: (n.backtrack?.rounds ?? 0) + 1, at: now }
     /**
      * **痕迹在这里被消费掉。**
@@ -643,6 +672,12 @@ export function backtrackLines(
    * 读到的是相反的承诺。
    */
   isolated = true,
+  /**
+   * id → 标题。**只影响这一屏的可读性**,不给就退回印 id(而 id 是全路径,长得吓人)。
+   * 做成回调而不是要一份 `byId`:这个函数的契约是「是数据,不是 JSX」,
+   * 而调用方手上本来就有节点表。
+   */
+  titleOf?: (id: string) => string | undefined,
 ): string[] {
   const out: string[] = []
   if (targets.length === 0) {
@@ -666,7 +701,21 @@ export function backtrackLines(
   const lvl2 = targets.filter(t => t.level === 2)
   if (lvl1.length > 0) {
     out.push(`${lvl1.length} 个任务走**重新执行**:把集成验收的意见注入执行提示词,重跑一遍。`)
-    for (const t of lvl1) out.push(`  · ${t.node.title}:${clip(t.blocking)}`)
+    /**
+     * **点名的必须是真的会被重跑的那个节点。**
+     *
+     * 上一版按 `t.node.title` 渲染 —— 而第 1 级真正送去 `planRedo` 的是它的 **suspects**。
+     * datum 那个场景下屏幕写的是「· P:datum.rs 不在集成工作区」,而 `P` 是拆分型节点、
+     * 一个执行者都不会被派给它;真正要跑的 `P/02` 从头到尾一个字都没出现。
+     * 这正是第 2 级分支已经修过、并在下面写了注释钉住的那个 bug ——**第 1 级没跟着改**,
+     * 而第 1 级才是用户最常走的那条。(规范席实测)
+     */
+    for (const t of lvl1) {
+      const kids = t.suspects.map(id => titleOf?.(id) ?? id)
+      out.push(kids.length > 0
+        ? `  · ${t.node.title} 下的 ${kids.length} 个子任务(${clipList(kids)}):${clip(t.blocking)}`
+        : `  · ${t.node.title}:${clip(t.blocking)}`)
+    }
     /**
      * **子任务全绿的那些父任务,买到的是另一样东西 —— 要在按下之前说清。**
      *
@@ -704,7 +753,8 @@ export function backtrackLines(
        * 按键处理里手搓一个等于把 `maxNodes` 静默关掉),但**理由不能替代告知** ——
        * 结果屏此前诚实地写了「下一轮集成验收**可以**给它们加新的子任务」,而那是按完之后。
        */
-      out.push('    并重新开放一次「补救拆分」:下一轮集成验收**可以**给它加新的子任务(加不加、加什么由那一轮决定)。')
+      out.push('    并重新开放一次「补救拆分」:之后集成验收**再次连续判不通过、到达迭代上限的那一轮**,'
+        + '可以给它加新的子任务(加不加、加什么由那一轮决定)。')
       if (t.remedy.length > 0) {
         out.push(`    集成验收此前提过的补救项:${t.remedy.slice(0, 3).join('、')}${t.remedy.length > 3 ? '…' : ''}`)
       }
@@ -739,3 +789,6 @@ export function backtrackLines(
 }
 
 const clip = (s: string): string => (s.length > 80 ? `${s.slice(0, 80)}…` : s) || '(没有留下意见)'
+/** 名单只印前几个 —— 而**印了几个、还剩几个**要说出来(不静默截断)。 */
+const clipList = (xs: readonly string[], n = 3): string =>
+  xs.length <= n ? xs.join('、') : `${xs.slice(0, n).join('、')}…另 ${xs.length - n} 个`

@@ -7413,8 +7413,35 @@ describe('自陈未做', () => {
       return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
     }
     await stepIntegrate(n, ctxFor([n, child], runAgent))
-    expect(prompts[0]).toContain('自己声明未做')
+    expect(prompts[0]).toContain('自报「本轮未做」的事项')
     expect(prompts[0]).toContain('创建 datum.rs')
+    /**
+     * **措辞必须是中性的。** 初级档的执行侧提示词**强制**执行者为「验收点之外的边界、
+     * 额外测试、重构」写这几行,而同一档的裁决侧明说「验收点之外的不要求」—— 一个
+     * ⚠ 加粗的「自己声明未做」会把本档明确允许的省略变成不通过(规范席实测)。
+     * 事实照给,判据交还给本档。
+     */
+    expect(prompts[0]).not.toContain('⚠ 该子任务')
+    expect(prompts[0]).toContain('按本次严格度的判据自己判')
+  })
+
+  /**
+   * **「本轮未做」要在截断之前摘出来。** `str()` 在解析边界就 `capText(…, 8000)` 了,
+   * 而这几行按提示词的要求写在报告**末尾** —— 从截断之后的字符串里摘,
+   * 等于 `TaskNode.undone` 立项的第一条理由一次都没兑现(规范席实测)。
+   */
+  it('8000 字以上的报告,末尾那几行照样摘得到', async () => {
+    const n = root(); n.status = 'READY'; n.kind = 'executable'
+    const long = 'x'.repeat(9000) + '\n本轮未做:创建 datum.rs(时间不够)'
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'execute'
+        ? '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+          '\n' + JSON.stringify({ execStatus: long }) + '\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    await stepExecute(n, ctxFor([n], runAgent))
+    // 落到节点上的 execStatus 确实被截断了 —— 而 undone 仍然拿得到。
+    expect(n.execStatus).toContain('已截断')
+    expect(n.undone).toEqual(['创建 datum.rs(时间不够)'])
   })
 })
 
@@ -7459,5 +7486,41 @@ describe('补救拆分:跨轮取并集', () => {
     const runAgent: RunAgentFn = async req => vtag(req) + '\n{"pass":false,"blocking":["缺 datum"],"comments":""}\n```'
     await stepIntegrate(n, ctxFor([n, child], runAgent))
     expect(n.degraded?.[0]?.reason).toContain('补救拆分未能进行')
+  })
+})
+
+/**
+ * 规范席验收提出的两条,各自钉住。
+ */
+describe('「加新任务」这条通道的两处堵点', () => {
+  it('remedy 出现在权威 schema 行里,不只在散文里提一句', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = 'Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      prompts.push(req.prompt)
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    // schema 行 = 模型照着填字段的那一行。跑机上 2215 个 node.md 里 remedy 出现 0 次。
+    const schemaLine = prompts[0].split('\n').find(l => l.includes('输出 json:'))!
+    expect(schemaLine).toContain('remedy')
+  })
+
+  /**
+   * 「一辈子只补救一次已经用掉了」是最常见的那个原因,而这条路以前是**静默**的 ——
+   * 降级理由里看不出为什么没长出补救子任务。
+   */
+  it('补救机会已经用掉时,降级理由要说出来并给出路', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.revised = true
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = 'Y'
+    const runAgent: RunAgentFn = async req =>
+      vtag(req) + '\n{"pass":false,"blocking":["缺 datum"],"comments":"","remedy":[{"title":"补 datum","deps":[]}]}\n```'
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    expect(n.degraded?.[0]?.reason).toContain('已经用掉')
+    expect(n.degraded?.[0]?.reason).toContain('回溯')
   })
 })
