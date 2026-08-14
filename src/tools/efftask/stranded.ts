@@ -5,6 +5,7 @@ import { RESCUED_REF_PREFIX } from './snapshot.js'
 // 硬编码副本(只认 ACCEPTED + 字面量)一件都扫不到,而同一个节点在回溯那边判 true。
 import { lastIntegrateFailed, outputMissing } from './backtrack.js'
 import { isTerminal } from './stateMachine.js'
+import { PHASE_LABEL } from './types.js'
 import type { TaskNode } from './types.js'
 
 /**
@@ -352,7 +353,14 @@ export async function scanStranded(
     if ((n.degraded ?? []).length > 0 && n.status === 'ACCEPTED') {
       items.push({
         kind: 'degraded', nodeId: n.id, title: n.title,
-        why: `降级放行(${(n.degraded ?? []).join('、')})—— 跑完了,但没有人判它通过`,
+        /**
+         * `degraded` 是 **`DegradeRecord[]`,不是字符串数组** —— 直接 `join` 出来的是
+         * `[object Object]`(跑机上逐字印成「降级放行([object Object])」)。
+         * 印哪一关走 `PHASE_LABEL`,和 `persistence.ts` 写 node.md 那一行同源。
+         * 重复的关只印一次:同一关触顶两轮会记两条,而用户要知道的是「哪几关没人判」。
+         */
+        why: `降级放行(${[...new Set((n.degraded ?? []).map(d => PHASE_LABEL[d.phase]))].join('、')})`
+          + '—— 跑完了,但没有人判它通过',
       })
     }
 

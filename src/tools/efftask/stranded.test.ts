@@ -29,6 +29,7 @@ const git: GitRunner = (args, cwd) =>
 const roots: string[] = []
 let gitRoot = ''
 let worktreeRoot = ''
+const NOW = '2026-08-14T00:00:00.000Z'
 
 const node = (id: string, over: Partial<TaskNode> = {}): TaskNode => ({
   ...createNode({
@@ -279,11 +280,41 @@ describe('要你自己定的那几格', () => {
     expect(STRANDED_KINDS.cancelled.action).toBe('report')
   })
 
-  it('降级放行的任务:跑完了,但没有人判它通过', async () => {
+  /**
+   * 这条原来用 `degraded: ['accept']` —— **字符串数组,而真类型是 `DegradeRecord[]`**。
+   * 于是测试里 `join` 出来是「accept」而生产上是「[object Object]」,跑机上逐字印了出来。
+   * 这个仓库的 tsc 不是安全网(既有错误上千),所以 fixture 必须自己是真形状。
+   */
+  it('降级放行的任务:印的是环节名,不是 [object Object]', async () => {
     const p = pool(); await p.init()
-    const n = node('root/11', { status: 'ACCEPTED', degraded: ['accept'] })
+    const n = node('root/11', {
+      status: 'ACCEPTED',
+      degraded: [
+        { phase: 'accept', round: 3, reason: '验收迭代超限(3)', advice: ['把 X 改成 Y'], at: NOW },
+        { phase: 'integrate', round: 3, reason: '集成验收迭代超限(3)', advice: [], at: NOW },
+      ],
+    })
     const r = await scanStranded(depsOf(p), [n])
     expect(kinds(r)).toContain('degraded')
+    const why = r.items.find(i => i.kind === 'degraded')!.why
+    expect(why).not.toContain('[object Object]')
+    expect(why).toContain('验收')
+    expect(why).toContain('集成验收')
+  })
+
+  /** 同一关触顶两轮会记两条,而用户要知道的是「哪几关没人判」—— 不许印成「验收、验收」。 */
+  it('同一关的多条降级记录只印一次', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/12', {
+      status: 'ACCEPTED',
+      degraded: [
+        { phase: 'accept', round: 3, reason: 'a', advice: [], at: NOW },
+        { phase: 'accept', round: 6, reason: 'b', advice: [], at: NOW },
+      ],
+    })
+    const r = await scanStranded(depsOf(p), [n])
+    const why = r.items.find(i => i.kind === 'degraded')!.why
+    expect(why).toContain('降级放行(验收)')
   })
 
   it('集成工作区里留着没解完的合并', async () => {
