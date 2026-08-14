@@ -45,6 +45,20 @@ import { stageAt } from './integrationMerge.js'
  *
  * 孤儿目录那条路(`backfillFromDir`)**没有**这个保证:它是从工作区文件正常入库,
  * clean filter 该跑也会跑。那是对的(那些文件本来就在工作区形态),但两条路的差别要说出来。
+ *
+ * ## 「尽最大努力」的第二半:一条坏的不许杀掉一整条 ref
+ *
+ * 上一版的 `stage` 回调是**全有或全无**:任何一条命令非零就整笔作废。于是同一条 ref 上
+ * 一个补录不了的路径(一个符号链接、一个 D/F 冲突、一个 `.gitignore` 挡下的构建产物)
+ * 会把旁边十个真正丢了的文件一起带走,而屏幕上报的理由里写着**受害者**的名字。
+ *
+ * 现在是 `stagePaths`:整批跑一次(快),非零就把这一批**拆成逐条**重跑,只有真的失败的
+ * 那一条进 `skipped`,理由取 git 自己的原话。安全侧一个字没松 —— 最后那道
+ * `--diff-filter=DMR`(基准 `tip`)照常跑。
+ *
+ * 另一件同样要两条路一视同仁的事是 **`.gitignore`**:`git add` 会自己挡下被忽略的路径,
+ * 而 `git checkout <ref> -- <path>` **从来不看** `.gitignore`(它从树对象取内容,永远回 0)。
+ * 不显式发这一问的话,同一件事在两条路上是相反的政策。见 `ignoredAt`。
  */
 
 export interface BackfillGit {
@@ -94,6 +108,80 @@ const literal = (p: string): string => `:(literal)${p}`
  * 既没被捞、也没进 skipped,验收席实测到的静默漏捞。
  */
 const splitZ = (s: string): string[] => s.split('\0').filter(x => x.length > 0)
+
+/**
+ * 一条命令的第一行错误 —— 拿 **git 自己的原话**当理由。
+ *
+ * 「取不出这一批文件」这种我们编的句子里没有可操作的东西;git 那句
+ * (`The following paths are ignored by one of your .gitignore files` / `did not match any file(s)`)
+ * 才是用户能据以动手的。多行只取第一行:后面几行是 `hint:`。
+ */
+const firstLine = (r: { code: number; stdout: string; stderr: string }): string =>
+  (r.stderr.trim() || r.stdout.trim()).split('\n')[0]?.trim() || `退出码 ${r.code}`
+
+/**
+ * **批量是优化,逐条是判据。**
+ *
+ * 上一版任何一条命令非零就整批作废,于是**一条**路径能杀掉同一条 ref 上所有无辜的文件,
+ * 而报出去的理由里写的是受害者的名字、不是肇事者的。真 git 上两条路的失败形状还不一样:
+ *
+ *  · `git checkout <ref> -- <批>` 混一条 ref 上没有的路径 → 退出码 1,**一个文件都不落地**;
+ *  · `git add -- <批>` 混一条被 `.gitignore` 挡下的 → 退出码 1,而**好的那条已经暂存了**
+ *    (git 部分成功)。上一版接着 `reset --hard` + `clean -fd` 把它一起冲掉 ——
+ *    这才是「孤儿目录里有一个构建产物就 0 捞回」的真成因,只分批不改回滚是修不掉的。
+ *
+ * 所以:先整批跑一次(快),非零就把**这一批**拆成逐条重跑,只有真的失败的那一条进
+ * `skipped`。安全侧一个字没松 —— 最后那道 `--diff-filter=DMR`(基准 `tip`)照常跑,
+ * 这里只决定**谁进得来**。
+ */
+async function stagePaths(
+  take: readonly string[],
+  run: (paths: string[]) => Promise<{ code: number; stdout: string; stderr: string }>,
+): Promise<{ staged: string[]; skipped: BackfillSkip[] }> {
+  const staged: string[] = []
+  const skipped: BackfillSkip[] = []
+  for (let i = 0; i < take.length; i += PATHSPEC_BATCH) {
+    const batch = take.slice(i, i + PATHSPEC_BATCH)
+    const res = await run(batch)
+    if (res.code === 0) { staged.push(...batch); continue }
+    for (const p of batch) {
+      const one = await run([p])
+      if (one.code === 0) { staged.push(p); continue }
+      skipped.push({ path: p, why: firstLine(one) })
+    }
+  }
+  return { staged, skipped }
+}
+
+/**
+ * 这些路径里,哪几条被**集成分支自己的** `.gitignore` 挡着。
+ *
+ * 在 `scratch` 里问,不在 `gitRoot` 里问:scratch 刚被 `stageAt` 对齐到 tip,那里的
+ * `.gitignore` 就是集成分支这一刻的规则,而用户检出里那份可能完全不同。
+ *
+ * **为什么要挡**:`.gitignore` 是这个仓库说的「我不要这个」。把构建产物补录进集成分支
+ * 不是捞回产出,是另一种污染 —— 而且它会随第 2 跳进用户的检出。挡下来的照样上屏,
+ * 由用户自己判。
+ *
+ * 三条实测出来的用法约束(git 2.54):
+ *  1. `check-ignore` **不认 pathspec magic**,`:(literal)` 直接 `fatal` —— 只能传裸路径。
+ *     不要紧:它比的是**路径名**,`pages/[id].tsx` 不会被当成通配符(实测退出码 1)。
+ *  2. **`-q` 只接单条**(`--quiet is only valid with a single pathname`),所以没法批量问。
+ *  3. **必须带 `--no-index`**:重试那一趟路径已经进了 index,裸 `-q` 会回「不忽略」,
+ *     于是第二趟给出一个和第一趟相反的理由。
+ * 退出码:0 = 忽略,1 = 不忽略,其它 = 探不动(**不猜**,当作不忽略)。
+ */
+async function ignoredAt(
+  deps: BackfillDeps, cwd: string, paths: readonly string[],
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  for (const p of paths) {
+    if (deps.signal?.aborted) break
+    const r = await deps.git(['check-ignore', '--no-index', '-q', '--', p], cwd)
+    if (r.code === 0) out.set(p, '集成分支的 .gitignore 说这个仓库不要它(多半是构建产物)—— 没有补录')
+  }
+  return out
+}
 
 /** 这个树对象上有没有这条路径。**gitlink 也算有** —— `cat-file -e` 在那一格是错的。 */
 async function existsAt(deps: BackfillDeps, tree: string, path: string): Promise<boolean> {
@@ -332,20 +420,33 @@ export async function backfillFromRef(
     const st = await stageAt(deps, scratch, tip)
     if (!st.ok) return { ok: false, added: [], skipped: cand.skipped, why: st.why }
 
+    /** 这一趟被逐条降级和 `.gitignore` 挡下来的 —— 和候选阶段的 `skipped` 合并后一起带出去。 */
+    const staging: BackfillSkip[] = []
     const res = await commitAndFf(deps, scratch, tip, `efftask: 补录 ${cand.take.length} 个集成分支缺失的文件\n\n${note}`, async () => {
-      for (let i = 0; i < cand.take.length; i += PATHSPEC_BATCH) {
-        const batch = cand.take.slice(i, i + PATHSPEC_BATCH)
-        const co = await deps.git(['checkout', ref, '--', ...batch.map(literal)], scratch)
-        if (co.code !== 0) return { ok: false, why: `取不出这一批文件(${co.stderr.trim() || `退出码 ${co.code}`})` }
-      }
+      /**
+       * **`checkout` 那条路自己不看 `.gitignore`** —— 它从一个树对象取内容,永远回 0。
+       * 所以这一问必须显式发:不发的话,同一件事在两条路上是**相反**的政策
+       * (孤儿目录那边被 `git add` 挡下,这边畅通无阻),而节点先提交过构建目录、
+       * `.gitignore` 是后来才进集成分支的,是真实存在的形状。
+       */
+      const ignored = await ignoredAt(deps, scratch, cand.take)
+      for (const [path, why] of ignored) staging.push({ path, why })
+      const keep = cand.take.filter(p => !ignored.has(p))
+      if (keep.length === 0) return { ok: false, why: '这一条 ref 上够得着的文件全被集成分支的 .gitignore 挡下了' }
+      const { staged, skipped } = await stagePaths(
+        keep, batch => deps.git(['checkout', ref, '--', ...batch.map(literal)], scratch),
+      )
+      staging.push(...skipped)
+      if (staged.length === 0) return { ok: false, why: `一个文件都没能取出来(${skipped[0]?.why ?? '原因不明'})` }
       return { ok: true }
     })
     if (res.ok) {
       // **报量出来的,不报打算做的。** `cand.take` 是候选清单,它不知道 git 最后收了什么。
       const added = res.added ?? cand.take
       deps.onProgress?.(`补录 ${added.length} 个文件(${ref})`)
-      return { ok: true, added, skipped: cand.skipped, ...(res.commit ? { commit: res.commit } : {}) }
+      return { ok: true, added, skipped: [...cand.skipped, ...staging], ...(res.commit ? { commit: res.commit } : {}) }
     }
+    if (staging.length > 0) cand.skipped.push(...staging)
     // 只有「集成分支前进了」值得重来(而且要**重算候选**);别的原因重试只是重复同一次失败。
     if (res.retryable === true) {
       deps.onProgress?.('集成分支在这期间前进了,重算补录清单后再试一次…')
@@ -410,28 +511,42 @@ export async function backfillFromDir(
     const st = await stageAt(deps, scratch, tip)
     if (!st.ok) return { ok: false, added: [], skipped, why: st.why }
 
+    const staging: BackfillSkip[] = []
     const res = await commitAndFf(deps, scratch, tip, `efftask: 从孤儿工作树目录补录 ${take.length} 个文件\n\n${note}`, async () => {
-      for (const rel of take) {
+      /**
+       * **先问 `.gitignore`,再拷。** 顺序不是风格:拷过去再被 `git add` 拒掉的话,
+       * 那份文件会永久留在**共享的** scratch 里(`clean -fd` 不带 `-x`,清不掉它),
+       * 每一趟都多一份。这一轮的起因正是跑机磁盘被撑爆。
+       */
+      const ignored = await ignoredAt(deps, scratch, take)
+      for (const [path, why] of ignored) staging.push({ path, why })
+      const keep = take.filter(p => !ignored.has(p))
+      if (keep.length === 0) return { ok: false, why: '这个目录里够得着的文件全被集成分支的 .gitignore 挡下了' }
+      const copied: string[] = []
+      for (const rel of keep) {
         try {
           await copyInto(`${dir}/${rel}`, `${scratch}/${rel}`)
+          copied.push(rel)
         } catch (e) {
-          return { ok: false, why: `拷不动 ${rel}(${e instanceof Error ? e.message : String(e)})` }
+          // **一个拷不动不该杀掉其余的** —— 它自己进 skipped,别人照走。
+          staging.push({ path: rel, why: `拷不动(${e instanceof Error ? e.message : String(e)})` })
         }
       }
-      for (let i = 0; i < take.length; i += PATHSPEC_BATCH) {
-        const batch = take.slice(i, i + PATHSPEC_BATCH)
-        const add = await deps.git(['add', '--', ...batch.map(literal)], scratch)
-        if (add.code !== 0) return { ok: false, why: `入库失败(${add.stderr.trim() || `退出码 ${add.code}`})` }
-      }
+      if (copied.length === 0) return { ok: false, why: `一个文件都没拷过去(${staging[0]?.why ?? '原因不明'})` }
+      const { staged, skipped: addSkips } = await stagePaths(
+        copied, batch => deps.git(['add', '--', ...batch.map(literal)], scratch),
+      )
+      staging.push(...addSkips)
+      if (staged.length === 0) return { ok: false, why: `一个文件都没能入库(${addSkips[0]?.why ?? '原因不明'})` }
       return { ok: true }
     })
     if (res.ok) {
       const added = res.added ?? take
       deps.onProgress?.(`从 ${dir} 补录 ${added.length} 个文件`)
-      return { ok: true, added, skipped, ...(res.commit ? { commit: res.commit } : {}) }
+      return { ok: true, added, skipped: [...skipped, ...staging], ...(res.commit ? { commit: res.commit } : {}) }
     }
     if (res.retryable === true) continue
-    return { ok: false, added: [], skipped, why: res.why }
+    return { ok: false, added: [], skipped: [...skipped, ...staging], why: res.why }
   }
   return { ok: false, added: [], skipped: [], why: '集成分支反复前进,补录重试 3 次仍没能落上去' }
 }

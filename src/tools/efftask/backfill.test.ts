@@ -8,6 +8,7 @@
  */
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test'
 import { mkdtemp, mkdir, rm, writeFile, readFile, symlink, copyFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -270,6 +271,7 @@ describe('两道兜底闸:必须能被单独证明', () => {
   ): BackfillDeps => ({
     git: async (args, _cwd) => {
       seen.push(args)
+      if (args[0] === 'check-ignore') return { code: 1, stdout: '', stderr: '' }
       const a = answer(args)
       return { code: a?.code ?? 0, stdout: a?.stdout ?? '', stderr: '' }
     },
@@ -358,6 +360,97 @@ describe('孤儿目录:此前唯一 0% 捞回的一格', () => {
 })
 
 /**
+ * **一条坏的不许杀掉一整条 ref。**
+ *
+ * 上一版的 `stage` 回调是全有或全无:任何一条命令非零就整笔作废,于是同一条 ref 上
+ * 一个补录不了的路径会把旁边真正丢了的文件一起带走,而报出去的理由里写的是受害者的名字。
+ */
+describe('逐条降级:批量是优化,逐条是判据', () => {
+  it('批里有一条取不出来 → 其余照样进集成分支,坏的那条带着 git 的原话进 skipped', async () => {
+    await onBranch('partial', { 'good1.ts': 'G1\n', 'bad.ts': 'B\n', 'good2.ts': 'G2\n' })
+    /**
+     * 真 git 造不出「同一批里恰好一条 checkout 失败」——判据阶段已经把不该收的全滤掉了。
+     * 所以这里只替换**那一句** checkout:批里含 `bad.ts` 就失败,逐条重跑时只有它自己失败。
+     * 其余全部走真 git,包括最后那道 DMR 复核和真正的快进。
+     */
+    const spy: BackfillDeps['git'] = async (args, cwd) => {
+      if (args[0] === 'checkout' && args.some(a => a.includes('bad.ts'))) {
+        return { code: 1, stdout: '', stderr: "error: pathspec 'bad.ts' did not match any file(s) known to git" }
+      }
+      return git(args, cwd)
+    }
+    const res = await backfillFromRef({ ...deps(), git: spy }, 'partial', '来历')
+    expect(res.ok).toBe(true)
+    expect(res.added.sort()).toEqual(['good1.ts', 'good2.ts'])
+    // **集成分支上真的有它们** —— 判据落在 git 上,不落在返回值上。
+    expect(await intFile('good1.ts')).toBe('G1\n')
+    expect(await intFile('good2.ts')).toBe('G2\n')
+    expect(await intFile('bad.ts')).toBe(null)
+    const bad = res.skipped.find(s => s.path === 'bad.ts')
+    expect(bad?.why).toContain('did not match any file')
+  })
+
+  it('一条都取不出来 → 报失败,而不是报一句「补录了 0 个」的成功', async () => {
+    await onBranch('allbad', { 'bad.ts': 'B\n' })
+    const spy: BackfillDeps['git'] = async (args, cwd) =>
+      args[0] === 'checkout' ? { code: 1, stdout: '', stderr: 'boom' } : git(args, cwd)
+    const res = await backfillFromRef({ ...deps(), git: spy }, 'allbad', '来历')
+    expect(res.ok).toBe(false)
+    expect(res.added).toEqual([])
+    expect(res.skipped.some(s => s.path === 'bad.ts')).toBe(true)
+  })
+})
+
+/**
+ * **`.gitignore` 两条路要一视同仁。**
+ *
+ * `git add` 自己会挡下被忽略的路径,而 `git checkout <ref> -- <path>` **从来不看**
+ * `.gitignore`(它从树对象取内容,永远回 0)。不显式问这一句的话,同一件事在两条路上
+ * 是相反的政策:孤儿目录那边挡下,ref 这边畅通无阻 —— 而节点先提交过构建目录、
+ * `.gitignore` 后来才进集成分支,是真实存在的形状。
+ */
+describe('集成分支的 .gitignore 说不要的东西,两条路都不补录', () => {
+  it('ref 那条路:被忽略的不进集成分支,而同一条 ref 上别的文件照样捞回来', async () => {
+    /**
+     * **顺序就是这条用例的前提**:节点先提交了构建目录(那时还没有这条忽略规则),
+     * `.gitignore` 是后来才进集成分支的。反过来写的话 `git add -A` 当场就把它挡了,
+     * 那条 ref 上压根没有 `dist/bundle.js`,这条用例测的就是另一个形状。
+     */
+    await onBranch('withdist', { 'src.ts': 'S\n', 'dist/bundle.js': 'BUILT\n' })
+    await commitOnInt({ '.gitignore': 'dist/\n' })
+    const res = await backfillFromRef(deps(), 'withdist', '来历')
+    expect(res.ok).toBe(true)
+    expect(res.added).toEqual(['src.ts'])
+    expect(await intFile('src.ts')).toBe('S\n')
+    expect(await intFile('dist/bundle.js')).toBe(null)
+    expect(res.skipped.find(s => s.path === 'dist/bundle.js')?.why).toContain('.gitignore')
+  })
+
+  it('孤儿目录那条路:一个被忽略的文件不许把整个目录的补录拖垮', async () => {
+    await commitOnInt({ '.gitignore': 'build/\n' })
+    const orphan = join(worktreeRoot, 'integration.orphan')
+    await mkdir(join(orphan, 'build'), { recursive: true })
+    await writeFile(join(orphan, 'lost.ts'), 'only here\n')
+    await writeFile(join(orphan, 'build', 'out.js'), 'junk\n')
+    const copyInto = async (from: string, to: string): Promise<void> => {
+      await mkdir(dirname(to), { recursive: true })
+      await copyFile(from, to)
+    }
+    const res = await backfillFromDir(deps(), orphan, ['lost.ts', 'build/out.js'], copyInto, '来历')
+    expect(res.ok).toBe(true)
+    expect(res.added).toEqual(['lost.ts'])
+    expect(await intFile('lost.ts')).toBe('only here\n')
+    expect(res.skipped.find(s => s.path === 'build/out.js')?.why).toContain('.gitignore')
+    /**
+     * **而且它根本没被拷过去。** 拷过去再被 `git add` 拒掉的话,那份文件会永久留在
+     * **共享的** scratch 里(`clean -fd` 不带 `-x`,清不掉它),每一趟多一份 ——
+     * 这一轮的起因正是跑机磁盘被撑爆。
+     */
+    expect(existsSync(join(worktreeRoot, 'merge-scratch', 'build', 'out.js'))).toBe(false)
+  })
+})
+
+/**
  * 验收席在真 git 上推翻的那几条 —— 每一条都配一条钉子。
  */
 describe('验收推翻过的形状', () => {
@@ -382,6 +475,9 @@ describe('验收推翻过的形状', () => {
     const res = await backfillFromRef({
       git: async (args, _cwd) => {
         seen.push(args)
+        // 替身默认对一切回 0,而 check-ignore 的 0 是「**被忽略**」—— 不写这一条,
+        // 这个替身会说「每一条路径都被 .gitignore 挡下了」。1 = 不忽略,才是常态。
+        if (args[0] === 'check-ignore') return { code: 1, stdout: '', stderr: '' }
         if (args[0] === 'rev-parse' && args[1] === INT) return { code: 0, stdout: 'tip1\n', stderr: '' }
         if (args[0] === 'diff' && args.includes('-z') && args[1] === '--name-only') return { code: 0, stdout: 'new.txt\0', stderr: '' }
         if (args[0] === 'rev-parse' && args[1] === '--verify') return { code: args[3]?.startsWith('tip1:') ? 1 : 0, stdout: '', stderr: '' }
@@ -410,6 +506,9 @@ describe('验收推翻过的形状', () => {
   it('要补录的内容在提交前消失时,报失败而不是成功', async () => {
     const res = await backfillFromRef({
       git: async (args, _cwd) => {
+        // 替身默认对一切回 0,而 check-ignore 的 0 是「**被忽略**」—— 不写这一条,
+        // 这个替身会说「每一条路径都被 .gitignore 挡下了」。1 = 不忽略,才是常态。
+        if (args[0] === 'check-ignore') return { code: 1, stdout: '', stderr: '' }
         if (args[0] === 'rev-parse' && args[1] === INT) return { code: 0, stdout: 'tip1\n', stderr: '' }
         if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { code: 0, stdout: 'tip1\n', stderr: '' }
         if (args[0] === 'diff' && args[1] === '--name-only') return { code: 0, stdout: 'new.txt\0', stderr: '' }

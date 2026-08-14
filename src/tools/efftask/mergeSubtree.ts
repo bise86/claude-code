@@ -1043,9 +1043,22 @@ async function noteRescueStranded(
      * 什么都不会发生)。两种都只能如实说,并给一条用户自己动得了手的命令。
      */
     const who = o.title !== undefined ? `「${o.title}」` : ''
+    /**
+     * **「你自己处置」那句话必须是一条真能跑的命令。**
+     *
+     * 上一版一律印 `git diff <集成分支> <ref>`,而孤儿目录那一格的 `ref` 是**盘上的目录
+     * 路径** —— 那条命令在 git 里根本跑不起来。这是这条出口唯一给用户的下一步。
+     *
+     * 数量同理:`remainingPathsOf` 探不动时回 `-1`(「量不出来」和「量出来是 0」必须
+     * 分开),照抄进句子就成了「还差 -1 处」。
+     */
+    const much = o.remaining < 0 ? '还差多少没量出来' : `还差 ${o.remaining} 处没捞回来`
+    const how = o.where === 'dir'
+      ? `ls -la ${o.ref};逐个比对:git diff --no-index -- ${deps.pool.integrationPath}/<路径> ${o.ref}/<路径>`
+      : `git diff ${deps.pool.integrationBranchName} ${o.ref}`
     out.problems.push(
-      `⚠ ${o.ref} 还差 ${o.remaining} 处没捞回来,而**回溯接不了它**${who ? `(它属于 ${who},而那个任务自己没有执行环节)` : `(没有对应的任务:${o.why})`}`
-      + ` —— 只能你自己处置:git diff ${deps.pool.integrationBranchName} ${o.ref}`,
+      `⚠ ${o.ref} ${much},而**回溯接不了它**${who ? `(它属于 ${who},而那个任务自己没有执行环节)` : `(没有对应的任务:${o.why})`}`
+      + ` —— 只能你自己处置:${how}`,
     )
   }
 }

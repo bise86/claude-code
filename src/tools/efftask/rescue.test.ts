@@ -5,7 +5,7 @@
  * 修好的代码上**。假 GitRunner 会对「合进去了没有」「撞冲突之后现场干不干净」全部点头。
  */
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, mkdir, rm, writeFile, readdir } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile, readdir, copyFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -378,6 +378,103 @@ describe('孤儿目录', () => {
     expect(withSeam).toContain('会被**补录**进集成分支')
     expect(withSeam).not.toContain('手工取用')
     expect(withSeam).toContain('目录本身不会被删')
+  })
+})
+
+/**
+ * **第 3 级对孤儿目录也要生效。**
+ *
+ * 上一版补录完什么都不量,于是这一格永远不会出现在 `stranded` 里 —— 三级递降只对 ref
+ * 那条路成立,而孤儿目录恰恰是四类里此前唯一 0% 捞回的那一格。
+ */
+describe('孤儿目录的第 3 级', () => {
+  const copyInto = async (from: string, to: string): Promise<void> => {
+    await mkdir(join(to, '..'), { recursive: true })
+    await copyFile(from, to)
+  }
+
+  async function orphanWith(files: Record<string, string>): Promise<string> {
+    const orphan = join(worktreeRoot, 'integration.orphan')
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(join(orphan, rel, '..'), { recursive: true })
+      await writeFile(join(orphan, rel), body)
+    }
+    return orphan
+  }
+
+  it('补录没成 → 落一条痕,而且说清是哪几个文件', async () => {
+    const p = pool(); await p.init()
+    const orphan = await orphanWith({ 'lost.ts': 'only here\n' })
+    // 让最后那一次快进一直失败 —— 补录进不去,而文件确确实实还没在集成分支上。
+    const stuck: RescueDeps['git'] = async (args, cwd) =>
+      args[0] === 'merge' && args[1] === '--ff-only'
+        ? { code: 1, stdout: '', stderr: 'fatal: Not possible to fast-forward, aborting.' }
+        : git(args, cwd)
+    const plan = await planRescue(depsOf(p, { copyInto }), [item({ kind: 'orphanDir', path: orphan, why: '' })], listFiles)
+    const out = await runRescue(depsOf(p, { copyInto, git: stuck }), plan)
+    const s = out.stranded.find(x => x.ref === orphan)
+    expect(s).toBeDefined()
+    expect(s?.paths).toEqual(['lost.ts'])
+    // 无主 —— 孤儿目录按定义没有节点,不许假装有人接。
+    expect(s?.nodeId).toBeUndefined()
+    // 「你自己处置」那句命令按它分岔:目录不能用 `git diff <分支> <目录>`。
+    expect(s?.where).toBe('dir')
+  })
+
+  it('补录成功的那些不落痕 —— 判据是量出来的,不是打算做的', async () => {
+    const p = pool(); await p.init()
+    const orphan = await orphanWith({ 'lost.ts': 'only here\n' })
+    const plan = await planRescue(depsOf(p, { copyInto }), [item({ kind: 'orphanDir', path: orphan, why: '' })], listFiles)
+    const out = await runRescue(depsOf(p, { copyInto }), plan)
+    expect(out.backfilled[0]?.added).toEqual(['lost.ts'])
+    expect(out.stranded.find(x => x.ref === orphan)).toBeUndefined()
+  })
+
+  /**
+   * **量差额的基准是补录那一笔提交,不是那条会动的分支。**
+   *
+   * `deps.integrationBranch` 是共享的:别的节点在这中间合进来、并且**故意删掉**我们刚
+   * 补录的文件时,再量一遍会得到「还差」,于是 `b` 会去复活一次故意的删除。这正是这个
+   * 仓库那条记忆(「基准挂在别人随时会动的东西上」)的又一张脸。
+   */
+  it('补录成功之后集成分支又删掉了它 —— 不许因此落痕', async () => {
+    const p = pool(); await p.init()
+    const orphan = await orphanWith({ 'lost.ts': 'only here\n' })
+    let deleted = false
+    // 补录那一笔快进进去之后,立刻模拟另一个节点合进来并删掉它。
+    const thenDelete: RescueDeps['git'] = async (args, cwd) => {
+      const r = await git(args, cwd)
+      if (!deleted && args[0] === 'merge' && args[1] === '--ff-only' && r.code === 0) {
+        deleted = true
+        await git(['rm', '-q', '--', 'lost.ts'], p.integrationPath)
+        await git(['commit', '-qm', '别的节点故意删掉了它'], p.integrationPath)
+      }
+      return r
+    }
+    const plan = await planRescue(depsOf(p, { copyInto }), [item({ kind: 'orphanDir', path: orphan, why: '' })], listFiles)
+    const out = await runRescue(depsOf(p, { copyInto, git: thenDelete }), plan)
+    expect(deleted).toBe(true)
+    expect(out.backfilled[0]?.added).toEqual(['lost.ts'])
+    expect(out.stranded.find(x => x.ref === orphan)).toBeUndefined()
+  })
+
+  /**
+   * **有明确理由被挡下的那些不落痕。**
+   *
+   * D/F 冲突、`.gitignore`、符号链接 —— 它们该留在屏幕上让**用户自己判**。落痕等于替他
+   * 判成「按 b 重做」,而 D/F 冲突那一类在结构上根本补录不了,重做多少次都一样。
+   */
+  it('被判据挡下的那一条不落痕,但要出现在 skipped 里', async () => {
+    const p = pool(); await p.init()
+    // 集成分支上 `lib` 是个文件,孤儿目录里 `lib/` 是目录 —— 补录它会让 git 删掉那个文件。
+    const l = await p.acquire(node('root/df')) as { path: string }
+    await writeFile(join(l.path, 'lib'), 'I am a file\n')
+    await p.commitAndMerge(node('root/df'))
+    const orphan = await orphanWith({ 'lib/util.ts': 'U\n' })
+    const plan = await planRescue(depsOf(p, { copyInto }), [item({ kind: 'orphanDir', path: orphan, why: '' })], listFiles)
+    const out = await runRescue(depsOf(p, { copyInto }), plan)
+    expect(out.backfilled[0]?.skipped.some(s => s.path === 'lib/util.ts')).toBe(true)
+    expect(out.stranded.find(x => x.ref === orphan)).toBeUndefined()
   })
 })
 

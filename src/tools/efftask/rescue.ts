@@ -342,6 +342,14 @@ export interface RescueOutcome {
     ref: string; nodeId?: string; title?: string; why: string; remaining: number
     /** 具体是哪几个文件(截断)。少了它,执行者收到的只有一个数字,据此动不了手。 */
     paths?: string[]
+    /**
+     * `ref` 到底是个 git 引用,还是**盘上的一个目录**(孤儿目录那一格)。
+     *
+     * 不是渲染口味:屏幕给的「你自己处置」命令按它分岔。上一版无主出口一律印
+     * `git diff <集成分支> <ref>`,而那条命令对一个目录路径**跑不起来** —— 用户拿到的
+     * 唯一一条下一步是个会报错的命令。缺省 `'ref'`,老的调用点一个字都不用改。
+     */
+    where?: 'ref' | 'dir'
   }[]
   problems: string[]
   aborted: boolean
@@ -457,7 +465,7 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
     await descend(deps, out, c, '分诊拿不准,没有整条合并')
   }
 
-  // ── 第 2 级:孤儿目录 ───────────────────────────────────────────
+  // ── 第 2 级 + 第 3 级:孤儿目录 ─────────────────────────────────
   for (const o of plan.orphanFiles) {
     if (deps.signal?.aborted) { out.aborted = true; break }
     const absent = o.files.filter(f => f.kind === 'absent').map(f => f.rel)
@@ -468,6 +476,44 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
     )
     out.backfilled.push({ ref: o.path, added: res.added, skipped: res.skipped })
     if (!res.ok && res.why !== undefined) out.problems.push(`孤儿目录 ${o.path} 补录没成:${res.why}`)
+    /**
+     * **第 3 级对这一格也生效。**
+     *
+     * 上一版补录完什么都不量,于是这一格永远不会出现在 `stranded` 里 —— 三级递降只对
+     * ref 那条路成立,而孤儿目录恰恰是四类里此前唯一 0% 捞回的那一格。
+     *
+     * 三条判据,每一条都有理由:
+     *
+     *  1. **基准是补录那一笔提交的 sha,不是 `deps.integrationBranch`。** 后者是一条共享的、
+     *     别的流随时在推的分支:另一个节点在这中间合进来、并且故意删掉了我们刚补录的文件时,
+     *     再量一遍会得到「还差」,于是 `b` 会去复活一次**故意的删除**。这正是这个仓库
+     *     那条记忆(「基准挂在别人随时会动的东西上」)的又一张脸。没有提交(一个都没补进去)
+     *     时才退回分支 —— 那时本来也没有我们造成的变化。
+     *  2. **只收 `absent ∖ skipped`。** 被判据挡下来的那些有明确理由(D/F 冲突、
+     *     `.gitignore`、符号链接),它们该留在屏幕上让**用户自己判**;把它们落痕等于替他
+     *     判成「按 b 重做」,而 D/F 冲突那一类在结构上根本补录不了,重做多少次都一样。
+     *  3. **不走 `strand()`。** 那条路要 `remainingPathsOf(ref)`,而孤儿目录的「ref」是
+     *     盘上的目录路径 —— `git diff <集成分支> /some/dir` 必然非零,返回 `-1`,
+     *     屏幕上会印出「还差 **-1** 处」并写进 node.md。
+     */
+    const baseline = res.commit ?? deps.integrationBranch
+    const excused = new Set(res.skipped.map(s => s.path))
+    const still: string[] = []
+    for (const rel of absent) {
+      if (deps.signal?.aborted) { out.aborted = true; break }
+      if (excused.has(rel)) continue
+      const there = await deps.git(['rev-parse', '--verify', '-q', `${baseline}:${rel}`], deps.gitRoot)
+      if (there.code !== 0) still.push(rel)
+    }
+    if (still.length > 0) {
+      out.stranded.push({
+        ref: o.path, where: 'dir', remaining: still.length,
+        paths: still.slice(0, MAX_STRANDED_PATHS),
+        why: res.added.length > 0
+          ? `孤儿目录,补录了 ${res.added.length} 个文件,还有 ${still.length} 个没能进集成分支`
+          : `孤儿目录,${still.length} 个集成分支缺失的文件一个都没能补录进去`,
+      })
+    }
   }
 
   // ── 第 3 级:分诊判「拿不准」而被取代、因此连补录都没做的 ────────
