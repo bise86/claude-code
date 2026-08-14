@@ -4524,7 +4524,24 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
    */
   if (res.merged) node.contributed = true
   if (!res.merged) {
-    node.execStatus = `${node.execStatus}\n(注:该节点${NO_CONTRIBUTION_NOTE})`
+    /**
+     * **注记要分两句写,按 `contributed` 分。**
+     *
+     * 这里原来无条件写「该节点没有向集成分支贡献任何改动」,而这句话对一个
+     * **此前交付过**的节点是假的:重跑一轮没有新东西可合(`isMerged` 为真 →
+     * `{merged:false}`)照样会走到这儿。跑机实测 14 个节点正是这形状 ——
+     * `contributed: true` 和这句注记同时在盘上。
+     *
+     * 假话进盘还只是一半。另一半是它**唯一的读者** `backtrack.outputMissing` 只认这句话
+     * (那里同时补了 `contributed !== true`),于是 `b` 会把这 14 个交付过的节点一起点中
+     * 重跑。两个缺陷互相喂:一个写假话,一个照着假话动手。
+     *
+     * 分开之后,盘上这两种情形逐字可分,而「从没交付过」那一句仍然逐字不变 ——
+     * `outputMissing` / `resumeCore` 的回填判据都按原文匹配它,改字面量会同时打断三处。
+     */
+    node.execStatus = node.contributed === true
+      ? `${node.execStatus}\n(注:该节点本轮没有新的改动可合并 —— 此前已向集成分支交付过)`
+      : `${node.execStatus}\n(注:该节点${NO_CONTRIBUTION_NOTE})`
     /**
      * **没合并提交,就不算完成。**(用户原话:「任务没有被合并提交,就不算完成吧」)
      *

@@ -1654,6 +1654,53 @@ describe('老 run 的 contributed 回填', () => {
     expect(node.contributed).toBeUndefined()
   })
 
+  /**
+   * **回填只对真老 run —— 判据是 run 级的,不是节点级的。**
+   *
+   * 节点级判据(「ACCEPTED 且没有注记 ⇒ 当初合成功过」)对**这一趟里从没走过
+   * `mergeAndRelease` 的节点**不成立:那种节点既没有字段也没有注记,于是被静默回填成
+   * 「交付过」—— 跑机实测 7 个。而 `serializeNode` 是 `{...node}` 整体落盘,所以只要
+   * 同一趟里**任何一个**节点带着这个字段,缺席的那些就是真的没交付过。
+   */
+  /** 两个节点的树:根 + 一个子任务。根必须真的叫 `root`,否则会走进「合成一个根」那条路。 */
+  const pair = (rootOver: Partial<TaskNode>, kidOver: Partial<TaskNode>): [TaskNode, TaskNode] => {
+    const kid = { ...n({ status: 'ACCEPTED', ...kidOver }), id: 'root/00-a', parentId: 'root' }
+    const root = { ...n({ status: 'ACCEPTED', ...rootOver }), childIds: ['root/00-a'] }
+    return [root, kid]
+  }
+
+  it('同一趟里只要有别的节点带 contributed,缺席的就不回填', () => {
+    const [root, kid] = pair({ contributed: true }, { execStatus: '实现了 api.ts' })
+    validateLoadedNodes([root, kid])
+    expect(root.contributed).toBe(true)
+    // 这一条就是修好的那件事:老代码会把它回填成 true。
+    expect(kid.contributed).toBeUndefined()
+  })
+
+  /**
+   * **`contributed: false` 也算「这份盘认得这个字段」。**
+   *
+   * 判据必须是 `!== undefined`,不能是 `=== true` —— 盘上真会出现全是 `false` 的 run
+   * (这个函数自己就把非布尔归一成 `false`,`serializeNode` 下一次 commit 就写回去了;
+   * 一趟什么都没合成功的 run 同理)。按 `=== true` 判,那种盘会被当成老 run,
+   * 缺字段的节点又被回填成「交付过」—— 正是这次要修的那个 bug 原样复发。
+   * 变异测试抓到的真覆盖缺口。
+   */
+  it('别的节点是 contributed: false 时,缺席的同样不回填', () => {
+    const [root, kid] = pair({ contributed: false }, { execStatus: '实现了 api.ts' })
+    validateLoadedNodes([root, kid])
+    expect(root.contributed).toBe(false)
+    expect(kid.contributed).toBeUndefined()
+  })
+
+  /** 反证:一个都不带的时候仍然是老 run,回填照旧 —— 否则升级会误杀真老 run。 */
+  it('一个节点都不带 contributed 时仍然回填(真老 run 的形态没变)', () => {
+    const [root, kid] = pair({ execStatus: '实现了 root' }, { execStatus: '实现了 a' })
+    validateLoadedNodes([root, kid])
+    expect(root.contributed).toBe(true)
+    expect(kid.contributed).toBe(true)
+  })
+
   /** 手改 node.md 写进一个真值非布尔 —— 和别的持久布尔同一条 `!== true → false` 纪律。 */
   it('非布尔一律归一成 false', () => {
     const node = n({ status: 'ACCEPTED', contributed: 'yes' as never })

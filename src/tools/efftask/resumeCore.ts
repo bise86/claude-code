@@ -383,6 +383,22 @@ export function validateLoadedNodes(
     repairs.push(`节点 ${n.id}:${why}`)
   }
 
+  /**
+   * **这份盘认不认得 `contributed` —— run 级判据,必须在下面那个循环之前算。**
+   *
+   * 下面那条给老 run 的回填(见 `contributed` 那一段)原本用的是**节点级**判据
+   * 「ACCEPTED 且 execStatus 上没有零贡献注记 ⇒ 当初合成功过」。它对真正的老 run 成立,
+   * 对**这一趟里从没走过 `mergeAndRelease` 的节点**不成立 —— 那种节点既没有字段也没有
+   * 注记(跑机实测 7 个),于是被静默回填成「交付过」,而它一个字节都没交付过。
+   *
+   * run 级判据能把两者分开:`serializeNode` 是 `{...node}` 整体落盘,所以只要这一趟里
+   * **任何一个**节点带着这个字段,就说明写它的那个版本认得它 —— 缺席的那些是真的缺席,
+   * 不是「版本太老没这个字段」。一个都没有才是真老 run,那时回填仍然照旧。
+   *
+   * 在循环之前算:循环体自己会给节点写 `contributed`,边改边判会让结果取决于遍历顺序。
+   */
+  const runKnowsContributed = [...byId.values()].some(n => n.contributed !== undefined)
+
   for (const n of byId.values()) {
     if (!LEGAL_STATUS.has(n.status as string)) block(n, `恢复时发现非法状态 ${String(n.status)},无法安全重入`)
     if (!LEGAL_KIND.has(n.kind as string)) { repairs.push(`节点 ${n.id} 的 kind 非法,重置为 unknown`); n.kind = 'unknown' as NodeKind }
@@ -731,8 +747,16 @@ export function validateLoadedNodes(
      * `mergeAndRelease` 在 `merged === false` 时写下的,所以「没有它」= 当初合成功过。
      * 判据窄到不会把真的零贡献节点也回填进去 —— 那种节点带着注记,回填不到它头上。
      */
+    /**
+     * 回填**只对真正的老 run**(这份盘一个节点都不带这个字段)。判据与理由见上面
+     * `runKnowsContributed`:认得这个字段的盘上,缺席就是真的没交付过 ——
+     * 回填它等于把「从没合并提交」写成「交付过」,而那正是这道闸要拦的东西。
+     */
     if (n.contributed !== undefined && n.contributed !== true) n.contributed = false
-    else if (n.contributed === undefined && n.status === 'ACCEPTED' && !n.execStatus.includes(NO_CONTRIBUTION_NOTE)) {
+    else if (
+      !runKnowsContributed
+      && n.contributed === undefined && n.status === 'ACCEPTED' && !n.execStatus.includes(NO_CONTRIBUTION_NOTE)
+    ) {
       n.contributed = true
     }
     // 各阶段耗时: a plain number map off disk, so every value needs the same treatment the

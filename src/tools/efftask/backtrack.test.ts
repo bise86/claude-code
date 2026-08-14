@@ -56,6 +56,26 @@ describe('范围:只收集成验收不过的和产出丢了的', () => {
   })
 
   /**
+   * **交付过的不算,哪怕盘上留着那句注记。**
+   *
+   * 旧版 `pipeline` 在 `!res.merged` 时**无条件**追加那句注记,于是一个此前交付过、
+   * 只是本轮没有新东西可合的节点,盘上同时有 `contributed: true` 和那句话。
+   * 跑机实测 14 个正是这形状 —— 少了这条判据,`b` 会把它们一起点中重跑,
+   * 而它们的产出早就在集成分支上。
+   */
+  it('contributed 为真时不算「产出丢了」—— 那句注记在这种节点上是旧版留下的假话', () => {
+    const noted = { status: 'ACCEPTED' as const, execStatus: `(注:该节点${NO_CONTRIBUTION_NOTE})` }
+    expect(outputMissing(mk('x', { ...noted, contributed: true }))).toBe(false)
+    // 缺席必须落到「没交付过」那一侧 —— 宁可多重跑一次,不可放过一个真没交付的。
+    expect(outputMissing(mk('x', { ...noted, contributed: undefined }))).toBe(true)
+    expect(outputMissing(mk('x', { ...noted, contributed: false }))).toBe(true)
+    // 阻断原因那一路同样要认(BLOCKED 是这道闸现在的主路径)。
+    expect(outputMissing(mk('x', {
+      status: 'BLOCKED', blockedReason: `该节点${NO_CONTRIBUTION_NOTE}`, contributed: true,
+    }))).toBe(false)
+  })
+
+  /**
    * `step` 缺席的老记录**谁的历史都不算** —— acceptLog 是测试修复/验收/集成验收共用的,
    * 把一条没有 step 的记录当成集成验收,会把回溯指到错的节点上。
    */

@@ -1394,6 +1394,40 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
       expect(n.status).toBe('ACCEPTED')
     })
 
+    /**
+     * **注记也要按 `contributed` 分两句 —— 上一版在这里往盘上写了一句假话。**
+     *
+     * 交付过的节点重跑一轮没有新东西可合,照样会被追加「该节点没有向集成分支贡献任何
+     * 改动」。跑机实测 14 个节点身上 `contributed: true` 和这句注记同时存在,
+     * 而它唯一的读者 `backtrack.outputMissing` 只认这句话 —— 于是 `b` 会把这批
+     * 交付过的节点一起点中重跑。两个缺陷互相喂,所以两边一起修、两边一起测。
+     */
+    it('交付过的节点本轮空转时,注记不许说它「没有贡献任何改动」', async () => {
+      const n = root()
+      n.contributed = true
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        worktrees: fakePool({ commitAndMerge: async () => ({ ok: true, merged: false }) }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.execStatus).toContain('本轮没有新的改动可合并')
+      expect(n.execStatus).not.toContain('没有向集成分支贡献任何改动')
+    })
+
+    /** 反面:真的没交付过的,那句话逐字不变 —— 三处判据(闸/回溯/恢复回填)都按原文匹配它。 */
+    it('从没交付过的节点,注记逐字仍是那句「没有向集成分支贡献任何改动」', async () => {
+      const n = root()
+      const ctx = {
+        ...ctxFor([n], okAgent()),
+        worktrees: fakePool({ commitAndMerge: async () => ({ ok: true, merged: false }) }) as never,
+      }
+      await stepStart(n, ctx)
+      await stepExecute(n, ctx)
+      expect(n.execStatus).toContain('没有向集成分支贡献任何改动')
+      expect(n.execStatus).not.toContain('本轮没有新的改动可合并')
+    })
+
     it('合成功过就把 contributed 记下来(下次重试才不会被误伤)', async () => {
       const n = root()
       const ctx = { ...ctxFor([n], okAgent()), worktrees: fakePool() as never }

@@ -225,6 +225,19 @@ const clipItem = (s: string): string => (s.length > 600 ? `${s.slice(0, 600)}…
 
 export function outputMissing(n: TaskNode): boolean {
   if (!n.execStatus.includes(NO_CONTRIBUTION_NOTE) && !n.blockedReason.includes(NO_CONTRIBUTION_NOTE)) return false
+  /**
+   * **交付过的不算 —— 哪怕盘上留着那句注记。**
+   *
+   * `contributed` 是「这个节点真的往集成分支放过东西」的持久标记,而那句注记在旧版本里是
+   * **无条件**追加的:一个交付过的节点重跑一轮没有新东西可合,照样会被写上这句话。
+   * 跑机实测 14 个节点正是这形状(`contributed: true` 与注记同时在盘上)——
+   * 少了这一句,`b` 会把它们一起点中重跑,而它们的产出早就在集成分支上了。
+   *
+   * 写 `=== true` 而不是 `!== false`:这个字段缺席(老 run、或者根本没走过合并)时是
+   * `undefined`,而 `undefined` 在这里必须落到「没交付过」那一侧 —— 宁可多重跑一次,
+   * 不可放过一个真的没交付的。这个仓库为「裸比较把默认判成反面」付过账,方向要写明。
+   */
+  if (n.contributed === true) return false
   // 还在跑的不算 —— 它本来就还没轮到贡献。
   return n.status === 'ACCEPTED' || n.status === 'BLOCKED'
 }
