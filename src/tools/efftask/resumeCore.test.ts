@@ -1699,3 +1699,34 @@ describe('隔离方式第三档的 round-trip', () => {
     expect(degraded.join('\n')).toContain('shared-parallel')
   })
 })
+
+
+/**
+ * **`remedy` 的形状校验要真的被走到。**
+ *
+ * 上一条探针只喂了 `remedy: 'boom'` —— 那被 `Array.isArray` 挡在门外,`parseRemedy`
+ * 根本没执行,于是把它换成裸 `x.remedy` 照样绿(对抗席实测)。而一份手改坏的 node.md 上
+ * `remedy: [{title: 123}]` 会一路流进 `createChildren`。
+ */
+describe('remedy 读回时的形状校验', () => {
+  it('数组里混着坏元素:只留形状对的,并夹住 MAX_REMEDY_CHILDREN', () => {
+    const raw = [{
+      ...mk({ id: 'r3' }),
+      acceptLog: [{
+        round: 1, step: 'integrate',
+        verdicts: [{
+          role: 'x', pass: false, blocking: ['b'], comments: '',
+          remedy: [
+            { title: 123 }, 'boom', { title: '真的补救项', deps: ['ok', 7] },
+            { title: '第二个' }, { title: '第三个' }, { title: '第四个' },
+          ],
+        }],
+        synthesized: { pass: false, blockingSummary: 'b' },
+      }],
+    }] as unknown as TaskNode[]
+    const out = validateLoadedNodes(raw, OPTS)
+    // parseRemedy:先丢非对象、再夹 3 条上限、再丢空标题;deps 只留字符串。
+    expect(out.nodes[0]!.acceptLog[0]!.verdicts[0]!.remedy)
+      .toEqual([{ title: '真的补救项', deps: ['ok'] }, { title: '第二个', deps: [] }])
+  })
+})

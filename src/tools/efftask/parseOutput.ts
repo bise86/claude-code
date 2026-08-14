@@ -197,15 +197,49 @@ const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
  */
 function taggedFromOpening(text: string, tag: string): string[] {
   const open = new RegExp('```[ \\t]*' + escapeRe(tag) + '(?![A-Za-z0-9_])[ \\t]*\\r?\\n?', 'gi')
-  // 收尾的判据和 FENCE_RE 逐字一致:行首(可缩进)或行尾。两边共用一个含义,
-  // 各写一份的话,哪天改了其中一处,这一道会和主路径对同一份回复给出不同的边界。
+  /**
+   * 收尾的判据和 `FENCE_RE` 逐字一致:行首(可缩进)**或行尾**。两边共用一个含义,
+   * 各写一份的话,哪天改了其中一处,这一道会和主路径对同一份回复给出不同的边界。
+   *
+   * **「或行尾」那一支今天是等价的 —— 记在这儿,免得下一个人当成缺口去补假探针。**
+   * 实测七种形状(单行紧贴 / 单行后跟正文 / 单行后跟另一个对象 / 改口两个块 /
+   * 行首多行 / 行中间多行 / 收尾缺席),去掉它之后**输出逐字相同**:body 少了精确边界会
+   * 一路取到文末,而 `consider` 的散文打捞取的是**标记之后第一个平衡对象** —— 还是同一个。
+   *
+   * 那为什么留着:它让单行块走 `JSON.parse` 的**直路**,而不是退到打捞那条修复路
+   * (打捞有它自己的前提:不许从数组里挖元素、只在 parse 失败后才跑)。
+   * 判据窄一点、走的路稳一点,代价是零。
+   */
   const close = /(?:\r?\n[ \t]*```|[ \t]*```[ \t]*(?=\r?\n|$))/g
   const out: string[] = []
   for (const m of text.matchAll(open)) {
     const start = m.index + m[0].length
     close.lastIndex = start
     const c = close.exec(text)
-    out.push(text.slice(start, c ? c.index : text.length))
+    const body = text.slice(start, c ? c.index : text.length)
+    /**
+     * **标记之后紧跟着的必须就是答案本身(第一个非空白字符是 `{`)。**
+     *
+     * 这一条不是收紧,是**把防伪造的锁装回去** —— 质量席实测出来的 P0,而我这一道的
+     * 第一版把它打开了:
+     *
+     *  - 这一道从**标记**起扫,收尾围栏缺席时取到文末;
+     *  - 而 `consider` 对 parse 失败的文本会跑 `sliceTopLevelObject` **散文打捞**。
+     *
+     * 两条合起来,判据退化成「回复里任何位置出现过本次标记 + 之后任何位置有一个带布尔
+     * `pass` 的 `{…}`」。而**在正文里提一句标记名是评审员的常见写法**(`FENCE_RE` 上方
+     * 那段注释原话:a normal thing to do),提示词里又铺着**另一个 agent 写的** execStatus
+     * 当证据 —— 里面的 `{"pass":true}` 是裸 JSON,`quote()` 只中和三反引号,一个字都挡不住。
+     *
+     * 实测(873ce8c):评审员正文写着「我的结论:严重不通过,datum.rs 完全缺失」,
+     * 而解析层读出 **pass=true**。修复前的老代码在这一格是 fail-closed 的。
+     *
+     * 加这一句之后:跑机原形(标记后换行接 JSON)、截断(没有收尾围栏)、
+     * 单行紧贴(``` TAG {json}```)三种真实形态**全部保住**,而植入的四种形态全部回到
+     * fail-closed。散文打捞在严格/宽松那两道里照旧有效(它们要求围栏成对,本来就没有这个敞口)。
+     */
+    if (!body.trimStart().startsWith('{')) continue
+    out.push(body)
   }
   return out
 }
@@ -227,9 +261,31 @@ function collectCandidates(text: string, preferTag?: string): Candidate[] {
       if ((m[1] ?? '').toLowerCase() === preferTag.toLowerCase()) tagged.push(m[2])
     }
   }
-  // 两道都没捞到带标记的块 → 从标记本身起扫(开头围栏不在行首 / 收尾围栏缺席)。
-  // 见 taggedFromOpening:跑机上 145 个节点的真裁决死在这一格。
-  if (preferTag && tagged.length === 0) tagged.push(...taggedFromOpening(text, preferTag))
+  /**
+   * 从标记本身起扫(开头围栏不在行首 / 收尾围栏缺席)。见 `taggedFromOpening`:
+   * 跑机上 145 个节点的真裁决死在这一格。
+   *
+   * **无条件跑,不看严格扫描有没有收获** —— 这一条我改过一次口,而反悔的理由是量出来的。
+   *
+   * 第一版加了「严格扫描空手时才跑」的闸,理由是「别多捞出候选、别把一次真裁决判成
+   * ambiguous」。对抗席顺着这条闸找到了它的代价,而那个代价比它买到的东西贵得多 ——
+   * **模型改口的那一格**:
+   *
+   *     ```TAG {"pass":true}```
+   *     改口:```TAG {"pass":false,"blocking":["其实不行"]}```
+   *
+   * 第一个块在行首(严格扫描收得到),更正那个在行中间(有闸时**永远看不见**)。
+   * 实测结论:`pass=true` —— **陈旧的那个通过被当成本轮结论**,而模型明明改了口。
+   * 这正是 `parseVerdict` 顶上那段话点名不可接受的那一种:「多烧一轮是可恢复的,
+   * 放过一个陈旧的通过不是」;也是 `pickAnswer` 那句「两个带标记的块仍然是两个答案,
+   * 别让『它带标记』替代『它是唯一一个』」。
+   *
+   * 无条件跑之后:改口那一格 → ambiguous → 失败关闭;行内引用过一份**完整的**旧裁决块
+   * 的那一格同样失败关闭(代价是一轮),而 145 那种「只有行中间一个」照旧解析得出来 ——
+   * 因为它本来就只有一个候选。同一个块被两道同时捞到时按内容去重(`consider` 的 `seen`),
+   * 不会自己和自己打架。
+   */
+  if (preferTag) tagged.push(...taggedFromOpening(text, preferTag))
   const out: Candidate[] = []
   const seen = new Set<string>()
   const consider = (raw: string, isTagged: boolean): void => {
@@ -758,10 +814,25 @@ export function parseNewChildren(o: Record<string, unknown>): NewChildSpec[] {
  * 而它的来源是模型自由文本。
  */
 export const UNDONE_PREFIX = '本轮未做'
+/**
+ * 「什么都没欠」的各种写法。**必须挡掉**,而这是质量席实测出来的:
+ * `strictness.ts` 的执行侧提示词原话是「不做的每一件……**也不要不写**」——
+ * 它明确在诱导模型在没有未做项时**也写一行**。收成一条「自陈未做:无」的后果一路朝坏:
+ * 一个完全健康的子任务进回溯的保守名单被重执行,而集成验收席位收到一条内容为「无」的
+ * 整改要求(中级及以上的档位判据是「列出的各项凡是落在验收点上的,不通过」)。
+ */
+const NOTHING_UNDONE = /^[(()\[【]?\s*(无|没有|暂无|均无|全部完成|全部已完成|无遗留项?|none|n\/?a)\s*[)))\]】]?\s*[。.!!]?$/i
 export function undoneItems(execStatus: string): string[] {
   const out: string[] = []
   for (const raw of execStatus.split('\n')) {
-    const line = raw.trim().replace(/^[-*·•]\s*/, '')
+    /**
+     * 列表符号在前、加粗标题在后,**而列表符号那条不许吃掉 `**` 的第一个星号**
+     * (探针第一版就栽在这儿:`**本轮未做**` 被啃成 `*本轮未做**`,加粗那条再也匹配不上)。
+     * 所以 `*` 只在**后面不是 `*`** 时才算列表符号。
+     */
+    const line = raw.trim()
+      .replace(/^(?:[-·•]|\*(?!\*))\s*/, '')
+      .replace(/^\*\*\s*(本轮未做)\s*\*\*/, '$1')
     if (!line.startsWith(UNDONE_PREFIX)) continue
     /**
      * **冒号是必需的,不是可选的。** 探针第一版就抓到了:「本轮未做**的判断标准是**:…」
@@ -772,7 +843,7 @@ export function undoneItems(execStatus: string): string[] {
     const m = /^[ \t]*[:：][ \t]*/.exec(rest)
     if (!m) continue
     const item = rest.slice(m[0].length).trim()
-    if (item.length > 0) out.push(item)
+    if (item.length > 0 && !NOTHING_UNDONE.test(item)) out.push(item)
   }
   return capBlockingList(out, '自陈未做')
 }

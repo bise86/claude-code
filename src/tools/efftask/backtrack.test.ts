@@ -5,7 +5,7 @@ import {
   NO_CONTRIBUTION_NOTE, RESCUE_STRANDED_NOTE, backtrackCanClaim, rescueStranded, strandedRefsOf,
   type BacktrackTarget,
 } from './backtrack.js'
-import { PROTOCOL_NO_BLOCK } from './parseOutput.js'
+import { PROTOCOL_AMBIGUOUS, PROTOCOL_NO_BLOCK } from './parseOutput.js'
 import { parseNodeFile, serializeNode } from './persistence.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
@@ -921,5 +921,112 @@ describe('规范席验收补漏', () => {
     const plan = { nodes: [leaf], deleted: [], dependencyRewrites: [], worktreesToRelease: [], seatedAt: 'READY' as const, reopenedAncestors: [], warnings: [] }
     markBacktracked(plan, [{ node: leaf, level: 1, blocking: '', remedy: [], suspects: [] }], NOW, new Set(['c']))
     expect(leaf.backtrack).toEqual({ rounds: 1, at: NOW })
+  })
+})
+
+/**
+ * 接缝席验收补漏:同一件事两处判据不一致,是这个仓库的固定病灶。
+ */
+describe('接缝席验收补漏', () => {
+  const protocolRound = {
+    round: 3, step: 'integrate' as const,
+    verdicts: [{ role: '集成官', pass: false, blocking: [PROTOCOL_NO_BLOCK], comments: '' }],
+    synthesized: { pass: false, blockingSummary: `[集成官] ${PROTOCOL_NO_BLOCK}` },
+  }
+  const realRound = {
+    round: 1, step: 'integrate' as const,
+    verdicts: [{
+      role: '集成官', pass: false, blocking: ['datum.rs 不在集成工作区'], comments: '',
+      remedy: [{ title: '补齐 sem/tree/datum.rs', deps: [] }],
+    }],
+    synthesized: { pass: false, blockingSummary: 'datum.rs 不在集成工作区' },
+  }
+
+  it('补救提案也跨轮取 —— 意见跨轮了而它没跨,就是两处判据不一致', () => {
+    const n = mk('x', { status: 'ACCEPTED', kind: 'executable', acceptLog: [realRound, protocolRound] })
+    const t = backtrackScope([n], 'x').targets[0]!
+    expect(t.remedy).toEqual(['补齐 sem/tree/datum.rs'])
+    expect(t.blocking).toContain('datum.rs 不在集成工作区')
+  })
+
+  /**
+   * **同一屏两个数字不许打架。** 抬头按 target 数、末尾那行按 entry 数 ——
+   * 一个「子任务全绿」的父任务会被抬头算进「走重新执行」,而它买到的是「只重新裁决」。
+   */
+  it('抬头的数字和末尾那行对得上', () => {
+    const judgeOnly: BacktrackTarget = {
+      node: mk('P', { title: '父任务', childIds: ['P/01'] }),
+      level: 1, blocking: '缺 x', remedy: [], suspects: [],
+    }
+    const rerun: BacktrackTarget = {
+      node: mk('Q', { title: '另一个', childIds: ['Q/01'] }),
+      level: 1, blocking: '缺 y', remedy: [], suspects: ['Q/01'],
+    }
+    const lines = backtrackLines([judgeOnly, rerun], [
+      { nodeId: 'P', entry: 'integrate' }, { nodeId: 'Q/01', entry: 'execute' },
+    ]).join('\n')
+    expect(lines).toContain('1 个任务走**重新执行**')
+    expect(lines).toContain('1 个任务重跑执行阶段')
+    expect(lines).toContain('1 个只重新裁决集成验收')
+    expect(lines).not.toContain('2 个任务走**重新执行**')
+  })
+})
+
+
+/**
+ * **对抗席补的七条** —— `integrateFeedback` 的顺序和两个上限此前**一条探针都没有**,
+ * 而这段文本是逐字塞进执行提示词的。
+ */
+describe('对抗席验收补漏', () => {
+  const round = (r: number, blocking: string[], advice?: string[]): TaskNode['acceptLog'][number] => ({
+    round: r, step: 'integrate',
+    verdicts: [{ role: '测试', pass: false, blocking, comments: '', ...(advice ? { advice } : {}) }],
+    synthesized: { pass: false, blockingSummary: blocking[0] ?? '' },
+  })
+
+  it('「多个裁决块」也不会被注入执行提示词', () => {
+    const n = mk('x', { acceptLog: [round(1, [PROTOCOL_AMBIGUOUS])] })
+    expect(integrateFeedback(n)).not.toContain('多个裁决块')
+  })
+
+  it('新的在前:最后一轮的意见排在前几轮之前', () => {
+    expect(integrateFeedback(mk('x', { acceptLog: [round(1, ['旧意见']), round(2, ['新意见'])] })).split('\n'))
+      .toEqual(['新意见', '旧意见'])
+  })
+
+  it('先具体后概括:同一轮里 blocking 全部排在 advice 之前', () => {
+    expect(integrateFeedback(mk('x', { acceptLog: [round(1, ['阻断A'], ['建议A'])] })).split('\n'))
+      .toEqual(['阻断A', '建议A'])
+  })
+
+  it('最多 12 条 —— 它会被逐字塞进执行提示词', () => {
+    const s = integrateFeedback(mk('x', { acceptLog: [round(1, Array.from({ length: 30 }, (_, i) => `阻断${i}`))] }))
+    expect(s.split('\n')).toHaveLength(12)
+    expect(s).toContain('阻断0')
+    expect(s).not.toContain('阻断12')
+  })
+
+  it('每条最多 600 字,超了截断并留省略号', () => {
+    const s = integrateFeedback(mk('x', { acceptLog: [round(1, ['X'.repeat(1200)])] }))
+    expect(s.length).toBe(601)
+    expect(s.endsWith('…')).toBe(true)
+  })
+
+  it('没有子任务的叶子目标不算「只重新裁决 + 重新开放补救拆分」', () => {
+    const leaf = mk('L', { kind: 'executable', childIds: [] })
+    const targets: BacktrackTarget[] = [{ node: leaf, level: 1, blocking: '没过', remedy: [], suspects: [] }]
+    expect(backtrackLines(targets, [{ nodeId: 'L', entry: 'execute' }], true).join('\n'))
+      .not.toContain('重新开放补救拆分')
+  })
+
+  it('保守名单去重:同一个节点被两个目标同时点到,只出现一次', () => {
+    const shared = mk('S', { kind: 'executable', status: 'BLOCKED' })
+    const a = mk('A', { kind: 'decompose', childIds: ['S'] })
+    const b = mk('B', { kind: 'decompose', childIds: ['S'] })
+    const byId = new Map([a, b, shared].map(n => [n.id, n]))
+    expect(conservativeEntries([
+      { node: a, level: 1, blocking: '', remedy: [], suspects: ['S'] },
+      { node: b, level: 1, blocking: '', remedy: [], suspects: ['S'] },
+    ], byId).map(e => e.nodeId)).toEqual(['S'])
   })
 })

@@ -3049,6 +3049,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         },
         strictness: control.strictness() ?? config.caps.strictness,
       }}
+      /**
+       * 「没做成的事」在**这一屏**也要有。`r`/`R`/`s`/`b` 四个键运行中全是通的,
+       * 而这条流此前只有结束屏读 —— 关口关掉之后回的就是这里,而 `ConfirmBacktrack`
+       * 印的是「原因见任务树上的提示」。(接缝席真帧实测:一个字都没有)
+       */
+      problems={redoProblems}
     />
   }
   return (
@@ -3231,6 +3237,18 @@ export function RunningView(props: {
   onRecalcDeps?: (node: TaskNode) => string | undefined
   /** 「按 d 重算」那行提示写不写 —— 走真正的准入,见 TaskTreePanel.recalcAvailable。 */
   recalcAvailable?: (node: TaskNode) => boolean
+  /**
+   * 重做/回溯那条路上「**没做成的事**」。
+   *
+   * **这一条以前只有结束屏读**,而 `r`/`R`/`s`/`b` 四个键在运行视图上全是通的 ——
+   * 接缝席真帧实测:回溯跳过了哪几个、落盘失败、以及三条「回溯未执行:…」,
+   * 在运行视图上**一个字都没有**;而关口关掉之后回的就是这一屏,`ConfirmBacktrack`
+   * 那句「原因见任务树上的提示」当场变成假话。
+   *
+   * 行预算走 `reservedRows`(和结束屏同一条规矩):不让位的话树多画这么多行,
+   * 底部的图例和按键提示被顶出屏幕。
+   */
+  problems?: string[]
 }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
@@ -3238,7 +3256,26 @@ export function RunningView(props: {
   // keyboard and calls back for exit.
   // suspended:权限对话框画在面板**之上**(spawnsSubagents ⇒ shouldContinueAnimation),
   // 两个组件同时挂着而 useInput 是广播的 —— 不让位的话,一下回车既批准工具又打开详情页。
-  return <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} sharedParallel={props.sharedParallel} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} />
+  /**
+   * 最多印 3 条 + 一句「另有 N 条」。**截断提示必须活过截断**(这个仓库为这条写过一次
+   * 判决):挤掉的那几条要有人说出来,否则用户以为一共就这几条。
+   */
+  const problems = (props.problems ?? []).slice(0, 3)
+  const moreProblems = (props.problems ?? []).length - problems.length
+  const problemRows = problems.length + (moreProblems > 0 ? 1 : 0)
+  const panel = (
+    <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} sharedParallel={props.sharedParallel} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} reservedRows={problemRows} />
+  )
+  if (problemRows === 0) return panel
+  return (
+    <Box flexDirection="column">
+      {/* `wrap="truncate-end"` 和结束屏同一条理由:这几行按**条数**计进 reservedRows,
+          而回流成两行会把树的最后一行静默挤掉。 */}
+      {problems.map((l, i) => <Text key={`p-${i}`} color="warning" wrap="truncate-end">⚠ {l}</Text>)}
+      {moreProblems > 0 ? <Text dimColor wrap="truncate-end">…另有 {moreProblems} 条未显示</Text> : null}
+      {panel}
+    </Box>
+  )
 }
 
 // 'done' phase: read-only tree + terminal summary (completed/blocked + reason) + exit key.

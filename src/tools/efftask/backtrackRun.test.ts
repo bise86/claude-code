@@ -475,3 +475,27 @@ describe('兜底注入的范围', () => {
     expect(JSON.stringify(n.guidance ?? {})).toContain('types.rs 不在集成工作区')
   })
 })
+
+
+/**
+ * **扣押集只按真的派出去的那些算。** `canApply` 扣住的节点在这段时间里不许被调度,
+ * 而把一个**根本没被回溯**的节点也扣进去,是在白白冻结一个还能往前跑的任务。
+ */
+describe('扣押集的范围', () => {
+  it('被跳过的那一条不进 canApply 的影响面', async () => {
+    const nodes = [
+      mk('root', {
+        childIds: ['root/00-a', 'root/01-b'], status: 'BLOCKED', kind: 'decompose',
+        acceptLog: [integrateFail()],
+      }),
+      mk('root/00-a', { parentId: 'root', status: 'BLOCKED', kind: 'executable' }),
+      mk('root/01-b', { parentId: 'root', status: 'BLOCKED', kind: 'unknown' }),
+    ]
+    let seen: readonly string[] = []
+    const { deps } = spyDeps({ canApply: ids => { seen = ids; return undefined } })
+    await runBacktrack(nodes, 'root', NOW, deps,
+      n => (n.id === 'root/01-b' ? { skipSteps: ['plan'] as const } : undefined))
+    expect(seen).toContain('root/00-a')
+    expect(seen).not.toContain('root/01-b')
+  })
+})

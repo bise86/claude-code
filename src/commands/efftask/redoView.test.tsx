@@ -20,7 +20,7 @@ import { ConfirmRedo } from './ConfirmRedo.js'
 import { ConfirmSkip } from './ConfirmSkip.js'
 import { ConfirmForcePass } from './ConfirmForcePass.js'
 import { ConfirmBacktrack, resultLines } from './ConfirmBacktrack.js'
-import { DoneView } from './efftask.js'
+import { DoneView, RunningView } from './efftask.js'
 
 const NOW = new Date().toISOString()
 const tick = (): Promise<void> => new Promise(r => setTimeout(r, 15))
@@ -678,6 +678,13 @@ describe('回溯关口', () => {
     expect(f).toContain('补救拆分')
     // 「N 个任务重跑执行阶段」这句话对这一格是假的 —— 一个执行者都不会被派出去。
     expect(f).toContain('0 个任务重跑执行阶段')
+    /**
+     * **这一句才是「接线接上了」的证据。** 对抗席实测:把 `conservativeEntries(...)`
+     * 整段换回改前的 `entry: ''`,上面那三条断言**照样成立**(其中 `0 个任务重跑执行阶段`
+     * 恰恰是坏版本也会印的那个 0),而真正被换掉的这一句在坏版本里整句消失。
+     * 真组件真帧 ≠ 真断言 —— 断言要落在「只有接对了才会出现」的那句话上。
+     */
+    expect(f?.replace(/\s+/g, '')).toContain('1个只重新裁决集成验收')
   })
 
   it('结果屏把「跳过了哪几个」印出来 —— 不许只报成功的那几个', () => {
@@ -697,5 +704,94 @@ describe('回溯关口', () => {
     const s = resultLines({ entries: [], skipped: [], rearmed: [] }).join('\n')
     expect(s).toContain('没有重跑任何任务')
     expect(s).not.toContain('已重跑 0')
+  })
+})
+
+/**
+ * **「没做成的事」在运行视图上也要看得见。**
+ *
+ * 接缝席真帧实测:`onProblems` 那条流此前只有结束屏读,而 `r`/`R`/`s`/`b` 四个键在运行
+ * 视图上全是通的 —— 关口关掉之后回的就是这一屏,而 `ConfirmBacktrack` 印的是
+ * 「这次回溯没有执行 —— 原因见任务树上的提示」。那时运行视图上一个字都没有。
+ */
+describe('运行视图上的 problems', () => {
+  it('印出来,而且给树让位(reservedRows)', async () => {
+    const { t, app } = await mount(
+      <RunningView
+        nodes={TREE()} runId="003" onAbort={() => {}}
+        problems={['回溯未执行:这棵子树里没有一个可以重新派出去的任务']}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('回溯未执行')
+  })
+
+  it('超过 3 条时,被挤掉的那几条要有人说出来', async () => {
+    const { t, app } = await mount(
+      <RunningView
+        nodes={TREE()} runId="003" onAbort={() => {}}
+        problems={['一', '二', '三', '四', '五']}
+      />,
+    )
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).toContain('另有 2 条未显示')
+  })
+
+  it('没有 problems 时一行都不占', async () => {
+    const { t, app } = await mount(<RunningView nodes={TREE()} runId="003" onAbort={() => {}} />)
+    const f = t.lastFrame()
+    app.unmount()
+    expect(f).not.toContain('⚠')
+  })
+})
+
+/**
+ * **让位是要量的,不是承诺的。**
+ *
+ * 这几行按条数计进 `reservedRows` —— 不让位的话树照旧画满,总输出多出这么多行,
+ * 而被顶出屏幕的是底部的图例和按键提示(这个仓库为同一件事写过两次注释)。
+ * 变异测试实测:把 `reservedRows={problemRows}` 整个拿掉,全套 4030 条一条都不红。
+ */
+describe('运行视图的行预算', () => {
+  const many = (): TaskNode[] => [
+    mk('root', { title: '根任务', kind: 'decompose', childIds: Array.from({ length: 30 }, (_, i) => `root/${i}`), status: 'WAITING_CHILDREN' }),
+    ...Array.from({ length: 30 }, (_, i) => mk(`root/${i}`, { title: `子任务${i}`, parentId: 'root', depth: 1, status: 'ACCEPTED' })),
+  ]
+  const countTaskRows = (f: string): number => (f.match(/\[(ACCEPTED|WAITING_CHILDREN)\]/g) ?? []).length
+
+  it('印了 3 条问题,树就要少画 3 行', async () => {
+    // 终端要**矮到**让 `termRows - 8 - reserved` 咬得住 20 行那个上限 ——
+    // 40 行的默认终端上两边都夹到 20,这条用例会证明不了任何事(第一版就是这样)。
+    const a = await mount(<RunningView nodes={many()} runId="003" onAbort={() => {}} />, { rows: 24 })
+    const rowsWithout = countTaskRows(a.t.lastFrame())
+    a.app.unmount()
+    const b = await mount(
+      <RunningView nodes={many()} runId="003" onAbort={() => {}} problems={['一', '二', '三']} />,
+      { rows: 24 },
+    )
+    const rowsWith = countTaskRows(b.t.lastFrame())
+    b.app.unmount()
+    expect(rowsWithout).toBeGreaterThan(3)
+    expect(rowsWithout - rowsWith).toBe(3)
+  })
+})
+
+
+/**
+ * 结果屏的截断纪律 —— 和仓库里那条「N hidden 必须活在被裁掉的东西之外」同一类。
+ */
+describe('结果屏:跳过的太多时', () => {
+  it('只印前 5 条,并说清还有几条', () => {
+    const s = resultLines({
+      entries: [{ nodeId: 'A', entry: 'execute' }],
+      skipped: Array.from({ length: 9 }, (_, i) => `P/0${i}:算不出来`),
+      rearmed: [],
+    }).join('\n')
+    expect(s).toContain('另有 9 个没能派出去')
+    expect(s).toContain('P/04')
+    expect(s).not.toContain('P/05')
+    expect(s).toContain('…另有 4 条')
   })
 })

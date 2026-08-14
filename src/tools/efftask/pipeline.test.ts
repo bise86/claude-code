@@ -7524,3 +7524,161 @@ describe('「加新任务」这条通道的两处堵点', () => {
     expect(n.degraded?.[0]?.reason).toContain('回溯')
   })
 })
+
+/**
+ * **222 那种形状**(前几轮认真提过意见和补救项,而**触顶那一轮根本没有裁决块**)——
+ * 跑机 .13 上 242 个集成验收未通过的节点里有 222 个是它。
+ *
+ * 接缝席点名的两处,都在「产生新工作 / 留给用户读」的地方,而且第一处是**这次改动
+ * 自己打开的**:跨轮取并集之前,这种形状一个补救子任务都长不出来。
+ */
+describe('222 形状:带下去的那句话不能是格式抱怨', () => {
+  const setup = () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = 'Y'
+    return { n, child }
+  }
+  /** 第 1 轮:真意见 + 真补救项;之后每一轮:协议失败(解析不出裁决块)。 */
+  const runAgentOf = () => {
+    let round = 0
+    const fn: RunAgentFn = async req => {
+      round++
+      return round === 1
+        ? vtag(req) + '\n' + JSON.stringify({
+          pass: false, blocking: ['datum.rs 不在集成工作区'], comments: '',
+          remedy: [{ title: '补齐 sem/tree/datum.rs', deps: [] }],
+        }) + '\n```'
+        : '我复核了一遍,三个文件都不在。'   // 没有任何围栏 → 协议失败
+    }
+    return fn
+  }
+
+  it('补救子任务被告知的「你为什么存在」是真意见', async () => {
+    const { n, child } = setup()
+    const ctx = ctxFor([n, child], runAgentOf())
+    await stepIntegrate(n, ctx)
+    expect(n.childIds).toHaveLength(2)
+    const born = ctx.byId.get(n.childIds[1]!)!
+    expect(born.goal).toContain('datum.rs 不在集成工作区')
+    // 一个刚被创建的子任务手上没有那份回复,这句话对它毫无意义。
+    expect(born.goal).not.toContain('裁决代码块')
+  })
+
+  it('降级放行那一节留给用户读的也是真意见,而且 advice 不空', async () => {
+    const { n, child } = setup()
+    n.revised = true   // 补救机会已用掉 → 直接走降级放行
+    await stepIntegrate(n, ctxFor([n, child], runAgentOf()))
+    const d = n.degraded?.[0]
+    expect(d?.reason).toContain('datum.rs 不在集成工作区')
+    expect(d?.reason).not.toContain('裁决代码块')
+    expect((d?.advice ?? []).join('\n')).toContain('datum.rs 不在集成工作区')
+  })
+})
+
+/**
+ * **测试修复席位是带写工具的** —— 它那一轮的自述同样要进 `undone`。
+ *
+ * 质量席点名:`node.undone` 只有执行环节一个写入点,而这一关会把报告写回 execStatus。
+ * 「修不动是允许的,编一份绿色输出才是不允许的」(测试修复的地板)—— 它照规矩写下的
+ * 「本轮未做」如果没人收,集成验收和回溯都看不到它。
+ */
+describe('测试修复之后的 undone', () => {
+  it('修复席位自己写下的「本轮未做」也算数', async () => {
+    const n = root(); n.status = 'READY'; n.kind = 'executable'
+    n.phaseRoles = { ...n.phaseRoles, verify: [{ roleName: '', roleTag: '测试' }] }
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') {
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+          '\n' + JSON.stringify({ execStatus: '实现完毕,全部通过。' }) + '\n```'
+      }
+      if (req.phase === 'verify') {
+        return '```' + (req.prompt.match(/语言标记\(fence info string\)写成 (exec[a-z]+)/)?.[1] ?? 'exec') +
+          '\n' + JSON.stringify({ execStatus: '跑了 cargo check,修掉 2 处。\n本轮未做:修复 tuple 编码(改不动,依赖上游 crate)' }) + '\n```'
+      }
+      return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    await stepExecute(n, ctxFor([n], runAgent))
+    expect(n.undone).toEqual(['修复 tuple 编码(改不动,依赖上游 crate)'])
+  })
+})
+
+
+/**
+ * **补救提案的取材顺序和上限。** 名额是 3 个(这些兄弟都在补同一个缺口、都动同一批文件,
+ * spec §16 把 worktree 冲突列为这套东西最大的风险),所以「谁先占」和「会不会超」都要钉住。
+ */
+describe('补救提案:新的在前 + 不越上限', () => {
+  it('名额不够时新的一轮胜出,总数不越 MAX_REMEDY_CHILDREN', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = 'Y'
+    let round = 0
+    const body = (old: boolean): string => JSON.stringify({
+      pass: false, blocking: ['缺 datum'], comments: '',
+      remedy: old
+        ? [{ title: '旧1', deps: [] }, { title: '旧2', deps: [] }, { title: '旧3', deps: [] }]
+        : [{ title: '新1', deps: [] }, { title: '新2', deps: [] }],
+    })
+    const runAgent: RunAgentFn = async req => {
+      round++
+      return vtag(req) + '\n' + body(round === 1) + '\n\`\`\`'
+    }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+    // 原有 1 个 + 补救 3 个 = 4。少了内层 break 会变成 6。
+    expect(n.childIds).toHaveLength(4)
+    expect(n.execStatus).toContain('新1')
+  })
+})
+
+/**
+ * **三层 break,每一层都要有输入打得到。**
+ *
+ * 变异测试逼出来的:单席位夹具下,只有**最内层**那条 break 是可观察的,
+ * 另外两层(每席一次 / 每轮一次)剪掉之后全套照绿。而集成验收本来就可以是多席位圆桌 ——
+ * 那时「每席一次」那条就是唯一挡住越界的东西:`specs` 是逐个 push 的,
+ * 最内层的检查在 push **之后**,所以少一层就多进来一条。
+ *
+ * 上限不是装饰:这几个补救子任务按定义都在补同一个缺口、都动同一批文件,
+ * spec §16 把 worktree 合并冲突列为整套东西最大的风险,而 3 是那份成本论证里的数。
+ */
+describe('补救提案:三层上限', () => {
+  it('多席位圆桌 + 更早的轮次,总数仍然恰好 MAX_REMEDY_CHILDREN', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = 'Y'
+    /**
+     * **席位要真的配上。** `emptyPhaseRoles()` 下集成验收只有一席,于是「三席各提一点」
+     * 从来没有成立过 —— 而「每席一次」那条 break 恰恰只有多席位时才可观察
+     * (变异测试第一版就栽在这儿:探针名字说三席,输入只有一席)。
+     */
+    n.phaseRoles = {
+      ...n.phaseRoles,
+      integrate: [
+        { roleName: '', roleTag: '甲' }, { roleName: '', roleTag: '乙' }, { roleName: '', roleTag: '丙' },
+      ],
+    }
+    // 触顶那一轮三席各提一点(2+1+1),更早那一轮再提一个不重名的。
+    n.acceptLog.push({
+      round: 1, step: 'integrate',
+      verdicts: [{ role: '旧席', pass: false, blocking: ['缺'], comments: '', remedy: [{ title: '旧1', deps: [] }] }],
+      synthesized: { pass: false, blockingSummary: '缺' },
+    })
+    const seats = [
+      [{ title: '新1', deps: [] }, { title: '新2', deps: [] }],
+      [{ title: '新3', deps: [] }],
+      [{ title: '新4', deps: [] }],
+    ]
+    let call = 0
+    const runAgent: RunAgentFn = async req => {
+      // 一轮三席:圆桌对每一席各发一次调用,这里按调用序轮流给三份 remedy。
+      const remedy = seats[call % seats.length]!
+      call++
+      return vtag(req) + '\n' + JSON.stringify({ pass: false, blocking: ['缺 datum'], comments: '', remedy }) + '\n```'
+    }
+    const ctx = ctxFor([n, child], runAgent)
+    await stepIntegrate(n, ctx)
+    // 原有 1 个 + 补救 3 个。少了任何一层 break 都会变成 4 个补救(childIds 5)。
+    expect(n.childIds).toHaveLength(4)
+  })
+})

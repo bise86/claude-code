@@ -4,7 +4,7 @@ import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { adviceOf, crossSeatNotice, degradeCarryPrompt, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
-import { ANSWER_TAGS, answerTag, capText, hollow, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, MAX_REMEDY_CHILDREN } from './parseOutput.js'
+import { ANSWER_TAGS, answerTag, capText, hollow, isProtocolBlocking, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, undoneItems, MAX_REMEDY_CHILDREN } from './parseOutput.js'
 import { runRoundtable, synthesizeVerdicts, type RunAgentFn } from './roundtable.js'
 import { childId } from './persistence.js'
 import { depLabel } from './depsRecalc.js'
@@ -13,7 +13,7 @@ import type { WorktreePool } from './worktreePool.js'
 import type { BuildWipeOutcome } from './buildOutputs.js'
 // 「没有合并提交就不算完成」那句话的措辞与判据,和回溯那一侧**共用一份** ——
 // 各写一份的话,哪天改了措辞,回溯就再也扫不到它要处理的那批节点。
-import { NO_CONTRIBUTION_LEAD, NO_CONTRIBUTION_NOTE, undoneOf } from './backtrack.js'
+import { NO_CONTRIBUTION_LEAD, NO_CONTRIBUTION_NOTE, integrateFeedback, undoneOf } from './backtrack.js'
 import { mapWithinPool, type SlotPool } from './slotPool.js'
 import { blockReasonWithRemedy, humanTimeoutRemedy, totalTimeoutRemedy, type BlockCategory } from './escalation.js'
 import { NodeCancelledError, PhaseTimeoutError, ProviderApiError, type TimeoutKind } from './runAgentAdapter.js'
@@ -2013,6 +2013,20 @@ async function runVerifyFix(
   if (reports.length > 0) {
     const kept = stripVerifyReport(node.execStatus)
     node.execStatus = `${kept}${kept ? '\n' : ''}${VERIFY_REPORT_MARK}\n${reports.join('\n\n')}`
+    /**
+     * **测试修复动了盘,自陈未做的那份账要跟着重算。**
+     *
+     * 质量席点名:`node.undone` 只有执行环节那一个写入点,而这一关的席位是**带写工具**的
+     * (「有问题直接修复,不要提出什么阻塞项」)。它真把 `datum.rs` 建出来之后,
+     * 旧的 `undone` 仍然挂着「创建 datum.rs」—— 于是集成验收提示词印一条**假的**
+     * 自报未做,而回溯把一个已经修好的节点当嫌疑犯拉回来重跑。方向朝坏,所以要修。
+     *
+     * 判据是**这一关之后的整份 execStatus**:执行者原来那几行「本轮未做」还在里面
+     * (`stripVerifyReport` 只摘掉上一次的测试报告),修复席位如果没把它们改掉,
+     * 那几条就该继续算数 —— 谁也没有权力凭空替执行者划掉他自己写下的欠账。
+     */
+    const after = undoneItems(node.execStatus)
+    node.undone = after.length > 0 ? after : undefined
   }
   /**
    * 记录进 `acceptLog` 并**显式标 `step: 'verify'`**。
@@ -5396,13 +5410,30 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
        * 它的孩子各自合过了)。少了 scoreNode,所有降级的拆分型节点包括根都不再被评分,
        * 整个 run 的最终分会消失。
        */
+      /**
+       * **降级理由和随节点带下去的建议,都不许是那句格式抱怨。**
+       *
+       * 接缝席实测(跑机 .13 的 222 形状):这一段是用户在 node.md「降级放行」一节读到的
+       * **全部内容**,而它逐字是「集成验收迭代超限(3): [main] 未按要求输出本轮的裁决
+       * 代码块」、`advice` 还是空的 —— 同一个节点上明明躺着「datum.rs 不在集成工作区」。
+       *
+       * `integrateFeedback` 是同一份跨轮汇总(前几轮的 blocking/advice + 过滤协议失败),
+       * 只在**它也凑不出东西**时才退回 `blockingSummary`。
+       */
+      const carried = integrateFeedback(node)
+      const degradeWhy = isProtocolBlocking(rec.synthesized.blockingSummary) && carried.length > 0
+        ? carried.split('\n').join(';')
+        : rec.synthesized.blockingSummary
+      const carriedAdvice = adviceOf(node.acceptLog, 'integrate')
       recordDegrade(
         node, ctx, 'integrate', node.iteration.integration,
-        `集成验收迭代超限(${caps.maxIterations}): ${rec.synthesized.blockingSummary}` +
+        `集成验收迭代超限(${caps.maxIterations}): ${degradeWhy}` +
         // WHY the last resort did not fire. Without this line the real cause (a cycle in the
         // proposed deps, duplicate titles, the node cap, a persist error) was discarded.
         (revise.note ? `;补救拆分未能进行: ${revise.note}` : ''),
-        adviceOf(node.acceptLog, 'integrate'),
+        // 建议为空时用同一份汇总兜底 —— 降级放行的**全部价值**就是把意见带给后面的环节,
+        // 而 `advice` 字段是模型可选填的,它不填不等于这个节点没有整改要求。
+        carriedAdvice.length > 0 ? carriedAdvice : carried.split('\n').filter(s => s.trim().length > 0),
       )
       if (firstRole(node, 'observer') && !(await commit(node, 'SCORING', ctx))) return
       await scoreNode(node, ctx)
@@ -5531,7 +5562,19 @@ async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: P
   // plus the parent's plan keyPoints — and that plan is the one the roundtable just refused,
   // so without this the corrective child replans against the very text that failed, knowing
   // only a ≤200-char title.
-  const why = rec.synthesized.blockingSummary
+  /**
+   * **新子任务被告知的「你为什么存在」,不能是一句格式抱怨。**
+   *
+   * 接缝席实测,而且这条路是**这次改动自己打开的**:跨轮取并集之前,222 那种形状
+   * (触顶那一轮根本没有裁决块)一个补救子任务都长不出来;现在长出来了,而它拿到的
+   * 第一句话逐字是「未按要求输出本轮的裁决代码块;按不通过处理」—— 一个刚被创建的
+   * 子任务,手上没有那份回复,这句话对它毫无意义,而它正是要靠这句话去写方案的。
+   *
+   * 走同一份 `integrateFeedback`(跨轮 blocking/advice + 过滤协议失败),
+   * 它凑不出东西时才退回 `blockingSummary`。
+   */
+  const carried = integrateFeedback(node)
+  const why = carried.trim().length > 0 ? carried : rec.synthesized.blockingSummary
   const res = await createChildren(node, chained, ctx, `集成验收未通过,本子任务是为解决以下问题而追加的:\n${why}`)
   if (!res.ok) {
     // The REAL reason travels back, whatever it was. Only the node cap used to be reported,

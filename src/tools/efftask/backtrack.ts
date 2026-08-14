@@ -281,9 +281,22 @@ export function backtrackScope(
     const stranded = rescueStranded(n) && backtrackCanClaim(n)
     if (!failed && !missing && !stranded) continue
     const rec = failed ? lastIntegrateRecord(n) : undefined
+    /**
+     * **补救提案也跨轮取,和意见那一侧同一个口径。**
+     *
+     * 接缝席点名:同一次改动把 `reviseDecomposition` 改成跨轮并集,却把回溯这一侧留在
+     * `lastIntegrateRecord` 上 —— 222 那种形状下(触顶那一轮是协议失败)`target.remedy`
+     * 恒空,而第 1 轮明明提过。后果两处:确认屏第 2 级那行「集成验收此前提过的补救项」
+     * 空着,以及喂给主模型映射的提示词里那一段整个消失。
+     * 同一件事两处判据不一致,是这个仓库的固定病灶。
+     */
     const remedy: string[] = []
-    for (const v of rec?.verdicts ?? []) {
-      for (const c of v.remedy ?? []) if (!remedy.includes(c.title)) remedy.push(c.title)
+    if (failed) {
+      for (const r of n.acceptLog.filter(x => x.step === 'integrate').slice().reverse()) {
+        for (const v of r.verdicts) {
+          for (const c of v.remedy ?? []) if (!remedy.includes(c.title)) remedy.push(c.title)
+        }
+      }
     }
     targets.push({
       node: n,
@@ -700,7 +713,17 @@ export function backtrackLines(
   const lvl1 = targets.filter(t => t.level === 1)
   const lvl2 = targets.filter(t => t.level === 2)
   if (lvl1.length > 0) {
-    out.push(`${lvl1.length} 个任务走**重新执行**:把集成验收的意见注入执行提示词,重跑一遍。`)
+    /**
+     * **抬头按 target 数、末尾那行按 entry 数 —— 同一屏两个数字打架。**
+     *
+     * 接缝席实测:一个「子任务全绿」的父任务在抬头里被算进「走重新执行」,而它买到的
+     * 是「只重新裁决」,末尾那行说的是 1 个 —— 而抬头说 2 个。抬头改成**按这一趟真的
+     * 会重跑执行的那些 target** 数,拆分型那几个由紧接着的「其中 N 个」那一行认领。
+     */
+    const rerunTargets = lvl1.filter(t => t.suspects.length > 0 || t.node.childIds.length === 0)
+    if (rerunTargets.length > 0) {
+      out.push(`${rerunTargets.length} 个任务走**重新执行**:把集成验收的意见注入执行提示词,重跑一遍。`)
+    }
     /**
      * **点名的必须是真的会被重跑的那个节点。**
      *
