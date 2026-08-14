@@ -1513,8 +1513,11 @@ describe('洗掉重试:失败出口同样要报 cleaned;不在集成分支上就
     if (res.ok || res.kind !== 'infra') throw new Error('expected infra')
     expect(res.message).toContain('somebody-elses-branch')
     expect(res.message).toContain('efftask/001/integration')
-    // 没有把这个节点的提交合进别人的分支
-    const theirs = await git(['log', '--oneline', 'somebody-elses-branch'], gitRoot)
+    // 没有把这个节点的提交合进别人的分支。
+    // **只看提交信息,不要 `--oneline`**:那一行开头是 7 位 sha,而 sha 是随机的 ——
+    // 十六进制里出现 `e1` 的概率不低(实测抓到过一次 `3e58e19 base`),这条断言会隔三差五
+    // 无缘无故地红一次,而它红的时候和被测行为毫无关系。
+    const theirs = await git(['log', '--format=%s', 'somebody-elses-branch'], gitRoot)
     expect(theirs.stdout).not.toContain('e1')
   })
 })
