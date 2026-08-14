@@ -148,6 +148,34 @@ describe('东西还在、只是没送到', () => {
     expect(it.title).toBe(n.title)
   })
 
+  /**
+   * **执行者在 detached HEAD 上自己打的提交。**
+   *
+   * 判据在工作区自己的 HEAD 上问,所以它**探得到**;而上一版报出去的是 `branchFor(n)` ——
+   * 一条不含那个提交的分支,`commits: 0`。`commitAndMerge` 合的也是那条分支,于是合了个空
+   * → 判「产出丢了」→ 按 `b` 重做整个任务,而那份产出就在盘上。
+   */
+  it('工作区 HEAD 上的提交不在它的分支上时,报的是那个 sha', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/stray', { status: 'ACCEPTED' })
+    const l = await p.acquire(n) as { path: string }
+    // 执行者自己脱离分支、自己提交 —— 分支指针留在原地。
+    await git(['checkout', '-q', '--detach'], l.path)
+    await writeFile(join(l.path, 'hand.ts'), '手打的产出\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', '我自己提交的'], l.path)
+    const sha = (await git(['rev-parse', 'HEAD'], l.path)).stdout.trim()
+
+    const r = await scanStranded(depsOf(p), [n])
+    const it0 = r.items.find(i => i.kind === 'unmerged')!
+    // 报的必须是**含着那个提交**的东西,否则按它去合就是合个空。
+    expect(it0.branch).toBe(sha)
+    expect(it0.commits).toBe(1)
+    expect(it0.why).toContain('自己打的提交')
+    // 而那条命令要能真的跑。
+    expect((await git(['rev-parse', '--verify', `${it0.branch}^{commit}`], gitRoot)).code).toBe(0)
+  })
+
   it('抢救分支认得回是谁的', async () => {
     const p = pool(); await p.init()
     const n = node('root/04', { status: 'ACCEPTED' })
@@ -511,6 +539,54 @@ describe('悬空提交', () => {
  * 这两格此前不在这份「不许漏项」的穷举表里,而 `stashBackup` 装的是四类里唯一
  * **不属于这一趟产出**的东西:他自己没提交的改动。
  */
+/**
+ * **临时合并工作区那一格。**
+ *
+ * 解冲突模型就在那棵树里干活。合成功了它当场被收掉;**合失败时它是现场**,而
+ * `rescue.ts` 只在那一次的结果屏上 push 一句「请去那里处理」—— 那句话不落盘,
+ * 用户按下 q 就再也没人提起它。三条清理路径的注释都写着「都不认识它」。
+ */
+describe('临时合并工作区', () => {
+  const scratchOf = () => join(worktreeRoot, 'merge-scratch')
+
+  it('那棵树里留着没收拾的改动 → 列出来,并给一条能跑的命令', async () => {
+    const p = pool(); await p.init()
+    await git(['worktree', 'add', '-q', '--detach', scratchOf(), p.integrationBranchName], gitRoot)
+    await writeFile(join(scratchOf(), 'base.txt'), 'base\n解到一半的冲突\n')
+
+    const r = await scanStranded(depsOf(p, { worktreeRoot }), [node('root', { status: 'ACCEPTED' })])
+    const it0 = r.items.find(i => i.kind === 'mergeScratch')
+    expect(it0).toBeDefined()
+    expect(it0?.loose).toBe(1)
+    expect(it0?.why).toContain('status')
+  })
+
+  /**
+   * **合成了、却没能快进进集成分支的那一笔。** 它挂在一个 detached HEAD 上,不在任何分支里;
+   * 下一次 `stageAt` 的 `reset --hard` 一过就只剩悬空对象。这一格是它唯一的观察者。
+   */
+  it('合成了却没进集成分支的提交要报出 sha', async () => {
+    const p = pool(); await p.init()
+    await git(['worktree', 'add', '-q', '--detach', scratchOf(), p.integrationBranchName], gitRoot)
+    await writeFile(join(scratchOf(), 'resolved.ts'), '模型解了半小时的结果\n')
+    await git(['add', '-A'], scratchOf())
+    await git(['commit', '-qm', 'resolved'], scratchOf())
+    const sha = (await git(['rev-parse', 'HEAD'], scratchOf())).stdout.trim()
+
+    const r = await scanStranded(depsOf(p, { worktreeRoot }), [node('root', { status: 'ACCEPTED' })])
+    const it0 = r.items.find(i => i.kind === 'mergeScratch')
+    expect(it0?.branch).toBe(sha)
+    expect(it0?.why).toContain(`git merge ${sha}`)
+  })
+
+  /** 那棵树不在(上一次合成功了、被收掉了)是**常态** —— 不许因此报一条。 */
+  it('那棵树不在时,一个字都不说', async () => {
+    const p = pool(); await p.init()
+    const r = await scanStranded(depsOf(p, { worktreeRoot }), [node('root', { status: 'ACCEPTED' })])
+    expect(r.items.some(i => i.kind === 'mergeScratch')).toBe(false)
+  })
+})
+
 describe('refs/et 下那两格', () => {
   it('我们钉的快照要被列出来,而且不许被当成悬空提交', async () => {
     const p = pool(); await p.init()

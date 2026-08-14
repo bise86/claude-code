@@ -256,6 +256,24 @@ describe('扫描', () => {
     expect((plan.rescue?.problems ?? []).some(p => p.includes(ref))).toBe(false)
   })
 
+  /**
+   * **临时合并工作区那一格要真的接到 `scanStranded` 上。**
+   *
+   * 它靠 `worktreeRoot` 这条缝;漏抄那一行,那一格**静默**变成「这次没查」——
+   * 而那棵树是整个功能里唯一「有人在里面写了几十分钟、却没有任何观察者」的地方。
+   */
+  it('临时合并工作区里的现场会上屏', async () => {
+    const pool = newPool()
+    await pool.init()
+    const scratch = join(worktreeRoot, 'merge-scratch')
+    await git(['worktree', 'add', '-q', '--detach', scratch, pool.integrationBranchName], gitRoot)
+    await writeFile(join(scratch, 'half.txt'), '解到一半的冲突\n')
+
+    const a = mk('root/00-a', { title: '甲' })
+    const plan = await scanSubtreeMerge(depsOf(pool, { runId: '001' }), [a], a.id)
+    expect((plan.rescue?.problems ?? []).join('\n')).toContain('merge-scratch')
+  })
+
   it('只有 problems 时,不许说「产出都已经在你的分支上了」', () => {
     const plan = {
       targetId: 'root', items: [], skipped: [], alreadyMerged: 0, absent: 0, ignoredOnly: 0,

@@ -137,6 +137,27 @@ export const STRANDED_KINDS = {
      */
     how: 'm 键动手前给集成工作区拍的快照 —— 那棵树随后可能被 reset --hard / clean -fd 收拾过',
   },
+  mergeScratch: {
+    label: '临时合并工作区里留着一次没做完的合并',
+    action: 'report',
+    /**
+     * **这一格此前连一格都没有 —— 而那棵树是整个功能里唯一「有人在里面写了几十分钟、
+     * 却没有任何观察者」的地方。**
+     *
+     * 解冲突模型就在 `<worktreeRoot>/merge-scratch` 里干活。合成功了那棵树当场被收掉;
+     * **合失败时它是现场**,而 `rescue.ts` 只在那一次的结果屏上 push 一句「请去那里处理」——
+     * 那句话不落盘,用户按下 q 就再也没人提起它。`c` 键 / `finishHandoff` / `dispose`
+     * 三条清理路径的注释都写着「都不认识它」。
+     *
+     * **只列,不动。** 那里可能停在半合并态,而替用户决定怎么收拾一个冲突现场不是这个键的事。
+     * 至于「抹掉之前先钉快照」:在这里**不做**,而且是想清楚之后不做 —— 已经提交的成果
+     * 会变成悬空提交(`dangling` 那一格接得住),没提交的在 `autoResolveMerge` 失败时
+     * 就已经被 `merge --abort` 收掉了(比 `stageAt` 早一步),而 `stageAt` 每次捞回和每次
+     * 同步主干都会跑 —— 在一棵**设计上就是一次性**的树上钉耐久 ref,只会把对象永久挡在
+     * gc 之外,而这一轮的起因正是磁盘被撑爆。
+     */
+    how: '一次合并撞了冲突而没解完 —— 那棵树是现场,而三条清理路径都不认识它',
+  },
   cancelled: {
     label: '被你按 x 取消的任务',
     action: 'report',
@@ -223,6 +244,12 @@ export interface StrandedDeps {
    * 缺席时那一格如实报进 `problems`,不静默跳过 —— 空白和「没有孤儿目录」在屏幕上一样。
    */
   exists?: (path: string) => Promise<boolean>
+  /**
+   * 临时合并工作树建在哪(`<worktreeRoot>/merge-scratch`)。
+   *
+   * **不给 = 那一格这次没查**,并如实报进 `problems` —— 空白和「那里很干净」在屏幕上一样。
+   */
+  worktreeRoot?: string
 }
 
 export interface StrandedReport {
@@ -355,14 +382,37 @@ export async function scanStranded(
       const inWt = await deps.git(['merge-base', '--is-ancestor', 'HEAD', deps.integrationBranch], path)
       const state = inWt.code === 0 ? 'yes' : inWt.code === 1 ? 'no' : 'unknown'
       if (state === 'no') {
-        const ahead = await aheadOf(deps, nodeBranch)
+        /**
+         * **报出去的 ref 必须真的含着那个提交。**
+         *
+         * 判据在**工作区自己的 HEAD** 上问(上一段注释说明了为什么),而这里报的却是
+         * `branchFor(n)` —— 执行者在 detached HEAD 上自己 `git commit` 过时,那条分支
+         * **不含**这个提交,`commits` 还是 0。后果不是少报一条:`commitAndMerge` 合的也是
+         * 那条分支,于是合了个空 → 节点判「产出丢了」→ 按 `b` 重做**整个任务**,
+         * 而那份产出就在盘上,一条 `git merge <sha>` 就回来了。
+         *
+         * 目录后来被清掉时更糟:它变成悬空提交,而 `dangling` 那一格按 `efftask:` 前缀过滤 ——
+         * **手打的提交不带那个前缀**,一格都接不住。
+         *
+         * 所以:分支含不住 HEAD 时,报 **HEAD 的 sha**,并说清它不在那条分支上。
+         */
+        const headSha = (await deps.git(['rev-parse', 'HEAD'], path)).stdout.trim()
+        const onBranch = headSha.length === 0
+          ? { code: 0 }
+          : await deps.git(['merge-base', '--is-ancestor', headSha, nodeBranch], deps.gitRoot)
+        const stray = onBranch.code === 1 && headSha.length > 0
+        const ref = stray ? headSha : nodeBranch
+        const ahead = await aheadOf(deps, ref)
         items.push({
           kind: 'unmerged',
-          nodeId: n.id, title: n.title, path, branch: nodeBranch,
+          nodeId: n.id, title: n.title, path, branch: ref,
           ...(ahead === undefined ? {} : { commits: ahead }),
-          why: n.mergeConflict === true
-            ? '撞了合并冲突,提交锁在它自己的分支上'
-            : '有提交没合进集成分支',
+          why: stray
+            ? `工作区里有**自己打的提交**(${headSha.slice(0, 12)}),而它不在 ${nodeBranch} 上 —— `
+              + `按分支合会合个空;要捞它:git merge ${headSha}`
+            : n.mergeConflict === true
+              ? '撞了合并冲突,提交锁在它自己的分支上'
+              : '有提交没合进集成分支',
         })
       } else if (state === 'unknown') {
         items.push({
@@ -679,6 +729,40 @@ export async function scanStranded(
         `${prefix} 下有 ${all.length} 条,只列了前 ${MAX_ET_REFS} 条(本趟的排在前面)。`
         + `全部:git for-each-ref ${prefix};确认不需要了可以自己删:git update-ref -d <ref>`,
       )
+    }
+  }
+
+  /**
+   * ── 临时合并工作区 ────────────────────────────────────────────────
+   *
+   * 判据和集成工作区那一格同形(`status --porcelain` 非空 = 有现场),外加**它自己的 HEAD
+   * 是不是还停在集成分支上** —— 一次合成了却没能快进的提交就挂在那个 detached HEAD 上,
+   * 而它不在任何分支里。
+   *
+   * 探不到那棵树(最常见:上一次合成功了,它已经被收掉)不是问题,是常态 —— 不报。
+   */
+  if (deps.worktreeRoot !== undefined) {
+    const scratch = `${deps.worktreeRoot}/merge-scratch`
+    const there = await deps.git(['rev-parse', '--git-dir'], scratch)
+    if (there.code === 0) {
+      const st = await deps.git(['-c', 'core.quotepath=false', 'status', '--porcelain'], scratch)
+      const lines = st.code === 0 ? st.stdout.split('\n').map(l => l.trim()).filter(Boolean) : []
+      const head = (await deps.git(['rev-parse', 'HEAD'], scratch)).stdout.trim()
+      const landed = head.length === 0
+        ? { code: 0 }
+        : await deps.git(['merge-base', '--is-ancestor', head, deps.integrationBranch], deps.gitRoot)
+      const strayCommit = landed.code === 1 && head.length > 0
+      if (lines.length > 0 || strayCommit) {
+        items.push({
+          kind: 'mergeScratch', path: scratch, ...(lines.length > 0 ? { loose: lines.length } : {}),
+          ...(strayCommit ? { branch: head } : {}),
+          why: strayCommit
+            ? `那次合并已经提交(${head.slice(0, 12)})却没能进集成分支,而这棵树是 detached —— `
+              + `它不在任何分支上;想捞:git merge ${head}(先看:git show --stat ${head})`
+            : `留着 ${lines.length} 处没收拾的改动(一次没解完的合并)—— 下一次捞回会先把它清掉;`
+              + `想看:git -C ${scratch} status`,
+        })
+      }
     }
   }
 

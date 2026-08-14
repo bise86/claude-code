@@ -480,6 +480,8 @@ async function scanRescue(
     branchFor: n => pool.worktreeBranchOf(n),
     ...(deps.inFlight ? { inFlight: deps.inFlight } : {}),
     ...(deps.exists ? { exists: deps.exists } : {}),
+    // 缺了它,临时合并工作区那一格这次没查 —— 而那是唯一「有人在里面写了几十分钟」的树。
+    ...(deps.worktreeRoot ? { worktreeRoot: deps.worktreeRoot } : {}),
   }, nodes)
   /**
    * **只收上面那一段够不着的那几类。** `loose` / `unmerged` 已经由逐节点那条路处理
@@ -590,6 +592,11 @@ export const MERGE_KEY_REPORTS: readonly string[] = [
    * 用户看过之后才知道要不要取回。
    */
   'stashBackup', 'rescued',
+  /**
+   * 临时合并工作区里那次没做完的合并 —— **只念**。那棵树可能停在半合并态,而替用户决定
+   * 怎么收拾一个冲突现场不是这个键的事;给路径、给命令。
+   */
+  'mergeScratch',
   // 合并解决不了,要按 b 回溯:产出丢了 / 集成验收没通过。
   'missing', 'integrateFail',
   // 这两格的 action 是 'report',但 `refOnly` **也会真的去合它们**(它们有 ref 或目录)——
