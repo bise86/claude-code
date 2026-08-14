@@ -150,3 +150,44 @@ C 和 D 加进来的 ref 会当场被 `dangling` 那一格重复列一遍。判�
 - A:批里混一条坏的 → 好的那些**照样进集成分支**,坏的那条带着 git 的原话进 `skipped`;
 - B:孤儿目录补录之后仍有 `absent` → 产生 `stranded` 且**没有 nodeId**,走无主出口;
 - E:C/D 造出的 ref → `dangling` 那一格**不列**它。
+
+---
+
+# 圆桌 + 验收推翻了什么(落地后补记)
+
+方案里写死的判据被两轮评审推翻了不少,逐条记下来,免得下一轮又照着方案做一遍。
+
+## 圆桌(三席)推翻的
+
+| 方案原话 | 实际 |
+|---|---|
+| §E「C/D 的 ref 会被 `dangling` 重复列一遍」 | **假的**。`stash create` 的 subject 是 `WIP on …`,`efftask:` 前缀过滤早就挡住了。真正在被重复列的是**活着的抢救分支的 tip**,而方案的 `refs/et` tip 集合碰不到它(它在 `refs/heads`)。判据整条换掉:去掉 fsck 的显式 head。 |
+| §A「`.gitignore` 两条路共用一条判据」 | 只对孤儿目录成立。`checkout <ref> -- <path>` **从来不看** `.gitignore` —— 见下面验收那一条,这个「统一」后来被完全推翻。 |
+| §0「漏做 4 的成因是 `git add` 整批失败」 | **不是**。实测 `git add` 混一条被忽略的 → 退出码 1,而好的那条**已经暂存了**。真成因是 `commitAndFf` 在 `!staged.ok` 时的回滚把它一起冲掉。只分批不改回滚,那一格照样 0 捞回。 |
+| §B「无主出口早就有了」 | 出口在,但对目录说的是假话:它印 `git diff <集成分支> <目录路径>`(跑不起来),而 `remainingPathsOf` 对目录必然回 `-1` → 屏幕会印「还差 **-1** 处」。 |
+| `check-ignore` 的用法 | `-z` 只能配 `--stdin`(而 git 接缝没有 stdin);**不认 pathspec magic**;`-q` **只接单条**;必须带 `--no-index`(否则重试那趟已进 index,回「不忽略」)。 |
+| 方案没提的 | 确认屏的 `hasNothingToDo` 只看 `rescue.merge` —— **上一轮做的第 2 级补录在生产上一次都没执行过**。 |
+| 方案没提的 | `mergeIntoIntegration` 的 `merge → rev-parse HEAD → ff` 之间没有锁,共享 scratch 被挪走时 `--ff-only <tip>` 回 `Already up to date`、**退出码 0** → 报成功而集成分支没动 → `contributed = true` → 第 3 级永远不为这条 ref 触发。 |
+
+## 验收(三席)推翻的
+
+| 上一批的判断 | 实际 |
+|---|---|
+| 「`.gitignore` 两条路一视同仁」 | **完全推翻**。`.gitignore` 按定义不管**已跟踪**的文件;执行者 `git add -f` 提交的交付物会被丢掉,而且没有出口(丢掉 → 落痕 → `b` 重做 → 再被丢)。ref 那条路取消这一问,只点名。 |
+| 「补录成功由 ff 的退出码证明」 | 和 `mergeIntoIntegration` 同一个洞,补录这条路没补。而 `res.commit` 当基准恰好把最后一次发现的机会也关掉。 |
+| 「快照 `ok: true` 就是钉住了」 | `status` 数出 N 处而 `stash create` 什么都不给时,上一版 `ok: true` 且**一行都不输出**。 |
+| 「按 tree 命名天然幂等」 | 只对同一棵树上同一份内容成立。不同基准、同 tree → 同名 → 第二次 `update-ref` 把第一条抹掉。 |
+| 「`rescuePending` 数四个数组够了」 | 八格只走 `problems`。「产出都已经在你的分支上了」和「产出不在任何地方」同屏出现过。 |
+| 「屏幕给了自查命令」 | 那条命令印的是占位符 `<集成分支>`,真名整屏没出现过,实测 `fatal`。 |
+
+## 明确没做的(不是忘了)
+
+- **`pinSnapshot` 只接了一个调用点。** `worktreePool` 合并失败那两处(**自动跑那条路,零保护**)、
+  `stageAt`(`merge-scratch`,那棵树连一格都没有)、`backfill` 的四处回滚、`c` 键的
+  `worktree remove --force` —— 四个抹除点接了一个。「通用原语」这三个字目前只兑现了四分之一。
+  最重的是 `worktreePool` 那两处:自动跑每次合并失败都触发,而 `recordCleaned` 只留下名字。
+- **`salvage` / 工作树分支仍按 runId 切**,只有 `refs/et/*` 那两格解了绑。上一趟崩掉的 run
+  留下的**节点产出**对每个扫描器仍然隐形。
+- **`refs/et/rescued/*` 没有回收者**,而 `stranded` 那一格不截断:按十次 `m` 就是十条永久 ⚠。
+- **`notices` 和 `refOnly` 的重复项没去重**:孤儿目录同屏出现「会被补录」和「确认无用后请自行删除」。
+- **detached HEAD 上手打的提交**:探对了,而报出去的 `branch` 是一条不含那个提交的分支。
