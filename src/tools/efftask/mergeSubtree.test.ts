@@ -196,6 +196,29 @@ describe('扫描', () => {
     expect(plan.items[0]!.loose).toBe(1)
     expect(subtreeMergeLines(plan).join('\n')).toContain('未提交内容会被一并提交')
   })
+
+  /**
+   * **「这棵子树的产出都已经在你的分支上了」是这一屏最强的一句话,而它对八格是假的。**
+   *
+   * `missing` / `integrateFail` / `degraded` / `cancelled` / `integrationDirty` / `dangling` /
+   * `stashBackup` / `rescued` **全部只走 `rescue.problems`**,而上一版这道门只数四个数组。
+   * 验收席逐字抄回来的对撞:同一屏上「产出都已经在你的分支上了」和「产出不在任何地方,
+   * 只能重新执行」;假的那句排在前面、没有 ⚠(所以不上色)、矮终端下最后才被裁。
+   */
+  it('只有 problems 时,不许说「产出都已经在你的分支上了」', () => {
+    const plan = {
+      targetId: 'root', items: [], skipped: [], alreadyMerged: 0, absent: 0, ignoredOnly: 0,
+      trunk: { branch: 'main', pending: 0 },
+      canResolve: true, runActive: false,
+      rescue: {
+        merge: [], backfill: [], hold: [], orphanFiles: [],
+        problems: ['任务甲:通过了验收,而它对集成分支的贡献是零 —— 产出不在任何地方,只能重新执行'],
+      },
+    }
+    const text = subtreeMergeLines(plan).join('\n')
+    expect(text).not.toContain('都已经在你的分支上了')
+    expect(text).toContain('产出不在任何地方')
+  })
 })
 
 describe('合并到主干', () => {

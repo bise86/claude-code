@@ -203,6 +203,13 @@ export interface SubtreeMergePlan {
   rescue?: RescuePlan
   /** 这一趟有没有孤儿目录的拷贝接缝 —— 确认屏据它决定承诺「补录」还是「手工取用」。 */
   canBackfillOrphan?: boolean
+  /**
+   * 集成分支的**真名**。屏幕上那几条「不同意的话自己来」的命令要用它。
+   *
+   * 上一版印的是占位符 `<集成分支>`,而那个名字整屏一个字都没出现过 —— 验收席真跑过:
+   * `fatal: ambiguous argument '<集成分支>'`。用户没有任何办法把它替换掉。
+   */
+  integrationBranch?: string
 }
 
 /**
@@ -446,6 +453,7 @@ export async function scanSubtreeMerge(
     trunk: await scanTrunk(deps),
     canResolve: deps.resolve !== undefined,
     canBackfillOrphan: deps.copyInto !== undefined,
+    integrationBranch: pool.integrationBranchName,
     runActive: deps.runActive === true,
     ...(await scanRescue(deps, nodes)),
   }
@@ -526,7 +534,7 @@ async function scanRescue(
   }, refOnly, deps.listFiles)
   if (needBacktrack > 0) {
     plan.problems.push(
-      `上面这 ${needBacktrack} 项**合并解决不了**(产出丢了 / 集成验收没通过 / 三级都试过还是没捞回)`
+      `下面这 ${needBacktrack} 项**合并解决不了**(产出丢了 / 集成验收没通过 / 三级都试过还是没捞回)`
       + '—— 按 b 回溯:它会把已有的意见注入执行阶段重跑,必要时完全重做并加新任务。',
     )
   }
@@ -664,6 +672,16 @@ export async function runSubtreeMerge(
     // 缺席**要说**:静默退回正是这个仓库的招牌缺陷。
     out.problems.push('⚠ 这一趟不知道 run 的编号,集成工作区里的未提交内容没有被钉成 ref —— 下一次合并失败会把它清掉')
   }
+
+  /**
+   * **「中断了」这个事实不许依赖 `plan.items` 非空。**
+   *
+   * 上一版只在循环体里置 `out.aborted`,而 `items` 为空(跑机上最常见的形状)时循环一次都
+   * 不进 → 恒为 false → 下面那句 `if (!out.aborted)` 照样放行第 2 跳。今天靠 `syncTrunk`
+   * 自己再查一遍 signal 兜住了,而那意味着哪天在这两者之间加一句写操作,Esc 就直接失效,
+   * 且没有任何测试会红。
+   */
+  if (deps.signal?.aborted) out.aborted = true
 
   for (const item of plan.items) {
     if (deps.signal?.aborted) { out.aborted = true; break }
@@ -1196,9 +1214,18 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
      * 逐节点那条路没事可做 ≠ 这次按键没事可做:抢救分支 / 只剩分支 / 孤儿目录那几类
      * 结构上不经过 `plan.items`,而它们正是用户按这个键最想知道的东西。
      */
+    /**
+     * **`problems` 也要数。**
+     *
+     * 这句「都已经在你的分支上了」是这一屏最强的一句话。上一版数了四个数组,而
+     * `missing` / `integrateFail` / `degraded` / `cancelled` / `integrationDirty` /
+     * `dangling` / `stashBackup` / `rescued` 这**八格全部只走 `problems`** ——
+     * 验收席实测:同一屏上「产出都已经在你的分支上了」和「产出不在任何地方,只能重新执行」
+     * 同时出现,而假的那句排在前面、没有 ⚠(所以不上色)、矮终端下最后才被裁掉。
+     */
     const rescuePending = plan.rescue !== undefined && (
       plan.rescue.merge.length + plan.rescue.backfill.length + plan.rescue.hold.length
-      + plan.rescue.orphanFiles.length > 0
+      + plan.rescue.orphanFiles.length + plan.rescue.problems.length > 0
     )
     out.push(rescuePending
       ? `集成分支上没有还没送到 ${plan.trunk.branch} 的提交,但下面这几处**没有工作区目录**的产出还没进来。`
@@ -1236,7 +1263,12 @@ export function subtreeMergeLines(plan: SubtreeMergePlan): string[] {
      */
     // 第二个参数是「这一趟有没有拷贝接缝」—— 孤儿目录那一格到底捞不捞由它决定,
     // 而这一屏是在用户按下 y **之前**读的。写死一个值就是在承诺一件没有根据的事。
-    out.push(...rescueLines(plan.rescue, plan.canBackfillOrphan === true))
+    /**
+     * 第三个参数是集成分支的**真名**。上一版这几条自查命令里印的是占位符 `<集成分支>`,
+     * 而那个名字整屏一个字都没出现过 —— 验收席真跑过:`fatal: ambiguous argument '<集成分支>'`。
+     * 用户没有任何办法把它替换掉,而那是「不同意这个判断的话自己来」的唯一入口。
+     */
+    out.push(...rescueLines(plan.rescue, plan.canBackfillOrphan === true, plan.integrationBranch))
   }
   /**
    * **「所有未提交的都要提交」有个后半句,必须说出口。**

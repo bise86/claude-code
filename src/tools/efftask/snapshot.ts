@@ -77,7 +77,11 @@ export const RESCUED_REF_PREFIX = 'refs/et/rescued'
  * 把一棵工作树此刻的未提交内容钉成一条耐久 ref。**只读那棵树**,一个字节都不改。
  */
 export async function pinSnapshot(deps: SnapshotDeps, cwd: string): Promise<SnapshotResult> {
-  const st = await deps.git(['-c', 'core.quotepath=false', 'status', '--porcelain'], cwd)
+  /**
+   * `-uall` 是必须的:不带它,`status` 把一个未跟踪**目录**折成一行(`bigdir/`)。
+   * 验收席实测:屏幕承诺「另有 1 个未跟踪文件没能钉住」,而 `clean -fd` 会删掉 500 个。
+   */
+  const st = await deps.git(['-c', 'core.quotepath=false', 'status', '--porcelain', '-uall'], cwd)
   if (st.code !== 0) {
     return { ok: false, why: `看不出 ${cwd} 里有没有未提交的内容(${first(st)})` }
   }
@@ -105,16 +109,45 @@ export async function pinSnapshot(deps: SnapshotDeps, cwd: string): Promise<Snap
     }
   }
   const sha = created.stdout.trim()
-  // 空 = 没有**已跟踪**的改动。未跟踪的照样要报,但没有可钉的东西。
+  /**
+   * **空 sha ≠ 「没什么可钉」。**
+   *
+   * 上面那句 `status` 已经数出 `lines.length` 处改动了。到这里 `stash create` 却什么都没给,
+   * 只有一种成因:**别的流程在这两句之间把那棵树收拾了**(集成工作区是共享的,而这一段
+   * 不在锁里)。验收席在真 git 上复现:`ok: true`、`ref` 为空、`snapshotLines` **一行都不输出** ——
+   * 用户一整天的未提交内容没了,屏幕上一个字都没有。
+   *
+   * 只有 `lines` 里全是未跟踪文件时,空 sha 才是正常的(`stash create` 本来就拿不到它们)。
+   */
   if (sha.length === 0) {
-    return { ok: true, changes: lines.length, ...(untracked.length > 0 ? { untracked } : {}) }
+    const tracked = lines.length - untracked.length
+    return {
+      ok: tracked === 0, changes: lines.length,
+      ...(untracked.length > 0 ? { untracked } : {}),
+      ...(tracked === 0 ? {} : { why: `看见了 ${tracked} 处已跟踪的改动,而一处都没能钉住(这棵树是共享的,可能正被别的流程收拾)` }),
+    }
   }
 
   const tree = await deps.git(['rev-parse', `${sha}^{tree}`], deps.gitRoot)
   if (tree.code !== 0) return { ok: false, changes: lines.length, why: `读不出快照的 tree(${first(tree)})` }
-  const ref = `${RESCUED_REF_PREFIX}/${deps.runId}/${tree.stdout.trim().slice(0, 12)}`
-  const pinned = await deps.git(['update-ref', ref, sha], deps.gitRoot)
-  if (pinned.code !== 0) return { ok: false, changes: lines.length, why: `钉不住那条 ref(${first(pinned)})` }
+  const base = `${RESCUED_REF_PREFIX}/${deps.runId}/${tree.stdout.trim().slice(0, 12)}`
+  /**
+   * **只创建,不覆盖。**
+   *
+   * ref 名只编码 tree,不编码基准。验收席实测:两棵不同基准的树上有同一份内容时,
+   * 第二次 `update-ref` 会把第一条**直接抹掉**,那份快照落到零个 ref 上等 gc ——
+   * 而这个函数是作为**通用原语**导出的,下一个调用者会直接踩进去。
+   * 空的 `<oldvalue>` 就是 git 的「必须不存在」。已经存在且指的就是同一个 sha = 幂等,收工。
+   */
+  let ref = base
+  for (let i = 0; i < 5; i++) {
+    const created = await deps.git(['update-ref', ref, sha, ''], deps.gitRoot)
+    if (created.code === 0) break
+    const cur = await deps.git(['rev-parse', '--verify', '-q', ref], deps.gitRoot)
+    if (cur.code === 0 && cur.stdout.trim() === sha) break
+    if (i === 4) return { ok: false, changes: lines.length, why: `钉不住那条 ref(${first(created)})` }
+    ref = `${base}-${i + 2}`
+  }
   return {
     ok: true, ref, changes: lines.length,
     ...(untracked.length > 0 ? { untracked } : {}),

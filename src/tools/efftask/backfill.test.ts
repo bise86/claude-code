@@ -365,6 +365,27 @@ describe('孤儿目录:此前唯一 0% 捞回的一格', () => {
  * 上一版的 `stage` 回调是全有或全无:任何一条命令非零就整笔作废,于是同一条 ref 上
  * 一个补录不了的路径会把旁边真正丢了的文件一起带走,而报出去的理由里写的是受害者的名字。
  */
+describe('补录到底有没有落到集成分支上', () => {
+  /**
+   * **「落上去了」由 git 证明,不由 `--ff-only` 的退出码证明。**
+   *
+   * 验收席实测:让快进假装成功,屏幕就说「补录了 N 个文件」而集成分支一个字节都没有。
+   * 更远一环:孤儿目录那条第 3 级拿 `res.commit` 当基准量差额,而那一笔提交里必然含着
+   * 我们暂存过的每一条 —— **一次假成功把最后一次发现的机会也关掉了**。
+   */
+  it('快进报了 0 而东西没落上去 → 判失败,不报「补录成功」', async () => {
+    await onBranch('phantom', { 'lost.ts': 'L\n' })
+    const lying: BackfillDeps['git'] = async (args, cwd) =>
+      args[0] === 'merge' && args[1] === '--ff-only'
+        ? { code: 0, stdout: '', stderr: '' }
+        : git(args, cwd)
+    const res = await backfillFromRef({ ...deps(), git: lying }, 'phantom', '来历')
+    expect(res.ok).toBe(false)
+    expect(res.why ?? '').toContain('并没有落到集成分支上')
+    expect(await intFile('lost.ts')).toBe(null)
+  })
+})
+
 describe('逐条降级:批量是优化,逐条是判据', () => {
   it('批里有一条取不出来 → 其余照样进集成分支,坏的那条带着 git 的原话进 skipped', async () => {
     await onBranch('partial', { 'good1.ts': 'G1\n', 'bad.ts': 'B\n', 'good2.ts': 'G2\n' })
@@ -409,21 +430,29 @@ describe('逐条降级:批量是优化,逐条是判据', () => {
  * 是相反的政策:孤儿目录那边挡下,ref 这边畅通无阻 —— 而节点先提交过构建目录、
  * `.gitignore` 后来才进集成分支,是真实存在的形状。
  */
-describe('集成分支的 .gitignore 说不要的东西,两条路都不补录', () => {
-  it('ref 那条路:被忽略的不进集成分支,而同一条 ref 上别的文件照样捞回来', async () => {
-    /**
-     * **顺序就是这条用例的前提**:节点先提交了构建目录(那时还没有这条忽略规则),
-     * `.gitignore` 是后来才进集成分支的。反过来写的话 `git add -A` 当场就把它挡了,
-     * 那条 ref 上压根没有 `dist/bundle.js`,这条用例测的就是另一个形状。
-     */
-    await onBranch('withdist', { 'src.ts': 'S\n', 'dist/bundle.js': 'BUILT\n' })
+describe('集成分支的 .gitignore', () => {
+  /**
+   * **ref 那条路照收,只是要点名 —— 这一条是验收席推翻我的。**
+   *
+   * 上一版对两条路发同一问,理由是「同一件事不许有相反的政策」。而验收席在真 git 上打穿了它:
+   * 执行者用 `git add -f` **故意提交**的交付物会被丢掉,理由还写着「多半是构建产物」——
+   * 一句猜测。而且它没有出口:丢掉 → 落痕 → 按 `b` 重做 → 再产出同样的文件 → 再被同一条
+   * 判据丢掉。
+   *
+   * 判据回到 git 自己的语义:`.gitignore` **按定义不管已跟踪的文件**。它们已经在一个 commit
+   * 里,`git merge` 会毫不犹豫地带进来,而第 2 级是「一次合并的加法子集」,不该比合并更严。
+   */
+  it('ref 那条路:已经入库的照样补录,但要点名说清楚', async () => {
+    await onBranch('withdist2', { 'src.ts': 'S\n', 'dist/bundle.js': 'BUILT\n' })
     await commitOnInt({ '.gitignore': 'dist/\n' })
-    const res = await backfillFromRef(deps(), 'withdist', '来历')
+    const res = await backfillFromRef(deps(), 'withdist2', '来历')
     expect(res.ok).toBe(true)
-    expect(res.added).toEqual(['src.ts'])
-    expect(await intFile('src.ts')).toBe('S\n')
-    expect(await intFile('dist/bundle.js')).toBe(null)
-    expect(res.skipped.find(s => s.path === 'dist/bundle.js')?.why).toContain('.gitignore')
+    expect(res.added.sort()).toEqual(['dist/bundle.js', 'src.ts'])
+    expect(await intFile('dist/bundle.js')).toBe('BUILT\n')
+    // 收了不等于不说 —— 用户有权知道集成分支的 .gitignore 覆盖到了它。
+    expect((res.notes ?? []).join('\n')).toContain('dist/bundle.js')
+    // 而它**不许**被写成「没捞到」:那会把它推进第 3 级,变成一个没有出口的环。
+    expect(res.skipped.some(s => s.path === 'dist/bundle.js')).toBe(false)
   })
 
   it('孤儿目录那条路:一个被忽略的文件不许把整个目录的补录拖垮', async () => {

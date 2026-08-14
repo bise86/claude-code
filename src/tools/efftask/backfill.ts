@@ -91,6 +91,8 @@ export interface BackfillResult {
   skipped: BackfillSkip[]
   /** 补录那一笔提交的 sha(有东西补进去时才有)。 */
   commit?: string
+  /** 收了、但要跟用户说一声的(目前只有一种:集成分支的 .gitignore 覆盖到了它)。 */
+  notes?: string[]
   why?: string
 }
 
@@ -380,6 +382,22 @@ async function commitAndFf(
       retryable: advanced,
     }
   }
+  /**
+   * **「落到集成分支上了」由 git 证明,不由 `--ff-only` 的退出码证明。**
+   *
+   * 验收席实测:让快进落在别处(或者对一个已经是祖先的 sha),`--ff-only` 照样回 0 ——
+   * 于是屏幕说「补录了 N 个文件」,集成分支上一个字节都没有。而孤儿目录那条第 3 级拿
+   * `res.commit` 当基准去量差额,那一笔提交里必然含着我们暂存过的每一条 ——
+   * **一次假成功把最后一次发现的机会也关掉了**。
+   *
+   * 184966f 刚给 `mergeIntoIntegration` 加过这道闸,理由逐字相同,而这边没有。
+   */
+  const landed = await deps.git(
+    ['merge-base', '--is-ancestor', sha, deps.integrationBranch], deps.gitRoot,
+  )
+  if (landed.code !== 0) {
+    return { ok: false, why: '快进报了成功,而这一笔补录并没有落到集成分支上 —— 一个字节都不算数' }
+  }
   return { ok: true, commit: sha, added: stagedNames }
 }
 
@@ -420,21 +438,32 @@ export async function backfillFromRef(
     const st = await stageAt(deps, scratch, tip)
     if (!st.ok) return { ok: false, added: [], skipped: cand.skipped, why: st.why }
 
-    /** 这一趟被逐条降级和 `.gitignore` 挡下来的 —— 和候选阶段的 `skipped` 合并后一起带出去。 */
+    /** 这一趟被逐条降级挡下来的 —— 和候选阶段的 `skipped` 合并后一起带出去。 */
     const staging: BackfillSkip[] = []
+    /** 收了、但有话要说的(见下面 `.gitignore` 那一段)。 */
+    const notes: string[] = []
     const res = await commitAndFf(deps, scratch, tip, `efftask: 补录 ${cand.take.length} 个集成分支缺失的文件\n\n${note}`, async () => {
       /**
-       * **`checkout` 那条路自己不看 `.gitignore`** —— 它从一个树对象取内容,永远回 0。
-       * 所以这一问必须显式发:不发的话,同一件事在两条路上是**相反**的政策
-       * (孤儿目录那边被 `git add` 挡下,这边畅通无阻),而节点先提交过构建目录、
-       * `.gitignore` 是后来才进集成分支的,是真实存在的形状。
+       * **这条路上不问 `.gitignore` —— 上一版问了,而那是把工作区的规则套到已入库的内容上。**
+       *
+       * 验收席在真 git 上打穿了它:执行者用 `git add -f` **故意提交**的交付物
+       * (`config.local.json`、被忽略目录下的产物)会被这一问丢掉,理由还写着「多半是
+       * 构建产物」—— 一句猜测,而事实是他显式提交的。更糟的是它没有出口:丢掉 → 落痕 →
+       * 按 `b` 重做 → 再产出同样的文件 → 再被同一条判据丢掉,一个没有出口的环。
+       *
+       * 判据回到 git 自己的语义:**`.gitignore` 按定义不管已跟踪的文件**。这些路径已经在
+       * 一个 commit 里,`git merge` 会毫不犹豫地合进来,而第 2 级是「一次合并的加法子集」,
+       * 不该比合并更严。孤儿目录那条路仍然问 —— 那边是**工作区文件**,`git add` 本来就挡,
+       * 两条路的差别不是政策不一致,是 git 在这两种形态上的规则本来就不同。
+       *
+       * 收是收,但要**点名**:集成分支的 `.gitignore` 覆盖到它们,用户有权知道。
        */
-      const ignored = await ignoredAt(deps, scratch, cand.take)
-      for (const [path, why] of ignored) staging.push({ path, why })
-      const keep = cand.take.filter(p => !ignored.has(p))
-      if (keep.length === 0) return { ok: false, why: '这一条 ref 上够得着的文件全被集成分支的 .gitignore 挡下了' }
+      const covered = await ignoredAt(deps, scratch, cand.take)
+      for (const path of covered.keys()) {
+        notes.push(`${path}:集成分支的 .gitignore 覆盖了这条路径,但它在 ref 上是已跟踪的产出 —— 照样补录(git merge 也会带它进来)`)
+      }
       const { staged, skipped } = await stagePaths(
-        keep, batch => deps.git(['checkout', ref, '--', ...batch.map(literal)], scratch),
+        cand.take, batch => deps.git(['checkout', ref, '--', ...batch.map(literal)], scratch),
       )
       staging.push(...skipped)
       if (staged.length === 0) return { ok: false, why: `一个文件都没能取出来(${skipped[0]?.why ?? '原因不明'})` }
@@ -444,7 +473,11 @@ export async function backfillFromRef(
       // **报量出来的,不报打算做的。** `cand.take` 是候选清单,它不知道 git 最后收了什么。
       const added = res.added ?? cand.take
       deps.onProgress?.(`补录 ${added.length} 个文件(${ref})`)
-      return { ok: true, added, skipped: [...cand.skipped, ...staging], ...(res.commit ? { commit: res.commit } : {}) }
+      return {
+        ok: true, added, skipped: [...cand.skipped, ...staging],
+        ...(notes.length > 0 ? { notes } : {}),
+        ...(res.commit ? { commit: res.commit } : {}),
+      }
     }
     if (staging.length > 0) cand.skipped.push(...staging)
     // 只有「集成分支前进了」值得重来(而且要**重算候选**);别的原因重试只是重复同一次失败。

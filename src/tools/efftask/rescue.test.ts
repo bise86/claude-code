@@ -479,6 +479,44 @@ describe('孤儿目录的第 3 级', () => {
 })
 
 describe('屏幕上说了什么', () => {
+  /**
+   * **「没有需要捞回来的东西」和它下面那几条 ⚠ 同屏出现过。**
+   *
+   * 八格(missing / integrateFail / degraded / cancelled / integrationDirty / dangling /
+   * stashBackup / rescued)**全部只走 `problems`**,而上一版这道门只数四个数组。
+   * 验收席逐字抄回来的对撞:「产出都已经在你的分支上了」+「产出不在任何地方,只能重新执行」。
+   */
+  it('只有 problems 时,不许说「没有需要捞回来的东西」', () => {
+    const plan = {
+      merge: [], backfill: [], hold: [], orphanFiles: [],
+      problems: ['任务甲:通过了验收,而它对集成分支的贡献是零 —— 产出不在任何地方,只能重新执行'],
+    }
+    const text = rescueLines(plan).join('\n')
+    expect(text).not.toContain('没有需要捞回来的东西')
+    expect(text).toContain('产出不在任何地方')
+  })
+
+  /**
+   * **屏幕给的自查命令必须能真的跑。**
+   *
+   * 上一版印的是占位符 `<集成分支>`,而集成分支的真名整屏一个字都没出现过 ——
+   * 用户没有任何办法把它替换掉,而那是「不同意这个判断的话自己来」的唯一入口。
+   */
+  it('自查命令里是集成分支的真名,不是占位符', async () => {
+    const p = pool(); await p.init()
+    const { branch } = await strandedBranch(p, 'root/09n', 'a.ts', 'x\n')
+    const plan = await planRescue(
+      depsOf(p, { triage: async ev => ev.map(e => ({ ref: e.ref, verdict: 'skip' as const, why: '已被取代' })) }),
+      [item({ kind: 'branchOnly', branch, why: '' })],
+    )
+    const text = rescueLines(plan, false, p.integrationBranchName).join('\n')
+    expect(text).not.toContain('<集成分支>')
+    expect(text).toContain(`git diff ${p.integrationBranchName} ${branch}`)
+    // 真的跑一遍那条命令 —— 「能照做」不是形容词。
+    const cmd = await git(['diff', '--name-only', p.integrationBranchName, branch], gitRoot)
+    expect(cmd.code).toBe(0)
+  })
+
   it('「拿不准」要说清会补录、也要说清不会动什么', async () => {
     const p = pool(); await p.init()
     const { branch } = await strandedBranch(p, 'root/09', 'a.ts', 'x\n')

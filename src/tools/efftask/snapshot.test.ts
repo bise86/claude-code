@@ -143,6 +143,51 @@ describe('钉一个耐久快照', () => {
   })
 
   /**
+   * **空 sha ≠ 「没什么可钉」。**
+   *
+   * 验收席在真 git 上复现:别的流程在 `status` 和 `stash create` 之间把那棵共享的树收拾了
+   * → `stash create` 什么都不给 → 上一版返回 `ok: true`、`snapshotLines` **一行都不输出**。
+   * 用户一整天的未提交内容没了,屏幕上一个字都没有。
+   */
+  it('看见了改动却一处都没钉住:报失败,而且屏幕上必须有话', async () => {
+    await writeFile(join(root, 'a.txt'), 'base\n一整天的活\n')
+    const meddling: SnapshotDeps['git'] = async (args, cwd) => {
+      if (args[0] === 'stash' && args[1] === 'create') {
+        // 另一条流在这两句之间收拾了这棵共享的树。
+        await git(['reset', '--hard'], root)
+        return git(args, cwd)
+      }
+      return git(args, cwd)
+    }
+    const res = await pinSnapshot({ ...deps(), git: meddling }, root)
+    expect(res.ok).toBe(false)
+    expect(res.ref).toBeUndefined()
+    expect(snapshotLines('集成工作区', res).join('\n')).toContain('没能钉住')
+  })
+
+  /**
+   * **只创建,不覆盖。** ref 名只编码 tree、不编码基准:两棵不同基准的树上有同一份内容时,
+   * 上一版第二次 `update-ref` 会把第一条直接抹掉,那份快照落到零个 ref 上等 gc。
+   */
+  it('同名而内容基准不同时,不许把上一条抹掉', async () => {
+    await writeFile(join(root, 'a.txt'), 'base\nX\n')
+    const one = await pinSnapshot(deps(), root)
+    expect(one.ref).toBeDefined()
+    const treeSha = (await git(['rev-parse', `${one.ref!}^{tree}`], root)).stdout.trim()
+    // 手工造一个「同 tree、不同 commit」的对象,占住同一个名字会用的位置。
+    const other = (await git(['commit-tree', treeSha, '-m', 'another base'], root)).stdout.trim()
+    const forced = await pinSnapshot({
+      ...deps(),
+      git: async (args, cwd) => args[0] === 'stash' && args[1] === 'create'
+        ? { code: 0, stdout: `${other}\n`, stderr: '' }
+        : git(args, cwd),
+    }, root)
+    expect(forced.ref).not.toBe(one.ref!)
+    // 第一条还在 —— 这才是「耐久」。
+    expect((await git(['rev-parse', '--verify', '-q', one.ref!], root)).code).toBe(0)
+  })
+
+  /**
    * **最该保护的那一格恰好是钉不住的那一格 —— 所以更要如实说。**
    *
    * 冲突态下 `stash create` 直接失败(`Cannot save the current index state`)。

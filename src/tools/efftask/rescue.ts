@@ -616,10 +616,16 @@ async function descend(
  * `canBackfillOrphan` = 这一趟有没有拷贝接缝。**必须由调用方传真值**:孤儿目录那一格
  * 会不会真的被补录取决于它,而屏幕是在用户按下 `y` **之前**读的。
  */
-export function rescueLines(plan: RescuePlan, canBackfillOrphan = false): string[] {
+export function rescueLines(
+  plan: RescuePlan, canBackfillOrphan = false, integrationBranch = '<集成分支>',
+): string[] {
   const out: string[] = []
+  /**
+   * **`problems` 也要数** —— 同 `rescuePending`。「没有需要捞回来的东西」和它下面那几条
+   * ⚠(「产出不在任何地方」「集成验收没通过」)同屏出现过,验收席逐字抄回来的。
+   */
   if (plan.merge.length === 0 && plan.backfill.length === 0 && plan.hold.length === 0
-    && plan.orphanFiles.length === 0) {
+    && plan.orphanFiles.length === 0 && plan.problems.length === 0) {
     out.push('没有需要捞回来的东西:孤立的分支和目录里都没有集成分支缺的内容。')
   }
   if (plan.merge.length > 0) {
@@ -652,7 +658,7 @@ export function rescueLines(plan: RescuePlan, canBackfillOrphan = false): string
       out.push(`判定**不该合** ${skipped.length} 处 —— 这几条到此为止,自动的路不会再碰它们:`)
       for (const c of skipped) {
         out.push(`  · ${c.evidence.title ?? c.evidence.ref}:${c.why}`)
-        out.push(`    不同意这个判断的话,自己来:git merge ${c.evidence.ref}(先看:git diff <集成分支> ${c.evidence.ref})`)
+        out.push(`    不同意这个判断的话,自己来:git merge ${c.evidence.ref}(先看:git diff ${integrationBranch} ${c.evidence.ref})`)
       }
       /**
        * **「到此为止」说的是这一趟,不是永远 —— 这句话必须说出来。**
@@ -668,7 +674,7 @@ export function rescueLines(plan: RescuePlan, canBackfillOrphan = false): string
         + '(它「集成分支上没有」的文件,很可能正是后来那一版故意删掉的):')
       for (const c of superseded) {
         out.push(`  · ${c.evidence.title ?? c.evidence.ref}:${c.why}`)
-        out.push(`    想自己看:git log ${c.evidence.ref} · git diff <集成分支> ${c.evidence.ref}`)
+        out.push(`    想自己看:git log ${c.evidence.ref} · git diff ${integrationBranch} ${c.evidence.ref}`)
       }
     }
   }

@@ -578,7 +578,13 @@ export async function scanStranded(
       listed += 1
       items.push({
         kind: 'dangling', branch: sha,
-        why: `一个不在任何分支上的提交(${subj.stdout.trim()})—— gc 之后就真没了`,
+        /**
+         * **给 sha 不等于给了下一步。** 分类表把这一格定成「给 sha、给命令,由用户自己判」,
+         * 而上一版只给了 sha —— 用户读到「gc 之后就真没了」,手里一个能照做的动作都没有。
+         * `git branch` 是唯一能让它**不再**被 gc 掉的那一条。
+         */
+        why: `一个不在任何分支上的提交(${subj.stdout.trim()})—— gc 之后就真没了;`
+          + `先看:git show ${sha.slice(0, 12)};想留住它:git branch 救回来的-${sha.slice(0, 7)} ${sha}`,
       })
     }
     if (shas.length > MAX_DANGLING) {
