@@ -289,7 +289,7 @@ export async function runOrchestrator(
       if (args.git && args.taskEntry?.runId && args.worktrees.gitRoot) {
         try {
           const swept = await sweepStashBackups({
-            git: args.git as never, cwd: args.worktrees.gitRoot, runId: args.taskEntry.runId,
+            git: args.git, cwd: args.worktrees.gitRoot, runId: args.taskEntry.runId,
           })
           keptBackups = swept.kept.map(k =>
             `保留了一份你未提交改动的备份:${k.ref} —— ${k.why};取回:git stash apply ${k.ref}`)
@@ -416,20 +416,44 @@ export async function runOrchestrator(
     }
     try {
       const worktreeRoot = `${pool.gitRoot}/.efftask-worktrees`
+      /**
+       * **字段名是 `pathFor`/`branchFor`,不是池子的 `worktreePathOf`/`worktreeBranchOf`。**
+       *
+       * 第一版写成了后者,而 `as never` 把类型检查整个关掉 —— 于是 `scanStranded` 里
+       * 第一次调 `deps.pathFor(...)` 就抛 TypeError,被下面那个 catch 接住,
+       * 每一趟收口都只吐一句「自动捞回没跑成」。声明了、实现了、却没有一次真的跑通,
+       * 正是这个仓库反复栽的那个形状。**不再用 `as never`**:这几个 deps 类型是导出的,
+       * 让编译器去核对字段名,比在注释里提醒自己可靠。
+       */
       const report = await scanStranded({
-        git: args.git as never,
+        git: args.git,
         gitRoot: pool.gitRoot,
         integrationBranch: pool.integrationBranchName,
         integrationPath: pool.integrationPath,
         runId: args.taskEntry.runId,
         worktreeRoot,
-        worktreePathOf: n => pool.worktreePathOf(n),
-        worktreeBranchOf: n => pool.worktreeBranchOf(n),
-      } as never, liveNodes)
+        pathFor: n => pool.worktreePathOf(n),
+        branchFor: n => pool.worktreeBranchOf(n),
+        // `inFlight` 不传:这一步排在整趟跑完之后(`handOff` 在 run 的下游),
+        // 那时没有任何节点在飞 —— 传一个空数组和不传是同一个意思,而少一行是少一处会漂的东西。
+      }, liveNodes)
       /**
        * 只有 `action: 'merge'` 那几格谈得上自动捞(工作区里没提交的、已提交没合入的、
        * 抢救分支、只剩分支的)。`backtrack` / 需要人处置的那几格照原样留给 `m` 和 `b` ——
        * 判据用 `STRANDED_KINDS[kind].action`,和 `mergeSubtree` 那一侧同一份表。
+       */
+      /**
+       * **今天这条过滤是等价的,仍然留着 —— 理由写清楚,免得下一个人补一条假探针。**
+       *
+       * `planRescue` 自己只处理 `branchOnly` / `salvage` / `salvageOrphan`,别的 kind
+       * 进去也会被它丢掉(变异测试实测:去掉这一行,四个测试文件全绿)。所以它今天
+       * 不改变**捞回**的行为。
+       *
+       * 留着是因为它改变**说出来的数**:下面 `!root` 那条注记印的是 `claimable.length`
+       * ——「盘上还有 N 处产出没进集成分支」。不过滤的话,悬空提交、集成工作区脏、
+       * 降级放行那几格(`action` 不是 `merge`,按定义要人处置)会被算进这个 N,
+       * 而它们**不是**「自动捞得回来的产出」。这个仓库为「屏幕上那个数说的不是它看起来
+       * 那件事」付过好几次账。
        */
       const claimable = report.items.filter(i => STRANDED_KINDS[i.kind]?.action === 'merge')
       if (claimable.length === 0) return
@@ -439,7 +463,7 @@ export async function runOrchestrator(
         return
       }
       const plan = await planRescue({
-        git: args.git as never,
+        git: args.git,
         gitRoot: pool.gitRoot,
         integrationBranch: pool.integrationBranchName,
         integrationPath: pool.integrationPath,
@@ -451,9 +475,9 @@ export async function runOrchestrator(
           ? {}
           : { rounds: args.config.caps.trunkResolveRounds }),
         signal: args.signal,
-      } as never, claimable)
+      }, claimable)
       const res = await runRescue({
-        git: args.git as never,
+        git: args.git,
         gitRoot: pool.gitRoot,
         integrationBranch: pool.integrationBranchName,
         integrationPath: pool.integrationPath,
@@ -464,7 +488,7 @@ export async function runOrchestrator(
           ? {}
           : { rounds: args.config.caps.trunkResolveRounds }),
         signal: args.signal,
-      } as never, plan)
+      }, plan)
       /**
        * **捞完必须重算 `handoff()`。** 它是「还有什么没送到」的唯一真相,而收口那一跳、
        * 结束屏、退出报告、`/tasks` 那一行读的都是它。不重算的话,刚合进集成分支的提交

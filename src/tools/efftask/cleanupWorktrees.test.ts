@@ -536,6 +536,48 @@ describe('集成工作区的构建产物', () => {
     expect(await exists(join(p.integrationPath, 'conflict.txt'))).toBe(true)
   })
 
+  /**
+   * **取消跟踪要落在集成分支上,不是用户的分支。**
+   *
+   * 扫的是集成分支(这个键属于某一趟 run,有权处置的是这一趟自己造出来的东西),
+   * 所以删和提交必须落在**同一条分支**上。第一版扫集成分支、却 `git rm` + `commit` 在
+   * `gitRoot` —— 于是用户分支上删了、集成分支上还跟踪着,下一次合并变成 delete/modify
+   * 冲突,正是这一整套要消灭的那个形状。变异测试实测这条路上原本一条探针都没有。
+   */
+  it('已被跟踪的构建产物:在集成分支上删并提交,用户分支不动', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/01-a', { status: 'ACCEPTED' })
+    const lease = await p.acquire(n)
+    const wt = (lease as { path: string }).path
+    // 执行者把一个 cargo target 目录**提交**了(add -A 的常态,而 .gitignore 里没有它)。
+    await mkdir(join(wt, '.cargo-target-x'), { recursive: true })
+    await writeFile(join(wt, '.cargo-target-x', 'CACHEDIR.TAG'),
+      'Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo\n')
+    await writeFile(join(wt, '.cargo-target-x', 'big.bin'), 'x'.repeat(64))
+    await writeFile(join(wt, 'src.txt'), 'work\n')
+    await git(['add', '-A', '-f'], wt)
+    await git(['commit', '--no-verify', '-qm', 'executor committed target too'], wt)
+    await p.commitAndMerge(n)
+
+    const beforeUser = await git(['rev-parse', 'HEAD'], p.gitRoot)
+    const deps = depsOf(p, { integrationPath: p.integrationPath })
+    const plan = await scanCleanup(deps, [n], n.id)
+    expect(plan.tracked?.proven.length).toBeGreaterThan(0)
+    expect(plan.tracked?.blocked).toEqual([])
+
+    const out = await runCleanup(deps, plan, [n])
+    expect(out.trackedUntracked?.committed).toBe(true)
+    // ① 集成分支上真的没有了
+    const onInt = await git(['ls-tree', '-r', '--name-only', p.integrationBranchName], p.gitRoot)
+    expect(onInt.stdout).not.toContain('.cargo-target-x')
+    // 而真正的产出还在 —— 删的只是产物
+    expect(onInt.stdout).toContain('src.txt')
+    // ② 用户那条分支一个提交都没多(HEAD 没动)
+    const afterUser = await git(['rev-parse', 'HEAD'], p.gitRoot)
+    expect(afterUser.stdout.trim()).toBe(beforeUser.stdout.trim())
+  })
+
   it('没给 integrationPath 就完全不碰它(旧行为)', async () => {
     const p = pool()
     await p.init()

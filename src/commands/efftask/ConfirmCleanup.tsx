@@ -32,6 +32,29 @@ import { redoSummaryLines } from './ConfirmRedo.js'
  * 扫描和执行都由调用方传进来(`onScan` / `onRun`),这一屏不认识 git —— 判据和动作住在
  * cleanupWorktrees.ts,那里能被真 git 测出来。
  */
+/**
+ * 这一屏按下确认之后**真的会做事**吗 —— 五桶取或。
+ *
+ * 判据原来只看 `items`(工作区那一桶),而 `runCleanup` 另外还删事件日志、`/tmp` 残留、
+ * 只清产物的那批目录、集成工作区里的产物,以及(本轮新增)版本库里已被跟踪的产物。
+ * 于是一棵工作区早就清干净、却还留着几百 MB 日志的子树,按回车什么都不会发生,
+ * 而屏幕上明明把它们列着 —— 「屏幕说有、按下去没有」是这个仓库的固定病灶。
+ *
+ * 导出是为了能被单独断言:它此前住在 useInput 里,而那里打不中。
+ */
+export function hasWork(p: CleanupPlan): boolean {
+  const tr = p.tracked
+  const trackedWork = tr !== undefined
+    && tr.blocked.length === 0
+    && (tr.proven.length > 0 || tr.suspected.length > 0)
+  return p.items.length > 0
+    || p.logs.length > 0
+    || p.scratch.length > 0
+    || (p.buildOnly?.length ?? 0) > 0
+    || p.integration !== undefined
+    || trackedWork
+}
+
 export function ConfirmCleanup(props: {
   target: TaskNode
   onScan: () => Promise<CleanupPlan>
@@ -46,6 +69,8 @@ export function ConfirmCleanup(props: {
   const [plan, setPlan, planRef] = useLiveState<CleanupPlan | null>(null)
   const [outcome, setOutcome] = useLiveState<CleanupOutcome | null>(null)
   const [error, setError] = useLiveState<string>('')
+  /** `t` 键的那一档:疑似桶算不算。默认关,见 useInput 里那一段。 */
+  const [includeSuspected, setIncludeSuspected, includeSuspectedRef] = useLiveState<boolean>(false)
 
   React.useEffect(() => {
     let alive = true
@@ -84,14 +109,33 @@ export function ConfirmCleanup(props: {
     if (key.escape || (plain && (k === 'q' || k === 'n'))) { props.onCancel(); return }
     if (m !== 'ready') return
     const p = planRef.current
-    // 没有可删的东西时回车也是「知道了」,不是「执行一次空操作」—— 页脚写的就是这一句。
-    if (!p || p.items.length === 0) {
+    /**
+     * **`t`:把「名字像产物、但拿不出签名」那一桶也算上。**
+     *
+     * 默认不选 —— 「很可能是产物」和「证明了是产物」在一次不可逆的删除面前不是同一件事
+     * (判据见 `buildOutputs.scanTrackedBuildOutputs`)。这个键是那一桶**唯一**的开关:
+     * 少了它,`includeSuspected` 在任何路径上都是 false,而计划屏上那句
+     * 「要一起删请按 t」是一条按不到的指令 —— 这个仓库为「屏幕承诺一个不存在的键」
+     * 付过账(收口报告印过一条 git 必然拒绝的 `branch -D`)。
+     */
+    if (plain && k === 't' && (p?.tracked?.suspected.length ?? 0) > 0) {
+      setIncludeSuspected(v => !v)
+      return
+    }
+    /**
+     * 没有可做的事时回车是「知道了」,不是「执行一次空操作」。
+     *
+     * **判据必须覆盖全部桶**,而它原来只看 `items`(工作区那一桶)—— 于是一棵工作区
+     * 早就清干净、却还留着几百 MB 事件日志 / `/tmp` 残留 / 版本库里的构建产物的子树,
+     * 按回车什么都不会发生,而屏幕上明明列着它们。
+     */
+    if (!p || !hasWork(p)) {
       if (plain && (key.return || k === 'y')) props.onCancel()
       return
     }
     if (plain && (key.return || k === 'y')) {
       setMode('working')
-      void props.onRun(p).then(
+      void props.onRun({ ...p, includeSuspected: includeSuspectedRef.current }).then(
         o => { setOutcome(o); setMode('done') },
         (e: unknown) => {
           setError(e instanceof Error ? e.message : String(e))
@@ -135,12 +179,18 @@ export function ConfirmCleanup(props: {
   // 和重做/跳过关口共用同一份夹取:这一屏会很长(每个工作区一行),而 ink 不裁剪 ——
   // 溢出时终端自己滚,滚掉的是最上面的标题和最重要的那几行。
   const { shown, hidden } = redoSummaryLines(lines, rows, columns)
-  const empty = mode === 'ready' && (plan?.items.length ?? 0) === 0
+  // 判据和按键处理**共用同一份** `hasWork` —— 两边各算一次的话,页脚说「回车确认删除」
+  // 而回车实际走的是「知道了」,用户是照着页脚按的。
+  const empty = mode === 'ready' && (plan === null || !hasWork(plan))
+  /** 疑似桶那一档的开关提示。只在真有那一桶时才出现 —— 按不到的键不许印。 */
+  const tHint = (plan?.tracked?.suspected.length ?? 0) > 0
+    ? ` · t ${includeSuspected ? '取消' : ''}包含 ${plan?.tracked?.suspected.length} 个疑似产物${includeSuspected ? '(已包含)' : ''}`
+    : ''
   const footer = mode === 'done'
     ? '回车 / q / Esc 返回'
     : empty
       ? '回车 / q / Esc 返回'
-      : '回车 / y 确认删除(不可恢复) · q / Esc / n 取消'
+      : `回车 / y 确认删除(不可恢复)${tHint} · q / Esc / n 取消`
   return (
     <Box borderStyle="round" paddingX={1} flexDirection="column">
       <Text bold color={mode === 'done' ? 'success' : 'warning'}>

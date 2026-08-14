@@ -18,7 +18,7 @@ import { EventEmitter } from 'node:events'
 
 import { render } from '../../ink.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from '../../tools/efftask/types.js'
-import { ConfirmCleanup } from './ConfirmCleanup.js'
+import { ConfirmCleanup, hasWork } from './ConfirmCleanup.js'
 import { DoneView } from './efftask.js'
 import type { CleanupOutcome, CleanupPlan } from '../../tools/efftask/cleanupWorktrees.js'
 
@@ -281,5 +281,53 @@ describe('清理关口', () => {
     await tick()
     app.unmount()
     expect([ran, cancelled]).toEqual([0, 1])
+  })
+})
+
+/**
+ * **「按下确认真的会做事吗」的判据必须覆盖全部桶。**
+ *
+ * 它原来只看 `items`(工作区那一桶),而 `runCleanup` 另外还删事件日志、`/tmp` 残留、
+ * 只清产物的那批目录、集成工作区里的产物,以及版本库里已被跟踪的产物。于是一棵工作区
+ * 早就清干净、却还留着几百 MB 日志的子树,按回车什么都不会发生 —— 而屏幕上明明列着它们。
+ * 页脚和按键处理共用这一份,两边各算一次的话用户是照着一句假话按的。
+ */
+describe('hasWork —— 五桶取或', () => {
+  const empty = {
+    targetId: 'root', items: [], kept: [], unfinished: 0, absent: 0, totalKb: 0, sizeKnown: false,
+    logs: [], logKb: 0, logSizeKnown: false,
+    scratch: [], scratchKb: 0, scratchSizeKnown: false,
+    buildOnly: [], buildOnlyKb: 0, buildOnlySizeKnown: false,
+    buildOnlySkippedRepos: [], buildOnlyBusy: 0,
+  }
+
+  it('五桶全空 → false', () => {
+    expect(hasWork(empty as never)).toBe(false)
+  })
+
+  it('任一桶非空 → true(逐桶各打一次)', () => {
+    expect(hasWork({ ...empty, items: [{}] } as never)).toBe(true)
+    expect(hasWork({ ...empty, logs: [{}] } as never)).toBe(true)
+    expect(hasWork({ ...empty, scratch: [{}] } as never)).toBe(true)
+    expect(hasWork({ ...empty, buildOnly: [{}] } as never)).toBe(true)
+    expect(hasWork({ ...empty, integration: { path: '/i', entries: [], entryCount: 0 } } as never)).toBe(true)
+    expect(hasWork({
+      ...empty, tracked: { proven: ['a'], suspected: [], provenDirs: 1, blocked: [] },
+    } as never)).toBe(true)
+  })
+
+  /** 被闸挡下的那一格**不算活** —— 屏幕会说「这次不做」,回车就该是「知道了」。 */
+  it('tracked 被 blocked 挡下时不算活', () => {
+    expect(hasWork({
+      ...empty,
+      tracked: { proven: ['a'], suspected: ['b'], provenDirs: 1, blocked: ['混进了源码'] },
+    } as never)).toBe(false)
+  })
+
+  /** 只有疑似桶(默认不选)时仍然算活:用户可以按 t 打开它,页脚也据此显示那一档。 */
+  it('只有疑似桶时算活(t 键那一档要能按)', () => {
+    expect(hasWork({
+      ...empty, tracked: { proven: [], suspected: ['x.rlib'], provenDirs: 0, blocked: [] },
+    } as never)).toBe(true)
   })
 })

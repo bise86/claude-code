@@ -312,19 +312,26 @@ export async function scanTrackedBuildOutputs(
  * 取消跟踪 + 删盘上的那一份。**盘上也删** —— 用户原话「如果不要,直接删除掉」,
  * 而留着的话它们只是从「被跟踪」变成「被忽略」,50 GB 一个字节都没少。
  *
- * `git rm -r --cached` + 盘上删分两步做不到原子,所以直接用 `git rm -r`(索引和盘上
- * 一起)。按**顶层条目**删而不是逐个路径:跑机上 2 681 个路径,逐条 pathspec 会把命令行
- * 撑爆,而顶层条目只有 133 个。前提是「这个顶层条目底下全是产物」—— 由调用方在确认屏
- * 之前验过(见 `mixedTops`)。
+ * `git rm -r --cached` + 盘上删分两步做不到原子,所以直接用 `git rm -r`(索引和盘上一起)。
+ *
+ * ## 按**精确路径**删,不按顶层目录
+ *
+ * 第一版按顶层条目删(理由是「2 681 个路径会把命令行撑爆」),而那会多删:
+ * 签名命中的目录可能**更深**(`.cargo-target-x/sub/` 带 CACHEDIR.TAG),于是
+ * `.cargo-target-x/other.rlib` 落在**默认不选**的疑似桶里 —— 而 `git rm -r .cargo-target-x`
+ * 把两个都删了。用户按下的是「只删证明过的那批」,实际发生的是另一回事。
+ *
+ * 命令行长度靠**分批**解决(每批 200 条),不靠放宽范围。这条路会删真文件,
+ * 「省几次 exec」不值得拿删除范围去换。
  */
 export async function untrackBuildOutputs(
   deps: BuildWipeDeps, path: string, files: readonly string[],
 ): Promise<{ removed: number; error?: string }> {
   if (files.length === 0) return { removed: 0 }
-  const tops = [...new Set(files.map(f => f.split('/')[0] ?? f))]
-  for (let i = 0; i < tops.length; i += 100) {
+  const list = [...new Set(files)]
+  for (let i = 0; i < list.length; i += 200) {
     const res = await deps.git(
-      ['-c', 'core.quotepath=false', 'rm', '-r', '-q', '--ignore-unmatch', '--', ...tops.slice(i, i + 100)],
+      ['-c', 'core.quotepath=false', 'rm', '-r', '-q', '--ignore-unmatch', '--', ...list.slice(i, i + 200)],
       path,
     )
     if (res.code !== 0) {

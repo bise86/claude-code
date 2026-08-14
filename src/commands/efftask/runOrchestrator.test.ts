@@ -1242,3 +1242,92 @@ describe('run.md 写入合并:只落最新那一份', () => {
  * 就删了;留下来的只有「pop 撞冲突」那一次,而判据是「那条 stash 条目还在不在」。
  * 留下来的要能被念出来 —— 否则它就是一个没人知道的 ref,而那正是这次要修的毛病。
  */
+
+/**
+ * **收口之前的自动捞回 —— 这条线第一版是断的,而没有任何测试打得中它。**
+ *
+ * 病因:`StrandedDeps` 要的字段是 `pathFor` / `branchFor`,而第一版传的是池子的方法名
+ * `worktreePathOf` / `worktreeBranchOf`,外面套着 `as never` 把类型检查关掉了。
+ * 于是 `scanStranded` 第一次调 `deps.pathFor(...)` 就抛 TypeError,被 catch 接住,
+ * 每一趟收口只吐一句「自动捞回没跑成」—— 声明了、实现了、生产上一次没跑通,
+ * 正是这个仓库的招牌缺陷。
+ *
+ * 所以这一组断言的不是「捞回捞到了什么」(那是 rescue.ts 自己的事),
+ * 而是**这条线接通了**:走得到 `scanStranded`,而且没有落进错误分支。
+ */
+describe('收口之前的自动捞回', () => {
+  /** 一个已验收的根节点 —— 和上面那组的 doneSeed 同形状,但那个在别的 describe 作用域里。 */
+  const seedNode = () => [{
+    id: 'root', title: '根任务', goal: 'g', parentId: null, childIds: [], deps: [],
+    kind: 'executable' as const, status: 'ACCEPTED' as const,
+    phaseRoles: emptyPhaseRoles(),
+    plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+    execStatus: '做完了', blockedReason: '', reviewLog: [], acceptLog: [], score: {},
+    iteration: { planReview: 0, acceptance: 0, integration: 0, scoring: 0, mergeResolve: 0 },
+    depth: 0, createdAt: 'T0', updatedAt: 'T0',
+  }]
+  const poolFor = (calls: string[][]) => ({
+    init: async () => ({ ok: true }),
+    acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b', gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: true, merged: true }),
+    release: async () => ({ removed: true }),
+    dispose: async () => ({ kept: [] }),
+    handoff: async () => ({
+      branch: 'efftask/004/integration', commits: 0, kept: [], salvage: [],
+      integrationPath: '/wt/integration', trunkLanded: 0,
+    }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    gitRoot: '/repo',
+    integrationPath: '/wt/integration',
+    integrationBranchName: 'efftask/004/integration',
+    // 这两个正是被传错名字的那一对。
+    worktreePathOf: (n: { id: string }) => { calls.push(['pathFor', n.id]); return '/wt/' + n.id },
+    worktreeBranchOf: (n: { id: string }) => { calls.push(['branchFor', n.id]); return 'wt-' + n.id },
+  })
+
+  const runIt = async (): Promise<{ notes: string[]; calls: string[][] }> => {
+    const calls: string[][] = []
+    const handoffs: { trunkSkips?: string[] }[] = []
+    const gitFn = async (args: string[]) => {
+      calls.push(args)
+      // 一个自洽的空世界:没有孤立 ref、没有额外工作树。
+      if (args[0] === 'symbolic-ref') return { code: 0, stdout: 'main\n', stderr: '' }
+      // 造一条**要人处置**的残留:悬空提交(STRANDED_KINDS.dangling.action !== 'merge')。
+      if (args[0] === 'fsck') return { code: 0, stdout: 'unreachable commit deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n', stderr: '' }
+      // 提交信息要以 efftask: 开头,scanStranded 才认它是这一趟的产出。
+      if (args[0] === 'log' && args.includes('--format=%s')) return { code: 0, stdout: 'efftask: 某个任务\n', stderr: '' }
+      // 那条悬空提交**不在**集成分支里(一律回 0 的话它会被当成「已合入」丢掉,
+      // 于是这条探针测的是空气 —— 实测踩过)。
+      if (args[0] === 'merge-base' && args.includes('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')) {
+        return { code: 1, stdout: '', stderr: '' }
+      }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/004', fs: memFs(),
+        runAgent: (async () => '') as RunAgentFn,
+        signal: new AbortController().signal,
+        worktrees: poolFor(calls) as never,
+        seed: seedNode() as never, cwd: '/repo', git: gitFn as never,
+        taskEntry: {
+          runId: '004', runDir: '/run/004',
+          setAppState: (() => {}) as never, abortController: new AbortController(),
+        },
+      },
+      () => {}, () => {}, () => {},
+      h => handoffs.push(h as never),
+    )
+    return { notes: handoffs.flatMap(h => h.trunkSkips ?? []), calls }
+  }
+
+  it('真的走到了 scanStranded —— 而不是每趟吐一句「自动捞回没跑成」', async () => {
+    const { notes, calls } = await runIt()
+    expect(notes.join('\n')).not.toContain('自动捞回没跑成')
+    // `pathFor` 被调到了 = 字段名对上了(传错名字时这里一次都不会出现)。
+    expect(calls.some(c => c[0] === 'pathFor')).toBe(true)
+    // 而且它真的问了 git 抢救分支那一格。
+    expect(calls.some(c => c[0] === 'for-each-ref')).toBe(true)
+  })
+
+})

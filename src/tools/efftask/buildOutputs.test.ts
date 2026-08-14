@@ -401,12 +401,30 @@ describe('mixedTops', () => {
 })
 
 describe('untrackBuildOutputs', () => {
-  it('按顶层条目删(2681 个路径逐条会把命令行撑爆)', async () => {
+  /**
+   * **按精确路径删,不按顶层目录。**
+   *
+   * 第一版按顶层条目删(为了省命令行长度),而那会多删:签名命中的目录可能更深
+   * (`.cargo-target-x/sub/` 带 CACHEDIR.TAG),于是 `.cargo-target-x/other.rlib` 落在
+   * **默认不选**的疑似桶里 —— 而 `git rm -r .cargo-target-x` 把两个都删了。
+   * 用户按下的是「只删证明过的那批」,实际发生的是另一回事。
+   */
+  it('按精确路径删 —— 同一个顶层目录下没被选中的文件不许被带走', async () => {
     const seen: string[][] = []
     const git: BuildWipeGit = (async args => { seen.push(args); return { code: 0, stdout: '', stderr: '' } })
-    const out = await untrackBuildOutputs({ git }, '/repo', ['a/1', 'a/2', 'b/3'])
-    expect(out).toEqual({ removed: 3 })
-    expect(seen[0]?.slice(-2)).toEqual(['a', 'b'])
+    const out = await untrackBuildOutputs({ git }, '/repo', ['a/sub/1', 'a/sub/2'])
+    expect(out).toEqual({ removed: 2 })
+    // 传给 git 的是那两条路径本身,不是 `a`。
+    expect(seen[0]?.slice(-2)).toEqual(['a/sub/1', 'a/sub/2'])
+    expect(seen[0]).not.toContain('a')
+  })
+
+  it('分批发,不靠放宽范围来省命令行长度', async () => {
+    const seen: string[][] = []
+    const git: BuildWipeGit = (async args => { seen.push(args); return { code: 0, stdout: '', stderr: '' } })
+    const many = Array.from({ length: 450 }, (_, i) => `d/f${i}`)
+    expect(await untrackBuildOutputs({ git }, '/repo', many)).toEqual({ removed: 450 })
+    expect(seen).toHaveLength(3)   // 200 + 200 + 50
   })
 
   it('git rm 失败 → 如实报,不谎报删了多少', async () => {

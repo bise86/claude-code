@@ -661,8 +661,21 @@ export async function runCleanup(
   const tr = plan.tracked
   if (tr && tr.blocked.length === 0) {
     const files = [...tr.proven, ...(plan.includeSuspected === true ? tr.suspected : [])]
-    if (files.length > 0) {
-      const res = await untrackBuildOutputs({ git: deps.git }, deps.gitRoot, files)
+    /**
+     * **在集成工作区里做,不在用户的检出里。**
+     *
+     * 扫的是集成分支(这个键属于某一趟 run,有权处置的是这一趟自己造出来的东西),
+     * 所以删和提交必须落在**同一条分支**上。第一版扫集成分支、却 `git rm` + `commit`
+     * 在 `gitRoot` —— 于是用户分支上删了、集成分支上还跟踪着,下一次合并变成
+     * delete/modify 冲突,正是这一整套要消灭的那个形状。
+     *
+     * 拿不到集成工作区路径就**整格不做**:在错的分支上删文件比不删糟得多。
+     */
+    const intPath = deps.integrationPath
+    if (files.length > 0 && intPath === undefined) {
+      problems.push('版本库里有构建产物,但这一趟拿不到集成工作区的位置 —— 没有动它们(在错的分支上删比不删糟)')
+    } else if (files.length > 0 && intPath !== undefined) {
+      const res = await untrackBuildOutputs({ git: deps.git }, intPath, files)
       if (res.error !== undefined) {
         problems.push(`取消跟踪构建产物失败:${res.error} —— 版本库里那份原样留着`)
         trackedUntracked = { files: 0, committed: false }
@@ -670,7 +683,7 @@ export async function runCleanup(
         const c = await deps.git(
           ['-c', 'core.quotepath=false', 'commit', '--no-verify', '-q', '-m',
             `chore(efftask): 构建产物不入版本库 —— 取消跟踪 ${res.removed} 个文件`],
-          deps.gitRoot,
+          intPath,
         )
         // 提交不成也要如实说:`git rm` 已经动了索引和盘上的文件,而那**不是**一次空操作。
         if (c.code !== 0) {
