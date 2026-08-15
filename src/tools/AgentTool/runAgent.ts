@@ -321,6 +321,15 @@ export async function* runAgent({
     systemPrompt?: SystemPrompt
     abortController?: AbortController
     agentId?: AgentId
+    /**
+     * **即便 PreToolUse 钩子自动放行,也必须调一次 `canUseTool`。**
+     *
+     * `resolveHookPermissionDecision` 在钩子回 `allow` 时会直接返回,`canUseTool` 一次
+     * 都不调(除非工具自己 `requiresUserInteraction`)。对包在 `canUseTool` 外层的检查
+     * 来说,这等于**整层消失** —— `/et` 的越界闸就在那一层,而无人值守跑几小时的人
+     * 正是最会装自动放行钩子的那一批。对抗席验收时点名的绕过路径。
+     */
+    requireCanUseTool?: boolean
   }
   model?: ModelAlias
   maxTurns?: number
@@ -766,6 +775,9 @@ export async function* runAgent({
     shareSetResponseLength: true, // Both sync and async contribute to response metrics
     criticalSystemReminder_EXPERIMENTAL:
       agentDefinition.criticalSystemReminder_EXPERIMENTAL,
+    // 见 override.requireCanUseTool 的注释:钩子自动放行会让包在 canUseTool 外层的
+    // 检查整层消失,而 `/et` 的越界闸就在那一层。
+    ...(override?.requireCanUseTool === true ? { requireCanUseTool: true } : {}),
     /**
      * **声明了窗口的 api 员工,自己开一份聚合预算状态。**
      *

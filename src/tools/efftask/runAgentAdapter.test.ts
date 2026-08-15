@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { subAgentToolPool } from '../../commands/efftask/efftask.js'
 import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs, providerErrorOf, providerErrorInfoOf, shrinkPrompt, PROMPT_SHRINK_RATIOS, ProviderApiError } from './runAgentAdapter.js'
 import { createEscapeRegistry } from './escapeRegistry.js'
@@ -1554,7 +1556,14 @@ describe('越界写主检出:硬闸与归因', () => {
   const G = '/repo'
   const W = '/repo/.efftask-worktrees/efftask-001-aa'
   /** 让子 agent 在被派出去之前就发生工具调用 —— 直接调拿到的那个 canUseTool。 */
-  const runWith = async (over: Record<string, unknown>, input: unknown, cwd?: string) => {
+  const runWith = async (
+    over: Record<string, unknown>, input: unknown, cwd?: string,
+    /**
+     * 第一个参数在生产上是 **Tool 对象**;这里默认仍喂字符串 `'Edit'`(既有用例一个字不改),
+     * 需要量对象形态那一格时显式传 `{ name: 'Write' }`。见 `toolNameOf` 的注释。
+     */
+    tool: unknown = 'Edit',
+  ) => {
     let captured: ((...a: unknown[]) => Promise<unknown>) | undefined
     async function* fake(args: { canUseTool?: unknown }): AsyncGenerator<never> {
       captured = args.canUseTool as never
@@ -1575,7 +1584,7 @@ describe('越界写主检出:硬闸与归因', () => {
       system: 's', prompt: 'p', signal: new AbortController().signal,
       ...(cwd === undefined ? {} : { cwd }),
     } as never)
-    return await captured?.('Edit', input)
+    return await captured?.(tool, input)
   }
 
   it('写主检出 → 拒绝,而且拒绝理由里告诉席位它的工作区在哪', async () => {
@@ -1590,7 +1599,102 @@ describe('越界写主检出:硬闸与归因', () => {
     expect(reg.claims()).toHaveLength(1)
     expect(reg.claims()[0]?.nodeId).toBe('root/00-a')
     expect(reg.claims()[0]?.phase).toBe('execute')
-    expect(reg.owns(`${G}/pkg/sql/a.rs`)).toBe(true)
+    /**
+     * **拦下来了 = 一个字节没写 = 不拥有这个文件。**
+     *
+     * 这条判据上一版是 `toBe(true)`,而它是错的:`owns()` 的下游是 park-then-merge,
+     * 语义必须是「**这个文件现在的脏是我们造的**」。对抗席构造的链条:
+     * t0 席位 Edit 主检出的 `conn_executor.rs` → 被拒、没写,但从此 owns 为真;
+     * t1 用户自己在编辑器里改同一个文件(run 跑三小时,他当然在改);
+     * t2 `intoTrunk` 被这个文件挡住 → 全称判断通过 → **用户的活被 stash 走**。
+     * 闸拦得越勤,伪造的所有权凭证越多 —— 两个特性之间的负交互。
+     */
+    expect(reg.owns(`${G}/pkg/sql/a.rs`)).toBe(false)
+    expect(reg.claims()[0]?.blocked).toBe(true)
+    // 屏幕那一栏还是要看得见「席位试过」—— 记录在,只是不给所有权
+    expect(reg.size()).toBe(0)
+  })
+
+  /**
+   * **`canUseTool` 第一个参数是 Tool 对象,不是字符串。**
+   *
+   * 上面那些用例喂的都是字符串 `'Edit'` —— 而生产上传进来的是工具对象。
+   * 加写工具白名单时当场发现:`String(args[0])` 在生产上是 `"[object Object]"`,
+   * 白名单一条都不匹配 ⇒ **闸整个变成空操作**,而且编译通过、这一批测试全绿。
+   * 所以这一格**必须按对象形态喂**。
+   */
+  it('工具对象形态:写工具照拦,读工具放行', async () => {
+    const reg = createEscapeRegistry()
+    const w = await runWith({ escapes: reg }, { file_path: `${G}/pkg/a.rs` }, W, { name: 'Write' }) as
+      { behavior: string }
+    expect(w.behavior).toBe('deny')
+    expect(reg.claims()[0]?.tool).toBe('Write')   // 不是 "[object Object]"
+
+    const r = createEscapeRegistry()
+    const rd = await runWith({ escapes: r }, { file_path: `${G}/pkg/a.rs` }, W, { name: 'Read' }) as
+      { behavior: string }
+    expect(rd.behavior).toBe('allow')
+    expect(r.claims()).toEqual([])
+  })
+
+  /**
+   * **读主检出不是越界。**
+   *
+   * `/et` 把 `.claude/efftask/<runId>/…/node.md` 写在**用户检出**里,它不在任何节点
+   * 工作区中,而提示词明说让席位去读 `run.md` / `node.md`。上一版只看输入里有没有
+   * `file_path`、不看工具 —— 席位照做就被拒,拒绝信息还让它去改「工作区里的同名相对
+   * 路径」,而那个文件在它工作区里根本不存在。每个 run 都在踩。
+   */
+  it('Read 主检出里的 node.md → 放行,而且不记账', async () => {
+    const reg = createEscapeRegistry()
+    const out = await runWith(
+      { escapes: reg }, { file_path: `${G}/.claude/efftask/001/root/node.md` }, W, { name: 'Read' },
+    ) as { behavior: string }
+    expect(out.behavior).toBe('allow')
+    expect(reg.claims()).toEqual([])
+  })
+
+  /**
+   * **`NotebookEdit` 的相对路径。**
+   *
+   * 它是唯一**没有** `backfillObservableInput` 的写工具,所以 `canUseTool` 拿到的是
+   * 模型给的原始串,而工具自己 `isAbsolute(p) ? p : resolve(getCwd(), p)` 且不 normalize。
+   * 上一版对非 `/` 开头的值直接放行(理由写的是「相对路径天然在工作区里」),
+   * 于是 `../../x.ipynb` 从工作区落进主检出,零拦截零记录(对抗席实测)。
+   */
+  it('NotebookEdit 用 ../.. 爬出工作区 → 拦得住', async () => {
+    const reg = createEscapeRegistry()
+    const out = await runWith(
+      { escapes: reg }, { notebook_path: '../../analysis.ipynb' }, `${G}/.efftask-worktrees/w`,
+      { name: 'NotebookEdit' },
+    ) as { behavior: string }
+    expect(out.behavior).toBe('deny')
+    expect(reg.claims()[0]?.path).toBe(`${G}/analysis.ipynb`)
+  })
+
+  /**
+   * **软链那一份也要拦。** 跑机上 `/home/esgyn/work/tools/qianbase-xtp` 是
+   * `/home/esgyn/tb/tools/qianbase-xtp` 的软链,node.md 里那条别名出现 1170 次 ——
+   * 而上一版靠「别名根」认,填进去的值恒等于 gitRoot,这条路径**一次都没被覆盖过**。
+   * 现在解的是被写的那条路径本身,所以不必事先知道有哪些软链。
+   */
+  it('席位照软链别名写主检出 → 照样拦,而且记的是解开之后那条', async () => {
+    const root = mkdtempSync(`${tmpdir()}/efftask-link-`)
+    const real = `${root}/real`
+    const link = `${root}/alias`
+    mkdirSync(`${real}/pkg`, { recursive: true })
+    symlinkSync(real, link)
+    const reg = createEscapeRegistry()
+    const wt = `${real}/.efftask-worktrees/w`
+    mkdirSync(wt, { recursive: true })
+    const out = await runWith(
+      { escapes: reg, escapeGate: false, gitRoot: () => real },
+      { file_path: `${link}/pkg/a.rs` }, wt,
+    ) as { behavior: string }
+    expect(out.behavior).toBe('allow') // 闸关着 —— 这一格量的是**归因**
+    // 记的必须是物理路径:`intoTrunk` 查的是 `${gitRoot}/${git 报的相对路径}`
+    expect(reg.owns(`${real}/pkg/a.rs`)).toBe(true)
+    rmSync(root, { recursive: true, force: true })
   })
 
   it('写自己的工作区 → 放行,不记账', async () => {

@@ -357,11 +357,14 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   const escapeReg = createEscapeRegistry()
   const gitRootBox: { current: string } = { current: '' }
   /**
-   * 主检出的**别名根**(软链)。跑机上 `/home/esgyn/work/tools/qianbase-xtp` 是
-   * `/home/esgyn/tb/tools/qianbase-xtp` 的软链,而 node.md 里两条各出现 1170 / 1396 次 ——
-   * 只认一条的话,席位照着另一条写就归因不到。
+   * 越界钉走的耐久 ref —— **由 call() 持有,给收口屏读**。
+   *
+   * 运行中那块屏只有一次机会:`RunningView.problems` 是滚动的,而 `refs/et/rescued/*`
+   * 全仓**没有任何扫描器**会再列出来(`sweepStashBackups` 扫的是另一个前缀,
+   * `scanStranded` 的 fsck 只看 unreachable,而这是活 ref)。run 一结束,
+   * 用户取回自己那份东西的唯一线索就没了 —— 接缝席点名的缺口。
    */
-  const aliasBox: { current: string[] } = { current: [] }
+  const escapeRefsOut: { current: string[] } = { current: [] }
   const runAgent: RunAgentFn = makeRunAgentFn({
     toolUseContext: context,
     canUseTool,
@@ -378,9 +381,6 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     // 越界闸:见 escapeRegistry。gitRoot 走盒子(池子建得比这里晚)。
     escapes: escapeReg,
     gitRoot: () => gitRootBox.current,
-    // 软链那一份也要认:跑机上 /home/esgyn/work/tools/… 是 /home/esgyn/tb/tools/… 的软链,
-    // node.md 里两条各出现 1170 / 1396 次。
-    gitRootAliases: () => (aliasBox.current.length > 0 ? aliasBox.current : []),
     // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded
     // axis left. The extraction seam below gets it too.
     timeoutMs: () => capsRef.nodeTimeoutMs,
@@ -499,7 +499,6 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
    * 而接收方 `useHumanWaitCount` 只在组件里才存在。和 handoffOut 同一套理由。
    */
   const humanWaitOut: { current: ((waiting: boolean) => void) | null } = { current: null }
-  const onEscapeOut: { current: ((info: { ref: string; files: readonly string[]; merged: boolean }) => void) | null } = { current: null }
   /**
    * 组件挂载后填进来的「有人在等确认」通知口。
    *
@@ -563,8 +562,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       humanWaitOut={humanWaitOut}
       escapes={escapeReg}
       gitRootBox={gitRootBox}
-      aliasBox={aliasBox}
-      onEscapeOut={onEscapeOut}
+      escapeRefsOut={escapeRefsOut}
       control={control}
       // The transcript is the only durable trace once the panel is gone: say how the run
       // ended and where its artifacts live, not just that it ended.
@@ -598,6 +596,14 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
            */
           const wiped = buildWipeLines(buildWipeOut.current)
           const wipedLine = wiped.length > 0 ? `\n${wiped.join('\n')}` : ''
+          /**
+           * 越界钉走的东西钉在哪 —— **同一条理由,而且更硬**:这是用户自己的内容,
+           * 被我们从他的工作区里拿走的。运行中那块屏是滚动的,而 `refs/et/rescued/*`
+           * 全仓**没有任何扫描器**会再列出来(`sweepStashBackups` 扫的是另一个前缀,
+           * `scanStranded` 的 fsck 只看 unreachable,而这是活 ref)。
+           * 不写进退出报告,run 一结束线索就永久消失(接缝席点名的缺口)。
+           */
+          const escapeLine = buildEscapeLine(escapeRefsOut.current)
           onDone(
             exitReportLine({
               runId, how, resumed, withPath,
@@ -605,7 +611,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
               // 「完成」那一格才需要被限定成「完成,但产出还没到你的分支」——
               // 被阻断 / 已取消的行本来就没在声称成功。
               completed: outcome?.status === 'completed',
-            }) + suppressed + wipedLine,
+            }) + suppressed + wipedLine + escapeLine,
             { display: 'system' },
           )
         }
@@ -681,10 +687,84 @@ function pickMainAgentDefinition(allAgents: AgentDefinition[]): AgentDefinition 
 }
 
 // FsLike backed directly by node:fs/promises.
-/** git via a child process. Every call names its own cwd — a worktree's index and HEAD are its own. */
+/**
+ * git via a child process. Every call names its own cwd — a worktree's index and HEAD are its own.
+ *
+ * ## 为什么要按住语言
+ *
+ * 这个仓库**到处**在拿正则读 git 的原话下判断:`overwriteBlocked`
+ * (「你的本地改动会被覆盖」→ 决定要不要 park-then-merge)、`stagedBlocked`、
+ * 「没有可中止的合并」…… 而 `spawn` 不给 env 就继承用户的 locale。
+ *
+ * 跑机 .30 上 git 说的是**中文** —— `worktreePool.ts` 和它的测试各自逐字记着那句
+ * 「您对下列文件的本地修改将被合并操作覆盖:devenv.lock」。也就是说事故现场那台机器上,
+ * 所有这些英文判据**一条都不命中**:park-then-merge 一次都不会跑,而它正是唯一
+ * 「让合并成功」的那条路。质量席实测复现,判不通过。
+ *
+ * 代价是 git 的原话上屏时是英文 —— 这些串会原样进 node.md 和收口屏。
+ * 换来的是判据成立。**能被机器读的那一份必须是稳定的**,给人看的解释由我们自己用中文写。
+ *
+ * `LANGUAGE` 要**删掉**而不是设空:gettext 里它优先于 `LC_ALL`,而空串才被当作未设置 ——
+ * 这一点各实现不一致,删键是唯一稳的写法。
+ *
+ * ## 为什么单独抽成一个具名函数
+ *
+ * **为了能被打中。** 第一版这段逻辑写在 `spawn` 的调用行里,变异测试实测:
+ * 把 `LC_ALL: 'C'` 拿掉、把 `delete env.LANGUAGE` 删掉,**全套 4646 条测试照绿** ——
+ * 判据在代码里,没有任何东西钉住它。而这正是这一轮在修的第 ⑥ 条(软链线恒空、
+ * 闸只断言了字符串存在)的同一个形状,不能在同一轮里自己再犯一次。
+ *
+ * 行为级测不了:要复现得让 git 真说中文,而 CI 机器上未必装了 zh_CN 语言包
+ * (本机实测就没装,`LANGUAGE=zh_CN` 回落英文)。所以判据下移到**我们交给 git 的
+ * 那份 env 长什么样** —— 那是这段代码唯一负责的事,也是它唯一会坏的地方。
+ */
+/**
+ * 退出报告里「越界的东西钉在哪」那一段。
+ *
+ * **抽成函数是为了能被打中。** 上一版这段是 onExit 闭包里的一串内联表达式,而闸门只
+ * 断言了 `escapeRefsOut` / `+ escapeLine` / `git stash apply ` 这几个字符串在文件里 ——
+ * 接缝席剪了三刀(不往盒子里写、不传 prop、把 refs 硬编成空),**每一刀 4148 条全绿**。
+ * 那正是这一轮宣称修掉的「真空通过」,隔一个文件原样重现。
+ *
+ * 内容本身的理由:`refs/et/rescued/*` 全仓**没有任何扫描器**会再列出来
+ * (`sweepStashBackups` 扫的是另一个前缀,`scanStranded` 的 fsck 只看 unreachable,
+ * 而这是活 ref),而运行中那块屏是滚动的 —— 不写进退出报告,run 一结束,
+ * 用户取回**他自己那份内容**的唯一线索就永久消失。
+ */
+/**
+ * 把一条钉走的耐久 ref 记进出口盒子(去重,保序)。
+ *
+ * **抽成函数的理由和 `buildEscapeLine` 一样,而且更硬**:上一版这一句写在组件回调里,
+ * 闸门只能断言源码里有 `box.current = [...]` 这串字符 —— 变异实测把条件改成
+ * `if (box && false)`,**字符串还在,4148 条全绿**。源码文本断言钉得住「这一行在不在」,
+ * 钉不住「这一行会不会执行」。有行为的地方就得能被真调一次。
+ */
+export function rememberEscapeRef(box: { current: string[] } | undefined, ref: string): void {
+  if (!box || box.current.includes(ref)) return
+  box.current = [...box.current, ref]
+}
+
+export function buildEscapeLine(refs: readonly string[]): string {
+  if (refs.length === 0) return ''
+  return '\n有席位把文件写到了主检出,为了让产出合回你的分支,那些改动被钉成了'
+    + `${refs.length === 1 ? '一条耐久 ref' : `${refs.length} 条耐久 ref`}:\n`
+    + refs.map(r => `  git stash apply ${r}`).join('\n')
+}
+
+export function gitSpawnEnv(
+  base: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  // `process.env` 在这个仓库里是**窄类型**的(只声明了用到的几个键),而这里要按名字
+  // 删两个没被声明的 —— 走一次 Record 视图,别为此去动那份全局声明。
+  const env: Record<string, string | undefined> = { ...base, LC_ALL: 'C' }
+  delete env.LANGUAGE
+  delete env.LC_MESSAGES
+  return env
+}
+
 const gitRunner: GitRunner = (args, cwd) =>
   new Promise(resolve => {
-    const p = spawn('git', args, { cwd })
+    const p = spawn('git', args, { cwd, env: gitSpawnEnv() })
     let stdout = ''
     let stderr = ''
     p.stdout.on('data', d => { stdout += String(d) })
@@ -771,6 +851,8 @@ async function makeWorktreePool(
   opts?: {
     escapes?: import('../../tools/efftask/escapeRegistry.js').EscapeRegistry
     onEscape?: (info: { ref: string; files: readonly string[]; merged: boolean }) => void
+    /** 「某个我们指望的优化没生效」—— 此前这类失败是零观测的。见 WorktreePoolDeps.onNotice。 */
+    onNotice?: (line: string) => void
   },
 ): Promise<{
   pool?: WorktreePool; reason?: string; notARepo?: boolean
@@ -818,6 +900,7 @@ async function makeWorktreePool(
     // park-then-merge 的判据:挡路的脏文件是不是席位越界写的。见 escapeRegistry。
     ...(opts?.escapes ? { escapes: opts.escapes } : {}),
     ...(opts?.onEscape ? { onEscape: opts.onEscape } : {}),
+    ...(opts?.onNotice ? { onNotice: opts.onNotice } : {}),
     // 「腾出多少」必须是量出来的。`du` 不在时 duKb 回 undefined,而屏幕跟着说
     // 「大小未知」——比一个 0 诚实得多(`CleanupDeps.dirSizeKb` 的同一条规矩)。
     dirSizeKb: duKb,
@@ -936,10 +1019,14 @@ type RunnerProps = {
   escapes?: EscapeRegistry
   /** gitRoot 的**盒子** —— 池子建得比 runAgent 晚,传值永远是空串。 */
   gitRootBox?: { current: string }
-  /** 主检出的别名根(软链)。 */
-  aliasBox?: { current: string[] }
-  /** 越界报告的出口盒子:组件挂载后填,`makeWorktreePool` 通过它上屏。 */
-  onEscapeOut?: { current: ((info: { ref: string; files: readonly string[]; merged: boolean }) => void) | null }
+  /**
+   * 越界钉走的耐久 ref,由 call() 持有、由收口那句话读。
+   *
+   * (软链不再靠「别名根」认 —— 那条线填的是 `getCwd()`,而它和 `git --show-toplevel`
+   * 都返回物理路径,恒等于 gitRoot、恒为空操作。现在在闸里对被写的那条路径直接
+   * `realpath`,见 `runAgentAdapter.resolveLinks`。)
+   */
+  escapeRefsOut?: { current: string[] }
   /** 运行中的人工干预面 —— 在 call() 里建,和 runAgent 共用同一个实例。 */
   control: RunControl
   onExit: (outcome: Outcome | null) => void
@@ -1095,7 +1182,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       `${info.merged ? '已钉走并把产出合回你的分支' : '钉走后仍未合上'}。` +
       `那些内容不在任何任务分支上,永远进不了集成分支;取回:git stash apply ${info.ref}`,
     )
-  }, [pushNotice])
+    /**
+     * **同一条 ref 还要活过这块屏。** `problems` 是滚动的,而这条 ref 没有任何扫描器
+     * 会在收口时再列出来 —— run 一结束,用户取回自己那份东西的唯一线索就没了。
+     */
+    rememberEscapeRef(props.escapeRefsOut, info.ref)
+  }, [pushNotice, props.escapeRefsOut])
   /**
    * 有几次工具权限确认在等人回答。>0 时任务树面板交出键盘。
    *
@@ -1123,9 +1215,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // 卸载时收回:指向一个已卸载组件的 setState 会静默丢事件,而丢的正是「拿回键盘」。
   React.useEffect(() => {
     props.humanWaitOut.current = (w: boolean) => { if (w) humanWait.begin(); else humanWait.end() }
-    // 越界报告的出口:组件在,才有屏幕可上。卸载时清掉(和上面那条同一条纪律)。
-    if (props.onEscapeOut) props.onEscapeOut.current = onEscapeNotice
-    return () => { props.humanWaitOut.current = null; if (props.onEscapeOut) props.onEscapeOut.current = null }
+    return () => { props.humanWaitOut.current = null }
   }, [props.humanWaitOut, humanWait.begin, humanWait.end])
   const handoffRef = React.useRef<HandoffSummary | null>(null)
   // What the gate must SAY. Resolved before the gate opens; 'none' until then.
@@ -1415,10 +1505,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       // declares a different nodeTimeoutMs must actually get it.
       props.capsRef.nodeTimeoutMs = withGuidance.caps.nodeTimeoutMs
       props.capsRef.humanTimeoutMs = withGuidance.caps.humanTimeoutMs
-      const isoR = await makeWorktreePool(runId!, getCwd(), { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice })
+      const isoR = await makeWorktreePool(runId!, getCwd(), { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice, onNotice: pushNotice })
       poolRef.current = isoR.pool
       if (props.gitRootBox) props.gitRootBox.current = isoR.pool?.gitRoot ?? ''
-      if (props.aliasBox) props.aliasBox.current = [getCwd()]
       setIsolation(isoR.pool ? 'worktree' : 'none')
       if (!isoR.pool && isoR.reason) withGuidance.notices.push(`${ISOLATION_DEGRADE_PREFIX}${isoR.reason}`)
       // 隔离**是靠自愈才建起来的** —— 盘上被动过,必须说出口(见 makeWorktreePool.healed)。
@@ -1477,7 +1566,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // which kind of run this is — and it was telling every isolated run it was serial,
         // i.e. denying the one thing the user asked for. init() only creates a branch and a
         // worktree; if the user then cancels, the teardown below disposes of them.
-        const iso = await makeWorktreePool(runId!, getCwd(), { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice })
+        const iso = await makeWorktreePool(runId!, getCwd(), { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice, onNotice: pushNotice })
         // init() is async, so the effect can be torn down while it runs. Without this the
         // pool it just created (a real branch and a real worktree on disk) would be
         // unreachable and never disposed.
@@ -1489,7 +1578,6 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         if (cancelled) return
         poolRef.current = iso.pool
         if (props.gitRootBox) props.gitRootBox.current = iso.pool?.gitRoot ?? ''
-        if (props.aliasBox) props.aliasBox.current = [getCwd()]
         setIsolation(iso.pool ? 'worktree' : 'none')
         // spec §8's 「允许选择」: carried as its own state so the gate can present it as a
         // decision, instead of a line buried in the prompt-parsing notices.
@@ -1576,13 +1664,13 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           return
         }
       }
-      const iso = await makeWorktreePool(runId!, cwd, { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice })
+      const iso = await makeWorktreePool(runId!, cwd, { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice, onNotice: pushNotice })
       poolRef.current = iso.pool
       if (props.gitRootBox) props.gitRootBox.current = iso.pool?.gitRoot ?? ''
       setIsolation(iso.pool ? 'worktree' : 'none')
       setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
       firstCommitRoot.current = iso.needsFirstCommit === true ? (iso.gitRoot ?? null) : null
-        setCanInitGit(iso.pool ? false : (iso.notARepo === true || iso.needsFirstCommit === true))
+      setCanInitGit(iso.pool ? false : (iso.notARepo === true || iso.needsFirstCommit === true))
     } finally {
       initingGit.current = false
       setInitingGit(false)
@@ -3152,6 +3240,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 而这条流此前只有结束屏读 —— 关口关掉之后回的就是这里,而 `ConfirmBacktrack`
        * 印的是「原因见任务树上的提示」。(接缝席真帧实测:一个字都没有)
        */
+      // runNotices 在后 —— 屏幕取的是**最新的**那几条(见 RunningView),而这一栏里
+      // 会动的、带着 stash ref 的是它;redoProblems 是整体替换的静态清单。
       problems={[...redoProblems, ...runNotices]}
     />
   }
@@ -3357,8 +3447,20 @@ export function RunningView(props: {
   /**
    * 最多印 3 条 + 一句「另有 N 条」。**截断提示必须活过截断**(这个仓库为这条写过一次
    * 判决):挤掉的那几条要有人说出来,否则用户以为一共就这几条。
+   *
+   * **取最新的 3 条,不是最前的 3 条。** 上一版是 `slice(0, 3)`,而生产者
+   * (`pushNotice`)保留的是**最新** 20 条 —— 两端方向相反,于是攒够 3 条之后
+   * 新告警永远进不了屏幕,只让那个「另有 N 条」的数字变大。事故当天的现象正是
+   * 40 分钟里积压 16→27,而屏幕会锁死在最早那三行上。三席里两席各自点了这一条。
+   *
+   * 同一条理由:`runNotices` 排在 `redoProblems` **后面**(调用点)—— 取的是最新那几条,
+   * 所以要让会动的那一栏靠后。⚠ 这句话上一版写反了(写成「前面」),而代码是对的;
+   * 接缝席点名:照那句注释去「修正」顺序,配上 `slice(-3)` 正好把 bug ⑧ 原样复活。
+   * 后者是整体替换的
+   * 静态清单,一次 `r` 拒绝就能凑够 3 条,把越界报告整个挤掉 —— 而那条报告里带着
+   * 用户取回自己东西的唯一线索。
    */
-  const problems = (props.problems ?? []).slice(0, 3)
+  const problems = (props.problems ?? []).slice(-3)
   const moreProblems = (props.problems ?? []).length - problems.length
   const problemRows = problems.length + (moreProblems > 0 ? 1 : 0)
   const panel = (

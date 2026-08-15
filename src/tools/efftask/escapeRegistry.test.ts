@@ -124,4 +124,73 @@ describe('createEscapeRegistry', () => {
   it('空登记簿:owns 恒假(默认不动用户的工作区)', () => {
     expect(createEscapeRegistry().owns('/repo/pkg/a.rs')).toBe(false)
   })
+
+  /**
+   * **被硬闸拦下的尝试进 claims,不进 owns。**
+   *
+   * `owns()` 的下游是 park-then-merge,语义必须是「这个文件现在的脏是**我们造的**」。
+   * 拦下来 = 一个字节没写 = 之后它要是脏了,那是用户干的。对抗席构造的链条:
+   * 席位 t0 被拒(但拿到所有权)→ 用户 t1 自己改同一个文件 → t2 合并被它挡住 →
+   * 全称判断通过 → **用户的活被 stash 走**。闸拦得越勤,伪造的凭证越多。
+   */
+  it('拦下来的尝试:claims 记得,owns 不认', () => {
+    const r = createEscapeRegistry()
+    r.note({ ...c('/repo/pkg/a.rs'), blocked: true })
+    expect(r.claims()).toHaveLength(1)   // 屏幕要说得出「席位试过」
+    expect(r.owns('/repo/pkg/a.rs')).toBe(false)
+    expect(r.size()).toBe(0)
+    // 同一条路径后来**真被写进去**了(闸关着 / 走 Bash)→ 这时才算数
+    r.note(c('/repo/pkg/a.rs'))
+    expect(r.owns('/repo/pkg/a.rs')).toBe(true)
+    expect(r.size()).toBe(1)
+  })
+})
+
+describe('normalisePath —— `.` 与 `..` 要消掉', () => {
+  /**
+   * 登记簿是**按字符串做键**的,而 `intoTrunk` 查的是 `${gitRoot}/${git 报的相对路径}`。
+   * `.` 不消的话 `/repo/./pkg/a.rs` 这条键永远对不上,记了等于没记(对抗席实测)。
+   */
+  it('`.` 段不改变含义', () => {
+    expect(normalisePath('/repo/./pkg/a.rs')).toBe('/repo/pkg/a.rs')
+  })
+
+  /**
+   * `NotebookEdit` 尤其要紧:Edit/Write 在 `canUseTool` 之前有 `backfillObservableInput`
+   * → `expandPath` 帮忙 normalize 过,notebook 那条**没有** —— 于是
+   * `<自己的工作区>/../../notebooks/x.ipynb` 会被判成「在工作区里」而放行且不记录。
+   */
+  it('`..` 段真的往上走一层,而不是被当成普通目录名', () => {
+    expect(normalisePath('/repo/wt/../pkg/a.rs')).toBe('/repo/pkg/a.rs')
+    expect(under('/repo/wt', '/repo/wt/../pkg/a.rs')).toBe(false)
+    expect(under('/repo', '/repo/wt/../pkg/a.rs')).toBe(true)
+  })
+
+  it('绝对路径在根上再往上还是根', () => {
+    expect(normalisePath('/../../etc/x')).toBe('/etc/x')
+  })
+})
+
+describe('escapedPathsIn —— 软链由调用方注入的 realpath 解开', () => {
+  const G = '/repo'
+  const W = '/repo/.efftask-worktrees/w'
+  /** 跑机上 `/home/esgyn/work/tools/…` 是 `/home/esgyn/tb/tools/…` 的软链。 */
+  const rp = (p: string): string => p.replace(/^\/alias\b/, G)
+
+  it('席位照别名写主检出 → 认得出,而且摘出来的是**解开之后**那条', () => {
+    expect(escapedPathsIn({ file_path: '/alias/pkg/a.rs' }, { gitRoot: G, cwd: W, realpath: rp }))
+      .toEqual([`${G}/pkg/a.rs`])
+  })
+
+  it('席位照别名写**自己的工作区** → 解开之后落在 cwd 里,不算越界', () => {
+    expect(escapedPathsIn(
+      { file_path: '/alias/.efftask-worktrees/w/a.rs' }, { gitRoot: G, cwd: W, realpath: rp },
+    )).toEqual([])
+  })
+
+  it('解不开(realpath 返回 undefined)→ 退回按字面比,不崩', () => {
+    expect(escapedPathsIn(
+      { file_path: `${G}/pkg/a.rs` }, { gitRoot: G, cwd: W, realpath: () => undefined },
+    )).toEqual([`${G}/pkg/a.rs`])
+  })
 })

@@ -1,3 +1,5 @@
+import { realpathSync } from 'node:fs'
+import { basename, dirname } from 'node:path'
 import { runAgent } from '../AgentTool/runAgent.js'
 import type { AgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import type { ToolUseContext, Tools } from '../../Tool.js'
@@ -329,6 +331,63 @@ export function pickAgentDefinition(
  * `roleClientConfig`,runAgent 已经按协议分好了支。从这里再传一次,只能盖错。
  */
 
+/**
+ * 把一条路径上的软链解开 —— **文件还不存在也要能解**。
+ *
+ * 越界闸的判据是「这条路径在不在主检出里」,而跑机上
+ * `/home/esgyn/work/tools/qianbase-xtp` 是 `/home/esgyn/tb/tools/qianbase-xtp` 的软链
+ * (node.md 里 1170 次)。不解的话席位照别名写,`under(gitRoot, …)` 为假 ——
+ * **不拦、不记**,而这正是提交信息自称要防的那条事故路径。
+ *
+ * `Write` 建新文件时路径本身不存在,`realpathSync` 会 ENOENT。所以沿着目录往上找到
+ * **最近的已存在祖先**,解开它,再把剩下的段接回去 —— 软链只可能出现在已存在的那一段上。
+ *
+ * 一路解不动就返回 `undefined`,调用方退回按字面比:**解不开是少拦一次,抛异常是把
+ * 整个工具调用带走**,后者不可接受(这个函数在每一次工具调用的关键路径上)。
+ */
+/**
+ * `canUseTool` 第一个参数的工具名。
+ *
+ * **它是一个 `ToolType` 对象,不是字符串。** 上一版写的是 `String(args[0])` ——
+ * 在生产上等于 `"[object Object]"`,于是登记簿里每条记录的 `tool` 字段一直是那串废话;
+ * 而如果拿它去和白名单比,白名单会**一条都不匹配、闸整个变成空操作**,
+ * 并且编译通过、测试全绿(测试里喂的是字符串)。这一刀是加白名单时当场发现的。
+ *
+ * 两种形态都认:真工具对象取 `.name`,测试里直接喂字符串。
+ */
+export function toolNameOf(t: unknown): string {
+  if (typeof t === 'string') return t
+  const n = (t as { name?: unknown } | null | undefined)?.name
+  return typeof n === 'string' ? n : ''
+}
+
+export function resolveLinks(p: string): string | undefined {
+  try {
+    let dir = p
+    const rest: string[] = []
+    for (let i = 0; i < 64; i++) {
+      try {
+        const real = realpathSync.native(dir)
+        if (rest.length === 0) return real
+        // `real` 是 `/` 时直接拼会得到 `//…`(POSIX 里 `//` 是实现定义的)。
+        // 目前唯一的调用点会 `normalisePath` 压平它,但这是导出函数 —— 契约得自己对。
+        // 和上面那条 `basename` 是同一刀的两半,接缝席点名了另一半。
+        return `${real === '/' ? '' : real}/${rest.reverse().join('/')}`
+      } catch {
+        const parent = dirname(dir)
+        if (parent === dir) return undefined // 到根都没有一段是存在的
+        // `basename` 而不是 `dir.slice(parent.length + 1)`:parent 是 `/` 时它自己带着
+        // 那个斜杠,+1 会把路径切掉一个字符(`/repo` → `epo`)。测试当场抓到了这一刀。
+        rest.push(basename(dir))
+        dir = parent
+      }
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function makeRunAgentFn(deps: {
   toolUseContext: ToolUseContext
   canUseTool: CanUseToolFn
@@ -404,8 +463,12 @@ export function makeRunAgentFn(deps: {
    * 而这个仓库 24 小时内为它付过两次账(`openStream`、`autoRescue`)。
    */
   gitRoot?: () => string
-  /** 主检出的**别名根**(软链)。跑机上 `/home/esgyn/work/tools/…` 是 `/home/esgyn/tb/tools/…` 的软链。 */
-  gitRootAliases?: () => readonly string[]
+  /**
+   * (软链**不再**靠「别名根」认。上一版让调用方把别名塞进 `roots`,而它填的是
+   * `getCwd()` —— 和 `git rev-parse --show-toplevel` 一样返回物理路径,恒等于 gitRoot、
+   * 恒为空操作,三席各自量到同一个结果。现在闸里对被写的那条路径直接 `realpath`,
+   * 见 `resolveLinks` —— 那样也不必去枚举「有哪些软链指向仓库」,那本来就枚举不完。)
+   */
   /**
    * 硬闸开关。**默认开**(`!== false`)。关掉之后只记录、不拦 ——
    * 留这个口是因为拦截会改变席位行为,而这个仓库的规矩是「不可逆的默认要能被关掉」。
@@ -537,21 +600,56 @@ export function makeRunAgentFn(deps: {
        *
        * 覆盖面缺口要说出来:**Bash 与 MCP 不在硬闸内**(从命令行推断改了哪个文件不可靠,
        * 而下游要动用户的工作区 —— 宁可归因不到也不可归因错)。
+       *
+       * ⚠ 「在所有权限档下都在路径上」这句话有一个前提:`override.requireCanUseTool`。
+       * 没有它,一个自动放行的 PreToolUse 钩子会让 `canUseTool` **一次都不被调用**
+       * (`resolveHookPermissionDecision` 直接返回)—— 闸和登记簿一起消失。
+       * 对抗席验收时找到的绕过,已在下面 `run()` 的 override 里堵上。
        */
+      /**
+       * **只管写工具。**
+       *
+       * 上一版只看输入里有没有 `file_path`,不看是哪个工具 —— 于是 `Read` 一个主检出的
+       * 绝对路径也被当成越界拒掉。而 `/et` 自己把 `.claude/efftask/<runId>/…/node.md`
+       * 写在**用户检出**里(还写进了 `.git/info/exclude`),它**不在任何节点工作区里**,
+       * 提示词又明说让席位去读 `run.md` / `node.md` —— 席位照做就被拒,
+       * 拒绝信息还让它「改写工作区里的同名相对路径」,而那个文件在它工作区里根本不存在。
+       *
+       * 每个 run 都在踩,是纯误伤。而且**是 `requireCanUseTool` 把它从「有时」放大成
+       * 「每次必踩」的**(以前自动放行钩子会让这一层整个消失)——
+       * 一个修复放大了另一个缺陷,对抗席点名的。
+       *
+       * 白名单而不是黑名单:新增一个读工具不该自动获得被拒的资格,
+       * 而新增一个写工具漏进来只是**少拦一次**(保守方向)。
+       */
+      const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
       const escaped = deps.escapes !== undefined && deps.gitRoot !== undefined
+        && WRITE_TOOLS.has(toolNameOf(args[0]))
         ? escapedPathsIn(args[1], {
           gitRoot: deps.gitRoot(),
           ...(req.cwd === undefined ? {} : { cwd: req.cwd }),
-          ...(deps.gitRootAliases ? { roots: deps.gitRootAliases() } : {}),
+          realpath: resolveLinks,
         })
         : []
       if (escaped.length > 0) {
+        /**
+         * **拦下来的记成 `blocked`,不进 `owns()`。**
+         *
+         * 拦下来 = 一个字节没写 = 这个文件之后要是脏了,那不是我们造的。
+         * 上一版无差别地记,于是硬闸每拦一次就给 park-then-merge 伪造一份所有权凭证:
+         * 席位 t0 被拒 → 用户 t1 自己改同一个文件 → t2 合并被它挡住 → 全称判断通过 →
+         * **用户的活被 stash 走**(对抗席构造)。闸拦得越勤,伪证越多。
+         */
+        const blocked = deps.escapeGate !== false
         for (const p of escaped) {
           try {
-            deps.escapes?.note({ nodeId: req.node.id, phase: req.phase, tool: String(args[0]), path: p })
+            deps.escapes?.note({
+              nodeId: req.node.id, phase: req.phase, tool: toolNameOf(args[0]), path: p,
+              ...(blocked ? { blocked: true } : {}),
+            })
           } catch { /* 记账不能把这次调用带走 */ }
         }
-        if (deps.escapeGate !== false) {
+        if (blocked) {
           return {
             behavior: 'deny',
             message: `这个路径在**主检出**里,不是你的工作区:${escaped[0]}\n`
@@ -729,7 +827,15 @@ export function makeRunAgentFn(deps: {
         // runWithCwdOverride). So we both record it AND actually switch the cwd below;
         // passing it alone would let P2's worktree executor write into the shared tree.
         worktreePath: req.cwd,
-        override: { abortController: inner },
+        /**
+         * `requireCanUseTool` —— **越界闸靠它才在所有档下都在路径上。**
+         *
+         * 上一版的注释说「这一层对所有工具、所有权限档都生效」,而对抗席找到了一档它不
+         * 生效:一个自动放行的 PreToolUse 钩子会让 `resolveHookPermissionDecision` 直接
+         * 返回,`canUseTool` 一次都不调 —— 闸和登记簿一起消失,连记录都没有。
+         * 而无人值守跑几小时的人正是最会装那种钩子的。
+         */
+        override: { abortController: inner, requireCanUseTool: true },
       })
 
     // The WHOLE consumption must run inside the cwd override, not just the call that

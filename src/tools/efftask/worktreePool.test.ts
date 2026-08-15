@@ -1229,6 +1229,507 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
   })
 
   /**
+   * **第二条判据:内容一模一样 ⇒ 丢弃可证明无损。**
+   *
+   * 归因那条在出厂配置下命中率结构性为 0(硬闸默认开 ⇒ 每次越界都被拒 ⇒ 记录全是
+   * `blocked` ⇒ `owns()` 恒假)—— 对抗席量出来的,park 整块曾是死代码。
+   * 所以加一条不需要知道是谁写的判据:工作区里的内容和合并将要写入的内容字节相同,
+   * 那么丢掉它一个字节都不损失。这一格**一条 `escapes` 都不给**,证明它独立成立。
+   */
+  it('挡路文件的内容和合并要写的一模一样 → 直接清掉合上,不需要任何归因', async () => {
+    const notices: string[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, onNotice: l => notices.push(l),
+    })
+    await p.init()
+    // 用户自己提交一笔,让回主干那一跳是真三方合并
+    await writeFile(join(gitRoot, 'note.md'), 'mine\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'regenerated\n')
+    /**
+     * 主检出里**同一个文件被改成了同样的内容** —— 跑机上那次真实事故的形状:
+     * 席位在集成工作区跑 `devenv shell`,devenv 重新生成了受跟踪的 `devenv.lock`,
+     * 内容和分支上那份一致,而 git 照样拒绝合并。
+     */
+    await writeFile(join(gitRoot, 'base.txt'), 'regenerated\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(true)
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('regenerated\n')
+    // 而且说出来了 —— 我们动了他的工作区,哪怕是无损的
+    expect(notices.join('\n')).toContain('一模一样')
+  })
+
+  /** 内容**不**一样就证明不了无损 —— 归因不到就一个字节不碰(这是上一格的反证)。 */
+  it('内容不同、又归因不到 → 不动,退回老路', async () => {
+    const p = pool()
+    await p.init()
+    await writeFile(join(gitRoot, 'note.md'), 'mine\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'USER IS EDITING THIS\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('USER IS EDITING THIS\n')
+  })
+
+  /**
+   * **retry 撞了现场就要收拾,而且屏幕不许说假话。**
+   *
+   * 质量席和对抗席**各自独立**复现:钉走脏文件之后真三方合并才跑起来,然后撞真冲突 ——
+   * 上一版这里一句 abort 都没有,于是用户主检出里留着 `UU` 和写进文件的冲突标记,
+   * 而 `restored`/`left` 是 park **之前**算的,下面组装消息时照旧复用,
+   * 屏幕上说「已还原你的工作区」,`conflicted` 还是 false。
+   */
+  it('钉走之后重试撞真冲突 → 收拾干净,而且不许说「已还原你的工作区」', async () => {
+    const reg = createEscapeRegistry()
+    const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, escapes: reg })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'FROM NODE\n')
+    // 用户在 run 期间自己提交同一个文件 → 钉走脏文件之后那次三方合并必然撞冲突
+    await writeFile(join(gitRoot, 'base.txt'), 'USER COMMITTED\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+    // 席位越界又把它写脏,并且归因得到 → 走 park 那条路
+    await writeFile(join(gitRoot, 'base.txt'), 'ESCAPED WRITE\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    // ① 现场收拾干净了 —— 不能把用户丢在一次未完成的合并里
+    expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], gitRoot)).code).not.toBe(0)
+    const uu = await git(['diff', '--name-only', '--diff-filter=U'], gitRoot)
+    expect(uu.stdout.trim()).toBe('')
+    // ② 文件里不许留冲突标记
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).not.toContain('<<<<<<<')
+  })
+
+  /**
+   * **`left` / `restored` 要重算,而这条判据落在「屏幕说了什么」上。**
+   *
+   * ⚠ 上一条探针查的是**树的状态**,而 `left` 只影响那句话和 `conflicted` 标志 ——
+   * 变异实测「left 不重算」在它下面**存活**。
+   *
+   * 而且重算唯一有价值的场合是 **retry 撞冲突、abort 又失败**:park 只在
+   * `left.length === 0` 时才进(`overwriteBlocked` 的前提),所以 park 那一刻 left 恒为空;
+   * 沿用它就等于宣称「没撞冲突」,而现场明明还在。
+   */
+  it('重试撞冲突且 abort 也失败 → 如实说撞了冲突,并标成 conflicted', async () => {
+    const reg = createEscapeRegistry()
+    let aborts = 0
+    const flaky: GitRunner = async (args, cwd) => {
+      // 只拦**主检出**那侧的 abort,让 retry 的现场留在那儿
+      if (args[0] === 'merge' && args[1] === '--abort' && cwd === gitRoot) {
+        aborts++
+        return { code: 1, stdout: '', stderr: "fatal: Unable to create '.git/index.lock': File exists.\n" }
+      }
+      return git(args, cwd)
+    }
+    const p = createWorktreePool({ runId: '001', gitRoot, git: flaky, worktreeRoot, escapes: reg })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'FROM NODE\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'USER COMMITTED\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+    await writeFile(join(gitRoot, 'base.txt'), 'ESCAPED WRITE\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    const res = await p.commitAndMerge(n)
+    expect(aborts).toBeGreaterThan(0)          // 确认真的走到了 retry 的收拾
+    /**
+     * 判据落在**措辞**上。⚠ 第一版写的是 `conflicted === true` + reason 含 `base.txt`,
+     * 而变异实测那两条**沿用旧值也满足**:abort 失败让 `restored` 为假,`conflicted`
+     * 靠 `!restored` 照样为真;而 git 的原话里本来就有文件名。
+     * 真正只有重算才说得出的,是「**撞了冲突**」这个定性 —— 不重算就退回
+     * `没成功:<git 原话>`,把一次冲突报成一次不明原因的失败。
+     */
+    expect(res.trunk?.reason ?? '').toContain('撞了冲突')
+    expect(res.trunk?.conflicted).toBe(true)
+    expect(res.trunk?.reason ?? '').toContain('base.txt')
+    // 而且不许再说「已还原你的工作区」—— 现场明明还在
+    expect(res.trunk?.reason ?? '').not.toContain('已还原你的工作区')
+  })
+
+  /**
+   * **报失败原因要取 stderr,不能取 stdout 的第一行。**
+   *
+   * 合并失败时 stdout 的第一行常常是 `Auto-merging base.txt` 这种*成功*输出,
+   * 拿它当原因念出来就是「集成工作区没能先与 main 同步(Auto-merging base.txt)」——
+   * 一句把成功当失败念的话。质量席点名的措辞刺。
+   */
+  it('前置同步撞冲突 → 通知里念的是错误原因,不是 Auto-merging', async () => {
+    const notices: string[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, onNotice: l => notices.push(l),
+    })
+    await p.init()
+    const intPath = join(worktreeRoot, 'integration')
+    await writeFile(join(intPath, 'clash.txt'), 'from-integration\n')
+    await git(['add', '-A'], intPath)
+    await git(['commit', '-qm', 'integration side'], intPath)
+    await writeFile(join(gitRoot, 'clash.txt'), 'from-user\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user side'], gitRoot)
+
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'fresh.txt'), 'node work\n')
+    await p.commitAndMerge(n)
+
+    const said = notices.join('\n')
+    expect(said).toContain('没能先与')
+    expect(said).not.toContain('Auto-merging')
+    expect(said).toMatch(/CONFLICT|error:|fatal:/)
+  })
+
+  /**
+   * **pathspec 里的文件名是字面量,不是通配符。**
+   *
+   * 真 git 实测:`git stash push -u -- 'a[1].txt'` 会连 `a1.txt` 一起收走 ——
+   * 「判据保护的是名单、动作超出了名单」从 pathspec 语法这一侧原样复活,
+   * 而 `[id].tsx` 这类文件名在真实仓库里遍地都是。
+   */
+  it('挡路文件名里有 [ ] ? → 不许顺手吞掉名字相近的文件', async () => {
+    await writeFile(join(gitRoot, 'a[1].txt'), 'base\n')
+    await writeFile(join(gitRoot, 'a1.txt'), 'base\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'add both'], gitRoot)
+    const reg = createEscapeRegistry()
+    const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, escapes: reg })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'a[1].txt'), 'from-node\n')
+    await writeFile(join(gitRoot, 'a[1].txt'), 'escaped-write\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'a[1].txt') })
+    // 用户手上一个**名字相近但没挡路**的改动
+    await writeFile(join(gitRoot, 'a1.txt'), 'USER WIP\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(true)
+    expect(await readFile(join(gitRoot, 'a1.txt'), 'utf-8')).toBe('USER WIP\n')
+  })
+
+  /**
+   * **挡路清单按 TAB 切,不按标点猜。** 三席各自实测同一个洞。
+   *
+   * 上一版的判据是 `!l.includes(' ') && l.includes('.')`,于是 `Makefile`(无扩展名)
+   * 和 `docs/my notes.md`(带空格)**从挡路清单里消失**。真 git 实测:这两条消息的
+   * 文件清单每一行都以 TAB 开头,空格原样、UTF-8 不转义。
+   *
+   * 这一格量的是「全漏」那一面:唯一挡路的是 `Makefile`,而它确实是席位写的 ——
+   * 上一版摘出空清单 → `blockedPaths.length > 0` 为假 → 不钉 → 七小时那条路照旧。
+   */
+  it('挡路的是无扩展名文件(Makefile)且归因到席位 → 照样钉、照样合上', async () => {
+    await writeFile(join(gitRoot, 'Makefile'), 'all:\n\techo base\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'add makefile'], gitRoot)
+    const reg = createEscapeRegistry()
+    const escapes: { ref: string; files: readonly string[]; merged: boolean }[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
+    })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'Makefile'), 'all:\n\techo from-node\n')
+    await writeFile(join(gitRoot, 'Makefile'), 'all:\n\techo escaped\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'Makefile') })
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(true)
+    expect(await readFile(join(gitRoot, 'Makefile'), 'utf-8')).toBe('all:\n\techo from-node\n')
+    expect(escapes).toHaveLength(1)
+  })
+
+  /**
+   * **漏摘的危险方向:混合形态下 `every()` 在被削过的集合上判真。**
+   *
+   * 挡路的有两条 —— 席位的 `base.txt`(有扩展名)和用户的 `Makefile`(无扩展名)。
+   * 上一版只摘到前者,全称判断在残缺集合上通过 → **把用户正在写的 Makefile 一起钉走,
+   * 然后被合并覆盖**(质量席端到端实测,`onEscape.files` 里赫然带着 `Makefile`)。
+   *
+   * 全称闸本身是对的,漏的是喂给它的那个集合 —— 所以这一格钉的是「一条不是席位的,
+   * 就整个不动」在**无扩展名**这一形态下也成立。
+   */
+  it('挡路清单里混进一条用户的无扩展名文件 → 一个字节都不动', async () => {
+    await writeFile(join(gitRoot, 'Makefile'), 'all:\n\techo base\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'add makefile'], gitRoot)
+    const reg = createEscapeRegistry()
+    const escapes: unknown[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
+    })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    // 节点改了两个文件,回主干时两个都要覆盖
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(l.path, 'Makefile'), 'all:\n\techo from-node\n')
+    // 主检出:一条是席位越界写的,另一条是**用户自己**在改
+    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    await writeFile(join(gitRoot, 'Makefile'), 'all:\n\techo USER WORK\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    // 用户的活原封不动 —— 这是这条判据存在的**全部**理由
+    expect(await readFile(join(gitRoot, 'Makefile'), 'utf-8')).toBe('all:\n\techo USER WORK\n')
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('escaped-write\n')
+    expect(escapes).toEqual([])
+  })
+
+  /**
+   * **钉走的范围 = 挡路的那几条,不是整棵树。**
+   *
+   * 判据是「挡路的每一条都归因到席位」,而上一版的动作是 `stash push -u` 无 pathspec ——
+   * 全称判断保护的是名单,清空的却是全树。质量席实测:用户没挡路的改动(含未跟踪文件)
+   * 一并被收走,而 `onEscape.files` 还把它们念成「有席位把文件写到了主检出」。
+   */
+  it('只钉挡路的那一条 —— 用户在别处的改动(含未跟踪文件)原地不动', async () => {
+    const reg = createEscapeRegistry()
+    const escapes: { files: readonly string[] }[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
+    })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+    // 用户手上两样和这次合并**无关**的东西:一个已跟踪的改动、一个未跟踪的新文件
+    await writeFile(join(gitRoot, 'user-tracked.md'), 'v0\n')
+    await git(['add', 'user-tracked.md'], gitRoot)
+    await git(['commit', '-qm', 'user file'], gitRoot)
+    await writeFile(join(gitRoot, 'user-tracked.md'), 'USER EDITING\n')
+    await writeFile(join(gitRoot, 'user-new.txt'), 'USER NEW\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(true)
+    // 挡路那条被钉走并换成了节点的版本
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\n')
+    // 而用户的两样东西**还在原地**
+    expect(await readFile(join(gitRoot, 'user-tracked.md'), 'utf-8')).toBe('USER EDITING\n')
+    expect(await readFile(join(gitRoot, 'user-new.txt'), 'utf-8')).toBe('USER NEW\n')
+    // 上屏那句话也不能把用户的文件念成席位干的
+    expect(escapes[0]?.files).toEqual(['base.txt'])
+  })
+
+  /**
+   * **钉走却仍然合不上 → 按 ref 还原,不许碰用户的 stash。**
+   *
+   * `pinAndClear` 钉成耐久 ref 之后会**把自己那条 stash 条目 drop 掉**(刻意的:
+   * `refs/stash` 是全仓库共享的),所以裸 `git stash pop` 弹的是**用户自己**那条。
+   * 三席各自真 git 实测同一个结果:席位那份没放回来,用户一条无关的 stash 被摊进工作区
+   * **并删除**,而且树反而更脏 —— 下一次合并接着被它堵。
+   */
+  it('重试仍失败 → 席位那份放回原处,用户自己的 stash 一条不少', async () => {
+    const reg = createEscapeRegistry()
+    // 让**第二次**「合集成分支进主检出」失败 —— 也就是钉走之后的那次重试
+    let merges = 0
+    const flaky: GitRunner = async (args, cwd) => {
+      if (cwd === gitRoot && args[0] === 'merge' && args.includes('efftask/001/integration')) {
+        merges++
+        if (merges === 2) return { code: 1, stdout: '', stderr: 'fatal: 实验注入的失败\n' }
+      }
+      return git(args, cwd)
+    }
+    const p = createWorktreePool({ runId: '001', gitRoot, git: flaky, worktreeRoot, escapes: reg })
+    await p.init()
+    // 用户自己贮藏了一份东西 —— 和这次合并毫无关系
+    await writeFile(join(gitRoot, 'mine.txt'), 'USER PRECIOUS\n')
+    await git(['add', 'mine.txt'], gitRoot)
+    await git(['commit', '-qm', 'user file'], gitRoot)
+    await writeFile(join(gitRoot, 'mine.txt'), 'USER WIP\n')
+    await git(['stash', 'push', '-m', 'user own stash'], gitRoot)
+
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    await p.commitAndMerge(n)
+    // ① 席位那份回到了工作区(它本来就在那儿,我们只是暂时拿开)
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('escaped-write\n')
+    // ② 用户那条 stash **还在**,而且没被摊进工作区
+    const list = await git(['stash', 'list'], gitRoot)
+    expect(list.stdout).toContain('user own stash')
+    expect(await readFile(join(gitRoot, 'mine.txt'), 'utf-8')).toBe('USER PRECIOUS\n')
+  })
+
+  /**
+   * **这一跳没成 → 前置同步造的那个 merge commit 要撤掉。**
+   *
+   * 质量席实测:用户 run 期间自己提交一笔 + 一个无关文件挡路 → 集成分支提交数 2→5,
+   * `git log --merges` 里多出「Merge branch 'main' into efftask/001/integration」,
+   * 而 `trunk.advanced === false` —— 副作用先落盘,收益一次都没拿到。
+   * 三层后果:用户分支上的东西灌进之后每个席位的基线、收口口径把用户的活算成 run 的产出、
+   * 和 `userRewound` 打架。
+   */
+  it('主干那跳失败 → 集成分支上不留「合并用户分支」的提交', async () => {
+    const p = pool()
+    await p.init()
+    const intBranch = 'efftask/001/integration'
+    // 用户自己提交一笔 → 回主干那一跳原本是真三方合并,前置同步会真的造一个 merge commit
+    await writeFile(join(gitRoot, 'user-note.md'), 'mine\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+    const userCommit = (await git(['rev-parse', 'HEAD'], gitRoot)).stdout.trim()
+    // 而主检出里有一个**归因不到**的脏文件挡住这次合并 → 这一跳必然失败
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'user is editing this\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    /**
+     * 判据是**用户那笔提交不在集成分支上** —— 而不是「提交数没变」:
+     * 节点自己那一笔本来就该进集成分支(这条探针第一版把它算成了污染,当场红)。
+     */
+    const contains = await git(['merge-base', '--is-ancestor', userCommit, intBranch], gitRoot)
+    expect(`用户的提交在集成分支上? ${contains.code === 0}`).toBe('用户的提交在集成分支上? false')
+    const merges = await git(['log', '--merges', '--oneline', intBranch], gitRoot)
+    expect(merges.stdout.trim()).toBe('')
+    // 而用户那个脏文件一个字节没动
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('user is editing this\n')
+  })
+
+  /**
+   * **前置同步失败必须有人说。**
+   *
+   * 集成工作区的索引里只要有一个无关文件是 staged,前置同步就**每一次**都失败 ——
+   * 也就是说「回主干那一跳永远走快进」这条收益一次都不发生,而上一版把 `sync` 的返回码
+   * 整个丢掉,零观测(质量席实测)。而把 intPath 弄成 staged 的正是在里面开会的
+   * 集成验收席位,它们拿的是全套工具、而 Bash 不在越界闸内。
+   */
+  it('集成工作区索引脏 → 前置同步失败,而且这件事上得了屏', async () => {
+    const notices: string[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, onNotice: l => notices.push(l),
+    })
+    await p.init()
+    const intPath = join(worktreeRoot, 'integration')
+    // 用户提交一笔,让前置同步真的有事可做
+    await writeFile(join(gitRoot, 'user-note.md'), 'mine\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+    // 集成工作区里留一个 staged 的无关文件 —— 席位在里面跑构建就会这样
+    await writeFile(join(intPath, 'stray.txt'), 'left by a seat\n')
+    await git(['add', 'stray.txt'], intPath)
+    // 而这个文件在用户分支上也存在且内容不同 → 同步会被它挡住
+    await writeFile(join(gitRoot, 'stray.txt'), 'different\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user adds stray'], gitRoot)
+
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'fresh.txt'), 'node work\n')
+    await p.commitAndMerge(n)
+
+    const said = notices.join('\n')
+    expect(said).toContain('没能先与')
+    /**
+     * **后果那一句也要钉。** 只断言前半句的话,把解释整段抽空照样绿(变异实测存活)——
+     * 而这条通知的全部价值就在后半句:用户看到「同步失败」四个字不会动,
+     * 看到「主检出里任何一个脏文件都可能把它整个挡住」才会去清主检出。
+     */
+    expect(said).toContain('三方合并')
+    expect(said).toContain('挡住')
+    // 收拾干净了 —— 下一个节点不能撞上一个半合并态
+    expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], intPath)).code).not.toBe(0)
+    expect((await git(['diff', '--name-only', '--diff-filter=U'], intPath)).stdout.trim()).toBe('')
+  })
+
+  /**
+   * **收拾要复核 —— 一条 abort 发出去不等于现场没了。**
+   *
+   * 质量席实测(让第一次 abort 输在 `index.lock` 上):intPath 留着 `UU`,而**没有任何人
+   * 被告知** —— 下一个节点撞上这个半合并态,被判成 `kind:'conflict'`,报的是它根本没
+   * 参与的冲突,它的兄弟全部「依赖阻断」。
+   *
+   * 判据也不能只认 `MERGE_HEAD`:这个文件 1600 行外自己记着实测「a lost merge race
+   * leaves a staged entry with **NO MERGE_HEAD**」。
+   *
+   * ⚠ 上一条探针打不中这一格:那个场景里第一次 abort 就成功了,升级那一步压根没走到
+   * (变异实测 `if (false)` 存活)。所以这里**注入一次失败的 abort**。
+   */
+  it('第一次 abort 失败 → 升级到 reset --hard,现场必须真的没了', async () => {
+    let aborts = 0
+    const flaky: GitRunner = async (args, cwd) => {
+      if (args[0] === 'merge' && args[1] === '--abort' && cwd?.endsWith('/integration')) {
+        aborts++
+        if (aborts === 1) return { code: 1, stdout: '', stderr: "fatal: Unable to create '.../index.lock': File exists.\n" }
+      }
+      return git(args, cwd)
+    }
+    const notices: string[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git: flaky, worktreeRoot, onNotice: l => notices.push(l),
+    })
+    await p.init()
+    const intPath = join(worktreeRoot, 'integration')
+    // 造一次**真冲突**的前置同步:同一个文件两边都改,而且用户那边已提交
+    await writeFile(join(intPath, 'clash.txt'), 'from-integration\n')
+    await git(['add', '-A'], intPath)
+    await git(['commit', '-qm', 'integration side'], intPath)
+    await writeFile(join(gitRoot, 'clash.txt'), 'from-user\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user side'], gitRoot)
+
+    /**
+     * 席位在集成工作区里留下的东西 —— **重手会把这些抹掉**,所以它们正是判据。
+     * 集成验收席位就在 intPath 里开会,带全套工具,这不是构造出来的边角。
+     *
+     * ⚠ 只放**未跟踪**的:改 `clash.txt` 会让同步在「你的本地改动会被覆盖」那一步就被拒,
+     * 根本进不了合并态,abort 一次都不发 —— 第一版这么写,`aborts` 当场为 0。
+     */
+    await writeFile(join(intPath, 'seat-scratch.md'), '席位在集成工作区里写的评审记录\n')
+
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'fresh.txt'), 'node work\n')
+    await p.commitAndMerge(n)
+
+    expect(aborts).toBeGreaterThan(0) // 确认这条探针真的走到了那段收拾代码
+    /**
+     * **抹掉了什么,必须说得出来。**
+     *
+     * 质量席实测:席位在集成工作区里写的未跟踪评审记录被 `clean -fd` 删掉、手工改动被
+     * `reset --hard` 抹平,`refs/et/rescued` 一条没有,屏幕上只字不提 ——
+     * **为了修「收拾不复核」而加的重手,自己是一次零观测的破坏。**
+     *
+     * ⚠ 第一版这条探针要求「必须钉住」,而真 git 实测**冲突态下 `stash push -u` 和
+     * `stash create` 都失败**(`needs merge`)—— 也就是说「先钉再抹」在这一格根本做不到,
+     * 那条判据是在要求一件不可能的事。判据改成能成立的那个:**钉住了报 ref,
+     * 钉不住就明说不可恢复、并点名清掉了哪几个**。静默抹掉才是要防的。
+     */
+    const said = notices.join('\n')
+    expect(said).toMatch(/refs\/et\/rescued|不可恢复/)
+    expect(said).toContain('seat-scratch.md')   // 点名,不是只说「清空了」
+    // **现场必须真的没了** —— 这才是判据,不是「abort 发出去过」
+    expect((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], intPath)).code).not.toBe(0)
+    expect((await git(['diff', '--name-only', '--diff-filter=U'], intPath)).stdout.trim()).toBe('')
+    // 而且这件事上了屏,不是静默收场
+    expect(notices.join('\n')).toContain('没能先与')
+  })
+
+  /**
    * **无关的脏文件不再堵住合并** —— 快进改造买到的就是这个。
    *
    * 真 git 实测(圆桌两席各自复现):真三方合并时索引里**任何一个**文件脏就整个被拒

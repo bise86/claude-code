@@ -179,8 +179,41 @@ const first = (r: { code: number; stdout: string; stderr: string }): string =>
  * 撞冲突态时 `stash push` 本身会失败(实测 `Cannot save the current index state`),
  * 那时退回 `pinSnapshot`(至少把已跟踪的那半钉住),并如实说未跟踪的没保住。
  */
-export async function pinAndClear(deps: SnapshotDeps, cwd: string): Promise<SnapshotResult> {
-  const st = await deps.git(['-c', 'core.quotepath=false', 'status', '--porcelain', '-uall'], cwd)
+export async function pinAndClear(
+  deps: SnapshotDeps,
+  cwd: string,
+  /**
+   * **只收这几条**(pathspec)。不给就是整棵树 —— 那是 `m` 键和抹掉集成工作区那两条路,
+   * 用户自己按的按钮,范围本来就是「这棵树」。
+   *
+   * 给了的场合是 park-then-merge:判据只证明了**挡路的那几条**是席位干的,
+   * 所以动手的范围也只能是它们。三席各自实测过整棵树那一版会把用户没挡路的改动
+   * (含未跟踪文件)一并收走。
+   *
+   * pathspec 那一档**不走 `pinSnapshot` 兜底**:`stash create` 是整棵树的,
+   * 拿它兜底等于把刚刚收窄掉的范围又放回去 —— 宁可不钉(退回老路,一个字节不碰)。
+   */
+  only?: readonly string[],
+): Promise<SnapshotResult> {
+  /**
+   * **每条都要 `:(literal)`。** git 的 pathspec 默认吃 wildmatch,而这些名字是从 git 的
+   * 输出里原样摘来的**字面文件名**。真 git 实测(对抗席构造,我复现):
+   *
+   * ```
+   * git stash push -u -- 'a[1].txt' 'q?.txt'
+   *   → 连用户的 a1.txt、qX.txt 一起收走了
+   * git stash push -u -- ':(literal)a[1].txt' ':(literal)q?.txt'
+   *   → 只收这两条,用户的原样留着
+   * ```
+   *
+   * 这正是这一版要修的「判据保护的是名单、动作超出了名单」,从 pathspec 语法这一侧
+   * 原样复活 —— 而 `[id].tsx` / `[...slug].tsx` 在真实仓库里遍地都是。
+   * 顺带也堵掉以 `:` 开头的文件名被当成 pathspec magic 那一格。
+   */
+  const spec = only ? ['--', ...only.map(p => `:(literal)${p}`)] : []
+  const st = await deps.git(
+    ['-c', 'core.quotepath=false', 'status', '--porcelain', '-uall', ...spec], cwd,
+  )
   if (st.code !== 0) return { ok: false, why: `看不出 ${cwd} 里有没有未提交的内容(${first(st)})` }
   const lines = st.stdout.split('\n').map(l => l.trimEnd()).filter(l => l.trim().length > 0)
   if (lines.length === 0) return { ok: true }
@@ -193,9 +226,13 @@ export async function pinAndClear(deps: SnapshotDeps, cwd: string): Promise<Snap
    * 记过一次真 git 实测。
    */
   const before = (await deps.git(['rev-parse', '-q', '--verify', 'refs/stash'], cwd)).stdout.trim()
-  const pushed = await deps.git(['stash', 'push', '-u', '-m', `efftask 抢救快照(${deps.runId})`], cwd)
+  const pushed = await deps.git(
+    ['stash', 'push', '-u', '-m', `efftask 抢救快照(${deps.runId})`, ...spec], cwd,
+  )
   const after = (await deps.git(['rev-parse', '-q', '--verify', 'refs/stash'], cwd)).stdout.trim()
   if (pushed.code !== 0 || after.length === 0 || after === before) {
+    // pathspec 那一档不兜底 —— 见形参注释:整棵树的兜底会把收窄掉的范围放回去。
+    if (only) return { ok: false, why: `没能只收走那几条挡路的改动(${first(pushed)})` }
     const fallback = await pinSnapshot(deps, cwd)
     const untracked = lines.filter(l => l.startsWith('??')).map(l => l.slice(3))
     return {

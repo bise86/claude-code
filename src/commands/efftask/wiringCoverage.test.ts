@@ -17,7 +17,7 @@
  */
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { subAgentToolPool } from './efftask.js'
+import { buildEscapeLine, gitSpawnEnv, rememberEscapeRef, subAgentToolPool } from './efftask.js'
 
 const SRC = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
 /** 详情页的按需读回住在树面板里 —— 这一跳断了,盘上的历史永远没人去读。 */
@@ -1255,26 +1255,104 @@ describe('回溯键的接线', () => {
  *
  * 这里钉的是**四根线各自都在**:少任何一根,闸就静默失效而全套测试照绿。
  */
+/**
+ * **交给 git 的那份 env —— 判据全靠它是英文。**
+ *
+ * 这个仓库到处在拿正则读 git 的原话下判断:`overwriteBlocked`(决定要不要
+ * park-then-merge,也就是**唯一那条让合并成功的路**)、`stagedBlocked`、
+ * 「没有可中止的合并」。而 `spawn` 不给 env 就继承用户 locale。
+ *
+ * 跑机 .30 上 git 说的是中文 —— `worktreePool.ts` 和它的测试各自逐字记着
+ * 「您对下列文件的本地修改将被合并操作覆盖:devenv.lock」。也就是说事故现场那台机器上
+ * 这些判据一条都不命中。质量席实测复现,判不通过。
+ *
+ * 行为级测不了(要让 git 真说中文,而 CI 机器未必装 zh_CN 语言包 —— 本机实测就没装),
+ * 所以判据下移到「我们交给 git 的 env 长什么样」。第一版没有这条,变异实测:
+ * 拿掉 `LC_ALL: 'C'` 全套 4646 条照绿。
+ */
+describe('git 的输出语言被按住', () => {
+  it('LC_ALL 锁成 C', () => {
+    expect(gitSpawnEnv({ PATH: '/usr/bin' }).LC_ALL).toBe('C')
+  })
+
+  /**
+   * `LANGUAGE` 在 gettext 里**优先于 `LC_ALL`** —— 不删的话前一条白设。
+   * 而且要**删键**不是设空串:「空串算不算未设置」各实现不一致。
+   */
+  it('用户环境里的 LANGUAGE / LC_MESSAGES 不许活下来', () => {
+    const env = gitSpawnEnv({ LANGUAGE: 'zh_CN:zh', LC_MESSAGES: 'zh_CN.UTF-8', LC_ALL: 'zh_CN.UTF-8' })
+    expect('LANGUAGE' in env).toBe(false)
+    expect('LC_MESSAGES' in env).toBe(false)
+    expect(env.LC_ALL).toBe('C')
+  })
+
+  it('其余环境变量原样带过去(PATH 之类不能丢)', () => {
+    expect(gitSpawnEnv({ PATH: '/usr/bin', HOME: '/home/x' }).PATH).toBe('/usr/bin')
+  })
+
+  it('真的用在了 spawn 上 —— 不是一个没人调的纯函数', () => {
+    expect(SRC).toContain('spawn(\'git\', args, { cwd, env: gitSpawnEnv() })')
+  })
+})
+
 describe('越界闸的四根线', () => {
-  it('runAgent 拿到登记簿、gitRoot 盒子和别名盒子', () => {
+  const ADAPTER_SRC = readFileSync(new URL('../../tools/efftask/runAgentAdapter.ts', import.meta.url), 'utf8')
+
+  it('runAgent 拿到登记簿和 gitRoot 盒子', () => {
     // `element()` 找的是 JSX 元素,而这是函数调用 —— 用整文件断言。
     expect(SRC).toContain('escapes: escapeReg')
     // **盒子而不是值** —— 池子建得比 makeRunAgentFn 晚,传值永远是空串
     expect(SRC).toContain('gitRoot: () => gitRootBox.current')
-    expect(SRC).toContain('gitRootAliases:')
     // 并且真的传给了组件(否则组件侧 props.escapes 恒 undefined)
     expect(SRC).toContain('escapes={escapeReg}')
+  })
+
+  /**
+   * **软链走 realpath,不走「别名根」。**
+   *
+   * 上一版是 `gitRootAliases: () => aliasBox.current`,而调用方填的是 `[getCwd()]` ——
+   * `getCwd()` 和 `git rev-parse --show-toplevel` **都返回物理路径**,所以那个别名根
+   * 恒等于 gitRoot、恒为空操作。三席各自量到同一个结果:提交信息自己点名的那条事故路径
+   * (席位照 `/home/esgyn/work/tools/…` 写,node.md 里 1170 次)**一次都没被覆盖过**,
+   * 而当时的接线闸只断言了字符串 `'gitRootAliases:'` 存在 —— 一条真空通过的闸门。
+   *
+   * 现在钉的是**真的能解软链的那一刀**在闸的调用点上。
+   */
+  /**
+   * **闸要在「装了自动放行钩子」这一档也在路径上。**
+   *
+   * `resolveHookPermissionDecision` 在 PreToolUse 回 `allow` 时直接返回,`canUseTool`
+   * 一次都不调 —— 包在它外层的越界闸整层消失,连记录都没有。而无人值守跑几小时的人
+   * 正是最会装那种钩子的。对抗席点名的绕过。
+   */
+  it('子 agent 强制走 canUseTool —— 钩子自动放行不能把闸整层跳过', () => {
+    expect(ADAPTER_SRC).toContain('requireCanUseTool: true')
+    const RUN_AGENT = readFileSync(new URL('../../tools/AgentTool/runAgent.ts', import.meta.url), 'utf8')
+    // runAgent 自己也得把它往下传,否则 override 里那一句是死的
+    expect(RUN_AGENT).toContain('override?.requireCanUseTool === true')
+  })
+
+  it('闸里对被写的路径做 realpath —— 别名根那条线是恒空的,已删', () => {
+    expect(ADAPTER_SRC).toContain('realpath: resolveLinks')
+    expect(ADAPTER_SRC).toContain('realpathSync.native')
+    // 别名盒子不能悄悄回来:它填什么都等于 gitRoot
+    expect(SRC).not.toContain('aliasBox')
+    expect(ADAPTER_SRC).not.toContain('gitRootAliases')
   })
 
   it('池子也拿到登记簿(park-then-merge 的判据)', () => {
     // 三个 makeWorktreePool 调用点**都要**传 —— 漏一个,那条路径整趟不检测,而另两条是绿的
     const calls = SRC.split('makeWorktreePool(runId!').length - 1
+    // **非零基线**:锚点串一旦变形(改名 runId、换个变量名)两边同时归零,`0/0 === 0/0`
+    // 直接绿 —— 一条真空通过的闸门。接缝席点名的。
+    expect(calls).toBe(3)
     const withEscapes = SRC.split('makeWorktreePool(runId!').filter(s => s.slice(0, 200).includes('escapes: props.escapes')).length
     expect(`${withEscapes}/${calls} 个调用点传了登记簿`).toBe(`${calls}/${calls} 个调用点传了登记簿`)
   })
 
   it('gitRoot 盒子在每个池子赋值点都被填上', () => {
     const assigns = SRC.split('poolRef.current = iso').length - 1
+    expect(assigns).toBe(3) // 同上:非零基线
     const fills = SRC.split('props.gitRootBox.current =').length - 1
     expect(`${fills} 处填盒子 / ${assigns} 处建池子`).toBe(`${assigns} 处填盒子 / ${assigns} 处建池子`)
   })
@@ -1290,9 +1368,68 @@ describe('越界闸的四根线', () => {
     expect(SRC).toContain('?.gitRoot ??')
   })
 
-  it('越界报告接到运行中那块屏上(不是 execStatus,不是收口屏)', () => {
-    expect(SRC).toContain('onEscape: onEscapeNotice')
-    expect(SRC).toContain('pushNotice(')
-    expect(SRC).toContain('onNotice: pushNotice')
+  /**
+   * **报告那一端:三个调用点都要报,而且屏幕那一头真的接了。**
+   *
+   * 上一版这条只 `toContain` 一次。接缝席实测:把三个调用点里的两个删掉 → 全绿;
+   * 把 `runNotices` 从 `problems={[…]}` 里摘掉 → 全绿(那一刀同时杀死 `onNotice`
+   * 和越界报告两条通道)。而 `effTaskViews.test.tsx` 里那条是**直接给 RunningView 喂
+   * `problems`** 的独立渲染 —— 一个 look-alike double:它证明 RunningView 会画,
+   * 不证明 `EffTaskRunner` 会喂。这个仓库为「看起来一样的替身」付过一次大账。
+   */
+  it('越界报告接到运行中那块屏上 —— 三个调用点都报,屏幕那头也接上了', () => {
+    const calls = SRC.split('makeWorktreePool(runId!').length - 1
+    expect(calls).toBe(3)
+    for (const key of ['onEscape: onEscapeNotice', 'onNotice: pushNotice']) {
+      const wired = SRC.split('makeWorktreePool(runId!').filter(s => s.slice(0, 300).includes(key)).length
+      expect(`${key}:${wired}/${calls}`).toBe(`${key}:${calls}/${calls}`)
+    }
+    // 屏幕那一端 —— 摘掉 runNotices 就等于把两条通道一起剪断,而它此前不会红
+    expect(SRC).toContain('problems={[...redoProblems, ...runNotices]}')
+    /**
+     * **取最新的,不是最前的。** 生产者 `pushNotice` 保留最新 20 条(`slice(-20)`),
+     * 消费端如果是 `slice(0, 3)`,攒够 3 条之后新告警永远进不了屏幕 —— 两端方向相反。
+     * 事故当天的现象正是 40 分钟里积压 16→27。
+     */
+    expect(SRC).toContain('.slice(-20)')
+    expect(SRC).toContain('(props.problems ?? []).slice(-3)')
+    expect(SRC).not.toContain('(props.problems ?? []).slice(0, 3)')
+  })
+
+  /**
+   * **钉走的那条 ref 要活过这块屏。**
+   *
+   * `problems` 是滚动的,而 `refs/et/rescued/*` 全仓没有任何扫描器会再列出来
+   * (`sweepStashBackups` 扫的是另一个前缀,`scanStranded` 的 fsck 只看 unreachable)。
+   * 不写进退出报告,run 一结束用户取回自己东西的唯一线索就永久消失 —— 而那是**他的**内容,
+   * 是我们从他工作区里拿走的。和「构建产物删了什么必须进退出报告」同一条理由,只会更硬。
+   */
+  it('钉走的耐久 ref 进退出报告', () => {
+    // 内容本身 —— 真调函数,不是断言源码里有这几个字
+    expect(buildEscapeLine([])).toBe('')
+    const one = buildEscapeLine(['refs/et/rescued/001/abc'])
+    expect(one).toContain('git stash apply refs/et/rescued/001/abc')
+    expect(buildEscapeLine(['a', 'b'])).toContain('2 条耐久 ref')
+
+    /**
+     * **三根链各自钉住。** 接缝席剪了三刀 ——(1)不往盒子里写、(2)不传 prop、
+     * (3)把读到的 refs 硬编成空 —— **每一刀 4148 条全绿**。只断言字符串存在的闸门
+     * 挡不住其中任何一刀,而那正是这一轮宣称修掉的那一族。
+     */
+    // (1) 生产端 —— **真调一次**,不是断言源码里有那串字符。
+    //     变异实测:把条件改成 `if (box && false)`,字符串还在,4148 条全绿。
+    const box = { current: [] as string[] }
+    rememberEscapeRef(box, 'refs/et/rescued/001/aaa')
+    rememberEscapeRef(box, 'refs/et/rescued/001/aaa')  // 同一条不重复记
+    rememberEscapeRef(box, 'refs/et/rescued/001/bbb')
+    expect(box.current).toEqual(['refs/et/rescued/001/aaa', 'refs/et/rescued/001/bbb'])
+    rememberEscapeRef(undefined, 'x')  // 没盒子不许抛 —— 它在合并的关键路径上
+    // 而且回调里真的调了它(否则上面测的是一个没人用的函数)
+    expect(SRC).toContain('rememberEscapeRef(props.escapeRefsOut, info.ref)')
+    // (2) prop 真的传下去(否则组件侧 props.escapeRefsOut 恒 undefined)
+    expect(SRC).toContain('escapeRefsOut={escapeRefsOut}')
+    // (3) 消费端读的是盒子里的值,而且结果真的拼进了那句话
+    expect(SRC).toContain('buildEscapeLine(escapeRefsOut.current)')
+    expect(SRC).toContain('+ escapeLine')
   })
 })
