@@ -1244,3 +1244,55 @@ describe('回溯键的接线', () => {
     expect(SRC).toContain(`props.signal.addEventListener('abort', onRunAbort, { once: true })`)
   })
 })
+
+/**
+ * **越界闸的接线 —— 这条线我差点又漏掉。**
+ *
+ * 实况:`escapeRegistry` 写好了、`canUseTool` 里的闸写好了、探针也绿了,而
+ * `efftask.tsx` 里 `escapes:` 出现 **0 次** —— 硬闸和归因在生产上是死的。
+ * 这是 24 小时内**第三次**同一个形状(`openStream`、`onBuildWipe`、`autoRescue` 在前),
+ * 而且就发生在那条提交信息引用这个教训的同一次改动里。
+ *
+ * 这里钉的是**四根线各自都在**:少任何一根,闸就静默失效而全套测试照绿。
+ */
+describe('越界闸的四根线', () => {
+  it('runAgent 拿到登记簿、gitRoot 盒子和别名盒子', () => {
+    // `element()` 找的是 JSX 元素,而这是函数调用 —— 用整文件断言。
+    expect(SRC).toContain('escapes: escapeReg')
+    // **盒子而不是值** —— 池子建得比 makeRunAgentFn 晚,传值永远是空串
+    expect(SRC).toContain('gitRoot: () => gitRootBox.current')
+    expect(SRC).toContain('gitRootAliases:')
+    // 并且真的传给了组件(否则组件侧 props.escapes 恒 undefined)
+    expect(SRC).toContain('escapes={escapeReg}')
+  })
+
+  it('池子也拿到登记簿(park-then-merge 的判据)', () => {
+    // 三个 makeWorktreePool 调用点**都要**传 —— 漏一个,那条路径整趟不检测,而另两条是绿的
+    const calls = SRC.split('makeWorktreePool(runId!').length - 1
+    const withEscapes = SRC.split('makeWorktreePool(runId!').filter(s => s.slice(0, 200).includes('escapes: props.escapes')).length
+    expect(`${withEscapes}/${calls} 个调用点传了登记簿`).toBe(`${calls}/${calls} 个调用点传了登记簿`)
+  })
+
+  it('gitRoot 盒子在每个池子赋值点都被填上', () => {
+    const assigns = SRC.split('poolRef.current = iso').length - 1
+    const fills = SRC.split('props.gitRootBox.current =').length - 1
+    expect(`${fills} 处填盒子 / ${assigns} 处建池子`).toBe(`${assigns} 处填盒子 / ${assigns} 处建池子`)
+  })
+
+  /**
+   * **池子可能是 undefined。** 拿不到隔离那一路 `makeWorktreePool` 回
+   * `{ pool: undefined, reason }`,而第一版写的是 `iso.pool.gitRoot` —— 当场抛 TypeError,
+   * 整条启动流程死掉、关口连 skipSteps 都不显示了。挂载测试当场抓到(8 条红)。
+   */
+  it('填盒子时用可选链 —— 拿不到隔离时池子是 undefined', () => {
+    expect(SRC).not.toContain('props.gitRootBox.current = iso.pool.gitRoot')
+    expect(SRC).not.toContain('props.gitRootBox.current = isoR.pool.gitRoot')
+    expect(SRC).toContain('?.gitRoot ??')
+  })
+
+  it('越界报告接到运行中那块屏上(不是 execStatus,不是收口屏)', () => {
+    expect(SRC).toContain('onEscape: onEscapeNotice')
+    expect(SRC).toContain('pushNotice(')
+    expect(SRC).toContain('onNotice: pushNotice')
+  })
+})

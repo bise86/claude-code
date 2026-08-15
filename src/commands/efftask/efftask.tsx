@@ -50,6 +50,7 @@ import { applyRecalc, askRecalc, type RecalcApply, type RecalcAsk } from '../../
 import { runCleanup, scanCleanup, type CleanupDeps } from '../../tools/efftask/cleanupWorktrees.js'
 import { buildWipeLines, emptyBuildWipeTally, noteBuildWipe, type BuildWipeTally } from '../../tools/efftask/buildWipeTally.js'
 import { mergeHeldBack, runSubtreeMerge, scanSubtreeMerge, type SubtreeMergeDeps } from '../../tools/efftask/mergeSubtree.js'
+import { createEscapeRegistry, type EscapeRegistry } from '../../tools/efftask/escapeRegistry.js'
 import { ConfirmMergeSubtree } from './ConfirmMergeSubtree.js'
 import { ConfirmResume } from './ConfirmResume.js'
 import { ResumePicker } from './ResumePicker.js'
@@ -345,6 +346,22 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
    * 仍然走池子函数而不是裸的 `context.options.tools`,是因为 Skill 必须摘掉。
    */
   const subAgentTools: Tools = subAgentToolPool(context.options.tools)
+  /**
+   * **席位越界写主检出的归因登记簿 + gitRoot 盒子。**
+   *
+   * gitRoot 做成**盒子**而不是值:池子建在关口批准之后(下面三个 `poolRef.current = …`),
+   * 而 `makeRunAgentFn` 构造在这里 —— 传值的话永远是空串,整条闸静默失效。
+   * 这个仓库 24 小时内为「声明了、实现了、生产上没人传」付过三次账
+   * (openStream / onBuildWipe / autoRescue),这是第四次的防线。
+   */
+  const escapeReg = createEscapeRegistry()
+  const gitRootBox: { current: string } = { current: '' }
+  /**
+   * 主检出的**别名根**(软链)。跑机上 `/home/esgyn/work/tools/qianbase-xtp` 是
+   * `/home/esgyn/tb/tools/qianbase-xtp` 的软链,而 node.md 里两条各出现 1170 / 1396 次 ——
+   * 只认一条的话,席位照着另一条写就归因不到。
+   */
+  const aliasBox: { current: string[] } = { current: [] }
   const runAgent: RunAgentFn = makeRunAgentFn({
     toolUseContext: context,
     canUseTool,
@@ -358,6 +375,12 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
     availableTools: subAgentTools,
     activeAgents,
     mainModelDefault,
+    // 越界闸:见 escapeRegistry。gitRoot 走盒子(池子建得比这里晚)。
+    escapes: escapeReg,
+    gitRoot: () => gitRootBox.current,
+    // 软链那一份也要认:跑机上 /home/esgyn/work/tools/… 是 /home/esgyn/tb/tools/… 的软链,
+    // node.md 里两条各出现 1170 / 1396 次。
+    gitRootAliases: () => (aliasBox.current.length > 0 ? aliasBox.current : []),
     // caps.nodeTimeoutMs was declared and never enforced; wall clock was the one unbounded
     // axis left. The extraction seam below gets it too.
     timeoutMs: () => capsRef.nodeTimeoutMs,
@@ -476,6 +499,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
    * 而接收方 `useHumanWaitCount` 只在组件里才存在。和 handoffOut 同一套理由。
    */
   const humanWaitOut: { current: ((waiting: boolean) => void) | null } = { current: null }
+  const onEscapeOut: { current: ((info: { ref: string; files: readonly string[]; merged: boolean }) => void) | null } = { current: null }
   /**
    * 组件挂载后填进来的「有人在等确认」通知口。
    *
@@ -537,6 +561,10 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       cardLimitOut={cardLimitOut}
       buildWipeOut={buildWipeOut}
       humanWaitOut={humanWaitOut}
+      escapes={escapeReg}
+      gitRootBox={gitRootBox}
+      aliasBox={aliasBox}
+      onEscapeOut={onEscapeOut}
       control={control}
       // The transcript is the only durable trace once the panel is gone: say how the run
       // ended and where its artifacts live, not just that it ended.
@@ -736,6 +764,14 @@ const tmpScratch: NonNullable<CleanupDeps['scratch']> = {
  */
 async function makeWorktreePool(
   runId: string, cwd: string,
+  /**
+   * 越界归因登记簿 + 报告口。**可选** —— 不给的话 park-then-merge 那条路一次都不会走
+   * (没有证据就不动用户的工作区),行为与引入它之前逐字相同。
+   */
+  opts?: {
+    escapes?: import('../../tools/efftask/escapeRegistry.js').EscapeRegistry
+    onEscape?: (info: { ref: string; files: readonly string[]; merged: boolean }) => void
+  },
 ): Promise<{
   pool?: WorktreePool; reason?: string; notARepo?: boolean
   /**
@@ -779,6 +815,9 @@ async function makeWorktreePool(
   }
   const pool = createWorktreePool({
     runId, gitRoot, git: gitRunner, worktreeRoot: `${gitRoot}/.efftask-worktrees`,
+    // park-then-merge 的判据:挡路的脏文件是不是席位越界写的。见 escapeRegistry。
+    ...(opts?.escapes ? { escapes: opts.escapes } : {}),
+    ...(opts?.onEscape ? { onEscape: opts.onEscape } : {}),
     // 「腾出多少」必须是量出来的。`du` 不在时 duKb 回 undefined,而屏幕跟着说
     // 「大小未知」——比一个 0 诚实得多(`CleanupDeps.dirSizeKb` 的同一条规矩)。
     dirSizeKb: duKb,
@@ -893,6 +932,14 @@ type RunnerProps = {
   /** call()-scoped count of escalation cards the limiter dropped, read by onExit. */
   cardLimitOut: { current: number }
   humanWaitOut: { current: ((waiting: boolean) => void) | null }
+  /** 越界归因登记簿。建在 call() 里,因为 runAgent 也在那儿构造。 */
+  escapes?: EscapeRegistry
+  /** gitRoot 的**盒子** —— 池子建得比 runAgent 晚,传值永远是空串。 */
+  gitRootBox?: { current: string }
+  /** 主检出的别名根(软链)。 */
+  aliasBox?: { current: string[] }
+  /** 越界报告的出口盒子:组件挂载后填,`makeWorktreePool` 通过它上屏。 */
+  onEscapeOut?: { current: ((info: { ref: string; files: readonly string[]; merged: boolean }) => void) | null }
   /** 运行中的人工干预面 —— 在 call() 里建,和 runAgent 共用同一个实例。 */
   control: RunControl
   onExit: (outcome: Outcome | null) => void
@@ -1036,6 +1083,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     setRunNotices(prev => (prev.includes(line) ? prev : [...prev, line].slice(-20)))
   }, [])
   /**
+   * 越界被钉走时的报告 —— 走和 `onNotice` **同一块屏**(RunningView.problems)。
+   *
+   * 必须说三件事:动了什么、钉在哪、怎么取回。落在主检出的内容**不在任何任务分支上**,
+   * `add -A` 够不着它 —— 这句话是用户判断「要不要留」的唯一依据。
+   */
+  const onEscapeNotice = React.useCallback((info: { ref: string; files: readonly string[]; merged: boolean }): void => {
+    const head = info.files.slice(0, 2).join('、')
+    pushNotice(
+      `有席位把文件写到了主检出(${head}${info.files.length > 2 ? ` 等 ${info.files.length} 个` : ''})——` +
+      `${info.merged ? '已钉走并把产出合回你的分支' : '钉走后仍未合上'}。` +
+      `那些内容不在任何任务分支上,永远进不了集成分支;取回:git stash apply ${info.ref}`,
+    )
+  }, [pushNotice])
+  /**
    * 有几次工具权限确认在等人回答。>0 时任务树面板交出键盘。
    *
    * 计数而不是布尔:并行度大于 1 时可以同时有几个执行节点各自等一个确认。
@@ -1062,7 +1123,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   // 卸载时收回:指向一个已卸载组件的 setState 会静默丢事件,而丢的正是「拿回键盘」。
   React.useEffect(() => {
     props.humanWaitOut.current = (w: boolean) => { if (w) humanWait.begin(); else humanWait.end() }
-    return () => { props.humanWaitOut.current = null }
+    // 越界报告的出口:组件在,才有屏幕可上。卸载时清掉(和上面那条同一条纪律)。
+    if (props.onEscapeOut) props.onEscapeOut.current = onEscapeNotice
+    return () => { props.humanWaitOut.current = null; if (props.onEscapeOut) props.onEscapeOut.current = null }
   }, [props.humanWaitOut, humanWait.begin, humanWait.end])
   const handoffRef = React.useRef<HandoffSummary | null>(null)
   // What the gate must SAY. Resolved before the gate opens; 'none' until then.
@@ -1352,8 +1415,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       // declares a different nodeTimeoutMs must actually get it.
       props.capsRef.nodeTimeoutMs = withGuidance.caps.nodeTimeoutMs
       props.capsRef.humanTimeoutMs = withGuidance.caps.humanTimeoutMs
-      const isoR = await makeWorktreePool(runId!, getCwd())
+      const isoR = await makeWorktreePool(runId!, getCwd(), { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice })
       poolRef.current = isoR.pool
+      if (props.gitRootBox) props.gitRootBox.current = isoR.pool?.gitRoot ?? ''
+      if (props.aliasBox) props.aliasBox.current = [getCwd()]
       setIsolation(isoR.pool ? 'worktree' : 'none')
       if (!isoR.pool && isoR.reason) withGuidance.notices.push(`${ISOLATION_DEGRADE_PREFIX}${isoR.reason}`)
       // 隔离**是靠自愈才建起来的** —— 盘上被动过,必须说出口(见 makeWorktreePool.healed)。
@@ -1412,7 +1477,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // which kind of run this is — and it was telling every isolated run it was serial,
         // i.e. denying the one thing the user asked for. init() only creates a branch and a
         // worktree; if the user then cancels, the teardown below disposes of them.
-        const iso = await makeWorktreePool(runId!, getCwd())
+        const iso = await makeWorktreePool(runId!, getCwd(), { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice })
         // init() is async, so the effect can be torn down while it runs. Without this the
         // pool it just created (a real branch and a real worktree on disk) would be
         // unreachable and never disposed.
@@ -1423,6 +1488,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // them rather than paying to build them again.
         if (cancelled) return
         poolRef.current = iso.pool
+        if (props.gitRootBox) props.gitRootBox.current = iso.pool?.gitRoot ?? ''
+        if (props.aliasBox) props.aliasBox.current = [getCwd()]
         setIsolation(iso.pool ? 'worktree' : 'none')
         // spec §8's 「允许选择」: carried as its own state so the gate can present it as a
         // decision, instead of a line buried in the prompt-parsing notices.
@@ -1509,8 +1576,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           return
         }
       }
-      const iso = await makeWorktreePool(runId!, cwd)
+      const iso = await makeWorktreePool(runId!, cwd, { ...(props.escapes ? { escapes: props.escapes } : {}), onEscape: onEscapeNotice })
       poolRef.current = iso.pool
+      if (props.gitRootBox) props.gitRootBox.current = iso.pool?.gitRoot ?? ''
       setIsolation(iso.pool ? 'worktree' : 'none')
       setIsolationReason(iso.pool ? null : (iso.reason ?? '未知原因'))
       firstCommitRoot.current = iso.needsFirstCommit === true ? (iso.gitRoot ?? null) : null
