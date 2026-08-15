@@ -579,7 +579,7 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      *
      * 1. **失败类型**:只认「你的本地改动会被覆盖」。别的失败(detached / 停在集成分支 /
      *    userRewound / 真冲突)钉走用户的改动毫无帮助,而冲突现场尤其要留给人看。
-     * 2. **归因**:挡路的每一条路径都被某个席位**点名写过**(`escapes`,见 escapeRegistry)。
+     * 2. **可证明无损**:挡路的每一条,内容/模式都和这次合并将要写入的一模一样(见 `losslessAt`)。
      *    `intoTrunk` 分不清脏文件是席位越界还是**用户自己在改** —— 一律钉走会把用户正在
      *    写的东西悄悄收进 stash,而「检测到脏就自动 stash」这一档用户**明确否决过**
      *    (`stashGuard.ts` 文件头:「默认关,由用户按一下打开」)。
@@ -624,7 +624,7 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * 多一条不会少一条 —— 多一条会让全称闸更容易判假(不动,保守),少一条才危险。
      *
      * 并发那条顾虑不适用:`status` 抢 `index.lock` 是**20 路并发**打在 gitRoot 上量出来的,
-     * 而 `intoTrunk` 整个跑在 `mergeLock` 里,且 `pinEscape` 本来就要在这儿跑一次 status。
+     * 而 `intoTrunk` 整个跑在 `mergeLock` 里 —— 这儿的 status 是串行的那一份。
      */
     /**
      * `-z` 输出按 NUL 切。**不许 trim** —— porcelain 记录的前两列是状态码,
@@ -817,9 +817,8 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
          * 「**而且自动还原失败**:你的工作区里现在留着一次未完成的合并」。
          * 也就是说 abort 失败时用户树里躺着 `UU` + 冲突标记,而屏幕只说「没成功」。
          *
-         * 而且这**不是边角**:硬闸开着时登记簿恒空 ⇒ `seatPaths` 恒空 ⇒ `pinned.ref`
-         * 恒 undefined,所以这是出厂配置下 park 失败**唯一**会走到的分支。
-         * 同一个「屏幕上说假话」的缺陷,在它 20 行之上刚被修好。
+         * 而且这**不是边角**:清理之后那次重试是唯一会走到这儿的路,
+         * 而它撞冲突并不罕见(用户在 run 期间自己提交过同一个文件)。
          *
          * 报失败原因要用**最后一次**失败的输出:走到这里说明 retry 才是现场。
          */

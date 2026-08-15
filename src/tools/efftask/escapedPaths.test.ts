@@ -52,16 +52,6 @@ describe('escapedPathsIn —— 摘出「落在主检出、不在自己工作区
     expect(escapedPathsIn({ file_path: '/src/qianbase/x.go' }, { gitRoot: G, cwd: W })).toEqual([])
   })
 
-  /**
-   * **软链要由调用方解开,但两条根都传进来时都要认。**
-   * 跑机上 `/home/esgyn/work/tools/…` 是 `/home/esgyn/tb/tools/…` 的软链,
-   * node.md 里两条各出现 1170 / 1396 次。
-   */
-  it('额外的根(软链那一份)也要认', () => {
-    const alt = '/alt/repo'
-    expect(escapedPathsIn({ file_path: `${alt}/pkg/a.rs` }, { gitRoot: G, cwd: W, roots: [alt] }))
-      .toEqual([`${alt}/pkg/a.rs`])
-  })
 
   /**
    * 只认 `file_path`/`notebook_path`;别的字段**故意不参与**(会归因错)。

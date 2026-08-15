@@ -1971,18 +1971,23 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\n')
   })
 
-  /** 反面:主检出干净时,这条路一次都不许触发(它会动用户的工作区)。 */
-  it('主检出干净 → 不钉、不报', async () => {
-    const escapes: unknown[] = []
+  /**
+   * 反面:主检出干净时,这条路一次都不许触发(它会动用户的工作区)。
+   *
+   * ⚠ 判据是 **onNotice 一声不响**。上一版断言的是 `onEscape` 收到的数组为空,
+   * 而 `onEscape` 这个 dep 已经删了 —— 那个数组永不被写,断言**恒真**,测的是空气。
+   */
+  it('主检出干净 → 不动、不报', async () => {
+    const notices: string[] = []
     const p = createWorktreePool({
-      runId: '001', gitRoot, git, worktreeRoot, onEscape: e => escapes.push(e),
+      runId: '001', gitRoot, git, worktreeRoot, onNotice: l => notices.push(l),
     })
     await p.init()
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'fresh.txt'), 'x\n')
     expect((await p.commitAndMerge(n)).trunk?.advanced).toBe(true)
-    expect(escapes).toEqual([])
+    expect(notices.filter(x => x.includes('清掉'))).toEqual([])
   })
 
   /**
@@ -1990,10 +1995,10 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
    *
    * 冲突现场就是要留给人看的,而钉走用户的改动对解冲突毫无帮助 —— 那是一次没有理由的动手。
    */
-  it('撞的是真冲突(UU)时不钉', async () => {
-    const escapes: unknown[] = []
+  it('撞的是真冲突(UU)时不动手', async () => {
+    const notices: string[] = []
     const p = createWorktreePool({
-      runId: '001', gitRoot, git, worktreeRoot, onEscape: e => escapes.push(e),
+      runId: '001', gitRoot, git, worktreeRoot, onNotice: l => notices.push(l),
     })
     await p.init()
     // 用户在自己的分支上提交一版
@@ -2002,9 +2007,10 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'base.txt'), 'node-side\n')
-    await p.commitAndMerge(n)
-    // 不管这一跳成没成,越界那条路都不该被走 —— 主检出当时是干净的。
-    expect(escapes).toEqual([])
+    const res = await p.commitAndMerge(n)
+    // 冲突现场要留给人看,清理那条路一次都不许走(同上:判据是 onNotice,不是已删的 onEscape)
+    expect(notices.filter(x => x.includes('清掉'))).toEqual([])
+    expect(res.trunk?.advanced).toBe(false)
   })
 
   /**

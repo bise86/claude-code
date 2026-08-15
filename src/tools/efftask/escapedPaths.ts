@@ -34,9 +34,9 @@
 /**
  * 路径归一:压平 `//`、消掉 `.` 与 `..` 段、去掉结尾斜杠。
  *
- * `.` / `..` 必须消:`/repo/./pkg/a.rs` 和 `/repo/pkg/a.rs` 是同一个文件,而登记簿是
- * 按字符串做键的 —— 不消的话 `owns()` 查 `${gitRoot}/${p}` 永远对不上那条 `.` 形态的键,
- * 记了等于没记(对抗席实测)。`NotebookEdit` 尤其要紧:Edit/Write 在 `canUseTool` 之前
+ * `.` / `..` 必须消:`/repo/./pkg/a.rs` 和 `/repo/pkg/a.rs` 是同一个文件,而下游
+ * (`under()` 的段边界比较、`intoTrunk` 那侧按 `${gitRoot}/${相对路径}` 拼)都是按字符串比的。
+ * `NotebookEdit` 尤其要紧:Edit/Write 在 `canUseTool` 之前
  * 有 `backfillObservableInput` → `expandPath` 帮忙 `normalize` 过,notebook 那条**没有**。
  *
  * **不做 realpath** —— 这个模块是纯的(没有 fs)。软链由调用方通过 `opts.realpath`
@@ -84,16 +84,12 @@ export function under(root: string, p: string): boolean {
  * 从命令行里推断"改了哪个文件"不可靠,而这个判据的下游要动用户的工作区 ——
  * 宁可归因不到(退回保守行为),不可归因错。这条覆盖面缺口要在屏幕上说出来。
  *
- * ## 软链走 `opts.realpath`,不走「别名根」
+ * ## 软链:解**被写的那条路径**
  *
- * 上一版是让调用方把别名根塞进 `roots`,而调用方填的是 `[getCwd()]` ——
- * `getCwd()` 和 `git rev-parse --show-toplevel` **都返回物理路径**
- * (前者在 bootstrap 里 `realpathSync` 过、`cd` 走 `pwd -P`;后者 git 自己解软链),
- * 所以那个别名根**恒等于 `gitRoot`,恒为空操作**。三席各自量到同一个结果。
- * 也就是说提交信息自己点名的那条事故路径(席位照 `/home/esgyn/work/tools/…` 写,
- * node.md 里 1170 次)**一次都没被覆盖过**。
- *
- * 正解是解**被写的那条路径**,而不是去枚举「有哪些软链指向仓库」—— 后者根本枚举不完。
+ * 曾经试过让调用方传「别名根」,而它填的是 `getCwd()` —— 那个值和
+ * `git rev-parse --show-toplevel` 一样返回**物理路径**,恒等于 `gitRoot`、恒为空操作,
+ * 于是跑机上那条软链别名(node.md 里 1170 次)**一次都没被覆盖过**。
+ * 正解是解被写的那条路径,而不是去枚举「有哪些软链指向仓库」—— 后者根本枚举不完。
  * `realpath` 由调用方注入(这个模块保持无 fs);文件还不存在时(Write 新建)沿着
  * 最近的**已存在祖先**解,再把剩下的段接回去。
  */
@@ -102,13 +98,12 @@ export function escapedPathsIn(
   opts: {
     gitRoot: string
     cwd?: string
-    roots?: readonly string[]
     /** 解软链。拿不到就返回 undefined(那时退回按字面比,不能因此崩)。 */
     realpath?: (p: string) => string | undefined
   },
 ): string[] {
   if (opts.cwd === undefined || opts.cwd.length === 0) return []
-  const roots = [opts.gitRoot, ...(opts.roots ?? [])].filter(r => r.length > 0)
+  const roots = [opts.gitRoot].filter(r => r.length > 0)
   const out: string[] = []
   const seen = new Set<string>()
   const visit = (v: unknown, key?: string): void => {
@@ -160,8 +155,7 @@ export function escapedPathsIn(
  *
  * ## 削什么、不削什么
  *
- * - 只削**注册过的根**下面的路径(gitRoot 及调用方给的别名),用 `under()` 的段边界比,
- *   不用 `startsWith` —— 否则 `/repo-backup/x` 会被削成 `-backup/x`。
+ * - 只削**传进来的根**下面的路径,两边都锚段边界 —— 否则 `/repo-backup/x` 会被削成 `-backup/x`。
  * - **仓库外的绝对路径一个字不动**(`/etc/…`、参考仓库、日志目录)——
  *   那些可能是用户故意写的,而且相对化之后毫无意义。
  * - 只作用于**模型产出的字段**,不作用于整份提示词:用户原话里的绝对路径同理不能碰。
@@ -170,7 +164,7 @@ export function escapedPathsIn(
  *
  * 跑机上 `/home/esgyn/work/tools/…` 是物理路径的**软链别名**,在 node.md 里 1170 次,
  * 而 `gitRoot` 来自 `rev-parse --show-toplevel`(物理路径)—— 这一削对那 1170 处
- * **一处都不命中**,除非调用方把别名也传进 `roots`。所以这是**降触发率**,不是防线:
+ * **一处都不命中**。所以这是**降触发率**,不是防线:
  * 提示词是建议,闸是强制。
  */
 export function relativisePaths(text: string, roots: readonly string[]): string {

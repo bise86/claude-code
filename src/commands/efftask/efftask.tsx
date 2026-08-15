@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import type { LocalJSXCommandCall } from '../../types/command.js'
 import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from '../../Tool.js'
+import { relativisePaths } from '../../tools/efftask/escapedPaths.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
 import { collectCaps, collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
 import { collectRoleLoadIssues } from '../../tools/AgentTool/loadAgentsDir.js'
@@ -2323,11 +2324,37 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       })
       if (cancelled) return
       if (res.ok) {
+        /**
+         * **削在这里,而不是等到批准那一刻。**
+         *
+         * 质量席点名两处:
+         *  1. `root.plan` 此前不削,而它会在**重拟**时被当成「上一版方案」原样喂回模型
+         *     (`planPrompt` 的 revision 通道)—— 提示词继续教绝对路径,治因漏了一半。
+         *  2. 关口渲染的是 `draft`,而削发生在 `applyRootDraft`(批准动作里)——
+         *     用户读到并批准的是 `cd /repo/ && make`,落库的却是削过的另一份。
+         *     那正是 `rootPlan.ts` 文件头点名要防的「关口描述的不是将要跑的东西」。
+         *
+         * 在收到的这一刻削一次,三处(关口、root.plan、落库)就是同一份。
+         * `applyRootDraft` 那边照旧再削一次 —— 幂等,而且它是唯一必须削的那道闸。
+         */
+        const gr = props.gitRootBox?.current
+        const shaved = gr
+          ? {
+            ...res.draft,
+            plan: {
+              ...res.draft.plan,
+              solution: relativisePaths(res.draft.plan.solution, [gr]),
+              keyPoints: relativisePaths(res.draft.plan.keyPoints, [gr]),
+              risks: relativisePaths(res.draft.plan.risks, [gr]),
+              acceptance: relativisePaths(res.draft.plan.acceptance, [gr]),
+            },
+          }
+          : res.draft
         // Keep the node in step with what the gate shows: a later re-draft must revise THIS
         // plan, and applyRootDraft on approval writes the same values again.
-        root.plan = { ...res.draft.plan }
-        root.kind = res.draft.kind
-        setDraft(res.draft)
+        root.plan = { ...shaved.plan }
+        root.kind = shaved.kind
+        setDraft(shaved)
         setDraftError(null)
       } else if (draft) {
         // A failed RE-draft still has a plan on screen — the previous one. Saying only
