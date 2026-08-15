@@ -1,5 +1,6 @@
 import { integrationBranch, worktreeBranch, worktreeSlug } from './worktreeId.js'
 import { pinAndClear } from './snapshot.js'
+import type { EscapeRegistry } from './escapeRegistry.js'
 import { EFFTASK_INTERNAL_PATHS, wipeBuildOutputsAt, type BuildWipeOutcome } from './buildOutputs.js'
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import type { TaskNode } from './types.js'
@@ -79,6 +80,24 @@ export interface WorktreePoolDeps {
   /** Where per-node worktrees live. */
   worktreeRoot: string
   /**
+   * **席位越界写了主检出、挡住回主干那一跳时,报一声。**
+   *
+   * 不是 `trunkSkips`:那一栏的语义是「有东西没送到你的目录」,而 park-then-merge
+   * 成功那一路**送到了** —— 用一栏说两件相反的事,屏幕就又开始说假话。
+   *
+   * 缺省 = 不报(既有调用点与测试逐字不变)。真正的接线在 runOrchestrator,
+   * 一路到 `RunningView.problems` —— 那是**唯一**一条运行中常驻的通道
+   * (`onProblems` / `notices` 都不是,这一条踩过两次)。
+   */
+  onEscape?: (info: { ref: string; files: readonly string[]; merged: boolean }) => void
+  /**
+   * 席位越界写主检出的**归因登记簿**(见 escapeRegistry)。
+   *
+   * 缺省 = 没有归因源 = park-then-merge 那条路**一次都不会走**,行为与引入它之前逐字相同。
+   * 这是刻意的:没有证据就不动用户的工作区。
+   */
+  escapes?: EscapeRegistry
+  /**
    * 目录占用(KB)。只给 `wipeBuildOutputs` 用,好让「腾出多少」是量出来的。
    *
    * **可选,而且缺席时不许编 0** —— `du` 在 Windows / 精简容器里可能根本不存在,
@@ -104,8 +123,30 @@ export interface WorktreePoolDeps {
 export type WorktreePool = ReturnType<typeof createWorktreePool>
 
 export function createWorktreePool(deps: WorktreePoolDeps) {
-  const { runId, gitRoot, git, worktreeRoot, dirSizeKb } = deps
+  const { runId, gitRoot, git, worktreeRoot, dirSizeKb, onEscape, escapes } = deps
   const intBranch = integrationBranch(runId)
+
+  /**
+   * 把**主检出**里越界席位留下的改动钉成一条耐久 ref,并清干净工作区。
+   *
+   * 和 `pinBeforeWipe` 共用 `pinAndClear`(同一条理由:`stash create` 拿不到未跟踪文件),
+   * 区别只有对象 —— 那个钉的是集成工作区,这个钉的是用户的主检出。
+   * 抛异常一律吞掉并返回 `ok: false`:**钉快照永远不许把一次合并变成一次崩溃**。
+   */
+  const pinEscape = async (
+    at: string,
+  ): Promise<{ ok: boolean; ref?: string; files?: readonly string[] }> => {
+    try {
+      const st = await git(['-c', 'core.quotepath=false', 'status', '--porcelain', '-uall'], at)
+      const files = st.code === 0
+        ? st.stdout.split('\n').map(l => l.slice(3).trim()).filter(Boolean)
+        : []
+      const res = await pinAndClear({ git, gitRoot, runId }, at)
+      return res.ref === undefined ? { ok: false } : { ok: true, ref: res.ref, files }
+    } catch {
+      return { ok: false }
+    }
+  }
 
   /**
    * **抹掉集成工作区之前,把里面的未提交内容钉成一条耐久 ref。**
@@ -290,6 +331,38 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * **拿掉闸的前提是下面那条失败路径已经安全**,而它本来就是:判据用「有没有
      * `MERGE_HEAD`」而不是「有没有 UU 行」,无条件 abort,再复核现场还在不在。
      */
+    /**
+     * **先把用户分支合进集成分支,让回主干那一跳变成快进。**
+     *
+     * 真 git 实测(圆桌质量席 + 对抗席各自复现):
+     *
+     * | 主检出的脏 | 真三方合并 | 快进 |
+     * |---|---|---|
+     * | 索引里一个**无关**文件脏 | `exit=2` **整个拒绝**,而且点名的文件这次合并根本没碰 | **`exit=0` 合上,脏文件毫发无损** |
+     * | 合并**要覆盖**那个脏文件 | 拒绝 | 拒绝(这一格由下面的 park-then-merge 接) |
+     *
+     * 也就是说这一步砍掉的是**误伤**那一整类:用户在 run 期间自己改了点东西、或者别的
+     * 席位在主检出留了个无关的脏文件,就把几百个提交全堵住。跑机上量到过 607 个提交
+     * 被 3 个不相干的脏文件堵死。
+     *
+     * `mergeSubtree` 的 `syncTrunk` 早就是这个形状,理由逐字写在那里;这里是把同一条纪律
+     * 搬到自动路径上。区别是那边有解冲突模型、这边没有 —— 所以**同步失败就退回原路**
+     * (照旧做三方合并),而不是把这一跳整个放弃:同步只是优化,不是前提。
+     *
+     * 同步在**集成工作区**里做,不在主检出 —— 那里是我们自己的树,没有第二个读者。
+     * 失败必须收拾干净(`merge --abort`),否则下一次 `commitAndMerge` 会撞上一个半合并态。
+     */
+    const behind = await git(['merge-base', '--is-ancestor', branch, intBranch], gitRoot)
+    if (behind.code !== 0) {
+      const sync = await git(['merge', '--no-edit', '--no-verify', branch], intPath)
+      if (sync.code !== 0) {
+        // 收拾干净再退回老路。判据用 MERGE_HEAD 而不是 UU 行(钩子拒绝/rerere 会留下
+        // 一个没有 unmerged path 的 MERGE_HEAD)——和主检出那一侧同一条纪律。
+        if ((await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], intPath)).code === 0) {
+          await git(['merge', '--abort'], intPath)
+        }
+      }
+    }
     const merge = await git(['merge', '--no-edit', '--no-verify', intBranch], gitRoot)
     if (merge.code === 0) {
       trunkMerged++
@@ -310,8 +383,13 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
        * 快进一定成立;万一不成立,说明有人动过集成分支 —— 那就**什么都不做**,节点继续
        * 用老基线,而不是在共享的集成工作区里造一次没人预料的合并。
        */
-      const behind = await git(['merge-base', '--is-ancestor', branch, intBranch], gitRoot)
-      if (behind.code !== 0) await git(['merge', '--ff-only', branch], intPath)
+      /**
+       * 反向同步现在**大多是空操作** —— 上面那次前置同步已经把用户分支带进集成分支了。
+       * 保留是因为这一跳自己也会产生一个 merge commit(非快进那条路),而且它幂等:
+       * 落后才做,不落后一条命令都不发。
+       */
+      const behindAfter = await git(['merge-base', '--is-ancestor', branch, intBranch], gitRoot)
+      if (behindAfter.code !== 0) await git(['merge', '--ff-only', branch], intPath)
       return { advanced: true }
     }
     /**
@@ -337,6 +415,86 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     const stillInMerge = (await git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], gitRoot)).code === 0
     const stillConflicted = (await conflicts()).length > 0
     const restored = !stillInMerge && !stillConflicted
+
+    /**
+     * **先钉后合(park-then-merge)—— 被「你的本地改动会被覆盖」挡住时的唯一出路。**
+     *
+     * 跑机 .30 run 001 实测两次:席位用提示词里写死的绝对路径写了**主检出**
+     * (node.md 全文里指向主检出的绝对路径有 2566 处,是方案自己教的),
+     * 于是这一跳被 git 拒绝,而集成分支照常前进 —— 第一次静默了**七小时**
+     * (23:40 → 06:38),第二次四小时后复发,40 分钟里积压从 16 涨到 27。
+     *
+     * ## 为什么不是「报出来让用户处理」
+     *
+     * 圆桌四席一致否掉了那一版。质量席的对照实验:不钉的话 10 个节点完成 → 合上 0,
+     * 20 个 → 合上 0,**永不自愈**;对抗席点出这次缺的从来不是信息 ——
+     * git 在第一次失败那一秒就把文件名放进了 `detail` 里,缺的是**让合并成功**。
+     *
+     * ## 为什么钉走不等于丢
+     *
+     * 落在主检出的改动**不在任何节点分支上**,`commitAndMerge` 的 `add -A` 够不着它,
+     * 所以它在任何路径上都到不了集成分支 —— 对流水线而言它已经丢了。
+     * `pinAndClear` 把它钉成一条**耐久 ref**(`stash push -u` + `update-ref`),
+     * 一个字节都不少,而且 ref 不随 `stash drop` 消失。
+     *
+     * **必须走 `pinAndClear` 而不是裸 `stash create`**:后者对未跟踪文件返回**空串**
+     * (`snapshot.ts:163` 记着这条,质量席复现过),而席位新建的文件正是未跟踪的。
+     *
+     * ## 判据窄:只对「会被覆盖」+ **归因到席位**的那一类动手
+     *
+     * 两道闸,缺一不可:
+     *
+     * 1. **失败类型**:只认「你的本地改动会被覆盖」。别的失败(detached / 停在集成分支 /
+     *    userRewound / 真冲突)钉走用户的改动毫无帮助,而冲突现场尤其要留给人看。
+     * 2. **归因**:挡路的每一条路径都被某个席位**点名写过**(`escapes`,见 escapeRegistry)。
+     *    `intoTrunk` 分不清脏文件是席位越界还是**用户自己在改** —— 一律钉走会把用户正在
+     *    写的东西悄悄收进 stash,而「检测到脏就自动 stash」这一档用户**明确否决过**
+     *    (`stashGuard.ts` 文件头:「默认关,由用户按一下打开」)。
+     *    归因不到就原样走老路:拒绝合并、如实报告、一个字节不碰。
+     *
+     * 第 2 道是**全称**判断:只要有一条挡路路径不是席位干的,就整个不钉。
+     * 少数服从多数在这里不成立 —— 混进去一条用户的改动,钉走它就是丢他的活。
+     */
+    const overwriteBlocked = /would be overwritten by merge|Your local changes/i.test(
+      merge.stderr || merge.stdout,
+    ) && left.length === 0
+    /**
+     * 挡路的是哪几条 —— 从 git 的原话里摘,而不是拿整棵树的 `status`:
+     * 后者会把用户在别处的改动一起卷进来,而那几条并没有挡住这次合并。
+     */
+    const blockedPaths = (merge.stderr || merge.stdout).split('\n')
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !l.includes(' ') && l.includes('.'))
+    const allSeatOwned = escapes !== undefined
+      && blockedPaths.length > 0
+      && blockedPaths.every(p => escapes.owns(`${gitRoot}/${p}`) || escapes.owns(p))
+    if (overwriteBlocked && restored && allSeatOwned) {
+      const pinned = await pinEscape(gitRoot)
+      if (pinned.ok && pinned.ref !== undefined) {
+        const retry = await git(['merge', '--no-edit', '--no-verify', intBranch], gitRoot)
+        if (retry.code === 0) {
+          trunkMerged++
+          trunkSkips = []
+          const tip2 = await git(['rev-parse', intBranch], gitRoot)
+          if (tip2.code === 0) lastMergedTip = tip2.stdout.trim()
+          const behind2 = await git(['merge-base', '--is-ancestor', branch, intBranch], gitRoot)
+          if (behind2.code !== 0) await git(['merge', '--ff-only', branch], intPath)
+          /**
+           * **成功也要说** —— 我们刚刚动了用户的工作区。这条不进 `trunkSkips`
+           * (那一栏的语义是「没送到」,而这次送到了),走 `onEscape` 单独报。
+           */
+          onEscape?.({
+            ref: pinned.ref,
+            files: pinned.files ?? [],
+            merged: true,
+          })
+          return { advanced: true }
+        }
+        // 钉走了却还是合不上 —— 那就不是脏树的问题。把改动放回去,别白拿走用户的东西。
+        await git(['stash', 'pop'], gitRoot)
+        onEscape?.({ ref: pinned.ref, files: pinned.files ?? [], merged: false })
+      }
+    }
     /**
      * git 的原话要带出来,而且**不能只取第一行**:实测「would be overwritten by merge」
      * 那一类的第一行是 `error: The following untracked working tree files would be

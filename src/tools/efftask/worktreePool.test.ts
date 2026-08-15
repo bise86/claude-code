@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner } from './worktreePool.js'
+import { createEscapeRegistry } from './escapeRegistry.js'
 import { worktreeSlug } from './worktreeId.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
@@ -1186,6 +1187,151 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     // 引用在不在只影响措辞;「有没有东西没送到」这个结论必须一样。
     expect(kept.map(k => k.path)).toContain(l.path)
     expect(kept.find(k => k.path === l.path)?.why).not.toBe('未回收')
+  })
+
+  /**
+   * **席位越界写主检出 → 先钉后合(park-then-merge)。**
+   *
+   * 跑机 .30 run 001 实测两次:席位用提示词里写死的绝对路径写了主检出,
+   * 于是回主干那一跳被 git 拒绝(`Your local changes … would be overwritten by merge`),
+   * 而集成分支照常前进 —— 第一次静默七小时,四小时后复发。
+   * 质量席的对照实验:不钉的话 10 个节点完成 → 合上 0,20 个 → 合上 0,**永不自愈**。
+   */
+  it('主检出被越界改脏、且合并要覆盖它 → 钉成耐久 ref 之后合上,一个字节不丢', async () => {
+    const escapes: { ref: string; files: readonly string[]; merged: boolean }[] = []
+    const reg = createEscapeRegistry()
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
+    })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    // 节点在**自己的工作区**里改 base.txt —— 这一笔要合回 master
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    // 而**主检出**里同一个文件被越界改脏 → 正撞
+    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    // 归因:这条路径被席位点名写过(真实链路上由 canUseTool 包装记下)
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    const res = await p.commitAndMerge(n)
+    expect(res.ok).toBe(true)
+    // ① 这一跳成了
+    expect(res.trunk?.advanced).toBe(true)
+    // ② 主检出干净了,而且拿到的是节点那一版
+    expect((await git(['status', '--porcelain'], gitRoot)).stdout.trim()).toBe('')
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\n')
+    // ③ 越界内容**一个字节都没丢** —— 钉在一条耐久 ref 上
+    expect(escapes).toHaveLength(1)
+    expect(escapes[0]?.merged).toBe(true)
+    const ref = escapes[0]!.ref
+    const show = await git(['show', `${ref}:base.txt`], gitRoot)
+    expect(show.stdout).toBe('escaped-write\n')
+  })
+
+  /**
+   * **无关的脏文件不再堵住合并** —— 快进改造买到的就是这个。
+   *
+   * 真 git 实测(圆桌两席各自复现):真三方合并时索引里**任何一个**文件脏就整个被拒
+   * (`exit=2`,而且点名的文件这次合并根本没碰);同样的脏,快进则 `exit=0` 合上、
+   * 脏文件毫发无损。跑机上量到过 607 个提交被 3 个不相干的脏文件堵死。
+   */
+  it('用户在主检出改了一个**无关**文件 → 照样合得上,而且他的改动一个字节没动', async () => {
+    const p = pool()
+    await p.init()
+    // 用户自己先提交一版,让回主干那一跳原本会是**真三方合并**
+    await writeFile(join(gitRoot, 'user-note.md'), 'mine\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+    /**
+     * 然后他手上留着一个和本次合并**无关**的改动,而且**已经 git add 进索引**。
+     *
+     * ⚠ 第一版这里只写文件、不 add —— 而实测表说三方合并对**工作区脏**是放行的
+     * (`exit=0`),真正被整个拒绝的是**索引脏**(`exit=2` + `strategy ort failed`,
+     * 而且点名的文件这次合并根本没碰)。于是快进改造做不做,结果都一样,
+     * 变异测试实测那条探针存活 —— 它测的是空气。
+     */
+    await writeFile(join(gitRoot, 'user-note.md'), 'mine, edited\n')
+    await git(['add', 'user-note.md'], gitRoot)
+
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'fresh.txt'), 'node work\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.ok).toBe(true)
+    expect(res.trunk?.advanced).toBe(true)                    // 合上了
+    expect(await readFile(join(gitRoot, 'fresh.txt'), 'utf-8')).toBe('node work\n')  // 产出到了
+    // 他的改动毫发无损 —— 既没被提交,也没被 stash 走
+    expect(await readFile(join(gitRoot, 'user-note.md'), 'utf-8')).toBe('mine, edited\n')
+    expect((await git(['status', '--porcelain'], gitRoot)).stdout).toContain('user-note.md')
+  })
+
+  /**
+   * **混进一条用户的改动 → 整个不钉。** 判据是**全称**,不是存在。
+   *
+   * 少数服从多数在这里不成立:挡路的两条里只要有一条是用户自己写的,钉走它就是丢他的活。
+   * 变异测试抓到过 `every → some` 存活 —— 那时没有任何一条用例造过混合形态。
+   */
+  it('挡路的路径里混着用户自己的改动 → 一个字节都不动', async () => {
+    const escapes: unknown[] = []
+    const reg = createEscapeRegistry()
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
+    })
+    await p.init()
+    // 基线里多一个文件,好让两边都能改到它
+    await writeFile(join(gitRoot, 'mine.txt'), 'base\n')
+    await git(['add', '-A'], gitRoot); await git(['commit', '-qm', 'add mine'], gitRoot)
+
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(l.path, 'mine.txt'), 'node also touched\n')
+    // 主检出:一条是席位越界(归因命中),一条是用户自己的(没有归因)
+    await writeFile(join(gitRoot, 'base.txt'), 'escaped\n')
+    await writeFile(join(gitRoot, 'mine.txt'), 'user edit\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    await p.commitAndMerge(n)
+    // 没钉:用户那条还原样躺着
+    expect(escapes).toEqual([])
+    expect(await readFile(join(gitRoot, 'mine.txt'), 'utf-8')).toBe('user edit\n')
+  })
+
+  /** 反面:主检出干净时,这条路一次都不许触发(它会动用户的工作区)。 */
+  it('主检出干净 → 不钉、不报', async () => {
+    const escapes: unknown[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, onEscape: e => escapes.push(e),
+    })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'fresh.txt'), 'x\n')
+    expect((await p.commitAndMerge(n)).trunk?.advanced).toBe(true)
+    expect(escapes).toEqual([])
+  })
+
+  /**
+   * **判据要窄:真冲突那一类不许钉。**
+   *
+   * 冲突现场就是要留给人看的,而钉走用户的改动对解冲突毫无帮助 —— 那是一次没有理由的动手。
+   */
+  it('撞的是真冲突(UU)时不钉', async () => {
+    const escapes: unknown[] = []
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git, worktreeRoot, onEscape: e => escapes.push(e),
+    })
+    await p.init()
+    // 用户在自己的分支上提交一版
+    await writeFile(join(gitRoot, 'base.txt'), 'user-side\n')
+    await git(['commit', '-aqm', 'user edit'], gitRoot)
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'node-side\n')
+    await p.commitAndMerge(n)
+    // 不管这一跳成没成,越界那条路都不该被走 —— 主检出当时是干净的。
+    expect(escapes).toEqual([])
   })
 
   /**

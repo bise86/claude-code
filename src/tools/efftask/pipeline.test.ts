@@ -1176,6 +1176,51 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     expect(ok.execStatus).not.toContain('合回')
   })
 
+  /**
+   * **同一件事必须上常驻屏,不能只进 execStatus。**
+   *
+   * `execStatus` 是累加文本、没有时间戳,要用户主动翻进那个节点才看得到 ——
+   * 跑机 .30 run 001 正是这样静默了七小时:每个子任务完成时 `intoTrunk` 都失败一次,
+   * 而屏幕上一个字都没有,集成分支照常前进。
+   *
+   * **不做「连续 N 次」计数**(圆桌否掉):`noteSkip` 按整串消息去重而消息里嵌着会变的
+   * 文件名,数不到 N;run 级计数器 `--resume` 又归零(`trunkLanded` 的注释早写过这一课)。
+   */
+  it('合不回主干时,除了写节点还要走 onNotice 上常驻屏', async () => {
+    const notices: string[] = []
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], okAgent()),
+      onNotice: (l: string) => notices.push(l),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({
+          ok: true, merged: true,
+          trunk: { advanced: false, reason: '你的工作区有未提交的改动,没有把产出合回你的目录' },
+        }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toContain('没送到你的分支')
+    expect(notices[0]).toContain(n.title)          // 哪个任务,要说出来
+  })
+
+  it('合上了 → onNotice 一次都不叫(正常路径不许刷屏)', async () => {
+    const notices: string[] = []
+    const n = root()
+    const ctx = {
+      ...ctxFor([n], okAgent()),
+      onNotice: (l: string) => notices.push(l),
+      worktrees: fakePool({
+        commitAndMerge: async () => ({ ok: true, merged: true, trunk: { advanced: true } }),
+      }) as never,
+    }
+    await stepStart(n, ctx)
+    await stepExecute(n, ctx)
+    expect(notices).toEqual([])
+  })
+
   it('a merge CONFLICT blocks the node and keeps the worktree findable', async () => {
     const n = root()
     const ctx = {

@@ -106,6 +106,28 @@ export interface PipelineCtx {
    */
   onBlocked?: (info: { node: TaskNode; reason: string; category: BlockCategory; stopped?: boolean }) => void
   /**
+   * **运行中要让用户看见的一句话。**
+   *
+   * 存在的理由是一次七小时的静默:跑机 .30 run 001 里 `intoTrunk` 每个子任务完成时都失败
+   * (席位越界写了主检出),而失败原因只被追加进 `execStatus` —— 那是累加文本、没有时间戳、
+   * 要用户主动翻进那个节点才看得到。集成分支照常前进,屏幕上一个字都没有。
+   *
+   * ## 为什么必须新开一条,而不是复用现成的
+   *
+   * 圆桌(接缝席 + 对抗席)各自核对过,现有的都不行:
+   *  - `onProblems` **不在** `PipelineCtx` 也不在 `runOrchestrator` —— 它只是
+   *    `redoRun`/`backtrackRun` 的入参,只有 `r/R/s/b` 四个按键路径够得到;
+   *  - `notices` 是启动关口的解析期概念,跑起来之后那一屏已经卸载,push 进去不会重绘;
+   *  - `onEscalate`/`onBlocked` **只发飞书**(没接飞书 = 零);
+   *  - `onBuildWipe` 只进退出报告;
+   *  - `trunkSkips` 只被结束屏读。
+   *
+   * 唯一常驻的是 `RunningView.problems`。这条线就是接到那儿的。
+   * (这个仓库 24 小时内两次凭空引用不存在的通道 —— `autoRescue` 是上一次。写「上屏」
+   * 之前必须先找到那块屏。)
+   */
+  onNotice?: (line: string) => void
+  /**
    * The run id, when the caller knows it.
    *
    * Only used to write actionable text — the record path and the retry command — into
@@ -4150,6 +4172,16 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
    */
   if (res.ok && res.trunk && res.trunk.advanced === false && res.trunk.reason) {
     noteOnNode(node, res.trunk.reason)
+    /**
+     * **同一件事也要上常驻屏。** `noteOnNode` 只写 execStatus —— 累加文本、没有时间戳、
+     * 要用户主动翻进这个节点才看得到。跑机上正是这样静默了七小时:每个子任务完成时
+     * 都失败一次,而屏幕上一个字都没有。
+     *
+     * **不做「连续 N 次」计数**(圆桌否掉了):`noteSkip` 按整串消息去重,而消息里嵌着
+     * 会变的文件名 —— 数不到 N;而且 run 级计数器 `--resume` 归零,`trunkLanded` 的注释
+     * 早写过这一课。每次都报,由 `RunningView` 那一栏自己去重和截断。
+     */
+    try { ctx.onNotice?.(`「${node.title}」的产出没送到你的分支:${res.trunk.reason}`) } catch { /* UI only */ }
   }
   if (!res.ok) {
     if (res.kind === 'conflict') {
@@ -5008,8 +5040,25 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
           `但本任务工作区的 git 指纹在执行前后一模一样。\n` +
           `工作区: ${node.worktree?.path ?? '(本节点没有工作区)'}\n` +
           `执行后的指纹: ${afterExec === '' ? '空 —— 目录里没有任何未提交改动(执行者确实一个文件都没写)' : `「${afterExec.split('\n').slice(0, 3).join(' / ')}」—— 有改动,但和执行前逐字相同`}\n` +
-          `下一步:到上面那个目录里跑 git status --porcelain --ignored 看它到底有没有东西;` +
-          `如果那里干干净净,就去查这一轮派给执行者的工具清单(日志窗口第一行「[工具 N 个 …]」)。`,
+          /**
+           * **这条建议原来指错了方向。**
+           *
+           * 「工作区干干净净」最常见的成因不是工具清单太窄,而是**席位写到了工作区之外** ——
+           * 它照着方案/验收点里写死的**主检出绝对路径**干活(跑机 .30 run 001 实测:
+           * node.md 全文里指向主检出的绝对路径有 2566 处,而事件流里逐条记着
+           * `Update(<主检出>/pkg/sql/conn_executor.rs)`)。
+           *
+           * 那种情形下这个节点的现象**逐字就是这一条**:执行者报告了工作、工作区指纹前后
+           * 一模一样、REWORK 到用尽迭代上限。而铃响了却让人去看工具清单 —— 圆桌规范席的
+           * 原话是「铃已经在响,只是指错了方向」。
+           *
+           * 排序按实测频率:先问「是不是写到外面去了」,再问工具清单。
+           */
+          `下一步:到上面那个目录里跑 git status --porcelain --ignored 看它到底有没有东西;\n` +
+          `如果那里干干净净,**先看它是不是写到工作区之外了** —— 方案和验收点里常带着主检出的` +
+          `绝对路径,而席位会照着那个路径写。在主检出跑 git status,或看日志窗口里这一席的` +
+          `Edit/Write 用的是哪个路径。写进主检出的内容不在任何任务分支上,永远进不了集成分支。\n` +
+          `都排除了再去查这一轮派给执行者的工具清单(日志窗口第一行「[工具 N 个 …]」)。`,
           ctx,
           'no-output',
         )

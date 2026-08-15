@@ -7,6 +7,7 @@ import { createUserMessage } from '../../utils/messages.js'
 import { runWithCwdOverride } from '../../utils/cwd.js'
 import type { RunControl } from './control.js'
 import type { RateLimitGate } from './rateLimitGate.js'
+import { escapedPathsIn, type EscapeRegistry } from './escapeRegistry.js'
 import { eventsFromMessage, type BriefResolver } from './agentEvents.js'
 import type { StreamHandle } from './agentStream.js'
 import type { RunAgentFn } from './roundtable.js'
@@ -390,6 +391,26 @@ export function makeRunAgentFn(deps: {
    * 就只能在每个调用点各修一遍,而调用点还会继续长。
    */
   rateGate?: RateLimitGate
+  /**
+   * **席位越界写主检出的归因登记簿。** 见 `escapeRegistry.ts`。
+   *
+   * 给了才检测。缺省 = 行为与引入它之前逐字相同 —— 既有调用点和测试一个字不改。
+   */
+  escapes?: EscapeRegistry
+  /**
+   * 主检出根目录。**做成函数而不是值**:池子建在关口批准之后
+   * (`efftask.tsx` 里三个 `poolRef.current = …`),而 `makeRunAgentFn` 构造在那之前 ——
+   * 传值的话永远是 `undefined`。这条线断了就是「声明了、实现了、生产上没人调用」,
+   * 而这个仓库 24 小时内为它付过两次账(`openStream`、`autoRescue`)。
+   */
+  gitRoot?: () => string
+  /** 主检出的**别名根**(软链)。跑机上 `/home/esgyn/work/tools/…` 是 `/home/esgyn/tb/tools/…` 的软链。 */
+  gitRootAliases?: () => readonly string[]
+  /**
+   * 硬闸开关。**默认开**(`!== false`)。关掉之后只记录、不拦 ——
+   * 留这个口是因为拦截会改变席位行为,而这个仓库的规矩是「不可逆的默认要能被关掉」。
+   */
+  escapeGate?: boolean
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
@@ -496,6 +517,50 @@ export function makeRunAgentFn(deps: {
      */
     const canUseTool: CanUseToolFn = (async (...args: Parameters<CanUseToolFn>) => {
       humanWaitFrom = Date.now()
+      /**
+       * **越界检查排在最前面 —— 这一层是唯一在所有权限模式下都在路径上的点。**
+       *
+       * 圆桌(规范席 + 对抗席)独立指出:`deps.canUseTool` 的 bypassPermissions / allowlist
+       * 短路发生在**它的实现内部**,不在调用点之前;无 hook 时 `toolHooks` 也无条件调用。
+       * 所以包在这里,对**所有工具、所有权限档**都生效。
+       *
+       * 闭包里有 `req.node` / `req.role` / `req.phase` / `req.cwd` —— 这是**免费的完美归因**,
+       * 也正是被否掉的「前后拍指纹」方案在并发下永远拿不到的东西
+       * (实测:1 个席位越界 5 次 → 只被点名 1 次,而 14 个诚实席位被冤枉)。
+       *
+       * 两档,判据分开:
+       *  - **记录**(默认开,不拦):进登记簿,供 `intoTrunk` 决定挡路的脏文件该不该钉走;
+       *  - **硬闸**(`escapeGate`,默认开):Edit/Write 这类直接拒,而且**拒绝理由里
+       *    告诉席位它的工作区在哪** —— 它拿的是提示词里写死的绝对路径
+       *    (node.md 全文里 2566 处),它根本不知道自己有工作区。这是「带内纠正」,
+       *    指纹方案永远做不到。
+       *
+       * 覆盖面缺口要说出来:**Bash 与 MCP 不在硬闸内**(从命令行推断改了哪个文件不可靠,
+       * 而下游要动用户的工作区 —— 宁可归因不到也不可归因错)。
+       */
+      const escaped = deps.escapes !== undefined && deps.gitRoot !== undefined
+        ? escapedPathsIn(args[1], {
+          gitRoot: deps.gitRoot(),
+          ...(req.cwd === undefined ? {} : { cwd: req.cwd }),
+          ...(deps.gitRootAliases ? { roots: deps.gitRootAliases() } : {}),
+        })
+        : []
+      if (escaped.length > 0) {
+        for (const p of escaped) {
+          try {
+            deps.escapes?.note({ nodeId: req.node.id, phase: req.phase, tool: String(args[0]), path: p })
+          } catch { /* 记账不能把这次调用带走 */ }
+        }
+        if (deps.escapeGate !== false) {
+          return {
+            behavior: 'deny',
+            message: `这个路径在**主检出**里,不是你的工作区:${escaped[0]}\n`
+              + `你的工作区是 ${req.cwd} —— 请改写那里的同名相对路径。\n`
+              + `方案和验收点里写的绝对路径是整趟运行共用的模板,对你这一席不适用:`
+              + `写进主检出的内容不在任何任务分支上,永远进不了集成分支,而且会挡住产出合回主干。`,
+          } as never
+        }
+      }
       // 通知**必须**用 try/catch 包住:一个抛异常的 UI 回调不能把这次工具调用带走,
       // 而它就在带写工具的执行环节的关键路径上。
       try { deps.onHumanWait?.(true) } catch { /* UI only */ }

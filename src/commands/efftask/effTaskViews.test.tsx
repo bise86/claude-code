@@ -509,3 +509,42 @@ describe('结束屏 · 结论行不许自相矛盾', () => {
     expect(f).toContain('按 m 捞回')
   })
 })
+
+/**
+ * **运行中的告警要真的画在屏幕上。**
+ *
+ * 存在的理由是一次七小时的静默:`intoTrunk` 每个子任务完成时都失败,而原因只进了
+ * `execStatus`(累加文本、没有时间戳、要用户主动翻进那个节点)。集成分支照常前进,
+ * 屏幕上一个字都没有。`RunningView.problems` 是**唯一**一条运行中常驻的通道。
+ */
+describe('运行中的告警横幅', () => {
+  const frameOf = async (props: Record<string, unknown>): Promise<string> => {
+    const t = fakeTty()
+    const app = await render(
+      React.createElement(RunningView as never, {
+        nodes: [node({ status: 'EXECUTING' })], runId: '003', onAbort: () => {}, ...props,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    return f
+  }
+
+  it('告警上屏,带 ⚠', async () => {
+    const f = await frameOf({ problems: ['「甲任务」的产出没送到你的分支:你的工作区有未提交的改动'] })
+    expect(f).toContain('⚠')
+    expect(f).toContain('没送到你的分支')
+  })
+
+  /** **截断提示必须活过截断** —— 这个仓库为这条写过一次判决。 */
+  it('超过 3 条时,挤掉的那几条要有人说出来', async () => {
+    const f = await frameOf({ problems: ['一', '二', '三', '四', '五'] })
+    expect(f).toContain('另有 2 条未显示')
+  })
+
+  it('没有告警时不画横幅(空标题是噪音)', async () => {
+    expect(await frameOf({ problems: [] })).not.toContain('⚠')
+  })
+})

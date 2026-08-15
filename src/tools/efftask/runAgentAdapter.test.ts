@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { subAgentToolPool } from '../../commands/efftask/efftask.js'
 import { collectText, pickAgentDefinition, makeRunAgentFn, pollIntervalMs, providerErrorOf, providerErrorInfoOf, shrinkPrompt, PROMPT_SHRINK_RATIOS, ProviderApiError } from './runAgentAdapter.js'
+import { createEscapeRegistry } from './escapeRegistry.js'
 import { createAssistantAPIErrorMessage } from '../../utils/messages.js'
 import { createRunControl } from './control.js'
 import { pwd } from '../../utils/cwd.js'
@@ -1534,5 +1535,94 @@ describe('额度用尽:认得出第三方网关那版文案', () => {
   it('真限流仍然是 rate_limit —— 两者的处置办法相反,不许混', () => {
     expect(providerErrorInfoOf([errMsg('API Error: Request rejected (429) · overloaded_error')] as never)?.kind)
       .toBe('rate_limit')
+  })
+})
+
+/**
+ * **席位用绝对路径写主检出的硬闸 + 归因。**
+ *
+ * 跑机 .30 run 001 实测:席位照着提示词里写死的绝对路径(node.md 全文 2566 处)写了主检出,
+ * 于是回主干那一跳被 git 拒绝,而集成分支照常前进 —— 静默七小时,四小时后复发。
+ *
+ * 闸放在 `canUseTool` 包装里,理由(圆桌规范席 + 对抗席各自独立指出):
+ * `deps.canUseTool` 的 bypassPermissions / allowlist 短路发生在**它的实现内部**,
+ * 不在调用点之前 —— 包在外面才对所有权限档生效。而闭包里有 node/phase/cwd,
+ * 是**免费的完美归因**(被否掉的指纹方案在并发下永远拿不到:实测 1 席越界 5 次只被点名 1 次,
+ * 而 14 个诚实席位被冤枉)。
+ */
+describe('越界写主检出:硬闸与归因', () => {
+  const G = '/repo'
+  const W = '/repo/.efftask-worktrees/efftask-001-aa'
+  /** 让子 agent 在被派出去之前就发生工具调用 —— 直接调拿到的那个 canUseTool。 */
+  const runWith = async (over: Record<string, unknown>, input: unknown, cwd?: string) => {
+    let captured: ((...a: unknown[]) => Promise<unknown>) | undefined
+    async function* fake(args: { canUseTool?: unknown }): AsyncGenerator<never> {
+      captured = args.canUseTool as never
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } } as never
+    }
+    const fn = makeRunAgentFn({
+      toolUseContext: {} as never,
+      canUseTool: (async () => ({ behavior: 'allow' })) as never,
+      availableTools: [] as never,
+      activeAgents: [{ agentType: '架构' } as never],
+      mainModelDefault: { agentType: 'main' } as never,
+      runAgentImpl: fake as never,
+      gitRoot: () => G,
+      ...over,
+    } as never)
+    await fn({
+      phase: 'execute', node: { id: 'root/00-a' } as never, role: null,
+      system: 's', prompt: 'p', signal: new AbortController().signal,
+      ...(cwd === undefined ? {} : { cwd }),
+    } as never)
+    return await captured?.('Edit', input)
+  }
+
+  it('写主检出 → 拒绝,而且拒绝理由里告诉席位它的工作区在哪', async () => {
+    const reg = createEscapeRegistry()
+    const out = await runWith({ escapes: reg }, { file_path: `${G}/pkg/sql/a.rs` }, W) as
+      { behavior: string; message: string }
+    expect(out.behavior).toBe('deny')
+    // 「带内纠正」—— 指纹方案永远做不到的那一步
+    expect(out.message).toContain(W)
+    expect(out.message).toContain('不是你的工作区')
+    // 归因:带节点、带环节
+    expect(reg.claims()).toHaveLength(1)
+    expect(reg.claims()[0]?.nodeId).toBe('root/00-a')
+    expect(reg.claims()[0]?.phase).toBe('execute')
+    expect(reg.owns(`${G}/pkg/sql/a.rs`)).toBe(true)
+  })
+
+  it('写自己的工作区 → 放行,不记账', async () => {
+    const reg = createEscapeRegistry()
+    const out = await runWith({ escapes: reg }, { file_path: `${W}/pkg/sql/a.rs` }, W) as
+      { behavior: string }
+    expect(out.behavior).toBe('allow')
+    expect(reg.claims()).toEqual([])
+  })
+
+  /**
+   * **共享工作树档必须早退。** 席位本来就在主检出干活,不排除的话每次调用都误报 ——
+   * 接缝席点名的那条。
+   */
+  it('席位没有自己的工作区(cwd 缺席)→ 放行,不记账', async () => {
+    const reg = createEscapeRegistry()
+    const out = await runWith({ escapes: reg }, { file_path: `${G}/pkg/sql/a.rs` }) as
+      { behavior: string }
+    expect(out.behavior).toBe('allow')
+    expect(reg.claims()).toEqual([])
+  })
+
+  it('关掉硬闸 → 只记账、不拦', async () => {
+    const reg = createEscapeRegistry()
+    const out = await runWith({ escapes: reg, escapeGate: false }, { file_path: `${G}/a.rs` }, W) as
+      { behavior: string }
+    expect(out.behavior).toBe('allow')
+    expect(reg.claims()).toHaveLength(1)   // 拦不拦是两件事,归因照记
+  })
+
+  it('没给登记簿 → 整条路不走(行为与引入它之前逐字相同)', async () => {
+    const out = await runWith({}, { file_path: `${G}/a.rs` }, W) as { behavior: string }
+    expect(out.behavior).toBe('allow')
   })
 })

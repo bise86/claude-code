@@ -108,6 +108,14 @@ export async function runOrchestrator(
      * `openStream` 当初就是「声明了、实现了、测过了,而生产上没有任何人传它」的那条死线。
      */
     onBuildWipe?: PipelineCtx['onBuildWipe']
+    /**
+     * **运行中要让用户看见的一句话** —— 见 `PipelineCtx.onNotice`。
+     *
+     * 这条线**必须一直接到界面**:它存在的全部理由就是那次七小时静默。
+     * 断在这一层的话,`intoTrunk` 每次失败都照旧只进 execStatus,而那要用户主动翻节点。
+     * (`openStream` / `onBuildWipe` / `autoRescue` 都在这一环死过。)
+     */
+    onNotice?: PipelineCtx['onNotice']
     /** 子 agent 实时输出 (spec §10.2): streamed per node, for the detail view. */
     openStream?: PipelineCtx['openStream']
     cwd?: PipelineCtx['cwd']
@@ -610,6 +618,7 @@ export async function runOrchestrator(
         onEscalate: args.onEscalate,
         onBlocked: args.onBlocked,
         onBuildWipe: args.onBuildWipe,
+        onNotice: args.onNotice,
         openStream: args.openStream,
         cwd: args.cwd,
         onUpdate: nodes => {

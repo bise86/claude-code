@@ -1022,6 +1022,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   /** 上一次重做落盘时**没做成**的那些事。空 = 干净。 */
   const [redoProblems, setRedoProblems] = React.useState<string[]>([])
   /**
+   * **运行中的告警**(见 `PipelineCtx.onNotice`)。
+   *
+   * **刻意不复用 `redoProblems`**:那个 state 的每一个生产者都是**整体替换**
+   * (`setRedoProblems([...])`),于是一次 `r` 的拒绝理由会把「产出没送到主干」的告警
+   * 整条抹掉,反之亦然。圆桌接缝席点名过这一条。
+   *
+   * 只增不改 + 去重 + 有界:这一栏在一趟长跑里会被同一个原因反复触发
+   * (每个子任务完成都失败一次),不去重的话它自己会把屏幕吃光。
+   */
+  const [runNotices, setRunNotices] = React.useState<string[]>([])
+  const pushNotice = React.useCallback((line: string): void => {
+    setRunNotices(prev => (prev.includes(line) ? prev : [...prev, line].slice(-20)))
+  }, [])
+  /**
    * 有几次工具权限确认在等人回答。>0 时任务树面板交出键盘。
    *
    * 计数而不是布尔:并行度大于 1 时可以同时有几个执行节点各自等一个确认。
@@ -1642,6 +1656,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
          * 就地累加进一个 ref 而不是 setState:这一路在一次跑里会被调几百次,每次都重渲染
          * 整棵树是白付的钱;而它唯一的读者是收口屏(`buildWipeLines`),那时候读一次就够。
          */
+        onNotice: pushNotice,
         onBuildWipe: e => {
           noteBuildWipe(buildWipe.current, e)
           props.buildWipeOut.current = buildWipe.current
@@ -3069,7 +3084,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 而这条流此前只有结束屏读 —— 关口关掉之后回的就是这里,而 `ConfirmBacktrack`
        * 印的是「原因见任务树上的提示」。(接缝席真帧实测:一个字都没有)
        */
-      problems={redoProblems}
+      problems={[...redoProblems, ...runNotices]}
     />
   }
   return (
