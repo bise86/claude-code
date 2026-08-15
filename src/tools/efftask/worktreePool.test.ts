@@ -7,7 +7,7 @@
  * measurement it encodes.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, rm, writeFile, mkdir, readFile, chmod, stat } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, mkdir, readFile, chmod, stat, symlink, readlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -1298,6 +1298,58 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     const said = notices.join('\n')
     expect(said).toContain('base.txt')
     expect(said).toContain('git checkout')   // 怎么取回
+  })
+
+  /**
+   * **挂了 clean 过滤器的路径一律判假。**
+   *
+   * `git hash-object` **会跑 clean 过滤器** —— 它算的是「过滤后的内容」,而这条判据
+   * 承诺的是「工作区的字节」。真 git 实测:`filter=scrub` 的 app.env,工作区
+   * `SECRET=hunter2`,hash-object 的结果和分支上那份**一模一样** → 判无损 → 删掉 →
+   * 用户真值没了,而取回命令取回的还是被洗过那份。同形:CRLF、nbstripout、git-crypt。
+   */
+  it('挂了 clean 过滤器 → 不算无损(hash-object 比的不是工作区的字节)', async () => {
+    await writeFile(join(gitRoot, '.gitattributes'), '*.env filter=scrub\n')
+    await git(['config', 'filter.scrub.clean', "sed 's/^SECRET=.*/SECRET=REDACTED/'"], gitRoot)
+    await writeFile(join(gitRoot, 'app.env'), 'SECRET=REDACTED\n')
+    await git(['add', '-A'], gitRoot); await git(['commit', '-qm', 'add env'], gitRoot)
+    const p = pool()
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'app.env'), 'SECRET=REDACTED\n')
+    await writeFile(join(l.path, 'other.txt'), 'x\n')
+    // 用户的真值 —— 过滤后和分支上那份等价,所以只比 blob 会判「无损」
+    await writeFile(join(gitRoot, 'app.env'), 'SECRET=hunter2\n')
+
+    await p.commitAndMerge(n)
+    // 真值必须还在
+    expect(await readFile(join(gitRoot, 'app.env'), 'utf-8')).toBe('SECRET=hunter2\n')
+  })
+
+  /**
+   * **软链一律判假。**
+   *
+   * `hash-object` **跟着链走**(实测 `hash-object -- sl` 给的是链**指向**那个文件内容的
+   * sha),而 git 给软链存的 blob 是**链文本**。两个东西在比,可构造成相等 ——
+   * 那时会删掉用户的链、合并写回另一条指向,而取回命令取回的是集成分支那条。
+   */
+  it('软链 → 不算无损(hash-object 跟着链走,git 存的是链文本)', async () => {
+    await writeFile(join(gitRoot, 'tgt'), 'A\n')
+    await writeFile(join(gitRoot, 'other'), 'tgt\n')
+    await git(['add', '-A'], gitRoot); await git(['commit', '-qm', 'files'], gitRoot)
+    const p = pool()
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await symlink('tgt', join(l.path, 'sl'))
+    await git(['add', '-A'], l.path)
+    // 用户那边同名软链指向别处,而那个文件的内容恰好等于「tgt」这个链文本
+    await symlink('other', join(gitRoot, 'sl'))
+
+    await p.commitAndMerge(n)
+    // 用户的链指向不许被改
+    expect(await readlink(join(gitRoot, 'sl'))).toBe('other')
   })
 
   /**
