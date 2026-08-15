@@ -34,10 +34,20 @@ export interface BuildWipeTally {
   skippedRepos: { title: string; path: string }[]
   /** 清理本身失败的节点。不影响判决,但要说。 */
   failures: { title: string; why: string }[]
+  /**
+   * 在**工作树之外**删掉的条目数(系统临时目录)。
+   *
+   * 和 `entries` 分开:那一栏是这棵树里被 git 忽略的文件,这一栏是 `rm -rf` 打在
+   * `tmpdir()` 上。用一句话把两者一起念,就是拿「任务工作区里的」去描述仓库之外的删除。
+   */
+  scratchEntries: number
 }
 
 export function emptyBuildWipeTally(): BuildWipeTally {
-  return { nodes: 0, entries: 0, freedKb: 0, sizeKnown: true, skippedRepos: [], failures: [] }
+  return {
+    nodes: 0, entries: 0, freedKb: 0, sizeKnown: true,
+    skippedRepos: [], failures: [], scratchEntries: 0,
+  }
 }
 
 /**
@@ -54,9 +64,11 @@ export function noteBuildWipe(
     tally.failures.push({ title: e.title, why: o.error })
     // 失败也可能已经删掉了一部分,所以下面照旧结算 —— 不 return。
   }
-  if (o.removed.length > 0) {
+  const scratched = o.scratch?.length ?? 0
+  if (o.removed.length > 0 || scratched > 0) {
     tally.nodes += 1
     tally.entries += o.removed.length
+    tally.scratchEntries += scratched
     tally.freedKb += o.freedKb
     if (!o.sizeKnown) tally.sizeKnown = false
   }
@@ -84,6 +96,20 @@ export function buildWipeLines(tally: BuildWipeTally): string[] {
     )
     // 代价要和收益写在一起,而不是让用户下次重做时才发现。
     out.push('  它们是被 .gitignore 忽略的产物,不含任何交付物;重做这些任务会全量重编。')
+    /**
+     * **仓库之外的那一份单独说。**
+     *
+     * 席位为了不弄脏工作树,会把 target / 日志写到系统临时目录 —— 那正好绕开工作树里的
+     * 回收(跑机实测 141 个条目、23 GB,最老 8 天)。现在自动清了,而这是一次
+     * **打在仓库之外的 `rm -rf`**:拿上面那句「任务工作区里的」把它一起念就是假话,
+     * 而不说等于静默删除。
+     */
+    if (tally.scratchEntries > 0) {
+      out.push(
+        `  另有 ${tally.scratchEntries} 项在**系统临时目录**里(席位自己写到那儿的构建产物),` +
+        '已按任务标识精确匹配后删除 —— 那是仓库之外的目录。',
+      )
+    }
   }
   for (const r of tally.skippedRepos) {
     // 指名道姓:用户能做的事只有知道路径才做得了。

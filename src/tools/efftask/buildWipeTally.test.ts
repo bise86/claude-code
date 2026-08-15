@@ -82,4 +82,35 @@ describe('run 级构建产物账', () => {
   it('什么都没发生时一个字都不印', () => {
     expect(buildWipeLines(emptyBuildWipeTally())).toEqual([])
   })
+
+  /**
+   * **仓库之外删掉的那一份必须单独说。**
+   *
+   * 席位为了不弄脏工作树,把 target / 日志写到系统临时目录 —— 现在那些也自动清了,
+   * 而这是一次**打在仓库之外的 `rm -rf`**。拿「已清掉 N 个**任务工作区里的**构建产物」
+   * 那句话把它一起念,就是一句假话;不说,就是静默删除。两样都不行。
+   */
+  it('临时目录那一份单独一行,不混进「任务工作区里的」那句', () => {
+    const t = emptyBuildWipeTally()
+    noteBuildWipe(t, {
+      title: 'A',
+      outcome: out({ removed: ['target/'], scratch: ['/tmp/efftask-001-abcd1234-target'], freedKb: 8 }),
+    })
+    expect(t.entries).toBe(1)          // 树里那一项
+    expect(t.scratchEntries).toBe(1)   // 仓库之外那一项,分开记
+    const lines = buildWipeLines(t)
+    expect(lines[0]).toContain('已清掉 1 个任务工作区里的 1 项')  // 不是 2 项
+    const outside = lines.find(l => l.includes('系统临时目录'))
+    expect(outside).toBeDefined()
+    expect(outside).toContain('仓库之外')
+  })
+
+  /** 树里一条没清、只清了临时目录 → 这个节点照样算「清过东西」,而且照样要说。 */
+  it('只清了临时目录也要计数、也要上屏', () => {
+    const t = emptyBuildWipeTally()
+    noteBuildWipe(t, { title: 'A', outcome: out({ scratch: ['/tmp/efftask-001-abcd1234-a'], freedKb: 3 }) })
+    expect(t.nodes).toBe(1)
+    expect(t.scratchEntries).toBe(1)
+    expect(buildWipeLines(t).some(l => l.includes('系统临时目录'))).toBe(true)
+  })
 })

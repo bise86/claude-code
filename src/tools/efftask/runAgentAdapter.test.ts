@@ -1592,6 +1592,13 @@ describe('越界写主检出:硬闸与归因', () => {
     const out = await runWith({ escapes: reg }, { file_path: `${G}/pkg/sql/a.rs` }, W) as
       { behavior: string; message: string }
     expect(out.behavior).toBe('deny')
+    /**
+     * `decisionReason` 是 `PermissionDenyDecision` 的**必填**字段。上一版整个对象
+     * `as never` 过去,运行时不炸但把 tsc 本该报的错沉下去了(这个仓库为 `as` 记过账),
+     * 而且权限调试面板拿不到「为什么被拒」。
+     */
+    expect((out as unknown as { decisionReason?: { type: string } }).decisionReason?.type)
+      .toBe('workingDir')
     // 「带内纠正」—— 指纹方案永远做不到的那一步
     expect(out.message).toContain(W)
     expect(out.message).toContain('不是你的工作区')

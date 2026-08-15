@@ -126,7 +126,7 @@ export interface PipelineCtx {
    * (这个仓库 24 小时内两次凭空引用不存在的通道 —— `autoRescue` 是上一次。写「上屏」
    * 之前必须先找到那块屏。)
    */
-  onNotice?: (line: string) => void
+  onNotice?: (line: string, /** 去重键:同一个键只占一格。不给就按整串去重 —— 而串里嵌着会变的东西时那等于不去重。 */ key?: string) => void
   /**
    * The run id, when the caller knows it.
    *
@@ -4181,7 +4181,14 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
      * 会变的文件名 —— 数不到 N;而且 run 级计数器 `--resume` 归零,`trunkLanded` 的注释
      * 早写过这一课。每次都报,由 `RunningView` 那一栏自己去重和截断。
      */
-    try { ctx.onNotice?.(`「${node.title}」的产出没送到你的分支:${res.trunk.reason}`) } catch { /* UI only */ }
+    /**
+     * 去重键用**原因**,不用整串:标题每个节点都不一样,按整串去重一次都命中不了,
+     * 20 席一趟就是 20 条各不相同的告警把上限打满 —— 和上面那段否掉「连续 N 次」的
+     * 理由是同一个形状,别在这里重犯。同一个原因只占一格,内容更新成最新那个节点。
+     */
+    try {
+      ctx.onNotice?.(`「${node.title}」的产出没送到你的分支:${res.trunk.reason}`, `trunk:${res.trunk.reason}`)
+    } catch { /* UI only */ }
   }
   if (!res.ok) {
     if (res.kind === 'conflict') {

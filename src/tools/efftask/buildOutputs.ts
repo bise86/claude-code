@@ -122,6 +122,14 @@ export interface BuildWipeOutcome {
   freedKb: number
   sizeKnown: boolean
   error?: string
+  /**
+   * 在**工作树之外**删掉的那些(系统临时目录里席位自己写的构建产物)。
+   *
+   * 和 `removed` 分开记,因为它们的性质不同:`removed` 是这棵工作树里被 git 忽略的文件,
+   * 删掉是「回收自己的垃圾」;这一栏是 `rm -rf` 打在 `tmpdir()` 上,**在仓库之外**。
+   * 屏幕上必须分开说 —— 拿「已清掉任务工作区里的 N 项」把它们一起念了就是一句假话。
+   */
+  scratch?: string[]
 }
 
 /** 一个条目是不是 `/et` 自己的东西 —— **双向判**,见文件头第三条。 */

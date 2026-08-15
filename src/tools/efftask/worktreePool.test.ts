@@ -1423,6 +1423,215 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
   })
 
   /**
+   * **失败原话要取最后一次失败的那次。**
+   *
+   * 第一次失败是「你的本地改动会被覆盖」—— 而我们已经把那个脏文件钉走了,那个状态不存在了。
+   * 现场是 retry 那次留下的。报第一次的原话,等于让用户去看一个被我们收拾掉的状态。
+   *
+   * ⚠ 撞冲突那条用例打不中这一刀:`left.length > 0` 时消息走的是「撞了冲突(x)」,
+   * 根本不用 `detail`。要让 `detail` 上场,retry 必须**失败但不留冲突**。
+   */
+  it('钉走后重试失败 → 报的是重试那次的原话,不是第一次的', async () => {
+    const reg = createEscapeRegistry()
+    let merges = 0
+    const flaky: GitRunner = async (args, cwd) => {
+      if (cwd === gitRoot && args[0] === 'merge' && args.includes('efftask/001/integration')) {
+        merges++
+        if (merges === 2) return { code: 1, stdout: '', stderr: 'fatal: 实验注入:重试这次的原话\n' }
+      }
+      return git(args, cwd)
+    }
+    const p = createWorktreePool({ runId: '001', gitRoot, git: flaky, worktreeRoot, escapes: reg })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    expect(res.trunk?.reason ?? '').toContain('实验注入:重试这次的原话')
+    // 第一次那句已经不成立了 —— 那个脏文件被我们钉走了
+    expect(res.trunk?.reason ?? '').not.toContain('would be overwritten')
+  })
+
+  /**
+   * **挡路清单要和「树上脏的」求交,不能拿「这次合并会碰的」当挡路清单。**
+   *
+   * 不求交的话,节点改过但主检出**没脏**的那些文件也会进清单;它们既归因不到、
+   * 又证明不了无损(工作区里是 HEAD 那版,不等于集成分支那版)→ 全称闸判假 → park 永不触发。
+   *
+   * ⚠ 别的用例打不中这一刀:那些场景里 HEAD 和集成分支**只差那一个脏文件**,
+   * 求不求交结果一样。所以这一条特意让节点**多改一个没脏的文件**。
+   */
+  it('节点还改了别的(主检出没脏)→ 那些不算挡路,park 照常成立', async () => {
+    const reg = createEscapeRegistry()
+    const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, escapes: reg })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    // 两个文件都改:base.txt 在主检出里被越界写脏,other.txt 主检出干干净净
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(l.path, 'other.txt'), 'brand new\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(true)
+    expect(await readFile(join(gitRoot, 'other.txt'), 'utf-8')).toBe('brand new\n')
+  })
+
+  /**
+   * **任务完成即回收:系统临时目录里那一份也要清。**
+   *
+   * 席位为了不把构建产物塞进工作树,会把 target / 日志写到 `tmpdir()` —— 那个动机是好的,
+   * 而它**恰好绕开**工作树里的自动回收:树被清、被删,那些东西一个都不跟着走。
+   * 跑机实测 `/tmp` 下 141 个条目、23 GB,最老的躺了 8 天。
+   */
+  describe('临时目录里的产出也自动回收', () => {
+    /** 假的 scratch:记下被要求删的东西,不真碰盘。 */
+    const fakeScratch = (entries: { path: string; kb?: number }[]) => {
+      const removed: string[] = []
+      return {
+        removed,
+        dep: {
+          list: async (slugs: readonly string[]) =>
+            entries.filter(e => slugs.some(s => e.path.includes(s))),
+          remove: async (p: string) => { removed.push(p) },
+        },
+      }
+    }
+
+    it('按 slug 精确匹配、只删本节点那几条,而且单独记一栏', async () => {
+      const n = node('root/00-a')
+      const slug = worktreeSlug('001', n.id)
+      const sc = fakeScratch([
+        { path: `/tmp/efftask-001-${slug}-target`, kb: 2048 },
+        { path: `/tmp/efftask-001-${slug}-cargo-check.log`, kb: 4 },
+        { path: '/tmp/别的-run-的东西', kb: 999 },   // 不该被碰
+      ])
+      const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, scratch: sc.dep })
+      await p.init()
+      const l = await p.acquire(n) as { path: string }
+      await writeFile(join(l.path, 'done.txt'), 'work\n')
+      await git(['add', '-A'], l.path)
+      await git(['commit', '-qm', 'x'], l.path)
+
+      const out = await p.wipeBuildOutputs(n)
+      expect(sc.removed).toEqual([
+        `/tmp/efftask-001-${slug}-target`,
+        `/tmp/efftask-001-${slug}-cargo-check.log`,
+      ])
+      // **单独一栏** —— 混进 removed 就会被屏幕念成「任务工作区里的」,而它在仓库之外
+      expect(out.scratch).toEqual(sc.removed)
+      expect(out.removed).not.toContain(`/tmp/efftask-001-${slug}-target`)
+      expect(out.freedKb).toBe(2052)
+    })
+
+    /**
+     * ⚠ **`slug.length >= 8` 那道闸这里测不了,不为它编一条空转的用例。**
+     *
+     * `pathFor` 的末段永远是 `worktreeSlug(runId, id)`,而它产出的是
+     * `efftask-<runId>-<8位hash>` —— 用真实入口构造不出退化的 slug。
+     * 那道闸挡的是「`worktreeSlug` 哪天变了 / `pathFor` 返回了个怪东西」的那一天
+     * (`cleanupWorktrees` 里同一道闸的注释逐字这么写)。
+     *
+     * 第一版这里硬写了一条,断言是 `expect(a === undefined || a.length >= 0).toBe(true)`
+     * —— 恒真,测的是空气。宁可留这段说明。
+     */
+    it('scratch 没给 → 行为与接它之前逐字相同(一条都不碰)', async () => {
+      const p = pool()
+      await p.init()
+      const n = node('root/00-a')
+      await p.acquire(n)
+      const out = await p.wipeBuildOutputs(n)
+      expect(out.scratch).toBeUndefined()
+    })
+
+    it('删某一条抛异常 → 不带走其余的,也不把节点判成失败', async () => {
+      const n = node('root/00-a')
+      const slug = worktreeSlug('001', n.id)
+      const p = createWorktreePool({
+        runId: '001', gitRoot, git, worktreeRoot,
+        scratch: {
+          list: async () => [
+            { path: `/tmp/efftask-001-${slug}-a`, kb: 1 },
+            { path: `/tmp/efftask-001-${slug}-b`, kb: 2 },
+          ],
+          remove: async (p2: string) => { if (p2.endsWith('-a')) throw new Error('EBUSY') },
+        },
+      })
+      await p.init()
+      await p.acquire(n)
+      const out = await p.wipeBuildOutputs(n)
+      expect(out.scratch).toEqual([`/tmp/efftask-001-${slug}-b`])
+      expect(out.error).toBeUndefined()
+    })
+  })
+
+  /**
+   * **ort 那一档:git 用两空格、一行、空格分隔** —— 解析散文的路走不通。
+   *
+   * ```
+   * error: Your local changes to the following files would be overwritten by merge:
+   *   f2.txt f3.txt              ← 不是 TAB,而且空格分隔对含空格的文件名不可解析
+   * Merge with strategy ort failed.
+   * ```
+   *
+   * 按 TAB 切的那一版在这一格摘出空清单 → 不 park → 七小时那条路照旧。
+   * 现在按结构算(树上脏的 ∩ 这次合并会碰的),不受措辞影响。
+   */
+  it('索引脏走 ort 那条消息 → 照样算得出挡路清单', async () => {
+    const reg = createEscapeRegistry()
+    const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, escapes: reg })
+    await p.init()
+    // 用户提交一笔,让回主干那一跳是真三方合并(ort 那条消息只在这时出现)
+    await writeFile(join(gitRoot, 'other.md'), 'mine\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    // 席位越界写主检出,而且**已暂存** —— 这正是走 ort 那条消息的条件
+    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    await git(['add', 'base.txt'], gitRoot)
+    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(true)
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\n')
+  })
+
+  /**
+   * **「无损」要连合并会写下什么一起证明。**
+   *
+   * 只比「工作区内容 == 集成分支那份」不够:HEAD 和集成分支**都**改过这个文件时,
+   * 三方合并产出的是一份合并结果,既不等于集成分支那份、也不等于我们丢掉的那份 ——
+   * 那时「合并会写回同样的字节」是假话。所以再要求这一侧没动过。
+   */
+  it('两边都改过同一文件 → 证明不了无损,一个字节不碰', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    // 节点改 base.txt 的第一行
+    await writeFile(join(l.path, 'base.txt'), 'from-node\ntail\n')
+    // 用户这一侧**也**改过它并提交 → 合并是真三方,产出不等于任何一边
+    await writeFile(join(gitRoot, 'base.txt'), 'user-line\ntail\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'user own commit'], gitRoot)
+    // 然后工作区里恰好摆成和集成分支将来那份一样 —— 上一版会据此判「无损」
+    await writeFile(join(gitRoot, 'base.txt'), 'from-node\ntail\n')
+
+    const res = await p.commitAndMerge(n)
+    // 证明不了 ⇒ 不动;用户那份原样留着
+    expect(res.trunk?.advanced).toBe(false)
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\ntail\n')
+  })
+
+  /**
    * **挡路清单按 TAB 切,不按标点猜。** 三席各自实测同一个洞。
    *
    * 上一版的判据是 `!l.includes(' ') && l.includes('.')`,于是 `Makefile`(无扩展名)

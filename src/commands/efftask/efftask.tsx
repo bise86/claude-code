@@ -852,7 +852,7 @@ async function makeWorktreePool(
     escapes?: import('../../tools/efftask/escapeRegistry.js').EscapeRegistry
     onEscape?: (info: { ref: string; files: readonly string[]; merged: boolean }) => void
     /** 「某个我们指望的优化没生效」—— 此前这类失败是零观测的。见 WorktreePoolDeps.onNotice。 */
-    onNotice?: (line: string) => void
+    onNotice?: (line: string, /** 去重键:同一个键只占一格。不给就按整串去重 —— 而串里嵌着会变的东西时那等于不去重。 */ key?: string) => void
   },
 ): Promise<{
   pool?: WorktreePool; reason?: string; notARepo?: boolean
@@ -904,6 +904,13 @@ async function makeWorktreePool(
     // 「腾出多少」必须是量出来的。`du` 不在时 duKb 回 undefined,而屏幕跟着说
     // 「大小未知」——比一个 0 诚实得多(`CleanupDeps.dirSizeKb` 的同一条规矩)。
     dirSizeKb: duKb,
+    /**
+     * 「任务完成即回收」连**系统临时目录**里那一份一起清。
+     *
+     * 和 `c` 键**共用同一个实现** —— 不是照抄一份:两处对「哪些条目属于这个节点」
+     * 的判据必须逐字相同,否则自动那条会漏下 `c` 键才认得出的东西(反过来更糟)。
+     */
+    scratch: tmpScratch,
   })
   const init = await pool.init()
   if (!init.ok) return { reason: init.reason }
@@ -1166,8 +1173,37 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
    * (每个子任务完成都失败一次),不去重的话它自己会把屏幕吃光。
    */
   const [runNotices, setRunNotices] = React.useState<string[]>([])
-  const pushNotice = React.useCallback((line: string): void => {
-    setRunNotices(prev => (prev.includes(line) ? prev : [...prev, line].slice(-20)))
+  /** 每条通知的去重键(见 `pushNotice`)。ref 而不是 state:它只服务去重,不该触发重绘。 */
+  const noticeKeys = React.useRef(new Map<string, string>())
+  /**
+   * ⚠ **按整串去重是假的去重。**
+   *
+   * 上一版是 `prev.includes(line)`,而最大的生产者
+   * (`pipeline` 每个节点合不回主干都报一次)把 `node.title` 嵌在串里 ——
+   * 每条都不一样,一次都命中不了,20 席一趟就是 20 条各不相同的告警把
+   * 上限打满,而「另有 N 条」一路涨。上面那句「不去重的话它自己会把屏幕吃光」
+   * 因此从来没生效过。
+   *
+   * 这和圆桌否掉「连续 N 次计数」的**同一个理由**(`noteSkip` 按整串去重,
+   * 而串里嵌着会变的文件名 → 永远数不到 N)在上一层原样重犯了。
+   *
+   * 所以去重按**调用方给的稳定键**:同一个原因只占一格,后来的覆盖先前的
+   * (内容更新、位置保持),没给键就退回按整串。
+   */
+  const pushNotice = React.useCallback((line: string, key?: string): void => {
+    const k = key ?? line
+    setRunNotices(prev => {
+      const idx = prev.findIndex(l => noticeKeys.current.get(l) === k)
+      if (idx >= 0) {
+        if (prev[idx] === line) return prev
+        noticeKeys.current.delete(prev[idx] as string)
+        noticeKeys.current.set(line, k)
+        const next = [...prev]; next[idx] = line
+        return next
+      }
+      noticeKeys.current.set(line, k)
+      return [...prev, line].slice(-20)
+    })
   }, [])
   /**
    * 越界被钉走时的报告 —— 走和 `onNotice` **同一块屏**(RunningView.problems)。
@@ -3240,9 +3276,21 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 而这条流此前只有结束屏读 —— 关口关掉之后回的就是这里,而 `ConfirmBacktrack`
        * 印的是「原因见任务树上的提示」。(接缝席真帧实测:一个字都没有)
        */
-      // runNotices 在后 —— 屏幕取的是**最新的**那几条(见 RunningView),而这一栏里
-      // 会动的、带着 stash ref 的是它;redoProblems 是整体替换的静态清单。
-      problems={[...redoProblems, ...runNotices]}
+      /**
+       * **两栏各自留位,不是简单拼起来再切。**
+       *
+       * 屏幕只印 3 条、取的是**最新的**那几条(见 `RunningView`)。直接拼的话
+       * `runNotices` 攒到 3 条(3 个节点合不回主干就够)就会把 `redoProblems`
+       * 整个挤出屏幕 —— 而后者存在的全部理由就是「按 `r`/`b` 被拒时屏幕上要有字」,
+       * **刚按下键就看不到反馈**。
+       *
+       * ⚠ 上一版的理由写反了:说 `redoProblems` 是整体替换的清单、「一次 `r` 拒绝就能
+       * 凑够 3 条」—— 实际它的 11 个生产者**全是单条**(`setRedoProblems([一条])`),
+       * 永远只有 1 条,被挤掉的从来是它。
+       *
+       * 所以给它留 1 格、通知留 2 格。
+       */
+      problems={[...redoProblems.slice(-1), ...runNotices.slice(-2)]}
     />
   }
   return (

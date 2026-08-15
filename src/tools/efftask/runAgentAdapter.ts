@@ -4,6 +4,7 @@ import { runAgent } from '../AgentTool/runAgent.js'
 import type { AgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import type { ToolUseContext, Tools } from '../../Tool.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
+import type { PermissionDenyDecision } from '../../types/permissions.js'
 import type { Message } from '../../types/message.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { runWithCwdOverride } from '../../utils/cwd.js'
@@ -650,13 +651,22 @@ export function makeRunAgentFn(deps: {
           } catch { /* 记账不能把这次调用带走 */ }
         }
         if (blocked) {
+          const message = `这个路径在**主检出**里,不是你的工作区:${escaped[0]}\n`
+            + `你的工作区是 ${req.cwd} —— 请改写那里的同名相对路径。\n`
+            + `方案和验收点里写的绝对路径是整趟运行共用的模板,对你这一席不适用:`
+            + `写进主检出的内容不在任何任务分支上,永远进不了集成分支,而且会挡住产出合回主干。`
+          /**
+           * `decisionReason` 是 `PermissionDenyDecision` 的**必填**字段,不是可选的。
+           * 上一版整个对象 `as never` 过去 —— 运行时不炸(消费方普遍写 `decisionReason?.type`),
+           * 但那正是这个仓库自己记过的「`as` 会让 tsc 本该报的错沉下去」。
+           * 用 `workingDir` 这个变体:它的语义就是「路径不在允许的工作目录里」,
+           * 而且填上之后权限调试面板能显示为什么被拒。
+           */
           return {
             behavior: 'deny',
-            message: `这个路径在**主检出**里,不是你的工作区:${escaped[0]}\n`
-              + `你的工作区是 ${req.cwd} —— 请改写那里的同名相对路径。\n`
-              + `方案和验收点里写的绝对路径是整趟运行共用的模板,对你这一席不适用:`
-              + `写进主检出的内容不在任何任务分支上,永远进不了集成分支,而且会挡住产出合回主干。`,
-          } as never
+            message,
+            decisionReason: { type: 'workingDir', reason: message },
+          } as PermissionDenyDecision as never
         }
       }
       // 通知**必须**用 try/catch 包住:一个抛异常的 UI 回调不能把这次工具调用带走,

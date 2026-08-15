@@ -1384,8 +1384,15 @@ describe('越界闸的四根线', () => {
       const wired = SRC.split('makeWorktreePool(runId!').filter(s => s.slice(0, 300).includes(key)).length
       expect(`${key}:${wired}/${calls}`).toBe(`${key}:${calls}/${calls}`)
     }
-    // 屏幕那一端 —— 摘掉 runNotices 就等于把两条通道一起剪断,而它此前不会红
-    expect(SRC).toContain('problems={[...redoProblems, ...runNotices]}')
+    /**
+     * 屏幕那一端 —— 摘掉 `runNotices` 就等于把两条通道一起剪断,而它此前不会红。
+     *
+     * **两栏各自留位**,不是拼起来再切:屏幕只印 3 条且取最新的,直接拼的话
+     * `runNotices` 攒到 3 条就把 `redoProblems` 整个挤出去 —— 而后者的全部理由
+     * 就是「按 `r`/`b` 被拒时屏幕上要有字」。它的 11 个生产者全是单条,永远只有 1 条,
+     * 被挤掉的从来是它。
+     */
+    expect(SRC).toContain('problems={[...redoProblems.slice(-1), ...runNotices.slice(-2)]}')
     /**
      * **取最新的,不是最前的。** 生产者 `pushNotice` 保留最新 20 条(`slice(-20)`),
      * 消费端如果是 `slice(0, 3)`,攒够 3 条之后新告警永远进不了屏幕 —— 两端方向相反。
