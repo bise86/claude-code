@@ -10,7 +10,7 @@ import { createUserMessage } from '../../utils/messages.js'
 import { runWithCwdOverride } from '../../utils/cwd.js'
 import type { RunControl } from './control.js'
 import type { RateLimitGate } from './rateLimitGate.js'
-import { escapedPathsIn, type EscapeRegistry } from './escapeRegistry.js'
+import { escapedPathsIn } from './escapedPaths.js'
 import { eventsFromMessage, type BriefResolver } from './agentEvents.js'
 import type { StreamHandle } from './agentStream.js'
 import type { RunAgentFn } from './roundtable.js'
@@ -452,11 +452,15 @@ export function makeRunAgentFn(deps: {
    */
   rateGate?: RateLimitGate
   /**
-   * **席位越界写主检出的归因登记簿。** 见 `escapeRegistry.ts`。
+   * **席位想写主检出、被拒了一次** —— 报一声(第二个参数是去重键)。
    *
-   * 给了才检测。缺省 = 行为与引入它之前逐字相同 —— 既有调用点和测试一个字不改。
+   * 缺省 = 不报,但**闸照样拦**(拦不拦不取决于有没有人听)。
+   *
+   * 这条线是判断「提示词治因那一步生效没有」的唯一观测手段:闸响得多说明方案/验收点
+   * 里还在给主检出的绝对路径。上一版把它记进一个 `claims()` 零消费者的登记簿,
+   * 等于没有。
    */
-  escapes?: EscapeRegistry
+  onEscapeBlocked?: (line: string, key: string) => void
   /**
    * 主检出根目录。**做成函数而不是值**:池子建在关口批准之后
    * (`efftask.tsx` 里三个 `poolRef.current = …`),而 `makeRunAgentFn` 构造在那之前 ——
@@ -471,10 +475,12 @@ export function makeRunAgentFn(deps: {
    * 见 `resolveLinks` —— 那样也不必去枚举「有哪些软链指向仓库」,那本来就枚举不完。)
    */
   /**
-   * 硬闸开关。**默认开**(`!== false`)。关掉之后只记录、不拦 ——
-   * 留这个口是因为拦截会改变席位行为,而这个仓库的规矩是「不可逆的默认要能被关掉」。
+   * (**没有「只记录不拦」那一档**。上一版留了个 `escapeGate` 开关,而它全仓没有任何
+   * 调用方 —— 于是它唯一的效果是让归因登记簿恒空、park-then-merge 整块变成死代码,
+   * 约 600 行为一个不存在的开关服务。要么做成用户按得到的开关,要么不留;
+   * 留一个「以后可能要」的模糊态是最差的。这里选不留 ——
+   * 闸误伤时的出路是修白名单/修判据,不是把整道闸关掉。)
    */
-  escapeGate?: boolean
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
@@ -611,21 +617,26 @@ export function makeRunAgentFn(deps: {
        * **只管写工具。**
        *
        * 上一版只看输入里有没有 `file_path`,不看是哪个工具 —— 于是 `Read` 一个主检出的
-       * 绝对路径也被当成越界拒掉。而 `/et` 自己把 `.claude/efftask/<runId>/…/node.md`
-       * 写在**用户检出**里(还写进了 `.git/info/exclude`),它**不在任何节点工作区里**,
-       * 提示词又明说让席位去读 `run.md` / `node.md` —— 席位照做就被拒,
-       * 拒绝信息还让它「改写工作区里的同名相对路径」,而那个文件在它工作区里根本不存在。
+       * 绝对路径也被当成越界拒掉,而**读一个文件从来不会挡住合并**。这一层的全部理由是
+       * 「写进主检出的内容到不了集成分支」,那句话对读不成立。
        *
-       * 每个 run 都在踩,是纯误伤。而且**是 `requireCanUseTool` 把它从「有时」放大成
-       * 「每次必踩」的**(以前自动放行钩子会让这一层整个消失)——
-       * 一个修复放大了另一个缺陷,对抗席点名的。
+       * 席位手上就有主检出的绝对路径(根方案的「工作目录」是它,而方案正文里的路径
+       * 又被全树复制 —— 见 `planPrompt`),所以它拿绝对路径去 `Read` 是常态;
+       * 而拒绝信息还让它「改写工作区里的同名相对路径」,那个文件在它工作区里可能根本不存在。
+       *
+       * ⚠ 上一版这里写的理由是「提示词明说让席位去读 `run.md` / `node.md`」——
+       * **全仓查不到这句提示词**,是我编的。白名单本身仍然对,但依据得是真的:
+       * 这个仓库为「凭空引用一个不存在的东西」在同一轮里付过四次账
+       * (`onProblems`/`notices`、`autoRescue`、`gitRootAliases`,以及这一条)。
+       *
+       * 而且**是 `requireCanUseTool` 把它从「有时」放大成「每次必踩」的**
+       * (以前自动放行钩子会让这一层整个消失)—— 一个修复放大了另一个缺陷。
        *
        * 白名单而不是黑名单:新增一个读工具不该自动获得被拒的资格,
        * 而新增一个写工具漏进来只是**少拦一次**(保守方向)。
        */
       const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
-      const escaped = deps.escapes !== undefined && deps.gitRoot !== undefined
-        && WRITE_TOOLS.has(toolNameOf(args[0]))
+      const escaped = deps.gitRoot !== undefined && WRITE_TOOLS.has(toolNameOf(args[0]))
         ? escapedPathsIn(args[1], {
           gitRoot: deps.gitRoot(),
           ...(req.cwd === undefined ? {} : { cwd: req.cwd }),
@@ -634,23 +645,25 @@ export function makeRunAgentFn(deps: {
         : []
       if (escaped.length > 0) {
         /**
-         * **拦下来的记成 `blocked`,不进 `owns()`。**
+         * **拦一次要说一次。**
          *
-         * 拦下来 = 一个字节没写 = 这个文件之后要是脏了,那不是我们造的。
-         * 上一版无差别地记,于是硬闸每拦一次就给 park-then-merge 伪造一份所有权凭证:
-         * 席位 t0 被拒 → 用户 t1 自己改同一个文件 → t2 合并被它挡住 → 全称判断通过 →
-         * **用户的活被 stash 走**(对抗席构造)。闸拦得越勤,伪证越多。
+         * 上一版把它记进一个登记簿(`escapes.note`),而那个登记簿的 `claims()`
+         * **全仓零消费者** —— 席位撞闸 40 次,屏幕、node.md、退出报告一个字都没有。
+         * 而这恰恰是判断「① 提示词改对没有」的唯一观测手段:闸响得多,说明提示词还在教
+         * 绝对路径;闸不响了,才说明治因那一步生效了。
+         *
+         * 现在直接上屏,不经过登记簿(它已删,理由见 `escapedPaths.ts` 文件头)。
+         * 去重键按**路径**:同一条路径撞 40 次只占一格,而不同路径各占一格 ——
+         * 要看的是「哪些路径在教它」,不是撞了多少次。
          */
-        const blocked = deps.escapeGate !== false
-        for (const p of escaped) {
-          try {
-            deps.escapes?.note({
-              nodeId: req.node.id, phase: req.phase, tool: toolNameOf(args[0]), path: p,
-              ...(blocked ? { blocked: true } : {}),
-            })
-          } catch { /* 记账不能把这次调用带走 */ }
-        }
-        if (blocked) {
+        try {
+          deps.onEscapeBlocked?.(
+            `「${req.node.title || req.node.id}」的席位想写主检出里的 ${escaped[0]} —— 已拒绝,`
+            + '它应该写自己的工作区。这类拒绝多说明方案/验收点里还在给主检出的绝对路径。',
+            `escape:${escaped[0]}`,
+          )
+        } catch { /* UI 回调不能把这次工具调用带走 */ }
+        {
           const message = `这个路径在**主检出**里,不是你的工作区:${escaped[0]}\n`
             + `你的工作区是 ${req.cwd} —— 请改写那里的同名相对路径。\n`
             + `方案和验收点里写的绝对路径是整趟运行共用的模板,对你这一席不适用:`

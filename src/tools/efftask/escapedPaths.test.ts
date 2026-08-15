@@ -1,11 +1,11 @@
 /**
- * `escapeRegistry` 的探针。
+ * `escapedPaths` 的探针。
  *
  * 这个模块的下游会**动用户的工作区**(park-then-merge),所以每一条判据都要能单独打中:
  * 归因错一次 = 把用户正在写的东西 stash 走。
  */
 import { describe, expect, it } from 'bun:test'
-import { createEscapeRegistry, escapedPathsIn, normalisePath, under } from './escapeRegistry.js'
+import { escapedPathsIn, normalisePath, under , relativisePaths } from './escapedPaths.js'
 
 describe('under —— 按路径段比,不按 startsWith', () => {
   /**
@@ -97,55 +97,6 @@ describe('escapedPathsIn —— 摘出「落在主检出、不在自己工作区
   })
 })
 
-describe('createEscapeRegistry', () => {
-  const c = (path: string, nodeId = 'n1') => ({ nodeId, phase: 'execute', tool: 'Edit', path })
-
-  it('点名过的路径 owns 为真,没点名的为假', () => {
-    const r = createEscapeRegistry()
-    r.note(c('/repo/pkg/a.rs'))
-    expect(r.owns('/repo/pkg/a.rs')).toBe(true)
-    expect(r.owns('/repo/pkg/b.rs')).toBe(false)
-  })
-
-  /** **边沿触发**:越界 4 次记 4 条。指纹方案只看得见第 1 次,这正是它被否掉的理由之一。 */
-  it('同一条路径被点名多次 → claims 记多条,size 只算一条', () => {
-    const r = createEscapeRegistry()
-    for (let i = 0; i < 4; i++) r.note(c('/repo/pkg/a.rs'))
-    expect(r.claims()).toHaveLength(4)
-    expect(r.size()).toBe(1)
-  })
-
-  it('结尾斜杠/重复斜杠归一之后仍然认得出', () => {
-    const r = createEscapeRegistry()
-    r.note(c('/repo//pkg/a.rs'))
-    expect(r.owns('/repo/pkg/a.rs')).toBe(true)
-  })
-
-  it('空登记簿:owns 恒假(默认不动用户的工作区)', () => {
-    expect(createEscapeRegistry().owns('/repo/pkg/a.rs')).toBe(false)
-  })
-
-  /**
-   * **被硬闸拦下的尝试进 claims,不进 owns。**
-   *
-   * `owns()` 的下游是 park-then-merge,语义必须是「这个文件现在的脏是**我们造的**」。
-   * 拦下来 = 一个字节没写 = 之后它要是脏了,那是用户干的。对抗席构造的链条:
-   * 席位 t0 被拒(但拿到所有权)→ 用户 t1 自己改同一个文件 → t2 合并被它挡住 →
-   * 全称判断通过 → **用户的活被 stash 走**。闸拦得越勤,伪造的凭证越多。
-   */
-  it('拦下来的尝试:claims 记得,owns 不认', () => {
-    const r = createEscapeRegistry()
-    r.note({ ...c('/repo/pkg/a.rs'), blocked: true })
-    expect(r.claims()).toHaveLength(1)   // 屏幕要说得出「席位试过」
-    expect(r.owns('/repo/pkg/a.rs')).toBe(false)
-    expect(r.size()).toBe(0)
-    // 同一条路径后来**真被写进去**了(闸关着 / 走 Bash)→ 这时才算数
-    r.note(c('/repo/pkg/a.rs'))
-    expect(r.owns('/repo/pkg/a.rs')).toBe(true)
-    expect(r.size()).toBe(1)
-  })
-})
-
 describe('normalisePath —— `.` 与 `..` 要消掉', () => {
   /**
    * 登记簿是**按字符串做键**的,而 `intoTrunk` 查的是 `${gitRoot}/${git 报的相对路径}`。
@@ -192,5 +143,51 @@ describe('escapedPathsIn —— 软链由调用方注入的 realpath 解开', ()
     expect(escapedPathsIn(
       { file_path: `${G}/pkg/a.rs` }, { gitRoot: G, cwd: W, realpath: () => undefined },
     )).toEqual([`${G}/pkg/a.rs`])
+  })
+})
+
+/**
+ * **把方案里指向仓库内的绝对路径削成相对。**
+ *
+ * 病根:根方案作者收到的「工作目录」逐字是主检出绝对路径,它写进方案正文之后被
+ * 子节点 goal 继承和 plan JSON 回灌复制到全树(跑机 node.md 里 2566 处)。
+ * 而那一席**不在越界闸内**(没有 `req.cwd`),只能在它的输出上削。
+ */
+describe('relativisePaths', () => {
+  const R = ['/home/e/tb/proj']
+
+  it('仓库内的削成相对', () => {
+    expect(relativisePaths('改 /home/e/tb/proj/pkg/sql/a.rs', R)).toBe('改 pkg/sql/a.rs')
+  })
+
+  /** **仓库外的一个字不动** —— 那些可能是用户故意写的(参考仓库、日志目录),相对化毫无意义。 */
+  it('仓库外的绝对路径原样保留', () => {
+    expect(relativisePaths('看 /etc/hosts 和 ~/.config/x', R)).toBe('看 /etc/hosts 和 ~/.config/x')
+  })
+
+  /**
+   * **段边界,不是 `startsWith`。** 后者会把 `/repo-backup/x` 削成 `-backup/x` ——
+   * 这个仓库为同一类前缀误判付过账(`buildOutputs` 的 proven 归属,变异测试抓出来的)。
+   */
+  it('同前缀的兄弟目录不许被削', () => {
+    expect(relativisePaths('别碰 /home/e/tb/proj-backup/x', R)).toBe('别碰 /home/e/tb/proj-backup/x')
+    expect(relativisePaths('也别碰 /home/e/tb/projx/y', R)).toBe('也别碰 /home/e/tb/projx/y')
+  })
+
+  /** 光秃秃的根本身 → `.`,别削成空串让句子塌掉(「在  里跑」)。 */
+  it('根本身削成 .', () => {
+    expect(relativisePaths('在 /home/e/tb/proj 里跑', R)).toBe('在 . 里跑')
+  })
+
+  /** 多个根时**长的先削** —— 否则 `/a` 会先命中 `/a/b` 里的前缀,把它削成 `/b`。 */
+  it('嵌套的根:长的先削', () => {
+    expect(relativisePaths('/a/b/x.rs', ['/a', '/a/b'])).toBe('x.rs')
+  })
+
+  it('没有根 / 空文本 → 原样返回', () => {
+    expect(relativisePaths('/a/b', [])).toBe('/a/b')
+    expect(relativisePaths('', R)).toBe('')
+    // `/` 单独一个不算根 —— 削它会把每一条绝对路径都变成相对
+    expect(relativisePaths('/etc/x', ['/'])).toBe('/etc/x')
   })
 })

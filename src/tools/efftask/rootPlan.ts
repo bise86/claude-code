@@ -11,6 +11,7 @@
 // surface after the gate — the exact "gate describes something other than the run" failure
 // the confirmation gates exist to prevent.
 import { ANSWER_TAGS, answerTag, hollow, MIN_FIELD_CHARS, parsePlanOutput } from './parseOutput.js'
+import { relativisePaths } from './escapedPaths.js'
 import type { StreamHandle } from './agentStream.js'
 import { planPrompt, seatPreamble, type PlanPromptCtx } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
@@ -201,9 +202,29 @@ export async function draftRootPlan(args: {
  * its own first plan call. Setting only `plan`/`kind` would have looked identical at the
  * gate and been silently discarded on the run's first step.
  */
-export function applyRootDraft(root: TaskNode, draft: RootDraft, now: string): void {
+export function applyRootDraft(
+  root: TaskNode, draft: RootDraft, now: string,
+  /**
+   * 主检出根 —— 给了就把方案里指向仓库内的绝对路径削成仓库根相对。
+   *
+   * **这一格是必须削的那一格。** 根方案作者收到的「工作目录」逐字是主检出绝对路径
+   * (根节点没有 worktree,`planPrompt` 那一行落到 `ctx.cwd`),而它写进 solution /
+   * acceptance 之后会被子节点 goal 继承和执行提示词的 plan JSON 回灌复制到全树 ——
+   * 跑机 node.md 里 2566 处就是这么长出来的。
+   *
+   * 而且这一席**不在越界闸内**:它没有 `req.cwd`,`escapedPathsIn` 第一行就早退。
+   * 也就是说它既是污染源,又不受拦截 —— 只能在它的输出上削。
+   */
+  gitRoot?: string,
+): void {
   root.kind = draft.kind
-  root.plan = { ...draft.plan }
+  const f = (s: string): string =>
+    (gitRoot ? relativisePaths(s, [gitRoot]) : s)
+  root.plan = {
+    ...draft.plan,
+    solution: f(draft.plan.solution), keyPoints: f(draft.plan.keyPoints),
+    risks: f(draft.plan.risks), acceptance: f(draft.plan.acceptance),
+  }
   // An executable root has no children, and an empty list must still mean "confirmed":
   // presence of the field is the signal, not its length.
   root.confirmedDraft = { children: draft.children.map(c => ({ title: c.title, deps: [...c.deps] })) }

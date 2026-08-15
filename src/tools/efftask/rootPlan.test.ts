@@ -134,6 +134,37 @@ describe('根方案关口 · 确认后真的生效', () => {
     expect(root.updatedAt).toBe('2026-07-26T00:00:00Z')
   })
 
+  /**
+   * **根方案是那 2566 处绝对路径的第一作者,而它不在越界闸内。**
+   *
+   * 它收到的「工作目录」逐字是主检出绝对路径(根节点没有 worktree),写进方案正文之后
+   * 被子节点 goal 继承和执行提示词的 plan JSON 回灌复制到全树;而这一席没有 `req.cwd`,
+   * `escapedPathsIn` 第一行就早退 —— 既是污染源,又不受拦截。只能在它的输出上削。
+   */
+  it('封存时把方案里指向仓库内的绝对路径削成相对', () => {
+    const root = makeRootNode(cfg(), NOW)
+    applyRootDraft(root, {
+      ...draft,
+      plan: {
+        solution: '改 /main/repo/pkg/sql/a.rs',
+        keyPoints: '参考 /etc/hosts',          // 仓库外的不许动
+        risks: '别碰 /main/repo-backup/x',      // 同前缀的兄弟目录不许误伤
+        acceptance: '在 /main/repo 里跑测试',
+      },
+    }, NOW, '/main/repo')
+    expect(root.plan.solution).toBe('改 pkg/sql/a.rs')
+    expect(root.plan.keyPoints).toBe('参考 /etc/hosts')
+    expect(root.plan.risks).toBe('别碰 /main/repo-backup/x')
+    expect(root.plan.acceptance).toBe('在 . 里跑测试')
+  })
+
+  /** 拿不到 gitRoot(隔离不可用那一档)→ 原样封存,削不了不是拒绝干活的理由。 */
+  it('没有 gitRoot → 一个字不削', () => {
+    const root = makeRootNode(cfg(), NOW)
+    applyRootDraft(root, { ...draft, plan: { ...draft.plan, solution: '改 /main/repo/a.rs' } }, NOW)
+    expect(root.plan.solution).toBe('改 /main/repo/a.rs')
+  })
+
   it('applyRootDraft copies, so later edits to the draft cannot reach the sealed node', () => {
     const root = makeRootNode(cfg(), NOW)
     const mutable: RootDraft = { ...draft, children: [{ title: 'AA', deps: ['x'] }] }

@@ -1,6 +1,5 @@
 import { integrationBranch, worktreeBranch, worktreeSlug } from './worktreeId.js'
 import { pinAndClear } from './snapshot.js'
-import type { EscapeRegistry } from './escapeRegistry.js'
 import { EFFTASK_INTERNAL_PATHS, wipeBuildOutputsAt, type BuildWipeOutcome } from './buildOutputs.js'
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import type { TaskNode } from './types.js'
@@ -80,23 +79,16 @@ export interface WorktreePoolDeps {
   /** Where per-node worktrees live. */
   worktreeRoot: string
   /**
-   * **席位越界写了主检出、挡住回主干那一跳时,报一声。**
+   * **我们把一份未提交的内容钉成了耐久 ref** —— 报一声(路径 + ref)。
    *
-   * 不是 `trunkSkips`:那一栏的语义是「有东西没送到你的目录」,而 park-then-merge
-   * 成功那一路**送到了** —— 用一栏说两件相反的事,屏幕就又开始说假话。
+   * `refs/et/rescued/*` 是**活 ref**,全仓没有任何扫描器会再列出来
+   * (`sweepStashBackups` 扫的是另一个前缀,`scanStranded` 的 fsck 只看 unreachable)。
+   * 不报的话,用户取回自己那份东西的唯一线索就永久消失。
    *
-   * 缺省 = 不报(既有调用点与测试逐字不变)。真正的接线在 runOrchestrator,
-   * 一路到 `RunningView.problems` —— 那是**唯一**一条运行中常驻的通道
-   * (`onProblems` / `notices` 都不是,这一条踩过两次)。
+   * 三个可达的生产者都在这一层:前置同步收拾、合并失败洗集成工作区(两处)。
+   * 缺省 = 不报(既有调用点与测试逐字不变)。
    */
-  onEscape?: (info: { ref: string; files: readonly string[]; merged: boolean }) => void
-  /**
-   * 席位越界写主检出的**归因登记簿**(见 escapeRegistry)。
-   *
-   * 缺省 = 没有归因源 = park-then-merge 那条路**一次都不会走**,行为与引入它之前逐字相同。
-   * 这是刻意的:没有证据就不动用户的工作区。
-   */
-  escapes?: EscapeRegistry
+  onPinned?: (info: { ref: string; where: string }) => void
   /**
    * **一句给运行中那块屏的话。**
    *
@@ -146,7 +138,7 @@ export interface WorktreePoolDeps {
 export type WorktreePool = ReturnType<typeof createWorktreePool>
 
 export function createWorktreePool(deps: WorktreePoolDeps) {
-  const { runId, gitRoot, git, worktreeRoot, dirSizeKb, onEscape, onNotice, escapes, scratch } = deps
+  const { runId, gitRoot, git, worktreeRoot, dirSizeKb, onPinned, onNotice, scratch } = deps
   /**
    * git 的第一句**失败原话** —— 报给人看时只要这一句,别把整页 stderr 灌上屏。
    *
@@ -176,40 +168,7 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     s.startsWith('"') && s.endsWith('"') && s.length >= 2 ? s.slice(1, -1) : s
   const intBranch = integrationBranch(runId)
 
-  /**
-   * 把**主检出**里越界席位留下的改动钉成一条耐久 ref,并清干净工作区。
-   *
-   * 和 `pinBeforeWipe` 共用 `pinAndClear`(同一条理由:`stash create` 拿不到未跟踪文件),
-   * 区别只有对象 —— 那个钉的是集成工作区,这个钉的是用户的主检出。
-   * 抛异常一律吞掉并返回 `ok: false`:**钉快照永远不许把一次合并变成一次崩溃**。
-   */
-  const pinEscape = async (
-    at: string,
-    /**
-     * **只钉这几条。** 归因只证明了「挡路的那几条是席位干的」,所以动手的范围也只能是它们 ——
-     * 不给就是整棵树(`m` 键那条路,那里用户是自己按的按钮)。
-     */
-    only?: readonly string[],
-  ): Promise<{ ok: boolean; ref?: string; files?: readonly string[] }> => {
-    try {
-      // `:(literal)` 与 `pinAndClear` 同一条理由:这些是字面文件名,不是通配符。
-      // 两处必须一致 —— 屏幕上念的那份和真正被收走的那份不同,就又是一句上屏的假话。
-      const st = await git(
-        ['-c', 'core.quotepath=false', 'status', '--porcelain', '-uall',
-          ...(only ? ['--', ...only.map(p => `:(literal)${p}`)] : [])],
-        at,
-      )
-      const files = st.code === 0
-        // `slice(3)` 之后可能还带一层 C 引号(`"my notes.md"`)—— quotepath 关掉也挡不住
-        // 含空格那一格。剥掉它,否则屏幕上念的文件名和盘上的不是一个。
-        ? st.stdout.split('\n').map(l => unquote(l.slice(3).trim())).filter(Boolean)
-        : []
-      const res = await pinAndClear({ git, gitRoot, runId }, at, only)
-      return res.ref === undefined ? { ok: false } : { ok: true, ref: res.ref, files }
-    } catch {
-      return { ok: false }
-    }
-  }
+
 
   /**
    * **抹掉集成工作区之前,把里面的未提交内容钉成一条耐久 ref。**
@@ -223,10 +182,18 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
    * 但它要能被看见,所以返回 ref 名(拿不到就 undefined,由调用方照实上屏)。
    */
   const pinBeforeWipe = async (): Promise<string | undefined> => {
+    /**
+     * **钉住了就报出去。** 这三个调用点都是可达的,而在此之前它们的 ref 只进
+     * `onNotice`(滚动屏)和 execStatus 注记 —— 一条都没进退出报告,
+     * 而 `refs/et/rescued/*` 是活 ref,没有任何扫描器会再列出来。
+     */
     try {
       // `pinAndClear` 而不是 `pinSnapshot`:下一行就要 clean -fd,而 `stash create` 拿不到
       // 未跟踪文件 —— 而那正是这棵树上最常见的一份丢失(席位在里面跑过构建)。
       const res = await pinAndClear({ git, gitRoot, runId }, intPath)
+      if (res.ref !== undefined) {
+        try { onPinned?.({ ref: res.ref, where: intPath }) } catch { /* UI only */ }
+      }
       return res.ref
     } catch {
       // 钉快照永远不许把一次合并变成一次崩溃。
@@ -699,76 +666,76 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * 两条判据是**或**的关系,而外层仍然是**全称** —— 只要有一条既归因不到、又证明不了
      * 无损,就整个不动。
      */
+    /** `<mode> <type> <sha>\t<path>` → `mode sha`;这条路径不在那棵树上就返回 undefined。 */
+    const entryIn = async (ref: string, p: string): Promise<string | undefined> => {
+      const r = await git(['ls-tree', ref, '--', `:(literal)${p}`], gitRoot)
+      const m = /^(\d+) \w+ ([0-9a-f]+)/.exec(r.stdout.trim())
+      return m ? `${m[1]} ${m[2]}` : undefined
+    }
+    /** 索引里那一份(`<mode> <sha> <stage>\t<path>`)。不在索引里(未跟踪)返回 undefined。 */
+    const entryInIndex = async (p: string): Promise<string | undefined> => {
+      const r = await git(['ls-files', '--stage', '--', `:(literal)${p}`], gitRoot)
+      const m = /^(\d+) ([0-9a-f]+) \d/.exec(r.stdout.trim())
+      return m ? `${m[1]} ${m[2]}` : undefined
+    }
+    /** 工作区里那个文件的 `mode sha`。`diff --no-index` 退出码是 1(有差异),不能查它。 */
+    const entryInTree = async (p: string): Promise<string | undefined> => {
+      const abs = `${gitRoot}/${p}`
+      const raw = await git(['diff', '--no-index', '--raw', '/dev/null', abs], gitRoot)
+      const mode = /^:\d+ (\d+) /.exec(raw.stdout.trim())?.[1]
+      const sha = await git(['hash-object', '--', abs], gitRoot)
+      return mode && sha.code === 0 ? `${mode} ${sha.stdout.trim()}` : undefined
+    }
     const losslessAt = async (p: string): Promise<boolean> => {
-      // 合并将要写入的那个 blob。拿不到(这次合并根本不碰它 / 它要被删掉)→ 证明不了。
-      const want = await git(['rev-parse', `${intBranch}:${p}`], gitRoot)
-      if (want.code !== 0) return false
-      const have = await git(['hash-object', '--', `${gitRoot}/${p}`], gitRoot)
-      if (have.code !== 0 || have.stdout.trim() !== want.stdout.trim()) return false
       /**
-       * **还要证明合并写下去的确实就是这个 blob。**
+       * 判据要**连模式一起比,还要看索引**。上一版只比 blob 内容,反对席三个实测全中:
        *
-       * 只比「工作区内容 == 集成分支上那份」是不够的:如果 HEAD 和集成分支**都**改过这个
-       * 文件,三方合并产出的是一份**合并结果**,既不等于集成分支那份,也不等于我们刚丢掉
-       * 的那份 —— 那时「合并会写回同样的字节」这句话是假的(内容仍可从集成分支取回,
-       * 所以不丢东西,但屏幕上那句话不成立,而这个仓库把「屏幕说假话」当 bug 治)。
-       *
-       * 加一条:HEAD 上这个文件和**合并基**上的一样(也就是这一侧没动过)。
-       * 那么三方合并对这条路径就是「取对面那一版」,写下去的逐字节就是 `want`。
-       * 基拿不到就当证明不了 —— 保守方向。
+       *  - **只改了权限位**:`hash-object` 只看内容 → 判「无损」→ `checkout HEAD --`
+       *    把 `+x` 抹掉,而屏幕说「逐字节没有损失」。实测 `:100644 100755 587be6b … M`。
+       *  - **索引里躺着第三份**(`MM`):判据一次都没看索引 → 用户 `git add` 过的那份
+       *    被覆盖成 dangling blob。
+       *  - **未跟踪的新文件**:`rev-parse HEAD:p` 直接 `fatal` → 恒判假 —— 而
+       *    「The following **untracked** working tree files would be overwritten」
+       *    正是事故的原形。对一次 **add** 来说合并根本不做三方,它就是写 `want`,
+       *    丢弃工作区那份是**平凡可证明**的,而上一版说不出来。
        */
+      const want = await entryIn(intBranch, p)
+      const have = await entryInTree(p)
+      if (want === undefined || have === undefined || have !== want) return false
       const base = await git(['merge-base', 'HEAD', intBranch], gitRoot)
       if (base.code !== 0) return false
-      const mine = await git(['rev-parse', `HEAD:${p}`], gitRoot)
-      const theirs = await git(['rev-parse', `${base.stdout.trim()}:${p}`], gitRoot)
-      // 两边都拿不到(这条路径是双方新增的)也算「我这侧没动过」不成立 —— 不证明。
-      return mine.code === 0 && theirs.code === 0 && mine.stdout.trim() === theirs.stdout.trim()
+      const mine = await entryIn('HEAD', p)
+      const theirs = await entryIn(base.stdout.trim(), p)
+      const idx = await entryInIndex(p)
+      // ① 双方都没有 ⇒ 这次合并是一次 **add**,直接写 `want`。索引里有东西说明用户
+      //    `git add` 过一份别的,那是第三份内容,不能证明。
+      if (mine === undefined && theirs === undefined) return idx === undefined
+      // ② 我这侧没动过 ⇒ 三方合并对这条路径就是「取对面那一版」,写下去逐字节就是 `want`。
+      //    索引必须和 HEAD 一致 —— 否则同样是第三份内容。
+      if (mine !== undefined && theirs !== undefined && mine === theirs) return idx === mine
+      return false
     }
-    const owned = (p: string): boolean =>
-      escapes !== undefined && (escapes.owns(`${gitRoot}/${p}`) || escapes.owns(p))
-    /** 归因到席位的那几条 —— 它们带着**够不到任何分支**的内容,必须钉。 */
-    const seatPaths: string[] = []
-    /** 可证明无损的那几条 —— 直接丢,不用钉(钉了也是钉一份和分支上一模一样的字节)。 */
+    /**
+     * 可证明无损的那几条 —— 直接清掉再重试合并。
+     *
+     * **判据是全称的**:只要有一条证明不了,就整个不动(拒绝合并、如实报告、
+     * 一个字节不碰)。混进去一条用户的改动,动它就是丢他的活。
+     */
     const losslessPaths: string[] = []
     if (overwriteBlocked && restored && blockedPaths.length > 0) {
       for (const p of blockedPaths) {
-        if (owned(p)) seatPaths.push(p)
-        else if (await losslessAt(p)) losslessPaths.push(p)
+        if (await losslessAt(p)) losslessPaths.push(p)
       }
     }
-    const parkable = blockedPaths.length > 0
-      && seatPaths.length + losslessPaths.length === blockedPaths.length
+    const parkable = blockedPaths.length > 0 && losslessPaths.length === blockedPaths.length
     if (overwriteBlocked && restored && parkable) {
-      /**
-       * **只钉挡路的那几条,不钉整棵树。**
-       *
-       * 判据是「挡路的每一条都归因到席位」,而上一版的动作是 `stash push -u` 无 pathspec ——
-       * 全称判断保护的是名单,清空的却是全树。质量席实测:挡路的只有 `a.ts`,
-       * 用户没挡路的 `user.ts` 和未跟踪的 `user-new.txt` 一并被收走,
-       * 而 `onEscape.files` 还把这三条一起念成「有席位把文件写到了主检出」—— 一句上屏的假话。
-       */
-      /**
-       * 可证明无损的那几条**直接清掉,不钉** —— 钉一份和分支上一模一样的字节,只会给用户
-       * 一条永远用不上的 ref 和一句看不懂的话。已跟踪的还原成 HEAD,未跟踪的删掉;
-       * 两种情形合并都会写回同样的字节。
-       */
+      // 已跟踪的还原成 HEAD,未跟踪的删掉 —— 两种情形合并都会写回同样的字节(见 losslessAt)。
       for (const p of losslessPaths) {
         const co = await git(['checkout', 'HEAD', '--', `:(literal)${p}`], gitRoot)
         if (co.code !== 0) await git(['clean', '-f', '--', `:(literal)${p}`], gitRoot)
       }
-      /**
-       * ⚠ 通知**放到重试成功之后**再发。
-       *
-       * 上一版在这儿就说「已就地清掉,合并会写回同样的字节」,而下面的 `pinEscape`
-       * 一旦失败就直接跳过重试 —— 文件已经删了,承诺没兑现,屏幕上却写着没有损失。
-       * 那句话只有在合并真的写回去之后才成立。
-       */
-      // 归因到席位的那几条才钉。一条都没有(全是无损那一类)就不用钉,直接重试。
-      const pinned = seatPaths.length > 0
-        ? await pinEscape(gitRoot, seatPaths)
-        : { ok: true, ref: undefined, files: [] as readonly string[] }
-      if (pinned.ok) {
-        const retry = await git(['merge', '--no-edit', '--no-verify', intBranch], gitRoot)
+      const retry = await git(['merge', '--no-edit', '--no-verify', intBranch], gitRoot)
+      {
         if (retry.code === 0) {
           trunkMerged++
           trunkSkips = []
@@ -777,13 +744,9 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
           const behind2 = await git(['merge-base', '--is-ancestor', branch, intBranch], gitRoot)
           if (behind2.code !== 0) await git(['merge', '--ff-only', branch], intPath)
           /**
-           * **成功也要说** —— 我们刚刚动了用户的工作区。这条不进 `trunkSkips`
-           * (那一栏的语义是「没送到」,而这次送到了),走 `onEscape` 单独报。
+           * **合并真的写回去了,那句「没有损失」现在才成立。**
+           * 早于兑现的承诺就是假话:清理发生在重试之前,而重试可能失败。
            */
-          if (pinned.ref !== undefined) {
-            onEscape?.({ ref: pinned.ref, files: pinned.files ?? [], merged: true })
-          }
-          // 合并真的写回去了,那句「没有任何损失」现在才成立(见上面的 ⚠)。
           if (losslessPaths.length > 0) {
             onNotice?.(
               `主检出里有 ${losslessPaths.length} 处改动(${losslessPaths.slice(0, 2).join('、')}`
@@ -831,30 +794,6 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
          * 报失败原因要用**最后一次**失败的输出:走到这里说明 retry 才是现场。
          */
         lastFail = retry
-        if (pinned.ref !== undefined) {
-        /**
-         * 钉走了却还是合不上 —— 那就不是脏树的问题。把改动放回去,别白拿走用户的东西。
-         *
-         * **按 ref 还原,不能裸 `stash pop`。** `pinAndClear` 钉成耐久 ref 之后
-         * 会**把自己那条 stash 条目 drop 掉**(snapshot.ts,刻意的:`refs/stash` 是
-         * 全仓库共享的),所以走到这里时栈顶剩的是**用户自己**那条。三席各自真 git 实测
-         * 同一个结果:席位那份**没**放回来,用户一条无关的 stash 被摊进工作区**并删除**,
-         * 而且树反而更脏了 —— 下一次合并接着被它堵。注释说的和代码做的正好相反。
-         *
-         * `stash apply` 吃任何 stash 形状的提交,而耐久 ref 指的就是那个提交,
-         * 未跟踪的那一半在它的第三个父提交里,一并回来。
-         */
-        const back = await git(['stash', 'apply', pinned.ref], gitRoot)
-        if (back.code !== 0) {
-          onNotice?.(
-            `钉走的改动没能自动放回主检出(${first(back)}) —— `
-            + `一个字节都没丢,用 git stash apply ${pinned.ref} 取回。`,
-            // 键带 ref:每条 ref 都要各自看得见,它是取回那份内容的唯一线索。
-            `stash-apply:${pinned.ref}`,
-          )
-        }
-        onEscape?.({ ref: pinned.ref, files: pinned.files ?? [], merged: false })
-        }
       }
     }
     /**
@@ -891,6 +830,24 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       : `把产出合回 ${branch} ${what},**而且自动还原失败**:你的工作区里现在留着一次未完成的合并` +
         `(解完 git commit,或 git merge --abort 回到合并前)`
     noteSkip(why)
+    /**
+     * **清掉的东西,合没合上都要说。**
+     *
+     * 「可证明无损」那几条是在重试**之前**就地清掉的,而那句「逐字节没有损失」原先只在
+     * 重试成功那一路发 —— 重试失败时文件已经删了、合并没发生,屏幕上一个字都没有。
+     * 反对席点名的静默破坏,而且它就长在我为「承诺早于兑现」写的那次修复里。
+     *
+     * 内容仍可从集成分支取回(那是这条判据的全部依据),所以这里说的是**怎么取**。
+     */
+    if (losslessPaths.length > 0) {
+      onNotice?.(
+        `主检出里 ${losslessPaths.length} 处和集成分支内容相同的改动`
+        + `(${losslessPaths.slice(0, 2).join('、')}${losslessPaths.length > 2 ? ' 等' : ''})`
+        + '已被就地清掉,但这一跳最终没合上 —— 那几份内容和集成分支上的逐字节相同,'
+        + `用 git checkout ${intBranch} -- <路径> 取回。`,
+        'lossless-cleared-but-failed',
+      )
+    }
     // 这一跳没成 —— 把前置同步造的那个 merge commit 撤掉,别在集成分支上留没人预期的东西。
     await rollbackSync()
     return { advanced: false, reason: why, conflicted: left.length > 0 || !restored }

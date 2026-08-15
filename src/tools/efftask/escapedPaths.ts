@@ -1,74 +1,35 @@
-// src/tools/efftask/escapeRegistry.ts
+// src/tools/efftask/escapedPaths.ts
 //
-// **哪些主检出里的路径,是被席位点名写过的。**
+// **一次工具调用要写的路径,落在主检出里还是落在这个席位自己的工作区里。**
 //
-// 病灶:隔离靠 cwd,而**绝对路径绕开 cwd**。跑机 .30 run 001 实测:席位用提示词里写死的
-// 绝对路径写了主检出(node.md 全文里指向主检出的绝对路径 2566 处,是方案自己教的),
-// 于是回主干那一跳被 git 拒绝(`Your local changes … would be overwritten by merge`),
-// 而集成分支照常前进 —— 第一次静默七小时,四小时后复发。
+// ## 这里曾经还有一个「归因登记簿」,已经删掉
 //
-// ## 为什么要有这么一个登记簿,而不是「脏了就钉走」
+// 那个登记簿记「哪条路径被哪个席位写过」,给 park-then-merge 判断「挡路的脏文件是不是
+// 我们自己造的」。它在生产上**一次都没有生效过**:硬闸默认开 ⇒ 每次越界都被拒 ⇒
+// 记录全是「拦下来的」⇒ `owns()` 结构性恒假 ⇒ park 整块是死代码(约 600 行含测试)。
 //
-// `intoTrunk` 分不清挡路的那个脏文件是**席位越界**还是**用户自己在改**。
-// 一律钉走会把用户正在写的东西悄悄收进 stash —— 而「检测到脏就自动 stash」这一档
-// 用户明确否决过(`stashGuard.ts` 文件头逐字写着「默认关,由用户按一下打开」)。
+// 病根是两个特性在争同一个证据源:**闸只看得见「我们没让它写成」的那些**,
+// 而 park 要的是「已经落了盘并挡住合并」的那些。闸拦得越干净,归因这条路越空。
 //
-// 所以判据是**归因**:这条路径被某个席位点名写过 → 是工具自己造的烂摊子,收拾它天经地义;
-// 没有被点名 → 那是用户的东西,维持原行为(拒绝合并、如实报告、一个字节不碰)。
+// 替代它的是一条**不需要知道是谁写的**判据(`worktreePool.losslessAt`):
+// 工作区里这条路径的内容/模式,和这次合并将要写入的一模一样 ⇒ 丢弃它可证明无损。
+// 那条判据严格更强 —— 不依赖任何证据源,而且对用户自己的改动也安全。
 //
-// ## 为什么是「工具输入」而不是「前后拍指纹」
+// 「被拒了一次」这件事仍然要上屏,走 `onEscapeBlocked`,不再经过登记簿
+// (登记簿的 `claims()` 全仓零消费者,席位撞闸 40 次没有任何人知道)。
 //
-// 圆桌四席一致否掉了指纹方案,三条实测理由:
-//  1. 20 路并发 `git status` 打在 gitRoot 上会抢 `index.lock` → merge 失败 38/40,
-//     **检测手段自己复现了要修的那个故障**;
-//  2. porcelain 是**电平**不是**边沿** —— 同一个文件被改第二次时前后文本相同,
-//     实测「1 个席位越界 5 次 → 只被点名 1 次,而 14 个诚实席位被冤枉」;
-//  3. `verifySnapshot` 自己的注释(pipeline.ts:2364-2374)明令禁止把它用在共享目录上。
+// ## 病灶
 //
-// 工具输入是**边沿触发**的:越界 4 次记 4 条,而且天然带席位身份。
-// 覆盖面要说清:Edit/Write/MultiEdit/NotebookEdit 看得见 `file_path`;
-// **Bash 与 MCP 看不见** —— 那一类归因不到,按「不是席位干的」处理(保守方向:不动用户的东西)。
-
-/** 一条越界记录。 */
-export interface EscapeClaim {
-  /** 哪个节点的席位。 */
-  nodeId: string
-  /** 哪一关。 */
-  phase: string
-  /** 被点名的绝对路径(已经过 realpath 归一)。 */
-  path: string
-  /** 哪个工具。 */
-  tool: string
-  /**
-   * **这一次被硬闸拦下了 —— 一个字节都没写。**
-   *
-   * 这样的记录进 `claims()`(屏幕要说「席位试了 N 次」),但**不进 `owns()`**。
-   *
-   * 上一版没有这个区分,先 `note` 再 `deny`,于是:t0 席位 Edit 主检出的 `conn_executor.rs`
-   * → 被拒、没写,但从此 `owns()` 为真;t1 用户自己在编辑器里改同一个文件(run 跑三小时,
-   * 他当然在改);t2 `intoTrunk` 被这个文件挡住 → 全称判断通过 → **把用户的活 stash 走**。
-   * 闸拦得越勤,伪造的归因证据越多 —— 两个特性之间的负交互,对抗席构造出来的。
-   *
-   * 判据回到它该有的样子:`owns()` 的语义是「**这个文件现在的脏,是我们造的**」,
-   * 只有真落了盘的写才算数。
-   */
-  blocked?: boolean
-}
-
-export interface EscapeRegistry {
-  /** 记一条。同一条路径重复点名只保留第一条的身份,但计数照增。 */
-  note(claim: EscapeClaim): void
-  /**
-   * 这条路径**落盘的脏是席位造的**吗。`path` 可以是绝对路径,也可以是相对 gitRoot 的。
-   *
-   * 被硬闸拦下的尝试(`blocked`)一律为假 —— 见 `EscapeClaim.blocked`。
-   */
-  owns(path: string): boolean
-  /** 全部记录(含被拦下的),给屏幕和 node.md 用。 */
-  claims(): readonly EscapeClaim[]
-  /** 有多少条不同的路径**真被写过**(不含被拦下的)。 */
-  size(): number
-}
+// 隔离靠 cwd,而**绝对路径绕开 cwd**。跑机 .30 run 001 实测:席位照提示词里的绝对路径
+// 写了主检出(node.md 里 2566 处,是根方案那次渲染教的),写进去的内容不在任何任务分支上,
+// `add -A` 够不着 —— 于是回主干那一跳被 git 拒绝,而集成分支照常前进,静默七小时。
+//
+// ## 覆盖面(说清楚,不假装)
+//
+// 只认 Edit/Write/MultiEdit/NotebookEdit 的 `file_path` / `notebook_path`。
+// **Bash 与 MCP 看不见** —— 从命令行推断「改了哪个文件」不可靠。那一类靠
+// `worktreePool.losslessAt`(内容可证明无损就清掉)兜一部分,兜不住的退回
+// 「拒绝合并、如实报告、一个字节不碰」。
 
 /**
  * 路径归一:压平 `//`、消掉 `.` 与 `..` 段、去掉结尾斜杠。
@@ -109,24 +70,6 @@ export function under(root: string, p: string): boolean {
   return q === r || q.startsWith(`${r}/`)
 }
 
-export function createEscapeRegistry(): EscapeRegistry {
-  const byPath = new Map<string, EscapeClaim>()
-  const all: EscapeClaim[] = []
-  return {
-    note(claim) {
-      const key = normalisePath(claim.path)
-      all.push({ ...claim, path: key })
-      // 被硬闸拦下的**不进索引** —— 没落盘的写不是「这个文件的脏是我们造的」的证据。
-      if (claim.blocked === true) return
-      if (!byPath.has(key)) byPath.set(key, { ...claim, path: key })
-    },
-    owns(path) {
-      return byPath.has(normalisePath(path))
-    },
-    claims() { return all },
-    size() { return byPath.size },
-  }
-}
 
 /**
  * 从一次工具调用的输入里,摘出**落在主检出、而不在这个席位工作区里**的路径。
@@ -199,5 +142,48 @@ export function escapedPathsIn(
     }
   }
   visit(input)
+  return out
+}
+
+/**
+ * **把方案文本里指向仓库内的绝对路径削成仓库根相对路径。**
+ *
+ * ## 为什么要在这里削
+ *
+ * 事故的病根不在闸,在**提示词自己教的**:根方案那一次渲染「工作目录:`<主检出绝对路径>`」
+ * (根节点没有 worktree,所以那一格落到 `ctx.cwd`),模型把它写进 solution / acceptance,
+ * 随后被 `子节点 goal 继承` 和 `执行提示词回灌整个 plan JSON` 复制到全树 ——
+ * 跑机上 node.md 里 2566 处就是这么长出来的。
+ *
+ * 而**根方案作者那一席根本不在闸内**(它没有 `req.cwd`,`escapedPathsIn` 第一行就早退),
+ * 所以它是唯一一个既在生产污染源、又不受拦截的席位。削要削在**它的输出**上。
+ *
+ * ## 削什么、不削什么
+ *
+ * - 只削**注册过的根**下面的路径(gitRoot 及调用方给的别名),用 `under()` 的段边界比,
+ *   不用 `startsWith` —— 否则 `/repo-backup/x` 会被削成 `-backup/x`。
+ * - **仓库外的绝对路径一个字不动**(`/etc/…`、参考仓库、日志目录)——
+ *   那些可能是用户故意写的,而且相对化之后毫无意义。
+ * - 只作用于**模型产出的字段**,不作用于整份提示词:用户原话里的绝对路径同理不能碰。
+ *
+ * ## 它替代不了硬闸
+ *
+ * 跑机上 `/home/esgyn/work/tools/…` 是物理路径的**软链别名**,在 node.md 里 1170 次,
+ * 而 `gitRoot` 来自 `rev-parse --show-toplevel`(物理路径)—— 这一削对那 1170 处
+ * **一处都不命中**,除非调用方把别名也传进 `roots`。所以这是**降触发率**,不是防线:
+ * 提示词是建议,闸是强制。
+ */
+export function relativisePaths(text: string, roots: readonly string[]): string {
+  const rs = roots.map(normalisePath).filter(r => r.length > 1)
+  if (rs.length === 0 || text.length === 0) return text
+  // 长的先削 —— 否则 `/a` 会先命中 `/a/b` 里的前缀,把它削成 `/b`
+  const sorted = [...new Set(rs)].sort((x, y) => y.length - x.length)
+  let out = text
+  for (const r of sorted) {
+    // 后面必须跟路径分隔符或词边界,`under()` 那条段边界规矩的字符串版
+    out = out.split(`${r}/`).join('')
+    // 光秃秃的根本身 → `.`(「在仓库根」),别削成空串让句子塌掉
+    out = out.replace(new RegExp(`${r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w/-])`, 'g'), '.')
+  }
   return out
 }

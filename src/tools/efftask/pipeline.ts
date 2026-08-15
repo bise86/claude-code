@@ -1,4 +1,5 @@
 // src/tools/efftask/pipeline.ts
+import { relativisePaths } from './escapedPaths.js'
 import type { DegradePhase, EffTaskConfig, NodePlan, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
@@ -1273,6 +1274,26 @@ const RETRACTED_FIELD = `, "retracted":string[](本轮经核实撤回的历史�
  */
 const ADVICE_FIELD = `, "advice":string[](不通过时**逐条给出怎么改**:改哪个文件/哪一条/换成什么,一条一项;通过则省略。不要写代码块围栏)`
 
+/**
+ * 把方案里指向仓库内的绝对路径削成仓库根相对 —— **在方案落库的那一刻**。
+ *
+ * 病根是根方案那次渲染把主检出绝对路径当「工作目录」告诉了作者,而它写进方案正文之后
+ * 被 goal 继承和 plan JSON 回灌复制到全树(跑机上 node.md 里 2566 处)。
+ * 削在落库处而不是渲染处:渲染处有七个,落库处只有三个,而且**根方案作者不在闸内**
+ * (它没有 `req.cwd`),它的输出是唯一必须削的那一份。
+ *
+ * 拿不到 gitRoot(隔离不可用那一档)就原样返回 —— 削不了不是拒绝干活的理由。
+ */
+function relativisePlan(plan: NodePlan, gitRoot: string | undefined): NodePlan {
+  if (gitRoot === undefined || gitRoot.length === 0) return plan
+  const f = (s: string): string => relativisePaths(s, [gitRoot])
+  return {
+    ...plan,
+    solution: f(plan.solution), keyPoints: f(plan.keyPoints),
+    risks: f(plan.risks), acceptance: f(plan.acceptance),
+  }
+}
+
 export function planPrompt(
   node: TaskNode, ctx: PlanPromptCtx, tag: string, feedback = '', brief = '',
   /**
@@ -1298,6 +1319,24 @@ export function planPrompt(
     `任务:${quote(node.title)}\n目标:${quote(ctxGoal(node))}\n` +
     // 「在哪」和「可以看」。这两句缺席时,方案作者只能照着标题写一句正确的废话。
     (where ? `工作目录:${quote(where)}\n` : '') +
+    /**
+     * **锚点要给,但要说清它只对这一席成立。**
+     *
+     * 事故的病根就在上面那一行:根节点没有 worktree,所以「工作目录」落到主检出的绝对
+     * 路径;方案作者把它写进 solution / acceptance,随后被子节点 goal 继承和执行提示词的
+     * plan JSON 回灌复制到全树 —— 跑机 node.md 里 2566 处指向主检出的绝对路径就是这么来的,
+     * 而每个执行席位都在**自己的**工作区里,照着写就写到主检出去了。
+     *
+     * 删锚点不行(作者此刻真的就在那儿,给它一个相对路径等于什么都没说),
+     * 所以改成**加约束**。落库时还会再削一次(`relativisePlan`)—— 提示词是建议,
+     * 削是兜底,两个都要。
+     */
+    (where
+      ? '⚠ 这份方案会发给多个**各自在不同工作区**里的席位执行 —— 上面那个工作目录只对你这一席\n'
+        + '成立。方案和验收点里引用仓库内的文件时,一律写**仓库根的相对路径**\n'
+        + '(例如 `pkg/sql/conn_executor.rs`),不要写绝对路径:执行者照着绝对路径写,\n'
+        + '内容会落到别人的目录里,永远进不了集成分支。\n'
+      : '') +
     /**
      * **不要在这里枚举工具。**
      *
@@ -2947,7 +2986,7 @@ async function runReviewFix(
       continue
     }
     const keptAlternatives = node.plan.alternatives
-    node.plan = parsed.plan
+    node.plan = relativisePlan(parsed.plan, ctx.worktrees?.gitRoot)
     // 这一关不问答卷(提示词里没有 responses 这个字段),解析层却收得无条件 —— 一个主动
     // 填它的模型能凭空造出一次不存在的返工。要什么就只收什么,和 stepStartCore 那一处同规矩。
     delete node.plan.responses
@@ -3578,7 +3617,7 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
       }
       const parsed = res.parsed
       node.kind = parsed.kind
-      node.plan = parsed.plan
+      node.plan = relativisePlan(parsed.plan, ctx.worktrees?.gitRoot)
       /**
        * 第 1 轮不收答卷 —— 判据和执行侧那一处逐字同因(见 `node.execResponses` 的赋值)。
        *

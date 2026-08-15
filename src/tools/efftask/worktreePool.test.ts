@@ -7,12 +7,11 @@
  * measurement it encodes.
  */
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, mkdir, readFile, chmod, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner } from './worktreePool.js'
-import { createEscapeRegistry } from './escapeRegistry.js'
 import { worktreeSlug } from './worktreeId.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 
@@ -1189,44 +1188,6 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     expect(kept.find(k => k.path === l.path)?.why).not.toBe('未回收')
   })
 
-  /**
-   * **席位越界写主检出 → 先钉后合(park-then-merge)。**
-   *
-   * 跑机 .30 run 001 实测两次:席位用提示词里写死的绝对路径写了主检出,
-   * 于是回主干那一跳被 git 拒绝(`Your local changes … would be overwritten by merge`),
-   * 而集成分支照常前进 —— 第一次静默七小时,四小时后复发。
-   * 质量席的对照实验:不钉的话 10 个节点完成 → 合上 0,20 个 → 合上 0,**永不自愈**。
-   */
-  it('主检出被越界改脏、且合并要覆盖它 → 钉成耐久 ref 之后合上,一个字节不丢', async () => {
-    const escapes: { ref: string; files: readonly string[]; merged: boolean }[] = []
-    const reg = createEscapeRegistry()
-    const p = createWorktreePool({
-      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
-    })
-    await p.init()
-    const n = node('root/00-a')
-    const l = await p.acquire(n) as { path: string }
-    // 节点在**自己的工作区**里改 base.txt —— 这一笔要合回 master
-    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
-    // 而**主检出**里同一个文件被越界改脏 → 正撞
-    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
-    // 归因:这条路径被席位点名写过(真实链路上由 canUseTool 包装记下)
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
-
-    const res = await p.commitAndMerge(n)
-    expect(res.ok).toBe(true)
-    // ① 这一跳成了
-    expect(res.trunk?.advanced).toBe(true)
-    // ② 主检出干净了,而且拿到的是节点那一版
-    expect((await git(['status', '--porcelain'], gitRoot)).stdout.trim()).toBe('')
-    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\n')
-    // ③ 越界内容**一个字节都没丢** —— 钉在一条耐久 ref 上
-    expect(escapes).toHaveLength(1)
-    expect(escapes[0]?.merged).toBe(true)
-    const ref = escapes[0]!.ref
-    const show = await git(['show', `${ref}:base.txt`], gitRoot)
-    expect(show.stdout).toBe('escaped-write\n')
-  })
 
   /**
    * **第二条判据:内容一模一样 ⇒ 丢弃可证明无损。**
@@ -1264,6 +1225,73 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     expect(notices.join('\n')).toContain('一模一样')
   })
 
+  /**
+   * **未跟踪的新文件 —— 事故的原形,而且它是平凡可证明的。**
+   *
+   * git 的原话是「The following **untracked** working tree files would be overwritten」。
+   * 这一格合并根本不做三方,它就是写对面那一版 —— 丢弃工作区那份不损失任何东西。
+   * ⚠ 上一版判据在这里**恒假**(`rev-parse HEAD:p` 直接 fatal),
+   * 也就是说最常见的那一格永远不自愈。反对席实测点名的。
+   */
+  it('未跟踪的新文件挡路、内容和集成分支一样 → 认得出是无损,合得上', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'added.rs'), 'brand new\n')
+    // 主检出里有一个**未跟踪**的同名同内容文件 —— git 会拒绝这次合并
+    await writeFile(join(gitRoot, 'added.rs'), 'brand new\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(true)
+    expect(await readFile(join(gitRoot, 'added.rs'), 'utf-8')).toBe('brand new\n')
+  })
+
+  /**
+   * **只改了权限位也算改动。** `hash-object` 只看内容,判据只比内容就会说
+   * 「逐字节没有损失」然后把 `+x` 抹掉 —— 反对席实测 `:100644 100755 587be6b … M`。
+   */
+  it('只改了权限位 → 不算无损,一个字节(和一个权限位)都不碰', async () => {
+    await writeFile(join(gitRoot, 'run.sh'), 'echo hi\n')
+    await git(['add', '-A'], gitRoot)
+    await git(['commit', '-qm', 'add script'], gitRoot)
+    const p = pool()
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    // 节点改内容;主检出这边内容不动、只 chmod +x
+    await writeFile(join(l.path, 'run.sh'), 'echo changed\n')
+    await chmod(join(gitRoot, 'run.sh'), 0o755)
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    // 权限位还在 —— 这正是上一版会悄悄抹掉的那样东西
+    expect(((await stat(join(gitRoot, 'run.sh'))).mode & 0o111) !== 0).toBe(true)
+  })
+
+  /**
+   * **索引里可能躺着第三份内容**(`MM`:暂存的和工作区的不一样)。
+   * 判据只比「工作区 vs 集成分支」和「HEAD vs 合并基」,一次都没看索引 ——
+   * `checkout HEAD --` 会把用户 `git add` 过的那一份覆盖成 dangling blob。
+   */
+  it('索引里暂存着另一份内容 → 不算无损,不许覆盖它', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    // 用户先暂存了一份自己的活,然后工作区里又摆成和集成分支将来那份一样
+    await writeFile(join(gitRoot, 'base.txt'), 'USER STAGED WORK\n')
+    await git(['add', 'base.txt'], gitRoot)
+    await writeFile(join(gitRoot, 'base.txt'), 'from-node\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    // 暂存的那份还在索引里
+    const staged = await git(['show', ':base.txt'], gitRoot)
+    expect(staged.stdout).toBe('USER STAGED WORK\n')
+  })
+
   /** 内容**不**一样就证明不了无损 —— 归因不到就一个字节不碰(这是上一格的反证)。 */
   it('内容不同、又归因不到 → 不动,退回老路', async () => {
     const p = pool()
@@ -1290,8 +1318,7 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
    * 屏幕上说「已还原你的工作区」,`conflicted` 还是 false。
    */
   it('钉走之后重试撞真冲突 → 收拾干净,而且不许说「已还原你的工作区」', async () => {
-    const reg = createEscapeRegistry()
-    const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, escapes: reg })
+    const p = pool()
     await p.init()
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
@@ -1302,7 +1329,6 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     await git(['commit', '-qm', 'user own commit'], gitRoot)
     // 席位越界又把它写脏,并且归因得到 → 走 park 那条路
     await writeFile(join(gitRoot, 'base.txt'), 'ESCAPED WRITE\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
 
     const res = await p.commitAndMerge(n)
     expect(res.trunk?.advanced).toBe(false)
@@ -1325,7 +1351,6 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
    * 沿用它就等于宣称「没撞冲突」,而现场明明还在。
    */
   it('重试撞冲突且 abort 也失败 → 如实说撞了冲突,并标成 conflicted', async () => {
-    const reg = createEscapeRegistry()
     let aborts = 0
     const flaky: GitRunner = async (args, cwd) => {
       // 只拦**主检出**那侧的 abort,让 retry 的现场留在那儿
@@ -1335,16 +1360,21 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
       }
       return git(args, cwd)
     }
-    const p = createWorktreePool({ runId: '001', gitRoot, git: flaky, worktreeRoot, escapes: reg })
+    const p = createWorktreePool({ runId: '001', gitRoot, git: flaky, worktreeRoot })
     await p.init()
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
-    await writeFile(join(l.path, 'base.txt'), 'FROM NODE\n')
+    /**
+     * 现场要同时满足两件事:**一条可证明无损**(让 park 走起来),
+     * 和**一条真会冲突的**(让清理之后那次重试撞上现场)。
+     */
+    await writeFile(join(l.path, 'clean.txt'), 'from-node\n')   // 无损那条
+    await writeFile(join(l.path, 'base.txt'), 'FROM NODE\n')    // 冲突那条
     await writeFile(join(gitRoot, 'base.txt'), 'USER COMMITTED\n')
     await git(['add', '-A'], gitRoot)
     await git(['commit', '-qm', 'user own commit'], gitRoot)
-    await writeFile(join(gitRoot, 'base.txt'), 'ESCAPED WRITE\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+    // 主检出里摆一份和合并将写入的一模一样的 —— 这条挡路,而且可证明无损
+    await writeFile(join(gitRoot, 'clean.txt'), 'from-node\n')
 
     const res = await p.commitAndMerge(n)
     expect(aborts).toBeGreaterThan(0)          // 确认真的走到了 retry 的收拾
@@ -1406,14 +1436,13 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     await writeFile(join(gitRoot, 'a1.txt'), 'base\n')
     await git(['add', '-A'], gitRoot)
     await git(['commit', '-qm', 'add both'], gitRoot)
-    const reg = createEscapeRegistry()
-    const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, escapes: reg })
+    const p = pool()
     await p.init()
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'a[1].txt'), 'from-node\n')
-    await writeFile(join(gitRoot, 'a[1].txt'), 'escaped-write\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'a[1].txt') })
+    // 主检出摆成和合并将写入的一样 ⇒ 可证明无损 ⇒ 走清理+重试那条路
+    await writeFile(join(gitRoot, 'a[1].txt'), 'from-node\n')
     // 用户手上一个**名字相近但没挡路**的改动
     await writeFile(join(gitRoot, 'a1.txt'), 'USER WIP\n')
 
@@ -1432,7 +1461,6 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
    * 根本不用 `detail`。要让 `detail` 上场,retry 必须**失败但不留冲突**。
    */
   it('钉走后重试失败 → 报的是重试那次的原话,不是第一次的', async () => {
-    const reg = createEscapeRegistry()
     let merges = 0
     const flaky: GitRunner = async (args, cwd) => {
       if (cwd === gitRoot && args[0] === 'merge' && args.includes('efftask/001/integration')) {
@@ -1441,13 +1469,13 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
       }
       return git(args, cwd)
     }
-    const p = createWorktreePool({ runId: '001', gitRoot, git: flaky, worktreeRoot, escapes: reg })
+    const p = createWorktreePool({ runId: '001', gitRoot, git: flaky, worktreeRoot })
     await p.init()
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'base.txt'), 'from-node\n')
-    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+    // 可证明无损 ⇒ 清掉再重试,而重试被注入成失败
+    await writeFile(join(gitRoot, 'base.txt'), 'from-node\n')
 
     const res = await p.commitAndMerge(n)
     expect(res.trunk?.advanced).toBe(false)
@@ -1466,16 +1494,14 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
    * 求不求交结果一样。所以这一条特意让节点**多改一个没脏的文件**。
    */
   it('节点还改了别的(主检出没脏)→ 那些不算挡路,park 照常成立', async () => {
-    const reg = createEscapeRegistry()
-    const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, escapes: reg })
+    const p = pool()
     await p.init()
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
     // 两个文件都改:base.txt 在主检出里被越界写脏,other.txt 主检出干干净净
     await writeFile(join(l.path, 'base.txt'), 'from-node\n')
     await writeFile(join(l.path, 'other.txt'), 'brand new\n')
-    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
+    await writeFile(join(gitRoot, 'base.txt'), 'from-node\n')
 
     const res = await p.commitAndMerge(n)
     expect(res.trunk?.advanced).toBe(true)
@@ -1583,8 +1609,7 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
    * 现在按结构算(树上脏的 ∩ 这次合并会碰的),不受措辞影响。
    */
   it('索引脏走 ort 那条消息 → 照样算得出挡路清单', async () => {
-    const reg = createEscapeRegistry()
-    const p = createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, escapes: reg })
+    const p = pool()
     await p.init()
     // 用户提交一笔,让回主干那一跳是真三方合并(ort 那条消息只在这时出现)
     await writeFile(join(gitRoot, 'other.md'), 'mine\n')
@@ -1595,9 +1620,8 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'base.txt'), 'from-node\n')
     // 席位越界写主检出,而且**已暂存** —— 这正是走 ort 那条消息的条件
-    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'from-node\n')
     await git(['add', 'base.txt'], gitRoot)
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
 
     const res = await p.commitAndMerge(n)
     expect(res.trunk?.advanced).toBe(true)
@@ -1631,37 +1655,6 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\ntail\n')
   })
 
-  /**
-   * **挡路清单按 TAB 切,不按标点猜。** 三席各自实测同一个洞。
-   *
-   * 上一版的判据是 `!l.includes(' ') && l.includes('.')`,于是 `Makefile`(无扩展名)
-   * 和 `docs/my notes.md`(带空格)**从挡路清单里消失**。真 git 实测:这两条消息的
-   * 文件清单每一行都以 TAB 开头,空格原样、UTF-8 不转义。
-   *
-   * 这一格量的是「全漏」那一面:唯一挡路的是 `Makefile`,而它确实是席位写的 ——
-   * 上一版摘出空清单 → `blockedPaths.length > 0` 为假 → 不钉 → 七小时那条路照旧。
-   */
-  it('挡路的是无扩展名文件(Makefile)且归因到席位 → 照样钉、照样合上', async () => {
-    await writeFile(join(gitRoot, 'Makefile'), 'all:\n\techo base\n')
-    await git(['add', '-A'], gitRoot)
-    await git(['commit', '-qm', 'add makefile'], gitRoot)
-    const reg = createEscapeRegistry()
-    const escapes: { ref: string; files: readonly string[]; merged: boolean }[] = []
-    const p = createWorktreePool({
-      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
-    })
-    await p.init()
-    const n = node('root/00-a')
-    const l = await p.acquire(n) as { path: string }
-    await writeFile(join(l.path, 'Makefile'), 'all:\n\techo from-node\n')
-    await writeFile(join(gitRoot, 'Makefile'), 'all:\n\techo escaped\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'Makefile') })
-
-    const res = await p.commitAndMerge(n)
-    expect(res.trunk?.advanced).toBe(true)
-    expect(await readFile(join(gitRoot, 'Makefile'), 'utf-8')).toBe('all:\n\techo from-node\n')
-    expect(escapes).toHaveLength(1)
-  })
 
   /**
    * **漏摘的危险方向:混合形态下 `every()` 在被削过的集合上判真。**
@@ -1677,109 +1670,26 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     await writeFile(join(gitRoot, 'Makefile'), 'all:\n\techo base\n')
     await git(['add', '-A'], gitRoot)
     await git(['commit', '-qm', 'add makefile'], gitRoot)
-    const reg = createEscapeRegistry()
-    const escapes: unknown[] = []
-    const p = createWorktreePool({
-      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
-    })
+    const p = pool()
     await p.init()
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
     // 节点改了两个文件,回主干时两个都要覆盖
     await writeFile(join(l.path, 'base.txt'), 'from-node\n')
     await writeFile(join(l.path, 'Makefile'), 'all:\n\techo from-node\n')
-    // 主检出:一条是席位越界写的,另一条是**用户自己**在改
-    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
+    // 主检出:一条**可证明无损**(内容和合并将写入的一样),另一条是**用户自己**在改
+    await writeFile(join(gitRoot, 'base.txt'), 'from-node\n')
     await writeFile(join(gitRoot, 'Makefile'), 'all:\n\techo USER WORK\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
 
     const res = await p.commitAndMerge(n)
     expect(res.trunk?.advanced).toBe(false)
-    // 用户的活原封不动 —— 这是这条判据存在的**全部**理由
+    // 用户的活原封不动 —— 这是全称判据存在的**全部**理由
     expect(await readFile(join(gitRoot, 'Makefile'), 'utf-8')).toBe('all:\n\techo USER WORK\n')
-    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('escaped-write\n')
-    expect(escapes).toEqual([])
-  })
-
-  /**
-   * **钉走的范围 = 挡路的那几条,不是整棵树。**
-   *
-   * 判据是「挡路的每一条都归因到席位」,而上一版的动作是 `stash push -u` 无 pathspec ——
-   * 全称判断保护的是名单,清空的却是全树。质量席实测:用户没挡路的改动(含未跟踪文件)
-   * 一并被收走,而 `onEscape.files` 还把它们念成「有席位把文件写到了主检出」。
-   */
-  it('只钉挡路的那一条 —— 用户在别处的改动(含未跟踪文件)原地不动', async () => {
-    const reg = createEscapeRegistry()
-    const escapes: { files: readonly string[] }[] = []
-    const p = createWorktreePool({
-      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
-    })
-    await p.init()
-    const n = node('root/00-a')
-    const l = await p.acquire(n) as { path: string }
-    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
-    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
-    // 用户手上两样和这次合并**无关**的东西:一个已跟踪的改动、一个未跟踪的新文件
-    await writeFile(join(gitRoot, 'user-tracked.md'), 'v0\n')
-    await git(['add', 'user-tracked.md'], gitRoot)
-    await git(['commit', '-qm', 'user file'], gitRoot)
-    await writeFile(join(gitRoot, 'user-tracked.md'), 'USER EDITING\n')
-    await writeFile(join(gitRoot, 'user-new.txt'), 'USER NEW\n')
-
-    const res = await p.commitAndMerge(n)
-    expect(res.trunk?.advanced).toBe(true)
-    // 挡路那条被钉走并换成了节点的版本
+    // 那条可证明无损的也没被动 —— 全称不成立就整个不动,不是「能动几条动几条」
     expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\n')
-    // 而用户的两样东西**还在原地**
-    expect(await readFile(join(gitRoot, 'user-tracked.md'), 'utf-8')).toBe('USER EDITING\n')
-    expect(await readFile(join(gitRoot, 'user-new.txt'), 'utf-8')).toBe('USER NEW\n')
-    // 上屏那句话也不能把用户的文件念成席位干的
-    expect(escapes[0]?.files).toEqual(['base.txt'])
   })
 
-  /**
-   * **钉走却仍然合不上 → 按 ref 还原,不许碰用户的 stash。**
-   *
-   * `pinAndClear` 钉成耐久 ref 之后会**把自己那条 stash 条目 drop 掉**(刻意的:
-   * `refs/stash` 是全仓库共享的),所以裸 `git stash pop` 弹的是**用户自己**那条。
-   * 三席各自真 git 实测同一个结果:席位那份没放回来,用户一条无关的 stash 被摊进工作区
-   * **并删除**,而且树反而更脏 —— 下一次合并接着被它堵。
-   */
-  it('重试仍失败 → 席位那份放回原处,用户自己的 stash 一条不少', async () => {
-    const reg = createEscapeRegistry()
-    // 让**第二次**「合集成分支进主检出」失败 —— 也就是钉走之后的那次重试
-    let merges = 0
-    const flaky: GitRunner = async (args, cwd) => {
-      if (cwd === gitRoot && args[0] === 'merge' && args.includes('efftask/001/integration')) {
-        merges++
-        if (merges === 2) return { code: 1, stdout: '', stderr: 'fatal: 实验注入的失败\n' }
-      }
-      return git(args, cwd)
-    }
-    const p = createWorktreePool({ runId: '001', gitRoot, git: flaky, worktreeRoot, escapes: reg })
-    await p.init()
-    // 用户自己贮藏了一份东西 —— 和这次合并毫无关系
-    await writeFile(join(gitRoot, 'mine.txt'), 'USER PRECIOUS\n')
-    await git(['add', 'mine.txt'], gitRoot)
-    await git(['commit', '-qm', 'user file'], gitRoot)
-    await writeFile(join(gitRoot, 'mine.txt'), 'USER WIP\n')
-    await git(['stash', 'push', '-m', 'user own stash'], gitRoot)
 
-    const n = node('root/00-a')
-    const l = await p.acquire(n) as { path: string }
-    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
-    await writeFile(join(gitRoot, 'base.txt'), 'escaped-write\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
-
-    await p.commitAndMerge(n)
-    // ① 席位那份回到了工作区(它本来就在那儿,我们只是暂时拿开)
-    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('escaped-write\n')
-    // ② 用户那条 stash **还在**,而且没被摊进工作区
-    const list = await git(['stash', 'list'], gitRoot)
-    expect(list.stdout).toContain('user own stash')
-    expect(await readFile(join(gitRoot, 'mine.txt'), 'utf-8')).toBe('USER PRECIOUS\n')
-  })
 
   /**
    * **这一跳没成 → 前置同步造的那个 merge commit 要撤掉。**
@@ -1983,11 +1893,7 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
    * 变异测试抓到过 `every → some` 存活 —— 那时没有任何一条用例造过混合形态。
    */
   it('挡路的路径里混着用户自己的改动 → 一个字节都不动', async () => {
-    const escapes: unknown[] = []
-    const reg = createEscapeRegistry()
-    const p = createWorktreePool({
-      runId: '001', gitRoot, git, worktreeRoot, escapes: reg, onEscape: e => escapes.push(e),
-    })
+    const p = pool()
     await p.init()
     // 基线里多一个文件,好让两边都能改到它
     await writeFile(join(gitRoot, 'mine.txt'), 'base\n')
@@ -1997,15 +1903,15 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     const l = await p.acquire(n) as { path: string }
     await writeFile(join(l.path, 'base.txt'), 'from-node\n')
     await writeFile(join(l.path, 'mine.txt'), 'node also touched\n')
-    // 主检出:一条是席位越界(归因命中),一条是用户自己的(没有归因)
-    await writeFile(join(gitRoot, 'base.txt'), 'escaped\n')
+    // 主检出:一条可证明无损(内容和合并将写入的一样),一条是用户自己的
+    await writeFile(join(gitRoot, 'base.txt'), 'from-node\n')
     await writeFile(join(gitRoot, 'mine.txt'), 'user edit\n')
-    reg.note({ nodeId: n.id, phase: 'execute', tool: 'Edit', path: join(gitRoot, 'base.txt') })
 
-    await p.commitAndMerge(n)
-    // 没钉:用户那条还原样躺着
-    expect(escapes).toEqual([])
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    // 用户那条原样躺着,可证明无损那条也没被动
     expect(await readFile(join(gitRoot, 'mine.txt'), 'utf-8')).toBe('user edit\n')
+    expect(await readFile(join(gitRoot, 'base.txt'), 'utf-8')).toBe('from-node\n')
   })
 
   /** 反面:主检出干净时,这条路一次都不许触发(它会动用户的工作区)。 */

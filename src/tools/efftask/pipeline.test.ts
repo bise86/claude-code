@@ -3295,6 +3295,29 @@ describe('spec §16:方案阶段必须被告知"可能冲突的子任务要用�
     expect(p).not.toContain('各自独立的 git worktree')
   })
 
+  /**
+   * **锚点给了,但要说清它只对这一席成立。**
+   *
+   * 事故的病根就是这一行:根节点没有 worktree,「工作目录」落到主检出的绝对路径,
+   * 方案作者把它写进 solution / acceptance,随后被子节点 goal 继承和执行提示词的
+   * plan JSON 回灌复制到全树 —— 跑机 node.md 里 2566 处就是这么来的。
+   * 删锚点不行(作者此刻真的就在那儿),所以加约束。
+   */
+  it('给了工作目录就必须同时说「方案里写仓库根相对路径」', () => {
+    const n = root()
+    const p = planPrompt(n, { config: cfg, byId: byIdMap([n]), cwd: '/main/checkout' }, 'plantag')
+    expect(p).toContain('工作目录:/main/checkout')
+    expect(p).toContain('仓库根的相对路径')
+    expect(p).toContain('各自在不同工作区')
+  })
+
+  /** 没有工作目录可印时,那句约束也不该凭空出现 —— 它是在解释上面那一行。 */
+  it('没有工作目录 → 那句约束也不印', () => {
+    const n = root()
+    const p = planPrompt(n, { config: cfg, byId: byIdMap([n]) }, 'plantag')
+    expect(p).not.toContain('仓库根的相对路径')
+  })
+
   it('到了深度上限就不再讲怎么拆 —— 上一句刚说了不许再拆', () => {
     const n = root()
     n.depth = cfg.caps.maxDepth
