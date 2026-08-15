@@ -178,12 +178,38 @@ export function relativisePaths(text: string, roots: readonly string[]): string 
   if (rs.length === 0 || text.length === 0) return text
   // 长的先削 —— 否则 `/a` 会先命中 `/a/b` 里的前缀,把它削成 `/b`
   const sorted = [...new Set(rs)].sort((x, y) => y.length - x.length)
+  const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  /**
+   * **两边都要锚。** 上一版只护了右边界(而且没排除 `.`),左边是裸子串切分,
+   * 对抗席实测六个方向全错:
+   *
+   * | 输入 | 上一版削成 | 错在哪 |
+   * |---|---|---|
+   * | `<R>//pkg/a.rs` | `/pkg/a.rs` | **安全属性反转** —— 闸拦得住的越界变成闸看不见的仓库外写 |
+   * | `cd <R>/ && make` | `cd  && make` | 命令不可执行(它自己的注释还写着「别削成空串让句子塌掉」) |
+   * | `<R>.git` / `<R>.tar.gz` | `..git` / `..tar.gz` | 右边界没排除 `.` |
+   * | `/mnt/backup<R>/pkg` | `/mnt/backuppkg` | **左边界没锚**,产出一条不存在的路径 |
+   * | `<R>~/a.rs` | `.~/a.rs` | 同上 |
+   *
+   * 现在:左边不许紧跟词字符/斜杠/点/波浪/连字符,右边只认「斜杠」或「真正的边界」。
+   */
+  const LEFT = '(?<![\\w/.~-])'
   let out = text
   for (const r of sorted) {
-    // 后面必须跟路径分隔符或词边界,`under()` 那条段边界规矩的字符串版
-    out = out.split(`${r}/`).join('')
-    // 光秃秃的根本身 → `.`(「在仓库根」),别削成空串让句子塌掉
-    out = out.replace(new RegExp(`${r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w/-])`, 'g'), '.')
+    const e = esc(r)
+    /**
+     * ① 后面跟着路径内容 → 削成相对。`/+` 一并吃掉,`<R>//pkg` 不许留下前导斜杠。
+     *
+     * ⚠ 前瞻是「**不是空白、不是行尾**」,不是 `[\w.]`。写成 `[\w.]` 的话
+     * `\w` **不含 CJK**,也不含 `[`、`@`、`(`、`+`、`-`、`~` —— 于是
+     * `<R>/文档/说明.md` → `.文档/说明.md`、`<R>/[id].tsx` → `.[id].tsx`
+     * (质量席实测)。那比原样留着**更糟**:绝对路径至少会被硬闸拦下,
+     * 而 `.文档/…` 是一条落在席位自己工作区里的**合法但指错**的相对路径,
+     * 它会直接把文件建在错的地方 —— 和 `<R>//pkg` 那条是同一个安全反转。
+     */
+    out = out.replace(new RegExp(`${LEFT}${e}/+(?=[^\\s])`, 'g'), '')
+    // ② 根本身(可带尾斜杠)且后面是真边界 → `.`,别削成空串让句子塌掉。
+    out = out.replace(new RegExp(`${LEFT}${e}/*(?=[^\\w.~/-]|$)`, 'g'), '.')
   }
   return out
 }

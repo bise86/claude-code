@@ -17,7 +17,7 @@
  */
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
-import { buildEscapeLine, gitSpawnEnv, rememberEscapeRef, subAgentToolPool } from './efftask.js'
+import { attachNoticeSink, buildEscapeLine, gitSpawnEnv, rememberEscapeRef, subAgentToolPool } from './efftask.js'
 
 const SRC = readFileSync(new URL('./efftask.tsx', import.meta.url), 'utf8')
 /** 详情页的按需读回住在树面板里 —— 这一跳断了,盘上的历史永远没人去读。 */
@@ -1304,8 +1304,19 @@ describe('越界闸的接线', () => {
     // 拦一次要说一次 —— 上一版记进一个 claims() 零消费者的登记簿,等于没有
     expect(SRC).toContain('onEscapeBlocked:')
     expect(SRC).toContain('pushNoticeOut.current?.(line, key)')
-    // 而那个出口盒子要在挂载时被真的填上
-    expect(SRC).toContain('props.pushNoticeOut.current = pushNotice')
+    /**
+     * 那个出口盒子要在挂载时被真的填上 —— **真调一次**,不是断言源码里有那行。
+     * 质量席实测:把它改成 `if (false && …)`,字符串还在,4169 条 efftask 测试无一变红。
+     */
+    const box: { current: ((l: string, k?: string) => void) | null } = { current: null }
+    const sink = (): void => {}
+    attachNoticeSink(box, sink)
+    expect(box.current).toBe(sink)
+    attachNoticeSink(box, null)      // 卸载时收回 —— 指向已卸载组件的 setState 会静默丢事件
+    expect(box.current).toBe(null)
+    attachNoticeSink(undefined, sink)  // 没盒子不许抛
+    // 而且回调里真的调了它(否则上面测的是一个没人用的函数)
+    expect(SRC).toContain('attachNoticeSink(props.pushNoticeOut, pushNotice)')
   })
 
   /**
@@ -1422,8 +1433,22 @@ describe('越界闸的接线', () => {
     rememberEscapeRef(undefined, 'x')  // 没盒子不许抛 —— 它在合并的关键路径上
     expect(SRC).toContain('rememberEscapeRef(props.escapeRefsOut, info.ref)')
     expect(SRC).toContain('escapeRefsOut={escapeRefsOut}')
-    expect(SRC).toContain('buildEscapeLine(escapeRefsOut.current)')
-    expect(SRC).toContain('+ escapeLine')
+    /**
+     * ⚠ **定域断言,不是整文件 `toContain`。**
+     *
+     * 质量席实测:把 `+ escapeLine` 那一行删掉,测试**照绿** —— 因为
+     * `buildEscapeLine` 上方那段解释「真空通过」的文档注释里,当时逐字写着这个标识符。
+     * 一段解释闸门的注释满足了闸门自己。整文件文本断言连「代码删了、注释还在」都拦不住。
+     *
+     * 所以只在**退出报告那一段**里找:从算 `escapeLine` 那行到 `onDone(` 结束。
+     */
+    // ⚠ 终点要**从起点之后**找:`{ display: 'system' }` 在文件里更早还有两处,
+    //    直接 indexOf 会切出一个空区间,而空区间对 `toContain` 永远为假 —— 假红。
+    const from = SRC.indexOf('const escapeLine =')
+    const region = SRC.slice(from, SRC.indexOf('{ display: \'system\' },', from))
+    expect(region.length).toBeGreaterThan(0)   // 非零基线:切不出区间就不是「通过」
+    expect(region).toContain('buildEscapeLine(escapeRefsOut.current)')
+    expect(region).toContain('+ escapeLine')
     // 生产者那一端:钉住了就报出去,否则这条链没有输入
     const POOL = readFileSync(new URL('../../tools/efftask/worktreePool.ts', import.meta.url), 'utf8')
     expect(POOL).toContain('onPinned?.({ ref: res.ref, where: intPath })')

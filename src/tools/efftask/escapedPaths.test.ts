@@ -187,7 +187,11 @@ describe('relativisePaths', () => {
   it('没有根 / 空文本 → 原样返回', () => {
     expect(relativisePaths('/a/b', [])).toBe('/a/b')
     expect(relativisePaths('', R)).toBe('')
-    // `/` 单独一个不算根 —— 削它会把每一条绝对路径都变成相对
-    expect(relativisePaths('/etc/x', ['/'])).toBe('/etc/x')
+    /**
+     * `/` 单独一个**不算根** —— 它会命中一切。
+     * ⚠ 判据要挑一个真的会被它改到的输入:`/etc/x` 里那个 `/` 后面跟着词字符,
+     * 负向前瞻本来就不匹配,拿它当探针是测空气(变异实测存活)。
+     */
+    expect(relativisePaths('cd / 然后跑', ['/'])).toBe('cd / 然后跑')
   })
 })

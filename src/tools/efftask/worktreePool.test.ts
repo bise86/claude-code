@@ -1248,6 +1248,59 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
   })
 
   /**
+   * **「一次 add」那一格也要看索引。** 双方都没有这条路径 ⇒ 合并是一次 add,
+   * 平凡可证明;但如果用户已经 `git add` 过一份**别的内容**,那就是第三份,
+   * `checkout HEAD --` / `clean -f` 会把它抹掉。
+   */
+  it('未跟踪但已暂存(内容和工作区不同)→ 不算无损', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'added.rs'), 'brand new\n')
+    // 用户先暂存了一份自己的,再把工作区摆成和合并将写入的一样
+    await writeFile(join(gitRoot, 'added.rs'), 'USER STAGED\n')
+    await git(['add', 'added.rs'], gitRoot)
+    await writeFile(join(gitRoot, 'added.rs'), 'brand new\n')
+
+    const res = await p.commitAndMerge(n)
+    expect(res.trunk?.advanced).toBe(false)
+    expect((await git(['show', ':added.rs'], gitRoot)).stdout).toBe('USER STAGED\n')
+  })
+
+  /**
+   * **删了却没合上,也要说。**
+   *
+   * 「可证明无损」那几条是在重试**之前**就地清掉的。那句「没有损失」原先只在重试成功
+   * 那一路发 —— 重试失败时文件已经删了、合并没发生,屏幕上一个字都没有。
+   * 内容仍可从集成分支取回,所以这里说的是**怎么取**。
+   */
+  it('清掉之后重试失败 → 说清删了哪几条、怎么取回', async () => {
+    const notices: string[] = []
+    let merges = 0
+    const flaky: GitRunner = async (args, cwd) => {
+      if (cwd === gitRoot && args[0] === 'merge' && args.includes('efftask/001/integration')) {
+        merges++
+        if (merges === 2) return { code: 1, stdout: '', stderr: 'fatal: 注入的重试失败\n' }
+      }
+      return git(args, cwd)
+    }
+    const p = createWorktreePool({
+      runId: '001', gitRoot, git: flaky, worktreeRoot, onNotice: l => notices.push(l),
+    })
+    await p.init()
+    const n = node('root/00-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'from-node\n')
+    await writeFile(join(gitRoot, 'base.txt'), 'from-node\n')   // 可证明无损
+
+    await p.commitAndMerge(n)
+    const said = notices.join('\n')
+    expect(said).toContain('base.txt')
+    expect(said).toContain('git checkout')   // 怎么取回
+  })
+
+  /**
    * **只改了权限位也算改动。** `hash-object` 只看内容,判据只比内容就会说
    * 「逐字节没有损失」然后把 `+x` 抹掉 —— 反对席实测 `:100644 100755 587be6b … M`。
    */
@@ -1259,8 +1312,12 @@ describe('收口:用户必须能找到自己的工作(spec §8)', () => {
     await p.init()
     const n = node('root/00-a')
     const l = await p.acquire(n) as { path: string }
-    // 节点改内容;主检出这边内容不动、只 chmod +x
+    /**
+     * ⚠ 主检出这边的**内容必须和合并将写入的一样**,只差权限位 ——
+     * 第一版让内容也不同,于是 sha 先判假,mode 那一比根本没执行(变异实测存活)。
+     */
     await writeFile(join(l.path, 'run.sh'), 'echo changed\n')
+    await writeFile(join(gitRoot, 'run.sh'), 'echo changed\n')
     await chmod(join(gitRoot, 'run.sh'), 0o755)
 
     const res = await p.commitAndMerge(n)

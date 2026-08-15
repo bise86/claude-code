@@ -1610,7 +1610,15 @@ describe('越界写主检出:硬闸与归因', () => {
      */
     expect(said).toHaveLength(1)
     expect(said[0]?.[0]).toContain(`${G}/pkg/sql/a.rs`)
-    expect(said[0]?.[1]).toBe(`escape:${G}/pkg/sql/a.rs`)
+    /**
+     * **去重键是固定的一格,不是路径。**
+     *
+     * 事故现场是 2566 条**不同**路径 —— 按路径分格的话,40 条拒绝就把
+     * 「产出没送到你的分支」那条唯一的真告警挤出 20 格缓冲区,无声消失
+     * (对抗席实测)。这一栏要的是趋势,不是每条点名。
+     */
+    expect(said[0]?.[1]).toBe('escape-blocked')
+    expect(said[0]?.[0]).toContain('已被拒绝 1 次')
   })
 
   /**

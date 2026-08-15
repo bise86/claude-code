@@ -728,9 +728,12 @@ function pickMainAgentDefinition(allAgents: AgentDefinition[]): AgentDefinition 
  * 退出报告里「越界的东西钉在哪」那一段。
  *
  * **抽成函数是为了能被打中。** 上一版这段是 onExit 闭包里的一串内联表达式,而闸门只
- * 断言了 `escapeRefsOut` / `+ escapeLine` / `git stash apply ` 这几个字符串在文件里 ——
- * 接缝席剪了三刀(不往盒子里写、不传 prop、把 refs 硬编成空),**每一刀 4148 条全绿**。
- * 那正是这一轮宣称修掉的「真空通过」,隔一个文件原样重现。
+ * 断言了几个标识符「在文件里」。接缝席剪了三刀(不往盒子里写、不传 prop、
+ * 把 refs 硬编成空),每一刀全绿。
+ *
+ * ⚠ 那种闸门还有一层更荒唐的失效:**一段解释它的注释就能满足它**。
+ * 质量席实测:把拼接那一行删掉,测试照绿 —— 因为这段文档里当时逐字写着那个标识符。
+ * 所以现在的闸门是**定域**的(只在退出报告那一段里找),而不是整文件 `toContain`。
  *
  * 内容本身的理由:`refs/et/rescued/*` 全仓**没有任何扫描器**会再列出来
  * (`sweepStashBackups` 扫的是另一个前缀,`scanStranded` 的 fsck 只看 unreachable,
@@ -745,6 +748,22 @@ function pickMainAgentDefinition(allAgents: AgentDefinition[]): AgentDefinition 
  * `if (box && false)`,**字符串还在,4148 条全绿**。源码文本断言钉得住「这一行在不在」,
  * 钉不住「这一行会不会执行」。有行为的地方就得能被真调一次。
  */
+/**
+ * 把「越界被拒」那句话的出口接上 / 收回。
+ *
+ * **抽成函数是为了能被真调一次。** 上一版这一句写在 useEffect 里,而闸门只断言了
+ * 源码里有这串字符 —— 质量席实测把它改成 `if (false && …)`,字符串还在,
+ * **4169 条 efftask 测试无一变红**:席位撞闸的那句话一辈子上不了屏,而全套绿。
+ * 源码文本断言钉得住「这一行在不在」,钉不住「这一行会不会执行」。
+ */
+export function attachNoticeSink(
+  box: { current: ((line: string, key?: string) => void) | null } | undefined,
+  sink: ((line: string, key?: string) => void) | null,
+): void {
+  if (!box) return
+  box.current = sink
+}
+
 export function rememberEscapeRef(box: { current: string[] } | undefined, ref: string): void {
   if (!box || box.current.includes(ref)) return
   box.current = [...box.current, ref]
@@ -1256,10 +1275,10 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   React.useEffect(() => {
     props.humanWaitOut.current = (w: boolean) => { if (w) humanWait.begin(); else humanWait.end() }
     // 越界被拒时那句话的出口。组件在,才有屏幕可上;卸载时收回(同一条纪律)。
-    if (props.pushNoticeOut) props.pushNoticeOut.current = pushNotice
+    attachNoticeSink(props.pushNoticeOut, pushNotice)
     return () => {
       props.humanWaitOut.current = null
-      if (props.pushNoticeOut) props.pushNoticeOut.current = null
+      attachNoticeSink(props.pushNoticeOut, null)
     }
   }, [props.humanWaitOut, props.pushNoticeOut, pushNotice, humanWait.begin, humanWait.end])
   const handoffRef = React.useRef<HandoffSummary | null>(null)
@@ -3300,6 +3319,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        * 所以给它留 1 格、通知留 2 格。
        */
       problems={[...redoProblems.slice(-1), ...runNotices.slice(-2)]}
+      hiddenProblems={Math.max(0, redoProblems.length - 1) + Math.max(0, runNotices.length - 2)}
     />
   }
   return (
@@ -3494,6 +3514,8 @@ export function RunningView(props: {
    * 底部的图例和按键提示被顶出屏幕。
    */
   problems?: string[]
+  /** 调用方已经丢掉了多少条 —— 截断发生在那里,计数就得从那里来(见 moreProblems)。 */
+  hiddenProblems?: number
 }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
@@ -3518,7 +3540,17 @@ export function RunningView(props: {
    * 用户取回自己东西的唯一线索。
    */
   const problems = (props.problems ?? []).slice(-3)
-  const moreProblems = (props.problems ?? []).length - problems.length
+  /**
+   * ⚠ **被丢掉的数量要由调用方给** —— 截断已经发生在那里了。
+   *
+   * 调用点传的是 `[...redoProblems.slice(-1), ...runNotices.slice(-2)]`,所以
+   * `props.problems` 的长度恒 ≤3,`slice(-3)` 是恒等,这里自己算出来的 `N` **恒为 0**,
+   * 「另有 N 条未显示」那一行是死代码。对抗席实测:22 条被丢弃、屏幕上零痕迹。
+   *
+   * 这和「N 条隐藏那一行必须活在被截断的范围之外」是同一形状,方向换了 ——
+   * 截断点搬走了,而计数器留在原地。
+   */
+  const moreProblems = props.hiddenProblems ?? ((props.problems ?? []).length - problems.length)
   const problemRows = problems.length + (moreProblems > 0 ? 1 : 0)
   const panel = (
     <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} sharedParallel={props.sharedParallel} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} reservedRows={problemRows} />

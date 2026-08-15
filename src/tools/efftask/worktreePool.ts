@@ -699,9 +699,39 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
        *    正是事故的原形。对一次 **add** 来说合并根本不做三方,它就是写 `want`,
        *    丢弃工作区那份是**平凡可证明**的,而上一版说不出来。
        */
+      /**
+       * ⚠ **先排除挂了过滤器的路径。**
+       *
+       * `git hash-object` **会跑 clean 过滤器** —— 它算的是「过滤后的内容」,
+       * 而这条判据承诺的是「工作区的字节」。真 git 实测:一个 `filter=scrub` 的
+       * `app.env`,工作区是 `SECRET=hunter2`,`hash-object` 的结果和分支上那份
+       * **一模一样** → 判「可证明无损」→ 删掉 → 用户的真值没了,而屏幕逐字说
+       * 「逐字节没有损失」,给的取回命令取回的还是被洗过的那一份。
+       *
+       * 同一形状:`text=auto` 的 CRLF 归一(工作区 `a\r\nb`,blob `a\nb`)、
+       * nbstripout、git-lfs、git-crypt。notebook 仓库尤其常见,而 `NotebookEdit`
+       * 就在写工具白名单里。
+       *
+       * 挂了 `filter` 或 `text` 就一律判假 —— 保守方向:少自愈一次,不丢一个字节。
+       */
+      const attr = await git(['check-attr', 'filter', 'text', '--', p], gitRoot)
+      if (attr.code === 0 && /: (?:filter|text): (?!unspecified$)/m.test(attr.stdout)) return false
       const want = await entryIn(intBranch, p)
       const have = await entryInTree(p)
       if (want === undefined || have === undefined || have !== want) return false
+      /**
+       * ⚠ **软链(mode 120000)一律判假。**
+       *
+       * `git hash-object` **跟着链走** —— 算的是「链指向的那个文件的字节」,
+       * 而 git 给软链存的 blob 是**链文本本身**。两个东西在比,通常不相等(保守),
+       * 但质量席构造出了相等的那一格:集成分支上 `sl -> "tgt"`(blob 是 3 字节 `tgt`),
+       * 用户那边 `sl -> "other"` 而 `other` 的内容恰好是 3 字节 `tgt` ——
+       * 判「无损」→ 删掉用户的链 → 合并写回 `sl -> tgt`。
+       * **丢的是链的指向,而且给出的取回命令取回的是集成分支那条,不是用户那条。**
+       *
+       * 和 `check-attr` 那条守卫同规矩:这一层比的是 blob,而软链的语义不在 blob 里。
+       */
+      if (want.startsWith('120000')) return false
       const base = await git(['merge-base', 'HEAD', intBranch], gitRoot)
       if (base.code !== 0) return false
       const mine = await entryIn('HEAD', p)
@@ -838,8 +868,13 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      * 反对席点名的静默破坏,而且它就长在我为「承诺早于兑现」写的那次修复里。
      *
      * 内容仍可从集成分支取回(那是这条判据的全部依据),所以这里说的是**怎么取**。
+     *
+     * ⚠ 守卫必须带 `parkable`:清理只发生在**全称成立**那一支里,而
+     * `losslessPaths.length > 0` 在「两条挡路、只有一条可证明无损」时也为真 ——
+     * 那时一个字节都没动,屏幕却说「已被就地清掉」(对抗席真 git 实测:
+     * `losslessPaths: ["n.txt"], parkable: false`,而 `n.txt` 还在盘上)。
      */
-    if (losslessPaths.length > 0) {
+    if (parkable && losslessPaths.length > 0) {
       onNotice?.(
         `主检出里 ${losslessPaths.length} 处和集成分支内容相同的改动`
         + `(${losslessPaths.slice(0, 2).join('、')}${losslessPaths.length > 2 ? ' 等' : ''})`

@@ -484,6 +484,12 @@ export function makeRunAgentFn(deps: {
   runAgentImpl?: typeof runAgent // injectable for tests; defaults to the real runAgent
 }): RunAgentFn {
   const run = deps.runAgentImpl ?? runAgent
+  /**
+   * 越界被拒的累计数与最近一条 —— 整趟共用一格屏幕(见 `onEscapeBlocked` 那段注释)。
+   * run 级而不是每次调用级:它量的是趋势,而趋势要跨调用才看得出来。
+   */
+  let blockedCount = 0
+  let lastBlocked = ''
   const once: RunAgentFn = async req => {
     /**
      * 上游还在限流就先等 —— **排在下面那条 abort 早退之前**。
@@ -653,14 +659,20 @@ export function makeRunAgentFn(deps: {
          * 绝对路径;闸不响了,才说明治因那一步生效了。
          *
          * 现在直接上屏,不经过登记簿(它已删,理由见 `escapedPaths.ts` 文件头)。
-         * 去重键按**路径**:同一条路径撞 40 次只占一格,而不同路径各占一格 ——
-         * 要看的是「哪些路径在教它」,不是撞了多少次。
+         *
+         * ⚠ **去重键是固定的一个字符串,不是路径。** 上一版按路径分格,而事故现场
+         * 恰恰是 2566 条**不同**路径 —— 对抗席实测:40 条不同路径的拒绝会把
+         * 「产出没送到你的分支」那条**唯一的真告警挤出 20 格缓冲区**,无声消失。
+         * 这一栏要的是**趋势**(闸还响不响),不是每一条都点名;真正要人动手的那条
+         * 是 trunk 那个通知,不能被它顶掉。所以:一格,里面写累计数和最近一条。
          */
+        blockedCount += escaped.length
+        lastBlocked = escaped[0] ?? lastBlocked
         try {
           deps.onEscapeBlocked?.(
-            `「${req.node.title || req.node.id}」的席位想写主检出里的 ${escaped[0]} —— 已拒绝,`
-            + '它应该写自己的工作区。这类拒绝多说明方案/验收点里还在给主检出的绝对路径。',
-            `escape:${escaped[0]}`,
+            `席位想写主检出、已被拒绝 ${blockedCount} 次(最近:${lastBlocked})——`
+            + '它们应该写自己的工作区。这个数字在涨,说明方案/验收点里还在给主检出的绝对路径。',
+            'escape-blocked',
           )
         } catch { /* UI 回调不能把这次工具调用带走 */ }
         {
