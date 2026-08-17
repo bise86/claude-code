@@ -621,9 +621,16 @@ describe('改回去要变红的四处', () => {
     // 强制通过用的是它自己那个判据函数,不是跳过那个。两者共用实现但**文案不同**
     // (「跳过它」vs「强制通过它」),接错了屏幕上会对着一个强制通过的动作说「无法跳过」。
     expect(done).toContain('forcePassFailedPhaseReason(node,')
-    // 中断标记那道闸门在**四个**入口上都要有(r / R / s / f):少了它,按下去会立刻再次阻断,
-    // 而屏幕上只会闪一下(redoUnavailableReason 的注释记着这条实测)。
-    expect(done.split('redoUnavailableReason({ aborted: props.signal.aborted').length - 1).toBe(4)
+    /**
+     * 中断标记那道闸门在**每一个会重启编排的入口**上都要有:少了它,按下去会立刻再次
+     * 阻断,而屏幕上只会闪一下(`redoUnavailableReason` 的注释记着这条实测)。
+     *
+     * 6 = 五个动作键(r / R / s / f / **a**)+ `a` 那个**页脚提示的准入判据**。
+     * 最后这一条不是凑数:`addTaskAvailable` 决定详情页页脚写不写「a 新增任务」,
+     * 而在一个中断过的 run 上宣告一个按下去必被拒的键,正是这个面板立过规矩要防的
+     * 「一个按了必然被拒的提示比没有更糟」。
+     */
+    expect(done.split('redoUnavailableReason({ aborted: props.signal.aborted').length - 1).toBe(6)
   })
 
   it('运行中的 f 走的是预先批准,不是重开编排', () => {
@@ -1452,5 +1459,248 @@ describe('越界闸的接线', () => {
     // 生产者那一端:钉住了就报出去,否则这条链没有输入
     const POOL = readFileSync(new URL('../../tools/efftask/worktreePool.ts', import.meta.url), 'utf8')
     expect(POOL).toContain('onPinned?.({ ref: res.ref, where: intPath })')
+  })
+})
+
+/**
+ * 详情页/任务树 `a`:用一段提示词新增任务。**六跳,断一跳这个键就是死键。**
+ *
+ * 这一档是接缝席点名要求补的:`wiringCoverage` 是**逐特性手写枚举**,没有任何
+ * 「RunningView 声明的每个 prop 都必须出现在 <TaskTreePanel> 里」这类通用闸门,而
+ * `§9.4` 的真渲染用例走的是 `RunningView → TaskTreePanel → NodeDetail`,恰恰**跨不过**
+ * `efftask.tsx` 那一跳(那个组件挂不起来,本文件开头逐字写着为什么)。
+ * 也就是说:剪掉 `onAddTask={props.onAddTask}`,或者只接 running 不接 done,全套照绿。
+ */
+describe('新增任务:a 键六跳都要接上', () => {
+  const PANEL = readFileSync(new URL('./TaskTreePanel.tsx', import.meta.url), 'utf8')
+  const DETAIL = readFileSync(new URL('./NodeDetail.tsx', import.meta.url), 'utf8')
+  const RUNNER = readFileSync(new URL('./runOrchestrator.ts', import.meta.url), 'utf8')
+
+  it('面板两支都认这个键(详情页一支、任务树一支)', () => {
+    // 判据是 `input`,不是小写化后的 `k` —— `plain` 挡得住 Ctrl/Alt,挡不住 Shift,
+    // 而 `a` 紧挨着 `s`(跳过失败环节)。
+    /**
+     * ⚠ **两条都要断言整行。**
+     *
+     * 上一版详情页那条查的是 `plain && input === 'a' && props.onAddTask` —— 它是树那一支
+     * (`… && current`)的**子串**,于是把详情页那一支整行删掉,这条断言照样绿
+     * (验收席剪线实测)。同一个文件开头那段「一段解释闸门的注释满足了闸门自己」
+     * 讲的是同一类事:文本断言必须精确到那一行独有的部分。
+     */
+    expect(`详情页接了: ${PANEL.includes("if (plain && input === 'a' && props.onAddTask) { act(props.onAddTask); return }")}`)
+      .toBe('详情页接了: true')
+    expect(`任务树接了: ${PANEL.includes("if (plain && input === 'a' && props.onAddTask && current) { actHere(props.onAddTask); return }")}`)
+      .toBe('任务树接了: true')
+    // 签名必须能回一句话(被拒时留在原地、把话画到页脚)。写成 `=> void` 就退回
+    // 「按了没效果」那个老 bug。
+    expect(`prop 声明了: ${PANEL.includes('onAddTask?: (node: TaskNode) => string | undefined')}`)
+      .toBe('prop 声明了: true')
+  })
+
+  it('页脚要宣告它,而且判据是**真准入**', () => {
+    expect(DETAIL).toContain('a 新增任务')
+    expect(`详情页收了: ${DETAIL.includes('canAddTask?: boolean')}`).toBe('详情页收了: true')
+    // 接成 `props.onAddTask !== undefined` 的话,提示照写、按下去必被拒 ——
+    // 这个面板自己立过「一个按了必然被拒的提示比没有更糟」。
+    expect(`面板传的是真准入: ${PANEL.includes('canAddTask={props.addTaskAvailable?.(detail) === true}')}`)
+      .toBe('面板传的是真准入: true')
+  })
+
+  it('phase 注册了,关口渲染得出来,而且**不按 phase 渲染**', () => {
+    expect(`phase 声明了: ${RUNNER.includes("| 'confirmAddTask'")}`).toBe('phase 声明了: true')
+    expect(`进得去: ${SRC.includes("setPhase('confirmAddTask')")}`).toBe('进得去: true')
+    /**
+     * **渲染条件必须只看 `addTaskTarget`,不看 `phase`。**
+     *
+     * 按 phase 渲染的话:用户正在打字,最后一个任务恰好跑完,`runOrchestrator` 收尾无条件
+     * `setPhase('done')` → 这一屏连同他写的几千字一起被卸载,屏幕上一句解释都没有。
+     * 验收席实跑出来的,而这条断言就是钉住那次修复。
+     */
+    expect(`关口渲染了: ${SRC.includes('if (addTaskTarget && addTaskScopeState) {')}`)
+      .toBe('关口渲染了: true')
+    expect(`没按 phase 渲染: ${!SRC.includes("phase === 'confirmAddTask' && addTaskTarget")}`)
+      .toBe('没按 phase 渲染: true')
+  })
+
+  /**
+   * **两个视图各接一次。**
+   *
+   * 只查「出现过」会被另一处满足(本文件 `occurrences` 那段注释记着这条),所以数次数:
+   * 运行视图一次、结束视图一次。`onRecalcDeps` 就是只接了 running 一边的现成先例 ——
+   * 这个键**两边都要**,因为结束屏正是「跑完了才想起还差一件事」的那一刻。
+   */
+  it('运行视图和结束视图**都**接上', () => {
+    expect(occurrences('onAddTask={props.onAddTask}')).toBe(2)
+    expect(occurrences('addTaskAvailable={props.addTaskAvailable}')).toBe(2)
+    expect(`running 接了: ${SRC.includes("setAddTaskFrom('running')")}`).toBe('running 接了: true')
+    expect(`done 接了: ${SRC.includes("setAddTaskFrom('done')")}`).toBe('done 接了: true')
+  })
+
+  /**
+   * **「编排器真的去跑这个新节点」那一跳。**
+   *
+   * 上一版这一档查到 `runAddTask(` + journal + 孤儿清理就收尾了,而 `hold` / `reserve` /
+   * `taskAdded` / `dropNodes` **一条都没查** —— 验收席逐条剪断实测:这四行各剪一次,
+   * 全套 4269 条**照样全绿**。它们各自的后果是:
+   *  - `taskAdded`:运行中新增的任务**永远不被调度**,而屏幕说「已新增」;
+   *  - `reserve`:maxNodes 这个启动关口批准过的安全阀被绕过;
+   *  - `hold`:落盘那次 await 期间祖先被派出去,拿**旧树**判通过;
+   *  - `dropNodes`:新任务的详情页顶着上一轮同 id 节点的输出。
+   *
+   * 这正是本仓招牌事故的形状,而且是这个功能唯一真正「生效」的那一跳。
+   */
+  it('编排器那四条接缝一条都不能少', () => {
+    expect(`taskAdded 接了: ${SRC.includes('orch.taskAdded(n, affected)')}`).toBe('taskAdded 接了: true')
+    expect(`reserve 接了: ${SRC.includes('reserve: () => orch.reserveOne(),')}`).toBe('reserve 接了: true')
+    expect(`hold 接了: ${SRC.includes('const h = orch.hold(ids)')}`).toBe('hold 接了: true')
+    expect(`丢旧流接了: ${SRC.includes('onDropStreams: (ids: readonly string[]) => { streams.current.dropNodes(ids) },')}`)
+      .toBe('丢旧流接了: true')
+    // 被扣住的节点也要算进准入 —— `runningNodeIds()` **不含** held(验收席实跑)。
+    expect(`held 并进准入了: ${SRC.includes('orchRef.current?.heldNodeIds()')}`).toBe('held 并进准入了: true')
+  })
+
+  it('关口真的会去调 runAddTask,而且落盘带状态账', () => {
+    expect(`调了: ${SRC.includes('void runAddTask(')}`).toBe('调了: true')
+    // 少了 journal:node.md 是整份覆盖写,磁盘满那一刻盘上留着的是上一次那份,
+    // 而这条路上最脆的一个字节正是 anchor 的 childIds。
+    expect(`账接了: ${SRC.includes('writeNodeFile(props.fs, dir, n, journal)')}`).toBe('账接了: true')
+    // 孤儿清理那条路(anchor 落盘失败时)要真的接上,否则「这次新增没有发生」是假话。
+    expect(`孤儿清理接了: ${SRC.includes('removeNodeDirs(props.fs, dir, [id])')}`).toBe('孤儿清理接了: true')
+    /**
+     * **而且删失败要抛。** `removeNodeDirs` 从不抛(它把失败收进返回值),丢掉返回值的话
+     * 下游那个「清掉了没有」的判据恒真 —— 屏幕说「新任务的文件已经清掉」,而它还在盘上,
+     * 下次 `--resume` 会把它挂回去并开始跑。验收席用只读盘实跑出来的。
+     */
+    expect(`删失败会抛: ${SRC.includes('if (r.failed.length > 0) throw new Error(')}`).toBe('删失败会抛: true')
+  })
+
+  it('结束屏那条路会重启编排,而且起不来要说出口', () => {
+    /**
+     * ⚠ **终点锚要挑一个注释里不会出现的**。
+     *
+     * 第一版用 `phase === 'running' && directiveOpen` 收尾,而关口那段注释里逐字写着
+     * 「排在下面那条 `phase === 'running' && directiveOpen` 之前」—— 区间当场缩到只剩
+     * 半句注释,断言假红。本文件上面那条「一段解释闸门的注释满足了闸门自己」是同一形状
+     * 的反面,两个方向都踩得到。
+     */
+    const from = SRC.indexOf('if (addTaskTarget && addTaskScopeState) {')
+    const region = SRC.slice(from, SRC.indexOf('\n  if (phase === \'running\' && directiveOpen) {', from))
+    expect(region.length).toBeGreaterThan(0)   // 非零基线:切不出区间就不是「通过」
+    expect(region).toContain('startRun(cfg, ns)')
+    expect(region).toContain('没有起跑')
+  })
+})
+
+/**
+ * Esc 之后屏幕上那一行:**四跳**,断一跳就退回「按了没反应」。
+ *
+ * 用户报的原话:「退出任务时按了 ESC,为什么要很久才有反应,在干啥呢」。
+ * 收口链跑完之前界面一直停在运行视图上,而它此前一个字都不说 —— 而这一跳恰恰跨在
+ * `efftask.tsx` 上(那个组件挂不起来,真渲染的用例够不着),正是本文件存在的理由。
+ */
+describe('中止反馈:接线那几跳(真画出来那一跳在 effTaskViews.test.tsx,本文件守不到)', () => {
+  const RUNNER = readFileSync(new URL('./runOrchestrator.ts', import.meta.url), 'utf8')
+
+  it('编排器报得出收口走到哪了', () => {
+    expect(`声明了: ${RUNNER.includes('onTeardown?: (stage: string | null) => void')}`)
+      .toBe('声明了: true')
+    // 最贵的那一步(每个还挂着工作区的节点几条 git)必须先报出来。
+    expect(`回收那步报了: ${RUNNER.includes('正在回收隔离工作区')}`).toBe('回收那步报了: true')
+    // 收完要清成 null,否则结束屏上会挂着一句早就做完的「正在回收…」。
+    expect(`收完清了: ${RUNNER.includes('args.onTeardown?.(null)')}`).toBe('收完清了: true')
+  })
+
+  it('中止时不做自动捞回,而且说出来', () => {
+    expect(`守卫在: ${RUNNER.includes('if (args.signal.aborted) {')}`).toBe('守卫在: true')
+    expect(`说了: ${RUNNER.includes('已中断:这一趟没有做自动捞回')}`).toBe('说了: true')
+  })
+
+  it('接线方把它接进运行视图', () => {
+    expect(`接了 onTeardown: ${SRC.includes('onTeardown: stage => setTeardown(stage)')}`)
+      .toBe('接了 onTeardown: true')
+    /**
+     * `aborting` 走 signal,不走按键回调 —— Esc 只是其中一个入口(REPL 级中止、父 signal
+     * 都会走到同一个 controller)。
+     *
+     * ⚠ **监听器的**函数体**也要钉住**,不能只钉 `addEventListener` 那一行:变异测试实测,
+     * 把 `on` 的函数体换成 `{}` 之后,`addEventListener(...)` 那行字原样还在 ——
+     * 于是「听了 signal」这条断言照绿,而屏幕上永远不会出现「已请求中断」。
+     * 这个组件挂不起来(见本文件开头),所以这一跳只有文本断言,那就必须钉到最里面那一句。
+     */
+    expect(`听了 signal: ${SRC.includes("props.signal.addEventListener('abort', on, { once: true })")}`)
+      .toBe('听了 signal: true')
+    expect(`听到了会改口: ${SRC.includes('const on = (): void => setAborting(true)')}`)
+      .toBe('听到了会改口: true')
+    // 组件一挂上就要认「已经中止过」的 signal —— 那时 abort 事件早就派发完了,不会再来一次。
+    expect(`已中止的 signal 也认: ${SRC.includes('React.useState(props.signal.aborted)')}`)
+      .toBe('已中止的 signal 也认: true')
+    expect(`传给视图了: ${SRC.includes('aborting={aborting}')}`).toBe('传给视图了: true')
+    expect(`传给视图了: ${SRC.includes('teardown={teardown}')}`).toBe('传给视图了: true')
+  })
+})
+
+/**
+ * `m` 键在 run 结束之后**必须还能用**。
+ *
+ * 评审用真 git 打出来的:`props.signal` 一旦 abort 就**永久** aborted,而全会话只有这一个
+ * `runController`。`armSignal()` 无条件 chain 的后果是 —— 用户按下 Esc 之后,`m` 在这个
+ * 会话里再也合不了任何东西(`merged=[] aborted=true`),而结果屏还写着「再按一次 m 可以
+ * 接着合」、结束屏写着「(按 m 捞回)」、中止那句说明也让他「按 m」。
+ * 三句话请他按的那个键,正是被那条 chain 关掉的 —— 一个永不终止的循环。
+ *
+ * run 级中止的语义是「别再跑任务了」,不是「这个会话里再也不许碰 git」。
+ *
+ * 这一跳只有文本断言:`armSignal` 是 `EffTaskRunner` 里的闭包,而那个组件挂不起来
+ * (见本文件开头)。所以钉到最里面那一句 —— 判据本身。
+ */
+describe('m 键不被一个早就结束的 run 摁住', () => {
+  it('只在编排还活着时才 chain run 级 signal', () => {
+    expect(`判据在: ${SRC.includes('const chained = orchRef.current !== null')}`)
+      .toBe('判据在: true')
+    // 三处都要走它:挂监听、摘监听、以及「已经 abort 了就直接 abort」那一支。
+    expect(`挂监听走它: ${SRC.includes("if (chained) {\n        if (props.signal.aborted) ctl.abort()")}`)
+      .toBe('挂监听走它: true')
+    expect(`摘监听走它: ${SRC.includes('if (chained) props.signal.removeEventListener')}`)
+      .toBe('摘监听走它: true')
+  })
+})
+
+/**
+ * **捞回把 `contributed` 记回节点** —— 这一跳断了,三处下游同时对着一个
+ * **产出确实已经在集成分支上**的节点说假话(见 runOrchestrator 里那一段)。
+ *
+ * 为什么只能文本断言:这一段在 `autoRescue()` 的 try 里,而走到它要一个**真 git 仓**
+ * (`runRescue` 会真的往集成分支上合)。runOrchestrator.test.ts 那一组自己写着,它钉的是
+ * 「这条线接通了」,捞回捞到了什么是 rescue.ts 的事 —— 判据本身在
+ * `rescue.test.ts` 的 `contributorsOf` 那一组里真跑。这里补中间那一跳。
+ */
+describe('捞回之后 contributed 要记回节点', () => {
+  const RUNNER = readFileSync(new URL('./runOrchestrator.ts', import.meta.url), 'utf8')
+
+  it('算属主、写节点、落盘,一步都不能少', () => {
+    // 判据:算出这一趟到底交付了谁。剪掉它,后面整段就没有输入。
+    expect(`算属主: ${RUNNER.includes('const delivered = contributorsOf(res)')}`)
+      .toBe('算属主: true')
+    // 写内存:少了它,`mergeAndRelease` 那道闸继续说「产出不在集成分支上」。
+    expect(`写节点: ${RUNNER.includes('n.contributed = true')}`).toBe('写节点: true')
+    // 落盘:只改内存的话,下一次 --resume 读回来又是「从没交付过」,三个后果原样回来。
+    expect(`落盘: ${RUNNER.includes('await writeNode(args.fs, args.runDir, n, journal)')}`)
+      .toBe('落盘: true')
+  })
+
+  /**
+   * 属主是从 `runRescue` 的返回值里带出来的 —— rescue.ts 那一头不 push `nodeId`,
+   * 这一头算得再对也永远是空集合。这一句就是那个源头。
+   */
+  it('rescue 那一头真的把 nodeId 带出来了', () => {
+    const RESCUE = readFileSync(new URL('../../tools/efftask/rescue.ts', import.meta.url), 'utf8')
+    /**
+     * **只查 `out.merged` 那一处。** 同一句 `nodeId` 透传在这个文件里有四处
+     * (stranded ×2、backfilled、merged),整文件查存在会被另外三处满足 —— 而漏的正是
+     * merged 这一处,剪掉它断言照样绿。所以切出那一个 push 的字面量再查。
+     */
+    const at = RESCUE.indexOf('out.merged.push({')
+    expect(`找得到 out.merged.push: ${at >= 0}`).toBe('找得到 out.merged.push: true')
+    expect(RESCUE.slice(at, RESCUE.indexOf('})', at))).toContain('nodeId: c.evidence.nodeId')
   })
 })

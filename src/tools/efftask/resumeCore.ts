@@ -648,6 +648,27 @@ export function validateLoadedNodes(
      * **一条没夹**原样回到内存,再落盘就是 9.5 MB 的 node.md,而 `commit()` 每次状态迁移
      * 都全量重写它。
      */
+    /**
+     * 手工新增的出身记录。**逐字段校验,坏了整条丢**。
+     *
+     * 守卫在这里而不只在渲染点:`serializeNode` **每次 commit 都跑**,而它要把
+     * `manualAdd.at` 交给 `stripControl`(`s.replace`)。盘上写着 `manualAdd: 123` 时
+     * 那一句会抛,于是这个节点**再也 commit 不了** —— hostileDisk 那道闸实测出来的。
+     * 丢掉的后果只是「树上少一行『这是人加的』」,而留着的后果是节点永久卡死。
+     */
+    if (n.manualAdd !== undefined) {
+      const m = n.manualAdd as unknown
+      const ok = !!m && typeof m === 'object' && !Array.isArray(m)
+        && typeof (m as { at?: unknown }).at === 'string'
+        && typeof (m as { anchorId?: unknown }).anchorId === 'string'
+      if (ok) {
+        const v = m as { at: string; anchorId: string }
+        n.manualAdd = { at: v.at, anchorId: v.anchorId }
+      } else {
+        delete n.manualAdd
+        repairs.push(`节点 ${n.id}:手工新增记录已损坏,已丢弃(不影响这个任务本身)`)
+      }
+    }
     if (n.depsRecalc !== undefined) {
       const raw = n.depsRecalc as unknown
       const arr = Array.isArray(raw) ? raw : []

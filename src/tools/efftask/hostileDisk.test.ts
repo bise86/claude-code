@@ -171,6 +171,14 @@ function richNode(): TaskNode {
   // 被恢复边界夹掉的条数。它和上面那个数组是一对:留着一个孤零零的计数会让 run.md
   // 印出「⟲ 依赖重算 ×7」而 node.md 那一节一条都没有。
   n.depsRecalcDropped = 3
+  /**
+   * 手工新增的出身记录。**两个消费者都在这条扫描线上**,所以它必须进这个夹具:
+   * `serializeNode` 会把它渲染进 body(`stripControl(m.at)` / `stripControl(m.anchorId)`),
+   * 而集成验收提示词按 `c.manualAdd` 决定给不给那一行。写坏成一个非对象(比如
+   * `manualAdd: 'boom'`)会让 `.at` 读出 undefined —— body 里出现「手工新增(undefined)」,
+   * 而那是每次 commit 都走的那条路。
+   */
+  n.manualAdd = { at: '2026-08-17T00:00:00Z', anchorId: 'root' }
   n.phaseMs = { EXECUTING: 42_000, ACCEPTANCE: 7_000 }
   // 模型用量。和 phaseMs 同一类:一张从盘上读回来的纯数字表,而它会被渲染成
   // `NaN 次 · NaNk`,还会顺着 childIds 被子树合计一路传染到根节点那一行。
@@ -689,5 +697,31 @@ describe('时间点与取消标记的读回校验', () => {
   it('cancelled 只认真正的 true —— 手抖写下的字符串不该永久摁住一条依赖链', () => {
     expect(load({ cancelled: 'yes' }).cancelled).toBe(false)
     expect(load({ cancelled: true }).cancelled).toBe(true)
+  })
+})
+
+/**
+ * **`BlockCategory` 的每一个成员都必须在 `BLOCK_CATEGORIES` 里。**
+ *
+ * 这个白名单是给**手工改坏的 node.md** 兜底的(升级卡片就在叫用户去改那个文件),不是
+ * 用来筛掉自己写下的值。`'no-output'` 曾经漏在里面,后果实测:一个零产出阻断的节点每次
+ * `--resume` 都被判「安全阀类别 no-output 无法识别,已清除」,而 `reseat` 的重入判据按
+ * `capCategory` 分岔 —— 类别被擦掉之后,一个方案评审曾降级放行(`planReview` 顶格)的
+ * 节点会被送回 **CREATED 重新拟方案**,而不是回 READY 重跑执行。
+ *
+ * 判据从**源码里的类型**取,不是照抄一份清单:照抄的话下一个新成员漏进来照样全绿,
+ * 而这正是这一条要防的那件事(仓库里没有 typecheck,类型和运行时对不上不会报错)。
+ */
+describe('阻断类别:类型和白名单不许各说各话', () => {
+  it('BlockCategory 的每一个成员都在 BLOCK_CATEGORIES 里', () => {
+    const src = readFileSync(new URL('./types.ts', import.meta.url), 'utf8')
+    const from = src.indexOf('export type BlockCategory =')
+    const decl = src.slice(from, src.indexOf('export const BLOCK_CATEGORIES', from))
+    // 注释里也有单引号串(比如举例说到 `rework`),所以只认联合成员那个形状:行首 `| '…'`。
+    const members = [...decl.matchAll(/\|\s*'([a-z-]+)'/g)].map(m => m[1] as string)
+    expect(members.length).toBeGreaterThan(5)
+    expect(members.filter(m => !BLOCK_CATEGORIES.has(m))).toEqual([])
+    // 反向:白名单里也不许有类型上不存在的档(那种值 escalation.ts 的正文分不出来)。
+    expect([...BLOCK_CATEGORIES].filter(c => !members.includes(c))).toEqual([])
   })
 })

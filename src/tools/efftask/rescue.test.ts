@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createWorktreePool, type GitRunner } from './worktreePool.js'
-import { orphanDirFindings, planRescue, remainingOnRef, rescueLines, runRescue, type RescueDeps } from './rescue.js'
+import { contributorsOf, orphanDirFindings, planRescue, remainingOnRef, rescueLines, runRescue, type RescueDeps } from './rescue.js'
 import { createNode, emptyPhaseRoles, type TaskNode } from './types.js'
 import type { StrandedItem } from './stranded.js'
 
@@ -227,6 +227,42 @@ describe('分诊:模型只圈范围,默认方向朝安全那一侧', () => {
     expect(seen[0]!.files).toContain('src/api.ts')
   })
 
+  /**
+   * **有提交、但一个字节的内容都不是集成分支上没有的 —— 同样没什么可捞。**
+   *
+   * 判据是 `commits === 0 || fileCount === 0`,而上一版写的是 `&&`,只挡得住两条同时成立
+   * 那一格。`commits > 0 && fileCount === 0` 是真实存在的形状(建了又删、只有一次同步
+   * 合并、`--allow-empty`),`&&` 放它过去的后果不是白跑一趟:它会被**合进集成分支**
+   * (零字节,只多一个合并提交)、记进 `out.merged`,于是 `contributorsOf` 把它算成一次
+   * 交付、`contributed` 被置真 —— 而这个节点的产出一个字节都不在集成分支上。
+   * 那一下正好把三道零贡献兜底一次性全部关掉。评审在真 git 上跑出来的。
+   */
+  it('有提交、但相对集成分支没带来任何内容的不进分诊', async () => {
+    const p = pool(); await p.init()
+    const n = node('root/04e')
+    const l = await p.acquire(n) as { path: string }
+    // 建了又删:两笔提交,净 diff 为空。
+    await writeFile(join(l.path, 'ghost.ts'), 'x\n')
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'efftask: add'], l.path)
+    await rm(join(l.path, 'ghost.ts'), { force: true })
+    await git(['add', '-A'], l.path)
+    await git(['commit', '-qm', 'efftask: remove'], l.path)
+    const branch = p.worktreeBranchOf(n)
+
+    let asked = 0
+    const plan = await planRescue(
+      depsOf(p, { triage: async ev => { asked = ev.length; return [] } }),
+      [item({ kind: 'branchOnly', branch, nodeId: n.id, why: '' })],
+    )
+    // 前提:它**确实**有提交(否则这条用例测的是上一条那一格)。
+    expect((await git(['rev-list', '--count', `${p.integrationBranchName}..${branch}`], gitRoot)).stdout.trim())
+      .not.toBe('0')
+    expect(asked).toBe(0)
+    expect(plan.merge).toEqual([])
+    expect(plan.backfill).toEqual([])
+  })
+
   it('相对集成分支一个提交都没多的不进分诊', async () => {
     const p = pool(); await p.init()
     const n = node('root/05')
@@ -260,6 +296,25 @@ describe('真的捞', () => {
     expect(show.stdout).toBe('the lost work\n')
     // **捞是加东西,不是清理** —— 分支一个都不删。
     expect((await git(['rev-parse', '--verify', branch], gitRoot)).code).toBe(0)
+  })
+
+  /**
+   * **属主要跟着产出一起出去。**
+   *
+   * 调用方拿这一格把 `node.contributed` 记回节点 —— 缺了它,一个产出**确实已经在集成分支
+   * 上**的节点在盘上永远是「从没交付过」,于是 `mergeAndRelease` 那道闸对它说假话、
+   * `backtrack.outputMissing` 把它点名重跑、执行环节那道指纹闸把它判成什么都没干。
+   * 跑机 .30 run 001:22 个阻断节点正是这一格。
+   */
+  it('合进去的那一条带着属主 nodeId(调用方要拿它记 contributed)', async () => {
+    const p = pool(); await p.init()
+    const { branch } = await strandedBranch(p, 'root/06b', 'owned.ts', 'mine\n')
+    const plan = await planRescue(
+      depsOf(p, { triage: async ev => ev.map(e => ({ ref: e.ref, verdict: 'merge' as const, why: '独有产出' })) }),
+      [item({ kind: 'branchOnly', branch, nodeId: 'root/06b', title: 'T', why: '' })],
+    )
+    const out = await runRescue(depsOf(p), plan)
+    expect(out.merged.map(m => m.nodeId)).toEqual(['root/06b'])
   })
 
   it('判「不合」的一个字节都不动', async () => {
@@ -598,5 +653,42 @@ describe('还剩多少没捞回来', () => {
     const p = pool(); await p.init()
     const { branch } = await strandedBranch(p, 'root/rm-2', 'mine.ts', 'M\n')
     expect(await remainingOnRef(depsOf(p), branch)).toBe(1)
+  })
+})
+
+/**
+ * **捞回也是一次交付,要记在节点身上。**
+ *
+ * 这一格是 `contributed` 的第三个赋值点(另两个是 `mergeAndRelease` 和用户按 `m` 的
+ * `mergeSubtree`)。跑机 .30 run 001 实测:22 个阻断节点的产出**已经在集成分支上**
+ * (233 条抢救分支全部被捞了回去),而它们在盘上一律是「从没交付过」。
+ */
+describe('捞回的属主', () => {
+  const out = (over: Partial<{ merged: unknown[]; backfilled: unknown[] }>) =>
+    ({ merged: [], backfilled: [], ...over }) as never
+
+  it('整条合并进去的算', () => {
+    expect([...contributorsOf(out({ merged: [{ ref: 'r', commits: 1, nodeId: 'root/01' }] }))])
+      .toEqual(['root/01'])
+  })
+
+  /** 判据是「有没有东西真的进了集成分支」,不是走的哪条路 —— 补录进去的文件没有区别。 */
+  it('补录进去的也算', () => {
+    expect([...contributorsOf(out({ backfilled: [{ ref: 'r', added: ['a.ts'], skipped: [], nodeId: 'root/02' }] }))])
+      .toEqual(['root/02'])
+  })
+
+  /** `added` 为空的那一条记的是「试过了,一个都没得补」—— 算成交付就是凭空造一次贡献。 */
+  it('补录一个字都没补进去的不算', () => {
+    expect([...contributorsOf(out({ backfilled: [{ ref: 'r', added: [], skipped: [], nodeId: 'root/03' }] }))])
+      .toEqual([])
+  })
+
+  /** 孤儿目录那一格没有属主(`ref` 是盘上的一个目录),不许因此炸掉整趟收口。 */
+  it('认不出属主的不算,也不抛', () => {
+    expect([...contributorsOf(out({
+      merged: [{ ref: 'r', commits: 1 }],
+      backfilled: [{ ref: '/wt/.orphan/x', added: ['a.ts'], skipped: [] }],
+    }))]).toEqual([])
   })
 })

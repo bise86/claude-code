@@ -108,6 +108,20 @@ export class EffTaskOrchestrator {
   runningNodeIds(): readonly string[] { return [...this.inFlightIds] }
 
   /**
+   * 此刻被**另一次操作扣住**的节点 id(见 `hold`)。
+   *
+   * `runningNodeIds()` 只回在飞的那些 —— 被扣住的**不在**里面。`pickBatch` 那一侧确实把
+   * 两者折进了同一个集合(`new Set([...inFlight.keys(), ...this.held])`),但那是调度循环
+   * 内部的事;界面拿到的是 `runningNodeIds()`,于是「新增任务」的准入把一个正被
+   * `d`(依赖重算)或 `r`(重做)扣着的节点当成空闲的。验收席实跑:同一批 id 连 hold 两次
+   * 都返回 ok,而**先释放的那一次会把后一次的扣也解开**(`held` 是个 Set,不是引用计数)。
+   *
+   * 交出去而不是让每个调用方自己拼:两处判据迟早会分叉,而这个仓库为「同一条判据的第二份」
+   * 反复付过账。
+   */
+  heldNodeIds(): readonly string[] { return [...this.held] }
+
+  /**
    * 编排器在「等某个节点跑完」时的额外唤醒口。
    *
    * 运行中就地换树之后必须立刻重扫:不叫醒的话,新放回可推进状态的那个节点要等到
@@ -283,6 +297,61 @@ export class EffTaskOrchestrator {
     this.safeUpdate()
     this.nudge()
     return { ok: true }
+  }
+
+  /**
+   * **一个新任务被手工挂进树了** —— 进 byId、上屏、叫醒调度。详情页/任务树的 `a` 键走这条。
+   *
+   * ## 为什么不复用 `applyLive`
+   *
+   * 和 `depsChanged` 逐字同因:`applyLive` 顺手 `clearCancel(affected)`,而 anchor 完全可能
+   * 正是用户按 `x` 取消过的节点 —— 抹掉那个标记 = 他明确拒绝过的任务把产出合进他的分支。
+   * (新增任务的准入本来就会拒绝取消过的节点,但那是**另一处**判据;两处都不该依赖对方。)
+   *
+   * ## 为什么 `byId.set` 和上屏排在 `finished` 判断**之前**
+   *
+   * 落盘已经发生了。这时候早退返回一句「编排已结束」会让这个任务**在盘上有、在内存里没有、
+   * 屏幕上也没有** —— 而下一次 `--resume` 它会自己冒出来。真相是「它已经在树里了,只是
+   * 这一轮不会再调度它」,那就得让屏幕先说出前半句。
+   *
+   * `affected` 是整份清单(新节点 + anchor + 整条祖先链),不是单个 anchorId:
+   * `clearStall` 是逐个清的(见 `applyLive`),而被重开的祖先每一个都可能带着上一辈子的
+   * 空转记账。
+   */
+  taskAdded(node: TaskNode, affected: readonly string[]): { ok: true } | { ok: false; reason: string } {
+    this.byId.set(node.id, node)
+    for (const id of affected) this.clearStall(id)
+    this.safeUpdate()
+    if (this.finished) {
+      return {
+        ok: false,
+        reason: this.signal.aborted ? '整个运行已被中止' : '本次编排刚刚结束',
+      }
+    }
+    /**
+     * **今天这一句是等价的,而它仍然留着 —— 理由写在这儿,免得下一个人补一条假探针。**
+     *
+     * 变异测试把它剪掉之后全套照绿,原因不是覆盖缺口:`runAddTask` 在运行中那条路上一定
+     * 先 `hold(...)`,而 `hold` 交出来的 `release()` **自己就带一次 `nudge()`**(见 hold),
+     * 那一次发生在本方法返回之后的 finally 里。所以唤醒**已经**有人送了。
+     *
+     * 留着的理由是它挡的不是今天:`taskAdded` 的契约是「新节点进树并被调度」,而
+     * 「调用方一定先扣住」是**调用方**的性质。哪天有人从别处调它(或者 hold 变成可选),
+     * 少了这一句的表现是「新任务要等某个在飞节点跑完才被发现」——而那正是用户按下这个键
+     * 的那一刻(其它任务还在跑一个二十分钟的执行环节)。
+     */
+    this.nudge()
+    return { ok: true }
+  }
+
+  /**
+   * 预留**一个**节点名额,和 `createChildren` 共用同一份 `maxNodes` 预算。
+   *
+   * 手工新增走这条而不是自己拿 `nodes().length` 比一次:那会是第二份判据,而且不是原子的 ——
+   * 关口开着的这几十秒里 `growTree` 完全可以把最后几个名额用掉。
+   */
+  reserveOne(): { release: () => void } | null {
+    return this.reserveNodes(1)
   }
 
   /**

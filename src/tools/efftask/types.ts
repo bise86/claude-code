@@ -115,8 +115,17 @@ export type BlockCategory =
    * 一张卡三处自相矛盾,`revise` 当初就是为同一个毛病单独立的档。
    */
   | 'degrade'
+/**
+ * `capCategory` 的白名单 —— `resumeCore` 拿它验盘,不认识的一律清掉。
+ *
+ * **`'no-output'` 曾经漏在这里**,而它是上面那个联合类型的正式成员。后果实测:一个零产出
+ * 阻断的节点每次 `--resume` 都被判「安全阀类别 no-output 无法识别,已清除」,于是
+ * `reseat` 那条按 `capCategory` 分岔的重入判据落进兜底 —— 一个方案评审曾降级放行
+ * (`planReview` 顶格)的节点会被送回 **CREATED 重新拟方案**,而不是回 READY 重跑执行。
+ * 漏一格的代价是这个:白名单是给**手工改坏的 node.md** 兜底的,不是用来筛掉自己写下的值。
+ */
 export const BLOCK_CATEGORIES: ReadonlySet<string> =
-  new Set(['cap-iteration', 'cap-nodes', 'rework', 'timeout', 'infra', 'cap-depth', 'revise', 'degrade'])
+  new Set(['cap-iteration', 'cap-nodes', 'rework', 'timeout', 'infra', 'cap-depth', 'revise', 'degrade', 'no-output'])
 
 /**
  * 降级放行可以发生在哪几关。执行不在内:那不是判决,零产出就是零产出。
@@ -838,6 +847,23 @@ export interface TaskNode {
    */
   depsRecalcDropped?: number
   /**
+   * 这个任务是**用户在运行中手工新增**的(详情页/任务树 `a` 键),不是模型拆出来的。
+   *
+   * 三个消费者,少一个这个字段就等于没加:
+   *  1. **详情页**(`detailSections` 的「出身」一段)和 **node.md 的 body** —— 这个文件自己的
+   *     规矩是「只落 frontmatter 等于只做到机器可读那一半,body 才是人读的那一半」
+   *     (见 `serializeNode` 里 alternatives / responses 两处);
+   *  2. **anchor 的集成验收证据**(`integratePrompt`):那一关问的是「这些子任务合起来达成
+   *     父目标了吗」,而一个用户手写的、可能和父目标毫无关系的子任务原样混进去,双向都坏 ——
+   *     要么 anchor 因为一个它方案里从没承诺过的子任务被判不通过,要么圆桌把它当成父目标的
+   *     一部分从而放宽判据。所以那一行要自报家门,和旁边「降级放行必须自报家门」同因;
+   *  3. 事后追责:树上多出来一个任务,没有它就没有任何地方说得出它是哪来的。
+   *
+   * **不写进 `execStatus`**(`noteOnNode` 那条路):那个字段会被喂进这个节点之后**每一次**
+   * 验收/测试提示词,而「谁加的」对**它自己**的验收不是判据。两件事的区别就在上面第 2 条。
+   */
+  manualAdd?: { at: string; anchorId: string }
+  /**
    * 各阶段耗时 (spec §10.2) — accumulated milliseconds per ACTIVE status.
    *
    * The detail pane showed one aggregate number, which cannot answer the question someone
@@ -1132,6 +1158,19 @@ export const SKIPPABLE_PHASES: ReadonlySet<string> = new Set<PhaseName>(['review
  * 文件进来。两处都是「用户在运行中/重做时补的一句话」,给不同的上限只会让人困惑。
  */
 export const MAX_GUIDANCE_CHARS = 2000
+
+/**
+ * 手工新增任务时那段提示词的长度上限(按码点)。
+ *
+ * **故意和 `MAX_DIRECTIVE_CHARS` / `MAX_GUIDANCE_CHARS` 的 2000 不一样,别去「统一」它。**
+ * 那两个是「用户在运行中/重做时**补的一句话**」——补充,不是全部;这一个是**一个任务的全部
+ * 输入**:它是新节点的 `goal`,而 `goal` 是分析席唯一拿得到的东西(`ctxGoal(node)` 就是它)。
+ * 给它 2000 等于让「新增任务」比「给已有任务补一句」还窄。
+ *
+ * 仍然要有上限,而且这个数要往下传:`createChildren` 让子任务的 goal 以父 goal 开头,
+ * 所以这段话一旦被拆开,会原样进它**每一个后代**的 goal 和每一次提示词。
+ */
+export const MAX_TASK_PROMPT_CHARS = 4000
 
 /**
  * 点名给角色/员工的额外要求最多几条。

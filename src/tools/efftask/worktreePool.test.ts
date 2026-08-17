@@ -48,7 +48,8 @@ async function freshRepo(): Promise<void> {
   await git(['commit', '-qm', 'base'], gitRoot)
 }
 
-const pool = () => createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot })
+const pool = (over: Partial<Parameters<typeof createWorktreePool>[0]> = {}) =>
+  createWorktreePool({ runId: '001', gitRoot, git, worktreeRoot, ...over })
 
 beforeEach(freshRepo)
 afterAll(async () => { for (const r of roots) await rm(r, { recursive: true, force: true }) })
@@ -268,6 +269,68 @@ describe('worktreePool against real git', () => {
     expect(show.stdout).toContain('half-finished work')
   })
 
+  /**
+   * **零贡献闸的判据:产出到底在不在集成分支上 —— 问 git,不是查账本。**
+   *
+   * `node.contributed` 只在「这一趟自己合成功」和「用户按 m」时记账,漏掉整条捞回链路:
+   * 节点被中止 → 产出被抢救到 salvage 分支 → 下一趟捞回把它合进集成分支。跑机 .30 run 001
+   * 里 31 个阻断有 22 个是这个形状,而闸门对它们逐字说「产出不在集成分支上,也不在任何
+   * 别的地方」—— 一句能用一条 `merge-base --is-ancestor` 证伪的假话。
+   *
+   * 抢救 ref **由池子自己造**(重新 acquire 一个脏工作区那条真路),不是手写一个名字:
+   * slug 算错、或者以后换了命名规则,手写那条照样绿,而真实现认不回自己的 ref。
+   */
+  describe('deliveredToIntegration:产出在不在集成分支上', () => {
+    /** 走真路造一条抢救 ref:写脏 → 重新 acquire → 池子把它固化到 salvage 分支。 */
+    const salvaged = async (p: ReturnType<typeof pool>, id: string): Promise<string> => {
+      const n = node(id)
+      const l = await p.acquire(n) as { path: string }
+      await writeFile(join(l.path, 'work.ts'), 'real output\n')
+      await p.acquire(n)
+      const refs = await git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/efftask/001/salvage'], gitRoot)
+      const ref = refs.stdout.split('\n').map(s => s.trim()).filter(Boolean).at(-1)
+      expect(ref).toBeDefined()
+      return ref as string
+    }
+
+    it('抢救分支合进集成分支之后 → 认它交付过', async () => {
+      const p = pool(); await p.init()
+      const n = node('root/60-salv')
+      const ref = await salvaged(p, 'root/60-salv')
+      // 合之前:还没到集成分支上。
+      expect(await p.deliveredToIntegration(n)).toBe(false)
+      await git(['merge', '--no-verify', '--no-edit', '-q', ref], p.integrationPath)
+      expect(await p.deliveredToIntegration(n)).toBe(true)
+    })
+
+    /**
+     * **别人的抢救分支不算数。** slug 是 `sha256(runId+nodeId)[:8]`,认错主的后果是把一个
+     * 什么都没干的节点判成「已交付」—— 而这个答案会**关掉**一道安全闸。
+     */
+    it('别的节点的抢救分支合进去了,不算这个节点交付', async () => {
+      const p = pool(); await p.init()
+      const ref = await salvaged(p, 'root/61-other')
+      await git(['merge', '--no-verify', '--no-edit', '-q', ref], p.integrationPath)
+      expect(await p.deliveredToIntegration(node('root/62-innocent'))).toBe(false)
+    })
+
+    /**
+     * **从没干过活的节点必须是 false,而这一条是整组里最要紧的。**
+     *
+     * 它的工作区分支和基线逐字相同,因而**天然**是集成分支的祖先 —— 判据一旦顺手把节点
+     * 自己那条分支也算进去,「什么都没干」当场变成「已交付」,零贡献闸就此彻底失效。
+     */
+    it('从没产出过的节点 → false(它的分支天然是集成分支的祖先)', async () => {
+      const p = pool(); await p.init()
+      const n = node('root/63-idle')
+      await p.acquire(n)
+      const branch = p.worktreeBranchOf(n)
+      // 前提:它那条分支**确实**已经是集成分支的祖先(否则这条用例测的是别的东西)。
+      expect((await git(['merge-base', '--is-ancestor', branch, p.integrationBranchName], gitRoot)).code).toBe(0)
+      expect(await p.deliveredToIntegration(n)).toBe(false)
+    })
+  })
+
   it('只有被忽略的构建产物时不留抢救分支 —— 那条分支会是集成分支的逐字副本', async () => {
     // 脏的判据带 --ignored(它得覆盖「产出就是 dist/」那种节点),于是一个只跑过构建的
     // 工作区也会走进抢救那一段;而 `add -A` 不暂存被忽略的文件,commit 无事可做,
@@ -302,10 +365,15 @@ describe('worktreePool against real git', () => {
     await p.init()
     const done = node('root/30-x')
     const dirty = node('root/31-y')
-    const ld = await p.acquire(done) as { path: string }
+    const ld = await p.acquire(done) as { path: string; branch: string }
+    // **和生产一致**:`node.worktree` 是**流水线**在拿到租约之后赋的(stepExecute /
+    // acquirePlanBase),池子自己不写它。而 `dispose` 正是靠这个字段判断「这个节点到底
+    // 有没有工作区」——不赋的话这里测的是一条生产上不存在的形状。
+    done.worktree = { branch: ld.branch, path: ld.path }
     await writeFile(join(ld.path, 'x.txt'), 'x\n')
     await p.commitAndMerge(done)
-    const ly = await p.acquire(dirty) as { path: string }
+    const ly = await p.acquire(dirty) as { path: string; branch: string }
+    dirty.worktree = { branch: ly.branch, path: ly.path }
     await writeFile(join(ly.path, 'y.txt'), 'never merged\n')
 
     const { kept } = await p.dispose([done, dirty])
@@ -313,6 +381,44 @@ describe('worktreePool against real git', () => {
     expect(kept[0].path).toContain('efftask-001-')
     expect(kept[0].why).toBeTruthy()
   })
+
+  /**
+   * **没有工作区引用的节点,`dispose` 一次 git 都不许跑。**
+   *
+   * 用户报的原话:「已经合入主干的任务,为什么还要跑呢」。`dispose` 走的是整棵树,而树上
+   * 绝大多数节点从来没有过工作区(拆分节点、还没执行到的),**跑的过程中已经合并回收掉的
+   * 那些也一样**(`mergeAndRelease` 成功后会把 `node.worktree` 清掉)。
+   *
+   * 对它们,`release` 会拿一个不存在的路径去 spawn `git status --porcelain --ignored` ——
+   * 必然失败,而 `--ignored` 恰恰是这里最贵的一条(要走遍被忽略的目录)。跑机上一个 run
+   * 有 2215 个节点,而 `dispose` 的返回值被唯一的生产调用方直接丢掉。
+   *
+   * 断言的是**真的没有 spawn**,不是「结果对」—— 后者在白跑一遍 git 的实现上同样成立。
+   */
+  it('没有工作区的节点:dispose 一条 git 都不跑', async () => {
+    let calls = 0
+    const p = pool({ git: (args, cwd) => { calls++; return git(args, cwd) } })
+    await p.init()
+    const withTree = node('root/40-a')
+    const lease = await p.acquire(withTree) as { path: string; branch: string }
+    withTree.worktree = { branch: lease.branch, path: lease.path }
+    await p.commitAndMerge(withTree)
+
+    // 一棵「正常」的树:一个有工作区,九个从来没有过。
+    const bare = Array.from({ length: 9 }, (_, i) => node(`root/5${i}-none`))
+    calls = 0
+    await p.dispose([...bare, withTree])
+    const withBoth = calls
+
+    calls = 0
+    await p.dispose(bare)
+    expect(calls).toBe(0)
+    // 而有工作区的那个照常被处理(否则上面那条 0 可以靠「dispose 整个不干活」拿到)。
+    expect(withBoth).toBeGreaterThan(0)
+  })
+
+  // 守卫的另一半(引用清了、目录还在的照样回收)已经有探针了 —— 见文件下方
+  // `describe('dispose 的判据是引用和目录都没有')`。别在这里再写一遍。
 })
 
 describe('生命周期边界(验收员用真 pool + 真 pipeline 同进程时发现的)', () => {
@@ -2966,5 +3072,46 @@ describe('索引脏 + 真三方合并', () => {
     expect(why).toContain('git stash')
     // 用户的东西一个字节都没动。
     expect(await readFile(join(gitRoot, 'mine.txt'), 'utf-8')).toContain('又改了')
+  })
+})
+
+/**
+ * **引用被清掉、目录还在**的那一类,`dispose` 仍然要回收。
+ *
+ * 这是评审逐条走完 `node.worktree` 的设/清路径抓出来的:
+ *  - `releasePlanBase`(pipeline.ts)对 `kind==='executable'` 的节点**清引用、故意把目录
+ *    留在盘上**给执行环节复用 —— 那是「分析跑完、还没排到执行」的每一个节点,
+ *    也正是被中止那一趟最典型的形状;
+ *  - `resumeCore` 在 `--resume` 时把除冲突节点外的**每一个**引用清掉,于是上一趟留在盘上的
+ *    目录在下一趟收口里一个都不会被碰。
+ *
+ * 只按 `!n.worktree` 跳过的话,干净且已合入的遗留目录**既不回收、也没有任何一处说它存在**
+ * (`handoff().kept` 只报脏的那些)。所以判据必须是「引用**和**目录都没有」。
+ */
+describe('dispose 的判据是引用和目录都没有', () => {
+  it('引用没了但目录还在(方案席借用 / --resume 之后):照样回收', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/60-plan')
+    const lease = await p.acquire(n) as { path: string; branch: string }
+    n.worktree = { branch: lease.branch, path: lease.path }
+    await writeFile(join(lease.path, 'x.txt'), 'x\n')
+    await p.commitAndMerge(n)
+    // `releasePlanBase` / `resumeCore` 做的就是这一下:交回引用,目录留着。
+    n.worktree = undefined
+    expect(await exists(lease.path)).toBe(true)
+
+    await p.dispose([n])
+    expect(await exists(lease.path)).toBe(false)
+  })
+
+  it('引用没了、目录也没有:一条 git 都不跑(收益仍然保住)', async () => {
+    let calls = 0
+    const p = pool({ git: (args, cwd) => { calls++; return git(args, cwd) } })
+    await p.init()
+    const bare = Array.from({ length: 9 }, (_, i) => node(`root/6${i}-none`))
+    calls = 0
+    await p.dispose(bare)
+    expect(calls).toBe(0)
   })
 })

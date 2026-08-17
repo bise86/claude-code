@@ -1331,3 +1331,154 @@ describe('收口之前的自动捞回', () => {
   })
 
 })
+
+/**
+ * 按下 Esc 之后屏幕上要有东西,以及中止时别再去干那些干不成的活。
+ *
+ * 用户报的原话:「退出任务时按了 ESC,为什么要很久才有反应,在干啥呢」。
+ * 实测过的分工:Esc 本身是通的(中止中继进子 agent,认 abort 的调用 1ms 就停),
+ * 时间花在 `run()` **返回之后**那条收口链上,而 `setPhase('done')` 排在整条链最后 ——
+ * 也就是说那段时间里界面还停在运行视图上,**一个字都不说**。
+ */
+describe('中止之后的收口', () => {
+  const poolStub = () => ({
+    init: async () => ({ ok: true }),
+    acquire: async (n: { id: string }) => ({ path: '/wt/' + n.id, branch: 'b-' + n.id, gitRoot: '/repo' }),
+    commitAndMerge: async () => ({ ok: true }),
+    release: async () => ({ removed: true }),
+    dispose: async () => ({ kept: [] }),
+    withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
+    integrationPath: '/wt/integration',
+    integrationBranchName: 'efftask/001/integration',
+    gitRoot: '/repo',
+    worktreePathOf: (n: { id: string }) => '/wt/' + n.id,
+    worktreeBranchOf: (n: { id: string }) => 'b-' + n.id,
+  })
+
+  /** 跑一趟,把上报的阶段清单原样交出来。 */
+  const stagesOf = async (over: Record<string, unknown> = {}): Promise<(string | null)[]> => {
+    const stages: (string | null)[] = []
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/001', fs: memFs(),
+        runAgent: (async () => { throw new Error('模型不应被调用') }) as RunAgentFn,
+        onTeardown: (s: string | null) => stages.push(s),
+        ...over,
+      } as never,
+      () => {}, () => {}, () => {},
+    )
+    return stages
+  }
+
+  it('没有隔离工作区时,只有写状态那一步 + 收完的 null', async () => {
+    const ac = new AbortController()
+    ac.abort()
+    // `reclaim` 在 `if (ran || !args.worktrees) return` 那一句直接退,所以这条路上就一步。
+    expect(await stagesOf({ signal: ac.signal })).toEqual(['正在写最后一次任务状态…', null])
+  })
+
+  /**
+   * **整串比对,不是「至少报过一句」。**
+   *
+   * 上一版这条用例叫「收口每一步都报出来」,而它**不传 `worktrees`** —— 真实清单只有
+   * 一步(`["正在写最后一次任务状态…", null]`),三条断言全由那一步满足。于是「结算这一趟
+   * 的产出去向…」那一步谁都没管,变异测试把它整行删掉照样全绿(评审实测)。
+   * 名字说「每一步」、输入只走得出一步,正是这个仓库说的「名实不符」。
+   */
+  it('有隔离工作区时,每一步都要报出来,而且收完清成 null', async () => {
+    const ac = new AbortController()
+    ac.abort()
+    expect(await stagesOf({ signal: ac.signal, worktrees: poolStub() as never })).toEqual([
+      '正在回收隔离工作区(0 个)…',
+      '正在结算这一趟的产出去向…',
+      '正在写最后一次任务状态…',
+      null,
+    ])
+  })
+
+  /**
+   * 自动捞回在中止之后**一件事也做不成**:`runAgentAdapter` 对已经 abort 的 signal
+   * 第一句就 `return ''`,分诊拿到空回答。剩下的只有 `scanStranded` 那一整趟 git 扫描 ——
+   * 纯粹的等待,而用户此刻要的正是「别再干活了」。
+   *
+   * 但**不许静默**:那些产出是真的存在的,只是没人替他捞。所以要说一句,并指向 `m`。
+   */
+  it('中止时不做自动捞回,但要说出来并指向 m 键', async () => {
+    const fs = memFs()
+    const ac = new AbortController()
+    ac.abort()
+    /**
+     * 判据是**那一步有没有被报出来**,不是「git 被调过没有」。
+     *
+     * 收口链上别处也用 git(`sweepStashBackups`、`finishHandoff`),拿一个「git 被调过」
+     * 的布尔去断言,在守卫生效的实现上也是 true —— 踩过一次。
+     * 而 `'正在扫描…'` 那一句就在 `autoRescue` 的 try 顶上、守卫的正下方,只有真的走进去才报。
+     */
+    const stages: (string | null)[] = []
+    const handoffs: { trunkSkips?: string[] }[] = []
+    const notices: string[] = []
+    await runOrchestrator(
+      {
+        config: cfg(), runDir: '/run/001', fs,
+        runAgent: (async () => { throw new Error('模型不应被调用') }) as RunAgentFn,
+        signal: ac.signal,
+        worktrees: poolStub() as never,
+        // scanStranded 会用它;被调到就说明自动捞回那条路跑了。
+        git: (async () => ({ code: 0, stdout: '', stderr: '' })) as never,
+        taskEntry: { runId: '001' } as never,
+        onTeardown: s => stages.push(s),
+        onNotice: (line: string) => notices.push(line),
+      },
+      () => {}, () => {}, () => {},
+      // ⚠ `onHandoff` 是**第 5 个位置参数**,不在 args 对象里 —— 放进 args 的话它静默不生效,
+      //    而断言会以「一句话都没说」变红(踩过一次)。
+      h => handoffs.push(h as { trunkSkips?: string[] }),
+    )
+    const said = handoffs.flatMap(h => h.trunkSkips ?? []).join(' ')
+    expect(said).toContain('已中断')
+    expect(said).toContain('m')
+    // 那一整趟 git 扫描没有发生 —— 这一条才是「快」的来源。
+    expect(stages.filter(s => s !== null).join(' ')).not.toContain('扫描')
+    /**
+     * **同一句话要走两条路。**
+     *
+     * `settleNotes` 整个包在 try 里:`pool.handoff()` 一抛就只 `logError`,这句话静默消失。
+     * 而在中止那条路上它是**唯一**的补偿(自动捞回被跳过了),用户全靠它知道
+     * 「东西还在,按 m」。两条同时断的概率远低于一条。
+     */
+    expect(notices.join(' ')).toContain('已中断')
+    expect(notices.join(' ')).toContain('m')
+  })
+
+  /**
+   * **上一条那个 `not.toContain` 的正向对照。**
+   *
+   * 只有否定断言时,把「正在扫描…」那一行整个删掉,上一条照样绿(变异实测存活)——
+   * 一条永远不会红的断言,而它的注释还写着「这一条才是快的来源」。
+   * 这个仓库把这一类叫「不可证伪」:`not.toContain` 型断言必须配一条同源的正向断言。
+   */
+  it('**没**中止时,整条收口链每一步都报出来(也是上一条的正向对照)', async () => {
+    const stages = await stagesOf({
+      signal: new AbortController().signal,
+      worktrees: poolStub() as never,
+      git: (async () => ({ code: 0, stdout: '', stderr: '' })) as never,
+      taskEntry: { runId: '001' } as never,
+    })
+    /**
+     * **整串比对。** 只断言「含『扫描』」的话,别的几步各自删掉都不会红 —— 变异实测
+     * 「合回你的目录」那一步存活。而它恰恰是一次正常收口里耗时占大头的那一段
+     * (`finishHandoff` → `syncTrunk`:git merge + 最多 N 轮主模型解冲突 + 合回用户目录
+     * + push),没有标签时屏幕上挂的是**上一步**的名字 —— 正是这次改动要消灭的那类缺陷
+     * 换个位置重犯:改前是不说话,不报就是说错话。
+     */
+    expect(stages).toEqual([
+      '正在回收隔离工作区(0 个)…',
+      '正在结算这一趟的产出去向…',
+      '正在扫描盘上还没送到的产出…',
+      '正在把产出合回你的目录…',
+      '正在写最后一次任务状态…',
+      null,
+    ])
+  })
+})

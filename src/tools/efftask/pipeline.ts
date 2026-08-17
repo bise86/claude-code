@@ -2291,6 +2291,21 @@ function integratePrompt(
         ? `### ${quote(c.title)}\n- 状态: ${c.status}${(c.degraded ?? []).length > 0
             ? `(⚠ 降级放行:${(c.degraded ?? []).map(d => `${PHASE_LABEL[d.phase]}未通过`).join('、')},按迭代上限放行,**不是通过**)`
             : ''}\n` +
+          /**
+           * **手工新增的子任务也必须自报家门**,和上面「降级放行」那一行逐字同因。
+           *
+           * 这一关问的是「这些子任务合起来达成父目标了吗」,而用户中途加进来的任务**不在
+           * 本节点的方案里** —— 它可能和父目标毫无关系。不说的话双向都坏:要么本节点因为
+           * 一个自己从没承诺过的子任务被判不通过(白烧一轮预算,还可能触发一次补救拆分),
+           * 要么圆桌把它当成父目标的一部分,从而放宽判据。
+           *
+           * 措辞**只给事实,不给判据** —— 和 `undone` 那一行同规矩:这一条是证据,
+           * 「算不算数」由本次严格度的判据自己判。
+           */
+          (c.manualAdd
+            ? `- 这个子任务是用户在运行中手工新增的,**不在本节点原方案的拆分里**` +
+              `(它达没达成、算不算本节点的目标,按本次严格度的判据自己判)\n`
+            : '') +
           ((c.degraded ?? []).flatMap(d => d.advice).length > 0
             ? `- 该子任务未落实的修改建议: ${quote((c.degraded ?? []).flatMap(d => d.advice).join(' / '))}\n`
             : '') +
@@ -2772,6 +2787,95 @@ async function runPlanRoundtable(
   }))
   if (failures.length > 0) noteOnNode(node, `方案圆桌有席位调用失败,已用其余稿融合: ${failures.join('; ')}`)
   return { ok: true, parsed }
+}
+
+/**
+ * **这个节点的产出到底交付了没有 —— 两道闸共用的唯一判据。**
+ *
+ * 先看账本(`node.contributed`),账本说没有就**去问 git**
+ * (`pool.deliveredToIntegration`:这个节点的抢救 ref 在不在集成分支上)。
+ *
+ * ## 为什么不能只看账本
+ *
+ * 账本只在「这一趟自己合成功」和「用户按 m」时记账,漏掉了整条捞回链路:节点被中止 →
+ * 产出被抢救到 salvage 分支 → 下一趟自动捞回把它合进集成分支。跑机 .30 run 001:
+ * 31 个阻断里 22 个正是这个形状,产出就在 `efftask/001/integration` 上,而账本全空。
+ *
+ * 只补捞回那一处的记账**不够** —— 评审在真 git 上跑出来的:`scanStranded` 对**已经**
+ * 合入的抢救 ref 直接跳过,于是存量那一趟(233 条抢救分支全部已合入)无论 `--resume`
+ * 多少次都不会再产生一次捞回,记账那一跳永远轮不到。判据必须**当场算**,不能等别人来记。
+ *
+ * 算出真值就**记回账本**:只增不减,下一次不用再问 git,`--resume` 读回来也还在。
+ */
+async function hasDelivered(node: TaskNode, ctx: Pick<PipelineCtx, 'worktrees'>): Promise<boolean> {
+  if (node.contributed === true) return true
+  /**
+   * 运行时探一眼,不是摆设:测试里的池子替身是 `as never` 造的对象字面量,**没有**这个方法,
+   * 裸调是 TypeError。而这条路上抛异常的后果是把一道安全闸炸成「不判」。
+   */
+  const probe = ctx.worktrees?.deliveredToIntegration
+  if (typeof probe !== 'function') return false
+  // 探不出来一律当成「没交付」—— 这个答案会**关掉**一道闸,拿不准必须朝闸门关着那一侧倒。
+  const found = await probe(node).catch(() => false)
+  if (!found) return false
+  node.contributed = true
+  return true
+}
+
+/**
+ * 「本轮没改动任何文件」那条读数的**行首**。
+ *
+ * 三件事挤在这一个常量里,都是刻意的:
+ *  · **清理判据**(见 stepExecute 装配 execStatus 那一段:这一句必须清掉再写)。拼行时
+ *    **必须**用它开头 —— 在它前面加一个字就等于关掉清理,而那正是它要防的那件事;
+ *  · **归属声明**。提示词里没有任何一处解释 `(注:` 是编排器写的(那是给 `realWork`
+ *    过滤器用的机器标记),而这条读数的全部价值就在于「量出来的,不是声称的」——
+ *    不说清楚,它在集成验收里顶格续在 `- 执行状态:` 底下,读起来就是执行者的自辩;
+ *  · **把「这不是判据」放在行首**。`capText` 砍的是尾巴,而这一行永远是 execStatus 的
+ *    最后一行 —— 定性写在行尾的话,被砍之后剩下的正好是一句纯指控。
+ *    (「截断提示必须活过截断」,这个仓库为它付过账。)
+ */
+export const NO_CHANGE_NOTE_LEAD = '工作区读数(编排器实测,不是执行者自述,也不是判据)'
+
+/**
+ * 把「工作区指纹前后一模一样」这条读数拼成**一行**证据(`noteOnNode` 是按行存的)。
+ *
+ * ## 两支的已知事实**相反**,所以尾巴不许共用
+ *
+ * 第一版两支共用一句对冲(「产出可能早已在基线里,也可能确实没做」),而那是双向坏的:
+ *  - `delivered === true` 那一支,编排器**已经查明**产出在集成分支上(`hasDelivered` 刚问过
+ *    git),却还对裁决席说「也可能确实没做」—— 凭空造出一份编排器手上并不存在的怀疑,
+ *    而它的落点是地板第 2 条(「找不到痕迹一律 false」),把本该通过的判成不通过;
+ *  - `delivered === false` 那一支,编排器**已经查明**它没有任何东西合入过集成分支,却把
+ *    「产出可能早已在基线里」放在第一位还替它背书 —— 一个裁决席在自己空工作区里无从证伪的
+ *    放行理由,而 `EVIDENCE_RULE` 只约束 blocking 一侧,**放行一侧不要求举证**。
+ *
+ * 所以改成:**把查到的事实直接说出来**,并且只在它真正留下的那几种可能里让裁决席去选。
+ *
+ * ## 「写到工作区之外」要连后果一起说
+ *
+ * 裁决席的 cwd 就是这个(空的)工作区。只提出这条假说、不说后果的话,它去主检出一看活确实
+ * 在那儿,就会判「做了」—— 而写进主检出的内容不在任何任务分支上,永远进不了集成分支。
+ * 上一版的阻断文案里有这一句,不能在搬家的路上丢掉。
+ *
+ * 指纹空不空是两件完全不同的事,必须分开说:空 = 目录里真的干干净净(一个文件都没写);
+ * 非空 = 有改动,但和执行前逐字相同(上一轮的东西还在,这一轮没往上加)。
+ */
+function noChangeReading(node: TaskNode, afterExec: string, why: string, delivered: boolean): string {
+  const where = node.worktree?.path ?? '(本节点没有工作区)'
+  const fp = afterExec === ''
+    ? '空 —— 目录里没有任何未提交改动'
+    : `非空,但和执行前逐字相同(${afterExec.split('\n').slice(0, 3).join(' / ')})`
+  const head = `${NO_CHANGE_NOTE_LEAD}:本轮执行没有改动本任务工作区的任何文件(${why});`
+    + `工作区 ${where};执行后指纹:${fp}。`
+  return delivered
+    ? head + '编排器另已查明:**本节点此前已有产出合入集成分支**,所以这一轮本来就无改可改 —— '
+      + '「本轮找不到改动痕迹」在这一格**不构成不通过的理由**。要判的是那份既有产出达没达成验收点,'
+      + '去工作区或集成分支上看它本身。'
+    : head + '编排器另已查明:**本节点没有任何改动合入过集成分支**。所以「产出早已在基线里」这条解释,'
+      + '除非你自己在集成分支上找到了那份产出,否则不成立;剩下的两种是「写到了本任务工作区之外」'
+      + '和「确实没做」—— 而写到本任务工作区之外的内容不在任何任务分支上,永远进不了集成分支,不算达成。'
+      + '是哪一种、算不算达成验收点,按本次严格度的判据判,并在意见里写清你去哪儿核实的。'
 }
 
 /** 往 execStatus 追一条编排器注记(带前缀,否则 integratePrompt 会当成执行产出)。 */
@@ -4617,7 +4721,16 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
      * 分开之后,盘上这两种情形逐字可分,而「从没交付过」那一句仍然逐字不变 ——
      * `outputMissing` / `resumeCore` 的回填判据都按原文匹配它,改字面量会同时打断三处。
      */
-    node.execStatus = node.contributed === true
+    /**
+     * **两句话都按同一份判据分岔,而且必须在写注记之前算出来。**
+     *
+     * 上一版这里读的是裸的 `node.contributed`,于是那 22 个「产出已经在集成分支上、只是
+     * 账本没记」的节点先被写下一句假注记(`NO_CONTRIBUTION_NOTE`),再被下面那道闸按同一句
+     * 假话阻断。而 `NO_CONTRIBUTION_NOTE` 的读者是 `backtrack.outputMissing` —— 一个写假话、
+     * 一个照着假话把已交付的节点点名重跑,两个缺陷互相喂。算一次,两处共用。
+     */
+    const delivered = await hasDelivered(node, ctx)
+    node.execStatus = delivered
       ? `${node.execStatus}\n(注:该节点本轮没有新的改动可合并 —— 此前已向集成分支交付过)`
       : `${node.execStatus}\n(注:该节点${NO_CONTRIBUTION_NOTE})`
     /**
@@ -4642,7 +4755,22 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
      *
      * 拦下来之后走 `b` 回溯(它认的正是这条)或者 `r` 重做 —— 两条路都在,而且卡片要说清。
      */
-    if (node.kind === 'executable' && node.contributed !== true) {
+    /**
+     * **判据从「查账本」改成「问 git」**(`hasDelivered`)。
+     *
+     * 下面那句话逐字断言「产出不在集成分支上,也不在任何别的地方」,而跑机 .30 run 001 上
+     * 它对 22 个节点**是假话** —— 它们的文件就在 `efftask/001/integration` 上,只是走的
+     * 抢救 ref + 自动捞回那条路,账本没记。一句能用一条 `merge-base --is-ancestor` 证伪的
+     * 断言,不许靠猜。算得出真值就当场算,并记回账本。
+     * (`delivered` 就在上面几行算好了 —— 同一份判据,不再问第二次。)
+     *
+     * ⚠ **这一行换回 `node.contributed !== true` 是一个等价变异**(变异测试实测存活):
+     * `hasDelivered` 查到真值时会把 `contributed` 写回去,所以在这一行上两者恒等。
+     * 判据的杀伤力全在上面那句 `const delivered = await hasDelivered(node, ctx)` 上 ——
+     * 把**那一句**换成裸读账本,「跳过判决段入场 + 账本空着」那条用例当场变红。
+     * 写成 `delivered` 而不是再读一次字段,是为了让「一次判据、两处共用」在代码上看得见。
+     */
+    if (node.kind === 'executable' && !delivered) {
       /**
        * **这一档和验收无关,措辞里一个字都不许提它。**
        *
@@ -4774,6 +4902,22 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
    * 工作区里是新产出,它确实需要被验一遍。
    */
   let skipVerifyThisRound = enterAtJudge && judgePhase === 'accept'
+  /**
+   * **上一趟留下的那条工作区读数,进门就清掉。**
+   *
+   * 它只描述「**本轮**执行」,而下面有好几条路根本不走装配 execStatus 那一跳(那是它唯一的
+   * 清理点):`enterAtJudge` 整个跳过执行段、空报告那一支直接 `continue`。评审实测:
+   * 一个 `skipPhase='verify'` 的节点这一轮**一次执行都没派**,而验收提示词里印着
+   * 「本轮执行没有改动本任务工作区的任何文件(已连续 3 轮如此)」—— 一句关于当下的假话,
+   * 而且会跟着 execStatus 进父节点的集成验收。
+   *
+   * 清在函数入口:任何一次重新进入 stepExecute 都让上一趟那条读数作废,该写的那几条路
+   * 稍后自己会重新写一条。装配那一跳的过滤器**照旧保留** —— 那一道管的是**同一次调用内**
+   * 跨轮次的作废(第 1 轮没改、第 2 轮真写了),两道各管一段,不是重复。
+   */
+  node.execStatus = node.execStatus.split('\n')
+    .filter(l => !l.startsWith(ORCHESTRATOR_NOTE + NO_CHANGE_NOTE_LEAD))
+    .join('\n')
   if (skipsJudge && !enterAtJudge) {
     const what = node.skipPhase === judgePhase ? '跳过' : '强制通过'
     noteOnNode(node, `要${what}${PHASE_LABEL[judgePhase!]},但本节点的隔离工作区引用已经不在了 —— ` +
@@ -5061,62 +5205,66 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
      * 那个节点两样正好相反(话很多、活没干)。判据是工作区指纹,不是执行者的自述 ——
      * 自述正是这一格里不可信的那一样。
      *
-     * 三条边界:
+     * 四条边界:
      *  · 两次指纹**都拿得到**才判(没有池子 / 没有本节点工作区时它是 undefined,那时这道
      *    闸本来就不成立,静默放行比假装判过好);
      *  · 长子任务(`newChildren`)那一路照样落到这里 —— 一个只长树、不写码的回合同样
      *    不算干活,理由和「报告为空」那道闸的注释逐字相同;
-     *  · 走**返工**而不是直接阻断:第一次很可能就是被提示词里那串限制吓住了,
-     *    而 feedback 里那句话正是解药。用尽迭代才停。
+     *  · `contributed === true` 时**根本不判** —— 那是幂等重跑,见下面那一段;
+     *  · 走**返工**而不是阻断:第一次很可能就是被提示词里那串限制吓住了,而 feedback 里
+     *    那句话正是解药。用尽迭代之后也**不阻断**,把读数当证据递给验收圆桌,见下面那一段。
      */
     const afterExec = await verifySnapshot(node, ctx)
-    if (beforeExec !== undefined && afterExec !== undefined && beforeExec === afterExec) {
-      node.iteration.acceptance++
-      if (node.iteration.acceptance >= caps.maxIterations) {
-        await blockWithReason(
-          node,
-          /**
-           * **把证据摆出来,别在这里猜成因。**
-           *
-           * 上一版列了三条「常见成因」,而排查时没有一条能被这段话证实或否掉。真正需要的
-           * 是那一刻的读数:工作区在哪、它此刻的 git 指纹是什么(空串 = 目录里真的干干净净,
-           * 非空 = 有改动但和执行前一模一样 —— 那是完全不同的两件事)。
-           */
-          `执行阶段连续没有改动任何文件(已达迭代上限 ${caps.maxIterations})—— 执行者报告了工作,` +
-          `但本任务工作区的 git 指纹在执行前后一模一样。\n` +
-          `工作区: ${node.worktree?.path ?? '(本节点没有工作区)'}\n` +
-          `执行后的指纹: ${afterExec === '' ? '空 —— 目录里没有任何未提交改动(执行者确实一个文件都没写)' : `「${afterExec.split('\n').slice(0, 3).join(' / ')}」—— 有改动,但和执行前逐字相同`}\n` +
-          /**
-           * **这条建议原来指错了方向。**
-           *
-           * 「工作区干干净净」最常见的成因不是工具清单太窄,而是**席位写到了工作区之外** ——
-           * 它照着方案/验收点里写死的**主检出绝对路径**干活(跑机 .30 run 001 实测:
-           * node.md 全文里指向主检出的绝对路径有 2566 处,而事件流里逐条记着
-           * `Update(<主检出>/pkg/sql/conn_executor.rs)`)。
-           *
-           * 那种情形下这个节点的现象**逐字就是这一条**:执行者报告了工作、工作区指纹前后
-           * 一模一样、REWORK 到用尽迭代上限。而铃响了却让人去看工具清单 —— 圆桌规范席的
-           * 原话是「铃已经在响,只是指错了方向」。
-           *
-           * 排序按实测频率:先问「是不是写到外面去了」,再问工具清单。
-           */
-          `下一步:到上面那个目录里跑 git status --porcelain --ignored 看它到底有没有东西;\n` +
-          `如果那里干干净净,**先看它是不是写到工作区之外了** —— 方案和验收点里常带着主检出的` +
-          `绝对路径,而席位会照着那个路径写。在主检出跑 git status,或看日志窗口里这一席的` +
-          `Edit/Write 用的是哪个路径。写进主检出的内容不在任何任务分支上,永远进不了集成分支。\n` +
-          `都排除了再去查这一轮派给执行者的工具清单(日志窗口第一行「[工具 N 个 …]」)。`,
-          ctx,
-          'no-output',
-        )
-        return
+    /**
+     * 前后逐字相同时**就是那个指纹本身**(空串也是一个合法读数);拿不到读数(没有池子 /
+     * 没有本节点工作区)或者确实变了,都是 undefined。写成「读数或 undefined」而不是布尔,
+     * 是为了让下面两条分支拿到的 `afterExec` 一定是 string —— 不必指望别名收窄。
+     */
+    const sameFingerprint = beforeExec !== undefined && afterExec !== undefined && beforeExec === afterExec
+      ? afterExec
+      : undefined
+    /** 只描述**这一轮**。在下面装配 execStatus 时先清旧的再写新的 —— 见那一段。 */
+    let noChangeNote: string | undefined
+    /**
+     * **「这一轮没动文件」不等于「这个节点什么都没干」—— 复用下游那份判据。**
+     *
+     * 下游 `mergeAndRelease` 判的是 `node.contributed`(一个只增不减的持久标记),而这道闸
+     * 此前只看单轮指纹。两者对同一件事给出相反答案的那一格是真实存在的:节点先前已经把
+     * 产出送进集成分支,之后因为验收返工 / `--resume --retry-blocked` 又跑了一轮 ——
+     * 这一轮**本来就该**什么都不改(活已经在基线里了),而这道闸把它判成「它什么都没干」,
+     * 连着三轮然后阻断。跑机 .30 run 001:全部 31 个阻断里有 22 个是这一格(71%)。
+     *
+     * 所以判据和下游对齐:`contributed === true` 时这一轮是幂等重跑,不计返工、不算零贡献。
+     */
+    if (sameFingerprint !== undefined && await hasDelivered(node, ctx)) {
+      noChangeNote = noChangeReading(node, sameFingerprint, '幂等重跑', true)
+    } else if (sameFingerprint !== undefined) {
+      // 用尽的那一轮**不再 ++**:`>= max` 是「这是最后一轮」的判据,而这一轮不返工。
+      // 多加的那一下会让降级记录写出 `round: 4`(上限是 3)—— 一个不可能的数。
+      if (node.iteration.acceptance + 1 >= caps.maxIterations) {
+        /**
+         * **用尽迭代之后不再机械阻断,把这条读数交给验收圆桌判。**
+         *
+         * 这道闸判的是**本任务工作区**的指纹,而「产出去哪了」有好几条它看不见的路:
+         * 集成验证类任务(跑机上那个 `A032 集成编译验证并提交` 就在这 22 个里)本来就
+         * 「有问题才有产出」;上一轮中断后产出被抢救到 salvage 分支、再由捞回合进集成分支的,
+         * 工作区里同样一个字节都没有。这两种情形下阻断说的都是假话。
+         *
+         * 反过来「它确实没做」也是真实存在的一格,所以读数不能丢 —— 它作为**证据**进验收
+         * 提示词(和 `undone` / 降级放行同规矩:事实照给,判据不给),由判决席去判到底是哪一种。
+         * 兜底还在:验收自己有迭代上限,`mergeAndRelease` 那道 `contributed` 闸也还在。
+         */
+        noChangeNote = noChangeReading(node, sameFingerprint, `已连续 ${caps.maxIterations} 轮如此`, false)
+      } else {
+        node.iteration.acceptance++
+        feedback = '上一轮你**一个文件都没有改**(本任务工作区的 git 指纹在执行前后一模一样),'
+          + '而你的 execStatus 描述了工作 —— 这两件事对不上。' + String.fromCharCode(10)
+          + '再说一次:提示词里的「只读 / 只探查下一层 / 少用工具」约束的是你**读**代码的范围,'
+          + '**不解除你写代码的义务**,工具也没有被禁用。这一轮请真正把方案落到文件里。' + String.fromCharCode(10)
+          + '如果确实不该改任何文件,就在 execStatus 里说清原因并给出 newChildren 或阻断理由,不要交总结。'
+        if (!(await commit(node, 'REWORK', ctx))) return
+        continue
       }
-      feedback = '上一轮你**一个文件都没有改**(本任务工作区的 git 指纹在执行前后一模一样),'
-        + '而你的 execStatus 描述了工作 —— 这两件事对不上。' + String.fromCharCode(10)
-        + '再说一次:提示词里的「只读 / 只探查下一层 / 少用工具」约束的是你**读**代码的范围,'
-        + '**不解除你写代码的义务**,工具也没有被禁用。这一轮请真正把方案落到文件里。' + String.fromCharCode(10)
-        + '如果确实不该改任何文件,就在 execStatus 里说清原因并给出 newChildren 或阻断理由,不要交总结。'
-      if (!(await commit(node, 'REWORK', ctx))) return
-      continue
     }
     // 执行者的自述覆盖**上一轮的自述**,但不能连编排器注记一起冲掉。那些注记记的是
     // 「这个环节整个没跑过」这类事实(跳过分析/质疑讨论都写在 stepStart 里),被这一行
@@ -5124,7 +5272,15 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
     // 正是注记要消除的那种歧义。实测:跳过质疑讨论的 executable 节点走完 stepExecute
     // 后,node.md 里搜不到「质疑讨论环节已跳过」。
     const keptNotes = node.execStatus.split('\n').filter(l => l.startsWith(ORCHESTRATOR_NOTE))
+      /**
+       * **唯独这一句要清掉再写。** 别的编排器注记记的是「这个环节整个没跑过」这类**只增不减**
+       * 的事实,而「本轮没改动任何文件」是**单轮读数** —— 第 2 轮真的写了文件、`keptNotes`
+       * 却把第 1 轮那句原样带过来的话,验收提示词里就是一句关于当下的假话。
+       * (只写不清是这个仓库反复付账的那一类,`node.undone` 那一段是同一条账。)
+       */
+      .filter(l => !l.startsWith(ORCHESTRATOR_NOTE + NO_CHANGE_NOTE_LEAD))
     node.execStatus = [reported, ...keptNotes].join('\n')
+    if (noChangeNote !== undefined) noteOnNode(node, noChangeNote)
     /**
      * **执行者自陈没做的那几件,结构化钉在节点上**(见 `TaskNode.undone`)。
      *

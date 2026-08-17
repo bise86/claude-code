@@ -316,6 +316,21 @@ export function guidanceBody(n: TaskNode): string {
 }
 
 /**
+ * 「出身」那一段 —— 只有手工新增的任务才有内容(其余节点这一段整个不显示)。
+ *
+ * `detailSections` 末尾会把空 body 过滤掉,所以模型拆出来的节点版面**逐字不变**。
+ */
+export function manualAddBody(n: TaskNode): string {
+  const m = n.manualAdd
+  if (!m) return ''
+  return (
+    `用户在运行中手工新增(${m.at})\n` +
+    `挂载点: ${m.anchorId}\n` +
+    '下面「目标」一段是用户逐字给出的提示词,不是从上级方案派生的 —— 它也不在上级任务原来的拆分里。'
+  )
+}
+
+/**
  * 「本轮返工原因」那一段。
  *
  * 比树行上那一句多两样东西:**不截断的原文**,和一句「下一轮会带着它跑」——后者不是废话,
@@ -506,6 +521,15 @@ export function detailSections(
      */
     { title: '依赖重算', body: recalcNotice ?? '', color: 'warning' },
     { title: '依赖重算记录', body: depsRecalcBody(n) },
+    /**
+     * 「这个任务是哪来的」。
+     *
+     * 树上多出来一个任务时,「模型拆出来的」和「有人中途手工加的」在界面上此前**逐字相同**,
+     * 而这两件事读方案、读验收记录的方式完全不同(手工加的那个不在父任务的方案里)。
+     * 排在「目标」**之前**:它决定了下面那一段该怎么读 —— 手工新增时,「目标」就是用户
+     * 逐字写下的提示词,不是从父目标派生的。
+     */
+    { title: '出身', body: manualAddBody(n) },
     // 以下都是模型写的散文,而且模型本来就在写 markdown。
     { title: '目标', body: n.goal, md: true },
     { title: '完整方案', body: n.plan.solution, md: true },
@@ -674,6 +698,13 @@ export function NodeDetail(props: {
    * 而这一行的提示串里没有它,这个组件连这个 prop 都没有。审计出来的。
    */
   canForcePass?: boolean
+  /**
+   * 能不能按 `a` 用一段提示词新增一个任务。
+   *
+   * 由调用方走**真正的准入**回答(同一个 `addTaskScope`),不是「回调给了没有」——
+   * 这个键的准入有七八条,而一个按了必然被拒的提示比没有这个提示更糟。
+   */
+  canAddTask?: boolean
   /** 页脚按键提示翻到第几页(取模,调用方一直加就行)。 */
   hintPage?: number
   /** 上一次动作键被拒的原因。给了就**盖住页脚那一行** —— 用户刚按了键,他只会看那儿。 */
@@ -981,6 +1012,15 @@ export function NodeDetail(props: {
    * 导航在后(↑↓ 按下去本来就有反应)。
    */
   const actionHints = [
+    /**
+     * **`a` 排在最前面。**
+     *
+     * 这个次序就是被翻页推后的次序(见上面那段实测:113 列以下 `r 重做本任务` 一个字都
+     * 画不出来)。`a` 是全新的、没人猜得到的键 —— 排在 `b 回溯未通过的子任务` 后面就等于
+     * 翻到第 2/3 页,而没有提示的键等于功能不存在。`r`/`R`/`s` 至少已经写在 README 和树的
+     * 页脚上,它没有。
+     */
+    props.canAddTask ? 'a 新增任务' : '',
     props.canRedo ? 'r 重做本任务' : '',
     props.canRedoFailed ? 'R 重做失败环节' : '',
     props.canSkipFailed ? 's 跳过它' : '',

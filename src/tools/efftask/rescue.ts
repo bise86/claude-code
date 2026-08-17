@@ -251,8 +251,21 @@ export async function planRescue(
       problems.push(`${it.branch}:探不出它相对集成分支带来了什么,没有分诊(git 失败)`)
       continue
     }
-    // 相对集成分支一个提交都没多 = 已经全在里面了,没什么可捞。
-    if (ev.commits === 0 && ev.fileCount === 0) continue
+    /**
+     * **没有任何内容是集成分支上没有的 = 没什么可捞。**
+     *
+     * 判据是 `||`,不是 `&&` —— 两条各自成立,而 `&&` 只挡得住两条同时成立那一格:
+     *  · `commits === 0` → 这条 ref 是集成分支的祖先,三点 diff 必然为空
+     *    (于是 `fileCount` 也必然是 0,`&&` 在这一侧和 `||` 等价);
+     *  · **`fileCount === 0` 而 `commits > 0` 是真实存在的一格,`&&` 放它过去了**:
+     *    建了又删的分支、只有一次同步合并的分支、`--allow-empty` 的提交,都是这个形状。
+     *    放过去的后果不是白跑一趟 —— 它会被合进集成分支(**零字节**,只多一个合并提交),
+     *    记进 `out.merged`,于是 `contributorsOf` 把它算成一次交付、`node.contributed`
+     *    被置真,而这个节点的产出**一个字节都不在集成分支上**。那正好把
+     *    `mergeAndRelease` 的零贡献闸、`backtrack.outputMissing`、执行环节那道指纹闸
+     *    三道兜底一次性全部关掉。评审在真 git 上跑出来的。
+     */
+    if (ev.commits === 0 || ev.fileCount === 0) continue
     withRef.push({ item: it, evidence: ev })
   }
 
@@ -343,7 +356,19 @@ const ORPHAN_FILES_SHOWN = 5
 export const MAX_STRANDED_PATHS = 12
 
 export interface RescueOutcome {
-  merged: { ref: string; commits: number; title?: string; resolvedFiles?: string[] }[]
+  /**
+   * 真的合进集成分支的。
+   *
+   * **`nodeId` 不是装饰** —— 它是「这批产出属于谁」的唯一线索,而调用方要拿它把
+   * `node.contributed` 记回去。缺了它,一个产出**确实已经在集成分支上**的节点在盘上
+   * 永远是 `contributed` 缺席,于是:
+   *  - `mergeAndRelease` 那道闸对它说「产出不在集成分支上,也不在任何别的地方」——
+   *    跑机实测这句话对 22 个节点**是假话**(它们的文件就在 `efftask/001/integration` 上);
+   *  - `backtrack.outputMissing` 认 `contributed !== true`,把已经交付的节点点名重跑;
+   *  - 执行环节那道指纹闸没有任何判据可用,把「活已经在基线里了」判成「它什么都没干」。
+   * 旁边 `backfilled` / `stranded` 两格本来就带 `nodeId`,只有这一格漏了。
+   */
+  merged: { ref: string; commits: number; nodeId?: string; title?: string; resolvedFiles?: string[] }[]
   /** 第 2 级真的补进集成分支的。`added` 为空也要留一条 —— 「试过了,一个都没得补」是结论。 */
   backfilled: { ref: string; title?: string; added: string[]; skipped: BackfillSkip[]; nodeId?: string }[]
   failed: { ref: string; why: string }[]
@@ -368,6 +393,27 @@ export interface RescueOutcome {
   }[]
   problems: string[]
   aborted: boolean
+}
+
+/**
+ * **这一趟捞回,把哪些节点的产出真的送进了集成分支。**
+ *
+ * 调用方拿它把 `node.contributed` 记回节点 —— 那是「这个节点往集成分支放过东西」的持久
+ * 标记,而捞回这条路此前一个赋值点都没有(只有 `mergeAndRelease` 和用户按 `m` 的
+ * `mergeSubtree` 会写)。后果见 `RescueOutcome.merged` 上那段:三处下游同时对着一个
+ * **产出确实已经在集成分支上**的节点说假话。
+ *
+ * 两条判据,各有理由:
+ *  - **补录(`backfilled`)也算**:判据是「有没有东西真的进了集成分支」,不是走的哪条路 ——
+ *    第 2 级加法补录进去的文件和第 1 级整条合并进去的,在集成分支上没有任何区别;
+ *  - **`added` 为空的不算**:那一格记的是「试过了,一个都没得补」(这个类型的注释明说了
+ *    空数组也要留一条),把它算成交付就是凭空造一次贡献。
+ */
+export function contributorsOf(out: Pick<RescueOutcome, 'merged' | 'backfilled'>): Set<string> {
+  const ids = new Set<string>()
+  for (const m of out.merged) if (m.nodeId !== undefined) ids.add(m.nodeId)
+  for (const b of out.backfilled) if (b.nodeId !== undefined && b.added.length > 0) ids.add(b.nodeId)
+  return ids
 }
 
 /**
@@ -453,6 +499,8 @@ export async function runRescue(deps: RescueDeps, plan: RescuePlan): Promise<Res
     if (res.ok) {
       out.merged.push({
         ref, commits: c.evidence.commits,
+        // 属主要带出去 —— 见 RescueOutcome.merged 上那段注释。
+        ...(c.evidence.nodeId ? { nodeId: c.evidence.nodeId } : {}),
         ...(c.evidence.title ? { title: c.evidence.title } : {}),
         ...(res.resolvedFiles.length > 0 ? { resolvedFiles: res.resolvedFiles } : {}),
       })

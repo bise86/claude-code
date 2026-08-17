@@ -272,6 +272,23 @@ export function TaskTreePanel(props: {
   /** 详情页 `g`:修复一个损毁的任务文件(账 + 残骸 + 主模型协助)。 */
   onRepairNode?: (node: TaskNode) => void
   /**
+   * `a`:用一段提示词新增一个任务(详情页和树上都能按)。
+   *
+   * 返回一句话 = 准入没过,**不切屏**(留在原地,话画到页脚);`undefined` = 关口接手。
+   * 准入是同步内存读,所以在按键这一刻就答得出来 —— 而切屏会把这个面板连同详情页整棵
+   * 卸载,用户展开到哪一段、读到第几行全没了。
+   */
+  onAddTask?: (node: TaskNode) => string | undefined
+  /**
+   * 「按 a 新增任务」那行提示写不写。
+   *
+   * **必须是真的准入,不是 `onAddTask !== undefined`。** 准入有七八条(在飞、取消过、
+   * 深度上限、状态白名单、祖先链、容量……),写成「回调给了没有」的话,提示照写,
+   * 按下去必被拒 —— 而这个面板自己立过「一个按了必然被拒的提示比没有更糟」。
+   * 判据和按键路径同源(同一个 `addTaskScope`)。
+   */
+  addTaskAvailable?: (node: TaskNode) => boolean
+  /**
    * 回溯:把这棵子树里**集成验收没通过**的、以及**产出丢了**的任务重新推一遍。
    * 详情页 `b` 键。
    */
@@ -503,6 +520,16 @@ export function TaskTreePanel(props: {
       // **`R` 要排在 `r` 之前**,而且判据要收两种终端写法(见 shiftR):下面那一句用的是
       // `k === 'r'`(已经 toLowerCase 过),所以 Shift+R 会先被它吃掉。
       if (plain && shiftR && props.onRedoFailed) { act(props.onRedoFailed); return }
+      /**
+       * 新增任务。**排在这一支最前面的一批里,而且必须排在下面那句「任何别的键都把上一条
+       * 提示清掉」之前** —— 排在后面的话,按 `a` 会先把上一次的拒绝理由清掉再走,而
+       * 被拒时那句话正是这个键唯一的输出。
+       *
+       * 判据用 `input` 而不是小写化后的 `k`:`plain` 挡得住 Ctrl/Alt,**挡不住 Shift**,
+       * 而这一屏本来就在教用户按 Shift(`R 重做失败环节`),`a` 又紧挨着 `s`(跳过)。
+       * 这条规矩树那一支为 `m`/`c`/`b` 立过(见下面那段注释)。
+       */
+      if (plain && input === 'a' && props.onAddTask) { act(props.onAddTask); return }
       if (plain && k === 's' && props.onSkipFailed) { act(props.onSkipFailed); return }
       if (plain && k === 'f' && props.onForcePass) { act(props.onForcePass); return }
       if (plain && k === 'r' && props.onRedo) { act(props.onRedo); return }
@@ -592,6 +619,15 @@ export function TaskTreePanel(props: {
      * 本来就在教用户按 Shift(`R 重做失败环节`),Shift+ 相邻键误触的概率不是零,
      * 而 `C` 那一下打开的是删目录的关口。这三个键从来没被宣告成大写形式。
      */
+    /**
+     * 新增任务在树这一层也要能按 —— 和 `m`/`c`/`b` 同一条理由(见上面那段实测):
+     * 「站在树上看着一堆任务,想在旁边补一个」正是这个键最自然的触发姿势,
+     * 而逼用户先回车进详情页再按,就是把它藏起来。
+     *
+     * 走 `actHere`(签名是 `(n) => string | undefined`):它的准入是同步内存读,
+     * 被拒时把话画到页脚,和详情页那一支逐字相同。
+     */
+    if (plain && input === 'a' && props.onAddTask && current) { actHere(props.onAddTask); return }
     if (plain && input === 'm' && props.onMergeWorktrees && current) { props.onMergeWorktrees(current); return }
     if (plain && input === 'c' && props.onCleanupWorktrees && current) { props.onCleanupWorktrees(current); return }
     if (plain && input === 'b' && props.onBacktrack && current) { props.onBacktrack(current); return }
@@ -710,6 +746,9 @@ export function TaskTreePanel(props: {
    * 那行注释自己写着「一个按了必然被拒的提示比没有更糟」。
    */
         canRecalcDeps={props.recalcAvailable?.(detail) === true}
+        // 同一条规矩(而且这个键的准入更长:在飞 / 取消过 / 深度上限 / 状态白名单 /
+        // 祖先链 / 容量)—— 判据和按下去那条路同源。
+        canAddTask={props.addTaskAvailable?.(detail) === true}
         // 只画属于**这个**节点的那一条。
         recalcNotice={notice?.nodeId === detail.id && notice.kind === 'recalc' ? notice.text : undefined}
         actionNotice={notice?.nodeId === detail.id && notice.kind === 'action' ? notice.text : undefined}

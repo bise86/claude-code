@@ -334,6 +334,26 @@ export function serializeNode(node: TaskNode): string {
   const c = stripControl
   const body =
     `# ${c(node.title)}\n\n` +
+    /**
+     * 手工新增的任务要**自报家门**,而且要落在 body 里。
+     *
+     * frontmatter 里已经有 `manualAdd`,但这个文件自己的规矩是「只落 frontmatter 等于只做到
+     * 机器可读那一半 —— body 才是人读的那一半」(见下面 alternatives 和 responses 两处)。
+     * 而这一行回答的是读 node.md 的人第一个会问的问题:树上这个任务是模型拆出来的,
+     * 还是有人中途加的?没有它,两者在盘上逐字相同。
+     */
+    /**
+     * 守卫是 `typeof === 'string'`,不是 `node.manualAdd ?`。
+     *
+     * 这一段**每次 commit 都跑**,而 `stripControl` 里是 `s.replace(...)`:盘上写着
+     * `manualAdd: 123` 时那一句直接抛,于是这个节点再也 commit 不了。`resumeCore` 已经
+     * 会把坏值丢掉,但那条路只覆盖「从 node.md 读回来」—— 这里是最后一道,而它的代价
+     * 是两个 typeof。(hostileDisk 那道闸实测出来的:`manualAdd = 123` 让恢复链路抛了。)
+     */
+    (typeof node.manualAdd?.at === 'string' && typeof node.manualAdd?.anchorId === 'string'
+      ? `> 本任务由用户在运行中手工新增(${stripControl(node.manualAdd.at)}),挂在 ${stripControl(node.manualAdd.anchorId)} 下面;\n` +
+        `> 下面「目标」一段是用户逐字给出的提示词,不是模型拆分出来的。\n\n`
+      : '') +
     `## 完整方案\n${c(node.plan.solution)}\n\n` +
     `## 重点\n${c(node.plan.keyPoints)}\n\n` +
     `## 风险点\n${c(node.plan.risks)}\n\n` +

@@ -15,7 +15,7 @@ import { trackedChanges } from '../../tools/efftask/handoffActions.js'
 import { syncTrunk } from '../../tools/efftask/integrationMerge.js'
 import { makeHandoffConflictResolver, makeRescueTriage } from '../../tools/efftask/handoffResolve.js'
 import { scanStranded, STRANDED_KINDS } from '../../tools/efftask/stranded.js'
-import { planRescue, rescueLines, runRescue } from '../../tools/efftask/rescue.js'
+import { contributorsOf, planRescue, rescueLines, runRescue } from '../../tools/efftask/rescue.js'
 import { countStatuses } from '../../tools/efftask/stateMachine.js'
 import { finishEffTaskRun, markEffTaskPendingHandoff, registerEffTaskRun, updateEffTaskRun } from '../../tasks/EffTaskTask/EffTaskTask.js'
 import type { SetAppState } from '../../Task.js'
@@ -71,6 +71,14 @@ export type Phase =
   // (状态账 → 残骸 → 主模型协助)。和 c/m 一样是岔路而不是运行阶段 —— 它不重启
   // 编排、不动别的节点,只把这一个节点在盘上那份修好,所以确认完原样回到来时那一屏。
   | 'confirmRepair'
+  /**
+   * 'confirmAddTask' 是详情页和任务树上的 `a` 键:用一段提示词新增一个任务。
+   *
+   * **两条路都走这一屏**:运行中把新节点并进正在跑的那棵树(`taskAdded`),结束屏则重启一次
+   * 编排(`startRun`)—— 后者和重做那几条是同一形状,所以那道 `useSettleOnce` 闩同样不是
+   * 可选的。整条路上**零模型调用**,所以它同步完成、按键那一刻就答得出准入。
+   */
+  | 'confirmAddTask'
 
 /**
  * Drive one run to completion and report it.
@@ -116,6 +124,19 @@ export async function runOrchestrator(
      * (`openStream` / `onBuildWipe` / `autoRescue` 都在这一环死过。)
      */
     onNotice?: PipelineCtx['onNotice']
+    /**
+     * **`run()` 返回之后那条收口链此刻走到哪了** —— 一句话,`null` = 收完了。
+     *
+     * 存在的理由是用户报的原话:「退出任务时按了 ESC,为什么要很久才有反应,在干啥呢」。
+     * 实测下来 Esc 本身是通的(中止中继进子 agent,认 abort 的调用 1ms 就停),
+     * 真正的时间花在 `run()` **返回之后**:回收隔离工作区、结算收口、扫盘上没送到的产出、
+     * 写最后一次 run.md。而 `setPhase('done')` 排在整条链的最后 ——
+     * 也就是说**这段时间里界面还停在运行视图上,树照画、计时器照跳、一个字都不说**。
+     *
+     * 全仓此前只有 `ConfirmMergeSubtree` 有一句「已请求中断」。快慢是一回事,
+     * 「按下去没有任何反应」是另一回事,而后者与这条链有多快无关。
+     */
+    onTeardown?: (stage: string | null) => void
     /** 子 agent 实时输出 (spec §10.2): streamed per node, for the detail view. */
     openStream?: PipelineCtx['openStream']
     cwd?: PipelineCtx['cwd']
@@ -283,6 +304,12 @@ export async function runOrchestrator(
       // dispose FIRST: it reclaims what is provably safe, so handoff then reports only the
       // worktrees that genuinely still hold something. Reporting before reclaiming would list
       // directories that are about to disappear.
+      //
+      // 每个还挂着工作区的节点要跑几条 git(其中 `status --porcelain --ignored` 要走遍被
+      // 忽略的目录,带 `target/` 的仓上是秒级),所以这一步要先报出来 —— 见 onTeardown。
+      // 包 try/catch:同一个 finally 里其余每个 UI 回调都包了,而这一句是 `reclaim` 的
+      // **第一句** —— 它一抛,`dispose` 整个不跑、工作区全泄漏,而 catch 只 log。
+      try { args.onTeardown?.(`正在回收隔离工作区(${nodes.filter(n => n.worktree).length} 个)…`) } catch { /* UI only */ }
       await args.worktrees.dispose(nodes)
       /**
        * **「先 stash 再合」留下的备份 ref,到这一刻该回收了。**
@@ -303,6 +330,7 @@ export async function runOrchestrator(
             `保留了一份你未提交改动的备份:${k.ref} —— ${k.why};取回:git stash apply ${k.ref}`)
         } catch { /* 回收失败不该影响收口本身 —— 它只是省空间 */ }
       }
+      try { args.onTeardown?.('正在结算这一趟的产出去向…') } catch { /* UI only */ }
       const h0 = await args.worktrees.handoff(nodes)
       /**
        * 留下来的备份并进 `trunkSkips` —— 那一栏的语义正是「有东西没送到你的目录,原因
@@ -422,7 +450,38 @@ export async function runOrchestrator(
         onHandoff?.(merged)
       } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
     }
+    /**
+     * **用户按了 Esc 就不做自动捞回。**
+     *
+     * 这一段是「扫一遍盘上还有什么没进集成分支,派主模型分诊,再逐条合过去」——
+     * 而中止之后它**一件事也做不成**:`runAgentAdapter` 对已经 abort 的 signal 直接
+     * `return ''`(那是它的第一句),于是分诊拿到空回答、`planRescue` 出一份空计划。
+     * 剩下的只有 `scanStranded` 那一整趟 git 扫描:`for-each-ref` + 逐节点探路径 +
+     * 逐节点探路径 —— 纯粹的等待,而用户此刻要的正是「别再干活了」。
+     * (⚠ 上一版这里写「列 `.efftask-worktrees`」,评审核实为假:`scanStranded` 拿
+     *  `worktreeRoot` 只用来拼 `merge-scratch`,全文件没有一处 readdir。)
+     *
+     * **但不许静默**:那些产出是真的存在的,只是没人替他捞。所以走 `trunkSkips` 说一句,
+     * 而 `m` 键随时能手动来一次(它不受中止影响)。静默退回是这个仓库的招牌缺陷。
+     */
+    if (args.signal.aborted) {
+      const why = '已中断:这一趟没有做自动捞回(它需要主模型分诊,而中止之后调用一律不发)。'
+        + '要把没进集成分支的产出捞回来,进任务详情页按 m。'
+      notes.push(why)
+      /**
+       * **同一句话走两条路。**
+       *
+       * `settleNotes` 把它并进 `trunkSkips`,而那一步整个包在 try 里:`pool.handoff()`
+       * 一抛就只 `logError`,这句话**静默消失**。而在中止那条路上它是唯一的补偿 ——
+       * 自动捞回被跳过了,用户全靠这一句知道「东西还在,按 m」。
+       * `onNotice` 是运行中通知那条独立的线(它自己也带去重),两条同时断的概率远低于一条。
+       */
+      try { args.onNotice?.(why, 'abort-no-rescue') } catch { /* UI only */ }
+      await settleNotes()
+      return
+    }
     try {
+      args.onTeardown?.('正在扫描盘上还没送到的产出…')
       const worktreeRoot = `${pool.gitRoot}/.efftask-worktrees`
       /**
        * **字段名是 `pathFor`/`branchFor`,不是池子的 `worktreePathOf`/`worktreeBranchOf`。**
@@ -470,6 +529,9 @@ export async function runOrchestrator(
         await settleNotes()
         return
       }
+      // 从这里开始是**主模型调用**,分钟级。不报的话屏幕还挂着上一步的「正在扫描…」——
+      // 一个早就做完的动作。改前是不说话,不报就是说错话,后者更糟。
+      try { args.onTeardown?.(`正在让主模型分诊 ${claimable.length} 处没送到的产出…`) } catch { /* UI only */ }
       const plan = await planRescue({
         git: args.git,
         gitRoot: pool.gitRoot,
@@ -484,6 +546,8 @@ export async function runOrchestrator(
           : { rounds: args.config.caps.trunkResolveRounds }),
         signal: args.signal,
       }, claimable)
+      // 逐条合并,撞冲突还会派模型解 —— 同样是分钟级。
+      try { args.onTeardown?.('正在把捞回来的产出合进集成分支…') } catch { /* UI only */ }
       const res = await runRescue({
         git: args.git,
         gitRoot: pool.gitRoot,
@@ -497,6 +561,37 @@ export async function runOrchestrator(
           : { rounds: args.config.caps.trunkResolveRounds }),
         signal: args.signal,
       }, plan)
+      /**
+       * **捞回也是一次交付,要记在节点身上。**
+       *
+       * `node.contributed` 此前只有两个赋值点:`mergeAndRelease`(节点自己合上了)和
+       * `mergeSubtree`(用户亲手按 m)。捞回这条路一个都不沾,于是「产出被抢救到 salvage
+       * 分支、之后由捞回合进集成分支」的节点在盘上永远是 `contributed` 缺席 ——
+       * 而它的产出**确确实实已经在集成分支上**。
+       *
+       * 跑机 .30 run 001 实测了这条链的每一环:22 个阻断节点(占全部阻断的 71%)
+       * 每一个都带着「产出已移到 salvage 分支」+「被手工重做」+「上次运行中断」三条注记、
+       * `contributed` 全部缺席、`acceptLog` 全空;而 233 条 salvage 分支**全部**已合入集成
+       * 分支,抽查 a044 该新建的 `pkg/gossip/simulation/network.rs` 就在集成分支上。
+       *
+       * 不记账的三个后果都实测到了:①`mergeAndRelease` 那道闸对它们说「产出不在集成分支上,
+       * 也不在任何别的地方」——**假话**;②`backtrack.outputMissing` 认 `contributed !== true`,
+       * 会把已经交付的节点点名重跑;③执行环节那道指纹闸没有判据可用,把「活已经在基线里了」
+       * 判成「它什么都没干」,连着三轮然后阻断。
+       *
+       * 判据本身(算不算一次交付、补录算不算)在 `contributorsOf` 里,连注释一起。
+       */
+      const delivered = contributorsOf(res)
+      if (delivered.size > 0) {
+        const journal = createNodeJournal({ fs: args.fs, runDir: args.runDir })
+        for (const n of liveNodes) {
+          if (!delivered.has(n.id) || n.contributed === true) continue
+          n.contributed = true
+          // 落盘失败不该把收口带走(这一整段都在 try 里),但**必须写** —— 只改内存的话
+          // 下一次 `--resume` 读回来又是「从没交付过」,三个后果原样回来。
+          try { await writeNode(args.fs, args.runDir, n, journal) } catch (e) { logError(e instanceof Error ? e : new Error(String(e))) }
+        }
+      }
       /**
        * **捞完必须重算 `handoff()`。** 它是「还有什么没送到」的唯一真相,而收口那一跳、
        * 结束屏、退出报告、`/tasks` 那一行读的都是它。不重算的话,刚合进集成分支的提交
@@ -528,6 +623,13 @@ export async function runOrchestrator(
      */
     const root = liveNodes.find(n => n.id === 'root')
     await autoRescue(root)
+    /**
+     * **一次正常收口里耗时占大头的那一段。** `finishHandoff` 里有 `syncTrunk`
+     * (git merge + 最多 `trunkResolveRounds` 轮主模型解冲突)、合回用户目录、`git push`。
+     * 不报的话屏幕上挂着的是 `autoRescue` 那一步的标签 —— 一个早就做完的动作。
+     * (中止那条路不受影响:`planFinish` 对 `outcome !== 'completed'` 早退,不跑 git。)
+     */
+    try { args.onTeardown?.('正在把产出合回你的目录…') } catch { /* UI only */ }
     const out = await finishHandoff({
       handoff: args.config.pendingHandoff,
       git: args.git,
@@ -687,7 +789,19 @@ export async function runOrchestrator(
      *
      * 幂等:happy path 已经写过时这只是再写一遍同样的内容(合并队列本来就只保留最新一份)。
      */
+    /**
+     * 包 try/catch。**这一句挡在下一句前面**,而下一句(`queueManifest`)被这个文件自己
+     * 称为「退出时盘上和屏幕上一致的**唯一**保证」。回调一抛:最后一次 run.md 不写、
+     * `onTeardown(null)` 不清、`setPhase('done')` 不执行 —— 正是本文件上面那段注释描述的
+     * 「界面永久停在运行中而 Esc 毫无反应」。同一个 finally 里其余每个 UI 回调都包了。
+     */
+    try { args.onTeardown?.('正在写最后一次任务状态…') } catch { /* UI only */ }
     await queueManifest(liveNodes, pendingOutcome)
+    /**
+     * 收完了。**必须在 `setPhase('done')` 之前清掉** —— 留着的话结束屏上会挂着一句
+     * 「正在回收…」,而那件事早就做完了。和「一次性标记要在每处清干净」同一条规矩。
+     */
+    try { args.onTeardown?.(null) } catch { /* UI only */ }
     // 面板同理:异常路径上 settle() 已经在 catch 里跑过了(那时 reclaim 还没发生),
     // 所以「待收口」得在这里补一次。终态任务只改描述,不动 status。
     if (args.config.pendingHandoff && taskId && entry) {

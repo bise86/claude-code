@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { parallelismLine, rosterLines, skipConflictLines, skipConsequenceLines } from './startupConfirm'
-import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_PARALLELISM, MANUAL_PASS_ROLE, MAX_ROLE_GUIDANCE, MIN_PARALLELISM, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
+import { clampParallelism, createNode, DEFAULT_CAPS, emptyPhaseRoles, MAX_GUIDANCE_CHARS, MAX_PARALLELISM, MANUAL_PASS_ROLE, MAX_ROLE_GUIDANCE, MAX_TASK_PROMPT_CHARS, MIN_PARALLELISM, PHASE_LABEL, PHASE_NAMES, SKIPPABLE_PHASES, type EffTaskConfig, type PhaseName, type TaskNode } from './types'
+import { addTaskScope, capacityRefusal } from './addTask'
 import { forcePassFailedPhaseReason, planForcePass, planSkip, redoOptions, redoUnavailableReason, skipFailedPhaseReason } from './redo'
 import { planFinish } from './finishHandoff'
 import { createRateLimitGate } from './rateLimitGate'
@@ -645,6 +646,42 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     expect(README).toContain(norm('每条指引上限 2000 字、点名给角色的最多 20 条'))
     expect(MAX_GUIDANCE_CHARS).toBe(2000)
     expect(MAX_ROLE_GUIDANCE).toBe(20)
+  })
+
+  /**
+   * `a` 键那一节。**文档说的三件事都钉在代码的取值上**,不是「README 里有没有这个词」——
+   * 那种断言删掉代码照样绿(本文件开头写着这条)。
+   */
+  it('说 a 键只认三种挂载点、说提示词逐字、说上限按启动关口那份算,代码就得是这样', () => {
+    expect(README).toContain(norm('#### `a`:中途想起还差一件事'))
+    expect(README).toContain(norm('**这段话逐字成为那个任务的目标**'))
+
+    const mk = (over: Partial<TaskNode>): TaskNode => ({
+      ...createNode({
+        id: 'root', title: 't', parentId: null, deps: [], depth: 0,
+        phaseRoles: emptyPhaseRoles(), now: '2026-08-17T00:00:00Z',
+      }),
+      ...over,
+    })
+    /** 只有一个节点、它就是 root:不可挂时没有上级可退,于是直接反映白名单。 */
+    const solo = (over: Partial<TaskNode>): boolean =>
+      addTaskScope(mk(over), new Map([['root', mk(over)]]), { caps: DEFAULT_CAPS, nodeCount: 1 }).ok === true
+
+    // 三种能挂的
+    expect(solo({ status: 'WAITING_CHILDREN', kind: 'decompose', childIds: ['root/01-a'] })).toBe(true)
+    expect(solo({ status: 'ACCEPTED' })).toBe(true)
+    expect(solo({ status: 'BLOCKED', kind: 'decompose', childIds: ['root/01-a'], blockedReason: '验收迭代超限(3)' })).toBe(true)
+    // README 逐条点名的那三种不能挂的
+    expect(solo({ status: 'CREATED' })).toBe(false)
+    expect(solo({ status: 'READY', kind: 'executable' })).toBe(false)
+    expect(solo({ status: 'BLOCKED', kind: 'executable', blockedReason: '编译不过' })).toBe(false)
+
+    // 「深度和任务数都按启动关口批准的那份算」
+    expect(capacityRefusal(DEFAULT_CAPS.maxNodes, 0, DEFAULT_CAPS)).toBeDefined()
+    expect(solo({ status: 'ACCEPTED', depth: DEFAULT_CAPS.maxDepth })).toBe(false)
+
+    // 「提示词逐字」:上限是它自己那一个,不是补充指引那 2000
+    expect(MAX_TASK_PROMPT_CHARS).toBeGreaterThan(MAX_GUIDANCE_CHARS)
   })
 
   it('说「只在真的能点时才写回车/点击」,那文案就得跟着可用性变', () => {

@@ -548,3 +548,130 @@ describe('运行中的告警横幅', () => {
     expect(await frameOf({ problems: [] })).not.toContain('⚠')
   })
 })
+
+/**
+ * 按下 Esc 之后,屏幕上必须有东西变。
+ *
+ * 用户报的原话:「退出任务时按了 ESC,为什么要很久才有反应,在干啥呢」。
+ * 快慢是一回事;**「按下去没有任何反应」是另一回事**,而后者与收口有多快无关 ——
+ * `setPhase('done')` 排在收口链最后,在那之前界面还停在运行视图上,树照画、计时器照跳。
+ */
+describe('中止之后的运行视图', () => {
+  const mount = async (props: Record<string, unknown>, rows = 40): Promise<string> => {
+    const t = fakeTty(rows)
+    const app = await render(
+      React.createElement(RunningView as never, {
+        nodes: [node({ status: 'EXECUTING' })], runId: '001', onAbort: () => {}, ...props,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    return f
+  }
+
+  it('没中断时一个字都不多印(现有版面逐字不变)', async () => {
+    const f = await mount({})
+    expect(f).not.toContain('已请求中断')
+    expect(f).not.toContain('正在收尾')
+  })
+
+  /** 中断那一刻收口还没报第一句 —— 这段空窗期正是用户报的那一段,屏幕不能空着。 */
+  it('刚按下 Esc、收口还没报第一句时就要改口', async () => {
+    const f = await mount({ aborting: true })
+    expect(f).toContain('已请求中断')
+    // 而且要说清「已完成的产出不会丢」,否则用户不知道这时候能不能直接杀进程。
+    expect(f).toContain('不会丢')
+  })
+
+  it('收口报到哪一步就印哪一步', async () => {
+    const f = await mount({ aborting: true, teardown: '正在回收隔离工作区(3 个)…' })
+    expect(f).toContain('已请求中断')
+    expect(f).toContain('正在回收隔离工作区(3 个)')
+  })
+
+  /** 正常跑完那条路也会停在运行视图上收口 —— 同样要说话,只是不带「已请求中断」。 */
+  it('没中断、但正在收尾时也要说', async () => {
+    const f = await mount({ teardown: '正在写最后一次任务状态…' })
+    expect(f).toContain('正在写最后一次任务状态')
+    expect(f).not.toContain('已请求中断')
+  })
+
+  /**
+   * 多出来的这一行要**从树的预算里扣**。不扣的话树多画一行,而被顶出屏幕的是底部的
+   * 图例和按键提示 —— 这个仓库为同一条规矩写过两次(problems 那一栏、结束屏那一栏)。
+   */
+  it('那一行要计进行预算,不许把底部按键提示顶掉', async () => {
+    /**
+     * ⚠ **树必须先被视口夹住(节点数远超终端行数),预算才咬得动。**
+     *
+     * 30 个节点 + 40 行的终端上,树本来就画得下,`reservedRows` 一行都不会少画 ——
+     * 那时多出来的提示行是**真的**多一行,断言只能是「+1」,而那条断言在预算被删掉之后
+     * 同样成立。要让「让没让位」变成可观测的,得让树处在「画不下、按预算裁」的状态。
+     */
+    const many = Array.from({ length: 200 }, (_, i) =>
+      node({ id: `root/${i}`, title: `子任务 ${i}`, parentId: 'root', depth: 1 }))
+    /**
+     * ⚠ **必须带上一条 `problems`。**
+     *
+     * 不带的话:没有中止提示时 `problemRows === 0`,`RunningView` 走的是
+     * `if (problemRows === 0) return panel` 那条**早退**,两次渲染根本不是同一个版面 ——
+     * 于是这条用例量的不是「让没让位」,而是「有没有那个外层 Box」。变异测试当场戳穿:
+     * 把 `+ (teardownLine ? 1 : 0)` 删掉,杀掉它的是隔壁两条渲染用例,而这一条照绿。
+     * (这个仓库把这一类叫「名实不符」——名字说 A、输入触发 B。)
+     */
+    /**
+     * ⚠ **终端还得够矮。** 树高是 `Math.min(20, Math.max(6, termRows - 8 - reserved))` ——
+     * 40 行的终端上那个 `min` 恒取 20,`reserved` 一点都不参与,于是这条断言量不到预算。
+     * 24 行才落进 `termRows - 8 - reserved` 那一支(实测:40 行下 27 vs 26,恒 +1)。
+     */
+    const SHORT = 24
+    const base = { nodes: [node(), ...many], problems: ['一条占位的告警'] }
+    const without = await mount(base, SHORT)
+    const withLine = await mount({ ...base, aborting: true }, SHORT)
+    const rows = (s: string): number => s.split('\n').length
+    // 多一行提示,总高度不许跟着涨 —— 涨了就说明树没让位。
+    expect(rows(withLine)).toBeLessThanOrEqual(rows(without))
+  })
+})
+
+/**
+ * 那一行在窄终端上被截掉之后,剩下的半句不许读成反面。
+ *
+ * 上一版写的是「正在收尾,已完成的产出不会丢」,评审真渲染实测 40 列切成
+ * 「…已完成的产出不…」—— 恰好切在否定词之后、宾语之前。而这一行的全部作用就是回答
+ * 「现在能不能直接 kill 掉」。所以保证挪到前半句,被截掉的只会是可推断的那一半。
+ */
+describe('中止那一行的截断', () => {
+  const at = async (columns: number): Promise<string> => {
+    const t = fakeTty(40, columns)
+    const app = await render(
+      React.createElement(RunningView as never, {
+        nodes: [node({ status: 'EXECUTING' })], runId: '001', onAbort: () => {}, aborting: true,
+      } as never),
+      { stdin: t.stdin as never, stdout: t.stdout as never, exitOnCtrlC: false, patchConsole: false },
+    )
+    await tick()
+    const f = t.lastFrame()
+    app.unmount()
+    return f
+  }
+
+  it('40 列上「产出不会丢」必须完整', async () => {
+    expect(await at(40)).toContain('产出不会丢')
+  })
+
+  it('30 列上也不许只剩「产出不」', async () => {
+    const f = await at(30)
+    // 要么整句在,要么连「产出不」都没出现 —— 就是不许停在否定词上。
+    const half = f.includes('产出不') && !f.includes('产出不会丢')
+    expect(half).toBe(false)
+  })
+
+  it('宽终端上整句都在', async () => {
+    const f = await at(80)
+    expect(f).toContain('已请求中断')
+    expect(f).toContain('产出不会丢')
+  })
+})

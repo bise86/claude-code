@@ -1080,6 +1080,59 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     return undefined
   }
 
+  /**
+   * **这个节点此前某一版产出被抢救在哪几条 ref 上。**
+   *
+   * 名字是 `efftask/<runId>/salvage/<slug>`,可能带 `-2`/`-3` 后缀(见 `salvageRefFor`)。
+   * slug 是 `worktreeSlug(runId, node.id)` —— 单向,所以只能**正向算出来再匹配**,
+   * 不能从 ref 反推(`stranded.ts` 那一侧为此额外读了提交信息,这里不需要:我们手上有节点)。
+   */
+  async function salvageRefsOf(node: TaskNode): Promise<string[]> {
+    const all = await git(
+      ['for-each-ref', '--format=%(refname:short)', `refs/heads/efftask/${runId}/salvage`], gitRoot,
+    )
+    if (all.code !== 0) return []
+    const want = slugFor(node)
+    return all.stdout.split('\n').map(s => s.trim()).filter(Boolean)
+      .filter(ref => (ref.split('/').pop() ?? '').replace(/-\d+$/, '') === want)
+  }
+
+  /**
+   * **这个节点的产出到底在不在集成分支上 —— 问 git,不是问账本。**
+   *
+     * ## 为什么必须有这一问
+     *
+     * `node.contributed` 是账本,而账本只在**这一趟自己合成功**时才记(`commitAndMerge`
+     * 那条路),外加用户按 `m`。它漏掉了一整条真实链路:节点被中止 → 产出被抢救到
+     * `efftask/<runId>/salvage/*` → 下一趟自动捞回把那条 ref 合进集成分支。走完这条链,
+     * 产出**确确实实在集成分支上**,而账本上一个字都没有。
+     *
+     * 跑机 .30 run 001 实测:31 个阻断里 22 个(71%)是这个形状 —— 233 条抢救分支**全部**
+     * 已合入集成分支,而这 22 个节点 `contributed` 全部缺席。于是零贡献闸对它们逐字说
+     * 「产出不在集成分支上,也不在任何别的地方」——**假话**,而且是一句本可以用一条
+     * `merge-base --is-ancestor` 证伪的假话。判据算得出来就别去猜。
+     *
+     * ## 判据:只认抢救 ref,而且「存在」本身就是证据
+     *
+     * 抢救 ref **只在真的有东西要救时才建**(`salvageRefFor` 拿着一个已经提交过的 tip 才被
+     * 调用),所以「这个节点有一条抢救 ref」= 它当时确实产出过。再问一次它在不在集成分支上,
+     * 两条合起来就是「它的产出已经交付」。
+     *
+     * **不去看节点自己那条工作区分支**:一条从没写过东西的节点分支和基线逐字相同,
+     * 因而**天然**是集成分支的祖先 —— 拿它当证据会把「什么都没干」判成「已交付」,
+     * 正好是这道闸要拦的那一种。那条路本来就由 `commitAndMerge` 在合成功那一刻记账。
+     *
+   * `--is-ancestor` 的约定:0 = 是祖先,1 = 不是,>1 = 命令自己出错。
+   * **探不出来一律回 false** —— 这个答案会关掉一道安全闸,拿不准时必须朝闸门关着那一侧倒。
+   */
+  async function deliveredToIntegration(node: TaskNode): Promise<boolean> {
+    for (const ref of await salvageRefsOf(node)) {
+      const inInt = await git(['merge-base', '--is-ancestor', ref, intBranch], gitRoot)
+      if (inInt.code === 0) return true
+    }
+    return false
+  }
+
   /** 第一个还没被占用的名字。`.orphan`、`.orphan-2`、…… —— 治过一次的仓库会治第二次。 */
   async function freeName(base: string): Promise<string> {
     if (!await exists(base)) return base
@@ -1088,6 +1141,8 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
   }
 
   return {
+    /** 见上面那段:零贡献闸的判据从「查账本」改成「问 git」,靠的就是它。 */
+    deliveredToIntegration,
     /**
      * Create the integration branch and a dedicated worktree to merge in.
      *
@@ -1775,6 +1830,45 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
     async dispose(nodes: TaskNode[]): Promise<{ kept: { path: string; why: string }[] }> {
       const kept: { path: string; why: string }[] = []
       for (const n of nodes) {
+        /**
+         * **既没有工作区引用、盘上也没有那个目录的节点,一次 git 都不跑。**
+         *
+         * `dispose` 走的是**整棵树**,而树上绝大多数节点从来没有过隔离工作区(拆分节点、
+         * 还没执行到的)。对它们 `release` 会拿一个不存在的路径去 spawn git,必然失败、
+         * 返回「无法读取工作区状态」,再被记进下面那个 `kept` 列表 —— 而**唯一的生产调用方
+         * 把返回值直接丢掉**(`runOrchestrator` 的 `reclaim`)。那一趟从头到尾没有产生任何东西。
+         *
+         * 量级(实测,和生产同形状的 spawn):2215 个无目录节点 **404ms → 0ms**;
+         * 换成 stat 之后是 **17ms**。⚠ 别把它说成「秒级」:`--ignored` 那 24ms 只在路径
+         * **存在**时才付得出去,不存在的路径 spawn 直接 ENOENT,git 根本没启动。
+         *
+         * ## 判据是「引用**和**目录都没有」,不是「没有引用」
+         *
+         * 只看引用会**真的丢掉回收**,评审逐条走完 `node.worktree` 的设/清路径抓出来的:
+         *  - `releasePlanBase`(pipeline.ts)对 `kind==='executable'` 的节点**清引用、
+         *    故意把目录留在盘上**给执行环节复用 —— 那是「分析跑完、还没排到执行」的每一个
+         *    节点,也正是被中止那一趟最典型的形状;
+         *  - `resumeCore` 在 `--resume` 时把**除冲突节点外的每一个**引用清掉,于是上一趟
+         *    留在盘上的目录在下一趟收口里一个都不会被碰。
+         * 实测过后果:干净且已合入的方案席遗留目录**既不回收、也没有任何一处说它存在**
+         * (`handoff().kept` 只报脏的那些)。
+         *
+         * `stat` 不是 spawn:两者差一个数量级,而正确性一分不让。
+         *
+         * **守卫只能放在这里,不能放进 `release()`**:`releasePlanBase` 先把
+         * `node.worktree` 交回成 undefined、**再**调 `release(node)` 去删目录 ——
+         * 放进 release 会让分析/质疑环节借用的那棵树永远收不掉。
+         *
+         * ## `!n.worktree &&` 那一半为什么留着(变异测试实测存活,不是漏网)
+         *
+         * 去掉它(只判目录在不在)在**今天的行为上等价**:有引用、目录却没了的那一格,
+         * `release` 第一条 `git status` 就 ENOENT,只会回一条
+         * `{removed:false, keptBecause:'无法读取工作区状态'}`,而唯一的生产调用方把返回值
+         * 丢掉 —— 差别只是一次白跑的 spawn。留着是为了**另一件事**:`exists` 是 stat,
+         * 权限错也返回 false。只判目录的版本会把一个**有引用、有真产出**的节点静默跳过,
+         * 而现在这一版仍然会去 `release` 它。安全边界不为省一次 spawn 让路。
+         */
+        if (!n.worktree && !(await exists(pathFor(n)))) continue
         const r = await this.release(n)
         if (!r.removed) kept.push({ path: pathFor(n), why: r.keptBecause ?? '未知' })
       }

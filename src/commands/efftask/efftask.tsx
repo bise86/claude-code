@@ -22,7 +22,8 @@ import type { EffTaskOrchestrator } from '../../tools/efftask/orchestrator.js'
 import { createWorktreePool, type GitRunner, type WorktreePool } from '../../tools/efftask/worktreePool.js'
 import { spawn } from 'node:child_process'
 import { annotateRoleModels, effectiveModel, type AgentModelInfo } from '../../tools/efftask/roleModels.js'
-import { loadRun, sweepTempFiles, writeNode as writeNodeFile, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
+import { loadRun, removeNodeDirs, sweepTempFiles, writeNode as writeNodeFile, writeRunManifest, type FsLike } from '../../tools/efftask/persistence.js'
+import { createNodeJournal } from '../../tools/efftask/nodeJournal.js'
 import { failedRedoTarget, forcePassFailedPhaseReason, redoContextOf, redoUnavailableReason, skipFailedPhaseReason, type RedoEntry, type RedoPlan } from '../../tools/efftask/redo.js'
 import { commitRedo } from '../../tools/efftask/redoCommit.js'
 import { runForcePass, runRedo, runSkip } from '../../tools/efftask/redoRun.js'
@@ -45,6 +46,11 @@ import { ConfirmSkip } from './ConfirmSkip.js'
 import { ConfirmForcePass } from './ConfirmForcePass.js'
 import { ConfirmCleanup } from './ConfirmCleanup.js'
 import { ConfirmRecalcDeps } from './ConfirmRecalcDeps.js'
+import { AddTask } from './AddTask.js'
+import {
+  addTaskScope, addedTaskBlockedBy, allocateChildId, scopeDiff, type AddTaskScope,
+} from '../../tools/efftask/addTask.js'
+import { runAddTask } from '../../tools/efftask/addTaskRun.js'
 import { recalcScope, type RecalcPlan } from '../../tools/efftask/depsRecalc.js'
 import { notSchedulableReason } from '../../tools/efftask/scheduler.js'
 import { applyRecalc, askRecalc, type RecalcApply, type RecalcAsk } from '../../tools/efftask/depsRecalcRun.js'
@@ -1150,6 +1156,59 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
   /** 依赖重算的目标。只从运行视图进来(它要 hold 住节点、还要叫醒调度)。 */
   const [recalcTarget, setRecalcTarget] = React.useState<TaskNode | null>(null)
   /**
+   * 详情页/任务树 `a` 键:要在谁身上新增任务,以及关口开之前是哪一屏。
+   *
+   * `addTaskFrom` 和 `forcePassFrom` / `cleanupFrom` 逐字同因,而且它比那几个更要紧:
+   * 它不只决定取消时回哪一屏,还决定这次新增是**并进正在跑的那一棵树**(`taskAdded`)
+   * 还是**重启一个编排器**(`startRun`)。写死 'done' 会让运行中按下的新增在别的节点
+   * 还跑着的时候另起一个编排器 —— 同一批节点被派两遍。
+   */
+  const [addTaskTarget, setAddTaskTarget] = React.useState<TaskNode | null>(null)
+  const [addTaskFrom, setAddTaskFrom] = React.useState<Phase>('done')
+  /**
+   * 按下 `a` 那一刻算出来的准入结果。**存下来,不在每次渲染时重算。**
+   *
+   * 重算的话:关口开着时任何一次 `onUpdate`(别的节点提交状态,一秒好几次)都会让这一屏
+   * 重新求值,而树只要动一下(anchor 长出子节点、目标跑完)准入就可能翻成拒绝 ——
+   * 用户正在打字,屏幕当场换成一句「现在加不了」,他写了一半的提示词一起没了。
+   *
+   * 树在这期间真的变了是要处理的,但处理的位置在**按下确认之后的复核**(runAddTask 的
+   * revalidate),那时盘上还一个字节都没动,而且他写的那段话还在。
+   */
+  const [addTaskScopeState, setAddTaskScopeState] = React.useState<AddTaskScope | null>(null)
+  /**
+   * 「已请求中断」和「收口走到哪了」——**Esc 按下之后屏幕上唯一会变的东西**。
+   *
+   * 这两件事分开存:中断是用户的动作(按下那一刻就该看见),收口阶段是编排器报上来的
+   * (可能几十秒之后才有第一句)。合成一个的话,按下 Esc 到第一句阶段之间那段空窗期
+   * 屏幕仍然一个字不说 —— 而那正是用户报的那一段。
+   *
+   * `aborting` 走 `props.signal`,不走按键回调:`Esc` 只是**其中一个**入口(REPL 级中止、
+   * 父 signal 都会走到同一个 controller),而它们每一个都该让屏幕改口。
+   */
+  const [aborting, setAborting] = React.useState(props.signal.aborted)
+  const [teardown, setTeardown] = React.useState<string | null>(null)
+  React.useEffect(() => {
+    if (props.signal.aborted) { setAborting(true); return }
+    const on = (): void => setAborting(true)
+    props.signal.addEventListener('abort', on, { once: true })
+    return () => props.signal.removeEventListener('abort', on)
+  }, [props.signal])
+  /**
+   * 用户已经打进去的那段提示词,**住在这一层,不住在关口组件里**。
+   *
+   * 两条都是验收席实跑出来的:
+   *  1. 关口开着的时候 run 恰好跑完 —— `runOrchestrator` 收尾无条件 `setPhase('done')`,
+   *     而关口按 phase 渲染 → 它连同用户正在打的几千字一起被卸载,屏幕上一个字都不说;
+   *  2. 按下确认之后**任何**一条拒绝(hold 失败 / 名额满 / 复核不过 / 落盘失败)都会关掉
+   *     关口 —— 那几千字要重打一遍。
+   *
+   * 提到这一层之后,两种情况下那段话都还在:再按一次 `a` 就接着改。
+   * **只有真的加成功了才清空**(见 onDone 那一处),否则「重来一次」会从空白开始。
+   */
+  const [addTaskPrompt, setAddTaskPrompt] = React.useState('')
+  const [addTaskDropped, setAddTaskDropped] = React.useState(0)
+  /**
    * 这一次重算调用自己的 AbortController。
    *
    * **必须是每次调用一个**,而且 chain 到 run 级 signal 上:这条缝没有 control,
@@ -1818,6 +1877,12 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         // 运行中重做的把手。两次调用都要收:开跑时存下,跑完时置回 null。
         onOrchestrator: o => { orchRef.current = o ?? null },
         /**
+         * 收口链走到哪了 —— 这段时间界面还停在运行视图上(`setPhase('done')` 排在整条链
+         * 最后),而它此前**一个字都不说**。用户报的原话:「按了 ESC 为什么要很久才有反应,
+         * 在干啥呢」。
+         */
+        onTeardown: stage => setTeardown(stage),
+        /**
          * 收口(spec §8 的自动那一半):跑完就把集成分支合回**当前目录**。
          *
          * 用户原话:「任务完后,在隔离环境产出的代码和目录,并且提交成功了,要在当前目录下
@@ -2009,6 +2074,47 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     })
     // biome-ignore lint/correctness/useExhaustiveDependencies: props are stable for a mount
   }, [props.fs, startRun])
+
+  /**
+   * 「此刻能不能在这个节点上新增任务」—— **一份判据,四个消费者**:
+   * 页脚提示写不写、按键那一刻答不答应、关口渲染、以及确认之后落盘之前的复核。
+   *
+   * **取编排器那一份树,不是 React 快照**(和依赖重算逐字同因):新挂上的子节点要等下一次
+   * `onUpdate` 才进 React state,拿快照去量会 fail-open —— 而这个功能最要紧的判据之一
+   * (anchor 现在有几个子节点、序号排到哪了)恰恰住在那上面。
+   *
+   * `reserved` 也要现读:`growTree` 可以在关口开着的这几十秒里把最后几个名额用掉。
+   */
+  const addTaskScopeOf = React.useCallback(
+    (node: TaskNode): AddTaskScope | { ok: false; reason: string; details: string[] } => {
+      const live = orchRef.current?.nodes() ?? nodes
+      const byId = new Map(live.map(n => [n.id, n] as [string, TaskNode]))
+      // 拿树上那一份(而不是调用方手里那个可能已经过期的对象)——「它此刻在飞吗」
+      // 「它有几个子节点」都要问最新的。
+      const target = byId.get(node.id)
+      if (!target) {
+        return { ok: false, reason: `「${node.title}」已经不在树里了。`, details: [] }
+      }
+      return addTaskScope(target, byId, {
+        /**
+         * 在飞的 **加上** 被别的操作扣住的。
+         *
+         * `runningNodeIds()` 不含 `held` —— 那一份只在 `pickBatch` 那一侧被折进同一个集合。
+         * 只传前者的话,一个正被 `d`/`r` 扣着的节点在这里是「空闲」的,两次操作会重叠,
+         * 而先释放的那一次把后一次的扣也解了(验收席实跑出来的)。
+         */
+        inFlight: new Set([
+          ...(orchRef.current?.runningNodeIds() ?? []),
+          ...(orchRef.current?.heldNodeIds() ?? []),
+        ]),
+        wasCancelled: id => control.wasCancelled(id),
+        caps: config?.caps ?? DEFAULT_CAPS,
+        nodeCount: live.length,
+        reserved: orchRef.current?.reservedCount() ?? 0,
+      })
+    },
+    [nodes, config, control],
+  )
 
   /** 这次重做/跳过要按哪份环节实况算 —— 关口预演和真正执行必须是同一份。 */
   const phaseCtxOf = React.useCallback(
@@ -2817,8 +2923,28 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       throw new Error('这一趟没有使用隔离工作区(共享工作目录运行),执行者直接写在你的工作目录里,没有需要合并的分支')
     }
     /**
-     * 每次开这一屏建一个 controller,并 **chain 到 run 级 signal**:run 被中止时这一次
-     * 合并也要停(它会在下一个节点的边界上停下,而不是把一次 git merge 劈成两半)。
+     * 每次开这一屏建一个 controller,并 **在编排还活着时** chain 到 run 级 signal:
+     * run 被中止时这一次合并也要停(它会在下一个节点的边界上停下,而不是把一次
+     * git merge 劈成两半)。
+     *
+     * ## 编排已经结束之后**不再 chain** —— 这一条是评审用真 git 打出来的
+     *
+     * `props.signal` 一旦 abort 就**永久** aborted,而全会话只有这一个 `runController`
+     * (`efftask.tsx` 顶上那个)。无条件 chain 的后果是:用户按下 Esc 之后,`m` 在**这个
+     * 会话里再也合不了任何东西** —— `runSubtreeMerge` 第一项就 break、`out.aborted=true`,
+     * 而结果屏还写着「再按一次 m 可以接着合」,结束屏写着「(按 m 捞回)」。评审实测:
+     *
+     *     merged = []   aborted = true   产出到用户目录了吗 = false
+     *     (对照:未中止时 merged = ["root/00-a"],产出确实到了)
+     *
+     * 也就是说那两句话是**永不终止的循环**:它请你按的那个键,正是被这条 chain 关掉的。
+     *
+     * **run 级中止的语义是「别再跑任务了」,不是「这个会话里再也不许碰 git」。**
+     * `m` 是用户在 run 结束之后主动按下的一次手动操作,它自己有 Esc 那条逐操作的出口
+     * (`mergeAbort.current?.abort()`),不需要也不该被一个早就结束的 run 的 signal 摁住。
+     *
+     * 判据用 `orchRef.current !== null`(编排器还在不在),和「运行中/结束屏」那一对
+     * 判据同源 —— 不用 `props.signal.aborted`:那个只说「有人中止过」,说不出「现在还在跑吗」。
      */
     const armSignal = (): AbortSignal => {
       const ctl = new AbortController()
@@ -2828,12 +2954,15 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       mergeAbortDetach.current?.()
       const onRunAbort = (): void => ctl.abort()
       mergeAbort.current = ctl
+      const chained = orchRef.current !== null
       mergeAbortDetach.current = () => {
-        props.signal.removeEventListener('abort', onRunAbort)
+        if (chained) props.signal.removeEventListener('abort', onRunAbort)
         mergeAbortDetach.current = null
       }
-      if (props.signal.aborted) ctl.abort()
-      else props.signal.addEventListener('abort', onRunAbort, { once: true })
+      if (chained) {
+        if (props.signal.aborted) ctl.abort()
+        else props.signal.addEventListener('abort', onRunAbort, { once: true })
+      }
       return ctl.signal
     }
     /** 关掉这一屏时的收尾:摘监听、丢掉 controller。两个出口共用,漏一个就漏一处。 */
@@ -3163,16 +3292,202 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       />
     )
   }
+  /**
+   * 新增任务关口的渲染条件**不看 `phase`**。
+   *
+   * 看 phase 的话:用户正在打字,最后一个任务恰好跑完,`runOrchestrator` 收尾无条件
+   * `setPhase('done')`(它的注释原话是 "the done view is ALWAYS reached")→ 这一屏当场
+   * 被换成结束屏,他写的几千字一个字都不剩,而屏幕上没有任何一句解释。验收席实跑出来的。
+   *
+   * `addTaskTarget` 只在这一屏开着时才非空,所以拿它当渲染条件是精确的;而「回哪一屏」
+   * 由 `addTaskFrom` + 编排器此刻还在不在共同决定(见 onDone)。
+   */
+  if (addTaskTarget && addTaskScopeState) {
+    /**
+     * 新增任务关口。**排在下面那条 `phase === 'running' && directiveOpen` 之前** ——
+     * 排在 `phase === 'running'` 那一条之后的话,运行中这一屏永远渲染不到。
+     *
+     * `scope` 是按下 `a` 那一刻算出来的那一份(见 addTaskScopeState:每帧重算会在用户
+     * 打字的时候把他写的东西换成一句拒绝)。树在这期间变了由**确认之后的复核**处理。
+     */
+    const target = addTaskTarget
+    const scope = addTaskScopeState
+    const live = (): TaskNode[] => orchRef.current?.nodes() ?? nodes
+    const liveById = (): Map<string, TaskNode> =>
+      new Map(live().map(n => [n.id, n] as [string, TaskNode]))
+    const fromRunning = addTaskFrom === 'running' && orchRef.current !== null
+    /**
+     * 关掉这一屏。**回哪一屏现算** —— `addTaskFrom` 是按下 `a` 那一刻记的,而 run 完全可能
+     * 在关口开着的这几十秒里跑完;那时候回 `'running'` 会得到一个不再更新的运行视图。
+     *
+     * **不清 `addTaskPrompt`** —— 用户写的那段话要活过每一次拒绝(见 addTaskPrompt)。
+     */
+    const closeAddTask = (): void => {
+      setAddTaskTarget(null)
+      setAddTaskScopeState(null)
+      setPhase(orchRef.current !== null && addTaskFrom === 'running' ? 'running' : 'done')
+    }
+    return (
+      <AddTask
+        scope={scope}
+        // 关口上印的那个 id 必须是**真的会落盘的那一个**:slug 会退化成 `node`、
+        // 序号会和已有兄弟撞,而两者都由这个函数解决。落盘之前还会再算一次。
+        previewId={title => allocateChildId(scope.anchor, title, liveById())}
+        /**
+         * 「确认后跑不跑得起来」。**要把这次操作自己会放开的那几个算进去** ——
+         * 否则在这个键最典型的用法上(盯着一个挂掉的任务按 `a`)同一屏会自相矛盾:
+         * 上半屏「会从 BLOCKED 重新打开成 WAITING_CHILDREN」,下半屏「还不会马上跑:
+         * 上级仍是阻断的」,而确认之后后一句当场变成假话。
+         */
+        notSchedulable={anchorId => {
+          const m = liveById()
+          const a = m.get(anchorId)
+          if (a === undefined) return '挂载点已经不在树里了'
+          return addedTaskBlockedBy(
+            a, m,
+            { anchorReopened: scope.anchorSeat !== undefined, willReopen: new Set(scope.reopen.map(r => r.id)) },
+            new Set(orchRef.current?.runningNodeIds() ?? []),
+          )
+        }}
+        willRestart={!fromRunning}
+        // 重启编排会清掉这两批一次性标记(`startRun` 的头两句)。只在真会重启时印。
+        clearsCancels={!fromRunning ? nodes.filter(n => control.wasCancelled(n.id)).length : undefined}
+        clearsForcePasses={!fromRunning
+          ? nodes.reduce((s, n) => s + control.forcePassesOf(n.id).length, 0)
+          : undefined}
+        // 权限对话框画在它之上时键盘归对话框 —— 否则一下回车既确认新增又批准工具。
+        isActive={!humanWait.waiting}
+        // 提示词住在这一层(见 addTaskPrompt):关口被卸载、或者确认之后被拒,那段话都还在。
+        initialPrompt={addTaskPrompt}
+        initialDropped={addTaskDropped}
+        onPromptChange={(t, d) => { setAddTaskPrompt(t); setAddTaskDropped(d) }}
+        onCancel={() => { closeAddTask() }}
+        onConfirm={(prompt, title) => {
+          const cfg = config
+          const dir = runDir
+          if (!cfg || !dir) {
+            setRedoProblems(['新增任务未执行:这一趟还没有 run 目录。'])
+            closeAddTask()
+            return
+          }
+          const orch = fromRunning ? orchRef.current : null
+          // 一次操作一份账(三次写共用它),照 `commitRedo` 的先例。
+          const journal = createNodeJournal({ fs: props.fs, runDir: dir })
+          void runAddTask(
+            scope,
+            { title, prompt },
+            {
+              byId: liveById,
+              now: () => new Date().toISOString(),
+              // **带 journal**:node.md 是整份覆盖写,磁盘满那一刻盘上留着的是上一次那份,
+              // 而这条路上最脆的一个字节正是 anchor 的 childIds。
+              persist: n => writeNodeFile(props.fs, dir, n, journal),
+              /**
+               * **`removeNodeDirs` 从不抛** —— 它把失败收进返回值(那是它自己立的规矩:
+               * 「一个删不掉的 node.md 是会自己长回来的东西,用户必须看见」)。丢掉返回值的话
+               * `runAddTask` 那边的 `cleaned` 判据恒真,屏幕会说「新任务的文件已经清掉」,
+               * 而它还在盘上、下次 `--resume` 会被挂回去并开始跑。验收席用只读盘实跑出来的。
+               */
+              removeNode: async id => {
+                const r = await removeNodeDirs(props.fs, dir, [id])
+                if (r.failed.length > 0) throw new Error(r.failed.map(f => f.message).join('; '))
+              },
+              ...(orch
+                ? {
+                  /**
+                   * `hold` 的拒绝原文说的是「这次**重做**要走结束屏那条路 / 请先按 x 取消,
+                   * 再重做」—— 而用户按的是 `a`。套一层措辞(依赖重算为同一件事套过一层)。
+                   */
+                  hold: (ids: readonly string[]) => {
+                    const h = orch.hold(ids)
+                    return h.ok
+                      ? h
+                      : {
+                        ok: false as const,
+                        reason: '这次新增要动的任务里有正在运行的(或本次编排刚结束)——' +
+                          `请先在树上选中它按 x 取消,再按 a。原话:${h.reason}`,
+                      }
+                  },
+                  reserve: () => orch.reserveOne(),
+                  taskAdded: (n: TaskNode, affected: readonly string[]) => orch.taskAdded(n, affected),
+                }
+                : {}),
+              onNodes: setNodes,
+              onProblems: setRedoProblems,
+              onDropStreams: (ids: readonly string[]) => { streams.current.dropNodes(ids) },
+              ...(orch
+                ? {}
+                : {
+                  start: (ns: TaskNode[]) => {
+                    // 起不来要**说出口**:这次新增已经写进磁盘了,静默返回会让界面翻到
+                    // 运行视图而显示的是另一趟的树。
+                    if (!startRun(cfg, ns)) {
+                      setRedoProblems([
+                        '上一轮编排还在收尾,新任务已经写进磁盘但没有起跑;' +
+                        '等它结束后 /et --resume 会带着它继续。',
+                      ])
+                    }
+                  },
+                }),
+              onDone: () => {
+                // 运行中回运行视图;结束屏那条路由 `start` 里的 startRun 自己切屏,
+                // 起不来时留在结束屏(而那句话已经印出去了)。
+                closeAddTask()
+              },
+            },
+            /**
+             * 复核。关口开着期间树是活的:目标可以跑完、anchor 可以长出子节点、
+             * 祖先可以重新 ACCEPTED、链上可以冒出结构性阻断。
+             * 比对的是**这次操作依赖的那几件事**,不是整份对象相等。
+             */
+            () => {
+              const now = addTaskScopeOf(target)
+              if (now.ok !== true) return `树在你确认之前变了: ${now.reason}`
+              /**
+               * 逐项比走 `scopeDiff`(纯函数,可测)。
+               *
+               * **手写这几条比较是踩过的**:上一版只比 `anchor.id` 和 `reopen` 清单,漏了
+               * `anchorSeat` —— 而验收席实跑出的那条 P0 正好落在这个缺口上:anchor 在关口
+               * 期间跑完(`WAITING_CHILDREN` → `ACCEPTED`),前两项一个都没变,于是放行,
+               * 落盘却按旧的「不用改状态」走,新任务挂到了一个**终态**父节点下面。
+               */
+              const diff = scopeDiff(scope, now)
+              return diff === undefined ? undefined : `树在你确认之前变了:${diff},已放弃这次新增。`
+            },
+          ).then(out => {
+            // **只有真的加成功了才清空那段话。** 任何一条拒绝之后它都要留着 ——
+            // 用户再按一次 `a` 就接着改,而不是从空白重打几千字。
+            if (out.ok) { setAddTaskPrompt(''); setAddTaskDropped(0) }
+          })
+        }}
+      />
+    )
+  }
   if (phase === 'running' && directiveOpen) {
     return (
-      <AddDirective
+      <Box flexDirection="column">
+        {/**
+          * 中断那一行在这一屏上也要有。
+          *
+          * 它只住在 `RunningView` 里,而这几个关口是**整屏替换**它的。追加指令这一屏是
+          * 用户会**长时间停留**的那一个(他正在打字),而中止可以从别处到达:`/tasks` 面板
+          * 按 `x`、REPL 级中止 —— 那时收口正在跑,屏幕上却是一个还在等你输入的输入框,
+          * 一个字不说,收完直接跳结束屏。评审点名的那一条。
+          */}
+        {aborting
+          ? <Text bold color="warning" wrap="truncate-end">
+            {`⏹ 已请求中断 · 产出不会丢 —— ${teardown ?? '正在收尾…'}`}
+          </Text>
+          : null}
+        <AddDirective
         // 权限对话框画在它之上时键盘归对话框 —— 否则一下回车既提交指令又批准工具。
         isActive={!humanWait.waiting}
         // 丢弃说明行不算「补过的一条」,否则 25 条会报成 21。
         existing={control.directives().filter(d => !d.startsWith('(较早的')).length}
         onSubmit={t => { control.addDirective(t); setDirectiveOpen(false) }}
         onCancel={() => setDirectiveOpen(false)}
-      />
+        />
+      </Box>
     )
   }
   if (phase === 'running') {
@@ -3250,6 +3565,20 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        */
       onRepairNode={node => { setRepairTarget(node); setRepairFrom('running'); setPhase('confirmRepair') }}
       onBacktrack={node => { setBacktrackTarget(node); setBacktrackFrom('running'); setPhase('confirmBacktrack') }}
+      /**
+       * 新增任务(`a`)。准入全是同步内存读,所以**在按键这一刻就答得出来**;
+       * 回一句话 = 不切屏(话画到页脚),`undefined` = 关口接手。
+       */
+      onAddTask={node => {
+        const scope = addTaskScopeOf(node)
+        if (scope.ok !== true) return [scope.reason, ...scope.details].join(' ')
+        setAddTaskTarget(node)
+        setAddTaskScopeState(scope)
+        setAddTaskFrom('running')
+        setPhase('confirmAddTask')
+        return undefined
+      }}
+      addTaskAvailable={node => addTaskScopeOf(node).ok === true}
       onMergeWorktrees={poolRef.current ? node => {
         setMergeTarget(node); setMergeFrom('running'); setPhase('confirmMerge')
       } : undefined}
@@ -3347,6 +3676,9 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
        */
       problems={[...redoProblems.slice(-1), ...runNotices.slice(-2)]}
       hiddenProblems={Math.max(0, redoProblems.length - 1) + Math.max(0, runNotices.length - 2)}
+      // Esc 之后屏幕上唯一会变的东西 —— 见 RunningView 里 teardownLine 那一段。
+      aborting={aborting}
+      teardown={teardown}
     />
   }
   return (
@@ -3380,6 +3712,27 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
         if (why) { setRedoProblems([why]); return why }
         setRedoTarget(node); setRedoEntry(null); setRedoFrom('done'); setPhase('confirmRedo')
       }}
+      /**
+       * 新增任务(`a`)。**两道闸门,顺序和 `R` 那一条逐字相同**:
+       *
+       * 先判「这一次能不能重启编排」—— 结束屏这条路的下游是 `startRun`,而一个**中断过**的
+       * run 里 `runLoop` 第一圈就 `return blocked`:界面闪一下回到同一屏,模型调用 0 次,
+       * 而任务已经写进磁盘了。挡在按键这一刻,不是让他写完几千字、看完后果、确认完再看一遍失败。
+       */
+      onAddTask={node => {
+        const why = redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined })
+        if (why) { setRedoProblems([why]); return why }
+        const scope = addTaskScopeOf(node)
+        if (scope.ok !== true) return [scope.reason, ...scope.details].join(' ')
+        setAddTaskTarget(node)
+        setAddTaskScopeState(scope)
+        setAddTaskFrom('done')
+        setPhase('confirmAddTask')
+        return undefined
+      }}
+      addTaskAvailable={node =>
+        redoUnavailableReason({ aborted: props.signal.aborted, runId: runId ?? undefined }) === undefined
+        && addTaskScopeOf(node).ok === true}
       /**
        * 快速重做失败的那个环节(`R`)。
        *
@@ -3530,6 +3883,13 @@ export function RunningView(props: {
   /** 「按 d 重算」那行提示写不写 —— 走真正的准入,见 TaskTreePanel.recalcAvailable。 */
   recalcAvailable?: (node: TaskNode) => boolean
   /**
+   * 新增任务(`a`)。**两个视图都接** —— 运行中把新节点并进正在跑的那棵树,
+   * 结束屏重启一轮编排。只接一边等于这个功能有一半不存在。
+   */
+  onAddTask?: (node: TaskNode) => string | undefined
+  /** 「按 a 新增任务」那行提示写不写 —— 真准入,见 TaskTreePanel.addTaskAvailable。 */
+  addTaskAvailable?: (node: TaskNode) => boolean
+  /**
    * 重做/回溯那条路上「**没做成的事**」。
    *
    * **这一条以前只有结束屏读**,而 `r`/`R`/`s`/`b` 四个键在运行视图上全是通的 ——
@@ -3543,6 +3903,15 @@ export function RunningView(props: {
   problems?: string[]
   /** 调用方已经丢掉了多少条 —— 截断发生在那里,计数就得从那里来(见 moreProblems)。 */
   hiddenProblems?: number
+  /**
+   * 用户已经请求中断了(Esc / REPL 级中止 / 父 signal 都算)。
+   *
+   * **按下那一刻就要为真**,不能等收口报第一句 —— 那两件事之间可以隔几十秒,而那正是
+   * 用户报「按了没反应」的那一段。
+   */
+  aborting?: boolean
+  /** 收口链此刻走到哪了;`null`/缺席 = 还没开始收(或者已经收完)。 */
+  teardown?: string | null
 }): React.ReactElement {
   // NO useInput here. TaskTreePanel is interactive and installs its own handler; a second one
   // would ALSO receive every key, so ↑↓ would scroll the tree *and* Esc would mean two
@@ -3578,15 +3947,46 @@ export function RunningView(props: {
    * 截断点搬走了,而计数器留在原地。
    */
   const moreProblems = props.hiddenProblems ?? ((props.problems ?? []).length - problems.length)
-  const problemRows = problems.length + (moreProblems > 0 ? 1 : 0)
+  /**
+   * 「已请求中断 / 正在收尾」那一行。
+   *
+   * **按下 Esc 之后屏幕上唯一会变的东西。** 在这之前:`setPhase('done')` 排在收口链的
+   * 最后,而收口要回收隔离工作区、结算产出去向、扫盘上没送到的东西、写最后一次 run.md ——
+   * 这段时间里界面还停在运行视图上,树照画、计时器照跳、**一个字都不说**。
+   * 用户报的原话:「按了 ESC 为什么要很久才有反应,在干啥呢」。
+   *
+   * 两段分开:中断是**按下那一刻**就要看见的(收口的第一句可能几十秒后才来);
+   * 阶段是编排器报上来的。合成一句的话,中间那段空窗期屏幕仍然什么都不说。
+   */
+  /**
+   * ⚠ **保证要放在前半句。** 这一行是 `wrap="truncate-end"`,而窄终端上它一定会被截。
+   * 上一版写的是「正在收尾,已完成的产出不会丢」,评审真渲染实测 40 列切成:
+   *
+   *     ⏹ 已请求中断 —— 正在收尾,已完成的产出不…
+   *
+   * 恰好切在否定词之后、宾语之前 —— 剩下的半句读起来像**反面**。而这一行的全部作用就是
+   * 回答「现在能不能直接 kill 掉」。所以把「产出不会丢」挪到最前面,被截掉的只会是
+   * 「正在收尾」那一半(它是可以推断的),而判断依据永远在。
+   */
+  const teardownLine = props.aborting === true
+    ? `⏹ 已请求中断 · 产出不会丢 —— ${props.teardown ?? '正在收尾…'}`
+    : props.teardown !== null && props.teardown !== undefined
+      ? `⏳ ${props.teardown}`
+      : null
+  // 计进行预算:不让位的话树会多画一行,把底部的图例和按键提示顶出屏幕(和 problems 同规矩)。
+  const problemRows = problems.length + (moreProblems > 0 ? 1 : 0) + (teardownLine ? 1 : 0)
   const panel = (
-    <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} sharedParallel={props.sharedParallel} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} reservedRows={problemRows} />
+    <TaskTreePanel nodes={props.nodes} runId={props.runId} interactive suspended={props.suspended} serialExecute={props.serialExecute} sharedParallel={props.sharedParallel} runControl={props.runControl} onForcePass={props.onForcePass} onRedo={props.onRedo} onRedoFailed={props.onRedoFailed} onSkipFailed={props.onSkipFailed} onCleanupWorktrees={props.onCleanupWorktrees} onMergeWorktrees={props.onMergeWorktrees} onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack} onRecalcDeps={props.onRecalcDeps} recalcAvailable={props.recalcAvailable} onAddTask={props.onAddTask} addTaskAvailable={props.addTaskAvailable} streams={props.streams} pool={props.pool} onExitKey={props.onAbort} reservedRows={problemRows} />
   )
   if (problemRows === 0) return panel
   return (
     <Box flexDirection="column">
       {/* `wrap="truncate-end"` 和结束屏同一条理由:这几行按**条数**计进 reservedRows,
           而回流成两行会把树的最后一行静默挤掉。 */}
+      {/* 中断那一行排在最前:它是用户刚按下去的那一下的回执,比任何告警都当下。 */}
+      {teardownLine
+        ? <Text bold color="warning" wrap="truncate-end">{teardownLine}</Text>
+        : null}
       {problems.map((l, i) => <Text key={`p-${i}`} color="warning" wrap="truncate-end">⚠ {l}</Text>)}
       {moreProblems > 0 ? <Text dimColor wrap="truncate-end">…另有 {moreProblems} 条未显示</Text> : null}
       {panel}
@@ -3641,6 +4041,15 @@ export function DoneView(props: {
   onRepairNode?: (node: TaskNode) => void
   /** 回溯:集成验收没通过的、以及产出丢了的任务重新推一遍。详情页 `b`。 */
   onBacktrack?: (node: TaskNode) => void
+  /**
+   * 给了才有 `a` 键(用一段提示词新增一个任务)。
+   *
+   * 结束屏这条路会**重启一轮编排**来跑它 —— 所以它的准入比运行中那条多一道:
+   * 中断过的 run 一律不行(见调用点)。
+   */
+  onAddTask?: (node: TaskNode) => string | undefined
+  /** 「按 a 新增任务」那行提示写不写 —— 真准入。 */
+  addTaskAvailable?: (node: TaskNode) => boolean
   onExit: (outcome: Outcome | null) => void
 }): React.ReactElement {
   // Same rule as RunningView: one keyboard owner. Enter used to exit here, but it now opens a
@@ -3704,6 +4113,7 @@ export function DoneView(props: {
         onCleanupWorktrees={props.onCleanupWorktrees}
         onMergeWorktrees={props.onMergeWorktrees}
         onRepairNode={props.onRepairNode} onBacktrack={props.onBacktrack}
+        onAddTask={props.onAddTask} addTaskAvailable={props.addTaskAvailable}
         onExitKey={() => props.onExit(props.outcome)}
       />
       <Box borderStyle="round" paddingX={1} flexDirection="column">

@@ -7,7 +7,7 @@ import type { EffTaskConfig, TaskNode } from './types.js'
 import { byIdMap } from './stateMachine.js'
 import { serializeNode, parseNodeFile, renderTreeSnapshot } from './persistence.js'
 import { validateLoadedNodes } from './resumeCore.js'
-import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, planPrompt, commitForTest } from './pipeline.js'
+import { PipelineCtx, stepStart, stepExecute, stepIntegrate, createChildren, planPrompt, commitForTest, NO_CHANGE_NOTE_LEAD } from './pipeline.js'
 import type { RunAgentFn } from './roundtable.js'
 import { PhaseTimeoutError } from './runAgentAdapter.js'
 import { reseatTransientNodes } from './reseat.js'
@@ -7295,15 +7295,43 @@ describe('执行提示词里的「必须真的改文件」', () => {
  * 照不到它,节点一路走到合并才被零贡献闸拦下。那时已经晚了。
  */
 describe('一轮没改任何文件的执行', () => {
-  const mkPool = (fps: string[]) => {
+  /**
+   * **`merged` 必须跟着指纹走。**
+   *
+   * 上一版这个替身写死 `merged: true`,而真池子在这个形状上答的是 `merged: false`
+   * ——「工作区干净 → `add -A` 什么都没暂存 → 节点分支本来就是集成分支的祖先 →
+   * `isMerged` 为真 → `{ok:true, merged:false}`」(评审在真 git 上跑出来的)。
+   * 差别不是细节:`merged:true` 会让 `mergeAndRelease` 把 `contributed` 记上,于是下游
+   * 那道零贡献闸**永远不会被这组用例走到** —— 「用尽迭代 → 不阻断」那条断言当时为真,
+   * **只因为替身答了真池子不会答的话**。
+   *
+   * `delivered` 是「这个节点的产出在不在集成分支上」那一问的替身
+   * (真实现:抢救 ref 在不在集成分支上)。缺省 false = 跑机上那 22 个节点的形状。
+   */
+  const mkPool = (fps: string[], delivered = false) => {
     let i = 0
+    let merged = false
     return {
       statusFingerprint: async () => fps[Math.min(i++, fps.length - 1)] as string,
-      commitAndMerge: async () => ({ ok: true, merged: true }),
+      // 前后指纹一样 = 这一轮没有任何东西可合。真池子在这一格答 merged:false。
+      commitAndMerge: async () => {
+        merged = new Set(fps).size > 1
+        return { ok: true, merged }
+      },
+      deliveredToIntegration: async () => delivered,
       release: async () => ({ removed: true }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
       // 第 2 轮开头会先从集成分支同步一次 —— 桩缺了它,返工那一路走不到。
       refreshFromIntegration: async () => ({ ok: true, updated: false }),
+    }
+  }
+
+  /** 带验收席位的上下文 —— 没有席位时验收整关会被跳过,读数递没递到就无从查起。 */
+  const withAccept = (n: TaskNode, runAgent: RunAgentFn, fps: string[], delivered = false) => {
+    n.phaseRoles = { ...emptyPhaseRoles(), accept: [{ roleName: 'a' }] }
+    return {
+      ...ctxFor([n], runAgent, { ...cfg, phaseRoles: n.phaseRoles }),
+      worktrees: mkPool(fps, delivered) as never,
     }
   }
 
@@ -7326,13 +7354,249 @@ describe('一轮没改任何文件的执行', () => {
     expect(seen.length).toBeGreaterThan(1)
     expect(seen[1] ?? '').toContain('一个文件都没有改')
     expect(seen[1] ?? '').toContain('不解除你写代码的义务')
-    // 用尽迭代之后停下来,而且归 no-output 这一档(不是 rework)。
+  })
+
+  /** 一个零产出节点走到底的公共夹具。`delivered` = 它的产出到底在不在集成分支上。 */
+  const runIdle = async (delivered: boolean, over: Partial<TaskNode> = {}) => {
+    const seen: string[] = []
+    const accepts: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') seen.push(req.prompt)
+      if (req.phase === 'accept') accepts.push(req.prompt)
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"我分析了很久,列出了完整方案"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.worktree = { branch: 'b', path: '/wt' }
+    Object.assign(n, over)
+    await stepExecute(n, withAccept(n, runAgent, ['same'], delivered))
+    return { n, seen, accepts }
+  }
+
+  /**
+   * **产出确实已经在集成分支上时,用尽迭代之后不阻断 —— 读数当证据递给验收圆桌。**
+   *
+   * 跑机 .30 run 001:31 个阻断里 22 个是这一条(71%),而它们的产出**确实已经在集成分支上**
+   * (233 条抢救分支全部被捞回合进去了),另有 `A032 集成编译验证并提交` 这种
+   * 「有问题才有产出」的验证型任务。
+   *
+   * ⚠ `delivered: true` **不是**为了让断言好看:`delivered: false` 时下游那道零贡献闸
+   * 会照常拦住它(下一条用例钉的就是那一格)。上一版这条用例用的替身写死 `merged: true`,
+   * 于是它为真只因为替身答了真池子不会答的话 —— 评审用真 git 打出来的。
+   */
+  it('产出在集成分支上 + 用尽迭代 → 不阻断,把读数当证据递给验收圆桌', async () => {
+    const { n, accepts } = await runIdle(true)
+
+    expect(n.status).not.toBe('BLOCKED')
+    expect(accepts.length).toBeGreaterThan(0)
+    const p = accepts[0] ?? ''
+    // 读数四样都要在:归属、说的是哪一件事、工作区在哪、指纹是空还是非空。
+    expect(p).toContain(NO_CHANGE_NOTE_LEAD)
+    expect(p).toContain('本轮执行没有改动本任务工作区的任何文件')
+    expect(p).toContain('工作区 /wt')
+    expect(p).toContain('非空,但和执行前逐字相同')
+    /**
+     * **这一支的事实是查明的,不许再对冲。** 编排器刚问过 git,产出就在集成分支上 ——
+     * 这时候还说「也可能确实没做」,是凭空造出一份自己并不持有的怀疑,而它的落点是
+     * 地板第 2 条(找不到痕迹一律 false),把本该通过的判成不通过。
+     */
+    expect(p).toContain('本节点此前已有产出合入集成分支')
+    expect(p).toContain('不构成不通过的理由')
+    expect(p).not.toContain('或者确实没做')
+  })
+
+  /**
+   * **反向那一格:产出真的不在集成分支上,兜底必须照常拦。**
+   *
+   * 「不再阻断」只挪走了执行环节那一道,`mergeAndRelease` 的零贡献闸原样还在 ——
+   * 少了这一条,上一条用例等于把「谎报完成」当成修好了。
+   */
+  it('产出不在集成分支上 → 仍然被零贡献闸拦下', async () => {
+    const { n, seen } = await runIdle(false)
+
     expect(n.status).toBe('BLOCKED')
-    expect(n.blockedReason).toContain('git 指纹在执行前后一模一样')
-    // 阻断信息要摆**读数**,不是猜成因:工作区在哪、执行后的指纹是什么。
-    expect(n.blockedReason).toContain('工作区: /wt')
-    expect(n.blockedReason).toContain('执行后的指纹')
-    expect(n.blockedReason).toContain('git status --porcelain --ignored')
+    expect(n.blockedReason).toContain('产出不在集成分支上')
+    expect(n.capCategory).toBe('no-output')
+    // 而那句话现在是**查过**的:同一条路上 delivered 为真时它不会出现(上一条用例)。
+
+    /**
+     * **正好 `maxIterations` 轮,一轮不多。**
+     *
+     * 用尽的那一轮**不再 ++** —— `>= max` 是「这是最后一轮」的判据,而那一轮不返工。
+     * 多加的那一下会白派一次最贵的调用,还会让降级记录写出 `round: 4`(上限是 3)。
+     * 判据钉在调用次数上:钉 `iteration.acceptance` 的话,多派一轮照样落在上限内。
+     */
+    expect(seen.length).toBe(DEFAULT_CAPS.maxIterations)
+  })
+
+  /**
+   * **只有合并那一道闸看得见的那一格。**
+   *
+   * `enterAtJudge`(手工跳过测试验证后从判决段入场)把整个执行段跳掉 —— 指纹闸一次都不跑,
+   * 于是账本上那个 `contributed` 到合并的那一刻仍然缺席。这时候唯一还能救它的,就是零贡献
+   * 闸自己去问一次 git。判据退回裸的 `node.contributed` 时,这一格当场变回阻断。
+   */
+  it('跳过判决段入场 + 账本空着 + git 说产出在集成分支上 → 合并闸不许拦', async () => {
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"不该被调用"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.worktree = { branch: 'b', path: '/wt' }
+    n.skipPhase = 'verify'
+    await stepExecute(n, withAccept(n, runAgent, ['same'], true))
+
+    expect(n.status).not.toBe('BLOCKED')
+    // 问出来的真值记回了账本。
+    expect(n.contributed).toBe(true)
+  })
+
+  /**
+   * **判据是「产出在不在集成分支上」,而不是「账本上记没记」。**
+   *
+   * 账本(`node.contributed`)只在「这一趟自己合成功」和「用户按 m」时记账,漏掉了整条
+   * 捞回链路。而评审在真 git 上跑出来的更狠一格:`scanStranded` 对**已经**合入的抢救 ref
+   * 直接跳过,于是存量那一趟(233 条全部已合入)无论 `--resume` 多少次都不会再产生一次
+   * 捞回记账 —— 判据必须当场问 git,不能等别人来记。
+   */
+  it('账本空着、但 git 说产出在集成分支上 → 幂等重跑,一轮返工都不派', async () => {
+    const { n, seen, accepts } = await runIdle(true)
+
+    // 一轮就够 —— 返工是这条 bug 的可观测症状,派了就是没修好。
+    expect(seen.length).toBe(1)
+    expect(n.iteration.acceptance).toBe(0)
+    // 问出来的真值要**记回账本**:只增不减,下一趟不用再问 git,--resume 读回来也还在。
+    expect(n.contributed).toBe(true)
+    expect(accepts[0] ?? '').toContain('幂等重跑')
+  })
+
+  /** 账本自己就说交付过时,一条 git 都不用问。 */
+  it('账本已记 contributed → 同样是幂等重跑', async () => {
+    const { seen, n } = await runIdle(false, { contributed: true })
+    expect(seen.length).toBe(1)
+    expect(n.status).not.toBe('BLOCKED')
+  })
+
+  /**
+   * **用尽迭代那一轮不再多记一次返工。**
+   *
+   * 多加的那一下会让降级记录写出 `round: 4`,而上限是 3 —— 一个不可能的数,它会跟着
+   * `degraded` 进父节点的集成验收证据段。
+   */
+  it('用尽迭代那一轮不再多记一次返工', async () => {
+    const { n } = await runIdle(true)
+    expect(n.iteration.acceptance).toBeLessThanOrEqual(DEFAULT_CAPS.maxIterations)
+  })
+
+  /**
+   * **单轮读数必须清掉再写。** 它和别的编排器注记不是一类:那些记的是「这个环节整个没跑过」
+   * 这种只增不减的事实,而这一句只描述**这一轮**。第 2 趟真写了文件却把第 1 趟那句原样
+   * 带过来的话,验收提示词里就是一句关于当下的假话。
+   */
+  it('这一轮改了文件 → 上一趟留下的那条读数被清掉', async () => {
+    const accepts: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'accept') accepts.push(req.prompt)
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"这一轮真写了三个文件"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    /**
+     * **陈旧那一行必须由代码自己产出,不许手写。**
+     *
+     * 手写的话,这条探针查的是「一个恰好以常量开头的字符串会不会被清掉」—— 而清理判据
+     * `startsWith(ORCHESTRATOR_NOTE + NO_CHANGE_NOTE_LEAD)` 真正会坏在**有人往
+     * `noChangeReading` 开头加了字**上(`⚠ `、`读数:`)。那种改动下手写的那一行照样绿,
+     * 真实读数却从此清不掉,而验收提示词里就是一句关于当下的假话。所以先真跑一趟。
+     */
+    const { n } = await runIdle(true)
+    expect(n.execStatus).toContain(NO_CHANGE_NOTE_LEAD)
+
+    n.status = 'READY'
+    n.worktree = { branch: 'b', path: '/wt' }
+    await stepExecute(n, withAccept(n, runAgent, ['a', 'b'], true))
+
+    expect(n.execStatus).not.toContain(NO_CHANGE_NOTE_LEAD)
+    expect(accepts[0] ?? '').not.toContain(NO_CHANGE_NOTE_LEAD)
+    expect(n.execStatus).toContain('这一轮真写了三个文件')
+  })
+
+  /**
+   * **同一次 stepExecute 之内跨轮次也要清 —— 那是装配那一跳的过滤器管的段。**
+   *
+   * 两道清理各管一段,不是重复:进门那一道作废**上一次调用**留下的读数,装配那一道作废
+   * **同一次调用内上一轮**的。这一条走的是第二段:第 1 轮没改动(写下读数)→ 验收判不
+   * 通过 → 返工 → 第 2 轮真写了文件。少了装配那道过滤器,第 2 次验收会读到一句关于当下
+   * 的假话,而进门那道这时候早就跑完了。
+   */
+  it('同一次调用内:第 2 轮改了文件 → 第 1 轮那条读数被清掉', async () => {
+    const accepts: string[] = []
+    let round = 0
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'accept') {
+        accepts.push(req.prompt)
+        round++
+        // 第 1 次判不通过 → 返工回执行;第 2 次通过。
+        return vtag(req) + `\n{"pass":${round > 1},"blocking":["再改改"],"comments":"c"}\n\`\`\``
+      }
+      return req.phase === 'execute'
+        ? `\`\`\`json\n{"execStatus":"第 ${round + 1} 轮"}\n\`\`\``
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.worktree = { branch: 'b', path: '/wt' }
+    /**
+     * 第 1 轮前后一样(写下读数),之后每一次取指纹都不同(再不写读数)。
+     * 尾巴要留够:替身的最后一格会被重复返回,而**重复 = 前后一样 = 又写一条读数**
+     * —— 踩过一次,最后那条断言因此变红,而它想查的东西早就通过了。
+     */
+    await stepExecute(n, withAccept(n, runAgent, ['s', 's', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'], true))
+
+    expect(accepts.length).toBeGreaterThan(1)
+    // 前提:第 1 轮确实写下过读数(否则这条探针测的是空气)。
+    expect(accepts[0] ?? '').toContain(NO_CHANGE_NOTE_LEAD)
+    expect(accepts[1] ?? '').not.toContain(NO_CHANGE_NOTE_LEAD)
+    expect(n.execStatus).not.toContain(NO_CHANGE_NOTE_LEAD)
+  })
+
+  /**
+   * **不走执行段那条路也要清。**
+   *
+   * `enterAtJudge`(手工跳过测试验证 / 验收后从判决段入场)把整个执行段跳掉,而装配
+   * execStatus 那一跳正是读数唯一的清理点。评审实测:这一轮**一次执行都没派**,
+   * 验收提示词里却印着「本轮执行没有改动本任务工作区的任何文件(已连续 3 轮如此)」。
+   */
+  it('从判决段入场(一次执行都不派)→ 上一趟那条读数也要清掉', async () => {
+    const accepts: string[] = []
+    const seen: string[] = []
+    const runAgent: RunAgentFn = async req => {
+      if (req.phase === 'execute') seen.push(req.prompt)
+      if (req.phase === 'accept') accepts.push(req.prompt)
+      return req.phase === 'execute'
+        ? '```json\n{"execStatus":"不该被调用"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    }
+    const { n } = await runIdle(true)
+    expect(n.execStatus).toContain(NO_CHANGE_NOTE_LEAD)
+
+    n.status = 'READY'
+    n.worktree = { branch: 'b', path: '/wt' }
+    n.skipPhase = 'verify'
+    await stepExecute(n, withAccept(n, runAgent, ['same'], true))
+
+    // 前提:这一轮真的一次执行都没派(否则清理是装配那一跳做的,测的是别的东西)。
+    expect(seen.length).toBe(0)
+    expect(accepts[0] ?? '').not.toContain(NO_CHANGE_NOTE_LEAD)
   })
 
   it('指纹变了 → 照常往下走', async () => {

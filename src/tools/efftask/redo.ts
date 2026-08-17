@@ -702,7 +702,13 @@ const PROPAGATED: ReadonlySet<string> = new Set(['子节点阻断', '上级任�
  * `--retry-blocked` 出于同样的理由拒绝复活它们。
  */
 const STRUCTURAL = ['依赖节点缺失', '子节点缺失', '依赖成环'] as const
-const isStructural = (reason: string): boolean => STRUCTURAL.some(k => reason.includes(k))
+/**
+ * **导出**是因为「新增任务」也要认这几种阻断:结构性阻断的节点 `reopenAncestor` 会拒绝重开
+ * (返回 false 且一个字段都不动),而新子节点挂到一个仍然 BLOCKED 的父/祖先下面,会被
+ * `propagateBlocked` 的 `parentBlocked` 当场扫成 BLOCKED —— 屏幕却说「已新增」。
+ * 抄一份判据的代价这个仓库反复付过,所以两边共用这一个。
+ */
+export const isStructural = (reason: string): boolean => STRUCTURAL.some(k => reason.includes(k))
 
 /**
  * 把一个**祖先**放回可推进的状态。
@@ -722,12 +728,34 @@ const isStructural = (reason: string): boolean => STRUCTURAL.some(k => reason.in
  *
  * 预算也要给回去:集成预算已经花完的祖先一被重开就会立刻再耗尽,那等于没重开。
  */
-function reopenAncestor(n: TaskNode, now: string): boolean {
+export function reopenAncestor(n: TaskNode, now: string): boolean {
   const wasBlocked = n.status === 'BLOCKED'
   if (wasBlocked && isStructural(n.blockedReason)) return false
   // 已经在可推进状态上就别动它 —— 尤其别把预算清了。
   if (!wasBlocked && n.status !== 'ACCEPTED') return false
   n.status = n.childIds.length > 0 ? 'WAITING_CHILDREN' : n.kind === 'executable' ? 'READY' : 'CREATED'
+  clearReopenMarks(n, now)
+  return true
+}
+
+/**
+ * 「这个节点要重新开工」这件事在字段上的全部含义 —— 状态**不在其中**。
+ *
+ * 抽出来是因为详情页的「新增任务」要用同一份清单,而它**不能**用 `reopenAncestor` 当
+ * drop-in:那个函数的状态是从 `n.childIds.length` / `n.kind` **现算**的(见上一行),
+ * 而它是给**祖先**写的 —— 祖先按构造必然有子节点,算出来恒为 `WAITING_CHILDREN`。
+ * anchor 却可能是一个**叶子**(一个跑完的 ACCEPTED 执行节点),而新子节点要等落盘成功
+ * 之后才挂上去。四席评审里三席各自打回同一条,质量席实跑出读数:
+ *
+ *   status = READY   advanceableKind = execute
+ *
+ * 也就是**带写工具的执行者会把一份已验收、已合进主干的产出再跑一遍**。三种调用顺序有
+ * 三种结局(先 reopen 再 push → READY 重跑;先改 kind 再 reopen → CREATED;先 reopen 再改
+ * kind → `READY + decompose`,`advanceableKind` 恒 null,节点**永远推不动**)。
+ *
+ * 所以状态由调用方**显式**决定,这里只做字段清理。清哪几个见下面每一行自己的理由。
+ */
+export function clearReopenMarks(n: TaskNode, now: string): void {
   n.blockedReason = ''
   n.interrupted = false
   // 同 reopenPropagatedNode:祖先重开了,「被点名取消过」的标记不该跨过这一次重开。
@@ -750,8 +778,17 @@ function reopenAncestor(n: TaskNode, now: string): boolean {
   n.startedAt = undefined
   // 和 startedAt 成对:重开 = 还没有结论。
   n.finishedAt = undefined
+  /**
+   * **一次性的手工标记不许跨过一次重开活下来。**
+   *
+   * `validateLoadedNodes` 的 `block()` 为同一件事清过它们,理由记在那里:一个带着
+   * `skipPhase='accept'` 被重开的节点会**跳过一关它自己都还没走到的判决**。
+   * `reopenPropagatedNode` 也清(它上面那段注释把这条规矩写全了),而这个函数是从
+   * `reopenAncestor` 里抽出来的第三条路 —— 三条路都该清,不能只有两条。
+   */
+  n.skipPhase = undefined
+  n.forcePass = undefined
   n.updatedAt = now
-  return true
 }
 
 /**
