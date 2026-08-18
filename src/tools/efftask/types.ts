@@ -289,6 +289,30 @@ export interface NodePlan {
    * 存它的理由是不静默截断:三份稿只产出一份,另外两份不能凭空消失。
    */
   alternatives?: { staff: string; solution: string }[]
+  /**
+   * **这个任务的产出是条件性的** —— 「检查/验证,发现问题才修」,没发现问题时正确结果
+   * 就是不改任何文件。零贡献闸(`mergeAndRelease`)和指纹闸(`stepExecute`)都认它。
+   *
+   * ## 为什么必须是「可选」而不是「无产出」
+   *
+   * 跑机 .30 run 001:12 个阻断里 10 个是「集成编译验证」类任务。它们**不是不产出**——
+   * 编译不过就要修,那是实打实的产出;编译过才没有。写成「预期无产出」会把「修编译错误」
+   * 这件真活一并取消掉。
+   *
+   * ## 缺席就是「产出必需」,而且不许补默认值
+   *
+   * `emptyPlan()` **不加这个键**:盘上每一个老节点给的都是 `undefined`,补一个 `false`
+   * 只会让「默认档」多一条不落盘的表示。所有读点一律写 `=== true`(授予)/ `!== true`
+   * (拦截),不许写取反或 truthy —— `yaml.parse` 把手写的 `outputOptional: yes` 解成
+   * **字符串** `"yes"`,truthy 判据下连 `no` 和 `"false"` 都会拿到豁免。
+   *
+   * ## 只由分析阶段决定
+   *
+   * 质疑修复那一关(`node.plan` 整份替换)既不能授予也不能撤销它 —— 那一席不是方案作者,
+   * 而且它的提示词里会原样出现方案 schema。撤销的后果实测过:上一版标了、这一版漏写,
+   * 误杀在第 2 轮原样回来。
+   */
+  outputOptional?: boolean
 }
 /** 落选稿单条的字符上限。远小于 MAX_FIELD_CHARS,理由见 NodePlan.alternatives。 */
 export const ALT_SOLUTION_CHARS = 1500

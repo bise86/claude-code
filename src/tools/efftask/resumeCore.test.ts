@@ -1453,6 +1453,51 @@ describe('上一版方案从盘上读回来时要校验', () => {
   })
 
   /**
+   * **「产出可选」是手改一次就能永久关掉零贡献闸的字段,读回来必须归一化。**
+   *
+   * plan 子字段这条路此前只归一化四个字符串键(`alternatives` 那条注释写着
+   * 「唯一不碰的 plan 字段…`alternatives: 'boom'` 能原样穿过去」)。而 `yaml.parse` 把
+   * 手写的 `outputOptional: yes` 解成**字符串** `"yes"` —— 闸那边虽然写了 `!== true`
+   * 顶得住,但两道都要:这一道让盘上的坏值当场消失,而不是每读一次赌一次。
+   *
+   * 清成**缺席**而不是 `false`:缺席就是默认档,补一个 false 只会让盘上多一行没有信息的
+   * frontmatter(见 `undefined-is-the-default-gear` 那笔账)。
+   */
+  it('盘上手写的「产出可选」非布尔值一律清掉,并报一条修复', () => {
+    for (const bad of ['yes', 'true', 1, 'no', null, {}]) {
+      const n = mk()
+      n.plan = { solution: '当前版', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+      ;(n.plan as unknown as { outputOptional: unknown }).outputOptional = bad
+      const { repairs } = validateLoadedNodes([n])
+      expect('outputOptional' in n.plan).toBe(false)
+      expect(repairs.join('\n')).toContain('产出可选')
+    }
+  })
+
+  /**
+   * **显式 `false` 是合法写法,清掉但不报修复。**
+   *
+   * 缺席和 `false` 表达同一件事(产出必需)。而 `repairs` 是 warn 级、会占掉
+   * `MAX_RECORDED_REPAIRS` 的名额、还会在恢复关口刷一屏 —— 对一个写对了的用户说
+   * 「你的盘坏了」,和这个仓库上一次「安全阀类别无法识别,已清除」是同一类假消息。
+   */
+  it('显式写 false 的,清成缺席但不报修复', () => {
+    const n = mk()
+    n.plan = { solution: '当前版', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: false }
+    const { repairs } = validateLoadedNodes([n])
+    expect('outputOptional' in n.plan).toBe(false)
+    expect(repairs.join('\n')).not.toContain('产出可选')
+  })
+
+  it('真布尔 true 原样留着 —— 否则声明过的任务每次恢复都被降回「产出必需」', () => {
+    const n = mk()
+    n.plan = { solution: '当前版', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: true }
+    const { repairs } = validateLoadedNodes([n])
+    expect(n.plan.outputOptional).toBe(true)
+    expect(repairs.join('\n')).not.toContain('产出可选')
+  })
+
+  /**
    * 轮次戳缺了/坏了 → 退化成「没有上一版」,而不是让渲染门去信一个坏数。
    * 没有它,`--retry-blocked` 和两种重做把 `planReview` 归零之后,上一次运行的方案会冒充
    * 本次的上一轮 —— 见 `TaskNode.prevPlanRound`。

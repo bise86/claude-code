@@ -191,6 +191,42 @@ describe('resumeSummarySections tells the user what recovery actually did', () =
     expect(text).toContain('无法读取')
     expect(s.filter(x => x.tone === 'warn').length).toBeGreaterThanOrEqual(4)
   })
+  /**
+   * **截断提示必须写在 heading 里** —— 放进 `lines` 的话它自己就是第 N+1 条,第一个被砍掉。
+   *
+   * 这几段此前都是裸 `slice(0, N)`,一条提示都没有(只有 `salvaged` 那一段做对了,
+   * 它的注释记着这笔学费)。heading 里带着总数所以数目没丢,丢的是「这份清单被截断了」
+   * 这个事实 —— 读的人会以为下面列的就是全部。一次 `--resume` 撞上十几条 repairs 就够。
+   */
+  it('清单被截断时,提示写在 heading 里而不是被截掉的那一行', () => {
+    const many = (n: number, p: string): string[] => Array.from({ length: n }, (_, i) => `${p}${i}`)
+    const s = resumeSummarySections({
+      ...base,
+      reseated: many(12, 'rs'), exhausted: many(12, 'ex'),
+      repairs: many(12, 'rp'), loadErrors: many(9, 'le'), salvaged: many(9, 'sv'),
+    })
+    /**
+     * 逐段钉,不写「凡是 heading 里的数大于 lines 长度就该有提示」那种通用断言 ——
+     * 「恢复自 run 003」也长这个样子,而它压根不是一份清单。
+     */
+    const secOf = (kw: string) => s.find(x => x.heading.includes(kw))
+    // `salvaged` 也在里面:它是这条规矩的**出处**,却曾经是唯一自己手写一份措辞的那一段。
+    for (const [kw, shown] of [['重新排队', 8], ['预算已耗尽', 8], ['校验修复', 8], ['节点文件有问题', 5], ['抢救回', 5]] as const) {
+      const sec = secOf(kw)
+      expect(sec?.lines.length).toBe(shown)
+      expect(sec?.heading).toContain(`只列前 ${shown} 条`)
+    }
+  })
+
+  /** 没被截断时不许印那句话 —— 一个恒真的后缀同样能骗过上面那条断言。 */
+  it('清单没被截断时,heading 里不出现截断提示', () => {
+    const s = resumeSummarySections({
+      ...base,
+      reseated: ['a'], exhausted: ['b'], repairs: ['c'], loadErrors: ['d'],
+    })
+    expect(s.map(x => x.heading).join(' | ')).not.toContain('只列前')
+  })
+
   it('announces guidance inherited from a previous resume', () => {
     const s = resumeSummarySections({ ...base, inheritedGuidance: '先从简' })
     expect(s.map(x => x.heading).join(' ')).toContain('沿用')

@@ -134,7 +134,13 @@ describe('触阀升级卡 (spec §9/§11)', () => {
     // 那句「静默超时(没有任何输出)」说同一件事。
     expect(lines('timeout')).toContain('静默超时')
     expect(lines('timeout')).not.toContain('执行超时')
-    expect(lines('infra')).toContain('角色调用连续失败')
+    /**
+     * **标题不许宣称「连续」。** `blockCategoryOf` 的兜底改成 `'infra'` 之后,这一档也收
+     * **执行环节的单次失败**(一次 502、一次上游按内容策略拒绝)—— 而执行环节
+     * `attempts === 1`,写「连续失败」是一句现成的假话,还会把人往「是不是重试了很多次」上带。
+     */
+    expect(lines('infra')).toContain('上游调用失败')
+    expect(lines('infra')).not.toContain('连续失败')
   })
 
   it('degrades to a placeholder rather than dropping the resume step', () => {

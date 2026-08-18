@@ -456,6 +456,30 @@ export function validateLoadedNodes(
       if (typeof n.plan[k] !== 'string') n.plan[k] = ''
     }
     /**
+     * **和 `capBlocked` 同一条纪律,而这一条更要紧:它关掉的是零贡献闸。**
+     *
+     * plan 子字段这条路此前只归一化上面那四个字符串键 —— 一个新加的布尔字段落进来就是
+     * 第二个零校验字段(`alternatives` 是第一个,那里的注释写着「`alternatives: 'boom'`
+     * 能原样穿过去」)。node.md 是手工可编辑的,而 `yaml.parse` 把 `outputOptional: yes`
+     * 解成**字符串** `"yes"`(实测,`on` / `no` 同理)—— 少了这一行,一次手改就能把节点
+     * 永久变成「产出可选」,而零贡献闸是拦「谎报完成」的唯一一道。
+     *
+     * 只有真的 `true` 算声明过;别的一律清成缺席(而不是写 `false`)—— 缺席就是默认档,
+     * 补一个 false 只会让盘上多一行没有信息的 frontmatter。
+     */
+    if (n.plan.outputOptional !== undefined && n.plan.outputOptional !== true) {
+      /**
+       * **显式写 `false` 是合法写法,不许报「你的盘坏了」。**
+       *
+       * 缺席和 `false` 表达的是同一件事(产出必需),而 `repairs` 是 warn 级、会占掉
+       * `MAX_RECORDED_REPAIRS` 的名额,还会在恢复关口刷一屏。只有**非布尔**才算盘坏了。
+       */
+      if (n.plan.outputOptional !== false) {
+        repairs.push(`节点 ${n.id} 的「产出可选」不是合法取值,已按默认档(产出必需)处理`)
+      }
+      delete n.plan.outputOptional
+    }
+    /**
      * 上一版方案。和 `n.plan` 对称的兜底,而**理由不是兼容,是这个文件的通例**:每一个
      * 模型产出的字段在这里都有一道校验,因为 node.md 是手工可编辑的。
      *

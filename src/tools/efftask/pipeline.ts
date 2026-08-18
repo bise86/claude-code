@@ -561,7 +561,23 @@ function blockCategoryOf(res: {
   // 限流和额度用尽都**必须**带分类:不带的话 `capBlocked` 是 false、`capCategory` 是
   // undefined —— 阻断卡给不出任何对症建议,而 `--retry-blocked` 也捞不回这个节点。
   if (res.rateLimited === true || res.quotaExhausted === true) return 'infra'
-  return undefined
+  /**
+   * **兜底也是 `'infra'` —— 一个没有分类的阻断是个死节点。**
+   *
+   * 上一版只认上面那四种,别的 API 错误(500 / 连接重置 / 模型名写错 / 鉴权失败 / 上游按
+   * 内容策略拒绝)一律返回 undefined → `capBlocked: false` → 三条恢复路**全部不认**:
+   * `--resume` 要 `interrupted`、`--retry-blocked` 要 `capBlocked === true`
+   * (reseat.ts:144)、`reopenPropagatedBlocks` 把它当真失败的种子。跑机 .30 run 001 上
+   * 有一个这样的节点(上游按 Usage Policy 拒绝),而只要它不动,root 的
+   * `childrenAllAccepted` 永远为假 —— **那趟 run 无论 resume 多少次都不可能 COMPLETED**。
+   * 上面那段注释早为 429 写过逐字同一条病,只是没扩到「其它 API 错误」。
+   *
+   * 兜底不会把「执行者写坏了 / 协议违规」误当基础设施:解析(`parseExecOutput` /
+   * `parsePlanOutput`)一律发生在 `ok:true` 之后,那些形状**永远走不到这里**。
+   * 这里的 `ok:false` 只有两个来源:`runPhaseOnce` 的 catch(模型调用抛了),
+   * 以及调用成功后发现 `signal.aborted` —— 后者由调用点单独挡掉,见那两处。
+   */
+  return 'infra'
 }
 
 /** 对症的那一句。省略 = 用 category 的默认那版。 */
@@ -1430,7 +1446,10 @@ export function planPrompt(
      */
     (node.depth + 1 <= caps.maxDepth
       ? `拆分时**先按文件/模块边界切**,尽量让不同子任务改到的文件不重叠;` +
-        `每个子任务的 solution 里要写清它预计会动哪些文件。\n`
+        `每个子任务的 solution 里要写清它预计会动哪些文件` +
+        // 「检查/验证类」被这一句逼着编一份文件清单,而验收席正是按 acceptance 判 ——
+        // 于是标了 outputOptional 也照样以「说好要改的文件没改」判不通过。
+        `(「检查/验证,有问题才修」这类预计可能一个文件都不动的,写明这一点,不要编一份文件清单)。\n`
       : '') +
     (isolated && node.depth + 1 <= caps.maxDepth && ctx.config.parallelism > 1
       ? `子任务在**各自独立的 git worktree** 里并行执行,最后逐个合并回集成分支。` +
@@ -1450,8 +1469,39 @@ export function planPrompt(
       : '') +
     `请输出一个 json 代码块:{ "kind":"decompose"|"executable", "solution", "keyPoints", "risks", "acceptance", ` +
     (feedback ? `"responses":["逐条回应上面的阻断意见"], ` : '') +
+    `"outputOptional":true(可省), ` +
     `"children":[{"title","deps":["兄弟标题"]}] }。` +
     `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。\n` +
+    /**
+     * **代码在强制一条从没被说出口的契约 —— 这就是根因。**
+     *
+     * `mergeAndRelease` 硬性要求「执行型节点必须有改动合入集成分支」,不满足就阻断而且
+     * 没有自动出口;而这里对 `kind` 的全部说明只有上面那一句「能直接完成就 executable」。
+     * 跑机 .30 run 001 的后果:方案席按用户要求造了一批「只验编译」的 executable 叶子
+     * (「集成编译验证」当然算「能直接完成」)。12 个阻断里 11 个是「方案没声明产出条件性」
+     * 这一类(10 个集成编译验证 + 1 个目标已被兄弟任务达成的),第 12 个死于上游拒绝。方案席没做错
+     * 任何事 —— 它没被告知这条契约。
+     *
+     * **字段必须出现在上面那行 json 骨架里。** 骨架就是那份会被照抄的示范;只活在散文里
+     * 等于漏填,而漏填就是默认档(这个仓库为「模型照抄我们给的示范」付过账)。
+     *
+     * **条件写进 `acceptance`,不是 `solution`。** 叶子验收(`acceptPrompt`)跑在
+     * `mergeAndRelease` **之前**,而它只渲染 `plan.acceptance` + `execStatus`,**根本不渲染
+     * solution** —— 写在 solution 里对第一个判它的人是隐形的,节点会先死在验收那一关。
+     *
+     * 最后那句不写成「不要滥用」:那是一份关闸说明书,受众还错了(这一席只为**自己这一个
+     * 节点**决定,「不要一律标 true」预设它在批量标注)。改成**标了要举证** —— 和
+     * `REBUTTAL_RULE` 同一形状,不靠自觉。
+     */
+    `executable 的含义是「本节点自己产出代码改动并合入集成分支」——跑完一个字节都没交付会被拦下,` +
+    `而且没有自动出口。\n` +
+    `如果这个任务的产出**本身是条件性的** —— 它做的是「检查/验证,发现问题才修」,没发现问题时` +
+    `正确结果就是不改任何文件 —— 就在 json 里加 "outputOptional":true。\n` +
+    // 「两种结局写进 acceptance」只在下面字段清单里说一次(那儿才是讲 acceptance 该写什么的
+    // 地方);这里只讲这个开关本身该不该按,以及按下去要付什么。
+    `标了 true 的任务,验收席会照你在 acceptance 里写的那条命令去核对;核不出「确实没问题」的` +
+    `证据一样判不通过。所以**只有你现在就写得出那条命令**时才标它。返工重出方案时,上一版标过的` +
+    `这一版要照样标 —— 漏写等于取消。\n` +
     // 四个字段此前只在 schema 里出现过名字,没说要什么 —— 于是模型只填 solution,其余
     // 三个返回空串,而解析层默认成 ''、关口照样渲染成「(空)」。空的验收点尤其糟:
     // 验收环节拿它当判据。
@@ -1459,7 +1509,11 @@ export function planPrompt(
     `- solution:怎么做,分几步,每步动到哪些文件/模块。不要复述目标。\n` +
     `- keyPoints:执行时最容易做错或做漏的地方。\n` +
     `- risks:这么做可能破坏什么、哪些地方不确定。\n` +
-    `- acceptance:**可检验**的完成标准(跑什么命令、看到什么结果、改了哪些文件),验收环节按它判。\n` +
+    `- acceptance:**可检验**的完成标准(跑什么命令、看到什么结果、改了哪些文件),验收环节按它判。` +
+    // 标了 outputOptional 却只写「改了哪些文件」的话,验收席会按一份编出来的文件清单
+    // 判「说好要改的没改」—— 豁免了合并那一关,却死在更早的验收那一关。
+    `产出是条件性的任务(outputOptional)把**两种结局**都写进来:发现问题时改哪些文件,` +
+    `没发现问题时凭哪条命令的什么输出判定「确实没问题」。\n` +
     /**
      * 逐条处置。**只在有上一轮意见时出现** —— 第 1 轮没有可回应的东西,凭空要一个
      * responses 只会换来一段编出来的话,而它随后会被当成真的答卷交给评审员核对。
@@ -1761,8 +1815,29 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
     '**本环节必须真的改文件。** 上面那些「只读 / 只探查下一层 / 少用工具」之类的限制,' +
     '约束的是你**读**代码的范围,**不解除你写代码的义务**,也不表示工具被禁用 —— ' +
     '你有写文件的工具,而且必须用它们把方案落到本任务工作区的文件里。\n' +
-    '如果你判断本任务确实不该改任何文件,**不要交一篇总结**:直接在 execStatus 里说清为什么,' +
-    '并给出 newChildren 或阻断理由 —— 一轮没有任何文件改动的执行不算完成,合并那一步会把它拦下来。\n' +
+    '如果你判断本任务确实不该改任何文件,**不要交一篇总结**:直接在 execStatus 里说清为什么、' +
+    '你跑了哪条命令看到什么输出,并给出 newChildren 或阻断理由。' +
+    /**
+     * **这句话对声明过条件性产出的任务是假的,不能再无条件说。**
+     *
+     * 执行者收到的只是 `JSON.stringify(node.plan)`,它看得见 acceptance 里那两种结局,
+     * 但看不见闸的判据。上一版无条件断言「合并那一步会把它拦下来」——对一个标了
+     * `outputOptional` 的节点逐字为假,而假话会把它推去做它不该做的事(硬塞改动)。
+     */
+    /**
+     * **判据挂字段,不挂提示词文本。**
+     *
+     * 上一版写的是「除非**验收点写明**…」,而真正的闸判的是 `node.plan.outputOptional === true`。
+     * 提示词只能请求方案席把两种结局写进 acceptance,强制不了 —— 方案席标了字段却漏写那句话时,
+     * 执行者读到的仍是一句对它为假的威胁,而那条路的出口正是「为了凑 diff 改代码」。
+     * 这个仓库为「写给 A 的话被塞进给 B 的提示词」付过账;这里是同一条账的另一面:
+     * **对 B 说的话,判据必须和真正管着 B 的那个开关同源。**
+     */
+    (node.plan.outputOptional === true
+      ? '本任务的产出是**条件性**的(方案已声明:检查/验证,发现问题才修)——' +
+        '没发现问题时不改任何文件就是正确结果,不会被拦下。' +
+        '但要在 execStatus 里写清你跑了哪条命令、看到什么输出,凭它判定「确实没问题」。\n'
+      : '一轮没有任何文件改动的执行不算完成,合并那一步会把它拦下来。\n') +
     // 跨分支依赖调度: what happened on the integration branch while this node worked. Told to
     // the executor rather than buried in execStatus, because it changes what it should DO —
     // re-read files that moved, or expect a conflict it will have to help resolve.
@@ -2248,6 +2323,21 @@ function acceptPrompt(
     `目标:${quote(ctxGoal(node))}\n` +
     // 目标在这一关是**无条件**渲染的(见上面那段),所以兜底不用再把它塞一遍。
     `验收点:${quote(node.plan.acceptance) || noAcceptanceFallback()}\n` +
+    /**
+     * **叶子验收跑在合并**之前**,所以「产出是条件性的」这条声明必须在这儿就到场。**
+     *
+     * 零贡献闸只是最后一关;一个「检查完没发现问题、所以没改文件」的执行自述,会先在
+     * 这一关被判不通过,根本走不到合并。而这一关只渲染验收点 + 执行状态 —— `solution`
+     * 一个字都不渲染,方案把条件写在那儿等于没写(这也是契约里要求写进 acceptance 的原因)。
+     *
+     * 措辞照 `undone` 那一行的规矩:**事实照给,判据不给**。要判的仍然是「验收点达没达成」,
+     * 只是把「零改动本身不构成不通过的理由」这条事实摆出来,免得它拿一条不存在的标准去判。
+     */
+    (node.plan.outputOptional === true
+      ? `(方案已声明:本任务的产出是条件性的 —— 检查/验证,发现问题才修。` +
+        `没发现问题时不改任何文件是正确结果,「没有改动」本身不构成不通过的理由;` +
+        `要判的是验收点里「确实没问题」那一条的证据够不够。)\n`
+      : '') +
     `执行状态:${quote(node.execStatus) || '(执行阶段没有报告任何产出,视为未完成)'}\n` +
     execResponsesSection(node) +
     roundStakes(round, maxRounds, '验收', spent) +
@@ -2373,8 +2463,64 @@ function integratePrompt(
     .filter(l => !l.trimStart().startsWith(ORCHESTRATOR_NOTE))
     .join('\n')
     .trim()
+  /**
+   * **标题不许无条件说「已合入集成分支」—— 那句话对一半的节点是主动的假话。**
+   *
+   * 实测的形状:一个执行型节点通过 `newChildren` 长出子任务 → `growTree` 把它改成
+   * `kind:'decompose'` → 于是 `mergeAndRelease` 那道零贡献闸(判据含 `kind === 'executable'`)
+   * **整个跳过** → 节点带着「该节点没有向集成分支贡献任何改动」进 `WAITING_CHILDREN`。
+   * 而上面那个 `realWork` 过滤器把这句注记删掉了(它防的是「把记账当代码」,对),
+   * 标题却照样写着「已合入集成分支」。实测输出:集成验收提示词里
+   * `已合入集成分支: true` / `没有向集成分支贡献: false` —— **而这一趟正是决定最终裁决的那一轮**。
+   *
+   * 判据用 `node.contributed`(结构化的事实,`mergeAndRelease` 写、`backtrack` 读),
+   * 不用「realWork 非空」—— 后者量的是执行者说了多少话,不是它交付了什么。
+   *
+   * 不新增并列字段:`degraded` / `manualAdd` / `undone` 需要字段是因为那些事实没有别处存,
+   * 而「零贡献」已经是 `TaskNode.contributed`。缺的从来只是渲染。
+   */
+  /**
+   * `contributed` 在这里已经是**问过 git** 的答案 —— `stepIntegrate` 进来时 await 过一次
+   * `hasDelivered`(它顺手回写)。读裸字段会把「抢救 ID 捞回、账本没记」的节点误判成零贡献。
+   *
+   * 第三档是**方案声明过条件性产出**的:对它说「不对应任何已合入的代码」属实,但
+   * 「按这一条算」就成了拿一条不存在的标准去判 —— 那正是这次改动要救的那一类节点。
+   */
   const ownWork = realWork.length > 0
-    ? `本节点自己的执行产出(已合入集成分支,同样需要你验收):\n${quote(realWork)}\n\n`
+    ? (node.contributed === true
+        ? `本节点自己的执行产出(已合入集成分支,同样需要你验收):\n`
+        : node.plan.outputOptional === true
+          ? `本节点自己的执行阶段自述(编排器实测:它没有向集成分支贡献任何改动,而方案已声明` +
+            `本节点的产出是条件性的 —— 检查/验证,发现问题才修。零改动可能就是正确结局,` +
+            `要判的是验收点里「确实没问题」那一条的证据够不够):\n`
+          : `本节点自己的执行阶段自述(⚠ 编排器实测:它**没有**向集成分支贡献任何改动 ——` +
+            `以下文字不对应任何已合入的代码,判它达没达成本节点目标时按这一条算):\n`) +
+      `${quote(realWork)}\n\n`
+    : ''
+  /**
+   * **被 `realWork` 滤掉的编排器注记要另起一段还给裁决席。**
+   *
+   * 过滤器本身是对的(记账不是代码),但它连**编排器实测读数**一起吃掉了 ——
+   * `NO_CHANGE_NOTE_LEAD` 那条「本轮执行没有改动本任务工作区的任何文件」写了一整段
+   * 给裁决席看的话(见 noChangeReading),而在本节点自己这一段它一次都没到过。
+   * 实测:同一句话挂在**子任务**上可见(`- 执行状态:` 不过滤),挂在自己身上不可见。
+   *
+   * 分开渲染而不是放回 `realWork`:归属不同 —— 上面那段是执行者说的,这一段是编排器量的。
+   */
+  const ownNotes = node.execStatus
+    .split('\n')
+    .filter(l => l.trimStart().startsWith(ORCHESTRATOR_NOTE))
+    .join('\n')
+    .trim()
+  /**
+   * **判据只看注记本身,不许挂在 `ownWork` 上。**
+   *
+   * 挂上去的后果实测复现:执行者自述为空、只剩编排器注记时(拆分型节点走完 `stepStart`,
+   * execStatus 恰好只有「本节点的方案没有验收点,已重拟一次仍未补上」+「质疑修复环节被
+   * 用户手工跳过」这两条),`ownWork` 是 `''` → 整段不渲染 —— 而那两句正是裁决席最该看到的。
+   */
+  const ownNotesBlock = ownNotes.length > 0
+    ? `本节点的编排器注记(实测读数与环节记账,不是执行者自述):\n${quote(ownNotes)}\n\n`
     : ''
   return (
     brief +
@@ -2383,7 +2529,20 @@ function integratePrompt(
       ? `请验收"本节点自己的执行产出 + 全部子任务的结果,合起来是否达成本节点目标"。\n`
       : `请验收"全部子任务的结果合起来是否达成本节点目标"。\n`) +
     `父目标:${quote(ctxGoal(node))}\n父验收点:${quote(node.plan.acceptance) || '(无)'}\n\n` +
+    /**
+     * **这条声明在集成验收这一关同样要到场。**
+     *
+     * 一个标了条件性产出的执行型节点长出子任务之后会变成 decompose,`stepIntegrate` 就是
+     * 它**唯一**的通过路径(零贡献闸的判据含 `kind === 'executable'`,那时已经拦不到它)。
+     * 而 review 席实测:改动之前这份提示词里「条件性」出现 0 次,却有新加的那句
+     * 「⚠ 它没有向集成分支贡献任何改动」—— 更严的话给了,该给的解释没给。
+     */
+    (node.plan.outputOptional === true
+      ? `(方案已声明:本节点自己的产出是条件性的 —— 检查/验证,发现问题才修。` +
+        `没发现问题时不改任何文件是正确结果,「本节点没有改动」本身不构成不通过的理由。)\n\n`
+      : '') +
     ownWork +
+    ownNotesBlock +
     `子任务结果:\n${children || '(无子任务)'}\n\n` +
     (feedback ? `上一轮集成验收阻断意见,请复核是否已解决:\n${quote(feedback)}\n\n` : '') +
     // 更早那几轮自己提过什么。「上一轮」回答「最新的账」,这一段回答「哪几条被我提过
@@ -2453,7 +2612,13 @@ async function verifySnapshot(node: TaskNode, ctx: PipelineCtx): Promise<string 
   try { return await ctx.worktrees.statusFingerprint(wt) } catch { return undefined }
 }
 
-/** 往 execStatus 追一条编排器注记(不是执行者写的,integratePrompt 会把它过滤掉)。 */
+/**
+ * 往 execStatus 追一条编排器注记。
+ *
+ * 前缀是给 `integratePrompt` 的 `realWork` 过滤器用的机器标记 —— 它把这些行从
+ * 「本节点自己的执行产出」里摘出去(记账不是代码),**再由 `ownNotesBlock` 另起一段
+ * 原样还给裁决席**。所以「会把它过滤掉」只对前半句成立:滤的是归属,不是可见性。
+ */
 function appendOrchestratorNote(cur: string, note: string): string {
   return `${cur}${cur ? '\n' : ''}${ORCHESTRATOR_NOTE}${note})`
 }
@@ -2838,6 +3003,30 @@ async function hasDelivered(node: TaskNode, ctx: Pick<PipelineCtx, 'worktrees'>)
 export const NO_CHANGE_NOTE_LEAD = '工作区读数(编排器实测,不是执行者自述,也不是判据)'
 
 /**
+ * 「方案声明过产出是条件性的,本轮确实没有可合并的改动」那一句。
+ *
+ * **逐字不许含 `NO_CONTRIBUTION_NOTE`。** 那句话是 `backtrack.outputMissing`
+ * (backtrack.ts:256)的判据,`b` 回溯按原文匹配把节点当「产出丢了」点名重跑。
+ * 闸放行了、注记还留着那半句的话,就是「一个写假话、一个照着假话动手」——
+ * 这个仓库为同一形状付过账(见 mergeAndRelease 里那段 14 个节点的记录)。
+ */
+export const OPTIONAL_OUTPUT_NOTE = '该节点的产出是条件性的(方案已声明「有问题才修」),本轮没有需要合并的改动'
+
+/** 此前交付过、这一轮无改可合。和上面两句同属「合并那一刻的单轮读数」。 */
+export const RE_DELIVER_NOTE = '该节点本轮没有新的改动可合并 —— 此前已向集成分支交付过'
+
+/**
+ * 合并那一刻可能写下的**三句**注记,逐字全行。
+ *
+ * **必须是同一份常量供「清」和「写」两处用。** 上一版清单和写侧各抄了一遍字面量,
+ * 任一处改一个字,逐字全行匹配就落空 —— 而后果不是报错,是「跨轮残留假话」静默复发
+ * (第 1 轮写下「没有贡献」、重试真交付了,那句话永远留在盘上,`backtrack.outputMissing`
+ * 照着它把已交付的节点点名重跑)。`noteOnNode` 的 `includes` 去重只挡同轮叠加,挡不住这个,
+ * 所以**不会有任何用例变红**。两处共用一份是这条判据唯一守得住的形状。
+ */
+const MERGE_NOTES = [RE_DELIVER_NOTE, OPTIONAL_OUTPUT_NOTE, `该节点${NO_CONTRIBUTION_NOTE}`] as const
+
+/**
  * 把「工作区指纹前后一模一样」这条读数拼成**一行**证据(`noteOnNode` 是按行存的)。
  *
  * ## 两支的已知事实**相反**,所以尾巴不许共用
@@ -2861,13 +3050,31 @@ export const NO_CHANGE_NOTE_LEAD = '工作区读数(编排器实测,不是执行
  * 指纹空不空是两件完全不同的事,必须分开说:空 = 目录里真的干干净净(一个文件都没写);
  * 非空 = 有改动,但和执行前逐字相同(上一轮的东西还在,这一轮没往上加)。
  */
-function noChangeReading(node: TaskNode, afterExec: string, why: string, delivered: boolean): string {
+function noChangeReading(node: TaskNode, afterExec: string, why: string, delivered: boolean | 'optional'): string {
   const where = node.worktree?.path ?? '(本节点没有工作区)'
   const fp = afterExec === ''
     ? '空 —— 目录里没有任何未提交改动'
     : `非空,但和执行前逐字相同(${afterExec.split('\n').slice(0, 3).join(' / ')})`
   const head = `${NO_CHANGE_NOTE_LEAD}:本轮执行没有改动本任务工作区的任何文件(${why});`
     + `工作区 ${where};执行后指纹:${fp}。`
+  /**
+   * **第三档:方案声明过产出是条件性的。不许拿 `delivered=false` 那一支顶。**
+   *
+   * 那一支的尾巴逐字写着「剩下的两种是『写到了工作区之外』和『确实没做』—— 都不算达成」。
+   * 而 acceptPrompt 里同时还有新加的那句「『没有改动』本身不构成不通过的理由」——
+   * **同一份提示词里 P 和 ¬P 并存**(review 席实测,两句原文同时出现在 accept 提示词里),
+   * 而 acceptPrompt 正是这条改动要救的那一关。
+   *
+   * 这一档的已知事实和另外两档都不同:编排器查明了「没有东西合进集成分支」**是真的**,
+   * 但方案已经声明这正是可能的正确结局。所以要给的是**第三种解释**,以及判它的落点。
+   */
+  if (delivered === 'optional') {
+    return head + '编排器另已查明:**本节点没有任何改动合入过集成分支** —— 而方案已声明本任务的产出是'
+      + '条件性的(检查/验证,发现问题才修)。所以零改动有三种可能:①检查完确实没问题(方案声明的正确结局);'
+      + '②写到了本任务工作区之外(那些内容不在任何任务分支上,永远进不了集成分支,不算达成);'
+      + '③它确实没检查。**要判的是验收点里「确实没问题」那一条的证据够不够**,不是「有没有改动」;'
+      + '并在意见里写清你去哪儿核实的。'
+  }
   return delivered
     ? head + '编排器另已查明:**本节点此前已有产出合入集成分支**,所以这一轮本来就无改可改 —— '
       + '「本轮找不到改动痕迹」在这一格**不构成不通过的理由**。要判的是那份既有产出达没达成验收点,'
@@ -3090,7 +3297,25 @@ async function runReviewFix(
       continue
     }
     const keptAlternatives = node.plan.alternatives
+    /**
+     * **`outputOptional` 只由分析阶段决定 —— 这一关既不能授予也不能撤销。**
+     *
+     * 两个方向都实测过风险:
+     *  · **撤销** —— `node.plan` 是整份替换,而这一席漏写就把上一版的声明删掉,
+     *    误杀在下一轮原样回来。`alternatives` 正是在这一行丢过,补丁就在下面三行。
+     *  · **授予** —— `reviewFixPrompt` 尾部直接挂着 `planPrompt`,新 schema 会原样出现在
+     *    这一席的提示词里;而它是**质疑修复席,不是方案作者**。更狠一格:`parsePlanOutput`
+     *    走的是宽松 pick(无 tag 也认),而这一关的提示词又要求「认可的部分照抄」——
+     *    实测过一次回复里先放新稿、后放照抄的旧稿,**被选中的是照抄那份**。
+     *    也就是说这个标志能从「被引用进提示词的旧方案文本」里解析回来。
+     *
+     * 所以无条件还原,不是「缺席才还原」。要改这个标志只有一条路:整任务重做,
+     * 让分析阶段重新判一次。
+     */
+    const keptOutputOptional = node.plan.outputOptional
     node.plan = relativisePlan(parsed.plan, ctx.worktrees?.gitRoot)
+    if (keptOutputOptional === true) node.plan.outputOptional = true
+    else delete node.plan.outputOptional
     // 这一关不问答卷(提示词里没有 responses 这个字段),解析层却收得无条件 —— 一个主动
     // 填它的模型能凭空造出一次不存在的返工。要什么就只收什么,和 stepStartCore 那一处同规矩。
     delete node.plan.responses
@@ -3713,8 +3938,15 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
         // 用户点名取消 ≠ 出了故障。走单独一条:不带 category(免得阻断卡去劝他提高超时),
         // 并保持 interrupted 好让 --resume 重新排队。
         if (f.cancelled === true) { await blockAsCancelled(node, ctx); return }
+        /**
+         * **整 run 中止那一支不给分类 —— 这是 `blockCategoryOf` 兜底成 `'infra'` 的护栏。**
+         *
+         * 它 `interrupted` 已经为真,`--resume` 本来就捞得回;再给一个 `capBlocked: true`
+         * 反而武装了 `--retry-blocked` 去**重置阶段预算**,那是花掉这趟 run 已经拒绝花的钱。
+         * 判据用的是本文件已经在读的同一个结构信号,不 grep provider 的错误文案。
+         */
         await blockWithReason(
-          node, f.reason, ctx, blockCategoryOf(f),
+          node, f.reason, ctx, ctx.signal.aborted ? undefined : blockCategoryOf(f),
           remedyOf(f),
         )
         return
@@ -4705,6 +4937,21 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
    * **合成功过 = 这个节点真的往集成分支上放过东西。** 记durable,理由见下一段。
    */
   if (res.merged) node.contributed = true
+  /**
+   * **合并那一刻的注记是「本轮读数」,先清后写。**
+   *
+   * 上一版是裸拼接、只增不减,坏在**跨轮残留**:第 1 轮零贡献写下「没有向集成分支贡献
+   * 任何改动」、阻断,重试这轮真交付了,`res.merged` 为真于是整块不进,**那句假话永远
+   * 留在盘上**,和 `contributed: true` 并存 —— 正是下面那段记的 14 个节点的病换了个入口
+   * 复发,而 `backtrack.outputMissing` 会照着它把已交付的节点点名重跑。
+   * (同轮叠加是另一件事,由 `noteOnNode` 的去重挡着,不是这一行挡的。)
+   *
+   * 判据和 `NO_CHANGE_NOTE_LEAD` 那条单轮读数完全一致:**清掉再写,合成功时一句都不写**。
+   * 清的是 `MERGE_NOTES` 三句的**逐字全行**(不是前缀匹配)—— 别的编排器注记记的是
+   * 「这个环节整个没跑过」那类只增不减的事实,一个宽一格的前缀会把它们一起抹掉。
+   */
+  const mergeNoteLines: string[] = MERGE_NOTES.map(b => `${ORCHESTRATOR_NOTE}${b})`)
+  node.execStatus = node.execStatus.split('\n').filter(l => !mergeNoteLines.includes(l)).join('\n')
   if (!res.merged) {
     /**
      * **注记要分两句写,按 `contributed` 分。**
@@ -4730,9 +4977,10 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
      * 一个照着假话把已交付的节点点名重跑,两个缺陷互相喂。算一次,两处共用。
      */
     const delivered = await hasDelivered(node, ctx)
-    node.execStatus = delivered
-      ? `${node.execStatus}\n(注:该节点本轮没有新的改动可合并 —— 此前已向集成分支交付过)`
-      : `${node.execStatus}\n(注:该节点${NO_CONTRIBUTION_NOTE})`
+    // 三句都取自 MERGE_NOTES —— 和上面那行「清」共用一份,漂字就一起漂,不会一半失效。
+    noteOnNode(node, delivered
+      ? MERGE_NOTES[0]
+      : node.plan.outputOptional === true ? MERGE_NOTES[1] : MERGE_NOTES[2])
     /**
      * **没合并提交,就不算完成。**(用户原话:「任务没有被合并提交,就不算完成吧」)
      *
@@ -4741,7 +4989,7 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
      * 一个字节都没多。判成完成之后,父节点的集成验收拿着「子任务都通过了」去裁决,
      * 而它要验的东西根本不在那儿。
      *
-     * ## 判据必须窄,三种「零贡献」里只有一种是错的
+     * ## 判据必须窄,四种「零贡献」里只有一种是错的
      *
      *  - **拆分型节点**:活在子任务身上,它自己本来就不贡献 —— 而这一路根本到不了,
      *    `releasePlanBase` 把它的 worktree 引用交回之后,上面那句
@@ -4770,7 +5018,15 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
      * 把**那一句**换成裸读账本,「跳过判决段入场 + 账本空着」那条用例当场变红。
      * 写成 `delivered` 而不是再读一次字段,是为了让「一次判据、两处共用」在代码上看得见。
      */
-    if (node.kind === 'executable' && !delivered) {
+    /**
+     * **`!== true`,不许写 `!node.plan.outputOptional`。**
+     *
+     * node.md 是手工可编辑的,而 `yaml.parse` 把 `outputOptional: yes` 解成**字符串**
+     * `"yes"`(实测,`no` / `on` 同理)。truthy 取反那一版下,盘上一个手写的 `no` 都能
+     * 拿到豁免 —— 这一档关掉的正是「谎报完成」的唯一硬闸。
+     * `validateLoadedNodes` 那一行归一化是纵深,不是替代:两道都要。
+     */
+    if (node.kind === 'executable' && !delivered && node.plan.outputOptional !== true) {
       /**
        * **这一档和验收无关,措辞里一个字都不许提它。**
        *
@@ -5165,8 +5421,9 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
       // 同上。而且这一处**尤其**要分开:执行环节被取消时工作区里可能已经有改动了,
       // 上面那句「以上为中断时已报告的产出」正是给用户看的,不该被一句「调用失败」盖过去。
       if (f.cancelled === true) { await blockAsCancelled(node, ctx); return }
+      // 中止那一支不给分类,理由同分析环节那一处(blockCategoryOf 兜底的护栏)。
       await blockWithReason(
-        node, f.reason, ctx, blockCategoryOf(f),
+        node, f.reason, ctx, ctx.signal.aborted ? undefined : blockCategoryOf(f),
         remedyOf(f),
       )
       return
@@ -5205,12 +5462,14 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
      * 那个节点两样正好相反(话很多、活没干)。判据是工作区指纹,不是执行者的自述 ——
      * 自述正是这一格里不可信的那一样。
      *
-     * 四条边界:
+     * 五条边界:
      *  · 两次指纹**都拿得到**才判(没有池子 / 没有本节点工作区时它是 undefined,那时这道
      *    闸本来就不成立,静默放行比假装判过好);
      *  · 长子任务(`newChildren`)那一路照样落到这里 —— 一个只长树、不写码的回合同样
      *    不算干活,理由和「报告为空」那道闸的注释逐字相同;
      *  · `contributed === true` 时**根本不判** —— 那是幂等重跑,见下面那一段;
+     *  · `plan.outputOptional === true` 时**也不判** —— 方案自己声明过「有问题才修」,
+     *    零改动是它的正确结局;但读数照写(豁免只免返工,不免举证),见那一支;
      *  · 走**返工**而不是阻断:第一次很可能就是被提示词里那串限制吓住了,而 feedback 里
      *    那句话正是解药。用尽迭代之后也**不阻断**,把读数当证据递给验收圆桌,见下面那一段。
      */
@@ -5238,6 +5497,22 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
      */
     if (sameFingerprint !== undefined && await hasDelivered(node, ctx)) {
       noChangeNote = noChangeReading(node, sameFingerprint, '幂等重跑', true)
+    } else if (sameFingerprint !== undefined && node.plan.outputOptional === true) {
+      /**
+       * **方案自己声明过「有问题才修」—— 这一轮零改动是正确结果,不返工。**
+       *
+       * 跑机 .30 run 001 实测:10 个「集成编译验证」类节点各被这道闸推着重跑 3 轮,
+       * 而它们第 1 轮就已经在逐条核验收点、答对了。那句返工话术(「这一轮请真正把方案
+       * 落到文件里」)更坏的一面是**它会逼执行者为了凑 diff 去改代码** —— 盘上有现场:
+       * 一个只该验编译的节点在第 2 轮写下「本轮真正改动了文件(上一轮零改动的问题已纠正)」,
+       * 改了 162 增 / 109 删,而这趟 run 的验收是关着的,没人看过那些改动。
+       *
+       * ⚠ **豁免只免返工,不免举证。** 这条读数必须照写 —— `noChangeReading` 的
+       * `delivered=false` 那一支是唯一告诉裁决席「去集成分支上找,找不到就不算达成」的
+       * 东西(见那个函数的注释:事实照给,判据不给)。跟着豁免一起删掉的话,验收席手上
+       * 就什么都没有了,而这一格恰恰是它该看的。
+       */
+      noChangeNote = noChangeReading(node, sameFingerprint, '方案已声明本任务的产出是条件性的', 'optional')
     } else if (sameFingerprint !== undefined) {
       // 用尽的那一轮**不再 ++**:`>= max` 是「这是最后一轮」的判据,而这一轮不返工。
       // 多加的那一下会让降级记录写出 `round: 4`(上限是 3)—— 一个不可能的数。
@@ -5261,7 +5536,15 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
           + '而你的 execStatus 描述了工作 —— 这两件事对不上。' + String.fromCharCode(10)
           + '再说一次:提示词里的「只读 / 只探查下一层 / 少用工具」约束的是你**读**代码的范围,'
           + '**不解除你写代码的义务**,工具也没有被禁用。这一轮请真正把方案落到文件里。' + String.fromCharCode(10)
-          + '如果确实不该改任何文件,就在 execStatus 里说清原因并给出 newChildren 或阻断理由,不要交总结。'
+          /**
+           * **必须堵掉最省事的那条出路。** 这道闸判的是工作区指纹,而**改一行注释就能过**。
+           * 上一版逐字告诉执行者「指纹一模一样 = 你没干活」,却从没告诉它不许凑改动 ——
+           * 盘上那个「本轮真正改动了文件(上一轮零改动的问题已纠正)」的现场就在上面那一支的
+           * 注释里。指出病症却不封死伪造那条路,等于教它作弊。
+           */
+          + '**不要为了让指纹变化而制造改动** —— 加空行、改注释、动无关文件都不算产出。' + String.fromCharCode(10)
+          + '如果确实不该改任何文件,就在 execStatus 里说清原因、写出你跑了哪条命令看到什么输出,'
+          + '并给出 newChildren 或阻断理由,不要交总结。'
         if (!(await commit(node, 'REWORK', ctx))) return
         continue
       }
@@ -5544,6 +5827,19 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     )
     return
   }
+  /**
+   * **问一次 git,再去拼提示词。**
+   *
+   * `integratePrompt` 那个 ⚠ 标题按 `node.contributed` 断言「它**没有**向集成分支贡献任何
+   * 改动」,而账本是**只增不减的记账**,不是事实本身:抢救 ref 捞回、账本没记的节点在盘上
+   * 就是 `contributed` 缺席。`mergeAndRelease` 专门为这一格从「查账本」改成了「问 git」
+   * (`hasDelivered`,那段注释记着 22 个节点),而这里是**决定最终裁决的那一轮** ——
+   * 拿账本去下一句主动断言,正是那次改动要根除的形状。
+   *
+   * 不改 `integratePrompt` 的签名:`hasDelivered` 查到真值时会把 `contributed` 回写,
+   * 所以在这儿 await 一次之后,下面那个同步函数读到的字段已经是问过 git 的答案。
+   */
+  await hasDelivered(node, ctx)
   const caps = ctx.config.caps
   /**
    * The blockers this node already earned, recovered from disk — the third consumer of

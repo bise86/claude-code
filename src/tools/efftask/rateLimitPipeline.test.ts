@@ -91,9 +91,20 @@ describe('分析环节吃到 429', () => {
     }
     const n = root()
     await stepStart(n, ctxFor([n], runAgent))
+    // 这条用例守的是**不重试** —— 那才是「这条路不通」和「慢一点」的区别。
     expect(calls).toBe(1)
     expect(n.status).toBe('BLOCKED')
-    expect(n.capCategory).toBeUndefined()
+    /**
+     * **带分类,而且必须带。** 上一版这里断言 `undefined`,那不是判据、是当时的缺陷:
+     * 没有分类 → `capBlocked: false` → `--resume` 不认(非 interrupted)、
+     * `--retry-blocked` 不认(reseat 要 `capBlocked === true`)、`reopenPropagatedBlocks`
+     * 把它当真失败的种子。跑机 .30 run 001 上有一个这样的节点(上游按内容策略拒绝),
+     * 只要它不动,root 的 `childrenAllAccepted` 永远为假 —— 那趟 run 无论 resume 多少次
+     * 都不可能 COMPLETED。
+     *
+     * 分类不等于会重试:重试由 `RATE_LIMIT_ATTEMPTS` 那条路决定,上面 `calls === 1` 钉着。
+     */
+    expect(n.capCategory).toBe('infra')
   })
 })
 

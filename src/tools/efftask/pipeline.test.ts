@@ -322,6 +322,124 @@ describe('pipeline', () => {
     expect(prompts[0]).toContain('父验收点X') // …against the parent's acceptance criteria
   })
 
+  /**
+   * **零贡献的节点自己那一段,标题不许说「已合入集成分支」。**
+   *
+   * 触发路径:执行型节点长出子任务 → `growTree` 把它改成 `kind:'decompose'` → 于是
+   * `mergeAndRelease` 那道零贡献闸(判据含 `kind === 'executable'`)**整个跳过** →
+   * 节点带着「没有向集成分支贡献任何改动」进 WAITING_CHILDREN，之后只能走 stepIntegrate。
+   * 而 `realWork` 过滤器把那句注记删掉了(它防的是「把记账当代码」)，标题却照样写着
+   * 「已合入集成分支」—— **在决定最终裁决的那一轮递上去一句主动的假话**。
+   */
+  it('stepIntegrate: 本节点零贡献时,标题说实话,而且被滤掉的编排器读数要另起一段还给裁决席', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.execStatus = '我实现了 api.ts\n(注:该节点没有向集成分支贡献任何改动)'
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+
+    const p = prompts[0] ?? ''
+    expect(p).not.toContain('本节点自己的执行产出(已合入集成分支')
+    expect(p).toContain('编排器实测')
+    expect(p).toContain('不对应任何已合入的代码')
+    // 执行者的自述照给 —— 改的是定性,不是把证据一起删掉。
+    expect(p).toContain('我实现了 api.ts')
+    // 被过滤器吃掉的编排器读数,另起一段还回来(归属分开:一段是它说的,一段是编排器量的)。
+    expect(p).toContain('本节点的编排器注记')
+    expect(p).toContain('该节点没有向集成分支贡献任何改动')
+  })
+
+  /**
+   * **产出可选的声明在集成验收这一关同样要到场。**
+   *
+   * 一个标了条件性产出的执行型节点长出子任务后会变成 decompose,`stepIntegrate` 就是它
+   * **唯一**的通过路径(零贡献闸判据含 `kind === 'executable'`,那时已经拦不到它)。
+   * review 席实测:补这一段之前提示词里「条件性」出现 0 次,却有那句更严的
+   * 「⚠ 它没有向集成分支贡献任何改动…按这一条算」—— 更严的话给了,该给的解释没给。
+   */
+  it('stepIntegrate: 标了产出可选的节点,提示词里要有那条声明,标题也不用「按这一条算」', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.execStatus = '我检查了 5 个文件的编译,没发现问题'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: true }
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+
+    const p = prompts[0] ?? ''
+    expect(p).toContain('本节点自己的产出是条件性的')
+    expect(p).toContain('本节点没有改动」本身不构成不通过的理由')
+    expect(p).not.toContain('按这一条算')
+  })
+
+  /**
+   * **编排器注记不许挂在「执行者自述非空」上。**
+   *
+   * 实测复现:拆分型节点走完 `stepStart` 之后 execStatus 恰好只剩两条编排器注记
+   * (「方案没有验收点,已重拟一次仍未补上」+「质疑修复环节被手工跳过」),`realWork` 为空 →
+   * 上一版整段不渲染 —— 而那两句正是裁决席最该看到的。
+   */
+  it('stepIntegrate: 执行者自述为空、只剩编排器注记时,注记照样递给裁决席', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.execStatus = '(注:质疑修复环节被用户手工跳过)\n(注:本节点的方案没有验收点,已重拟一次仍未补上)'
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+
+    const p = prompts[0] ?? ''
+    expect(p).toContain('本节点的编排器注记')
+    expect(p).toContain('方案没有验收点')
+    expect(p).toContain('质疑修复环节被用户手工跳过')
+  })
+
+  /**
+   * **⚠ 那句主动断言必须问过 git,不能裸读账本。**
+   *
+   * `contributed` 是只增不减的**记账**,不是事实:抢救 ref 捞回、账本没记的节点在盘上就是
+   * 缺席。`mergeAndRelease` 专门为这一格从「查账本」改成了「问 git」,而集成验收是决定
+   * 最终裁决的那一轮 —— 在这儿拿账本下断言,正是那次改动要根除的形状。
+   */
+  it('stepIntegrate: 账本空着但 git 说交付过 → 标题仍是「已合入」,而且账本被回填', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.execStatus = '我实现了 api.ts'
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    const ctx = {
+      ...ctxFor([n, child], runAgent),
+      worktrees: {
+        deliveredToIntegration: async () => true,
+        withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      } as never,
+    }
+    expect(n.contributed).toBeUndefined()
+    await stepIntegrate(n, ctx)
+
+    expect(prompts[0] ?? '').toContain('本节点自己的执行产出(已合入集成分支')
+    // 问出来的真值要记回账本 —— 下一趟不用再问 git。
+    expect(n.contributed).toBe(true)
+  })
+
+  /** 交付过的那一支照旧 —— 少了这一条,上面那句可以靠「两支都改口」蒙混过关。 */
+  it('stepIntegrate: 本节点确实交付过时,标题仍然是「已合入集成分支」', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    n.execStatus = '我实现了 api.ts'
+    n.contributed = true
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const prompts: string[] = []
+    const runAgent: RunAgentFn = async req => { prompts.push(req.prompt); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```' }
+    await stepIntegrate(n, ctxFor([n, child], runAgent))
+
+    expect(prompts[0] ?? '').toContain('本节点自己的执行产出(已合入集成分支')
+  })
+
   it('stepIntegrate: integration acceptance fails until iterations exhausted => 降级放行', async () => {
     const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
     const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
@@ -2191,12 +2309,27 @@ describe('触阀升级 (spec §9/§11):每个阀真的会喊人', () => {
     expect(fired[0].reason).toContain('阶段调用超时')
   })
 
-  it('普通的模型调用失败不是超时,给的建议也不一样', async () => {
+  /**
+   * **普通的模型调用失败报 `infra`,不是超时,更不是「没有分类」。**
+   *
+   * 上一版这里断言 `fired` 为空 —— 那不是判据,是当时的缺陷:`blockCategoryOf` 只认
+   * 超时/限流/额度/超长,别的 API 错误(502、连接重置、模型名写错、鉴权失败、上游按内容
+   * 策略拒绝)一律无分类 → `capBlocked: false` → 阻断卡不喊人,而且 `--resume` 和
+   * `--retry-blocked` **双双捞不回这个节点**。紧挨着的下一条用例(`角色连续调用失败 → infra`)
+   * 写的就是这个仓库的本意:真的会停的关口,故障要报成 infra。
+   *
+   * 「不是超时」那一半仍然是判据 —— 建议文案按分类分岔,报成 timeout 会去劝用户调
+   * `nodeTimeoutMs`,而上游根本不是慢。
+   */
+  it('普通的模型调用失败报 infra,不报 timeout', async () => {
     const n = root()
     n.kind = 'executable'
     const { ctx, fired } = ctxWithBlocks([n], async () => { throw new Error('502 bad gateway') })
     await stepExecute(n, ctx)
-    expect(fired).toEqual([])
+    expect(fired.map(f => f.category)).toEqual(['infra'])
+    expect(fired[0].reason).toContain('502 bad gateway')
+    // 带分类 = `--retry-blocked` 捞得回来。这是这条改动全部的意义。
+    expect(n.capBlocked).toBe(true)
   })
 
   /**
@@ -7482,6 +7615,189 @@ describe('一轮没改任何文件的执行', () => {
     const { seen, n } = await runIdle(false, { contributed: true })
     expect(seen.length).toBe(1)
     expect(n.status).not.toBe('BLOCKED')
+  })
+
+  /**
+   * **合并那一刻的注记是单轮读数,不是只增不减的事实 —— 先清后写。**
+   *
+   * 最坏的形状不是「同一句叠 N 遍」,是**跨轮残留**:第 1 轮零贡献写下这句、阻断,
+   * 重试这轮真交付了 → `res.merged` 为真 → 上一版整块不进 → **那句假话永远留在盘上**,
+   * 和 `contributed: true` 并存。而 `backtrack.outputMissing` 按原文匹配它,会把一个
+   * 已交付的节点当「产出丢了」点名重跑 —— 和 mergeAndRelease 里记的那 14 个节点同形。
+   */
+  it('合并成功那一轮,盘上不许再留着上一轮那句「没有向集成分支贡献」', async () => {
+    const runAgent: RunAgentFn = async req =>
+      req.phase === 'execute'
+        ? '```json\n{"execStatus":"这一轮真的改了文件"}\n```'
+        : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
+    const n = root()
+    n.kind = 'executable'
+    n.status = 'READY'
+    n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
+    n.worktree = { branch: 'b', path: '/wt' }
+    n.execStatus = '上一轮的自述\n(注:该节点没有向集成分支贡献任何改动)'
+    // 指纹前后不同 → 真池子在这一格答 merged:true。
+    await stepExecute(n, withAccept(n, runAgent, ['before', 'after'], false))
+
+    expect(n.contributed).toBe(true)
+    expect(n.execStatus).not.toContain('没有向集成分支贡献任何改动')
+  })
+
+  /**
+   * **三句注记之间切换时,旧的那句必须消失。**
+   *
+   * 上一版这条断言的是「同一句至多一条」—— 那是**恒真**的:`noteOnNode` 自带整行去重,
+   * 把先清那一行整个删掉它照样绿。真正只有「先清」守得住的是**换了一句**的那一格:
+   * 盘上带着「没有向集成分支贡献任何改动」的节点,这一轮方案声明了条件性产出,
+   * 旧那句必须让位 —— 否则 `backtrack.outputMissing` 照着它把节点当丢件点名重跑。
+   */
+  it('注记换了一句时,旧的那句要被清掉', async () => {
+    const { n } = await runIdle(false, {
+      execStatus: '旧自述\n(注:该节点没有向集成分支贡献任何改动)',
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: true },
+    })
+
+    expect(n.execStatus).not.toContain('没有向集成分支贡献任何改动')
+    expect(n.execStatus).toContain('产出是条件性的')
+  })
+
+  /**
+   * **产出可选:方案自己声明过「检查/验证,发现问题才修」的任务,零产出是正确结果。**
+   *
+   * 跑机 .30 run 001 实测:12 个阻断里 10 个是「集成编译验证」类任务 —— 编译不过就修
+   * (有产出)、编译过就没有(零产出)。闸按字节判,于是**验证通过判失败、验证发现问题
+   * 并修好才判成功**,判据和任务语义正好相反。16 个通过的编译验证节点 `contributed`
+   * 全是 true,10 个被拦的全是空,零例外。
+   *
+   * ⚠ 只断言 `status !== 'BLOCKED'` 是**假绿**:指纹闸返工三轮之后节点照样能到 ACCEPTED,
+   * 闸一点没被绕开,而每个检查类节点白烧三次最贵的执行调用。杀得动变异的那一维是
+   * **派了几次执行**和 `iteration.acceptance`。
+   */
+  it('方案标了产出可选 + 零产出 → 不阻断,而且一轮返工都不派', async () => {
+    const { n, seen, accepts } = await runIdle(false, {
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: true },
+    })
+
+    expect(n.status).not.toBe('BLOCKED')
+    expect(n.capCategory).toBeUndefined()
+    expect(seen.length).toBe(1)
+    expect(n.iteration.acceptance).toBe(0)
+    expect(seen.join('\n')).not.toContain('一个文件都没有改')
+    /**
+     * **豁免只免返工,不免举证。** 那条工作区读数是唯一告诉裁决席「去集成分支上找、
+     * 找不到就不算达成」的东西(见 noChangeReading 的 delivered=false 那一支)。
+     * 跟着豁免一起删掉的话,验收席手上就什么都没有了。
+     */
+    expect(accepts[0] ?? '').toContain(NO_CHANGE_NOTE_LEAD)
+    /**
+     * **不许拿 `delivered=false` 那一支顶。** 它的尾巴逐字写着「剩下的两种是…都不算达成」,
+     * 而同一份提示词里还有「『没有改动』本身不构成不通过的理由」—— P 和 ¬P 并存,
+     * 而这一关正是这条改动要救的那一关。第三档给的是第三种解释和判它的落点。
+     */
+    expect(accepts[0] ?? '').toContain('三种可能')
+    expect(accepts[0] ?? '').not.toContain('剩下的两种是')
+  })
+
+  /**
+   * **两道闸都必须写 `=== true` / `!== true`,不许写 truthy —— 这一条钉的就是那个写法。**
+   *
+   * 变异实测:把闸改成 `!node.plan.outputOptional`、把指纹闸改成 `!== undefined`,
+   * 上面那几条用例**全都照样绿** —— 因为内存里这个字段只可能是 `true` 或缺席,两种写法
+   * 在那两个取值上恒等。差别只在盘上出现 `outputOptional: yes` 时才显形:`yaml.parse`
+   * 把它解成**字符串** `"yes"`,truthy 那一版下连手写的 `no` / `"false"` 都能拿到豁免。
+   *
+   * `validateLoadedNodes` 会在读盘时把这种值清掉,所以这是**纵深的第二道**。给它一条探针,
+   * 否则「两道都要」这句话在代码注释里写着、却没有任何东西在守它。
+   */
+  it('闸上的判据是恒等比较:非 true 的真值不许拿到豁免', async () => {
+    const junk = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: 'yes' }
+    const { n, seen } = await runIdle(false, { plan: junk as never })
+
+    // 合并闸:`!node.plan.outputOptional` 那一版下 `!'yes'` 为假 → 不拦 → 这一条红。
+    expect(n.status).toBe('BLOCKED')
+    expect(n.capCategory).toBe('no-output')
+    // 指纹闸:`!== undefined` 那一版下 `'yes'` 会拿到豁免 → 只跑一轮 → 这一条红。
+    expect(seen.length).toBe(DEFAULT_CAPS.maxIterations)
+  })
+
+  /**
+   * **叶子验收跑在合并之前,所以这条声明必须在那一关就到场。**
+   *
+   * 零贡献闸只是最后一关。一个「检查完没发现问题、所以没改文件」的自述,会先在验收
+   * 那一关被判不通过,根本走不到合并 —— 而验收提示词只渲染验收点 + 执行状态。
+   * (变异实测:把这一段换成恒 false,在补这条探针之前全套用例一条都不红。)
+   */
+  it('产出可选时,叶子验收提示词里要有那条声明', async () => {
+    const { accepts } = await runIdle(false, {
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: true },
+    })
+
+    const p = accepts[0] ?? ''
+    expect(p).toContain('本任务的产出是条件性的')
+    expect(p).toContain('不构成不通过的理由')
+  })
+
+  /**
+   * **执行提示词里那句威胁,判据必须和真正管着执行者的那个开关同源。**
+   *
+   * 上一版写的是「除非**验收点写明**…」—— 而真正的闸判的是 `plan.outputOptional === true`。
+   * 提示词只能请求方案席把两种结局写进 acceptance,强制不了;方案席标了字段却漏写那句话时,
+   * 执行者读到的仍是一句对它为假的威胁,而那条路的出口正是「为了凑 diff 改代码」。
+   */
+  it('执行提示词:产出可选时不威胁「会把它拦下来」,缺省档照旧威胁', async () => {
+    const opt = await runIdle(false, {
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: true },
+    })
+    expect(opt.seen[0] ?? '').toContain('本任务的产出是**条件性**的')
+    expect(opt.seen[0] ?? '').not.toContain('合并那一步会把它拦下来')
+
+    // 反向锚:少了它,「两支都删掉」照样绿。
+    const bare = await runIdle(false, {
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+    })
+    expect(bare.seen[0] ?? '').toContain('合并那一步会把它拦下来')
+    expect(bare.seen[0] ?? '').not.toContain('本任务的产出是**条件性**的')
+  })
+
+  /**
+   * **缺省档必须是「产出必需」,而且判据要从「键根本不存在」出发。**
+   *
+   * 这个仓库为「undefined 就是默认档」付过账:默认档不落盘,盘上每一个老节点给的都是
+   * `undefined`。把实现写成 `outputOptional !== false` 时,`undefined` 会落进「可选」那一侧
+   * —— 而在内存里显式写 `outputOptional: false` 再跑闸的探针**照样全绿**。
+   * 所以这里先钉住「这个键不在 plan 里」,再钉行为。
+   */
+  it('方案没写产出可选 → 缺省是「产出必需」,照旧阻断,而且正好 maxIterations 轮', async () => {
+    const { n, seen } = await runIdle(false, {
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+    })
+
+    // 「这个键根本不存在」是这条用例唯一守得住、别处守不住的那一维。
+    expect('outputOptional' in n.plan).toBe(false)
+    expect(n.status).toBe('BLOCKED')
+    expect(n.capCategory).toBe('no-output')
+    // 缺省档的返工次数也要逐字不变 —— 否则「行为完全没变」这句话只覆盖了终态。
+    expect(seen.length).toBe(DEFAULT_CAPS.maxIterations)
+  })
+
+  /**
+   * **豁免掉的节点不许留下那句「没有向集成分支贡献任何改动」。**
+   *
+   * 那句话是 `backtrack.outputMissing` 的判据(backtrack.ts:256 按原文匹配),`b` 回溯据此
+   * 把节点当「产出丢了」点名重跑。闸放行了、注记还在,就是「一个写假话、一个照着假话
+   * 动手」—— 和 pipeline.ts 4711-4720 记的那 14 个节点逐字同形。判据留在**写侧**。
+   */
+  it('产出可选且零产出 → 不留「没有向集成分支贡献」那句话', async () => {
+    const { n } = await runIdle(false, {
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a', outputOptional: true },
+    })
+
+    expect(n.execStatus).not.toContain('没有向集成分支贡献任何改动')
+    // 而缺省档那一支照样要留着它 —— 少了这一条,上面那句可以靠「两支都不写」蒙混过关。
+    const bare = await runIdle(false, {
+      plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' },
+    })
+    expect(bare.n.execStatus).toContain('没有向集成分支贡献任何改动')
   })
 
   /**

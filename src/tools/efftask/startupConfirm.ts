@@ -935,29 +935,52 @@ export function resumeSummarySections(s: ResumeSummary): SummarySection[] {
     lines: [`已验收 ${s.counts.accepted} · 已阻断 ${s.counts.blocked} · 待处理 ${s.counts.pending} · 共 ${s.counts.total}`],
     tone: 'info',
   })
+  /**
+   * **截断提示必须写在 heading 里,不能写进被截断的 lines。**
+   *
+   * 下面五段此前都是裸 `slice(0, N)`、一个字的提示都没有 —— 只有 `salvaged` 那一段做对了
+   * (它的注释记着这笔学费)。缓解情节是这几段的 heading 都带着总数,所以**数目**没丢;
+   * 丢的是「这份清单被截断了」这个事实,读的人会以为下面列的就是全部。
+   *
+   * 一次 `--resume` 就能把它撑爆:存量那一批不合法的分类/标记会一次产生十几条 `repairs`,
+   * 把真正要紧的那几条挤到第 9 条之后,静默消失。
+   */
+  const cut = (n: number, shown: number): string => n > shown ? `,以下只列前 ${shown} 条` : ''
   if (s.reseated.length > 0) {
-    out.push({ heading: `重新排队 ${s.reseated.length} 个节点`, lines: s.reseated.slice(0, 8).map(x => clip(x)), tone: 'info' })
+    out.push({
+      heading: `重新排队 ${s.reseated.length} 个节点${cut(s.reseated.length, 8)}`,
+      lines: s.reseated.slice(0, 8).map(x => clip(x)), tone: 'info',
+    })
   }
   if (s.retried && s.retried.length > 0) {
     // Loud, and its own section. This is the one resume action that re-arms a safety valve —
     // it spends budget the run had already refused to spend, so the gate must not let it
     // slide by inside the ordinary 重新排队 count.
     out.push({
-      heading: `--retry-blocked:重开 ${s.retried.length} 个被安全阀停下的节点(该阶段预算已重置)`,
+      heading: `--retry-blocked:重开 ${s.retried.length} 个被安全阀停下的节点(该阶段预算已重置)${cut(s.retried.length, 8)}`,
       lines: s.retried.slice(0, 8).map(x => clip(x)), tone: 'warn',
     })
   }
   if (s.exhausted.length > 0) {
-    out.push({ heading: `${s.exhausted.length} 个节点预算已耗尽,不再重试`, lines: s.exhausted.slice(0, 8).map(x => clip(x)), tone: 'warn' })
+    out.push({
+      heading: `${s.exhausted.length} 个节点预算已耗尽,不再重试${cut(s.exhausted.length, 8)}`,
+      lines: s.exhausted.slice(0, 8).map(x => clip(x)), tone: 'warn',
+    })
   }
   if (s.repairs.length > 0) {
-    out.push({ heading: `校验修复 ${s.repairs.length} 处`, lines: s.repairs.slice(0, 8).map(l => clip(l, 100)), tone: 'warn' })
+    out.push({
+      heading: `校验修复 ${s.repairs.length} 处${cut(s.repairs.length, 8)}`,
+      lines: s.repairs.slice(0, 8).map(l => clip(l, 100)), tone: 'warn',
+    })
   }
   if (s.loadErrors.length > 0) {
     // NOT "无法读取": loadRun reports id/directory mismatches through the same channel, and
     // those files read perfectly well. One heading for two different facts sent users looking
     // for a corrupt file that is not corrupt.
-    out.push({ heading: `${s.loadErrors.length} 个节点文件有问题(无法读取或 id 与目录不符)`, lines: s.loadErrors.slice(0, 5).map(l => clip(l, 100)), tone: 'warn' })
+    out.push({
+      heading: `${s.loadErrors.length} 个节点文件有问题(无法读取或 id 与目录不符)${cut(s.loadErrors.length, 5)}`,
+      lines: s.loadErrors.slice(0, 5).map(l => clip(l, 100)), tone: 'warn',
+    })
   }
   if (s.salvaged && s.salvaged.length > 0) {
     /**
@@ -965,9 +988,10 @@ export function resumeSummarySections(s: ResumeSummary): SummarySection[] {
      * 第 6 条起的「还有几个」如果也放进 lines,它自己就是第 6 条,一个字都印不出来。
      * 这个仓库为同一件事付过学费(见 truncation-notice-must-outlive-the-truncation)。
      */
-    const extra = s.salvaged.length > 5 ? `,以下只列前 5 个` : ''
+    // 用同一个 `cut()`:这一段是上面那条规矩的**出处**,却唯独自己手写了一份措辞
+    // (「个」vs「条」),读起来像两套规则。判据一份,措辞一份。
     out.push({
-      heading: `抢救回 ${s.salvaged.length} 个被写坏的节点文件(节点已恢复,但方案全文与判决记录已丢失)${extra}`,
+      heading: `抢救回 ${s.salvaged.length} 个被写坏的节点文件(节点已恢复,但方案全文与判决记录已丢失)${cut(s.salvaged.length, 5)}`,
       lines: s.salvaged.slice(0, 5).map(l => clip(l, 100)),
       tone: 'warn',
     })

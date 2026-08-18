@@ -534,6 +534,18 @@ export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
   // 是同一件该被看见的事(见 NodePlan.responses),补一个空数组只会让 node.md 多一节空标题。
   const responses = capResponses(obj?.responses)
   if (responses.length > 0) plan.responses = responses
+  /**
+   * **`=== true`,而且只在模型真给了 true 时才挂这个键。**
+   *
+   * 实测五种输入(`"true"` / `1` / `"是"` / 缺失 / `null`)在 `=== true` 下全部落 false;
+   * 换成 `!== false`、`Boolean(...)`、`str(...) !== 'false'` 三种写法则**全部落 true ——
+   * 连缺失也落 true**,等于给全树发豁免。这一档关掉的是零贡献闸,写宽一个字符就是
+   * 「谎报完成」的总开关。
+   *
+   * 不挂键(而不是挂 `false`)和 `responses` 同规矩:缺席本身就是默认档,补一个 false
+   * 只会让 node.md 多一行没有信息的 frontmatter。
+   */
+  if (obj?.outputOptional === true) plan.outputOptional = true
   const rawChildren = Array.isArray(obj?.children) ? (obj!.children as unknown[]) : []
   const children = rawChildren
     .map(c => {

@@ -358,6 +358,21 @@ export function serializeNode(node: TaskNode): string {
     `## 重点\n${c(node.plan.keyPoints)}\n\n` +
     `## 风险点\n${c(node.plan.risks)}\n\n` +
     `## 验收点\n${c(node.plan.acceptance)}\n\n` +
+    /**
+     * **产出可选,写进人读的那一半。**
+     *
+     * frontmatter 里已经有 `plan.outputOptional`,但这个文件自己的规矩写了三遍:
+     * 「只落 frontmatter 等于只做到机器可读那一半」(见 manualAdd / responses / degraded)。
+     * 这一条比那三条更要紧 —— 它**关掉了零贡献闸**,而少了这一行,一个免检节点在 node.md
+     * 上读起来和普通节点逐字相同:用户翻遍自己的文件也找不到「为什么这个任务零产出还算通过」。
+     *
+     * 并进「验收点」正文尾部,不新开 `## 段落`:这一条讲的正是**验收点该怎么读**
+     * (零改动算不算达成),和它分家会让人以为是另一件事。
+     */
+    (node.plan.outputOptional === true
+      ? `> 本任务的产出是**条件性**的(方案已声明「检查/验证,有问题才修」):没发现问题时不改任何文件\n` +
+        `> 就是正确结果,「零改动合入集成分支」这一条不作为不通过的理由。\n\n`
+      : '') +
     // 逐条处置。**body 也要有** —— 它是「作者/执行者当时声称这条已经解决了」的唯一书面
     // 记录,而事后追责问的正是这句话:哪一条是它说改了而其实没改的。只落进 frontmatter
     // 等于只做到机器可读那一半,这个文件自己的规矩是 body 才是人读的那一半(见 alternatives)。
