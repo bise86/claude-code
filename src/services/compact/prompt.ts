@@ -9,21 +9,26 @@ const proactiveModule =
     : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-// Aggressive no-tools preamble. The cache-sharing fork path inherits the
-// parent's full tool set (required for cache-key match), and on Sonnet 4.6+
-// adaptive-thinking models the model sometimes attempts a tool call despite
-// the weaker trailer instruction. With maxTurns: 1, a denied tool call means
-// no text output → falls through to the streaming fallback (2.79% on 4.6 vs
-// 0.01% on 4.5). Putting this FIRST and making it explicit about rejection
-// consequences prevents the wasted turn.
-const NO_TOOLS_PREAMBLE = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
-
-- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
-- You already have all the context you need in the conversation above.
-- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
-- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
-
-`
+/**
+ * **压缩请求不再对模型提任何「禁止工具 / 只输出纯文本」的要求。**
+ *
+ * 原来这里有 NO_TOOLS_PREAMBLE(前置)和 NO_TOOLS_TRAILER(后置)两段,内容是
+ * 「CRITICAL: Respond with TEXT ONLY. Do NOT call any tools … 九个部分」。它们本是为了
+ * 省掉 maxTurns:1 下被拒工具调用浪费的那一轮(注释记的是 4.6 上 2.79% vs 4.5 上 0.01%)。
+ *
+ * 去掉的理由是它有一个更贵的副作用:压缩请求是以**一条 user 消息**送达的,而模板第 1 段要
+ * 「capture all of the user's explicit requests」、第 6 段要「list ALL user messages」——
+ * 于是这两段要求会被模型忠实地当成「用户的最新要求」写进摘要。压缩之后那条**假要求**
+ * 永久留在上下文里,而它比恢复端那句泛泛的「继续」具体得多。
+ *
+ * 跑机实测(qianbase-xtp run 001,节点「翻译 ALTER DATABASE DDL 真实逻辑」):执行席位跑了
+ * 59 分钟、69 次调用,压缩后交的 execStatus 逐字是「由于最新要求禁止调用任何工具,本次只能
+ * 提供状态总结,不能继续编辑或验证文件」,并把「输出纯文本、<analysis>/<summary>、九个部分」
+ * 列成了用户需求 —— 一个文件没改,零贡献闸阻断。同一签名在该 run 里有 45 个节点碰到。
+ *
+ * 输出结构不受影响:`<analysis>`/`<summary>` 在 DETAILED_ANALYSIS_INSTRUCTION 和正文的
+ * <example> 里都写着,formatCompactSummary 照常解析得到。
+ */
 
 // Two variants: BASE scopes to "the conversation", PARTIAL scopes to "the
 // recent messages". The <analysis> block is a drafting scratchpad that
@@ -266,11 +271,6 @@ Here's an example of how your output should be structured:
 Please provide your summary following this structure, ensuring precision and thoroughness in your response.
 `
 
-const NO_TOOLS_TRAILER =
-  '\n\nREMINDER: Do NOT call any tools. Respond with plain text only — ' +
-  'an <analysis> block followed by a <summary> block. ' +
-  'Tool calls will be rejected and you will fail the task.'
-
 export function getPartialCompactPrompt(
   customInstructions?: string,
   direction: PartialCompactDirection = 'from',
@@ -279,25 +279,21 @@ export function getPartialCompactPrompt(
     direction === 'up_to'
       ? PARTIAL_COMPACT_UP_TO_PROMPT
       : PARTIAL_COMPACT_PROMPT
-  let prompt = NO_TOOLS_PREAMBLE + template
+  let prompt = template
 
   if (customInstructions && customInstructions.trim() !== '') {
     prompt += `\n\nAdditional Instructions:\n${customInstructions}`
   }
-
-  prompt += NO_TOOLS_TRAILER
 
   return prompt
 }
 
 export function getCompactPrompt(customInstructions?: string): string {
-  let prompt = NO_TOOLS_PREAMBLE + BASE_COMPACT_PROMPT
+  let prompt = BASE_COMPACT_PROMPT
 
   if (customInstructions && customInstructions.trim() !== '') {
     prompt += `\n\nAdditional Instructions:\n${customInstructions}`
   }
-
-  prompt += NO_TOOLS_TRAILER
 
   return prompt
 }
