@@ -256,15 +256,14 @@ import {
   CannotRetryError,
   FallbackTriggeredError,
   getDefaultMaxRetries,
-  getRetryDelay,
   is529Error,
+  nextRetryDelay,
   retryNoticeText,
   type RetryContext,
   shouldRetry,
   withRetry,
 } from './withRetry.js'
 import { reportContextNotice } from './contextNoticeSink.js'
-import { isRetryableTransportError } from './errorPayload.js'
 import { sleep } from '../../utils/sleep.js'
 
 // Define a type that represents valid JSON values
@@ -2567,21 +2566,21 @@ async function* queryModel(
          * 真正重试了。所以补丁只补这一个分支,不碰回退开着的那条路。
          *
          * 判据两条,缺一不可:
-         *  - **错误本身可重试** —— 复用 `shouldRetry`(它现在认得没有状态码的那一帧)
-         *    和传输层那条,和别处同一份判据,不在这里再写一套;
-         *  - **一个字都还没吐出去** —— 见 `emittedToCaller`。
+         *  - **错误本身可重试** —— 复用 `shouldRetry`。政策是「所有失败都重试」,所以这一条
+         *    实际只在挡中止;和别处同一份判据,不在这里再写一套;
+         *  - **一个字都还没吐出去** —— 见 `emittedToCaller`。**这一条才是这里真正的约束**:
+         *    重发一个已经吐过正文的轮次,用户会看到同一段话说两遍,工具甚至跑两次。
+         *    它不是「这个错误不值得重试」,是「这一轮已经没法原样重来了」。
          *
-         * 退避复用 `getRetryDelay`(0.5s→1s→2s…),次数用通用的那个上限。中止不在其中:
-         * `APIUserAbortError` 在上面已经原样抛出去了。
+         * 退避复用 `nextRetryDelay`(0.5s→1s→2s…,和别处同一条曲线),次数用通用的那个上限。
+         * 中止不在其中:`APIUserAbortError` 在上面已经原样抛出去了。
          */
-        const retryableMidStream =
-          (streamingError instanceof APIError && shouldRetry(streamingError)) ||
-          isRetryableTransportError(streamingError)
+        const retryableMidStream = shouldRetry(streamingError)
         const midStreamMax = getDefaultMaxRetries()
         if (retryableMidStream && !emittedToCaller && midStreamAttempt <= midStreamMax) {
           // 旧的那条流和它的响应体必须先放掉:下面要重新建一条,而这一条已经废了。
           releaseStreamResources()
-          const delayMs = getRetryDelay(midStreamAttempt)
+          const delayMs = nextRetryDelay(midStreamAttempt)
           logEvent('tengu_api_retry', {
             attempt: midStreamAttempt,
             delayMs,

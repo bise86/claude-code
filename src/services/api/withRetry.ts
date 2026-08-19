@@ -19,7 +19,6 @@ import {
   getClaudeAIOAuthTokens,
   handleOAuth401Error,
   isClaudeAISubscriber,
-  isEnterpriseSubscriber,
 } from '../../utils/auth.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import { errorMessage } from '../../utils/errors.js'
@@ -45,12 +44,7 @@ import {
   isMockRateLimitError,
 } from '../rateLimitMocking.js'
 import { reportContextNotice } from './contextNoticeSink.js'
-import { REPEATED_529_ERROR_MESSAGE } from './errors.js'
-import {
-  effectiveErrorStatus,
-  isRetryableGatewayBadRequest,
-  isRetryableTransportError,
-} from './errorPayload.js'
+import { effectiveErrorStatus, isAbortError } from './errorPayload.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
 
 const abortError = () => new APIUserAbortError()
@@ -61,53 +55,14 @@ const MAX_529_RETRIES = 3
 export const BASE_DELAY_MS = 500
 
 /**
- * 网关形状的 400 —— **自己一套次数和退避**(判据见 errorPayload.isRetryableGatewayBadRequest)。
+ * 单次退避的**硬封顶**,`Retry-After` 也越不过去。
  *
- * 为什么不跟着通用的那 10 次走:400 里认不出来的那些,默认方向是「重试」,也就是说
- * 一个我们没认出来的确定性 400 会被白试。跟着 10 次 + 32s 封顶走,它能把一席堵满
- * 8 分钟,而 20 席并发时是 20 席一起堵。单独封在 3 次 × 最长 60s 以内,最坏 70 秒。
- *
- * 退避的两个端点是**给定的**(10s 起、60s 封顶),所以 `Retry-After` 也被夹在这个区间里 ——
- * 别处让 `Retry-After` 越过封顶是对的(那是服务端在说自己什么时候好),但 400 这一类
- * 本来就是「网关自己也没说清」,一个越界的头没有资格改这两个端点。
+ * 「所有失败都重试」之后,这个头第一次能拖住整个循环:订阅账号撞到窗口限额时上游给的
+ * 就是几千秒,而 `getRetryDelay` 对这个头是原样照办的 —— 那在「只有真限流才走到这一行」
+ * 的年代是对的,现在不是了。头照看,但夹在一分钟以内:真没好的话下一次重试会再撞一次
+ * 同样的头,**总时长由 maxRetries 决定,不由一个头决定**。
  */
-const BAD_REQUEST_BASE_DELAY_MS = 10_000
-const BAD_REQUEST_MAX_DELAY_MS = 60_000
-const DEFAULT_MAX_BAD_REQUEST_RETRIES = 3
-
-// Foreground query sources where the user IS blocking on the result — these
-// retry on 529. Everything else (summaries, titles, suggestions, classifiers)
-// bails immediately: during a capacity cascade each retry is 3-10× gateway
-// amplification, and the user never sees those fail anyway. New sources
-// default to no-retry — add here only if the user is waiting on the result.
-const FOREGROUND_529_RETRY_SOURCES = new Set<QuerySource>([
-  'repl_main_thread',
-  'repl_main_thread:outputStyle:custom',
-  'repl_main_thread:outputStyle:Explanatory',
-  'repl_main_thread:outputStyle:Learning',
-  'sdk',
-  'agent:custom',
-  'agent:default',
-  'agent:builtin',
-  'compact',
-  'hook_agent',
-  'hook_prompt',
-  'verification_agent',
-  'side_question',
-  // Security classifiers — must complete for auto-mode correctness.
-  // yoloClassifier.ts uses 'auto_mode' (not 'yolo_classifier' — that's
-  // type-only). bash_classifier is ant-only; feature-gate so the string
-  // tree-shakes out of external builds (excluded-strings.txt).
-  'auto_mode',
-  ...(feature('BASH_CLASSIFIER') ? (['bash_classifier'] as const) : []),
-])
-
-function shouldRetry529(querySource: QuerySource | undefined): boolean {
-  // undefined → retry (conservative for untagged call paths)
-  return (
-    querySource === undefined || FOREGROUND_529_RETRY_SOURCES.has(querySource)
-  )
-}
+const MAX_RETRY_DELAY_MS = 60_000
 
 // CLAUDE_CODE_UNATTENDED_RETRY: for unattended sessions (ant-only). Retries 429/529
 // indefinitely with higher backoff and periodic keep-alive yields so the host
@@ -206,8 +161,6 @@ export async function* withRetry<T>(
   }
   let client: Anthropic | null = null
   let consecutive529Errors = options.initialConsecutive529Errors ?? 0
-  /** 网关形状的 400 用掉了几次。**累计,不是连续** —— 见下面封顶那一段。 */
-  let badRequestRetries = 0
   let lastError: unknown
   let persistentAttempt = 0
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
@@ -337,16 +290,6 @@ export async function* withRetry<T>(
         continue
       }
 
-      // Non-foreground sources bail immediately on 529 — no retry amplification
-      // during capacity cascades. User never sees these fail.
-      if (is529Error(error) && !shouldRetry529(options.querySource)) {
-        logEvent('tengu_api_529_background_dropped', {
-          query_source:
-            options.querySource as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-        })
-        throw new CannotRetryError(error, retryContext)
-      }
-
       // Track consecutive 529 errors
       if (
         is529Error(error) &&
@@ -356,83 +299,40 @@ export async function* withRetry<T>(
           (!isClaudeAISubscriber() && isNonCustomOpusModel(options.model)))
       ) {
         consecutive529Errors++
-        if (consecutive529Errors >= MAX_529_RETRIES) {
-          // Check if fallback model is specified
-          if (options.fallbackModel) {
-            logEvent('tengu_api_opus_fallback_triggered', {
-              original_model:
-                options.model as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-              fallback_model:
-                options.fallbackModel as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-              provider: getAPIProviderForStatsig(),
-            })
-
-            // Throw special error to indicate fallback was triggered
-            throw new FallbackTriggeredError(
-              options.model,
-              options.fallbackModel,
-            )
-          }
-
-          if (
-            process.env.USER_TYPE === 'external' &&
-            !process.env.IS_SANDBOX &&
-            !isPersistentRetryEnabled()
-          ) {
-            logEvent('tengu_api_custom_529_overloaded_error', {})
-            throw new CannotRetryError(
-              new Error(REPEATED_529_ERROR_MESSAGE),
-              retryContext,
-            )
-          }
+        // 连着这么多次 529 还有回落模型的话,换模型比继续等更划算。没有回落模型就
+        // 什么都不做 —— 交给下面那条统一的退避,和别的失败一样。
+        if (consecutive529Errors >= MAX_529_RETRIES && options.fallbackModel) {
+          logEvent('tengu_api_opus_fallback_triggered', {
+            original_model:
+              options.model as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            fallback_model:
+              options.fallbackModel as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+            provider: getAPIProviderForStatsig(),
+          })
+          // Throw special error to indicate fallback was triggered
+          throw new FallbackTriggeredError(options.model, options.fallbackModel)
         }
       }
 
-      /**
-       * 网关形状的 400 单独封顶。
-       *
-       * **累计而不是「连续」**:429 那个计数器可以清零,因为一次成功证明容量确实回来了;
-       * 而 400 这一类里,我们没认出来的确定性错误**每一次都长得一模一样**。用连续计数的话,
-       * 一个「奇数次成功、偶数次 400」的网关能让它无限试下去,而那正是这个封顶要挡的。
-       *
-       * 判据放在闸门**之前**:走到 `shouldRetry` 的时候次数已经用完了,而那个函数拿不到
-       * 这一趟的计数(它是纯函数,只看一个错误对象)。
-       */
-      const gatewayBadRequest =
-        error instanceof APIError && isRetryableGatewayBadRequest(error)
-      if (gatewayBadRequest) {
-        badRequestRetries++
-        if (badRequestRetries > getMaxBadRequestRetries()) {
-          throw new CannotRetryError(error, retryContext)
-        }
-      }
-
-      // Only retry if the error indicates we should
+      // 次数用完了就报出来。「一律重试」不等于「无限重试」—— 边界在这里,不在判据里。
       const persistent =
         isPersistentRetryEnabled() && isTransientCapacityError(error)
       if (attempt > maxRetries && !persistent) {
         throw new CannotRetryError(error, retryContext)
       }
 
-      // AWS/GCP errors aren't always APIError, but can be retried
-      const handledCloudAuthError =
-        handleAwsCredentialError(error) || handleGcpCredentialError(error)
-      /**
-       * **传输层的失败也不是 APIError,同样可以重试**(见 errorPayload.isRetryableTransportError)。
-       *
-       * 这道闸原来的写法是「不是 APIError 就一定不重试」。而 Bun 的 fetch 在**响应流被中途
-       * 掐断**时抛的是一个普通 Error —— 那时候 SDK 早把响应交出去了,不会再包成
-       * APIConnectionError。跑机实测:这一趟每一个杀掉席位的错误都是这一类。
-       *
-       * 放在 `shouldRetry` 那一侧治不了:它的形参就是 `APIError`,而问题恰恰是错误根本
-       * 到不了那儿。所以判据必须加在**闸上**。
-       */
-      const transport = isRetryableTransportError(error)
-      if (
-        !handledCloudAuthError &&
-        !transport &&
-        (!(error instanceof APIError) || !shouldRetry(error))
-      ) {
+      // AWS/GCP 的凭据错误不一定是 APIError,而它们要的是**清缓存**这个副作用 ——
+      // 不清的话,下一趟重试拿到的还是同一份过期凭据。
+      handleAwsCredentialError(error)
+      handleGcpCredentialError(error)
+      // 401 同理:apiKeyHelper 的缓存不丢,下一趟拿到的还是那把不好使的钥匙。
+      // (OAuth 的刷新在循环开头,由 lastError 触发,那是另一件事。)
+      if (error instanceof APIError && error.status === 401) {
+        clearApiKeyHelperCache()
+      }
+
+      // 唯一的一道闸:除了中止和 /mock-limits 的假错,**一律重试**(判据见 shouldRetry)。
+      if (!shouldRetry(error)) {
         throw new CannotRetryError(error, retryContext)
       }
 
@@ -513,27 +413,8 @@ export async function* withRetry<T>(
           ),
           PERSISTENT_RESET_CAP_MS,
         )
-      } else if (gatewayBadRequest) {
-        /**
-         * 10s 起、翻倍、封顶 60s,而且**两端都是硬的** —— `getRetryDelay` 里
-         * `Retry-After` 会越过 `maxDelayMs`(那是有意的),但 400 这一类不给它这个资格:
-         * 见 BAD_REQUEST_BASE_DELAY_MS 那一段。抖动只会往上加,所以下界夹在取抖动之后
-         * 仍然是 10s。
-         */
-        delayMs = Math.min(
-          Math.max(
-            getRetryDelay(
-              badRequestRetries,
-              retryAfter,
-              BAD_REQUEST_MAX_DELAY_MS,
-              BAD_REQUEST_BASE_DELAY_MS,
-            ),
-            BAD_REQUEST_BASE_DELAY_MS,
-          ),
-          BAD_REQUEST_MAX_DELAY_MS,
-        )
       } else {
-        delayMs = getRetryDelay(attempt, retryAfter)
+        delayMs = nextRetryDelay(attempt, retryAfter)
       }
 
       // In persistent mode the for-loop `attempt` is clamped at maxRetries+1;
@@ -542,6 +423,9 @@ export async function* withRetry<T>(
       logEvent('tengu_api_retry', {
         attempt: reportedAttempt,
         delayMs: delayMs,
+        // 哪一席在重试。政策改成「一律重试」之后,这是唯一还能回答「谁在原地打转」的字段。
+        query_source:
+          options.querySource as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         error: (error as APIError)
           .message as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         status: (error as APIError).status,
@@ -630,7 +514,6 @@ export function getRetryDelay(
   attempt: number,
   retryAfterHeader?: string | null,
   maxDelayMs = 32000,
-  baseDelayMs = BASE_DELAY_MS,
 ): number {
   if (retryAfterHeader) {
     const seconds = parseInt(retryAfterHeader, 10)
@@ -640,11 +523,25 @@ export function getRetryDelay(
   }
 
   const baseDelay = Math.min(
-    baseDelayMs * Math.pow(2, attempt - 1),
+    BASE_DELAY_MS * Math.pow(2, attempt - 1),
     maxDelayMs,
   )
   const jitter = Math.random() * 0.25 * baseDelay
   return baseDelay + jitter
+}
+
+/**
+ * 一次失败之后等多久。**所有失败共用这一条曲线**:0.5s 起、翻倍、32s 封顶、带抖动;
+ * `Retry-After` 照看,但夹在 `MAX_RETRY_DELAY_MS` 以内(见那个常量)。
+ *
+ * 单拆一个函数是为了它能被**直接**探到:退避埋在生成器循环里,从外面只能靠等真实的
+ * 秒数间接观察,而那样的探针要么慢得没人跑,要么就只好去测替身。
+ */
+export function nextRetryDelay(
+  attempt: number,
+  retryAfterHeader?: string | null,
+): number {
+  return Math.min(getRetryDelay(attempt, retryAfterHeader), MAX_RETRY_DELAY_MS)
 }
 
 export function parseMaxTokensContextOverflowError(error: APIError):
@@ -792,120 +689,32 @@ function handleGcpCredentialError(error: unknown): boolean {
   return false
 }
 
-export function shouldRetry(error: APIError): boolean {
-  // Never retry mock errors - they're from /mock-limits command for testing
-  if (isMockRateLimitError(error)) {
-    return false
-  }
-
-  // Persistent mode: 429/529 always retryable, bypass subscriber gates and
-  // x-should-retry header.
-  if (isPersistentRetryEnabled() && isTransientCapacityError(error)) {
-    return true
-  }
-
-  // CCR mode: auth is via infrastructure-provided JWTs, so a 401/403 is a
-  // transient blip (auth service flap, network hiccup) rather than bad
-  // credentials. Bypass x-should-retry:false — the server assumes we'd retry
-  // the same bad key, but our key is fine.
-  if (
-    isEnvTruthy(process.env.CLAUDE_CODE_REMOTE) &&
-    (error.status === 401 || error.status === 403)
-  ) {
-    return true
-  }
-
-  // Check for overloaded errors first by examining the payload.
-  // The SDK sometimes fails to properly pass the 529 status code during streaming,
-  // so we need to check the error body's own type (see errorPayload.ts).
-  if (is529Error(error)) {
-    return true
-  }
-
-  // Check for max tokens context overflow errors that we can handle
-  if (parseMaxTokensContextOverflowError(error)) {
-    return true
-  }
-
-  // Note this is not a standard header.
-  const shouldRetryHeader = error.headers?.get('x-should-retry')
-
-  // If the server explicitly says whether or not to retry, obey.
-  // For Max and Pro users, should-retry is true, but in several hours, so we shouldn't.
-  // Enterprise users can retry because they typically use PAYG instead of rate limits.
-  if (
-    shouldRetryHeader === 'true' &&
-    (!isClaudeAISubscriber() || isEnterpriseSubscriber())
-  ) {
-    return true
-  }
-
-  // Ants can ignore x-should-retry: false for 5xx server errors only.
-  // For other status codes (401, 403, 400, 429, etc.), respect the header.
-  if (shouldRetryHeader === 'false') {
-    const is5xxError = error.status !== undefined && error.status >= 500
-    if (!(process.env.USER_TYPE === 'ant' && is5xxError)) {
-      return false
-    }
-  }
-
-  if (error instanceof APIConnectionError) {
-    return true
-  }
-
-  /**
-   * 没有状态码时,回落到**错误体自己说的类型**(见 errorPayload.ts)。
-   *
-   * 流中途的一帧 `event: error` 在 SDK 里造出来的 APIError 的 status 恒为 undefined ——
-   * 而上游在那一帧里说的可能正是「我过载了,请稍后重试」。此前这里直接
-   * `if (!error.status) return false`,也就是这一整类可重试的故障**一次都不重试**。
-   *
-   * 下面每一条判据原样复用:归一到状态码之后,这一层不需要重复任何一条重试策略。
-   */
-  const status = effectiveErrorStatus(error)
-
-  if (!status) return false
-
-  // Retry on request timeouts.
-  if (status === 408) return true
-
-  // Retry on lock timeouts.
-  if (status === 409) return true
-
-  // Retry on rate limits, but not for ClaudeAI Subscription users
-  // Enterprise users can retry because they typically use PAYG instead of rate limits
-  if (status === 429) {
-    return !isClaudeAISubscriber() || isEnterpriseSubscriber()
-  }
-
-  // Clear API key cache on 401 and allow retry.
-  // OAuth token handling is done in the main retry loop via handleOAuth401Error.
-  // 只认**真**状态码:errorPayload 故意不映射鉴权类,401 在主循环里会触发一次
-  // OAuth 刷新,那是另一件事,不该由一帧流中错误来发起。
-  if (error.status === 401) {
-    clearApiKeyHelperCache()
-    return true
-  }
-
-  // Retry on 403 "token revoked" (same refresh logic as 401, see above)
-  if (isOAuthTokenRevokedError(error)) {
-    return true
-  }
-
-  /**
-   * **网关形状的 400 也重试** —— 判据和它为什么把默认方向反过来,见
-   * `errorPayload.isRetryableGatewayBadRequest`。
-   *
-   * 位置在 `parseMaxTokensContextOverflowError` **之后**是必须的:那一条是「改小
-   * max_tokens 再发」的受控重试,而这里发的是原样的同一个请求。次数与退避由主循环
-   * 单独管(`DEFAULT_MAX_BAD_REQUEST_RETRIES`),不走那 10 次。
-   */
-  if (status === 400) return isRetryableGatewayBadRequest(error)
-
-  // Retry internal errors.
-  if (status >= 500) return true
-
-  return false
+/**
+ * **所有失败都重试。**
+ *
+ * 这里以前是一张按状态码分档的表:`x-should-retry: false`、订阅账号的 429、没有状态码的
+ * 那一整类、以及「确定性的 400」。每一档回答的都是同一个问题 ——「这次值不值得再发一次」——
+ * 而真实跑机(qianbase-xtp run 001)上的账是**不对称**的:判成「不值得」而判错,代价是
+ * 一席当场死掉(整轮 FAIL、该节点从此没有验收判据、自动解决冲突未能完成 ×3);判成
+ * 「值得」而判错,代价只是几十秒退避。这张表连着三次被同一件事推翻(流中错误帧没有状态码、
+ * 传输层失败连 APIError 都不是、网关把自己的故障写成 400),每一次都是「又发现一种它其实
+ * 该重试」。所以不再逐类猜了。
+ *
+ * 判据只剩一条:**发出去失败了就再发**,次数和退避由调用方统一算(`maxRetries` +
+ * `nextRetryDelay`)。明码标价的成本:一个真的必死的请求(模型名写错、提示词超长、
+ * 网关认不了的参数)现在会走满那 10 次才报出来,而不是当场。`CLAUDE_CODE_MAX_RETRIES`
+ * 可以把它调小。
+ *
+ * 两种东西不在「失败」的范围里 —— 它们和「值不值得重试」无关:
+ *  - **中止**:用户按了 Esc、阶段闸门开火。重试它等于用户按了停止之后我们又跑十次。
+ *  - **`/mock-limits` 造的假限流**:ant 本地造出来的、根本没出过网的错误对象,
+ *    它存在的唯一目的就是让这一趟失败。
+ */
+export function shouldRetry(error: unknown): boolean {
+  if (error instanceof APIUserAbortError) return false
+  if (isAbortError(error)) return false
+  if (error instanceof APIError && isMockRateLimitError(error)) return false
+  return true
 }
 
 export function getDefaultMaxRetries(): number {
@@ -916,19 +725,6 @@ export function getDefaultMaxRetries(): number {
 }
 function getMaxRetries(options: RetryOptions): number {
   return options.maxRetries ?? getDefaultMaxRetries()
-}
-
-/**
- * 网关形状的 400 最多试几次。默认 3 —— 调大了才碰得到 60s 那个封顶(3 次是 10/20/40s)。
- * 认不出来的值(负数、NaN)一律回落到默认:这个数字直接决定一个必死的 400 能堵多久。
- */
-export function getMaxBadRequestRetries(): number {
-  const raw = process.env.CLAUDE_CODE_MAX_400_RETRIES
-  if (raw) {
-    const n = parseInt(raw, 10)
-    if (Number.isFinite(n) && n >= 0) return n
-  }
-  return DEFAULT_MAX_BAD_REQUEST_RETRIES
 }
 
 const DEFAULT_FAST_MODE_FALLBACK_HOLD_MS = 30 * 60 * 1000 // 30 minutes

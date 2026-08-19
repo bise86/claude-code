@@ -1,34 +1,32 @@
 /**
- * 流中途的一帧 `event: error` **没有状态码**,而它此前意味着「一次都不重试」。
+ * **政策:所有失败都重试,一律退避。**
  *
- * 这一档钉的是真实跑机(qianbase-xtp run 001)上的事故。node.md 里逐字抄下来的是:
+ * 这一档钉的是那条政策本身,以及它唯一的例外(中止)。之前这里是一张按状态码分档的表,
+ * 每一档都在回答「这次值不值得再发一次」;它连着三次被同一件事推翻 ——
  *
- *     API Error: {"type":"error","error":{"type":"api_error",
- *                 "message":"Our servers are currently overloaded. Please try again later."}}
+ *  - 流中途的一帧 `event: error` **没有状态码**(SDK 造的 APIError,status 恒为 undefined),
+ *    而上游在那一帧里写的正是 `Please try again later`;
+ *  - 传输层的失败连 APIError 都不是(Bun 在流被中途掐断时抛普通 Error);
+ *  - 网关把自己的故障写成 400(`Stream must be set to true`、注入了上游不认的参数)。
  *
- * 上游自己写着 **Please try again later**,而 `shouldRetry` 在
- * `if (!error.status) return false` 那一行把它判成不可重试 —— 因为 SDK 对流中错误帧造出来
- * 的 APIError,status 恒为 `undefined`(`core/streaming.js`)。日志里能看见代价:
- * 「补验收点那次调用未完成」(该节点从此没有验收判据)、「自动解决冲突未能完成」×3。
+ * 每一次都是「又发现一种它其实该重试」,而每一次判错的代价都是**一席当场死掉**。所以判据
+ * 不再逐类猜:发出去失败了就再发。
  *
- * 探针从**真的两侧**看:错误对象照 SDK 那一行原样构造(`new APIError(undefined, 解析后的
- * body, undefined, headers)`),判据用真的 `shouldRetry` —— 中间不放替身,否则这条测试
- * 测的是我自己写的那个假 SDK。
+ * 探针从**真的两侧**看:错误对象照 SDK 那一行原样构造,判据用真的 `shouldRetry`,
+ * 重试用真的 `withRetry` 循环 —— 中间不放替身,否则测的是我自己写的那个假 SDK。
  */
 import { describe, expect, it } from 'bun:test'
-import { APIError } from '@anthropic-ai/sdk'
+import { APIError, APIUserAbortError } from '@anthropic-ai/sdk'
 import type Anthropic from '@anthropic-ai/sdk'
 import { withContextNoticeSink } from './contextNoticeSink.js'
 import {
   effectiveErrorStatus,
-  isDeterministicBadRequest,
-  isRetryableGatewayBadRequest,
-  isRetryableTransportError,
+  isAbortError,
   transientStatusFromErrorPayload,
 } from './errorPayload.js'
 import {
-  getRetryDelay,
   is529Error,
+  nextRetryDelay,
   shouldRetry,
   withRetry,
 } from './withRetry.js'
@@ -44,135 +42,319 @@ function midStreamError(data: string): APIError {
   return new APIError(undefined, body, undefined, new Headers())
 }
 
-describe('没有状态码的上游错误', () => {
+/** SDK 拿到一个**真的** HTTP 状态码时造出来的东西。 */
+function httpError(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): APIError {
+  return new APIError(status, body, undefined, new Headers(headers))
+}
+
+/**
+ * 翻译层(`openaiCompat/roleFetch.ts`)的形状:外层 type 是 `api_error`,网关原文
+ * **整段塞在 message 里**。用户报障贴的就是这个形状。
+ */
+function roleFetch400(upstream: string): APIError {
+  return httpError(400, {
+    type: 'error',
+    error: {
+      type: 'api_error',
+      message:
+        `员工「架构」(openai-responses 协议)调用失败 · POST ` +
+        `http://10.10.20.33:3000/v1/responses → 400 Bad Request · 上游原文:${upstream}`,
+    },
+  })
+}
+
+/** 跑真的重试循环,数 operation 被调了几次;抛出来的错原样交给调用方。 */
+async function runLoop(
+  fail: (attempt: number) => unknown | null,
+  opts: { maxRetries: number; querySource?: string } = { maxRetries: 1 },
+): Promise<{ attempts: number; yields: number; value: unknown; error: unknown }> {
+  let attempts = 0
+  // 循环每决定退避一次就 yield 一条系统消息 —— 数它,才分得清「一次都没重试」和
+  // 「重试了但 operation 根本没被调到」(闸门在调用之前开火的那些)。
+  let yields = 0
+  let value: unknown
+  let error: unknown
+  const gen = withRetry(
+    async () => ({}) as Anthropic,
+    async () => {
+      attempts++
+      const e = fail(attempts)
+      if (e) throw e
+      return '答上来了'
+    },
+    {
+      model: 'claude-opus-5',
+      thinkingConfig: { type: 'disabled' },
+      maxRetries: opts.maxRetries,
+      ...(opts.querySource ? { querySource: opts.querySource as never } : {}),
+    },
+  )
+  try {
+    let out = await gen.next()
+    while (out.done !== true) {
+      yields++
+      out = await gen.next()
+    }
+    value = out.value
+  } catch (e) {
+    error = e
+  }
+  return { attempts, yields, value, error }
+}
+
+describe('所有失败都重试', () => {
   /**
-   * 主判据。变异:把 `shouldRetry` 里的 `effectiveErrorStatus(error)` 换回
-   * `error.status` → 这条红。
+   * **用户报障的那一个**,逐字。网关(10.10.20.33)自己往请求体里注入了
+   * `prompt_cache_retention`,上游不认这个参数 —— 而错误体上写的是
+   * `invalid_request_error` + `invalid_parameter`,也就是老判据里「我们的请求本身不合法」
+   * 的两条,于是**一次都不重试**,那一席当场死掉。
+   *
+   * 变异:把 `shouldRetry` 里加回「400 且认得出是确定性错误就返回 false」→ 这条红。
    */
-  it('跑机实测的那一帧(api_error · overloaded)现在会重试', () => {
+  it('网关注入了上游不认的参数(invalid_parameter)——现在会重试', async () => {
+    const e = roleFetch400(
+      '{"error":{"message":"prompt_cache_retention is not supported on this model",' +
+        '"type":"invalid_request_error","param":"prompt_cache_retention","code":"invalid_parameter"}}',
+    )
+    expect(e.status).toBe(400) // 前提:它是个真的 400
+    expect(shouldRetry(e)).toBe(true)
+    const r = await runLoop(a => (a < 2 ? e : null))
+    expect(r.value).toBe('答上来了')
+    expect(r.attempts).toBe(2)
+  }, 30_000)
+
+  /** 提示词超长、模型名写错、工具块对不上 —— 老判据里全是「必死」,现在一样重试。 */
+  it('老判据里那四类确定性 400,现在也重试', () => {
+    expect(
+      shouldRetry(
+        httpError(400, {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: 'prompt is too long: 250000 tokens > 200000 maximum',
+          },
+        }),
+      ),
+    ).toBe(true)
+    expect(
+      shouldRetry(
+        httpError(400, {
+          error: { message: 'The model `gpt-9` does not exist', code: 'model_not_found' },
+        }),
+      ),
+    ).toBe(true)
+    expect(
+      shouldRetry(
+        httpError(400, {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: 'messages.12: `tool_use` ids must be unique',
+          },
+        }),
+      ),
+    ).toBe(true)
+  })
+
+  /**
+   * 服务端明说「别重试」也重试。这一条是政策里最扎眼的一条,单独钉住 ——
+   * 变异:把 `x-should-retry: false` 那道老闸加回来 → 这条红。
+   */
+  it('x-should-retry: false 不再是一票否决', async () => {
+    const e = httpError(400, { error: { message: 'nope' } }, { 'x-should-retry': 'false' })
+    expect(shouldRetry(e)).toBe(true)
+    const r = await runLoop(a => (a < 2 ? e : null))
+    expect(r.attempts).toBe(2)
+  }, 30_000)
+
+  /**
+   * 跑机上 16/20 席死在这一个上:Bun 的 fetch 在**消费响应流**时抛的普通 Error ——
+   * 既不是 APIError 也不是 APIConnectionError,老闸写的是「不是 APIError 就一定不重试」。
+   */
+  it('连 APIError 都不是的传输层失败,也重试', async () => {
+    const socketClose = new Error(
+      'The socket connection was closed unexpectedly. For more information, ' +
+        'pass `verbose: true` in the second argument to fetch()',
+    )
+    expect(shouldRetry(socketClose)).toBe(true)
+    const r = await runLoop(a => (a < 3 ? socketClose : null), { maxRetries: 3 })
+    expect(r.value).toBe('答上来了')
+    expect(r.attempts).toBe(3)
+  }, 30_000)
+
+  /**
+   * 「配置错不重试」这条老规矩也没了 —— 网关刚起来的那几秒、DNS 刚生效的那几秒,
+   * 长得和「域名打错一个字母」一模一样,而分辨它们要付的代价是一席。
+   */
+  it('ENOTFOUND / ECONNREFUSED 这类老「配置错」也重试', () => {
+    expect(
+      shouldRetry(Object.assign(new Error('getaddrinfo ENOTFOUND typo.example'), { code: 'ENOTFOUND' })),
+    ).toBe(true)
+    expect(
+      shouldRetry(Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })),
+    ).toBe(true)
+  })
+
+  /** 没有状态码的那一帧(上游自己写着 Please try again later)。 */
+  it('流中途的错误帧(没有状态码)会重试', async () => {
     const e = midStreamError(
       '{"type":"error","error":{"type":"api_error","message":"Our servers are currently overloaded. Please try again later."}}',
     )
     expect(e.status).toBeUndefined() // 前提:它真的没有状态码
-    expect(shouldRetry(e)).toBe(true)
+    const r = await runLoop(a => (a < 3 ? e : null), { maxRetries: 3 })
+    expect(r.value).toBe('答上来了')
+    expect(r.attempts).toBe(3)
+  }, 30_000)
+
+  /** 压根不是 JSON 的一帧 —— 认不出类型,照样重试。 */
+  it('认不出类型的错误也重试', () => {
+    expect(shouldRetry(midStreamError('boom'))).toBe(true)
+    expect(shouldRetry(new Error('方案解析失败'))).toBe(true)
   })
 
   /**
-   * 用户最初报障时贴的那一串(另一家网关,另一段文案,同一个形状)。
-   * 两条一起在,是为了说明判据认的是**类型字段**,不是某一句文案。
+   * 后台来源(标题、摘要、分类器)的 529 以前是**当场丢弃**的,理由是重试放大。
+   * 政策统一之后它们也重试 —— 变异:把 `shouldRetry529` 那道闸加回来 → 这条红。
    */
-  it('另一家网关的同型错误(help.openai.com 那一串)也重试', () => {
-    const e = midStreamError(
-      '{"type":"error","error":{"type":"api_error","message":"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 33a70f5f in your message."}}',
-    )
-    expect(shouldRetry(e)).toBe(true)
+  it('后台来源的 529 不再被当场丢弃', async () => {
+    // 529 会走到「连续 529 就切 fallbackModel」那一段,而它要问 isClaudeAISubscriber() ——
+    // 单测进程里 config 还没允许访问,那一句会抛 `Config accessed before allowed`。
+    // 这个环境变量是那个 || 的**第一个**操作数,置上它就短路在配置之前,而被测的那条
+    // 判据(来源名单)在更前面,不受影响。
+    const saved = process.env.FALLBACK_FOR_ALL_PRIMARY_MODELS
+    process.env.FALLBACK_FOR_ALL_PRIMARY_MODELS = '1'
+    try {
+      const e = httpError(529, { type: 'error', error: { type: 'overloaded_error' } })
+      const r = await runLoop(a => (a < 2 ? e : null), {
+        maxRetries: 1,
+        // 老名单(FOREGROUND_529_RETRY_SOURCES)里没有的来源
+        querySource: 'conversation_title',
+      })
+      expect(r.attempts).toBe(2)
+    } finally {
+      if (saved === undefined) delete process.env.FALLBACK_FOR_ALL_PRIMARY_MODELS
+      else process.env.FALLBACK_FOR_ALL_PRIMARY_MODELS = saved
+    }
+  }, 30_000)
+})
+
+describe('重试是有界的', () => {
+  /**
+   * 「一律重试」不等于「无限重试」:次数仍然由 `maxRetries` 封顶,超了就 `CannotRetryError`。
+   * 少了这一条,把上面那些改成死循环也能全绿。
+   */
+  it('一个永远失败的请求,走满 maxRetries+1 次就报出来', async () => {
+    const e = roleFetch400('{"error":{"message":"whatever","code":"invalid_parameter"}}')
+    const r = await runLoop(() => e, { maxRetries: 2 })
+    expect(r.attempts).toBe(3)
+    expect(r.error).toBeDefined()
+    expect(String((r.error as Error).message)).toContain('whatever')
+  }, 30_000)
+})
+
+describe('唯一的例外:中止', () => {
+  it('isAbortError 认得三种形状,别的都不认', () => {
+    expect(isAbortError(Object.assign(new Error('aborted'), { name: 'AbortError' }))).toBe(true)
+    expect(isAbortError(Object.assign(new Error('timed out'), { name: 'TimeoutError' }))).toBe(true)
+    expect(isAbortError(Object.assign(new Error('x'), { code: 'ABORT_ERR' }))).toBe(true)
+    expect(isAbortError(new Error('The socket connection was closed unexpectedly'))).toBe(false)
+    expect(isAbortError(null)).toBe(false)
+    expect(isAbortError('AbortError')).toBe(false) // 字符串不是错误对象
   })
 
-  /** OpenAI 自己的形状:没有外层壳,类型写在 `error.type` 上。 */
-  it('OpenAI 形状的 server_error 也重试', () => {
-    const e = midStreamError(
-      '{"error":{"message":"The server had an error while processing your request.","type":"server_error","code":null}}',
-    )
-    expect(shouldRetry(e)).toBe(true)
-  })
-
-  /** 有的网关只填 `code`,不填 `type`。 */
-  it('只写 code 的网关也认得出来', () => {
-    const e = midStreamError(
-      '{"error":{"message":"upstream unavailable","code":"service_unavailable"}}',
-    )
-    expect(shouldRetry(e)).toBe(true)
+  it('shouldRetry 对中止说不 —— SDK 的那一种也算', () => {
+    expect(shouldRetry(new APIUserAbortError())).toBe(false)
+    expect(shouldRetry(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }))).toBe(false)
   })
 
   /**
-   * **反向探针**:这个改动只放行「上游临时挂了」,不是把所有无状态码的错误都变成可重试。
-   * 少了它,把 `transientStatusFromErrorPayload` 写成「恒返回 500」也能让上面四条全绿。
+   * 反向探针,从**真循环**外面看:用户按了 Esc 之后不许再跑十次。
+   * 变异:把 `shouldRetry` 里两条中止判据去掉 → 这条会变成 4 次调用。
    */
-  it('请求体写错(invalid_request_error)仍然不重试', () => {
-    const e = midStreamError(
-      '{"type":"error","error":{"type":"invalid_request_error","message":"messages: at least one message is required"}}',
-    )
-    expect(shouldRetry(e)).toBe(false)
+  it('真循环:中止只调用一次', async () => {
+    const abort = Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
+    const r = await runLoop(() => abort, { maxRetries: 3 })
+    expect(r.attempts).toBe(1)
+    expect(r.error).toBeDefined()
+  }, 30_000)
+
+  /**
+   * 另一个例外:`/mock-limits` 造的假限流 —— ant 本地造出来的、根本没出过网的错误对象。
+   * 它在循环**开头**就抛,所以真循环里 operation 一次都不该被调到。
+   * 变异:把 `isMockRateLimitError` 那条去掉 → 这条会变成 4 次调用(每次都重试那个假错)。
+   */
+  it('真循环:/mock-limits 的假限流不重试', async () => {
+    const savedUser = process.env.USER_TYPE
+    const savedMock = process.env.CLAUDE_MOCK_HEADERLESS_429
+    process.env.USER_TYPE = 'ant'
+    process.env.CLAUDE_MOCK_HEADERLESS_429 = '假的限流,别重试'
+    try {
+      const r = await runLoop(() => null, { maxRetries: 3 })
+      expect(r.attempts).toBe(0)
+      expect(r.error).toBeDefined()
+      // **这一条才是判据**:假错在 operation **之前**抛,attempts 恒为 0,重不重试都一样。
+      // 每退避一次会 yield 一条系统消息 —— 一条都没有,才证明它当场就结束了。
+      expect(r.yields).toBe(0)
+    } finally {
+      if (savedUser === undefined) delete process.env.USER_TYPE
+      else process.env.USER_TYPE = savedUser
+      if (savedMock === undefined) delete process.env.CLAUDE_MOCK_HEADERLESS_429
+      else process.env.CLAUDE_MOCK_HEADERLESS_429 = savedMock
+    }
+  }, 30_000)
+})
+
+describe('退避曲线', () => {
+  /** 0.5s 起、翻倍、32s 封顶;抖动只往上加(≤25%),所以下界就是基数。 */
+  it('0.5s 起、翻倍、32s 封顶', () => {
+    expect(nextRetryDelay(1)).toBeGreaterThanOrEqual(500)
+    expect(nextRetryDelay(1)).toBeLessThanOrEqual(625)
+    expect(nextRetryDelay(2)).toBeGreaterThanOrEqual(1000)
+    expect(nextRetryDelay(3)).toBeGreaterThanOrEqual(2000)
+    expect(nextRetryDelay(9)).toBeGreaterThanOrEqual(32_000)
+    expect(nextRetryDelay(9)).toBeLessThanOrEqual(40_000)
   })
 
-  it('鉴权失败仍然不重试(它不该由一帧流中错误去刷 token)', () => {
-    const e = midStreamError(
-      '{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}',
-    )
-    expect(shouldRetry(e)).toBe(false)
+  /** 服务端说什么时候回来就什么时候回来 —— 在封顶以内的照办。 */
+  it('Retry-After 照看', () => {
+    expect(nextRetryDelay(1, '5')).toBe(5_000)
+    expect(nextRetryDelay(1, '45')).toBe(45_000)
   })
 
-  it('压根不是 JSON 的一帧,行为不变(不重试)', () => {
-    expect(shouldRetry(midStreamError('boom'))).toBe(false)
+  /**
+   * **但夹在一分钟以内。** 政策改成「所有失败都重试」之后,订阅账号的窗口限额第一次能
+   * 走到这一行,而它给的 `Retry-After` 是以小时计的 —— 一次调用不该为一个头挂几个小时。
+   *
+   * 变异:把 `nextRetryDelay` 里的 `Math.min(…, MAX_RETRY_DELAY_MS)` 去掉 → 这条红。
+   */
+  it('Retry-After 再大也夹在 60s', () => {
+    expect(nextRetryDelay(1, '18000')).toBe(60_000)
+    expect(nextRetryDelay(4, '3600')).toBe(60_000)
   })
 })
 
 /**
- * 判据对了不等于**真的重试了**:`shouldRetry` 只是重试循环里的一个 if。这一档从
- * `withRetry` 这个真的循环外面看 —— 它是整条链路上唯一的重试实现(claude.ts 建客户端时
- * 写死 `maxRetries: 0`,「Disabled auto-retry in favor of manual implementation」)。
+ * 判据对了不等于**用户看得见**:`withRetry` yield 出去的那条系统消息只到 QueryEngine ——
+ * 子 agent 那条路上看不见它(`createSubagentContext` 对子 agent 写死
+ * `addNotification: undefined`)。而一串重试加起来能有两分半:窗口一动不动,
+ * 和「这一席挂死了」长得一模一样。
  */
-describe('真的重试循环', () => {
-  it('流中错误帧连着两次之后,第三次拿到答案', async () => {
-    let attempts = 0
-    const gen = withRetry(
-      async () => ({}) as Anthropic,
-      async () => {
-        attempts++
-        if (attempts < 3) {
-          throw midStreamError(
-            '{"type":"error","error":{"type":"api_error","message":"Our servers are currently overloaded. Please try again later."}}',
-          )
-        }
-        return '答上来了'
-      },
-      {
-        model: 'claude-opus-5',
-        thinkingConfig: { type: 'disabled' },
-        maxRetries: 3,
-      },
-    )
-    // 生成器 yield 的是「正在重试」的系统消息,返回值才是结果。
-    let out = await gen.next()
-    while (out.done !== true) out = await gen.next()
-    expect(out.value).toBe('答上来了')
-    expect(attempts).toBe(3)
-  }, 30_000)
-
-  /**
-   * **退避期间席位窗口必须有话说。**
-   *
-   * `withRetry` yield 出去的那条系统消息只到 QueryEngine —— 子 agent 那条路上看不见它
-   * (`createSubagentContext` 对子 agent 写死 `addNotification: undefined`)。而一串重试
-   * 加起来能有两分半:窗口一动不动,和「这一席挂死了」长得一模一样。
-   */
-  it('退避时通过 ALS 旁路报一行,子 agent 那条路才看得见', async () => {
+describe('退避期间席位窗口有话说', () => {
+  it('通过 ALS 旁路报一行,子 agent 那条路才看得见', async () => {
     const seen: string[] = []
-    let attempts = 0
     await withContextNoticeSink(
       n => {
         if (n.kind === 'api-retry') seen.push(n.text)
       },
       async () => {
-        const gen = withRetry(
-          async () => ({}) as Anthropic,
-          async () => {
-            attempts++
-            if (attempts < 2) {
-              throw midStreamError(
-                '{"type":"error","error":{"type":"api_error","message":"Our servers are currently overloaded. Please try again later."}}',
-              )
-            }
-            return 'ok'
-          },
-          {
-            model: 'claude-opus-5',
-            thinkingConfig: { type: 'disabled' },
-            maxRetries: 2,
-          },
+        const e = midStreamError(
+          '{"type":"error","error":{"type":"api_error","message":"Our servers are currently overloaded. Please try again later."}}',
         )
-        let out = await gen.next()
-        while (out.done !== true) out = await gen.next()
+        await runLoop(a => (a < 2 ? e : null), { maxRetries: 2 })
       },
     )
     expect(seen).toHaveLength(1)
@@ -183,6 +365,10 @@ describe('真的重试循环', () => {
   }, 30_000)
 })
 
+/**
+ * 归一表**不再决定重试与否**,但仍然是三条岔路的判据:切 fallbackModel、持久重试只对
+ * 容量类无限等、以及退避那一行上印的状态码。所以它自己那一档留着。
+ */
 describe('归一成状态码', () => {
   it('overloaded_error → 529,并且 is529Error 认得(回落模型那条路要用)', () => {
     const e = midStreamError(
@@ -204,6 +390,20 @@ describe('归一成状态码', () => {
     ).toBe(500)
   })
 
+  /** OpenAI 系与只填 code 的网关,拼写不同、说的是同一件事。 */
+  it('三家的拼写都认得', () => {
+    expect(
+      transientStatusFromErrorPayload(
+        midStreamError('{"error":{"message":"boom","type":"server_error","code":null}}'),
+      ),
+    ).toBe(500)
+    expect(
+      transientStatusFromErrorPayload(
+        midStreamError('{"error":{"message":"upstream unavailable","code":"service_unavailable"}}'),
+      ),
+    ).toBe(503)
+  })
+
   /** body 没被解析成对象时(SDK 把整段 JSON 塞进了 message),文本兜底要接住。 */
   it('只有文本时也能认出来', () => {
     const e = new APIError(
@@ -218,335 +418,24 @@ describe('归一成状态码', () => {
   /**
    * **真状态码优先**:上游明说 400 的时候,它错误体里写什么都不该翻案 ——
    * 我们自己的翻译层(roleFetch 的 failureResponse)对**任何**上游失败都写
-   * `error.type = 'api_error'`,包括那些 4xx。
+   * `error.type = 'api_error'`,包括那些 4xx。翻成 500 的话,一个 400 会被
+   * 持久重试当成容量问题无限等下去。
    */
   it('有真状态码时不被错误体翻案', () => {
-    const e = new APIError(
-      400,
-      { type: 'error', error: { type: 'api_error', message: 'bad request' } },
-      undefined,
-      new Headers(),
-    )
-    // 归一表把 api_error 读成 500,而这里**必须**仍然是 400 —— 400 走的是自己那套
-    // (次数封在 3 次、退避 10→60s),被翻成 500 就会去走通用的 10 次 × 32s。
-    expect(effectiveErrorStatus(e)).toBe(400)
-  })
-
-  /**
-   * 同一个形状在**重试判据**上的归属:400 现在按「网关形状」重试(见下面那一档),
-   * 而确定性的那一半仍然当场失败。这条钉的是「翻案与否」和「重不重试」是两件事。
-   */
-  it('真 400 的重试与否由 400 自己那套判据决定,不由归一表决定', () => {
-    const gateway = new APIError(
-      400,
-      { type: 'error', error: { type: 'api_error', message: 'bad request' } },
-      undefined,
-      new Headers(),
-    )
-    expect(shouldRetry(gateway)).toBe(true)
-    const deterministic = new APIError(
-      400,
-      { type: 'error', error: { type: 'invalid_request_error', message: 'messages: at least one message is required' } },
-      undefined,
-      new Headers(),
-    )
-    expect(shouldRetry(deterministic)).toBe(false)
-  })
-})
-
-/**
- * **同一个洞低一层:传输层的错连 APIError 都不是。**
- *
- * 上面那一档治的是「有错误体、没状态码」。跑机(qianbase-xtp run 001)在那之后的日志里,
- * **每一个**杀掉席位的错误都换成了这一类,16/20 逐字是
- *
- *     角色调用失败: API Error: The socket connection was closed unexpectedly.
- *     For more information, pass `verbose: true` in the second argument to fetch()
- *
- * 那是 Bun 的 fetch 在**消费响应流**时抛的普通 Error —— SDK 只包装 `fetch()` 本身抛出的
- * 异常,流是后来才炸的,所以既不是 APIError 也不是 APIConnectionError。而 `withRetry`
- * 那道闸写的是「不是 APIError 就一定不重试」。
- */
-describe('传输层失败(连 APIError 都不是的那一类)', () => {
-  /** Bun 在流被中途掐断时抛的那一个,逐字。 */
-  const bunSocketClose = (): Error =>
-    new Error(
-      'The socket connection was closed unexpectedly. For more information, ' +
-      'pass `verbose: true` in the second argument to fetch()',
-    )
-
-  it('跑机上那 16 次:socket 被掐断,现在算可重试', () => {
-    expect(isRetryableTransportError(bunSocketClose())).toBe(true)
-  })
-
-  it('按错误码认(ECONNRESET / undici 的超时)', () => {
-    expect(isRetryableTransportError(Object.assign(new Error('read'), { code: 'ECONNRESET' }))).toBe(true)
-    expect(isRetryableTransportError(Object.assign(new Error('x'), { code: 'UND_ERR_HEADERS_TIMEOUT' }))).toBe(true)
-  })
-
-  /**
-   * **最常见的形状:外层文本太笼统,真因挂在 `cause` 上。**
-   *
-   * 外层**故意不用** `fetch failed` —— 那一句本身就在文本表里,拿它做输入的话
-   * 第一层就返回 true,`cause` 那条递归一次都不执行。第一版探针就是这么写的,
-   * 变异测试当场证明:剪掉整条 `cause` 递归,22 条测试一条不红。
-   */
-  it('穿透 cause:外层文本不匹配,真因在 cause 上(ECONNRESET)', () => {
-    const inner = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' })
-    const outer = Object.assign(new Error('request to http://10.10.20.9/v1 did not complete'), { cause: inner })
-    expect(isRetryableTransportError(outer)).toBe(true)
-    // 反证外层自己不算数,这条测的确实是递归。
-    expect(isRetryableTransportError(new Error('request to http://10.10.20.9/v1 did not complete'))).toBe(false)
-  })
-
-  /** undici 真实的形状。它靠外层文本就能认出来 —— 记在这里免得有人以为上一条多余。 */
-  it('undici 的 TypeError: fetch failed 靠外层文本就认得', () => {
-    expect(isRetryableTransportError(new TypeError('fetch failed'))).toBe(true)
-  })
-
-  it('cause 成环也不挂(深度有界)', () => {
-    const a = new Error('outer') as Error & { cause?: unknown }
-    const b = new Error('inner') as Error & { cause?: unknown }
-    a.cause = b
-    b.cause = a
-    expect(isRetryableTransportError(a)).toBe(false)
-  })
-
-  /**
-   * **中止不是传输故障。** 用户按 Esc、阶段超时闸门开火,底层长得和「连接断了」一模一样;
-   * 当成故障重试 = 用户按了停止之后又跑十次。`roleFetch` 的 catch 里为同一件事写过同一条例外。
-   */
-  it('AbortError 不重试,哪怕它同时长着一句 socket 文本', () => {
-    expect(isRetryableTransportError(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }))).toBe(false)
-    const aborted = Object.assign(bunSocketClose(), { name: 'AbortError' })
-    expect(isRetryableTransportError(aborted)).toBe(false)
-  })
-
-  /**
-   * **配置错不重试。** 域名打错一个字母、网关没起 —— 重试十次只是把一句能看懂的报错
-   * 换成五分钟之后的同一句。和归一表那边「认不出来的一律沿用旧行为」同源。
-   */
-  it('ENOTFOUND / ECONNREFUSED 仍然当场失败', () => {
-    expect(isRetryableTransportError(Object.assign(new Error('getaddrinfo ENOTFOUND typo.example'), { code: 'ENOTFOUND' }))).toBe(false)
-    expect(isRetryableTransportError(Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }))).toBe(false)
-  })
-
-  it('普通的业务异常不受影响', () => {
-    expect(isRetryableTransportError(new Error('方案解析失败'))).toBe(false)
-    expect(isRetryableTransportError(null)).toBe(false)
-    expect(isRetryableTransportError('socket connection was closed')).toBe(false) // 字符串不是错误对象
-  })
-
-  /**
-   * 从**真的** `withRetry` 循环外面看。这一条才是用户报的那件事:
-   * 修之前它在第一次就 `CannotRetryError`,那一席当场死掉。
-   *
-   * 变异:把闸上的 `!transport &&` 删掉 → 这条红。
-   */
-  it('真循环:socket 断两次,第三次拿到答案', async () => {
-    let attempts = 0
-    const gen = withRetry(
-      async () => ({}) as Anthropic,
-      async () => {
-        attempts++
-        if (attempts < 3) throw bunSocketClose()
-        return '答上来了'
-      },
-      { model: 'claude-opus-5', thinkingConfig: { type: 'disabled' }, maxRetries: 3 },
-    )
-    let out = await gen.next()
-    while (out.done !== true) out = await gen.next()
-    expect(out.value).toBe('答上来了')
-    expect(attempts).toBe(3)
-  }, 30_000)
-
-  /** 反向:中止在真循环里**一次都不重试**(否则 Esc 会变成十次调用)。 */
-  it('真循环:AbortError 当场结束,只调用一次', async () => {
-    let attempts = 0
-    const gen = withRetry(
-      async () => ({}) as Anthropic,
-      async () => {
-        attempts++
-        throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
-      },
-      { model: 'claude-opus-5', thinkingConfig: { type: 'disabled' }, maxRetries: 3 },
-    )
-    await (async () => {
-      try {
-        let out = await gen.next()
-        while (out.done !== true) out = await gen.next()
-      } catch { /* CannotRetryError —— 正是要的 */ }
-    })()
-    expect(attempts).toBe(1)
-  }, 30_000)
-})
-
-/**
- * **400 也重试** —— 但只重试「网关自己吐的」那一半。
- *
- * 跑机实测(qianbase-xtp run 001,7 个节点各一次):
- *
- *     POST http://10.10.20.21:3000/v1/responses → 400 Bad Request · 上游原文:
- *     {"error":{"message":"Stream must be set to true","type":"bad_response_status_code",…}}
- *
- * 这一档的两侧同样重要:**放行网关形状**(正向),**挡住四类确定性 400**(反向)。少了反向
- * 那一半,把 `isDeterministicBadRequest` 写成 `return false` 也能让正向全绿 —— 而那正是
- * 「一个必死的 400 把一席堵满 8 分钟」的形态。
- */
-describe('网关形状的 400', () => {
-  /** SDK 拿到一个**真的** HTTP 400 时造出来的东西。 */
-  function badRequest(body: unknown): APIError {
-    return new APIError(400, body, undefined, new Headers())
-  }
-
-  /**
-   * 翻译层(`openaiCompat/roleFetch.ts`)的形状:外层 type 是 `api_error`,网关原文
-   * **整段塞在 message 里**。判据必须扫到 message,否则结构化字段永远只看到 api_error。
-   */
-  function roleFetch400(upstream: string): APIError {
-    return badRequest({
+    const e = httpError(400, {
       type: 'error',
-      error: {
-        type: 'api_error',
-        message: `员工「测试」(openai-responses 协议)调用失败 · POST http://10.10.20.21:3000/v1/responses → 400 Bad Request · 上游原文:${upstream}`,
-      },
+      error: { type: 'api_error', message: 'bad request' },
     })
-  }
+    expect(effectiveErrorStatus(e)).toBe(400)
+    expect(is529Error(e)).toBe(false)
+  })
 
-  /** 主判据。变异:`isRetryableGatewayBadRequest` 恒返回 false → 这条红。 */
-  it('跑机实测那句 Stream must be set to true 会重试', () => {
-    const e = roleFetch400(
-      '{"error":{"message":"Stream must be set to true","type":"bad_response_status_code","param":"","code":"bad_response_status_code"}}',
+  /** 鉴权类故意不映射:401 会触发一次 OAuth 刷新,那不该由一帧流中错误发起。 */
+  it('鉴权类不归一(但它照样重试)', () => {
+    const e = midStreamError(
+      '{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}',
     )
-    expect(e.status).toBe(400)
+    expect(transientStatusFromErrorPayload(e)).toBeUndefined()
     expect(shouldRetry(e)).toBe(true)
   })
-
-  it('网关把自己的故障写成 400 的那些,也重试', () => {
-    expect(shouldRetry(badRequest({ error: { message: 'upstream connect error', code: 'bad_gateway' } }))).toBe(true)
-    expect(shouldRetry(badRequest('Bad Request'))).toBe(true)
-  })
-
-  /**
-   * 反向 ①:提示词超长。它有压缩重发那条专门的路(`PROMPT_SHRINK_RATIOS`),
-   * 原样重发三次只是把该说的那句话推迟半分钟。
-   */
-  it('提示词超长的 400 仍然不重试', () => {
-    const e = badRequest({
-      type: 'error',
-      error: { type: 'invalid_request_error', message: 'prompt is too long: 250000 tokens > 200000 maximum' },
-    })
-    expect(shouldRetry(e)).toBe(false)
-  })
-
-  /**
-   * 反向 ②:**同一件事经翻译层出来**。外层是 api_error,只有 message 里那段原文能说明
-   * 它是长度问题。变异:把 `isDeterministicBadRequest` 的文本兜底删掉 → 这条红。
-   */
-  it('翻译层包过一层的长度类 400,仍然认得出来', () => {
-    const e = roleFetch400(
-      '{"error":{"message":"This model\'s maximum context length is 128000 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}',
-    )
-    expect(isDeterministicBadRequest(e)).toBe(true)
-    expect(shouldRetry(e)).toBe(false)
-  })
-
-  /** 反向 ③:工具块对不上 —— 重发的是同一段坏掉的历史。 */
-  it('tool_use id 重复的 400 仍然不重试', () => {
-    const e = badRequest({
-      type: 'error',
-      error: { type: 'invalid_request_error', message: 'messages.12: `tool_use` ids must be unique' },
-    })
-    expect(shouldRetry(e)).toBe(false)
-  })
-
-  /** 反向 ④:配置错。 */
-  it('模型名写错的 400 仍然不重试', () => {
-    expect(shouldRetry(badRequest({ error: { message: 'The model `gpt-9` does not exist', code: 'model_not_found' } }))).toBe(false)
-  })
-
-  /** 判据只管 400 —— 别的状态码有各自的策略,不该从这条路进来。 */
-  it('只对 400 生效', () => {
-    expect(isRetryableGatewayBadRequest(new APIError(500, {}, undefined, new Headers()))).toBe(false)
-    expect(isRetryableGatewayBadRequest(new APIError(429, {}, undefined, new Headers()))).toBe(false)
-    expect(isRetryableGatewayBadRequest(new APIError(undefined, { type: 'error', error: { type: 'api_error' } }, undefined, new Headers()))).toBe(false)
-  })
-
-  /**
-   * 退避的两个端点。10s 起、翻倍、封顶 60s —— 抖动只往上加(≤25%),所以下界就是基数。
-   * 变异:把 `baseDelayMs` 这个新参数去掉(回落到 500ms)→ 这条红。
-   */
-  it('退避是 10→20→40,封顶 60', () => {
-    const at = (n: number) => getRetryDelay(n, null, 60_000, 10_000)
-    expect(at(1)).toBeGreaterThanOrEqual(10_000)
-    expect(at(1)).toBeLessThan(12_500 + 1)
-    expect(at(2)).toBeGreaterThanOrEqual(20_000)
-    expect(at(3)).toBeGreaterThanOrEqual(40_000)
-    expect(at(9)).toBeLessThanOrEqual(60_000 * 1.25)
-    expect(at(9)).toBeGreaterThanOrEqual(60_000)
-  })
-
-  /**
-   * **封顶真的存在**。用 `CLAUDE_CODE_MAX_400_RETRIES=0` 量:一个必死的 400 在真循环里
-   * 只调用一次就结束,而不是走满通用的那 10 次。
-   *
-   * 变异:把主循环里 `badRequestRetries > getMaxBadRequestRetries()` 那一段删掉 →
-   * 这条会跑满 10 次(并且要等好几分钟)→ 红。
-   */
-  it('真循环:次数用完当场结束,不占用通用的 10 次', async () => {
-    const prev = process.env.CLAUDE_CODE_MAX_400_RETRIES
-    process.env.CLAUDE_CODE_MAX_400_RETRIES = '0'
-    let attempts = 0
-    try {
-      const gen = withRetry(
-        async () => ({}) as Anthropic,
-        async () => {
-          attempts++
-          throw badRequest({ error: { message: 'Stream must be set to true', code: 'bad_response_status_code' } })
-        },
-        { model: 'claude-opus-5', thinkingConfig: { type: 'disabled' }, maxRetries: 10 },
-      )
-      try {
-        let out = await gen.next()
-        while (out.done !== true) out = await gen.next()
-      } catch { /* CannotRetryError —— 正是要的 */ }
-    } finally {
-      if (prev === undefined) delete process.env.CLAUDE_CODE_MAX_400_RETRIES
-      else process.env.CLAUDE_CODE_MAX_400_RETRIES = prev
-    }
-    expect(attempts).toBe(1)
-  }, 30_000)
-
-  /**
-   * 而次数没用完的时候它**真的会再发一次** —— 这一条是从真循环外面看的正向探针。
-   * 要等一次真实退避(10s),所以只留一次重试。
-   */
-  it('真循环:网关 400 一次之后,第二次拿到答案', async () => {
-    const prev = process.env.CLAUDE_CODE_MAX_400_RETRIES
-    process.env.CLAUDE_CODE_MAX_400_RETRIES = '1'
-    let attempts = 0
-    let value: unknown
-    try {
-      const gen = withRetry(
-        async () => ({}) as Anthropic,
-        async () => {
-          attempts++
-          if (attempts < 2) {
-            throw badRequest({ error: { message: 'Stream must be set to true', code: 'bad_response_status_code' } })
-          }
-          return '答上来了'
-        },
-        { model: 'claude-opus-5', thinkingConfig: { type: 'disabled' }, maxRetries: 10 },
-      )
-      let out = await gen.next()
-      while (out.done !== true) out = await gen.next()
-      value = out.value
-    } finally {
-      if (prev === undefined) delete process.env.CLAUDE_CODE_MAX_400_RETRIES
-      else process.env.CLAUDE_CODE_MAX_400_RETRIES = prev
-    }
-    expect(value).toBe('答上来了')
-    expect(attempts).toBe(2)
-  }, 40_000)
 })
-
