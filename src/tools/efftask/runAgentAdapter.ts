@@ -1,5 +1,6 @@
 import { realpathSync } from 'node:fs'
 import { basename, dirname } from 'node:path'
+import { LOCAL_CONTEXT_LIMIT_DETAIL } from '../../services/api/errors.js'
 import { runAgent } from '../AgentTool/runAgent.js'
 import type { AgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import type { ToolUseContext, Tools } from '../../Tool.js'
@@ -195,6 +196,20 @@ export type ProviderErrorKind =
    * 也不是 quota,得自己一档:`makeRunAgentFn` 认这一档去压缩重发。
    */
   | 'prompt_too_long'
+  /**
+   * **是我们自己判死的**,请求根本没发出去(`query.ts` 的硬封顶闸)。
+   *
+   * 和 `prompt_too_long` 分开,理由和 quota/rate_limit 分开逐字相同:两者的正文
+   * **完全一样**(都是 `Prompt is too long`),而该做的事正相反 —— 真拒收说明对面收不下,
+   * 该收窗口该压缩(引擎已经会自己救一次);本地闸说明**我们自己的估算 + 阈值**把这一轮
+   * 拦下了,该看的是压缩为什么没压下去,不是对面。
+   *
+   * 2026-08-19 跑机上这条区分缺席的代价:10 个执行席位被本地闸打死(全 run 复核:10 席
+ * 全部命中 PTL,`errorDetails` 一条都没有),而阻断卡照着「上游
+   * 拒收」那套建议用户去**调大** `contextWindow` —— 调大只会把闸门和压缩阈值之间的
+   * 必杀区间拉得更宽,越听话死得越快。
+   */
+  | 'local_context_limit'
 
 /**
  * 429 走**结构化**字段,529/overloaded 只能认文案 —— 这条不对称是实测的,不是偷懒:
@@ -243,12 +258,20 @@ const PROMPT_TOO_LONG_TEXT = /prompt is too long|input length and `max_tokens` e
 export function providerErrorInfoOf(
   messages: readonly unknown[],
 ): { text: string; kind?: ProviderErrorKind } | undefined {
-  for (const m of messages as { type?: string; isApiErrorMessage?: boolean; error?: string }[]) {
+  for (const m of messages as {
+    type?: string
+    isApiErrorMessage?: boolean
+    error?: string
+    errorDetails?: string
+  }[]) {
     if (m?.type !== 'assistant' || m.isApiErrorMessage !== true) continue
     const raw = collectText([m] as never)
     const text = raw.trim() === '' ? '模型服务返回了一条空的错误消息' : raw
     const kind: ProviderErrorKind | undefined = PROMPT_TOO_LONG_TEXT.test(text)
-      ? 'prompt_too_long'
+      ? // 正文分不开这两种(逐字相同),署名才分得开 —— 见 LOCAL_CONTEXT_LIMIT_DETAIL。
+        m.errorDetails === LOCAL_CONTEXT_LIMIT_DETAIL
+        ? 'local_context_limit'
+        : 'prompt_too_long'
       : QUOTA_TEXT.test(text)
         ? 'quota'
         : m.error === 'rate_limit' || RATE_LIMIT_TEXT.test(text) ? 'rate_limit' : undefined
@@ -1155,9 +1178,23 @@ export const PROMPT_SHRINK_RATIOS = [0.55, 0.3, 0.15]
  */
 export const PROMPT_SHRINK_WORTH_IT = 20_000
 
-/** 这个错是不是上游在说「提示词太长」。 */
+/**
+ * 这个错是不是「装不下」—— **上游说的和我们自己判的都算**。
+ *
+ * 两档都要认,因为这个函数的下游是 `makeRunAgentFn` 的压缩重发(PROMPT_SHRINK_RATIOS
+ * 三档)。本地闸量的是**整段对话**,而席位第一轮时那段对话**就是**我们发过去的提示词
+ * (方案正文 + 历次意见 + 执行自述都在里面),压到 55% / 30% / 15% 是那一轮唯一真正
+ * 能让它过闸的手段 —— 摘要压缩在只有一条消息时救不了。
+ *
+ * 只认 `prompt_too_long` 的那一版把这条路对本地闸整条关掉了(验收实测:重发次数
+ * 3 → 1,节点第一次就 BLOCKED)。而「提示词本来就不长时不压」有 `PROMPT_SHRINK_WORTH_IT`
+ * 单独把关,所以两档都认不会白花重试。
+ */
 export function isPromptTooLongError(e: unknown): boolean {
-  return e instanceof ProviderApiError && e.kind === 'prompt_too_long'
+  return (
+    e instanceof ProviderApiError &&
+    (e.kind === 'prompt_too_long' || e.kind === 'local_context_limit')
+  )
 }
 
 /**

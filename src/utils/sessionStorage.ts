@@ -642,12 +642,32 @@ class Project {
     }
   }
 
-  private async drainWriteQueue(): Promise<void> {
+  /** 每条「值得等」的记录**第一次**被这么判定的时刻。见 writableQueuePrefix。 */
+  private finalizeFirstSeen = new WeakMap<object, number>()
+
+  /**
+   * @param force 无条件写出去,不为「等待定稿」留任何一条。
+   *   `flush()` 必须传 true:关机/切会话时再等下去就是**丢记录**,而一条 usage 是 0 的
+   *   记录远好过一条不存在的记录。
+   */
+  private async drainWriteQueue(force = false): Promise<void> {
     for (const [filePath, queue] of this.writeQueues) {
       if (queue.length === 0) {
         continue
       }
-      const batch = queue.splice(0)
+      /**
+       * **等一条未定稿的记录时,它后面的也要一起等。**
+       *
+       * 只把它自己留下、先写后面的,会把文件顺序打乱 —— 而 transcript 是靠
+       * `parentUuid` 串起来的链,同时流式工具执行(`streamingToolExecutor`)会在
+       * assistant 还没定稿时就产生 tool_result 记录,所以「后面的先到」是真实会发生的。
+       * 顺序一乱,`--resume` 重建出来的父子关系就是错的。
+       */
+      const cut = writableQueuePrefix(queue, force, this.finalizeFirstSeen)
+      if (cut === 0) {
+        continue
+      }
+      const batch = queue.splice(0, cut)
 
       let content = ''
       const resolvers: Array<() => void> = []
@@ -848,8 +868,9 @@ class Project {
     if (this.activeDrain) {
       await this.activeDrain
     }
-    // Drain anything remaining in the queues
-    await this.drainWriteQueue()
+    // Drain anything remaining in the queues. force:见 drainWriteQueue 的参数注释 ——
+    // 这里再为「等定稿」留一条,就是把它永远留在内存里。
+    await this.drainWriteQueue(true)
 
     // Wait for non-queue tracked operations (e.g. removeMessageByUuid)
     if (this.pendingWriteCount === 0) {
@@ -5102,4 +5123,116 @@ export async function enrichLogs(
   }
 
   return { logs: result, nextIndex: i }
+}
+
+/**
+ * 这条 assistant 记录**还没定稿**吗?
+ *
+ * `claude.ts` 在 `message_delta` 里把最终的 `usage` 和 `stop_reason` **一起**原地写回
+ * `newMessages.at(-1)`(两条相邻赋值,同一个 `if` 块、中间没有 await,所以同生共死),
+ * 而记录是在更早的 `content_block_stop`
+ * 就入队的。队列存的是**活引用**、序列化发生在 drain,所以只要 drain 抢在写回之前,
+ * 落盘的就是 `message_start` 铺的初值:`usage` 全 0、`stop_reason: null`。
+ *
+ * **这不是理论风险,是实测的常态。** 2026-08-19 跑机上量到:openai-responses 协议的席位,
+ * 最后一个内容块到 `message_delta` 之间隔 **121ms**(该协议的 usage 只在
+ * `response.completed` 帧里,要等整条流跑完),而 drain 周期是 100ms —— 于是
+ * **234 次响应里只有 58 次(24.8%)的 usage 落到了盘上**;同机 chat 协议的席位
+ * 收口只差 1ms,落盘率 100%。
+ *
+ * 代价不是「统计不好看」:`--resume` 和 `reconstructForSubagentResume` 都从盘上重建,
+ * 而 `tokenCountWithEstimation` 会锚在一条全 0 的记录上返回约 0 —— 恢复出来的会话
+ * 以为自己是空的。事后排查同样被它骗:一次真实事故的四席评审里有三席据此得出了错误
+ * 的根因,直到有人去比对旁路的用量表才发现盘上那份是残的。
+ *
+ * `QueryEngine.ts` 那段「fire-and-forget for assistant messages」的注释明写着它**在指望**
+ * 这次惰性序列化能接住写回 —— 这个函数让那个指望真的成立,而不是一场竞态。
+ *
+ * 判据只看 `stop_reason`,不看 `usage`:两者同生共死,而 `stop_reason` 没有「合法的
+ * 空值」这种歧义(`usage` 全 0 理论上可以是别的原因)。
+ */
+export function isUnfinalizedAssistantEntry(entry: unknown): boolean {
+  const e = entry as { type?: string; message?: { stop_reason?: unknown } }
+  return (
+    e?.type === 'assistant' &&
+    e.message !== undefined &&
+    e.message !== null &&
+    (e.message.stop_reason === null || e.message.stop_reason === undefined)
+  )
+}
+
+/**
+ * 一条未定稿的记录最多让 drain 等多久(**墙钟毫秒,不是轮数**)。
+ *
+ * 早先这个数是「跳过几轮」,而 `Project` 那个私有的 `FLUSH_INTERVAL_MS`(本文件,默认
+ * 100ms)并不是常量:`setRemoteIngressUrl` /
+ * `setInternalEventWriter` 会把它从 100ms 改成 **10ms**。于是 5 轮在 remote/CCR 模式下
+ * 只有 50ms,而实测要等的是 121ms —— 整条修复在那一档**完全失效**,盘上照样是一条
+ * `usage` 全 0 的记录(验收席实测:83ms 就写出去了)。改成墙钟之后两档行为一致。
+ *
+ * 400ms 对 121ms 有三倍余量。**必须有上限**:流被中断、上游报错早退(`w.error()` 那条路
+ * 不发 `message_delta`)时那条记录永远不会定稿,没有上限就是永久卡住 —— 而卡住的不只是
+ * 它自己,还有它后面所有排队的记录(见 {@link writableQueuePrefix} 为什么要连坐)。
+ * 到点就按现状写出去:一条 usage 是 0 的记录,总好过一条不存在的记录。
+ */
+export const FINALIZE_WAIT_MS = 400
+
+/**
+ * 这一轮 drain 能写出去队列里的**前几条**。
+ *
+ * 返回值是可写前缀的长度:0 = 一条都不写(队头就是那条要等的)。
+ * `firstSeen` 就地记账,记的是这条记录**第一次**被判为「值得等」的时刻。
+ *
+ * ## 只等**队列里最后那条**未定稿的 assistant
+ *
+ * 这是判据里最要紧的一句。`claude.ts` 的 `content_block_stop` 给**每个内容块**各造一条
+ * AssistantMessage(`{ ...partialMessage, content }` —— 是新对象),而 `message_delta`
+ * 只写回 `newMessages.at(-1)`。也就是说一条多块响应里,**除最后一块外的记录
+ * `stop_reason` 永远是 null**:它们不是「还没定稿」,是**永远不会定稿**。
+ *
+ * 早先的版本对它们一视同仁地等,而 text+tool_use 这种两块响应是 agent 循环里最普通的一轮。
+ * 两席验收各自实测出同一组数(真写盘路径):
+ *   单块(已定稿) 128ms → 两块 610ms(4.8×)→ 四块 1608ms(12.6×)
+ * 白等,而且把崩溃/SIGKILL 的丢失窗口从 ~100ms 拉到 ~1.6s —— 和这条修复要治的
+ * 「恢复出来的会话以为自己是空的」是同一类事故。
+ *
+ * ## 为什么要连坐
+ *
+ * 只把要等的那条留下、先写它后面的,会把文件顺序打乱 —— transcript 是靠 `parentUuid`
+ * 串起来的链,而流式工具执行(`streamingToolExecutor`)会在 assistant 还没定稿时就产生
+ * tool_result 记录,所以「后面的先到」是真实会发生的。顺序一乱,`--resume` 重建出来的
+ * 父子关系就是错的。
+ *
+ * @param force 无条件全写。`flush()` 传 true:关机/切会话时再等下去就是**丢记录**。
+ * @param now   注入时钟,给探针用。
+ */
+export function writableQueuePrefix(
+  queue: readonly { entry: unknown }[],
+  force: boolean,
+  firstSeen: WeakMap<object, number>,
+  now: () => number = Date.now,
+): number {
+  if (force) return queue.length
+  /**
+   * 候选只有一条:队列里**最后那条 assistant**,不管它定没定稿。
+   *
+   * `message_delta` 只写回 `newMessages.at(-1)`,所以在它前面的 assistant 记录**永远**
+   * 不会被写回 —— 哪怕它们的 `stop_reason` 还是 null。判据要是写成「最后一条**未定稿的**
+   * assistant」就会踩到最常见的那一轮:text(永不定稿)+ tool_use(定稿),它会回头去等
+   * 那条 text —— 实测落盘 122ms → 509ms,和不修一样亏。
+   */
+  let last = -1
+  for (let i = 0; i < queue.length; i++) {
+    const e = queue[i]!.entry as { type?: string }
+    if (e?.type === 'assistant') last = i
+  }
+  if (last < 0 || !isUnfinalizedAssistantEntry(queue[last]!.entry)) return queue.length
+  const key = queue[last]!.entry as object
+  const seen = firstSeen.get(key)
+  const t = now()
+  if (seen === undefined) {
+    firstSeen.set(key, t)
+    return last
+  }
+  return t - seen >= FINALIZE_WAIT_MS ? queue.length : last
 }

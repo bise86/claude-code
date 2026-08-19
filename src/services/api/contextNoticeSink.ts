@@ -43,6 +43,13 @@ export type ContextNoticeKind =
    * 而用户上一次为这类静默付的代价就是那句「没看到日志」。
    */
   | 'api-retry'
+  /**
+   * 上游说上下文超长,我们把这个员工的窗口上界收到实测值、压缩一次之后重发。
+   *
+   * 必须被看见:它同时说明了两件用户改得动的事 —— settings 里那个 `contextWindow`
+   * 写大了(大多少这行会印出来),以及这一轮的产出被摘要取代了。
+   */
+  | 'ptl-ceiling-retry'
 
 export interface ContextNotice {
   kind: ContextNoticeKind

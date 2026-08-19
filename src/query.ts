@@ -6,11 +6,12 @@ import type {
 import type { CanUseToolFn } from './hooks/useCanUseTool.js'
 import { FallbackTriggeredError } from './services/api/withRetry.js'
 import {
-  calculateTokenWarningState,
   isAutoCompactEnabled,
+  shouldPreemptForContextLimit,
   type AutoCompactTrackingState,
 } from './services/compact/autoCompact.js'
 import { buildPostCompactMessages } from './services/compact/compact.js'
+import { noteUpstreamContextLimit } from './services/compact/roleContextCeiling.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
 const reactiveCompact = feature('REACTIVE_COMPACT')
   ? (require('./services/compact/reactiveCompact.js') as typeof import('./services/compact/reactiveCompact.js'))
@@ -39,8 +40,11 @@ import type {
 } from './types/message.js'
 import { logError } from './utils/log.js'
 import {
+  LOCAL_CONTEXT_LIMIT_DETAIL,
   PROMPT_TOO_LONG_ERROR_MESSAGE,
   isPromptTooLongMessage,
+  isRecoverableUpstreamContextLimit,
+  parsePromptTooLongTokenCounts,
 } from './services/api/errors.js'
 import { logAntError, logForDebugging } from './utils/debug.js'
 import {
@@ -311,6 +315,44 @@ async function* queryLoop(
   // trigger point. Loop-local (not on State) to avoid touching the 7 continue
   // sites.
   let taskBudgetRemaining: number | undefined = undefined
+
+  /**
+   * **真上游拒收上下文超长时,这一趟允许救一次。**
+   *
+   * 和 `taskBudgetRemaining` 同一个理由做成循环局部量:加进 `State` 就要改 8 个
+   * continue 点,而漏一个的后果本文件下方已经记过 —— 无限循环烧掉几千次调用。
+   *
+   * 单发是硬要求:救的动作是「压一次再重发」,而压完仍然超长时再压一次是同样的结果。
+   * 熔断由 `autoCompactIfNeeded` 自己那套 `consecutiveFailures` 兜底(走的是同一个
+   * `deps.autocompact`),这个闩只保证同一轮不打转。
+   */
+  let ptlCeilingRetryUsed = false
+  /**
+   * 自动压缩开着吗 —— **整趟只求一次**。
+   *
+   * 和本文件下方 `mediaRecoveryEnabled` 的 hoist 逐字同因:扣住(在流循环里)和恢复
+   * (流结束之后)必须给出同一个答案,而这两次求值之间隔着 5~30 秒的流。
+   * `isAutoCompactEnabled()` 读的是 `getGlobalConfig()`,那份缓存有后台 freshness
+   * watcher,别的进程写一次配置就会在流中途翻。翻成 false 的后果正是那段注释警告的形态:
+   * 消息被扣住了,而恢复分支不认它 —— 这个 fork 里 reactiveCompact / contextCollapse
+   * 都是编译期死代码,没有人会替我们把它发出来,那条报错就被吃掉了。
+   */
+  const autoCompactOn = isAutoCompactEnabled()
+  /**
+   * 这条 PTL 该不该救 —— **扣住**和**恢复**两处必须用同一个判据,否则会扣住一条
+   * 永远不会被重新发出来的消息(那正是本文件下方 mediaRecoveryEnabled 提过的坑)。
+   *
+   * 四个条件:
+   *  - 是 PTL;
+   *  - **不是我们自己的封顶闸**(见 errors.ts 的 LOCAL_CONTEXT_LIMIT_DETAIL)。拿本地闸
+   *    去收窗口是自己咬自己:窗口收小 → 阈值降低 → 更早撞自己的闸 → 再收;
+   *  - 这一趟还没救过;
+   *  - 自动压缩是开着的 —— 救的手段就是压缩,用户显式关掉时不要绕过他的决定。
+   */
+  const shouldTryPtlCeilingRetry = (msg: Message | undefined): boolean =>
+    !ptlCeilingRetryUsed &&
+    isRecoverableUpstreamContextLimit(msg as AssistantMessage | undefined) &&
+    autoCompactOn
 
   // Snapshot immutable env/statsig/session state once at entry. See QueryConfig
   // for what's included and why feature() gates are intentionally excluded.
@@ -686,14 +728,23 @@ async function* queryLoop(
       ) &&
       !collapseOwnsIt
     ) {
-      const { isAtBlockingLimit } = calculateTokenWarningState(
+      /**
+       * **员工的 `roleClientConfig` 必须一路传进去** —— 判据、为什么、以及漏传那次的
+       * 代价,都写在 `shouldPreemptForContextLimit` 上。一句话:漏传的话这道闸会用
+       * 父会话模型的默认窗口,和自动压缩按两个不同的数算,中间那一段是必杀区间。
+       */
+      const isAtBlockingLimit = shouldPreemptForContextLimit(
         tokenCountWithEstimation(messagesForQuery) - snipTokensFreed,
         toolUseContext.options.mainLoopModel,
+        toolUseContext.options.roleClientConfig,
       )
       if (isAtBlockingLimit) {
         yield createAssistantAPIErrorMessage({
           content: PROMPT_TOO_LONG_ERROR_MESSAGE,
           error: 'invalid_request',
+          // 署名。正文和 error 字段与上游那条**逐字相同**(UI 按正文精确匹配),
+          // 所以「这是谁发的」只能靠这里 —— 见 LOCAL_CONTEXT_LIMIT_DETAIL 的注释。
+          errorDetails: LOCAL_CONTEXT_LIMIT_DETAIL,
         })
         return { reason: 'blocking_limit' }
       }
@@ -873,6 +924,11 @@ async function* queryLoop(
               withheld = true
             }
             if (isWithheldMaxOutputTokens(message)) {
+              withheld = true
+            }
+            // 上游真的说上下文超长,而我们打算压一次再重发 —— 先扣住。
+            // 判据与下面的恢复分支共用,见 shouldTryPtlCeilingRetry。
+            if (shouldTryPtlCeilingRetry(message)) {
               withheld = true
             }
             if (!withheld) {
@@ -1170,6 +1226,136 @@ async function* queryLoop(
             continue
           }
         }
+      }
+      /**
+       * **上游真的拒收了上下文长度 → 学一次真实上限,压一次,重发。**
+       *
+       * 这条路存在的理由:压缩阈值是从**用户声明的** `contextWindow` 推出来的,而那句
+       * 声明写大了是默认会发生的事(用户手上只有网关标称的窗口,不含系统提示词、工具
+       * schema、以及网关自己留给输出的那一段)。阈值一旦坐在对面真实上限的外面,proactive
+       * 压缩结构上就够不着 —— 而这个 fork 里 `feature('REACTIVE_COMPACT')` 是 false、
+       * `reactiveCompact.ts` 根本不存在,撞上去之后这一席直接死掉。
+       *
+       * **学到的数从哪来**(两条都是硬证据,不是猜):
+       *  1. 上游肯说 `N tokens > M maximum` 时,M 就是它的上限;
+       *  2. 不肯说时(第三方网关基本不说),用**最后一次成功请求的大小** —— 那是一个
+       *     被证实过收得下的数。
+       *
+       * **压缩用的是同一个 `deps.autocompact`**,不是另起一套:上界收小之后阈值跟着降,
+       * 这次调用里 `shouldAutoCompact` 自然就为真了。顺带白拿它那套熔断
+       * (`consecutiveFailures`,连续 3 次失败后不再尝试)、会话记忆和压缩后清理 ——
+       * 自己 new 一条压缩路径的话这三样都要重写一遍,而它们各自都踩过坑。
+       *
+       * 压不动(阈值仍够不着 / 熔断跳闸 / 压缩自己失败)时把扣住的那条报错原样发出去,
+       * 落回原来的行为。
+       */
+      if (shouldTryPtlCeilingRetry(lastMessage)) {
+        ptlCeilingRetryUsed = true
+        const ptlMessage = lastMessage as AssistantMessage
+        const reportedLimit = ptlMessage.errorDetails
+          ? parsePromptTooLongTokenCounts(ptlMessage.errorDetails).limitTokens
+          : undefined
+        /**
+         * 上游不肯报 M 时,退回**这次被拒绝的请求有多大**,而不是「上一次成功的有多大」。
+         *
+         * 方向是判据的全部:一次成功只证明真实上限 **≥** 那个数(下界),拿下界当上界是
+         * 把窗口往死里收 —— 验收实测过这条:上一轮响应小、这一轮被一条几 MB 的工具产出
+         * 撑爆时,1M 的员工会被学成 5 万、夹到地板 4 万,而账本按员工名进程级共享、只减
+         * 不增,于是**整趟 run 余下的所有节点**都按 4 万算,每轮都在压缩。
+         *
+         * 被拒绝的大小则是真实上限的**上界**(它确实没被收下),往下收是单调收敛的:
+         * 窗口 = 失败大小 → 阈值 ≈ 0.72×失败大小,下一次多半就过了;万一还超,再学一次
+         * 更小的。每一步都有一次真实观测背书,不猜。
+         *
+         * 顺带修好另一条路:第一次 proactive 压缩已经跑过时,`messagesForQuery` 是
+         * post-compact 消息(合成模型),`tokenCountFromLastAPIResponse` 会返回 0 →
+         * 什么都学不到 → 第二次压缩参数和第一次完全一样 → 必然不压,整条恢复退化成
+         * 「白扣一次消息再原样发出去」。而 `tokenCountWithEstimation` 不依赖真实锚点。
+         */
+        const ceiling = noteUpstreamContextLimit(
+          toolUseContext.options.roleClientConfig?.roleName,
+          reportedLimit ??
+            tokenCountWithEstimation(messagesForQuery) - snipTokensFreed,
+        )
+        logForDebugging(
+          `ptl-ceiling-retry: role=${toolUseContext.options.roleClientConfig?.roleName ?? '(main)'} ` +
+            `reported=${reportedLimit ?? 'none'} ceiling=${ceiling ?? 'none'}`,
+          { level: 'warn' },
+        )
+        const { compactionResult: ptlCompaction, consecutiveFailures: ptlFailures } =
+          await deps.autocompact(
+            messagesForQuery,
+            toolUseContext,
+            {
+              systemPrompt,
+              userContext,
+              systemContext,
+              toolUseContext,
+              forkContextMessages: messagesForQuery,
+            },
+            querySource,
+            tracking,
+            snipTokensFreed,
+          )
+        if (ptlCompaction) {
+          const noticeText =
+            `上游拒收了上下文长度${ceiling === undefined ? '' : `,已把这个员工的窗口上界收到约 ${ceiling} token`}` +
+            '(压缩后重发)。这一轮的原始产出已被摘要取代。'
+          // 兜底和本文件上方 tool-result-persisted 那处逐字同因:sink 只在子 agent 那条
+          // 路上装了,主循环收不到 —— 不兜的话这条通知在主循环上是一次完整的空操作。
+          if (!reportContextNotice({ kind: 'ptl-ceiling-retry', text: noticeText })) {
+            toolUseContext.addNotification?.({
+              key: 'ptl-ceiling-retry',
+              priority: 'medium',
+              timeoutMs: 10_000,
+              text: noticeText,
+            })
+          }
+          // task_budget 结转:和 proactive / reactive 两条压缩路同因(见它们的注释)——
+          // 压缩之后服务端只看得见摘要,不告诉它压掉了多少就会把 remaining 算多。
+          if (params.taskBudget) {
+            const preCompactContext =
+              finalContextTokensFromLastResponse(messagesForQuery)
+            taskBudgetRemaining = Math.max(
+              0,
+              (taskBudgetRemaining ?? params.taskBudget.total) - preCompactContext,
+            )
+          }
+          const postCompactMessages = buildPostCompactMessages(ptlCompaction)
+          for (const msg of postCompactMessages) {
+            yield msg
+          }
+          const next: State = {
+            messages: postCompactMessages,
+            toolUseContext,
+            autoCompactTracking: undefined,
+            maxOutputTokensRecoveryCount,
+            hasAttemptedReactiveCompact,
+            maxOutputTokensOverride: undefined,
+            pendingToolUseSummary: undefined,
+            stopHookActive: undefined,
+            turnCount,
+            transition: { reason: 'ptl_ceiling_retry' },
+          }
+          state = next
+          continue
+        }
+        // 失败要**回写**熔断器,否则这条路只白拿到「读」的方向:连续失败推不动
+        // consecutiveFailures,`autoCompactIfNeeded` 的三次熔断永远跳不了闸。
+        // 和 proactive 那处(本文件上方)逐字同因。
+        if (ptlFailures !== undefined) {
+          tracking = {
+            ...(tracking ?? { compacted: false, turnId: '', turnCounter: 0 }),
+            consecutiveFailures: ptlFailures,
+          }
+        }
+        logForDebugging(
+          `ptl-ceiling-retry: 压不动(consecutiveFailures=${ptlFailures ?? 0}),把上游那条报错原样发出去`,
+          { level: 'warn' },
+        )
+        // 扣住的必须还回去 —— 否则这条报错谁都看不到,而下面那些分支
+        // (reactiveCompact / contextCollapse)在这个 fork 里全是死代码,不会替我们发。
+        yield ptlMessage
       }
       if ((isWithheld413 || isWithheldMedia) && reactiveCompact) {
         const compacted = await reactiveCompact.tryReactiveCompact({

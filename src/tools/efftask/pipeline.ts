@@ -1,5 +1,6 @@
 // src/tools/efftask/pipeline.ts
 import { relativisePaths } from './escapedPaths.js'
+import { isAutoCompactEnabled } from '../../services/compact/autoCompact.js'
 import type { DegradePhase, EffTaskConfig, NodePlan, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
 import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
@@ -498,6 +499,11 @@ type PhaseResult =
        * 建议要说的是「怎么把窗口或节点调对」,不是「先查网络」。
        */
       promptTooLong?: boolean
+      /**
+       * 请求**根本没发出去** —— 是本地封顶闸(`query.ts`)按我们自己的估算判死的。
+       * 正文和真拒收逐字相同,靠署名区分,见 runAgentAdapter 的 `local_context_limit`。
+       */
+      localContextLimit?: boolean
     }
 
 /**
@@ -518,6 +524,11 @@ type PlanPhaseResult =
       rateLimited?: boolean; quotaExhausted?: boolean
       // 和 rateLimited 逐字同因:调用方读它决定分类与建议,漏一个字段就是一条死分支。
       promptTooLong?: boolean
+      /**
+       * 请求**根本没发出去** —— 是本地封顶闸(`query.ts`)按我们自己的估算判死的。
+       * 正文和真拒收逐字相同,靠署名区分,见 runAgentAdapter 的 `local_context_limit`。
+       */
+      localContextLimit?: boolean
     }
 // Wraps a direct runAgent phase call (plan/execute). A throw OR an abort observed
 // after the call yields ok:false with a reason; the caller hands it to blockWithReason,
@@ -553,11 +564,15 @@ const RATE_LIMIT_ATTEMPTS = 3
  */
 function blockCategoryOf(res: {
   timeout?: boolean; rateLimited?: boolean; quotaExhausted?: boolean; promptTooLong?: boolean
+  localContextLimit?: boolean
 }): BlockCategory | undefined {
   if (res.timeout === true) return 'timeout'
   // 提示词超长也算 infra:它和「上游不可用」一样**不是这个节点干得好不好**的问题,而且
   // 用户改完窗口/员工之后要靠 `--retry-blocked` 把节点捞回来 —— 那条路只认带分类的阻断。
-  if (res.promptTooLong === true) return 'infra'
+  // 提示词超长(上游拒收 / 本地封顶闸)都算 infra。这一行是**文档不是判据** ——
+  // 函数末尾的兜底同样返回 'infra',删掉它行为一个字节都不变(验收席实测过)。
+  // 留着是因为下一个人读到这里会想问「这两种归哪一类」,而答案写在这里比写在兜底上清楚。
+  if (res.promptTooLong === true || res.localContextLimit === true) return 'infra'
   // 限流和额度用尽都**必须**带分类:不带的话 `capBlocked` 是 false、`capCategory` 是
   // undefined —— 阻断卡给不出任何对症建议,而 `--retry-blocked` 也捞不回这个节点。
   if (res.rateLimited === true || res.quotaExhausted === true) return 'infra'
@@ -583,8 +598,14 @@ function blockCategoryOf(res: {
 /** 对症的那一句。省略 = 用 category 的默认那版。 */
 function remedyOf(res: {
   timeoutKind?: TimeoutKind; rateLimited?: boolean; quotaExhausted?: boolean; promptTooLong?: boolean
+  localContextLimit?: boolean
 }): string | undefined {
   if (res.timeoutKind === 'human') return humanTimeoutRemedy()
+  /**
+   * **不是上游拒收,是我们自己判死的。** 两者正文逐字相同,所以这一句必须和下面那句
+   * 分开 —— 说错了用户会去调一个和这次失败无关的旋钮,而且是往错的方向调。
+   */
+  if (res.localContextLimit === true) return localContextLimitRemedy()
   /**
    * 提示词太长,而且**已经压缩重发过三次**。默认那句「先确认角色模型/网络可用」在这里
    * 是纯误导:上游是通的,收不下的是我们发过去的字数。
@@ -662,6 +683,9 @@ async function runPhaseOnce(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], me
       quotaExhausted: e instanceof ProviderApiError && e.kind === 'quota',
       // 适配层已经压缩重发过了(PROMPT_SHRINK_RATIOS 三档),还到这里就是真收不下。
       promptTooLong: e instanceof ProviderApiError && e.kind === 'prompt_too_long',
+      // 请求**没发出去**,本地封顶闸判的 —— 见 runAgentAdapter 的 local_context_limit。
+      localContextLimit:
+        e instanceof ProviderApiError && e.kind === 'local_context_limit',
       // 取消带回来的那部分产出。别的失败路径没有它(runPhase 的 text 只在
       // 「成功之后才发现 abort」那条路上才有),所以这里是取消**独有**的一份。
       text: e instanceof NodeCancelledError ? e.partialText : undefined,
@@ -834,17 +858,66 @@ function rateLimitRemedy(): string {
 }
 
 /**
- * 提示词超长、而且压缩重发三次仍被拒时该给的那一句。
+ * **上游真的拒收**了上下文长度,而且引擎已经自动救过一次仍然不行时的那一句。
  *
- * 说的是**这一层能动的三个旋钮**,而不是「等一等」或「查网络」:上游是通的,拒收的是字数。
- * 压缩本身已经在 `makeRunAgentFn` 里发生过(见 PROMPT_SHRINK_RATIOS),所以走到这里意味着
- * 这个员工的窗口小到连压过的提示词都收不下 —— 最可能的是它根本不是一个大窗口的模型。
+ * 走到这里意味着两道防线都没拦住:引擎在收到上游那条 400 之后,已经把这个员工的窗口上界
+ * 收到实测值(上游报的 M,或者最后一次成功请求的大小)、压缩了一次并重发 —— 见
+ * `query.ts` 的 ptl-ceiling-retry。所以建议要说的是「声明值离真实上限有多远」和
+ * 「这个节点是不是本来就太大」,而不是「等一等」或「查网络」。
+ *
+ * ## 这句话上一版是有害的,记在这里免得长回去
+ *
+ * 上一版写的是「给这个员工声明真实的上下文窗口(…写 contextWindow)」。当时封顶闸漏传员工
+ * 窗口(见 `query.ts` 那处),闸门恒在 177000,而压缩阈值跟着声明值走 —— 于是**声明得越大,
+ * 两者之间的必杀区间越宽**:声明 233000 是 [177000, 200000),声明 1M 是 [177000, 967000)。
+ * 2026-08-19 跑机上 10 个执行席位就是照着这句建议配出来后被打死的。闸门那个 bug 已经修了,
+ * 但这句话的方向本来就是反的:窗口该往**小**里收,不是往大里写。
  */
 function promptTooLongRemedy(): string {
-  return '上游拒收的是**长度**(不是限流、也不是网络)。先看一眼这次调用里有没有某个工具一次返回了几 MB —— '
-    + 'Glob `**/*`、Read 一份超大文件、MCP 一次全量查询都会,而上游说的「太长」指的是**整段对话**,不只是我们发过去的提示词。'
-    + '可做的三件事:给这个员工声明真实的上下文窗口(.claude/settings.json 的角色配置里写 contextWindow),'
-    + '换一个窗口更大的员工模型,或者把这个节点拆小(方案正文/执行自述/历次意见越攒越长,越往后越容易撞)。'
+  /**
+   * **「引擎已经救过一次」这句话有前提** —— 恢复分支带着 `isAutoCompactEnabled()`。
+   * 用户显式关掉自动压缩时引擎一次都没救过,把它说成救过是在让人跳过唯一有效的那个开关。
+   */
+  const rescued = isAutoCompactEnabled()
+    ? '引擎已经自动把这个员工的窗口上界收到实测值、压缩一次并重发过了,仍然被拒 —— 所以这不是「再试一次」能过去的。'
+    : '**自动压缩被关掉了**(DISABLE_AUTO_COMPACT / autoCompactEnabled),所以引擎这一层没有做任何补救 —— 先打开它。'
+  return '上游拒收的是**长度**(不是限流、也不是网络,上游是通的)。' + rescued
+    + '两件该做的事:'
+    + '① 把 .claude/settings.json 里这个员工的 contextWindow 往**小**里写(网关标称的窗口不含系统提示词、工具 schema,'
+    + '也不含它自己留给输出的那一段;写大了压缩阈值就够不着),或者干脆删掉让引擎按协议默认值估;'
+    + '② 把这个节点拆小 —— 方案正文/执行自述/历次意见是累积的,节点越大越往后越容易撞。'
+}
+
+/**
+ * **不是上游拒收,是我们自己判死的**那一句。
+ *
+ * `query.ts` 的硬封顶闸按本地估算判定这一轮装不下,于是合成一条正文与上游拒收**逐字相同**
+ * 的报错,而请求根本没发出去。区分靠署名(`LOCAL_CONTEXT_LIMIT_DETAIL`),不靠正文。
+ *
+ * 闸门现在恒在自动压缩阈值**之后**(见 `autoCompact.ts` 的 max 那处),所以走到这里只剩
+ * 一种情况:**压缩跑了,但没能把上下文压到阈值以下**。该看的是压缩为什么没成功,
+ * 而不是这个员工的窗口 —— 调大窗口不会让这条闸让路,只会把压缩阈值一起抬高。
+ */
+function localContextLimitRemedy(): string {
+  /**
+   * **两种世界,两句话。** 「闸门排在自动压缩之后」这条不变量由 `calculateTokenWarningState`
+   * 的 `Math.max` 保证,而那个 `Math.max` **带着 `isAutoCompactEnabled()` 前提**。
+   *
+   * 压缩关掉时闸门回到 `effective − 3000`、排在压缩之前(压缩根本不跑),这时候
+   * 「压缩跑了但没压下去」和「调大窗口没有用」**两句都是反的** —— 那种情况下调大窗口
+   * 恰恰是唯一有用的旋钮。2026-08-19 那次事故就是建议把用户推向了错误的旋钮,
+   * 这里不要用反方向再犯一次。
+   */
+  if (!isAutoCompactEnabled()) {
+    return '这条不是上游拒收 —— 请求**没有发出去**,是本地的上下文封顶闸按估算判的(上游是通的)。'
+      + '而**自动压缩被关掉了**(DISABLE_AUTO_COMPACT / autoCompactEnabled),所以这道闸是唯一的保护,'
+      + '它排在 effective 窗口减 3000 的位置。要么打开自动压缩(推荐,引擎会自己压),'
+      + '要么把这个员工的 contextWindow 调大到与网关真实上限相符,要么把节点拆小。'
+  }
+  return '这条不是上游拒收 —— 请求**没有发出去**,是本地的上下文封顶闸按估算判的(上游是通的)。'
+    + '闸门排在自动压缩之后,所以走到这里说明**压缩跑了但没压下去**:多半是这一轮里有一条巨大的工具产出'
+    + '(压缩会保留最近一轮),或者压缩调用本身连续失败了(连续 3 次后会熔断不再尝试)。'
+    + '先看这个节点最后几步的工具产出有多大;把 contextWindow 调大**没有用**,它会把压缩阈值一起抬高。'
 }
 
 /**
@@ -2013,15 +2086,15 @@ function verifyFixPrompt(
  *     比在每个调用点各写一次强转要少得多,也让「为什么要强转」有地方写。
  */
 /**
- * 「这一席**因为某一类故障**倒下了吗」—— 给圆桌那两处 `every()` 用。
+ * 「这一席**因为某一类故障**倒下了吗」—— 给圆桌那**三**处 `every()` 用。
  *
- * 收窄一次,理由同 `seatCallFailed`。写成助手而不是在两处各强转一次,是因为这两处判的是
- * **同一个命题的两个实例**(全席位都限流 / 全席位都提示词过长),而它们必须一起改:
- * 少改一处,阻断建议就会在其中一种故障上退回「先查网络」。
+ * 收窄一次,理由同 `seatCallFailed`。写成助手而不是在三处各强转一次,是因为它们判的是
+ * **同一个命题的三个实例**(全席位都限流 / 都提示词过长 / 都被本地闸打死),而它们必须
+ * 一起改:少改一处,阻断建议就会在其中一种故障上退回「先查网络」。
  */
 function failedWith(
   r: PromiseSettledResult<PhaseResult>,
-  kind: 'rateLimited' | 'promptTooLong',
+  kind: 'rateLimited' | 'promptTooLong' | 'localContextLimit',
 ): boolean {
   if (r.status !== 'fulfilled' || r.value.ok) return false
   return (r.value as Extract<PhaseResult, { ok: false }>)[kind] === true
@@ -2926,6 +2999,9 @@ async function runPlanRoundtable(
       rateLimited: settled.length > 0 && settled.every(r => failedWith(r, 'rateLimited')),
       // 同一条规矩:全席位都因为「提示词太长」倒下时,建议要说的是窗口和节点大小。
       promptTooLong: settled.length > 0 && settled.every(r => failedWith(r, 'promptTooLong')),
+      // 同上。全席位都被**本地闸**判死时,要说的是压缩为什么没压下去,不是对面。
+      localContextLimit:
+        settled.length > 0 && settled.every(r => failedWith(r, 'localContextLimit')),
     }
   }
   // 只剩一份 → 没什么可融合的,直接用它(还省下融合那一次调用)。
@@ -3156,7 +3232,7 @@ async function runPlanRefinement(
         return {
           ok: false, reason: f.reason, timeout: f.timeout, timeoutKind: f.timeoutKind,
           cancelled: f.cancelled, rateLimited: f.rateLimited, quotaExhausted: f.quotaExhausted,
-          promptTooLong: f.promptTooLong,
+          promptTooLong: f.promptTooLong, localContextLimit: f.localContextLimit,
         }
       }
       node.execStatus = (node.execStatus ? node.execStatus + '\n' : '') +

@@ -61,6 +61,65 @@ export function startsWithApiErrorPrefix(text: string): boolean {
 }
 export const PROMPT_TOO_LONG_ERROR_MESSAGE = 'Prompt is too long'
 
+/**
+ * 「这条 `Prompt is too long` 是**我们自己**发的,不是上游发的」的标记。
+ *
+ * ## 为什么必须有一个明写的标记
+ *
+ * 全仓有两处产出这条消息,而它们在消息层面**曾经完全同形**:
+ *  - 这个文件的 400/413 分支 —— 上游真的拒收了;
+ *  - `query.ts` 的硬封顶闸 —— 请求**根本没发出去**,是我们按本地估算判死的。
+ *
+ * 两者要做的事正相反:前者说明上下文真的超了对面的上限,该收窗口、该压缩;后者说明
+ * 我们自己的估算 + 阈值把这一轮拦下了,该看的是阈值配置,不是对面。
+ *
+ * 2026-08-19 跑机上这条区分缺席的代价:10 个执行席位被本地闸打死(全 run 复核:10 席
+ * 全部命中 PTL,`errorDetails` 一条都没有),而阻断卡照着「上游
+ * 拒收」那套给建议,让用户去**调大** `contextWindow` —— 而调大只会把必杀区间拉得更宽。
+ * 整整一轮排查(含四席评审)都在拿上游当嫌疑人,直到有人注意到这些消息**没有**
+ * `errorDetails`。
+ *
+ * ## 为什么标记落在 errorDetails 上
+ *
+ * 那一轮排查能翻案,靠的正是「真拒收必带 `errorDetails`、本地闸不带」这个**副产物**——
+ * 它没有被任何测试或注释守着,两边随便哪一处改一行就没了。所以把它从副产物变成判据:
+ * 本地闸显式写一个哨兵串,`isLocalContextLimitMessage` 认它。
+ *
+ * 正文一个字都不能改:UI 和 `isPromptTooLongMessage` 都按正文精确匹配。
+ * 哨兵里不含 `N tokens > M maximum` 的形状,所以 `getPromptTooLongTokenGap`
+ * 对它照旧返回 undefined(那本来就是对的:本地闸不知道对面的上限是多少)。
+ */
+export const LOCAL_CONTEXT_LIMIT_DETAIL =
+  'local-blocking-limit: request was never sent; refused by the local context-window estimate'
+
+/** 这条 PTL 是不是**我们自己的封顶闸**发的(而不是上游拒收)。 */
+export function isLocalContextLimitMessage(msg: AssistantMessage): boolean {
+  return (
+    isPromptTooLongMessage(msg) && msg.errorDetails === LOCAL_CONTEXT_LIMIT_DETAIL
+  )
+}
+
+/**
+ * 这条 PTL 是**上游真的拒收**、因而值得「收窗口 + 压一次 + 重发」的那一种吗?
+ *
+ * 判据的重点是**排除本地闸**。拿自家闸去收员工窗口是一条自己咬自己的负反馈:
+ * 窗口收小 → 压缩阈值降低 → 更早撞自己的闸 → 再收,几轮就把席位锁死在地板上。
+ *
+ * 反过来的误判是安全的:没有署名的 PTL(别的 provider 直接回的 400、以及这条署名上线
+ * 之前的历史消息)一律当上游算 —— 那时候最多是白救一次,而不是把窗口越收越小。
+ */
+export function isRecoverableUpstreamContextLimit(
+  msg: AssistantMessage | undefined,
+): boolean {
+  return (
+    msg !== undefined &&
+    msg.type === 'assistant' &&
+    msg.isApiErrorMessage === true &&
+    isPromptTooLongMessage(msg) &&
+    !isLocalContextLimitMessage(msg)
+  )
+}
+
 export function isPromptTooLongMessage(msg: AssistantMessage): boolean {
   if (!msg.isApiErrorMessage) {
     return false
