@@ -99,10 +99,42 @@ export function sdkBaseURL(apiUrl: string, knownRoutes: readonly string[]): stri
   return u.toString().replace(/\/+$/, '')
 }
 
+/**
+ * 把 SDK 自己那套遥测头**关掉**。
+ *
+ * `x-stainless-*` 是 stainless 生成器给每个官方 SDK 加的客户端指纹(语言、运行时、
+ * 版本、重试次数)。它们不参与鉴权也不参与缓存,但**会参与网关的分流规则** —— 跑机上
+ * 那条 codex cli trace 规则要看请求特征,而带着一串 `x-stainless-*` 的请求一眼就不是 codex。
+ *
+ * openai-node 的约定是:`defaultHeaders` 里把某个头设成 `null` 就**不发**它(不是发空串)。
+ * 逐个列出来而不是通配:SDK 加了哪些是版本相关的,列表里少一个的表现是它照旧被发出去,
+ * 而这件事只有抓包看得见 —— 所以 `codexIdentity.test.ts` 用真的 buildRoleFetch 抓一次头,
+ * 断言出网请求里一个 `x-stainless-` 都没有。
+ */
+const STAINLESS_OFF: Record<string, null> = {
+  'x-stainless-lang': null,
+  'x-stainless-package-version': null,
+  'x-stainless-os': null,
+  'x-stainless-arch': null,
+  'x-stainless-runtime': null,
+  'x-stainless-runtime-version': null,
+  'x-stainless-retry-count': null,
+  'x-stainless-timeout': null,
+  'x-stainless-read-timeout': null,
+}
+
 export function buildOpenAIClient(
   cfg: { apiUrl: string; apiToken: string },
   knownRoutes: readonly string[],
   fetchImpl: typeof fetch,
+  /**
+   * 覆盖 SDK 自己那套头。
+   *
+   * SDK 默认发 `user-agent: OpenAI/JS <ver>` 加六个 `x-stainless-*`,而跑机上的网关按
+   * 请求特征分流(codex cli trace),那套头一条都匹配不上 —— 于是走没有前缀缓存的渠道。
+   * 这里传进来的是 codex 形状的头(见 codexIdentity),同名的会覆盖掉 SDK 的默认值。
+   */
+  defaultHeaders?: Record<string, string>,
 ): OpenAI {
   return new OpenAI({
     apiKey: cfg.apiToken,
@@ -110,6 +142,7 @@ export function buildOpenAIClient(
     fetch: fetchImpl,
     maxRetries: 0,
     timeout: SDK_TIMEOUT_MS,
+    ...(defaultHeaders ? { defaultHeaders: { ...STAINLESS_OFF, ...defaultHeaders } } : {}),
   })
 }
 

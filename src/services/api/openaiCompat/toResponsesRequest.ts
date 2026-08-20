@@ -20,6 +20,7 @@
  * 发回下一轮(只对 cache_control 做特判)。加前缀是为了永远不会把 anthropic 自己的签名
  * 误认成我们编的这个。
  */
+import { bodyPrefixKey, derivedId } from './codexIdentity.js'
 import { stripAnthropicSystemBlocks } from './systemBlocks.js'
 
 export const REASONING_SIG_PREFIX = 'openai-responses-reasoning:'
@@ -158,5 +159,16 @@ export function toResponsesRequest(body: any, opts: ResponsesOptions): any {
       // 这里也是扁平的 —— `{type:'function', name}`,没有嵌套的 function 对象。
       : { type: 'function', name: body.tool_choice.name }
   }
+  /**
+   * **缓存路由键** —— codex 每次都带(抓包实测),值是它的会话 uuid,跨轮恒定。
+   *
+   * 我们没有会话对象,所以从请求前缀派生(见 codexIdentity 的文件头):同一席位的同一段
+   * 对话逐轮同值,换席位就换值。拿每轮都变的东西去填等于告诉上游「每轮都是新对话」。
+   *
+   * 放在最后算:它要读 `out.instructions` 和 `out.input`,那两样上面才刚拼好。
+   * chat 那条协议不加 —— codex 不走那条,而一个上游没见过的字段是会 400 的
+   * (truncation 那次的教训)。responses 这条已实测过网关收得下(200)。
+   */
+  out.prompt_cache_key = derivedId(bodyPrefixKey(out), 'session')
   return out
 }

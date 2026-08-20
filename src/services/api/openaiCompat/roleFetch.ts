@@ -3,6 +3,7 @@ import { proxyRouteNote, registerDirectHosts } from '../../../utils/lanDirect.js
 import { estimateBodyTokens } from '../tokenEstimate.js'
 import { anthropicEventsToSSE } from './blocks.js'
 import { PROTOCOL_ROUTES, TRANSLATING_PROTOCOLS } from './protocols.js'
+import { bodyPrefixKey, codexHeaders } from './codexIdentity.js'
 import { buildOpenAIClient, framesWithErrorFrame, isSdkAbort, peekFrames, sdkFailure } from './sdkTransport.js'
 import { drainText, joinRoute, parseSSE, sniffSSE } from './sse.js'
 import { upstreamFailureMessage } from './upstreamError.js'
@@ -180,6 +181,18 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      * 我们自己要什么,自己说清楚。
      */
     if ((outBody as { stream?: unknown } | null)?.stream === true) headers.set('accept', 'text/event-stream')
+    /**
+     * **request-id 提前签,codex 形状的头两条路共用。**
+     *
+     * 原来 requestId 是在 raw 档嗅完 SSE 之后才签的;现在它还要参与 `x-client-request-id`,
+     * 得在发请求之前就有。响应头那一侧的用法一个字没变(见下面签发那段的注释)。
+     *
+     * 头本身的理由见 codexIdentity 的文件头:跑机上的网关按请求特征分流,SDK 默认那套
+     * `user-agent: OpenAI/JS` + `x-stainless-*` 一条都匹配不上。
+     */
+    const requestId = mintRequestId()
+    const codexHdrs = codexHeaders(bodyPrefixKey(outBody as any), requestId)
+    for (const [k, v] of Object.entries(codexHdrs)) headers.set(k, v)
     // 拼好的地址要**留在手上**:它是诊断 502 的第一手材料,而此前它只存在于这一行表达式里。
     const dest = joinRoute(target.toString(), proto.route, PROTOCOL_ROUTES)
     const said = (status: number, statusText: string) =>
@@ -205,7 +218,6 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      */
     if (cfg.transport === 'sdk') {
       const abortSignal = init.signal as AbortSignal | undefined
-      const requestId = mintRequestId()
       /**
        * 非流式请求在这条路上没有能走通的结局(见 STREAM_ONLY 的注释),而 sdk 档更糟:
        * `create()` 不带 stream 时返回的是一个**普通对象**,`for await` 它要么抛 TypeError、
@@ -234,7 +246,9 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
       let stream: AsyncIterable<any>
       try {
         stream = await proto.sdkStream(
-          buildOpenAIClient(cfg, PROTOCOL_ROUTES, spy),
+          // accept 在这条分支上显式给:sdk 档不经过我们那套 headers(SDK 自己拼头,
+          // 默认发 application/json),而上面那道闸已经保证了这里一定是流式请求。
+          buildOpenAIClient(cfg, PROTOCOL_ROUTES, spy, { ...codexHdrs, accept: 'text/event-stream' }),
           outBody,
           abortSignal,
         )
@@ -333,7 +347,6 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      *
      * 用 `req_` 前缀 + 计数器 + 随机段:不与上游的 id 空间冲突,同进程内唯一,肉眼可辨来源。
      */
-    const requestId = mintRequestId()
     const events = proto.toAnthropicEvents(parseSSE(new Response(sniff.stream)), {
       anthropicModel: anthropicBody.model,
       requestId,
