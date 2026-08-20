@@ -627,7 +627,96 @@ function remedyOf(res: {
   return undefined
 }
 
+/**
+ * 静默超时之后**原样再跑一次**这个环节。
+ *
+ * 1 = 只多试一次(一个环节最多 2 次调用),用户定的数。为什么值得试这一次:超时是
+ * `infra` —— **没有任何人对这份工作做出过判断**,和「评审员否掉了」是两回事。而在此之前,
+ * 走单次调用的那九处(分析 / 方案融合 / 方案精化 / 补验收点 / 质疑修复 / 测试修复 /
+ * 观察评分 / 执行 / 冲突自动解决)一次都不重试:一次 10 分钟的静默 = 节点当场 BLOCKED,
+ * 要人回到终端敲 `/et --resume <id> --retry-blocked` 才动得了 —— 跑机上那就是「下班之后
+ * 整棵树停在那儿等一个人」。圆桌那三条路(方案评审 / 验收 / 集成验收)本来就会重派超时的
+ * 席位(超时在 roundtable.ts 里被打上 `infra: true`,见 `roundtableWithInfraRetry`),
+ * 这一条是把同一条政策补给单次调用。
+ *
+ * **`human` 那一种不在内**,这不是保守。它的意思是「没有人来点那个工具权限确认」
+ * (预算见 `caps.humanTimeoutMs`,默认 7 天)。原样重跑只会再挂 7 天,而屏幕上那个确认
+ * 依然没人点。它的补救是去把确认点掉(`humanTimeoutRemedy`),和节点大小、和
+ * `nodeTimeoutMs` 都没有关系。
+ */
+const TIMEOUT_RETRIES = 1
+
+/**
+ * 重跑那一次要追加到提示词末尾的旁白。
+ *
+ * **第一句必须说清「上一次不是被否掉的」**:这一席看不见系统日志,一段没头没尾的
+ * 「再做一次」会被读成「上一版被打回了」,于是它去改一个根本没人反对过的答案。
+ *
+ * 第二句是给工作区的。七个环节**共用同一个工具池**(见 runAgentAdapter 的
+ * `availableTools`:曾经的 readOnlyTools / verifyTools 分档已经取消),所以「上一次可能
+ * 已经动过盘」对分析席同样成立,不只对执行席。不说的话,第二个执行者会对着一棵改了
+ * 一半的树从头再写一遍。
+ *
+ * 末尾那句「输出格式不变」不是废话:这段话追加在提示词**最后**,而各环节交代输出格式的
+ * 那几行恰好也在最后 —— 不收口的话,模型读到的最后一句变成了这段旁白。
+ */
+function timeoutRetryNote(kind: TimeoutKind | undefined): string {
+  const what = kind === 'total'
+    ? '上一次调用一直在输出,但久到超过总时长上限都没能完成一条完整消息,被系统中止了'
+    : '上一次调用连着很久一个字都没有输出,被系统按静默超时中止了'
+  return '\n\n───── 这一次是重跑 ─────\n'
+    + `${what} —— **不是有人否掉了你的答案**。这一次的任务和上面写的完全一样。\n`
+    + '上一次可能已经在工作区里留下了一部分改动或产出:先看一眼现在的实际状态'
+    + '(比如 git status、读一下相关文件),在那个基础上接着做 —— 别假设一切还是原样,'
+    + '也别把已经做完的事重做一遍。\n'
+    + '输出格式和上面要求的完全一致,不因为这是重跑而改变。'
+}
+
 async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: Omit<StreamMeta, 'nodeId'>): Promise<PhaseResult> {
+  /** 已经因为超时重跑过几次。0 = 这是第一次调用。 */
+  let retried = 0
+  /** 上一次是哪一种超时 —— 旁白要按它换措辞(静默 / 攒不出一条消息)。 */
+  let kind: TimeoutKind | undefined
+  for (;;) {
+    const res = await runPhaseWithRateLimitRetry(
+      ctx,
+      retried === 0 ? req : { ...req, prompt: req.prompt + timeoutRetryNote(kind) },
+      /**
+       * **重跑要在表头上看得出来。**
+       *
+       * 流的句柄是 `runPhaseOnce` 每次调用现开的(`req.stream ?? ctx.openStream?.()`),
+       * 所以两次调用结构上不会写进同一条流。但表头如果一模一样,节点详情里就是两条
+       * 同名同轮次的「分析」,前一条停在「静默超时」—— 用户分不出哪条是后来的那次。
+       */
+      retried === 0 ? meta : { ...meta, phaseLabel: `${meta.phaseLabel}(超时重跑)` },
+    )
+    if (res.ok) return res
+    // 一次收窄,和 stepExecute 那一处同一条理由(见 `seatCallFailed`)。
+    const f = res as Extract<PhaseResult, { ok: false }> // 超时重跑
+    const again = retried < TIMEOUT_RETRIES
+      && f.timeout === true
+      // 见 TIMEOUT_RETRIES:等人超时重跑一次只会再挂一个 humanTimeoutMs。
+      && f.timeoutKind !== 'human'
+      // 中止 / 单节点取消是**决定**,不是故障 —— 和限流那个循环逐字同一条规矩。
+      && !ctx.signal.aborted && ctx.control?.wasCancelled(req.node.id) !== true
+    if (again) { kind = f.timeoutKind; retried++; continue }
+    /**
+     * 「已经替他试过了」这件事要**写进 blockedReason**。
+     *
+     * 阻断卡给的补救是「提高 caps.nodeTimeoutMs 或把节点拆小」,而用户看到的如果只有
+     * 一句「静默超时」,他分不出这是偶发还是每次都这样 —— 第一反应多半是手动
+     * `--retry-blocked` 再跑一遍,而那一遍我们刚刚已经替他跑过了。
+     *
+     * 追加在**末尾**:`超时(N ms)` 那个形状是用户和测试都在读的锚点(见 PhaseTimeoutError)。
+     */
+    return retried === 0 ? f : { ...f, reason: `${f.reason}(已自动重跑 ${retried} 次,仍然如此)` }
+  }
+}
+
+/**
+ * 一次调用 + 限流重试。超时重跑在外面那一层(`runPhase`)。
+ */
+async function runPhaseWithRateLimitRetry(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: Omit<StreamMeta, 'nodeId'>): Promise<PhaseResult> {
   /**
    * 限流可以重试**几次**。
    *
