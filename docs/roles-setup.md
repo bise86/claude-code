@@ -273,7 +273,7 @@
   | 200k | 167000 |
   | 1M | 967000 |
 
-  **`transport: "sdk"` 的员工上这个键不生效** —— 那一档的上下文交给上游管（见下面 `transport`），载入时会点名。
+  **`transport: "sdk"` 的员工上这个键没有消费者** —— 那一档不做本地上下文压缩（见下面 `transport`），载入时会点名。
 
   **只在 `execMode: 'api'` 上生效**。cli 档的外部 CLI 自己管上下文，写在那种员工上会被忽略并在关口上说明；要给一个 cli 档的 codex 设这两个值，直接写进它自己的参数：`"args": ["-c", "model_context_window=1000000", "-c", "model_auto_compact_token_limit=900000"]`。
 
@@ -281,29 +281,21 @@
 
 - `transport`：这一席用哪条**传输**把请求发出去。`"raw"`（默认）或 `"sdk"`。
 
-  | 值 | 怎么发 |
-  |---|---|
-  | `raw`（默认） | 我们自己的 fetch + SSE 解析 |
-  | `sdk` | 官方 `openai` 客户端发请求，帧喂给**同一个**翻译器 |
-
-  **`sdk` 不只是换传输，它还换了「谁管上下文」**：
-
-  | | raw | sdk |
+  | | raw（默认） | sdk |
   |---|---|---|
-  | 请求怎么发 | 我们的 fetch + SSE 解析 | 官方 `openai` 客户端 |
-  | 上下文涨满谁管 | **我们**：到阈值先摘要一次，再补恢复附件（最近读的文件、plan、skill、MCP 指令…） | **上游**（仅 `openai-responses`）：请求带 `truncation: "auto"`，超出模型窗口时由 API 从对话开头丢条目 |
-  | `contextWindow` / `autoCompactTokenLimit` | 都用于压缩 | `openai-responses`：**不再决定压缩**（上游按它自己的模型窗口判定，看不到你写的数）——但 `contextWindow` 仍用于**工具产出的每消息预算**，别因此删掉它；`openai`：照常生效 |
-  | 本地硬封顶闸 | 生效 | 交给上游的那一档让开（否则会在请求发出去之前把本该由上游截断的那一轮判死）；`openai` 照常生效 |
+  | 请求怎么发 | 我们自己的 fetch + SSE 解析 | 官方 `openai` 客户端 |
+  | 上下文压缩 | **我们做**：到阈值先摘要一次，再补恢复附件（最近读的文件、plan、skill、MCP 指令…） | **不做** —— 交给 SDK / 模型处理 |
+  | 本地硬封顶闸 | 生效 | 不拦 |
+  | `contextWindow` / `autoCompactTokenLimit` | 都用于压缩 | `autoCompactTokenLimit` 无消费者；`contextWindow` 不再决定压缩时机，但**仍用于工具产出的每消息预算**，别因此删掉它 |
 
-  代价要清楚：`truncation` **丢原文、不摘要**，模型会失忆而且不知道自己失忆了；压缩后那套恢复附件也不会有。换来的是这条路上你完全不用管上下文。
+  除上下文之外，两条路是**同一件事**：同一个地址、同一个鉴权头、**逐字相同的请求体**，同一份上游字节翻出来的事件流逐字相同。这条等价性由 `transportParity.test.ts` 拿同一份字节喂两条路钉住，不是一句承诺。
 
-  ⚠️ 上面这张表说的是 `openai-responses`。**`openai`（chat/completions）协议没有 `truncation` 字段**，所以它 + `sdk` 只换传输：上下文**仍由我们压**（阈值、`contextWindow`、`autoCompactTokenLimit`、硬封顶闸全部照常生效），和 `raw` 完全一样。判据是「这条协议接不接得住」，不是「transport 是不是 sdk」——加新方言时这个事实写在协议注册表里（`upstreamTruncation`）。
+  > 历史:sdk 档曾经多发一个 `truncation: "auto"`（想把上下文交给上游截断）。2026-08-20 跑机实测,new-api 网关的 `/v1/responses` 直接 400 `Unsupported parameter: truncation`——同一发去掉这个字段就 200，带不带 SDK 那套 `x-stainless-*` 头都 200。该字段已移除，两条路的请求体现在完全一致。
 
-  除上下文之外的一切都是同一件事：同一个地址、同一个鉴权头、同一份上游字节翻出来的事件流逐字相同，请求体**只差一个 `truncation`**。这条由 `transportParity.test.ts` 拿同一份字节喂两条路钉住，不是一句承诺。
-
-  sdk 档的两处实现细节：客户端上 `maxRetries: 0`（重试策略统一留在 `withRetry`，两套叠起来是乘法，而且退避曲线会错乱），以及**把我们自己的 fetch 传进 SDK**（内网直连、请求头清洗、连接失败的分类诊断都挂在它上面）。失败诊断里会额外印一句「sdk 传输」，好让灰度期间「切了之后开始报」和「本来就报」分得开。
+  sdk 档的两处实现细节：客户端上 `maxRetries: 0`（重试策略统一留在 `withRetry`：所有错误都重试、10 次、0.5→32s；两套叠起来是乘法，而且退避曲线会错乱），以及**把我们自己的 fetch 传进 SDK**（内网直连、请求头清洗、连接失败的分类诊断都挂在它上面）。失败诊断里会额外印一句「sdk 传输」，好让灰度期间「切了之后开始报」和「本来就报」分得开。
 
   只对 `execMode: 'api'` 的**翻译型协议**（`openai` / `openai-responses`）有意义；写在 `anthropic` 协议或 cli 档上会被忽略，并在 `/et` 启动关口上说明。
+
 
 #### `cli` 模式
 

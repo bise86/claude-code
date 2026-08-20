@@ -6,9 +6,9 @@ import type { ToolUseContext } from '../../Tool.js'
 import type { Message } from '../../types/message.js'
 import { getGlobalConfig } from '../../utils/config.js'
 import {
+  contextUnmanaged,
   effectiveRoleCompactLimits,
   type RoleCompactLimits,
-  upstreamManagesContext,
 } from './roleContextCeiling.js'
 import { getContextWindowForModel } from '../../utils/context.js'
 import { logForDebugging } from '../../utils/debug.js'
@@ -267,18 +267,17 @@ export function shouldPreemptForContextLimit(
         contextWindow?: number
         autoCompactTokenLimit?: number
         transport?: 'raw' | 'sdk'
-        apiProtocol?: string
       }
     | undefined,
 ): boolean {
   /**
-   * 上下文归上游管的那一档,这道闸**必须让开**。
+   * 完全不做上下文管理的那一档,这道闸也**必须让开**(见 contextUnmanaged)。
    *
-   * 它是在请求发出去**之前**合成一条 `Prompt is too long` 把这一轮判死的,而那正是本该
-   * 交给上游 `truncation: 'auto'` 去截断的那一次请求。不让开的话,sdk 档比改动前更糟:
-   * 改动前至少还会先压一次,现在是压缩关了、闸门还在,直接判死。
+   * 它不发请求、不压缩,直接合成一条 `Prompt is too long` 把这一轮判死 —— 留着它就是
+   * 「我们不管上下文」这个约定里唯一还在管的一处,而且是最糟的那种管法:比上游拒收更早、
+   * 报错里还没有上游的任何线索。
    */
-  if (upstreamManagesContext(roleClientConfig)) return false
+  if (contextUnmanaged(roleClientConfig)) return false
   return calculateTokenWarningState(
     tokenCount,
     model,
@@ -414,11 +413,11 @@ export async function autoCompactIfNeeded(
   }
 
   /**
-   * `transport: 'sdk'` = 这一席的上下文归上游管(出网带 `truncation: 'auto'`)——
-   * 我们这边整套压缩让开。放在最前面而不是混进阈值算术里:这不是「阈值够不着」,
-   * 是**这条路上不该有我们的压缩**,两者在日志和遥测上要分得开。
+   * `transport: 'sdk'` = 这一席完全不做上下文管理(见 contextUnmanaged)。放在最前面
+   * 而不是混进阈值算术里:这不是「阈值够不着」,是**这条路上不该有我们的压缩**,
+   * 两者在日志和遥测上要分得开。
    */
-  if (upstreamManagesContext(toolUseContext.options.roleClientConfig)) {
+  if (contextUnmanaged(toolUseContext.options.roleClientConfig)) {
     return { wasCompacted: false }
   }
 

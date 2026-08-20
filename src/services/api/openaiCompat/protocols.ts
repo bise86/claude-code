@@ -64,18 +64,6 @@ export interface TranslatingProtocol {
    * `import type` 引 SDK:类型在构建期被完全擦掉,员工载入路径上不会因此多拖一个包。
    */
   sdkStream(client: OpenAI, body: any, signal?: AbortSignal): Promise<AsyncIterable<any>>
-  /**
-   * 这条协议**能不能把上下文交给上游** —— 也就是线格式里有没有「超了自己丢」这个字段。
-   *
-   * Responses 有 `truncation: 'auto'`;chat/completions **没有**。差别不是细节:
-   * `transport: 'sdk'` 那一档的约定是「这一席的上下文归上游管」,而这个约定只有在上游
-   * 真的接得住的时候才成立。接不住却照样让开本地压缩,就是一个两边都不管的裸奔组合 ——
-   * 撞满直接 400,而用户以为自己已经把这件事交出去了。
-   *
-   * 所以这个事实必须留在**注册表**里,和 route / buildBody 放在一起:加一条新方言时,
-   * 「它管不管上下文」是和「它的路由是什么」同等必答的问题。写在别处就会漏。
-   */
-  upstreamTruncation: boolean
 }
 
 export const TRANSLATING_PROTOCOLS: Record<string, TranslatingProtocol> = {
@@ -84,20 +72,12 @@ export const TRANSLATING_PROTOCOLS: Record<string, TranslatingProtocol> = {
     buildBody: (body, cfg) => toOpenAIRequest(body, cfg.backendModel, cfg.thinkingDepth),
     toAnthropicEvents: openaiChunksToAnthropicEvents,
     sdkStream: (client, body, signal) => client.chat.completions.create(body, { signal }) as any,
-    // chat/completions 没有 truncation —— 这一档的上下文**由我们压**,和 raw 一样。
-    upstreamTruncation: false,
   },
   'openai-responses': {
     route: 'responses',
-    buildBody: (body, cfg) => toResponsesRequest(body, {
-      backendModel: cfg.backendModel,
-      effort: cfg.thinkingDepth,
-      // sdk 档 = 上下文归上游管。这是那个约定的**出网**那一半。
-      truncation: cfg.transport === 'sdk',
-    }),
+    buildBody: (body, cfg) => toResponsesRequest(body, { backendModel: cfg.backendModel, effort: cfg.thinkingDepth }),
     toAnthropicEvents: responsesEventsToAnthropicEvents,
     sdkStream: (client, body, signal) => client.responses.create(body, { signal }) as any,
-    upstreamTruncation: true,
   },
 }
 
@@ -128,14 +108,3 @@ export const ROLE_API_PROTOCOLS = ['anthropic', ...Object.keys(TRANSLATING_PROTO
  * 是全表而不是「本次这一条」:换协议时 apiUrl 常常还停在上一条协议的路由上。
  */
 export const PROTOCOL_ROUTES = Object.values(TRANSLATING_PROTOCOLS).map(p => p.route)
-
-/**
- * 哪些协议能把上下文交给上游(见 `upstreamTruncation`)。
- *
- * 从表派生,不写死名字:压缩那一侧要问的是「这一席的上下文归谁管」,而答案的来源必须
- * 只有一处 —— 否则加一条新方言时,漏改的表现是**静默**的(那一席既没人压、上游也不截,
- * 撞满才炸,而那时已经跑了几十轮)。
- */
-export const UPSTREAM_TRUNCATION_PROTOCOLS: ReadonlySet<string> = new Set(
-  Object.entries(TRANSLATING_PROTOCOLS).filter(([, p]) => p.upstreamTruncation).map(([name]) => name),
-)

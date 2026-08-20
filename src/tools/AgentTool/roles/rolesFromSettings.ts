@@ -2,7 +2,7 @@ import { z } from 'zod/v4'
 import { logError } from '../../../utils/log.js'
 import { registerDirectHosts } from '../../../utils/lanDirect.js'
 import type { EffortValue } from '../../../utils/effort.js'
-import { ROLE_API_PROTOCOLS, UPSTREAM_TRUNCATION_PROTOCOLS } from '../../../services/api/openaiCompat/protocols.js'
+import { ROLE_API_PROTOCOLS } from '../../../services/api/openaiCompat/protocols.js'
 import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from './roleThinking.js'
 import { formatContextWindow, MAX_ROLE_CONTEXT_WINDOW, maxUsefulAutoCompactLimit, MIN_ROLE_CONTEXT_WINDOW, parseContextWindow, roleContextWindow } from './roleContextWindow.js'
 import type { RoleClientConfig } from './roleTypes.js'
@@ -281,22 +281,19 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
       if (wire.note) issues.push({ name: r.name, source, reason: wire.note })
       const parsedEffort = translating ? undefined : (wire.value as EffortValue | undefined)
       /**
-       * **上下文归不归上游管,判据是「这条协议接不接得住」**,不是「transport 是不是 sdk」。
+       * **`transport: 'sdk'` 这一档不做本地上下文管理**,要在开跑之前说一声 —— 这是一个
+       * 会改变运行行为的开关,而它的效果要跑很久才看得出来。只陈述我们这边做了什么、
+       * 哪些配置因此没有消费者;交出去之后由 SDK / 模型怎么处理,不在这里预测。
        *
-       * `truncation: 'auto'` 只有 Responses 有,chat/completions 没有 —— 所以
-       * `openai` + sdk 的上下文仍由我们压(见 roleContextCeiling 的 upstreamManagesContext),
-       * 那一档这两个旋钮照常生效,不该报「不生效」。
-       *
-       * 归上游的那一档要说出来:用户写的 1M / 900k 上游看不见(它按**自己的**模型窗口判定),
-       * 安安静静不起作用正是这个仓库反复付代价的那一类。
-       *
-       * **措辞不能笼统说「不生效」** —— 验收席跑出来的:`contextWindow` 还有第二个消费者,
-       * `query.ts` 拿它算**工具产出的每消息预算**(`roleWindowChars`),那条在这一档照常生效。
-       * 说成「不生效」会让用户以为可以把它删掉,而删掉之后巨大的工具产出会原样进上下文。
+       * 两个旋钮的归宿要说清:`autoCompactTokenLimit` 在这一档没有消费者;
+       * `contextWindow` 不再决定压缩时机,但**仍然**用于工具产出的每消息预算
+       * (`query.ts` 的 roleWindowChars),别因为这句话把它删了。
        */
-      if (transport === 'sdk' && UPSTREAM_TRUNCATION_PROTOCOLS.has(protocol)
-          && (window.value !== undefined || declaredLimit !== undefined)) {
-        issues.push({ name: r.name, source, reason: 'transport 为 sdk 时这一席的上下文交给上游管(请求带 truncation: auto):autoCompactTokenLimit 不生效,contextWindow 也不再决定压缩时机(但仍用于工具产出的每消息预算,别删)' })
+      if (transport === 'sdk') {
+        issues.push({ name: r.name, source, reason: 'transport 为 sdk 的员工不做本地上下文管理:不压缩、封顶闸不拦,上下文交给 SDK / 模型处理' })
+        if (window.value !== undefined || declaredLimit !== undefined) {
+          issues.push({ name: r.name, source, reason: 'transport 为 sdk 时 autoCompactTokenLimit 无效,contextWindow 也不再决定压缩时机(但仍用于工具产出的每消息预算,别删)' })
+        }
       }
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
         ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value, autoCompactTokenLimit: declaredLimit, transport }

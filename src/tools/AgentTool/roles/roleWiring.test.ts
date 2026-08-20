@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'bun:test'
 import { parseRoles, roleLoadIssues } from './rolesFromSettings.js'
 import { buildRoleFetch } from '../../../services/api/openaiCompat/roleFetch.js'
-import { upstreamManagesContext } from '../../../services/compact/roleContextCeiling.js'
+import { contextUnmanaged } from '../../../services/compact/roleContextCeiling.js'
 
 const api = (over: Record<string, unknown> = {}) => ({
   name: 'gpt', whenToUse: 'w', execMode: 'api',
@@ -264,69 +264,59 @@ describe('transport 配得进去', () => {
 })
 
 /**
- * `transport: 'sdk'` 改的不只是传输,而是**谁管上下文**。两条"配了但不生效/会裸奔"
- * 必须在开跑之前说出来 —— 这一档最贵的失败是「写了 1M,安安静静没起作用」。
+ * `transport: 'sdk'` 改的不只是传输,而是**这一席不再做本地上下文管理**。这是一个会改变
+ * 运行行为的开关,而效果要跑很久才看得出来,所以关口上要说一声 —— 说的是我们这边做了
+ * 什么、哪些配置因此没有消费者,不预测交出去之后会发生什么。
  */
-describe('sdk 档:上下文交给上游之后,哪些配置不再生效', () => {
-  it('写了 contextWindow / autoCompactTokenLimit 会被点名不生效', () => {
+describe('sdk 档:后果和失效的配置都要在关口上说出来', () => {
+  it('点名「不做上下文管理」', () => {
+    const source = 'probe-sdk-unmanaged'
+    parseRoles([api({ apiProtocol: 'openai-responses', transport: 'sdk' })], source)
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('不做本地上下文管理')
+    expect(reasons).toContain('交给 SDK / 模型处理')
+  })
+
+  it('写了两个旋钮时,把它们各自的归宿说清(contextWindow 仍管工具产出预算)', () => {
     const source = 'probe-sdk-knobs'
     parseRoles([api({ apiProtocol: 'openai-responses', transport: 'sdk', contextWindow: '1m', autoCompactTokenLimit: 900_000 })], source)
     const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
-    expect(reasons).toContain('truncation')
-    expect(reasons).toContain('contextWindow')
-    expect(reasons).toContain('autoCompactTokenLimit')
+    expect(reasons).toContain('autoCompactTokenLimit 无效')
+    expect(reasons).toContain('工具产出的每消息预算')
   })
 
-  it('raw 档不说这句 —— 那一档它们照常生效', () => {
-    const source = 'probe-raw-knobs'
+  it('raw 档一个字都不多说', () => {
+    const source = 'probe-raw-quiet'
     parseRoles([api({ apiProtocol: 'openai-responses', contextWindow: '1m', autoCompactTokenLimit: 900_000 })], source)
     const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
-    expect(reasons).not.toContain('truncation')
-  })
-
-  /**
-   * chat/completions 没有 truncation 字段,所以那一档的上下文**仍由我们压** —— 两个旋钮
-   * 照常生效,不该报「不生效」。这条守的是判据本身:如果哪天有人把判据写回
-   * 「transport === 'sdk'」,chat 档会既被告知旋钮失效、又真的没人压。
-   */
-  it('openai(chat)协议 + sdk:旋钮照常生效,不报不生效', () => {
-    const source = 'probe-sdk-chat'
-    const out = parseRoles([api({ apiProtocol: 'openai', transport: 'sdk', contextWindow: '1m', autoCompactTokenLimit: 900_000 })], source)
-    expect(out[0].agentDef.roleClientConfig?.transport).toBe('sdk')
-    expect(out[0].agentDef.roleClientConfig?.autoCompactTokenLimit).toBe(900_000)
-    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
-    expect(reasons).not.toContain('不生效')
+    expect(reasons).not.toContain('不做本地上下文管理')
   })
 })
 
 /**
- * **从 settings.json 那几行,直通「这一席的上下文归谁管」。**
+ * **从 settings.json 那几行,直通「这一席做不做上下文管理」。**
  *
  * 前面几组用的是手搓的 config 对象,而生产里那个对象是 `parseRoles` 造出来的 ——
- * 这个仓库为「探针打在一个长得像的替身上」付过学费:替身答得出的话,真身答不出。
- * 所以这一条把两端直接接上:settings 里写什么 → 运行期的判据说什么。
+ * 这个仓库为「探针打在一个长得像的替身上」付过学费。
  */
-describe('settings → 谁管这一席的上下文', () => {
-  const ownerOf = (role: Record<string, unknown>, source: string): boolean => {
+describe('settings → 这一席做不做上下文管理', () => {
+  const unmanaged = (role: Record<string, unknown>, source: string): boolean => {
     const out = parseRoles([api(role)], source)
     const cfg = out[0]?.agentDef.roleClientConfig
     expect(cfg).toBeDefined()
-    return upstreamManagesContext(cfg)
+    return contextUnmanaged(cfg)
   }
 
-  it('openai-responses + sdk:归上游', () => {
-    expect(ownerOf({ apiProtocol: 'openai-responses', transport: 'sdk' }, 'probe-own-a')).toBe(true)
+  it('两条协议的 sdk 档都不管', () => {
+    expect(unmanaged({ apiProtocol: 'openai-responses', transport: 'sdk' }, 'probe-own-a')).toBe(true)
+    expect(unmanaged({ apiProtocol: 'openai', transport: 'sdk' }, 'probe-own-b')).toBe(true)
   })
 
-  it('openai(chat)+ sdk:仍归我们(那条协议没有 truncation)', () => {
-    expect(ownerOf({ apiProtocol: 'openai', transport: 'sdk' }, 'probe-own-b')).toBe(false)
+  it('不写 transport:照常由我们管', () => {
+    expect(unmanaged({ apiProtocol: 'openai-responses' }, 'probe-own-c')).toBe(false)
   })
 
-  it('不写 transport:归我们', () => {
-    expect(ownerOf({ apiProtocol: 'openai-responses' }, 'probe-own-c')).toBe(false)
-  })
-
-  it('transport 写错(被忽略成 raw):归我们 —— 一个打错的字不该把上下文悄悄交出去', () => {
-    expect(ownerOf({ apiProtocol: 'openai-responses', transport: 'sdk1' }, 'probe-own-d')).toBe(false)
+  it('transport 写错(被忽略成 raw):照常由我们管 —— 一个打错的字不该把上下文管理悄悄关掉', () => {
+    expect(unmanaged({ apiProtocol: 'openai-responses', transport: 'sdk1' }, 'probe-own-d')).toBe(false)
   })
 })

@@ -153,12 +153,15 @@ describe('原来那两条线一条都没被拆掉', () => {
  * 合成的一条 `Prompt is too long` 判死,而那正是本该交给上游去截断的那一次请求 ——
  * 结果比改动前更糟(改动前至少还会先压一次)。所以两道闸各钉一条。
  */
-describe('谁管这一席的上下文', () => {
+describe('sdk 档不做上下文管理', () => {
   /**
-   * 判据不是「transport 是不是 sdk」,而是「**这条协议接不接得住**」:
-   * `truncation: 'auto'` 只有 Responses 有,chat/completions 没有。
-   * 对 chat 也让开本地压缩的话,那一席就是「我们不压、上游也不截」—— 撞满直接 400,
-   * 而用户以为自己已经把这件事交出去了。
+   * 用户 2026-08-20 定的:`transport: 'sdk'` 这一档我们**什么都不管** —— 不压缩、
+   * 封顶闸不拦,出网也不带 truncation(那个参数被跑机上的网关 400 掉了,见
+   * transportParity.test.ts 的文件头)。
+   *
+   * 两道闸各钉一条。**只关压缩而留着封顶闸是最糟的组合**:那一席会在请求发出去之前
+   * 被我们自己合成的 `Prompt is too long` 判死 —— 比上游拒收更早,而且报错里没有上游的
+   * 任何线索。
    */
   const seat = (protocol: string, transport?: 'raw' | 'sdk') => ({
     roleName: 'seat', contextWindow: 1_000_000, autoCompactTokenLimit: 900_000,
@@ -179,23 +182,20 @@ describe('谁管这一席的上下文', () => {
     return r.consecutiveFailures === 1
   }
 
-  test('openai-responses + sdk:交给上游,我们不压', async () => {
+  test('两条协议的 sdk 档都不压', async () => {
     expect(await compacted('openai-responses', 'sdk')).toBe(false)
+    expect(await compacted('openai', 'sdk')).toBe(false)
   })
 
-  test('openai(chat)+ sdk:上游没有 truncation,所以**照样由我们压**', async () => {
-    expect(await compacted('openai', 'sdk')).toBe(true)
-  })
-
-  test('raw 档一律由我们压', async () => {
+  test('raw 档(以及不写 transport)照常由我们压', async () => {
     expect(await compacted('openai-responses', 'raw')).toBe(true)
     expect(await compacted('openai', undefined)).toBe(true)
   })
 
-  test('硬封顶闸和压缩同进同退 —— 只有归上游的那一档放行', () => {
+  test('封顶闸和压缩同进同退', () => {
     // 1M 窗口下封顶线是 997000,取 999000 让每一档都毫无疑义地越过它。
     expect(shouldPreemptForContextLimit(999_000, MODEL, seat('openai-responses', 'sdk'))).toBe(false)
-    expect(shouldPreemptForContextLimit(999_000, MODEL, seat('openai', 'sdk'))).toBe(true)
+    expect(shouldPreemptForContextLimit(999_000, MODEL, seat('openai', 'sdk'))).toBe(false)
     expect(shouldPreemptForContextLimit(999_000, MODEL, seat('openai-responses', 'raw'))).toBe(true)
   })
 })

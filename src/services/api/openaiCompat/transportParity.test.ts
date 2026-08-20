@@ -5,14 +5,12 @@
  * `new OpenAI({ fetch })` 交进去。同一份上游字节喂进去,翻译出来的 anthropic 事件流
  * 必须逐字相等,出网地址和鉴权头也必须相同。
  *
- * 请求体只允许有**一个**差异:`openai-responses` 的 sdk 档多一个 `truncation: 'auto'`
- * (那一档的约定是「这一席的上下文归上游管」)。
+ * **请求体一个差异都不允许有。** 曾经有过一个:sdk 档发 `truncation: 'auto'`,想把上下文
+ * 交给上游截断。2026-08-20 跑机上实测:那台 new-api 网关的 `/v1/responses` 直接 400
+ * `Unsupported parameter: truncation`(同一发去掉这个字段就 200,加不加 SDK 那套
+ * `x-stainless-*` 头都 200 —— 所以病根是这个参数,不是 SDK)。这个字段已经拿掉。
  *
- * **`openai`(chat/completions)没有 truncation 这个字段**,所以那条协议的 sdk 档请求体
- * 和 raw **逐字相同**,而它的上下文**仍由我们压**(判据见
- * `roleContextCeiling.upstreamManagesContext`:交不交出去看的是「这条协议接不接得住」,
- * 不是「transport 是不是 sdk」)。这里用一条断言把「chat 的两条传输请求体全等」钉住 ——
- * 哪天有人给 chat 硬塞一个 truncation,它会立刻变红。
+ * 下面那条「两条路请求体全等」的断言就是它的墓碑:再有人往 sdk 档单独塞字段,它立刻变红。
  */
 import { expect, test } from 'bun:test'
 import { buildRoleFetch } from './roleFetch.js'
@@ -37,8 +35,8 @@ const chatSSE = (): string =>
   `${CHAT_CHUNKS.map(c => `data: ${JSON.stringify(c)}\n\n`).join('')}data: [DONE]\n\n`
 
 const PROTOCOLS = [
-  { name: 'openai-responses' as const, route: 'responses', sse: responsesSSE, truncates: true },
-  { name: 'openai' as const, route: 'chat/completions', sse: chatSSE, truncates: false },
+  { name: 'openai-responses' as const, route: 'responses', sse: responsesSSE },
+  { name: 'openai' as const, route: 'chat/completions', sse: chatSSE },
 ]
 
 const ANTHROPIC_BODY = JSON.stringify({
@@ -107,25 +105,15 @@ for (const p of PROTOCOLS) {
     expect(raw.text).toContain('11')
   })
 
-  test(`[${p.name}] 请求体的差异清单:${p.truncates ? '只有 truncation' : '一个都没有(这条协议没有 truncation)'}`, async () => {
+  test(`[${p.name}] 两条传输的请求体逐字相同,而且都不带 truncation`, async () => {
     const raw = await drive(p.name, 'raw', ok)
     const sdk = await drive(p.name, 'sdk', ok)
     const rawBody = raw.seen[0]!.body as Record<string, unknown>
     const sdkBody = sdk.seen[0]!.body as Record<string, unknown>
+    // 这个字段害过一次(见文件头),两条路都不许出现它。
     expect(rawBody.truncation).toBeUndefined()
-    if (p.truncates) {
-      // 有意的那一个差异:上下文归上游管。
-      expect(sdkBody.truncation).toBe('auto')
-      const { truncation: _dropped, ...rest } = sdkBody
-      expect(rest).toEqual(rawBody)
-    } else {
-      /**
-       * chat/completions 侧**没有**这个字段,所以这里逐字相同 —— 而这正是
-       * 「openai + sdk 的上下文仍由我们压」那条判据的依据(见 autoCompactLimit.test.ts)。
-       */
-      expect(sdkBody.truncation).toBeUndefined()
-      expect(sdkBody).toEqual(rawBody)
-    }
+    expect(sdkBody.truncation).toBeUndefined()
+    expect(sdkBody).toEqual(rawBody)
   })
 }
 

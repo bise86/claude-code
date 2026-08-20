@@ -39,8 +39,6 @@
  * 而这份账本只减不增、按员工名共享、进程内不可恢复。地板是它的止损位。
  */
 
-import { UPSTREAM_TRUNCATION_PROTOCOLS } from '../api/openaiCompat/protocols.js'
-
 /**
  * 学到的上界不许低于这个数。见文件头「为什么有地板」。
  *
@@ -136,32 +134,26 @@ export type RoleCompactLimits = {
 }
 
 /**
- * **这一席的上下文归上游管吗。**
+ * **这一席完全不做上下文管理。**
  *
- * 两个条件缺一不可:
+ * `transport: 'sdk'` 的约定(用户 2026-08-20 定的):这条路上我们**什么都不管** ——
+ * 不压缩、封顶闸不拦,出网请求也**不带** `truncation`(实测跑机那台 new-api 网关的
+ * `/v1/responses` 不认这个参数,带上就是 400 `Unsupported parameter: truncation`)。
  *
- *  1. `transport: 'sdk'` —— 用户明确把这一席交出去了;
- *  2. **这条协议的线格式里真的有那个字段**(`UPSTREAM_TRUNCATION_PROTOCOLS`)。
+ * 名字里的 `unmanaged` 说的是**我们这一侧**:交出去之后由 SDK / 模型怎么处理,不是这个
+ * 模块的判断范围,也不该在这里写成预言。不叫「归上游管」是因为那句话我们证明不了。
  *
- * 第 2 条不能省。`truncation: 'auto'` 只有 Responses 有,chat/completions **没有** ——
- * 对它照样让开本地压缩的话,那一席就是「我们不压、上游也不截」的裸奔组合,撞满直接 400,
- * 而用户以为自己已经把这件事交出去了。所以 `openai`(chat)+ sdk 的上下文**仍由我们压**,
- * 和 raw 完全一样;换掉的只有传输。
+ * 两道闸必须**一起**让开:只关自动压缩而留着封顶闸,那一席会在请求发出去**之前**被我们
+ * 自己合成的一条 `Prompt is too long` 判死 —— 那比让它真的发出去还早,而且报错里没有
+ * 上游的任何线索(errorDetails 是空的,见 errors.ts 的 LOCAL_CONTEXT_LIMIT_DETAIL)。
  *
- * 判据是「这条协议接不接得住」而不是写死协议名:加一条新方言时,漏改的表现是**静默**的。
- *
- * 归上游管的那一档,自动压缩和硬封顶闸必须**一起**让开 —— 只关压缩而留着闸门,那一席会在
- * 请求发出去**之前**被我们自己合成的一条 `Prompt is too long` 判死,而那正是本该交给上游
- * 去截断的那一次请求。结果比改动前更糟:原来至少还会先压一次。
- *
- * 写成一个具名函数而不是散在两处布尔表达式:这个仓库为「两条线各自算各自的」付过一次
- * 学费(见 blockingLimitOrder.test.ts 的文件头)。
+ * 写成具名函数而不是散在两处布尔表达式:这个仓库为「两条线各自算各自的」付过一次学费
+ * (见 blockingLimitOrder.test.ts 的文件头)。
  */
-export function upstreamManagesContext(
-  cfg: { transport?: 'raw' | 'sdk'; apiProtocol?: string } | undefined,
+export function contextUnmanaged(
+  cfg: { transport?: 'raw' | 'sdk' } | undefined,
 ): boolean {
-  if (cfg?.transport !== 'sdk') return false
-  return cfg.apiProtocol !== undefined && UPSTREAM_TRUNCATION_PROTOCOLS.has(cfg.apiProtocol)
+  return cfg?.transport === 'sdk'
 }
 
 /**
