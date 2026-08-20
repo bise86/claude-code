@@ -3,6 +3,7 @@ import { proxyRouteNote, registerDirectHosts } from '../../../utils/lanDirect.js
 import { estimateBodyTokens } from '../tokenEstimate.js'
 import { anthropicEventsToSSE } from './blocks.js'
 import { PROTOCOL_ROUTES, TRANSLATING_PROTOCOLS } from './protocols.js'
+import { buildOpenAIClient, framesWithErrorFrame, isSdkAbort, peekFrames, sdkFailure } from './sdkTransport.js'
 import { drainText, joinRoute, parseSSE, sniffSSE } from './sse.js'
 import { upstreamFailureMessage } from './upstreamError.js'
 
@@ -189,8 +190,90 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
           // 「走的代理还是直连」现算,不在构造期算一次:`NO_PROXY` 是进程级的,而一次
           // run 里另一个员工的登记会改变这个答案 —— 印一个过期的判断比不印更糟。
           route: proxyRouteNote(dest),
+          transport: cfg.transport,
           ...extra,
         }))
+    /**
+     * **sdk 档在这里分叉** —— 帧来自官方客户端,别的一切照旧(见 sdkTransport 的文件头)。
+     *
+     * 分叉点选在这里,是为了让**所有**已经算好的东西都被两条路共用:请求体(`outBody`)、
+     * 诊断闭包(`said`,连 `dest` 和代理路线都在里面)、下面那段重新编码和 request-id。
+     * 两条传输的差异因此被压到只剩「帧从哪来」这一件事,而那正是对拍测试要钉的东西。
+     *
+     * sniffSSE / 空流 / 200-不是-SSE 那三条判断不在这条路上:SDK 自己会因为响应不是 SSE
+     * 而抛错,那条异常经 `sdkFailure` 走进**同一句**诊断文案。少掉的不是判断,是判断的位置。
+     */
+    if (cfg.transport === 'sdk') {
+      const abortSignal = init.signal as AbortSignal | undefined
+      const requestId = mintRequestId()
+      /**
+       * 非流式请求在这条路上没有能走通的结局(见 STREAM_ONLY 的注释),而 sdk 档更糟:
+       * `create()` 不带 stream 时返回的是一个**普通对象**,`for await` 它要么抛 TypeError、
+       * 要么什么都不产出 —— 两种都会变成「成功但空白」。在发出去之前就说清楚。
+       */
+      if ((outBody as { stream?: unknown } | null)?.stream !== true) {
+        return said(0, '')(502, '(本地判定:这条路只走流式,请求没有发出)', { notStreamed: true })
+      }
+      /**
+       * **盯住上游那条原始响应** —— sdk 档补回 raw 档 `sniffSSE` 的那两条判断靠它。
+       *
+       * 只在「不是 SSE」时才 clone:clone 会把整条响应缓冲一份,而正常那条是几百 KB 的
+       * 流式正文,复制一份纯属白烧内存。判失败的那些体都是小 JSON,拷了不心疼。
+       */
+      const upstreamSeen: { status?: number; contentType?: string | null; text?: () => Promise<string> } = {}
+      const spy = (async (u: any, i: any) => {
+        const r = await inner(u, i)
+        upstreamSeen.status = r.status
+        upstreamSeen.contentType = r.headers.get('content-type')
+        if (r.ok && !(upstreamSeen.contentType ?? '').includes('text/event-stream')) {
+          const copy = r.clone()
+          upstreamSeen.text = () => copy.text().catch(() => '')
+        }
+        return r
+      }) as typeof fetch
+      let stream: AsyncIterable<any>
+      try {
+        stream = await proto.sdkStream(
+          buildOpenAIClient(cfg, PROTOCOL_ROUTES, spy),
+          outBody,
+          abortSignal,
+        )
+      } catch (e) {
+        // 中止原样抛 —— 和下面 raw 档 catch 里那条判据同因,判法见 isSdkAbort。
+        if (isSdkAbort(e, abortSignal)) throw e
+        const f = sdkFailure(e)
+        return said(f.status, '')(
+          f.status > 0 ? f.status : 502,
+          f.body,
+          f.connectFailed ? { connectFailed: true } : undefined,
+        )
+      }
+      /**
+       * **一帧都没有 = 上游什么都没给**,和 raw 档那两条判断等价(见 peekFrames)。
+       *
+       * 验收实测:上游回 200 的 JSON、或者 200 空体时,SDK **不抛错**,只是零帧 —— 于是
+       * 这一席交出一次「成功但完全空白」的回答,而流水线会把它当成真实产出继续往下走。
+       * 分两档报,措辞和 raw 档逐字对齐:不是 SSE 的那档要把上游原文带上,它是诊断的第一手材料。
+       */
+      const peeked = await peekFrames(stream)
+      if (peeked.empty) {
+        const notSSE = !(upstreamSeen.contentType ?? '').includes('text/event-stream')
+        return said(upstreamSeen.status ?? 0, '')(
+          502,
+          notSSE && upstreamSeen.text ? await upstreamSeen.text() : '',
+          notSSE ? { notStreamed: true } : { emptyStream: true },
+        )
+      }
+      const events = proto.toAnthropicEvents(framesWithErrorFrame(peeked.frames, abortSignal), {
+        anthropicModel: anthropicBody.model,
+        requestId,
+        estimatedInput: () => estimateBodyTokens(outBody),
+      })
+      return new Response(anthropicEventsToSSE(events), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream', 'request-id': requestId },
+      })
+    }
     let res: Response
     try {
       res = await inner(dest, { ...init, method: 'POST', headers, body: JSON.stringify(outBody) })

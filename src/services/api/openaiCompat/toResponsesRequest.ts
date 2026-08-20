@@ -48,6 +48,19 @@ function textOf(content: any): string {
 
 export interface ResponsesOptions {
   backendModel: string
+  /**
+   * 上下文超出模型窗口时,让**上游**从对话开头丢条目,而不是回 400。
+   *
+   * 只有 `transport: 'sdk'` 的员工会打开它 —— 那一档的约定是「这一席的上下文归上游管」,
+   * 我们这边不再压缩(见 roleContextCeiling 的 upstreamManagesContext)。两件事必须**同时**
+   * 成立:只关掉我们的压缩而不开这个,那一席撞满就是硬 400;只开这个而不关压缩,则是
+   * 两套上下文管理同时在动,谁先开火取决于阈值算得准不准。
+   *
+   * 语义要记清楚:它**丢原文,不摘要**,而且按**模型自己的**窗口判定 —— 用户写的
+   * `contextWindow` / `autoCompactTokenLimit` 它不看(那两个键在这一档因此不生效,
+   * 载入时会记一条诊断)。
+   */
+  truncation?: boolean
   /** 已经按协议归一过的思考档位。原样填进 `reasoning.effort`。 */
   effort?: string
 }
@@ -120,6 +133,7 @@ export function toResponsesRequest(body: any, opts: ResponsesOptions): any {
     store: false,
     include: ['reasoning.encrypted_content'],
   }
+  if (opts.truncation === true) out.truncation = 'auto'
   const systemText = textOf(body.system)
   if (systemText.length > 0) out.instructions = systemText
   // anthropic 的 max_tokens 在这个协议里叫 max_output_tokens。

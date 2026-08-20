@@ -5,7 +5,11 @@ import type { QuerySource } from '../../constants/querySource.js'
 import type { ToolUseContext } from '../../Tool.js'
 import type { Message } from '../../types/message.js'
 import { getGlobalConfig } from '../../utils/config.js'
-import { effectiveRoleContextWindow } from './roleContextCeiling.js'
+import {
+  effectiveRoleCompactLimits,
+  type RoleCompactLimits,
+  upstreamManagesContext,
+} from './roleContextCeiling.js'
 import { getContextWindowForModel } from '../../utils/context.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
@@ -41,6 +45,20 @@ const SUMMARY_RESERVE_FRACTION = 0.2
 /** 同上,缓冲区在小窗口下按比例夹。200k 档不受影响(13k < 18k)。 */
 const AUTOCOMPACT_BUFFER_FRACTION = 0.1
 
+/**
+ * 这一档的上下文限制。**收一个数 = 只给窗口**(历史调用点全是这么写的,原样有效)。
+ *
+ * 为什么还收一个裸数字:这个仓库没有 typecheck,签名改成只收对象的话,任何漏改的
+ * 调用点会在运行期悄悄变成「什么都没传」—— 而「漏传一个窗口」正是 2026-08-19 那趟
+ * 跑机上打死 10 个席位的东西(见 shouldPreemptForContextLimit 的注释)。留着数字这条
+ * 形状,漏改的调用点最差也只是行为不变。
+ */
+export type ContextLimitOverride = number | RoleCompactLimits
+
+function limitsOf(o?: ContextLimitOverride): RoleCompactLimits {
+  return typeof o === 'number' ? { window: o } : (o ?? {})
+}
+
 // Returns the context window size minus the max output tokens for the model
 export function getEffectiveContextWindowSize(
   model: string,
@@ -51,9 +69,11 @@ export function getEffectiveContextWindowSize(
    * (`runAgent.ts` 故意这么设,引擎要拿它做 Claude 的算术)。不接这个口子的话,一个 128k
    * 的员工在 opus[1m] 会话里的压缩阈值是 1M —— 永远不压,直接撞上游 400。
    */
-  contextWindowOverride?: number,
+  contextWindowOverride?: ContextLimitOverride,
 ): number {
-  let contextWindow = contextWindowOverride ?? getContextWindowForModel(model, getSdkBetas())
+  let contextWindow =
+    limitsOf(contextWindowOverride).window ??
+    getContextWindowForModel(model, getSdkBetas())
 
   // 环境变量的夹取必须排在保留额度**之前**算。原来它在后面无所谓 —— 保留额度只看模型;
   // 现在它按比例跟着窗口走,排在后面就会用一个已经被夹掉的窗口去减一份按原窗口算的保留,
@@ -98,19 +118,32 @@ const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
 
 export function getAutoCompactThreshold(
   model: string,
-  contextWindowOverride?: number,
+  contextWindowOverride?: ContextLimitOverride,
 ): number {
   const effectiveContextWindow = getEffectiveContextWindowSize(
     model,
     contextWindowOverride,
   )
 
-  const autocompactThreshold =
+  const derivedThreshold =
     effectiveContextWindow -
     Math.min(
       AUTOCOMPACT_BUFFER_TOKENS,
       Math.floor(effectiveContextWindow * AUTOCOMPACT_BUFFER_FRACTION),
     )
+
+  /**
+   * 用户声明的绝对阈值(`autoCompactTokenLimit`,对齐 codex 的
+   * `model_auto_compact_token_limit`)—— **取小**,不是取代。
+   *
+   * 取小的那一半是安全性:推出来的那个数是「压缩这次请求本身还发得出去」的上界,
+   * 而声明值高过它时被拒的是压缩自己。载入时已经挡掉了明显高过的写法,这里咬合的
+   * 是**学到的上界**把窗口收小之后 —— 那时候推出来的数会掉到声明值以下,而声明值
+   * 是一句写死的话,不会自己跟着变。
+   */
+  const declared = limitsOf(contextWindowOverride).autoCompactAt
+  const autocompactThreshold =
+    declared === undefined ? derivedThreshold : Math.min(declared, derivedThreshold)
 
   // Override for easier testing of autocompact
   const envPercent = process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
@@ -130,7 +163,7 @@ export function getAutoCompactThreshold(
 export function calculateTokenWarningState(
   tokenUsage: number,
   model: string,
-  contextWindowOverride?: number,
+  contextWindowOverride?: ContextLimitOverride,
 ): {
   percentLeft: number
   isAboveWarningThreshold: boolean
@@ -228,12 +261,28 @@ export function calculateTokenWarningState(
 export function shouldPreemptForContextLimit(
   tokenCount: number,
   model: string,
-  roleClientConfig: { roleName?: string; contextWindow?: number } | undefined,
+  roleClientConfig:
+    | {
+        roleName?: string
+        contextWindow?: number
+        autoCompactTokenLimit?: number
+        transport?: 'raw' | 'sdk'
+        apiProtocol?: string
+      }
+    | undefined,
 ): boolean {
+  /**
+   * 上下文归上游管的那一档,这道闸**必须让开**。
+   *
+   * 它是在请求发出去**之前**合成一条 `Prompt is too long` 把这一轮判死的,而那正是本该
+   * 交给上游 `truncation: 'auto'` 去截断的那一次请求。不让开的话,sdk 档比改动前更糟:
+   * 改动前至少还会先压一次,现在是压缩关了、闸门还在,直接判死。
+   */
+  if (upstreamManagesContext(roleClientConfig)) return false
   return calculateTokenWarningState(
     tokenCount,
     model,
-    effectiveRoleContextWindow(roleClientConfig),
+    effectiveRoleCompactLimits(roleClientConfig),
   ).isAtBlockingLimit
 }
 
@@ -258,8 +307,8 @@ export async function shouldAutoCompact(
   // pre-snip context, so tokenCountWithEstimation can't see the savings.
   // Subtract the rough-delta that snip already computed.
   snipTokensFreed = 0,
-  /** 员工自己的上下文窗口(见 getEffectiveContextWindowSize 的同名参数)。 */
-  contextWindowOverride?: number,
+  /** 员工自己的窗口 + 绝对阈值(见 ContextLimitOverride;传一个裸数字 = 只给窗口)。 */
+  contextWindowOverride?: ContextLimitOverride,
 ): Promise<boolean> {
   // Recursion guards. session_memory and compact are forked agents that
   // would deadlock.
@@ -318,6 +367,7 @@ export async function shouldAutoCompact(
   }
 
   const tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed
+  const roleLimits = limitsOf(contextWindowOverride)
   const threshold = getAutoCompactThreshold(model, contextWindowOverride)
   const effectiveWindow = getEffectiveContextWindowSize(
     model,
@@ -325,7 +375,7 @@ export async function shouldAutoCompact(
   )
 
   logForDebugging(
-    `autocompact: tokens=${tokenCount} threshold=${threshold} effectiveWindow=${effectiveWindow}${contextWindowOverride ? ` roleWindow=${contextWindowOverride}` : ''}${snipTokensFreed > 0 ? ` snipFreed=${snipTokensFreed}` : ''}`,
+    `autocompact: tokens=${tokenCount} threshold=${threshold} effectiveWindow=${effectiveWindow}${roleLimits.window ? ` roleWindow=${roleLimits.window}` : ''}${roleLimits.autoCompactAt ? ` roleLimit=${roleLimits.autoCompactAt}` : ''}${snipTokensFreed > 0 ? ` snipFreed=${snipTokensFreed}` : ''}`,
   )
 
   const { isAboveAutoCompactThreshold } = calculateTokenWarningState(
@@ -363,6 +413,15 @@ export async function autoCompactIfNeeded(
     return { wasCompacted: false }
   }
 
+  /**
+   * `transport: 'sdk'` = 这一席的上下文归上游管(出网带 `truncation: 'auto'`)——
+   * 我们这边整套压缩让开。放在最前面而不是混进阈值算术里:这不是「阈值够不着」,
+   * 是**这条路上不该有我们的压缩**,两者在日志和遥测上要分得开。
+   */
+  if (upstreamManagesContext(toolUseContext.options.roleClientConfig)) {
+    return { wasCompacted: false }
+  }
+
   const model = toolUseContext.options.mainLoopModel
   /**
    * 翻译型协议的员工跑在别人的模型上,而 `mainLoopModel` 是父会话的 Claude 模型
@@ -370,13 +429,14 @@ export async function autoCompactIfNeeded(
    * 「压缩该不该发生」的地方 —— 见 getEffectiveContextWindowSize 的参数注释。
    */
   /**
-   * **声明值和学到的上界取小** —— 见 roleContextCeiling 的文件头。
+   * 这一席的**两个数**:按哪个窗口算(声明值和学到的上界取小,见 roleContextCeiling
+   * 的文件头),以及压缩在哪个绝对 token 数上开火(`autoCompactTokenLimit`)。
    *
    * 原来这里直接读 `contextWindow`,也就是完全相信用户在 settings 里写的那句话。
    * 写大了的后果是压缩阈值坐在对面真实上限的外面:压缩永远够不着,直接撞上游 400,
    * 而这个 fork 撞上去没有任何兜底。
    */
-  const roleWindow = effectiveRoleContextWindow(
+  const roleLimits = effectiveRoleCompactLimits(
     toolUseContext.options.roleClientConfig,
   )
   const shouldCompact = await shouldAutoCompact(
@@ -384,7 +444,7 @@ export async function autoCompactIfNeeded(
     model,
     querySource,
     snipTokensFreed,
-    roleWindow,
+    roleLimits,
   )
 
   if (!shouldCompact) {
@@ -395,7 +455,7 @@ export async function autoCompactIfNeeded(
     isRecompactionInChain: tracking?.compacted === true,
     turnsSincePreviousCompact: tracking?.turnCounter ?? -1,
     previousCompactTurnId: tracking?.turnId,
-    autoCompactThreshold: getAutoCompactThreshold(model, roleWindow),
+    autoCompactThreshold: getAutoCompactThreshold(model, roleLimits),
     querySource,
   }
 

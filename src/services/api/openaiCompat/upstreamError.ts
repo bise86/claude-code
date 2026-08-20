@@ -29,6 +29,14 @@ export interface UpstreamFailure {
   /** 哪个员工。缺省时不提 —— 编一个「未知员工」比不写更让人迷惑。 */
   roleName?: string
   protocol: string
+  /**
+   * 这一次走的是哪条传输。**只有 sdk 档会印出来**。
+   *
+   * 两条传输发的是同一个请求体、打的是同一个地址,失败正文因此长得一模一样 ——
+   * 不点名的话,「切了 sdk 之后开始报这个」和「本来就报这个」在报障截图上无法区分,
+   * 而灰度期间这正是第一个要回答的问题。raw 档不印:那是默认档,一个字都不该多。
+   */
+  transport?: 'raw' | 'sdk'
   /** 我们**真正** POST 过去的那个地址。诊断 502 的第一手材料。 */
   url: string
   status: number
@@ -189,7 +197,7 @@ export function upstreamFailureMessage(f: UpstreamFailure): string {
     : f.notStreamed === true ? `${code} 但不是 SSE` : code
   const label = f.connectFailed === true ? '错误' : '上游原文'
   return [
-    `${who}(${f.protocol} 协议)调用失败`,
+    `${who}(${f.protocol} 协议${f.transport === 'sdk' ? ' · sdk 传输' : ''})调用失败`,
     `POST ${f.url} → ${status}`,
     `${label}:${upstreamBodyText(f.body)}${f.connectFailed === true && f.route ? ` ${f.route}` : ''}`,
     // 上游给没给内容会换一条建议 —— 空体 5xx 和带内容的 5xx 该查的东西不一样。

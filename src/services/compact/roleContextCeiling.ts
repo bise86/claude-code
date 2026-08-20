@@ -39,6 +39,8 @@
  * 而这份账本只减不增、按员工名共享、进程内不可恢复。地板是它的止损位。
  */
 
+import { UPSTREAM_TRUNCATION_PROTOCOLS } from '../api/openaiCompat/protocols.js'
+
 /**
  * 学到的上界不许低于这个数。见文件头「为什么有地板」。
  *
@@ -116,4 +118,64 @@ export function effectiveRoleContextWindow(
  */
 export function resetLearnedContextWindows(): void {
   learned.clear()
+}
+
+/**
+ * 一个员工的**两个数**:按哪个窗口算,以及压缩在哪个绝对 token 数上开火。
+ *
+ * 为什么捆成一个对象而不是两个参数往下传:这个仓库刚为「两条线各自算各自的」付过一次
+ * 学费 —— 硬封顶闸漏传了员工窗口,和自动压缩按两个不同的数算,中间那一段是必杀区间
+ * (见 blockingLimitOrder.test.ts 的文件头)。两个数分开传,就有第二次漏传的位置;
+ * 捆成一个,调用点要么传要么不传,没有「传一半」这个状态。
+ */
+export type RoleCompactLimits = {
+  /** 这一席真正的上下文窗口。`undefined` = 不干预,按引擎自己那套算。 */
+  window?: number
+  /** 自动压缩的绝对阈值(用户声明的 `autoCompactTokenLimit`)。`undefined` = 从窗口推。 */
+  autoCompactAt?: number
+}
+
+/**
+ * **这一席的上下文归上游管吗。**
+ *
+ * 两个条件缺一不可:
+ *
+ *  1. `transport: 'sdk'` —— 用户明确把这一席交出去了;
+ *  2. **这条协议的线格式里真的有那个字段**(`UPSTREAM_TRUNCATION_PROTOCOLS`)。
+ *
+ * 第 2 条不能省。`truncation: 'auto'` 只有 Responses 有,chat/completions **没有** ——
+ * 对它照样让开本地压缩的话,那一席就是「我们不压、上游也不截」的裸奔组合,撞满直接 400,
+ * 而用户以为自己已经把这件事交出去了。所以 `openai`(chat)+ sdk 的上下文**仍由我们压**,
+ * 和 raw 完全一样;换掉的只有传输。
+ *
+ * 判据是「这条协议接不接得住」而不是写死协议名:加一条新方言时,漏改的表现是**静默**的。
+ *
+ * 归上游管的那一档,自动压缩和硬封顶闸必须**一起**让开 —— 只关压缩而留着闸门,那一席会在
+ * 请求发出去**之前**被我们自己合成的一条 `Prompt is too long` 判死,而那正是本该交给上游
+ * 去截断的那一次请求。结果比改动前更糟:原来至少还会先压一次。
+ *
+ * 写成一个具名函数而不是散在两处布尔表达式:这个仓库为「两条线各自算各自的」付过一次
+ * 学费(见 blockingLimitOrder.test.ts 的文件头)。
+ */
+export function upstreamManagesContext(
+  cfg: { transport?: 'raw' | 'sdk'; apiProtocol?: string } | undefined,
+): boolean {
+  if (cfg?.transport !== 'sdk') return false
+  return cfg.apiProtocol !== undefined && UPSTREAM_TRUNCATION_PROTOCOLS.has(cfg.apiProtocol)
+}
+
+/**
+ * 从员工配置里取出这两个数 —— 窗口那一半仍然是「声明值和学到的上界取小」。
+ *
+ * 阈值那一半**不参与学习**:它是一个绝对数,而学到的东西是窗口。窗口被学小之后,
+ * 从窗口推出来的阈值跟着变小,再和这个绝对数取小(在 `getAutoCompactThreshold` 里),
+ * 所以学习的效果照样传导得到,不需要在这里再动一次手。
+ */
+export function effectiveRoleCompactLimits(
+  cfg: { roleName?: string; contextWindow?: number; autoCompactTokenLimit?: number } | undefined,
+): RoleCompactLimits {
+  return {
+    window: effectiveRoleContextWindow(cfg),
+    autoCompactAt: cfg?.autoCompactTokenLimit,
+  }
 }

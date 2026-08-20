@@ -2,9 +2,9 @@ import { z } from 'zod/v4'
 import { logError } from '../../../utils/log.js'
 import { registerDirectHosts } from '../../../utils/lanDirect.js'
 import type { EffortValue } from '../../../utils/effort.js'
-import { ROLE_API_PROTOCOLS } from '../../../services/api/openaiCompat/protocols.js'
+import { ROLE_API_PROTOCOLS, UPSTREAM_TRUNCATION_PROTOCOLS } from '../../../services/api/openaiCompat/protocols.js'
 import { parseRoleThinking, resolveRoleThinking, ROLE_THINKING_LEVELS } from './roleThinking.js'
-import { MAX_ROLE_CONTEXT_WINDOW, MIN_ROLE_CONTEXT_WINDOW, parseContextWindow, roleContextWindow } from './roleContextWindow.js'
+import { formatContextWindow, MAX_ROLE_CONTEXT_WINDOW, maxUsefulAutoCompactLimit, MIN_ROLE_CONTEXT_WINDOW, parseContextWindow, roleContextWindow } from './roleContextWindow.js'
 import type { RoleClientConfig } from './roleTypes.js'
 
 /**
@@ -82,6 +82,17 @@ const RoleSchema = z.object({
    * 是 .strict(),写法不收就是**整条员工被跳过**,而用户看到的是「这个员工不存在」。
    */
   contextWindow: z.union([z.string(), z.number()]).optional(),
+  /**
+   * 自动压缩的绝对阈值 —— 对齐 codex 的 `model_auto_compact_token_limit`。
+   * 同 contextWindow 收两种写法(`900000` / `"900k"`);.strict() 下写法不收 =
+   * **整条员工被跳过**,而用户看到的是「这个员工不存在」。
+   */
+  autoCompactTokenLimit: z.union([z.string(), z.number()]).optional(),
+  /**
+   * 传输档。写错的值不能让**整条员工**被跳过(.strict() 下 zod 会那么干),所以收
+   * 自由字符串,合法性在下面自己判 —— 和 thinkingDepth 同一个理由。
+   */
+  transport: z.string().optional(),
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   interactive: z.boolean().optional(),
@@ -217,14 +228,78 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
         issues.push({ name: r.name, source, reason: `contextWindow "${String(r.contextWindow)}" 无法识别,已忽略;写成 token 数(128000)或 128k,范围 ${MIN_ROLE_CONTEXT_WINDOW}~${MAX_ROLE_CONTEXT_WINDOW}` })
       }
       const window = roleContextWindow({ execMode: r.execMode, apiProtocol: protocol, declared: declaredWindow })
+      /**
+       * 传输档。三种「配了但不生效」都说出来,一条都不静默 —— 这个字段的全部意义就是
+       * 灰度期间能明确回答「这一席到底走的哪条路」,而一个被悄悄忽略的值会让那个问题
+       * 变成猜。
+       */
+      let transport: 'raw' | 'sdk' | undefined
+      const rawTransport = typeof r.transport === 'string' ? r.transport.trim().toLowerCase() : undefined
+      if (rawTransport !== undefined && rawTransport !== '') {
+        if (rawTransport === 'raw' || rawTransport === 'sdk') {
+          transport = rawTransport
+        } else {
+          issues.push({ name: r.name, source, reason: `transport "${String(r.transport)}" 不是合法取值,可用:raw / sdk,已按 raw 处理` })
+        }
+      }
+      if (transport !== undefined && r.execMode !== 'api') {
+        issues.push({ name: r.name, source, reason: 'transport 只对 execMode 为 api 的员工有意义,已忽略' })
+        transport = undefined
+      } else if (transport !== undefined && protocol === 'anthropic') {
+        issues.push({ name: r.name, source, reason: `transport 只对翻译型协议(${ROLE_API_PROTOCOLS.filter(p => p !== 'anthropic').join(' / ')})有意义,anthropic 协议是原样转发,已忽略` })
+        transport = undefined
+      }
+      /**
+       * 自动压缩的绝对阈值。三条都**说出来**,一条都不静默:
+       *
+       *  1. 写法不认识 —— 同 contextWindow,静默回落等于「配了但没生效」;
+       *  2. 写在 cli 员工上 —— 那一档没有 roleClientConfig,压缩由外部 CLI 自己做,
+       *     这个字段一个消费者都没有。不说的话它看起来配上了;
+       *  3. 高过这个窗口能用的上限 —— 压缩自己那次请求要装得下整段对话加一段摘要,
+       *     阈值贴着窗口的话被上游拒的是压缩本身(见 maxUsefulAutoCompactLimit)。
+       *     这一条在**载入时**就算得出来,所以不留给运行期的 Math.min 去悄悄夹。
+       */
+      let declaredLimit = parseContextWindow(r.autoCompactTokenLimit)
+      if (r.autoCompactTokenLimit !== undefined && r.autoCompactTokenLimit !== '' && declaredLimit === undefined) {
+        issues.push({ name: r.name, source, reason: `autoCompactTokenLimit "${String(r.autoCompactTokenLimit)}" 无法识别,已忽略;写成 token 数(900000)或 900k,范围 ${MIN_ROLE_CONTEXT_WINDOW}~${MAX_ROLE_CONTEXT_WINDOW}` })
+      }
+      if (declaredLimit !== undefined && r.execMode === 'cli') {
+        issues.push({ name: r.name, source, reason: 'autoCompactTokenLimit 在 execMode 为 cli 的员工上不生效(外部 CLI 自己管上下文),已忽略' })
+        declaredLimit = undefined
+      }
+      if (declaredLimit !== undefined && window.value !== undefined) {
+        const cap = maxUsefulAutoCompactLimit(window.value)
+        if (declaredLimit > cap) {
+          issues.push({ name: r.name, source, reason: `autoCompactTokenLimit 最多写到 ${cap}(窗口 ${formatContextWindow(window.value)} 要留给压缩自己一段摘要额度和缓冲),你写的 ${declaredLimit} 已忽略,仍按 ${cap} 触发` })
+          declaredLimit = undefined
+        }
+      }
       const translating = protocol !== 'anthropic'
       const wire = r.execMode === 'api'
         ? resolveRoleThinking({ level, protocol, model: r.model ?? '' })
         : resolveRoleThinking({ level, protocol: 'anthropic', model: r.model ?? '' })
       if (wire.note) issues.push({ name: r.name, source, reason: wire.note })
       const parsedEffort = translating ? undefined : (wire.value as EffortValue | undefined)
+      /**
+       * **上下文归不归上游管,判据是「这条协议接不接得住」**,不是「transport 是不是 sdk」。
+       *
+       * `truncation: 'auto'` 只有 Responses 有,chat/completions 没有 —— 所以
+       * `openai` + sdk 的上下文仍由我们压(见 roleContextCeiling 的 upstreamManagesContext),
+       * 那一档这两个旋钮照常生效,不该报「不生效」。
+       *
+       * 归上游的那一档要说出来:用户写的 1M / 900k 上游看不见(它按**自己的**模型窗口判定),
+       * 安安静静不起作用正是这个仓库反复付代价的那一类。
+       *
+       * **措辞不能笼统说「不生效」** —— 验收席跑出来的:`contextWindow` 还有第二个消费者,
+       * `query.ts` 拿它算**工具产出的每消息预算**(`roleWindowChars`),那条在这一档照常生效。
+       * 说成「不生效」会让用户以为可以把它删掉,而删掉之后巨大的工具产出会原样进上下文。
+       */
+      if (transport === 'sdk' && UPSTREAM_TRUNCATION_PROTOCOLS.has(protocol)
+          && (window.value !== undefined || declaredLimit !== undefined)) {
+        issues.push({ name: r.name, source, reason: 'transport 为 sdk 时这一席的上下文交给上游管(请求带 truncation: auto):autoCompactTokenLimit 不生效,contextWindow 也不再决定压缩时机(但仍用于工具产出的每消息预算,别删)' })
+      }
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
-        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value }
+        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value, autoCompactTokenLimit: declaredLimit, transport }
         : undefined
       /**
        * 内网端点**在载入时**就登记直连(见 utils/lanDirect)。

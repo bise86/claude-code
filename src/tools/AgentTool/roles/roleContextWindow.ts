@@ -99,3 +99,28 @@ export function formatContextWindow(n: number): string {
   if (n >= 1_000 && n % 100 === 0) return `${Math.round(n / 100) / 10}k`.replace('.0k', 'k')
   return String(n)
 }
+
+/**
+ * 这个窗口下,`autoCompactTokenLimit` 最大能写到多少 —— **写大于它的数没有意义**。
+ *
+ * ## 为什么有这个上限
+ *
+ * 压缩本身**也是一次请求**:它把整段对话原样发上去,再要一段摘要回来。阈值如果贴着窗口
+ * (「1M 的窗口,涨到 990k 再压」),那一次压缩请求就是 990k 输入 + 摘要输出 > 窗口 ——
+ * 于是**压缩自己被上游拒收**,而这一席已经没有别的自救手段了(这个 fork 里
+ * `feature('REACTIVE_COMPACT')` 是 false)。摘要额度和缓冲区就是留给它的那一段。
+ *
+ * ## 它和 autoCompact.ts 那份算术的关系(**不是重复,是下界**)
+ *
+ * 真身多一个模型侧的项:保留额度是 `min(模型输出上限, 20000, 窗口×20%)`,而这里只算
+ * `min(20000, 窗口×20%)` —— 少 min 一项只会让保留额度**更大**、算出来的上限**更小**。
+ * 也就是说这个函数返回的是真实上限的**下界**:它放行的值,真身一定也放行。
+ *
+ * 这条「≤」由 `autoCompactLimit.test.ts` 拿两个函数对着跑钉住,不是靠这段注释。
+ * 之所以不直接 import 真身:那条链把 growthbook、api/claude 全拖进员工载入路径,
+ * 而员工载入跑在启动最早的那一段。
+ */
+export function maxUsefulAutoCompactLimit(window: number): number {
+  const effective = window - Math.min(20_000, Math.floor(window * 0.2))
+  return effective - Math.min(13_000, Math.floor(effective * 0.1))
+}

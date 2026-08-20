@@ -244,6 +244,67 @@
 
   合法范围 8000 ~ 10000000，写错（比如 `"huge"`）不会让整条员工失效，只会在关口上记一条诊断。
 
+- `autoCompactTokenLimit`：自动压缩的**绝对阈值**（token 数）。同样收 `900000` 和 `"900k"`。
+
+  **这是 codex 那两个 `-c` 的对等物**——`contextWindow` 对 `model_context_window`，`autoCompactTokenLimit` 对 `model_auto_compact_token_limit`：
+
+  | codex | 这个 fork（写在员工上） |
+  |---|---|
+  | `-c model_context_window=1000000` | `"contextWindow": "1m"` |
+  | `-c model_auto_compact_token_limit=900000` | `"autoCompactTokenLimit": 900000` |
+
+  ```jsonc
+  {
+    "name": "gpt5", "whenToUse": "……", "execMode": "api",
+    "apiProtocol": "openai-responses",
+    "apiUrl": "https://api.openai.com/v1", "apiToken": "sk-…", "model": "gpt-5.1",
+    "contextWindow": "1m",
+    "autoCompactTokenLimit": 900000
+  }
+  ```
+
+  **不写的话**阈值是从窗口推出来的（`窗口 − 摘要保留 − 缓冲`）：1M 推出来是 967000，200k 是 167000，128k 是 97200。写了就按你写的这个数触发。
+
+  **有上限,而且就是上面那个推出来的数**。压缩自己也是一次带着整段对话的请求：阈值贴着窗口的话，被上游拒收的是压缩本身，而这一席撞上去没有兜底（这个 fork 没有反应式压缩）。写大了不会静默生效——关口上会告诉你这个窗口最多能写到多少，然后按那个数触发。
+
+  | 窗口 | `autoCompactTokenLimit` 最多写到 |
+  |---|---|
+  | 128k（不写 contextWindow 时的估值） | 97200 |
+  | 200k | 167000 |
+  | 1M | 967000 |
+
+  **`transport: "sdk"` 的员工上这个键不生效** —— 那一档的上下文交给上游管（见下面 `transport`），载入时会点名。
+
+  **只在 `execMode: 'api'` 上生效**。cli 档的外部 CLI 自己管上下文，写在那种员工上会被忽略并在关口上说明；要给一个 cli 档的 codex 设这两个值，直接写进它自己的参数：`"args": ["-c", "model_context_window=1000000", "-c", "model_auto_compact_token_limit=900000"]`。
+
+  还有一条和跑动有关：上游真的拒收过一次之后，我们会学一个更小的窗口上界，阈值跟着重算，并**仍与你写的数取小**——只会压得更早，不会更晚。
+
+- `transport`：这一席用哪条**传输**把请求发出去。`"raw"`（默认）或 `"sdk"`。
+
+  | 值 | 怎么发 |
+  |---|---|
+  | `raw`（默认） | 我们自己的 fetch + SSE 解析 |
+  | `sdk` | 官方 `openai` 客户端发请求，帧喂给**同一个**翻译器 |
+
+  **`sdk` 不只是换传输，它还换了「谁管上下文」**：
+
+  | | raw | sdk |
+  |---|---|---|
+  | 请求怎么发 | 我们的 fetch + SSE 解析 | 官方 `openai` 客户端 |
+  | 上下文涨满谁管 | **我们**：到阈值先摘要一次，再补恢复附件（最近读的文件、plan、skill、MCP 指令…） | **上游**（仅 `openai-responses`）：请求带 `truncation: "auto"`，超出模型窗口时由 API 从对话开头丢条目 |
+  | `contextWindow` / `autoCompactTokenLimit` | 都用于压缩 | `openai-responses`：**不再决定压缩**（上游按它自己的模型窗口判定，看不到你写的数）——但 `contextWindow` 仍用于**工具产出的每消息预算**，别因此删掉它；`openai`：照常生效 |
+  | 本地硬封顶闸 | 生效 | 交给上游的那一档让开（否则会在请求发出去之前把本该由上游截断的那一轮判死）；`openai` 照常生效 |
+
+  代价要清楚：`truncation` **丢原文、不摘要**，模型会失忆而且不知道自己失忆了；压缩后那套恢复附件也不会有。换来的是这条路上你完全不用管上下文。
+
+  ⚠️ 上面这张表说的是 `openai-responses`。**`openai`（chat/completions）协议没有 `truncation` 字段**，所以它 + `sdk` 只换传输：上下文**仍由我们压**（阈值、`contextWindow`、`autoCompactTokenLimit`、硬封顶闸全部照常生效），和 `raw` 完全一样。判据是「这条协议接不接得住」，不是「transport 是不是 sdk」——加新方言时这个事实写在协议注册表里（`upstreamTruncation`）。
+
+  除上下文之外的一切都是同一件事：同一个地址、同一个鉴权头、同一份上游字节翻出来的事件流逐字相同，请求体**只差一个 `truncation`**。这条由 `transportParity.test.ts` 拿同一份字节喂两条路钉住，不是一句承诺。
+
+  sdk 档的两处实现细节：客户端上 `maxRetries: 0`（重试策略统一留在 `withRetry`，两套叠起来是乘法，而且退避曲线会错乱），以及**把我们自己的 fetch 传进 SDK**（内网直连、请求头清洗、连接失败的分类诊断都挂在它上面）。失败诊断里会额外印一句「sdk 传输」，好让灰度期间「切了之后开始报」和「本来就报」分得开。
+
+  只对 `execMode: 'api'` 的**翻译型协议**（`openai` / `openai-responses`）有意义；写在 `anthropic` 协议或 cli 档上会被忽略，并在 `/et` 启动关口上说明。
+
 #### `cli` 模式
 
 角色通过执行本地命令行工具运行。支持两个执行档次。

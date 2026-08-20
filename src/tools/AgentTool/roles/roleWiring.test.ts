@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'bun:test'
 import { parseRoles, roleLoadIssues } from './rolesFromSettings.js'
 import { buildRoleFetch } from '../../../services/api/openaiCompat/roleFetch.js'
+import { upstreamManagesContext } from '../../../services/compact/roleContextCeiling.js'
 
 const api = (over: Record<string, unknown> = {}) => ({
   name: 'gpt', whenToUse: 'w', execMode: 'api',
@@ -155,5 +156,177 @@ describe('出网请求真的按协议分流', () => {
       expect(`${p}: ${h.get('authorization')}`).toBe(`${p}: Bearer sk-role`)
       expect(`${p}: ${h.get('x-api-key')}`).toBe(`${p}: null`)
     }
+  })
+})
+
+/**
+ * **自动压缩的绝对阈值**从 settings 一路走到 roleClientConfig ——
+ * 对齐 codex 的 `model_auto_compact_token_limit`(那边是 `-c` 一行,我们这边是员工上的一个键)。
+ *
+ * 这一档只看两侧:settings 里写了什么 → roleClientConfig 上是什么 / 用户被告知了什么。
+ * 阈值算术本身在 services/compact/autoCompactLimit.test.ts。
+ */
+describe('autoCompactTokenLimit 配得进去', () => {
+  it('900000 和 "900k" 都收,落在 roleClientConfig 上', () => {
+    for (const v of [900_000, '900k', '900000'] as const) {
+      const out = parseRoles([api({ apiProtocol: 'openai-responses', contextWindow: '1m', autoCompactTokenLimit: v })], `probe-acl-${v}`)
+      expect(`${v}: ${out[0]?.agentDef.roleClientConfig?.autoCompactTokenLimit}`).toBe(`${v}: 900000`)
+    }
+  })
+
+  it('写法不认识:整条员工照样载入,但把原因说出来', () => {
+    const source = 'probe-acl-bad'
+    const out = parseRoles([api({ contextWindow: '1m', autoCompactTokenLimit: 'lots' })], source)
+    expect(out).toHaveLength(1)
+    expect(out[0].agentDef.roleClientConfig?.autoCompactTokenLimit).toBeUndefined()
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('autoCompactTokenLimit')
+    expect(reasons).toContain('900k')
+  })
+
+  /**
+   * 压缩自己也是一次带着整段对话的请求。阈值贴着窗口 = 被上游拒的是压缩本身,
+   * 而这个 fork 撞上去没有兜底。所以这个值有上限,而且**在载入时**就说出来 ——
+   * 留给运行期的 Math.min 去悄悄夹的话,用户看到的是「我写了 995000,它 967000 就压了」。
+   */
+  it('高过窗口能用的上限:忽略,并且告诉用户最多能写多少', () => {
+    const source = 'probe-acl-cap'
+    const out = parseRoles([api({ contextWindow: '1m', autoCompactTokenLimit: 995_000 })], source)
+    expect(out[0].agentDef.roleClientConfig?.autoCompactTokenLimit).toBeUndefined()
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('967000')
+  })
+
+  it('没声明 contextWindow 时,上限按那个**估出来的** 128k 算', () => {
+    const source = 'probe-acl-assumed'
+    const out = parseRoles([api({ apiProtocol: 'openai-responses', autoCompactTokenLimit: 900_000 })], source)
+    expect(out[0].agentDef.roleClientConfig?.autoCompactTokenLimit).toBeUndefined()
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('97200')
+  })
+
+  it('cli 员工上写了它:不生效,而且说出来(那一档没有 roleClientConfig,外部 CLI 自己压)', () => {
+    const source = 'probe-acl-cli'
+    const out = parseRoles([{ name: 'cx', whenToUse: 'w', execMode: 'cli', command: 'codex', autoCompactTokenLimit: 900_000 }], source)
+    expect(out).toHaveLength(1)
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('autoCompactTokenLimit')
+    expect(reasons).toContain('cli')
+  })
+})
+
+/**
+ * **传输档**从 settings 一路走到 roleClientConfig。
+ *
+ * 两条传输的等价性由 `services/api/openaiCompat/transportParity.test.ts` 钉;这一档只管
+ * 「用户写的那个字符串有没有变成这一席真正走的路」—— 灰度期间最需要能明确回答的就是这个,
+ * 而一个被悄悄忽略的值会让那个问题变成猜。
+ */
+describe('transport 配得进去', () => {
+  it('sdk / raw 都收,大小写和空格不计', () => {
+    for (const [written, want] of [['sdk', 'sdk'], ['SDK', 'sdk'], [' raw ', 'raw']] as const) {
+      const out = parseRoles([api({ apiProtocol: 'openai-responses', transport: written })], `probe-tr-${written}`)
+      expect(`${written}: ${out[0]?.agentDef.roleClientConfig?.transport}`).toBe(`${written}: ${want}`)
+    }
+  })
+
+  it('不写就是 undefined —— 默认走 raw,不靠字符串默认值', () => {
+    const out = parseRoles([api({ apiProtocol: 'openai-responses' })], 'probe-tr-none')
+    expect(out[0].agentDef.roleClientConfig?.transport).toBeUndefined()
+  })
+
+  it('写错的值不让整条员工消失,只记一条能照做的诊断', () => {
+    const source = 'probe-tr-bad'
+    const out = parseRoles([api({ apiProtocol: 'openai', transport: 'openai-sdk' })], source)
+    expect(out).toHaveLength(1)
+    expect(out[0].agentDef.roleClientConfig?.transport).toBeUndefined()
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('raw / sdk')
+  })
+
+  it('anthropic 协议上写了它:忽略并说明(那一档是原样转发,没有可替换的帧来源)', () => {
+    const source = 'probe-tr-anthropic'
+    const out = parseRoles([api({ apiProtocol: 'anthropic', transport: 'sdk' })], source)
+    expect(out[0].agentDef.roleClientConfig?.transport).toBeUndefined()
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('transport')
+    expect(reasons).toContain('anthropic')
+  })
+
+  it('cli 员工上写了它:忽略并说明', () => {
+    const source = 'probe-tr-cli'
+    const out = parseRoles([{ name: 'cx', whenToUse: 'w', execMode: 'cli', command: 'codex', transport: 'sdk' }], source)
+    expect(out).toHaveLength(1)
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('transport')
+    expect(reasons).toContain('api')
+  })
+})
+
+/**
+ * `transport: 'sdk'` 改的不只是传输,而是**谁管上下文**。两条"配了但不生效/会裸奔"
+ * 必须在开跑之前说出来 —— 这一档最贵的失败是「写了 1M,安安静静没起作用」。
+ */
+describe('sdk 档:上下文交给上游之后,哪些配置不再生效', () => {
+  it('写了 contextWindow / autoCompactTokenLimit 会被点名不生效', () => {
+    const source = 'probe-sdk-knobs'
+    parseRoles([api({ apiProtocol: 'openai-responses', transport: 'sdk', contextWindow: '1m', autoCompactTokenLimit: 900_000 })], source)
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).toContain('truncation')
+    expect(reasons).toContain('contextWindow')
+    expect(reasons).toContain('autoCompactTokenLimit')
+  })
+
+  it('raw 档不说这句 —— 那一档它们照常生效', () => {
+    const source = 'probe-raw-knobs'
+    parseRoles([api({ apiProtocol: 'openai-responses', contextWindow: '1m', autoCompactTokenLimit: 900_000 })], source)
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).not.toContain('truncation')
+  })
+
+  /**
+   * chat/completions 没有 truncation 字段,所以那一档的上下文**仍由我们压** —— 两个旋钮
+   * 照常生效,不该报「不生效」。这条守的是判据本身:如果哪天有人把判据写回
+   * 「transport === 'sdk'」,chat 档会既被告知旋钮失效、又真的没人压。
+   */
+  it('openai(chat)协议 + sdk:旋钮照常生效,不报不生效', () => {
+    const source = 'probe-sdk-chat'
+    const out = parseRoles([api({ apiProtocol: 'openai', transport: 'sdk', contextWindow: '1m', autoCompactTokenLimit: 900_000 })], source)
+    expect(out[0].agentDef.roleClientConfig?.transport).toBe('sdk')
+    expect(out[0].agentDef.roleClientConfig?.autoCompactTokenLimit).toBe(900_000)
+    const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
+    expect(reasons).not.toContain('不生效')
+  })
+})
+
+/**
+ * **从 settings.json 那几行,直通「这一席的上下文归谁管」。**
+ *
+ * 前面几组用的是手搓的 config 对象,而生产里那个对象是 `parseRoles` 造出来的 ——
+ * 这个仓库为「探针打在一个长得像的替身上」付过学费:替身答得出的话,真身答不出。
+ * 所以这一条把两端直接接上:settings 里写什么 → 运行期的判据说什么。
+ */
+describe('settings → 谁管这一席的上下文', () => {
+  const ownerOf = (role: Record<string, unknown>, source: string): boolean => {
+    const out = parseRoles([api(role)], source)
+    const cfg = out[0]?.agentDef.roleClientConfig
+    expect(cfg).toBeDefined()
+    return upstreamManagesContext(cfg)
+  }
+
+  it('openai-responses + sdk:归上游', () => {
+    expect(ownerOf({ apiProtocol: 'openai-responses', transport: 'sdk' }, 'probe-own-a')).toBe(true)
+  })
+
+  it('openai(chat)+ sdk:仍归我们(那条协议没有 truncation)', () => {
+    expect(ownerOf({ apiProtocol: 'openai', transport: 'sdk' }, 'probe-own-b')).toBe(false)
+  })
+
+  it('不写 transport:归我们', () => {
+    expect(ownerOf({ apiProtocol: 'openai-responses' }, 'probe-own-c')).toBe(false)
+  })
+
+  it('transport 写错(被忽略成 raw):归我们 —— 一个打错的字不该把上下文悄悄交出去', () => {
+    expect(ownerOf({ apiProtocol: 'openai-responses', transport: 'sdk1' }, 'probe-own-d')).toBe(false)
   })
 })
