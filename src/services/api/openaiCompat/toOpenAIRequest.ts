@@ -1,3 +1,5 @@
+import { stripAnthropicSystemBlocks } from './systemBlocks.js'
+
 function textOf(content: any): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) return content.filter(b => b.type === 'text').map(b => b.text).join('')
@@ -5,7 +7,8 @@ function textOf(content: any): string {
 }
 export function toOpenAIRequest(body: any, backendModel: string, thinkingDepth?: string): any {
   const messages: any[] = []
-  const systemText = textOf(body.system)
+  // Anthropic 专属的归因块和「你是 Claude Code」身份前缀不发给第三方模型(见 systemBlocks)。
+  const systemText = textOf(stripAnthropicSystemBlocks(body.system))
   if (systemText) messages.push({ role: 'system', content: systemText })
   for (const m of body.messages ?? []) {
     const blocks = Array.isArray(m.content) ? m.content : [{ type: 'text', text: m.content }]

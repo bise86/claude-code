@@ -20,6 +20,8 @@
  * 发回下一轮(只对 cache_control 做特判)。加前缀是为了永远不会把 anthropic 自己的签名
  * 误认成我们编的这个。
  */
+import { stripAnthropicSystemBlocks } from './systemBlocks.js'
+
 export const REASONING_SIG_PREFIX = 'openai-responses-reasoning:'
 
 export function encodeReasoningSignature(id: string, encrypted: string): string {
@@ -120,7 +122,8 @@ export function toResponsesRequest(body: any, opts: ResponsesOptions): any {
     store: false,
     include: ['reasoning.encrypted_content'],
   }
-  const systemText = textOf(body.system)
+  // Anthropic 专属的归因块和「你是 Claude Code」身份前缀不发给第三方模型(见 systemBlocks)。
+  const systemText = textOf(stripAnthropicSystemBlocks(body.system))
   if (systemText.length > 0) out.instructions = systemText
   // anthropic 的 max_tokens 在这个协议里叫 max_output_tokens。
   if (body.max_tokens != null) out.max_output_tokens = body.max_tokens

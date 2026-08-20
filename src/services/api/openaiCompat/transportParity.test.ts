@@ -20,7 +20,7 @@ const RESPONSES_FRAMES: any[] = [
   { type: 'response.created', response: { id: 'resp_1' } },
   { type: 'response.output_text.delta', delta: '你' },
   { type: 'response.output_text.delta', delta: '好' },
-  { type: 'response.completed', response: { usage: { input_tokens: 11, output_tokens: 22 } } },
+  { type: 'response.completed', response: { usage: { input_tokens: 11, output_tokens: 22, input_tokens_details: { cached_tokens: 7 } } } },
 ]
 const responsesSSE = (): string =>
   RESPONSES_FRAMES.map(f => `event: ${f.type}\ndata: ${JSON.stringify(f)}\n\n`).join('')
@@ -29,7 +29,7 @@ const responsesSSE = (): string =>
 const CHAT_CHUNKS: any[] = [
   { id: 'chatcmpl_1', choices: [{ index: 0, delta: { role: 'assistant', content: '你' } }] },
   { id: 'chatcmpl_1', choices: [{ index: 0, delta: { content: '好' } }] },
-  { id: 'chatcmpl_1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 11, completion_tokens: 22 } },
+  { id: 'chatcmpl_1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 11, completion_tokens: 22, prompt_tokens_details: { cached_tokens: 7 } } },
 ]
 const chatSSE = (): string =>
   `${CHAT_CHUNKS.map(c => `data: ${JSON.stringify(c)}\n\n`).join('')}data: [DONE]\n\n`
@@ -102,7 +102,35 @@ for (const p of PROTOCOLS) {
     expect(sdk.text).toBe(raw.text)
     // 两边都空的话上面那条断言毫无意义。
     expect(raw.text).toContain('你')
-    expect(raw.text).toContain('11')
+    expect(raw.text).toContain('"output_tokens":22')
+  })
+
+  /**
+   * **用量(含缓存命中那一段)两条传输都拿得到,而且是同一个数。**
+   *
+   * 这条单列出来,是因为它靠的东西和正文不一样:用量只在 `response.completed` /
+   * 最后一个 chunk 上出现一次,而 `cache_read_input_tokens` 还要从
+   * `input_tokens_details.cached_tokens`(chat 侧是 `prompt_tokens_details`)里
+   * 单独摘出来、并从 input 里减掉 —— 上游报的 input **已经包含**缓存那一段,不减的话
+   * 详情页那句「缓存 读 X」对 openai 系员工恒为 0,便宜的那一大截被算成全价。
+   *
+   * 这段摘取在两条传输之间是**同一份代码**(fromResponsesStream / fromOpenAIStream),
+   * 但「同一份代码」不等于「同一个结果」—— 帧来源换了,SDK 有没有把 usage 原样交出来
+   * 是要跑一遍才知道的。
+   */
+  test(`[${p.name}] 用量和缓存命中:两条传输拿到的是同一份`, async () => {
+    const usageOf = (text: string): any => {
+      const line = text.split('\n').find(l => l.startsWith('data:') && l.includes('"usage"') && l.includes('message_delta'))
+      return line ? JSON.parse(line.slice(5)).usage : undefined
+    }
+    const raw = usageOf((await drive(p.name, 'raw', ok)).text)
+    const sdk = usageOf((await drive(p.name, 'sdk', ok)).text)
+    expect(raw).toBeDefined()
+    expect(sdk).toEqual(raw)
+    // 缓存那一段确实被单列出来,并且从 input 里减掉了(11 − 7 = 4)。
+    expect(raw.cache_read_input_tokens).toBe(7)
+    expect(raw.input_tokens).toBe(4)
+    expect(raw.output_tokens).toBe(22)
   })
 
   test(`[${p.name}] 两条传输的请求体逐字相同,而且都不带 truncation`, async () => {

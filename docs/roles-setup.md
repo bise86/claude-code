@@ -314,6 +314,9 @@
 
 ## API 模式（execMode: 'api'）
 
+> **发给第三方模型的系统提示词里没有 Anthropic 专属的那两块。** 引擎每次请求前会往系统提示词最前面拼 `x-anthropic-billing-header: …`（计费/归因标识）和 `You are Claude Code, Anthropic's official CLI for Claude.`（身份前缀）——它们是给 Anthropic 的 API 的：一个是纯噪音，另一个更糟，它在告诉一个不是 Claude 的模型「你是 Claude Code」。`openai` / `openai-responses` 两条协议在翻译时会把这两块摘掉，**只发这一席自己的系统提示词**（员工 prompt、工具说明、环境信息）。`anthropic` 协议是原样转发，不受影响。
+
+
 ### 协议类型
 
 三选一,判据是**你的后端说哪种话**,以及**你要不要看到思考过程**:
