@@ -57,6 +57,7 @@ describe('人工解决合并冲突后,--resume 真的接手', () => {
     release: async () => ({ removed: false, keptBecause: '冲突未解决' }),
     dispose: async () => ({ kept: [] }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/pay.ts'] }),

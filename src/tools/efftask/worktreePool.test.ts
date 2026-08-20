@@ -3115,3 +3115,232 @@ describe('dispose 的判据是引用和目录都没有', () => {
     expect(calls).toBe(0)
   })
 })
+
+
+/**
+ * **集成验收 vs 合并** —— 这一组钉的是跑机上那次 102 分 35 秒的死锁(.30 run 001,
+ * 2026-08-20)。病根:集成验收和合并共用 `mergeLock`,而验收那一席跑了 84 分钟,
+ * 期间 27 个节点堵在 MERGE 上各占一个并发槽,91 个 READY 一个都起不来。
+ *
+ * 判据是两条,**必须一起立**:
+ *  1. 验收开着的时候合并照样落得下去(验收不占锁);
+ *  2. 验收脚下那份检出在整场验收里一个字节都不变(外面合了也不许灌进来)。
+ *
+ * 只立第 1 条的实现(把锁删掉、仍在共享的集成工作区里开会)会当场违反第 2 条;
+ * 只立第 2 条的实现(把树冻在 run 起点)会让验收永远看不到子任务的产出 —— 所以
+ * 第 2 条里还有一半是**反空转**:下一场验收必须看得见刚合进来的东西。
+ */
+describe('集成验收的快照检出', () => {
+  /** 到点还没 settle 就交出 `'TIMEOUT'` —— 用「没按时完成」表达「被挡住了」。 */
+  const raceTimeout = <T,>(p: Promise<T>, ms: number): Promise<T | 'TIMEOUT'> =>
+    Promise.race([p, new Promise<'TIMEOUT'>(r => setTimeout(() => r('TIMEOUT'), ms))])
+
+  const deferred = (): { wait: Promise<void>; go: () => void } => {
+    let go = (): void => {}
+    const wait = new Promise<void>(r => { go = r })
+    return { wait, go }
+  }
+
+  it('验收开着的时候,别人的合并照样落得下去', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/40-a')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'a.txt'), 'a\n')
+
+    const entered = deferred()
+    const hold = deferred()
+    let reviewDone = false
+    // 一场**永远不结束**的验收:它代表那 84 分钟。
+    const review = p.withIntegrationReview(async () => {
+      entered.go()
+      await hold.wait
+      reviewDone = true
+    })
+    await entered.wait // 验收确实已经在跑了,不是还没开始
+
+    const merged = await raceTimeout(p.commitAndMerge(n), 10_000)
+    // 两句一起断言:合并**完成了**,而且是在验收**还没结束**的时候完成的。
+    expect({
+      merged: merged !== 'TIMEOUT' && merged.ok === true && merged.merged === true,
+      reviewDone,
+    }).toEqual({ merged: true, reviewDone: false })
+
+    hold.go()
+    await review
+  }, 30_000)
+
+  it('验收脚下的代码在验收期间一个字节都不变,而下一场看得见刚合进来的东西', async () => {
+    const p = pool()
+    await p.init()
+    const n = node('root/41-b')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'base.txt'), 'MERGED-MIDWAY\n')
+
+    const look = async (path: string): Promise<string> =>
+      (await git(['rev-parse', 'HEAD'], path)).stdout.trim()
+        + '|' + await readFile(join(path, 'base.txt'), 'utf8')
+
+    const entered1 = deferred()
+    const hold1 = deferred()
+    const seen1: string[] = []
+    const r1 = p.withIntegrationReview(async path => {
+      seen1.push(await look(path))
+      entered1.go()
+      await hold1.wait
+      seen1.push(await look(path))
+    })
+    await entered1.wait
+
+    // 一次真的合并,**夹在两场验收之间**。顺序是判据的一部分:先按「两场同时开、再合并」
+    // 写过一版,「共享一棵树 + 每轮 reset」那种错实现**全绿** —— 因为 reset 的时候 tip
+    // 还没动,那一下是内容上的空操作。合并必须落在两场中间才打得中。
+    expect((await p.commitAndMerge(n)).ok).toBe(true)
+
+    // 第二场开在第一场**还开着**的时候 —— 两场集成验收本来就能真并发
+    // (stateMachine 每节点独立判 integrate,pickBatch 不按 kind 去重)。
+    const seen2 = await p.withIntegrationReview(look)
+
+    hold1.go()
+    await r1
+
+    // 第一场:开场和收场逐字相同 —— 既没被合并改写,也没被第二场的准备动作拽走。
+    expect(seen1[1]).toBe(seen1[0] as string)
+    expect(seen1[0]).toContain('base\n')
+
+    // 反空转:第二场必须看得见刚合进来的东西,而且不是同一个 HEAD。
+    // (少了这一条,「一律冻在 run 起点」也能骗过上面那句。)
+    expect(seen2).toContain('MERGED-MIDWAY')
+    expect(seen2.split('|')[0]).not.toBe((seen1[0] as string).split('|')[0])
+  }, 30_000)
+
+  /**
+   * **退路必须重新持锁,而且必须说出来。**
+   *
+   * 建不出快照时回到共享的集成工作区 —— 那里合并正在写,不持锁开会会让别人的合并
+   * 在验收脚下改写它(见 commitAndMerge 合并失败那一段记的实测)。所以退路是
+   * 「慢回去」,不是「不安全地快」。
+   *
+   * 这条用例是第一条用例的**反面**:那边断言合并不被挡,这边断言退路上合并**就是**
+   * 被挡的 —— 两条一起才说明「不持锁」是被选出来的,不是碰巧的。
+   * 变异实测:把退路的 `mergeLock(() => fn(intPath))` 改成 `fn(intPath)`,
+   * 在补这条之前全仓 519 个用例**全绿**。
+   */
+  it('建不出快照时:退回共享集成工作区,重新持锁,并把 git 的原话报出来', async () => {
+    const notices: string[] = []
+    // 只让「建验收快照」这一件事失败,别的 git 照常 —— 打在真实现的这条缝上。
+    const failAdd: GitRunner = async (args, cwd) =>
+      args[0] === 'worktree' && args[1] === 'add' && (args[3] ?? '').includes('integration-review')
+        ? { code: 1, stdout: '', stderr: "fatal: '...' already exists\n" }
+        : git(args, cwd)
+    const p = pool({ git: failAdd, onNotice: (line: string) => { notices.push(line) } })
+    await p.init()
+    const n = node('root/44-e')
+    const l = await p.acquire(n) as { path: string }
+    await writeFile(join(l.path, 'e.txt'), 'e\n')
+
+    const entered = deferred()
+    const hold = deferred()
+    let handed = ''
+    const review = p.withIntegrationReview(async path => { handed = path; entered.go(); await hold.wait })
+    await entered.wait
+
+    // 退到哪:共享集成工作区。
+    expect(handed).toBe(p.integrationPath)
+    // 退回之后**仍然持锁** —— 合并这时候就该被挡住。
+    expect(await raceTimeout(p.commitAndMerge(n), 3000)).toBe('TIMEOUT')
+    // 而且这件事要能被读到,还要带上 git 的原因(盘满/分支没了/撞名,下一步完全不同)。
+    const said = notices.find(x => x.includes('退回共享集成工作区')) ?? ''
+    expect(said).toContain('already exists')
+
+    hold.go()
+    await review
+  }, 30_000)
+
+  it('验收里抛异常:快照照样删掉,下一场照样建得出来', async () => {
+    const p = pool()
+    await p.init()
+    let path = ''
+    await expect(p.withIntegrationReview(async x => { path = x; throw new Error('boom') }))
+      .rejects.toThrow('boom')
+    expect(await stat(path).then(() => true, () => false)).toBe(false)
+    // 后面的验收不受影响 —— 一次失败不许把这条路堵死。
+    expect(await p.withIntegrationReview(async x => x)).not.toBe(path)
+  }, 30_000)
+
+  /**
+   * 撞名换号,**不去动盘上那个目录** —— 它可能是另一个还活着的进程正在用的快照。
+   * 这是 `for (let i = 0; i < 3; i++)` 那个循环的全部理由。
+   */
+  it('目录被占住:换个号建,不碰占住它的那个目录', async () => {
+    const p = pool()
+    await p.init()
+    const squat = join(worktreeRoot, 'integration-review-001-0')
+    await mkdir(squat, { recursive: true })
+    await writeFile(join(squat, 'someone-elses.txt'), 'keep me\n')
+
+    const got = await p.withIntegrationReview(async x => x)
+    expect(got).toBe(join(worktreeRoot, 'integration-review-001-1'))
+    expect(await readFile(join(squat, 'someone-elses.txt'), 'utf8')).toBe('keep me\n')
+  }, 30_000)
+
+  /**
+   * 「删就是删」这条不容分说的销毁,全部依据就是**快照里的提交到不了任何分支**。
+   * 哪天有人把 `--detach` 换成开一条分支,这条会红 —— 否则没有任何东西会红。
+   */
+  it('快照是 detached 的:席位在里面提交,也到不了集成分支', async () => {
+    const p = pool()
+    await p.init()
+    const before = (await git(['rev-parse', 'efftask/001/integration'], gitRoot)).stdout.trim()
+    const made = await p.withIntegrationReview(async path => {
+      await writeFile(join(path, 'seat.txt'), 'seat wrote this\n')
+      await git(['add', '-A'], path)
+      await git(['commit', '-qm', 'seat commit'], path)
+      return (await git(['rev-parse', 'HEAD'], path)).stdout.trim()
+    })
+    expect((await git(['rev-parse', 'efftask/001/integration'], gitRoot)).stdout.trim()).toBe(before)
+    // 那条提交不在任何分支上(它连 ref 都没有,gc 之前只是个游离对象)。
+    expect((await git(['branch', '--contains', made, '-a'], gitRoot)).stdout.trim()).toBe('')
+  }, 30_000)
+
+  /**
+   * **崩溃留下的快照必须有第二条清理路。**
+   *
+   * `finally` 挡不住 SIGKILL / OOM / 断电,而残留是复利的:留 k 棵 ⇒ 之后每个进程要付
+   * `ceil(k/3)` 次「退回共享工作区、持锁开一整场验收」—— 这次改动要消灭的那 102 分钟,
+   * 被它自己的失败模式复活。`worktree prune` 救不了:目录还在,登记项就有效。
+   */
+  it('init 认领上一趟自己留下的快照:清掉本 run 的,不碰别人的', async () => {
+    const p = pool()
+    await p.init()
+    // 造一棵「上一趟崩溃时留下的」本 run 快照 + 一棵别的 run 的。
+    const mine = join(worktreeRoot, 'integration-review-001-9')
+    const theirs = join(worktreeRoot, 'integration-review-002-9')
+    const sha = (await git(['rev-parse', 'efftask/001/integration'], gitRoot)).stdout.trim()
+    await git(['worktree', 'add', '--detach', mine, sha], gitRoot)
+    await git(['worktree', 'add', '--detach', theirs, sha], gitRoot)
+
+    await pool().init()   // 同一个 runId 的下一趟
+
+    expect(await stat(mine).then(() => true, () => false)).toBe(false)
+    expect(await stat(theirs).then(() => true, () => false)).toBe(true)
+    expect((await git(['worktree', 'list'], gitRoot)).stdout).not.toContain(mine)
+  }, 30_000)
+
+  it('快照是私有的一次性检出:不是集成工作区,而且用完就没了', async () => {
+    const p = pool()
+    await p.init()
+    const paths: string[] = []
+    await p.withIntegrationReview(async path => { paths.push(path) })
+    await p.withIntegrationReview(async path => { paths.push(path) })
+    // 两场各自一棵,而且都不是那棵共享的集成工作区。
+    expect(paths[0]).not.toBe(paths[1])
+    for (const path of paths) expect(path).not.toBe(p.integrationPath)
+    // 用完即删:目录没了,git 的登记表里也不该再留着它们。
+    for (const path of paths) expect(await stat(path).then(() => true, () => false)).toBe(false)
+    const list = (await git(['worktree', 'list'], gitRoot)).stdout
+    for (const path of paths) expect(list).not.toContain(path)
+    // 而集成工作区原样还在 —— 它不是这次要动的东西。
+    expect(await stat(p.integrationPath).then(() => true, () => false)).toBe(true)
+  }, 30_000)
+})

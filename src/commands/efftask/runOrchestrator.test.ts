@@ -105,6 +105,7 @@ describe('runOrchestrator reports the run it just drove', () => {
       release: async () => ({ removed: false, keptBecause: '冲突未解决' }),
       dispose: async () => ({ kept: [] }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
       integrationPath: '/wt/integration',
       conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/pay.ts'] }),
@@ -169,6 +170,7 @@ describe('runOrchestrator reports the run it just drove', () => {
       dispose: async () => { disposed++; return { kept: [] } },
       handoff: async () => { handedOff++; return { branch: 'efftask/002/integration', commits: 3, kept: [], salvage: [], integrationPath: '/wt/integration' } },
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       integrationPath: '/wt/integration',
       integrationBranchName: 'efftask/002/integration',
     }
@@ -200,6 +202,7 @@ describe('runOrchestrator reports the run it just drove', () => {
       dispose: async () => { disposed++; return { kept: [] } },
       handoff: async () => ({ branch: 'b', commits: 0, kept: [], salvage: [], integrationPath: '/wt/integration' }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       integrationPath: '/wt/integration',
       integrationBranchName: 'b',
     }
@@ -257,6 +260,7 @@ describe('收口:跑完就把产出送回当前目录', () => {
       trunkLanded,
     }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     // `syncTrunk` 拿它当**用户检出**的 cwd(送达那一跳就在这里跑)。
     // 少了它,那一跳的 cwd 是 undefined —— 而这一屏的判据正是「它必须落在用户目录上」。
     gitRoot: '/repo',
@@ -1141,6 +1145,7 @@ describe('收口撞上冲突:模型先解一次(用户要求的那件事)', () =
           dispose: async () => ({ kept: [] }),
           handoff: async () => ({ branch: 'efftask/005/integration', commits: 3, kept: [], salvage: [], integrationPath: '/wt/integration' }),
           withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+          withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
           gitRoot: '/repo',
           integrationPath: '/wt/integration',
           integrationBranchName: 'efftask/005/integration',
@@ -1277,6 +1282,7 @@ describe('收口之前的自动捞回', () => {
       integrationPath: '/wt/integration', trunkLanded: 0,
     }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     gitRoot: '/repo',
     integrationPath: '/wt/integration',
     integrationBranchName: 'efftask/004/integration',
@@ -1348,6 +1354,7 @@ describe('中止之后的收口', () => {
     release: async () => ({ removed: true }),
     dispose: async () => ({ kept: [] }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     integrationBranchName: 'efftask/001/integration',

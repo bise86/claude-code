@@ -8,10 +8,14 @@ import { DEFAULT_TRUNK_RESOLVE } from './types.js'
  *
  * ## 为什么不能在集成工作区里做
  *
- * `.efftask-worktrees/integration` 只有一个 index、一个检出:`commitAndMerge` 写它,
- * 集成验收读它,两者共用 `mergeLock`。把一次**几分钟的模型调用**关进那把锁里,
- * 整棵树的合并当场停摆 —— `mergeSubtree.ts` 顶上那段注释为这件事写死过规矩:
- * 「解冲突那次模型调用不在锁里」。
+ * `.efftask-worktrees/integration` 只有一个 index、一个检出,`commitAndMerge`、收口的
+ * 反向快进、以及建不出验收快照时退回来的那一场集成验收都在里面,共用 `mergeLock`。把一次
+ * **几分钟的模型调用**关进那把锁里,整棵树的合并当场停摆 —— `mergeSubtree.ts` 顶上那段
+ * 注释为这件事写死过规矩:「解冲突那次模型调用不在锁里」。
+ *
+ * (集成验收自己已经搬走了,见 `worktreePool.ts` 的 `withIntegrationReview`:它开在本轮
+ * 一次性的快照检出里、全程不进锁。搬走的起因正是这条规矩被它破了 —— 跑机上一场 84 分钟的
+ * 集成验收持着 `mergeLock`,把整趟 run 的合并锁死 102 分钟。)
  *
  * 所以合并在**第三棵树**里做:`<worktreeRoot>/merge-scratch`,detached 在集成分支的 tip 上。
  * 它不属于任何节点,没有第二个读者,所以模型可以在里面解任意久。锁只用在最后那一次

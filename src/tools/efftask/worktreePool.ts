@@ -218,6 +218,132 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
   const acquireLock = mutex()
   const mergeLock = mutex()
 
+  /**
+   * **集成验收的一次性快照检出。**
+   *
+   * 存在的全部理由:集成验收此前和合并共用 `mergeLock`(见 `withIntegrationRead`),
+   * 而它是全仓唯一含模型调用/编译的临界区。跑机实测(.30 run 001,2026-08-20):一场
+   * 84 分钟的集成验收把整棵树的合并锁死 **102 分 35 秒** —— 27 个节点堵在 MERGE 上、
+   * 各占一个并发槽,91 个 READY 一个都起不来;那一席一结束,21 次合并在 3.8 秒内全部落地。
+   * (`nodeTimeoutMs` 拦不住它:那是**静默**超时,而该席最大静默只有 94 秒。)
+   *
+   * 判据是两条,缺一不可:
+   *  1. **验收不用锁** —— 它一秒都不该挡着别人合并;
+   *  2. **它脚下的代码不许被外面更新** —— 这期间集成分支前进了也不能灌进来,否则裁决
+   *     是在一棵中途换过的树上做的。
+   *
+   * 只做第 1 条(删掉锁、仍在共享的 `intPath` 里开会)会当场违反第 2 条,并且复活下面
+   * `:1523` 记的那次实测:「a reviewer saw conflict markers and a live MERGE_HEAD
+   * mid-review, and clean -fd deleted its scratch files」。所以两条一起做。
+   *
+   * **为什么是一次性建删,不是复用一棵**:复用就得每轮 `reset --hard` + `clean -fd`,
+   * 而那恰恰是「把别人脚下的代码换掉」—— 两场集成验收**能真并发**(`stateMachine.ts`
+   * 每节点独立判 integrate,`scheduler.ts` 的 pickBatch 不按 kind 去重,`serialiseExecute`
+   * 只串行 execute)。一次性检出把不可变性交给**生命周期**,不交给命名约定;顺带把
+   * 「谁来 reset、reset 前要不要先钉住」这一整串问题从根上删掉 —— 新树上没有别人的现场。
+   *
+   * **快照不需要任何临界区**:`rev-parse` 是对 ref 的一次原子读(真 git 实测:12 路并发
+   * merge 期间读 2065 次,零次半截 sha);`worktree add` 打的是新目录,和 `intPath` 没有
+   * 共享可写状态;sha 被 detached 树的 HEAD 指住之后就是 gc 根(实测 `gc --prune=now`
+   * 都删不掉)。唯一进 `acquireLock` 的是 `worktree add` 本身 —— 这个文件上面量过
+   * 「5 路并发 add → could not lock config file .git/config」,那是毫秒级的排队,不是这次
+   * 要消灭的那种。
+   */
+  let reviewSeq = 0
+
+  /**
+   * 这一趟自己的验收快照检出叫什么。
+   *
+   * **带 runId**:`worktreeRoot` 是跨 run 共享的,而 `reviewSeq` 只是进程内的一个计数器。
+   * 不带 runId 的话,上一趟崩溃留下的 `integration-review-0` 会让下一趟第一场验收撞名 ——
+   * 而撞名的代价见 `makeReviewTree`:一次调用烧三个号,烧完就退回持锁开会。
+   * 这个文件下面(合并重试那一段)为「`intPath` 不带 runId」写过一整段事故,同一个坑。
+   */
+  const reviewPrefix = `${worktreeRoot}/integration-review-${runId}-`
+
+  /**
+   * **认领并收掉这一趟自己留下的验收快照。**
+   *
+   * `withIntegrationReview` 的 `finally` 是第一条清理路,但它挡不住 SIGKILL / OOM / 断电。
+   * 验收席实测过后果,而且是复利的:残留 k 棵 ⇒ 之后每个进程要付 `ceil(k/3)` 次
+   * 「退回共享集成工作区、持锁开一整场验收」—— 也就是这次改动要消灭的那 102 分钟,
+   * 被这次改动自己的失败模式原样复活。`git worktree prune` 救不了:目录还在,登记项就有效。
+   *
+   * 只认 `reviewPrefix`(带本趟 runId)。别的 run 留下的不碰 —— 同一个仓库可能真的有
+   * 另一趟在跑,而那棵树里可能正开着一场验收。
+   */
+  const reapReviewTrees = async (): Promise<void> => {
+    const listed = await git(['worktree', 'list', '--porcelain'], gitRoot)
+    if (listed.code !== 0) return
+    for (const line of listed.stdout.split('\n')) {
+      if (!line.startsWith('worktree ')) continue
+      const path = line.slice('worktree '.length).trim()
+      if (!path.startsWith(reviewPrefix)) continue
+      await git(['worktree', 'remove', '--force', path], gitRoot)
+    }
+    await git(['worktree', 'prune'], gitRoot)
+  }
+
+  /**
+   * **集成验收的一次性快照检出。**
+   *
+   * 存在的全部理由:集成验收此前和合并共用 `mergeLock`(见 `withIntegrationRead`),
+   * 而它是全仓唯一含模型调用/编译的临界区。跑机实测(.30 run 001,2026-08-20):一场
+   * 84 分钟的集成验收把整棵树的合并锁死 **102 分 35 秒** —— 27 个节点堵在 MERGE 上、
+   * 各占一个并发槽,91 个 READY 一个都起不来;那一席一结束,21 次合并在 3.8 秒内全部落地。
+   * (`nodeTimeoutMs` 拦不住它:那是**静默**超时,而该席最大静默只有 94 秒。)
+   *
+   * 判据是两条,缺一不可:
+   *  1. **验收不用锁** —— 它一秒都不该挡着别人合并;
+   *  2. **它脚下的代码不许被外面更新** —— 这期间集成分支前进了也不能灌进来,否则裁决
+   *     是在一棵中途换过的树上做的。
+   *
+   * 只做第 1 条(删掉锁、仍在共享的 `intPath` 里开会)会当场违反第 2 条,并且复活
+   * `commitAndMerge` 合并失败那一段记着的实测:「a reviewer saw conflict markers and a
+   * live MERGE_HEAD mid-review, and clean -fd deleted its scratch files」。所以两条一起做。
+   *
+   * **为什么是一次性建删,不是复用一棵**:复用就得每轮 `reset --hard` + `clean -fd`,
+   * 而那恰恰是「把别人脚下的代码换掉」—— 两场集成验收**能真并发**(`stateMachine.ts`
+   * 每节点独立判 integrate,`scheduler.ts` 的 pickBatch 不按 kind 去重,`serialiseExecute`
+   * 只串行 execute)。一次性检出把不可变性交给**生命周期**,不交给命名约定;顺带把
+   * 「谁来 reset、reset 前要不要先钉住」这一整串问题从根上删掉 —— 新树上没有别人的现场。
+   *
+   * **快照不需要任何临界区**:`rev-parse` 是对 ref 的一次原子读(真 git 实测:12 路并发
+   * merge 期间读 2065 次,零次半截 sha);`worktree add` 打的是新目录,和 `intPath` 没有
+   * 共享可写状态;sha 被 detached 树的 HEAD 指住之后就是 gc 根(实测 `gc --prune=now`
+   * 都删不掉)。唯一进 `acquireLock` 的是 `worktree add`/`remove` 本身 —— 这个文件上面
+   * 量过「5 路并发 add → could not lock config file .git/config」,那是毫秒级的排队。
+   *
+   * **为什么不把集成工作区的构建缓存喂过来**(试过,退回了)。一版实现把 `intPath` 里
+   * 被忽略的目录硬链接过来保温,验收席在真 cargo 上量出它会**损坏裁决**:产物(`.rlib`)
+   * 走 create+rename 确实断链,但 cargo 自己的账本(`.fingerprint/*`、`*.d`、
+   * `invoked.timestamp`)走 `fs::write` = O_TRUNC,**直接写回共享 inode**。于是一场验收
+   * 跑过 `cargo build` 之后,另一场并发验收的 `cargo` 会把自己那份(继承自集成树的)
+   * 旧产物判成 fresh:源码是 VERSION-2、编译报告成功、跑出来的是 VERSION-1,零警告。
+   * 而它买到的只有 5.5 秒/场(30 万文件实测)。冷编译是**慢**,那个是**错**。
+   * 要保温得走别的路(写时复制、或给验收席独立的 CARGO_TARGET_DIR),那是另一件事。
+   */
+  const makeReviewTree = async (): Promise<{ path: string } | { why: string }> => {
+    const tip = await git(['rev-parse', intBranch], gitRoot)
+    if (tip.code !== 0) return { why: first(tip) }
+    const sha = tip.stdout.trim()
+    let why = '未知原因'
+    /**
+     * 撞名就换号,不去动盘上那个目录 —— 它可能是**另一个还活着的进程**正在用的快照。
+     * `prune` 清得掉登记项,清不掉目录,所以撞名是可能的;真正兜底的是 `reapReviewTrees`。
+     */
+    for (let i = 0; i < 3; i++) {
+      const path = `${reviewPrefix}${reviewSeq++}`
+      const add = await acquireLock(async () => {
+        await git(['worktree', 'prune'], gitRoot)
+        return git(['worktree', 'add', '--detach', path, sha], gitRoot)
+      })
+      if (add.code === 0) return { path }
+      why = first(add)
+    }
+    return { why }
+  }
+
   const slugFor = (node: TaskNode): string => worktreeSlug(runId, node.id)
   const branchFor = (node: TaskNode): string => worktreeBranch(slugFor(node))
   const pathFor = (node: TaskNode): string => `${worktreeRoot}/${slugFor(node)}`
@@ -1234,6 +1360,7 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
           await writeFile(excl, `${cur}${cur.endsWith('\n') || cur === '' ? '' : '\n'}${want.join('\n')}\n`)
         }
       } catch { /* cosmetic only — never fail a run over it */ }
+      await reapReviewTrees()
       const registered = await git(['rev-parse', '--git-dir'], intPath)
       if (registered.code !== 0) {
         await git(['worktree', 'prune'], gitRoot)
@@ -1520,11 +1647,12 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
          * 清理动作原来只有上面那两句,而它跑在合并失败**之后** —— 于是第一次合并必然撞上
          * 别人留下的脏东西,阻断;下一次运行反而是干净的。晚了整整一次合并。
          *
-         * 为什么是「失败后洗+重试」而不是「合并前无条件洗」:intPath 是**共享**的,而
-         * 集成验收就在里面开会(`withIntegrationRead`),这个文件上面记过一次实测——
-         * 「a reviewer saw conflict markers and a live MERGE_HEAD mid-review, and clean -fd
-         * deleted its scratch files」。把清理常态化 = 把那个已经量到的破坏从「罕见」提成
-         * 「每次」。后置方案在正常路径上一次都不洗。
+         * 为什么是「失败后洗+重试」而不是「合并前无条件洗」:intPath 是**共享**的 ——
+         * 合并、收口、以及建不出验收快照时退回来的那一场集成验收都在里面。这个文件上面
+         * 记过一次实测:「a reviewer saw conflict markers and a live MERGE_HEAD mid-review,
+         * and clean -fd deleted its scratch files」。集成验收现在默认开在自己的一次性快照上
+         * (`withIntegrationReview`),那次实测因此从**常态**降成**退路上的窄窗口** ——
+         * 但把清理常态化仍然是把它重新提回「每次」。后置方案在正常路径上一次都不洗。
          *
          * 前提是真 git 量过的:合并因本地修改被拒时**工作树一个字节都没动**、没有
          * MERGE_HEAD,所以「洗掉本地修改再合一次」不会丢掉任何已经合进去的东西。
@@ -2021,15 +2149,6 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
      */
 
     /**
-     * Run `fn` with exclusive use of the integration worktree.
-     *
-     * That worktree has ONE index and ONE checkout: commitAndMerge writes it (merge, and on
-     * failure reset --hard + clean -fd) while integration acceptance READS it. Measured
-     * without this: a reviewer saw conflict markers and a live MERGE_HEAD mid-review, and
-     * clean -fd deleted its scratch files. Serialising execute used to keep that to one
-     * writer; lifting the lock made it N.
-     */
-    /**
      * Bring the integration branch INTO the node's own worktree, leaving any conflict there.
      *
      * This exists because the obvious design is wrong. `commitAndMerge` merges in the SHARED
@@ -2224,8 +2343,79 @@ export function createWorktreePool(deps: WorktreePoolDeps) {
       return { ok: false, message: merge.stderr.trim() || merge.stdout.trim() || '合并未生效' }
     },
 
+    /**
+     * 把对**集成工作区**的写序列化。
+     *
+     * 它只有一个 index、一个检出,而 `commitAndMerge`(merge,失败后 `reset --hard` +
+     * `clean -fd`)、收口的反向快进(`integrationMerge` / `backfill` 的 `merge --ff-only`)
+     * 都打在它上面。没有这把锁时实测:4 路并发合并 → 一个 rc=0、两个 rc=128
+     * `cannot lock ref 'HEAD'`、一个 rc=2,**只有赢家真的合上了**。
+     *
+     * **今天它只挡写与写。** 从前集成验收也走这里(整场圆桌包在锁里),那把一次 84 分钟的
+     * 模型调用关进了合并锁,跑机上锁死整趟 run 102 分钟;它现在开在自己的一次性快照里
+     * (`withIntegrationReview`),一秒都不进这把锁。名字里的 `Read` 是那段历史的遗留 ——
+     * 剩下的调用方全部把它接成 `withIntegrationLock`。
+     */
     withIntegrationRead<T>(fn: () => Promise<T>): Promise<T> {
       return mergeLock(fn)
+    },
+
+    /**
+     * 集成验收在**它自己那份一次性检出**里开会 —— 全程不进任何锁。见 `makeReviewTree`
+     * 上面那段:为什么不进锁、为什么必须是私有的、为什么不复用一棵。
+     *
+     * 交出路径而不是让调用方去猜:圆桌的 cwd 必须**就是这一棵**。此前它是
+     * `integrationPath`,而那棵树正是合并在写的那一棵。
+     *
+     * **退路是今天的形态,不是「不加锁的今天」**:建不出快照时回到共享的 `intPath`,
+     * 并且**必须**重新持锁 —— 不持锁地在那里开会会让合并在验收脚下改写它,那比慢更糟。
+     * 这条路上会掉回原来的排队行为,所以要说出来。
+     */
+    async withIntegrationReview<T>(fn: (path: string) => Promise<T>): Promise<T> {
+      const made = await makeReviewTree()
+      if (!('path' in made)) {
+        /**
+         * **退路是今天的形态,不是「不加锁的今天」** —— 见方法头上那段。
+         *
+         * 带上 git 的原话:失败原因决定了下一步完全不同的三件事(盘满 / 集成分支没了 /
+         * 残留目录撞名),而用户在这条路上唯一能读到的就是这一句。
+         */
+        onNotice?.(
+          `建不出集成验收快照(${made.why}),本轮退回共享集成工作区 ${intPath} —— ` +
+          `这期间其它节点的合并会全部排队(跑机上这条路堵过 102 分钟)。` +
+          `残留目录可以删 ${reviewPrefix}* `,
+          'review-snapshot-fallback',
+        )
+        return mergeLock(() => fn(intPath))
+      }
+      const path = made.path
+      try {
+        return await fn(path)
+      } finally {
+        // 一次性的:这棵树里的任何东西都到不了任何分支,所以删就是删。
+        //
+        // 席位可能在里面建过嵌套工作树(跑机实测:验收席自己 `worktree add` 了一棵,
+        // 那台机器上现存 29 棵)。真 git 实测:`remove --force` 照样成功,嵌套那条登记项
+        // 变成 prunable,由下一次 `makeReviewTree` 开头那句 `prune` 收掉。
+        //
+        // 删不掉要**说出来**:这条路上失败一次就是永久多一份仓库留在盘上,而这个功能
+        // 为同一个形状付过账(见 `integrationMerge.ts` 记的跑机 916 G)。
+        const gone = await acquireLock(async () => {
+          const r = await git(['worktree', 'remove', '--force', path], gitRoot)
+          // 席位在里面建过的嵌套工作树,删目录之后会留一条 prunable 登记项。收掉它,
+          // 否则最后一场验收留下的那条会一直挂在 `git worktree list` 里(跑机上那 210 条
+          // 里就有这种)。
+          await git(['worktree', 'prune'], gitRoot)
+          return r
+        })
+        if (gone.code !== 0) {
+          // **去重键要带 path**。`onNotice` 对同一个键是就地替换,而这句话里嵌着每轮
+          // 都不同的路径 —— 固定键会把「盘上留了 3 份」压成「留了 1 份」,而这句话的
+          // 全部价值就是那个路径。(同一个文件的 `onNotice` 形参注释警告过它的镜像:
+          // 串会变而不给键,等于不去重。)
+          onNotice?.(`集成验收快照删不掉,留在盘上了: ${path}(${first(gone)})`, `review-snapshot-leak:${path}`)
+        }
+      }
     },
 
     integrationPath: intPath,

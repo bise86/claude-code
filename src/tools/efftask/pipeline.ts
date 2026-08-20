@@ -1033,9 +1033,14 @@ function localContextLimitRemedy(): string {
  * 自己的工作区),于是哪儿都能去。devenv 改写了那棵树上受跟踪的 `devenv.lock` 并留在那儿,
  * 40 分钟后一个全部关口通过的节点合并失败,9 个兄弟连带阻断。
  *
- * **集成验收不能收到这句话** —— 它的圆桌 cwd 就是集成工作区(唯一合法住在那儿的环节),
- * 给它这句等于叫唯一该在那儿干活的人别在那儿干活。所以这句话由 planPrompt / reviewPrompt
- * 各自注入,不进共用的 `seatPreamble`。
+ * **集成验收也不发这句话,但理由已经换了。** 从前它的圆桌 cwd 就是集成工作区(那时唯一
+ * 合法住在那儿的环节),给它这句等于叫唯一该在那儿干活的人别在那儿干活。现在它开在本轮
+ * 自己的一次性快照里(见 `withIntegrationReview`),共享的 `integration` 那棵树**没有任何
+ * 环节住在里面**了 —— 只剩合并、收口这些机器动作。不发的新理由是:这一关的证据是子任务的
+ * execStatus,不是路径,而对着一个它根本不在的目录下禁令只会让它去找那个目录。
+ *
+ * (顺带,这句话的注入点是 `planPrompt` 和 `executePrompt` 两处 —— 全仓 `sharedTreeNote`
+ * 只有这两个调用者。此前这里写的是 planPrompt / reviewPrompt,那是错的。)
  *
  * 隔离没开时不说:那时候根本没有这个目录,凭空提一个不存在的路径是另一种说假话。
  *
@@ -6069,7 +6074,7 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
     // 每一场圆桌之前重新求值一次,理由见测试验证那一处。
     const integrateStrict = effectiveStrictness(ctx)
     const integrateNotice = judgeNotice(node, 'integrate', node.iteration.integration + 1, '集成验收', '子任务的结果', integrateStrict)
-    const runIntegrate = async () => roundtableWithInfraRetry({
+    const runIntegrate = async (cwd: string | undefined) => roundtableWithInfraRetry({
       // 集成提交(integrate)自己的席位。
       //
       // 回落到 accept 是**兼容**,不是默认:老 run.md 和没配这个环节的用户照旧由验收
@@ -6081,14 +6086,21 @@ export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<v
       phaseLabel: PHASE_LABEL.integrate,
       buildPrompt: (tag, seat) => integratePrompt(node, ctx, tag, feedback, seatPreamble(ctx, seat, 'integrate', node, integrateBriefPhase(node), integrateStrict), integrateNotice, integrateStrict, node.iteration.integration + 1, caps.maxIterations), // child evidence, NOT acceptPrompt
       ctx, strictness: integrateStrict,
-      // The INTEGRATION worktree, not the user's tree. This roundtable accepts every
-      // decompose node — including root, i.e. the run's final verdict — and under isolation
-      // the user's checkout contains none of the run's work.
-      cwd: ctx.worktrees?.integrationPath,
+      /**
+        * **本轮验收自己那份一次性快照**,不是共享的集成工作区,更不是用户的检出
+        * (隔离档下用户的检出里没有这一趟的任何产出;这场圆桌验的是每个拆分节点,
+        * 包括 root —— 整个 run 的最终裁决)。
+        *
+        * 交出来的这个值是判据的一部分:此前这里写死 `integrationPath`,而那棵树正是
+        * 合并在写的那一棵,于是「验收全程持锁」才成了唯一能让它读到一致内容的办法。
+        * 实测把它改成 `undefined` 时全仓 4385 个测试**全绿** —— 集成验收到底在哪棵树上
+        * 开会,此前零覆盖。改这一行请连着那条 cwd 断言一起看。
+        */
+      cwd,
     })
     const { rec, infraExhausted } = ctx.worktrees
-      ? await ctx.worktrees.withIntegrationRead(runIntegrate)
-      : await runIntegrate()
+      ? await ctx.worktrees.withIntegrationReview(path => runIntegrate(path))
+      : await runIntegrate(undefined)
     /**
      * **标上是哪一关**。集成验收和叶子验收共用 acceptLog,而省略 step 的含义是「验收」——
      * 于是一条集成验收记录读回来会被当成叶子验收。两个消费者会因此说错话:node.md 的

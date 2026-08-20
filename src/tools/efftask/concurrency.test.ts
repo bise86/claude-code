@@ -312,6 +312,7 @@ describe('隔离可用时才解除 execute 串行(用户第一句的后半)', ()
     release: async () => ({ removed: true }),
     dispose: async () => ({ kept: [] }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/pay.ts'] }),

@@ -52,6 +52,7 @@ function spyPool(over: Record<string, unknown> = {}) {
       dispose: async () => ({ kept: [] }),
       init: async () => ({ ok: true }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       refreshFromIntegration: async () => ({ ok: true, updated: false }),
       integrationPath: '/wt/integration',
       integrationBranchName: 'efftask/001/integration',

@@ -404,6 +404,47 @@ describe('pipeline', () => {
    * 缺席。`mergeAndRelease` 专门为这一格从「查账本」改成了「问 git」,而集成验收是决定
    * 最终裁决的那一轮 —— 在这儿拿账本下断言,正是那次改动要根除的形状。
    */
+  /**
+   * **集成验收开在哪棵树上,是一条判据,不是一个实现细节。**
+   *
+   * 此前这里写死 `cwd: ctx.worktrees.integrationPath` —— 而那棵树正是合并在写的那一棵,
+   * 于是「验收全程持有合并锁」成了唯一能让它读到一致内容的办法,跑机上因此死锁了
+   * 102 分钟。现在它拿的是本轮自己的一次性快照。
+   *
+   * 这条用例补的是一个**零覆盖**的洞:实测把那一行改成 `cwd: undefined` 时,
+   * `src/tools/efftask/` + `src/commands/efftask/` 全量 4385 个测试**全绿** ——
+   * 而生产上那意味着集成验收跑在用户的主检出里(隔离档下那棵树里没有这一趟的任何产出)。
+   */
+  it('集成验收的 cwd 就是本轮的快照检出 —— 不是集成工作区,也不是没有 cwd', async () => {
+    const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
+    const child = createNode({ id: 'root/01-aa', title: 'AA', parentId: 'root', deps: [], depth: 1, phaseRoles: emptyPhaseRoles(), now: NOW })
+    child.status = 'ACCEPTED'; child.execStatus = '子任务产出Y'
+    const cwds: (string | undefined)[] = []
+    const runAgent: RunAgentFn = async req => { cwds.push(req.cwd); return vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n\`\`\`' }
+    const handed: string[] = []
+    const ctx = {
+      ...ctxFor([n, child], runAgent),
+      worktrees: {
+        deliveredToIntegration: async () => true,
+        integrationPath: '/wt/integration',
+        withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+        withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => {
+          const p = '/wt/integration-review-7'
+          handed.push(p)
+          return fn(p)
+        },
+      } as never,
+    }
+    await stepIntegrate(n, ctx)
+
+    // 每一席都开在池子交回来的那一棵上 —— 一席都不能落在别处。
+    expect(cwds.length).toBeGreaterThan(0)
+    expect(cwds).toEqual(cwds.map(() => handed[0] as string))
+    // 两个反面各钉一次:老行为(共享集成工作区)和「忘了传」(落到进程 cwd)。
+    expect(cwds).not.toContain('/wt/integration')
+    expect(cwds).not.toContain(undefined)
+  })
+
   it('stepIntegrate: 账本空着但 git 说交付过 → 标题仍是「已合入」,而且账本被回填', async () => {
     const n = root(); n.status = 'WAITING_CHILDREN'; n.childIds = ['root/01-aa']
     n.execStatus = '我实现了 api.ts'
@@ -416,6 +457,7 @@ describe('pipeline', () => {
       worktrees: {
         deliveredToIntegration: async () => true,
         withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+        withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       } as never,
     }
     expect(n.contributed).toBeUndefined()
@@ -1163,6 +1205,7 @@ describe('隔离下,验收与评分必须读到被验收的工作', () => {
         commitAndMerge: async () => ({ ok: true, merged: true }),
         release: async () => ({ removed: true }),
         withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+        withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       } as never,
     }
     await stepStart(n, ctx)
@@ -1206,6 +1249,7 @@ describe('隔离接线:拿不到工作区就拒绝,合并是 ACCEPTED 前最后�
     dispose: async () => ({ kept: [] }),
     init: async () => ({ ok: true }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/a.ts'] }),
@@ -2410,6 +2454,7 @@ describe('跨分支依赖调度:返工前先把基线拉齐', () => {
     release: async () => ({ removed: true }),
     dispose: async () => ({ kept: [] }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     handoff: async () => ({ branch: 'i', commits: 0, kept: [], salvage: [] }),
     conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
     mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
@@ -2520,6 +2565,7 @@ describe('一个被回收掉的隔离工作区不能继续被声称存在', () =
       conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
       mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       integrationPath: '/wt/i', integrationBranchName: 'i',
     } as never
     await stepExecute(n, ctx)
@@ -2541,6 +2587,7 @@ describe('一个被回收掉的隔离工作区不能继续被声称存在', () =
       conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
       mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       integrationPath: '/wt/i', integrationBranchName: 'i',
     } as never
     await stepExecute(n, ctx)
@@ -2924,6 +2971,7 @@ describe('评分和合并是各自独立的阶段,面板不该把它们显示成
       conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
       mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
       withIntegrationRead: (fn: () => Promise<unknown>) => fn(),
+      withIntegrationReview: (fn: (p: string) => Promise<unknown>) => fn('/wt/integration-review-0'),
       integrationPath: '/wt/i', integrationBranchName: 'i',
     } as never
     await stepExecute(n, ctx)
@@ -2982,6 +3030,7 @@ describe('MERGE 必须在评分之后', () => {
       conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
       mergeIntegrationIntoNode: async () => ({ ok: true, conflicted: false }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       integrationPath: '/wt/i', integrationBranchName: 'i',
     } as never
     await stepExecute(n, ctx)
@@ -3606,6 +3655,7 @@ describe('各阶段耗时的账目必须和总耗时对得上', () => {
         commitAndMerge: async () => { bump(40_000); merged = true; return { ok: true, merged: true } },
         release: async () => ({ removed: true }),
         withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+        withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       } as never,
     }
     await stepStart(n, ctx)
@@ -3655,6 +3705,7 @@ describe('返工与集成验收这两个阶段同样要有账', () => {
         release: async () => ({ removed: true }),
         refreshFromIntegration: async () => { c.bump(5_000); return { ok: true, updated: true } },
         withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+        withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       } as never,
     }
     await stepExecute(n, ctx)
@@ -5058,6 +5109,7 @@ describe('跳过验收 × 合并冲突:三个调用点都不能谎报完成', ()
     dispose: async () => ({ kept: [] }),
     init: async () => ({ ok: true }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     conflictState: async () => ({ markers: true, staged: false, stale: false, files: ['src/a.ts'] }),
@@ -5203,6 +5255,7 @@ describe('跳过验收的另外两个调用点(冲突场景)', () => {
     dispose: async () => ({ kept: [] }),
     init: async () => ({ ok: true }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     handoff: async () => ({ branch: 'efftask/001/integration', commits: 0, kept: [], salvage: [] }),
     integrationPath: '/wt/integration',
     conflictState: async () => ({ markers: false, staged: false, stale: false, files: [] }),
@@ -6607,6 +6660,7 @@ describe('共享集成工作区的提醒:发给在别处干活的那两关,不�
       commitAndMerge: async () => ({ ok: true, merged: true }),
       release: async () => ({ removed: true }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       integrationPath: '/wt/integration',
       integrationBranchName: 'efftask/001/integration',
       refreshFromIntegration: async () => ({ ok: true, updated: false }),
@@ -6937,6 +6991,7 @@ describe('降级放行走完通过那条尾巴,一步都不少', () => {
         release: async () => { released = true; return { removed: true } },
         refreshFromIntegration: async () => ({ ok: true }),
         withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+        withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       } as never,
     }
     await stepExecute(n, ctx)
@@ -7198,6 +7253,7 @@ describe('执行者拿到「你在哪、别碰什么」', () => {
         commitAndMerge: async () => ({ ok: true, merged: true }),
         release: async () => ({ removed: true }),
         withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+        withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       } as never,
     })
     expect(p).toContain('.efftask-worktrees/integration')
@@ -7239,6 +7295,7 @@ describe('零贡献阻断的措辞与类别', () => {
         commitAndMerge: async () => ({ ok: true, merged: false }),
         release: async () => ({ removed: true }),
         withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+        withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       } as never,
     }
     await stepExecute(n, ctx)
@@ -7269,6 +7326,7 @@ describe('执行提示词里的「必须真的改文件」', () => {
     commitAndMerge: async () => ({ ok: true, merged: true }),
     release: async () => ({ removed: true }),
     withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+    withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
     refreshFromIntegration: async () => ({ ok: true, updated: false }),
     integrationAhead: async () => false,
     integrationPath: '/repo/.efftask-worktrees/integration',
@@ -7454,6 +7512,7 @@ describe('一轮没改任何文件的执行', () => {
       deliveredToIntegration: async () => delivered,
       release: async () => ({ removed: true }),
       withIntegrationRead: <T,>(fn: () => Promise<T>) => fn(),
+      withIntegrationReview: <T,>(fn: (p: string) => Promise<T>) => fn('/wt/integration-review-0'),
       // 第 2 轮开头会先从集成分支同步一次 —— 桩缺了它,返工那一路走不到。
       refreshFromIntegration: async () => ({ ok: true, updated: false }),
     }

@@ -83,7 +83,7 @@ export const STRANDED_KINDS = {
   integrationDirty: {
     label: '集成工作区里留着未提交或没解完的合并',
     action: 'report',
-    how: '席位在里面跑过构建,或者一次合并失败之后现场没收拾干净',
+    how: '一次合并失败之后现场没收拾干净;或者有席位违反禁令自己 cd 进去跑了构建(建不出验收快照时退回来的那一场也在这里开)',
   },
   orphanDir: {
     label: 'git 已经不认识的孤儿工作树目录',
@@ -784,7 +784,7 @@ export async function scanStranded(
         kind: 'integrationDirty', path: deps.integrationPath, loose: lines.length,
         why: conflicted.length > 0
           ? `留着一次没解完的合并(${conflicted.length} 个冲突文件)—— 下一次合并会被它挡住`
-          : '有未提交的内容(席位在里面跑过构建)—— 下一次合并会先把它清掉',
+          : '有未提交的内容(合并失败留下的,或有席位在里面跑过构建)—— 下一次合并会先把它清掉',
       })
     }
   }
