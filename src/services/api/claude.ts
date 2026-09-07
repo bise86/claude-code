@@ -1783,14 +1783,16 @@ async function* queryModel(
   let usage: NonNullableUsage = EMPTY_USAGE
   let costUSD = 0
   let stopReason: BetaStopReason | null = null
-  /**
-   * **这一趟有没有已经往调用方吐过东西。**
-   *
-   * 流中途失败之后能不能整轮重来,判据只有这一条:一个字都还没吐出去的失败,和一次
-   * 「请求根本没建起来」在外面看是同一件事;而已经吐过半截正文再重来,用户会看到同一段
-   * 话说两遍,工具调用甚至可能执行两次 —— 那比不重试坏得多。
-   */
-  let emittedToCaller = false
+  // Text/thinking deltas are previews, not a reason to give up on a failed stream.
+  // On stream-only routes, defer completed assistant blocks until the response
+  // finishes or a non-replayable block starts. Failed attempts then cannot leak
+  // into transcripts, agent results or the next request's reasoning signatures.
+  const deferStreamMessages = shouldDisableNonStreamingFallback(options.fetchOverride)
+  const pendingStreamMessages: AssistantMessage[] = []
+  let streamReplayBlockedBy: 'tool-output' | 'completed-response' | undefined
+  function* flushPendingStreamMessages(): Generator<AssistantMessage> {
+    yield* pendingStreamMessages.splice(0)
+  }
   let didFallBackToNonStreaming = false
   let fallbackMessage: AssistantMessage | undefined
   let maxOutputTokens = 0
@@ -2019,6 +2021,12 @@ async function* queryModel(
             break
           }
           case 'content_block_start':
+            // Only known, side-effect-free output is replayable. In particular,
+            // tool blocks may already be consumed/executed before the stream ends.
+            if (!['text', 'thinking', 'redacted_thinking'].includes(part.content_block.type)) {
+              streamReplayBlockedBy = 'tool-output'
+              yield* flushPendingStreamMessages()
+            }
             switch (part.content_block.type) {
               case 'tool_use':
                 contentBlocks[part.index] = {
@@ -2233,8 +2241,11 @@ async function* queryModel(
               ...(advisorModel && { advisorModel }),
             }
             newMessages.push(m)
-            emittedToCaller = true
-            yield m
+            if (deferStreamMessages && !streamReplayBlockedBy) {
+              pendingStreamMessages.push(m)
+            } else {
+              yield m
+            }
             break
           }
           case 'message_delta': {
@@ -2298,6 +2309,11 @@ async function* queryModel(
               cacheWrite: usage.cache_creation_input_tokens ?? 0,
             })
 
+            if (stopReason) {
+              streamReplayBlockedBy ??= 'completed-response'
+              yield* flushPendingStreamMessages()
+            }
+
             const refusalMessage = getErrorMessageIfRefusal(
               part.delta.stop_reason,
               options.model,
@@ -2339,14 +2355,6 @@ async function* queryModel(
             break
         }
 
-        /**
-         * `message_start` **不算「吐过东西」**。
-         *
-         * 网关最常见的失败形状恰恰是「先把流开起来(message_start),再吐一帧 error」——
-         * 把开场白算进去的话,这个判据会正好挡掉它要救的那一个。而它本身不带任何正文:
-         * 重来一次的代价只是调用方再收到一个开场事件,而不是同一段话被说两遍。
-         */
-        if (part.type !== 'message_start') emittedToCaller = true
         yield {
           type: 'stream_event',
           event: part,
@@ -2413,6 +2421,9 @@ async function* queryModel(
         })
         throw new Error('Stream ended without receiving any events')
       }
+
+      streamReplayBlockedBy ??= 'completed-response'
+      yield* flushPendingStreamMessages()
 
       // Log summary if any stalls occurred during streaming
       if (stallCount > 0) {
@@ -2542,44 +2553,16 @@ async function* queryModel(
             : 'other') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         })
 
-        /**
-         * **只走流式的链路上,这里是唯一还能重试的地方 —— 而在这之前它一次都不重试。**
-         *
-         * 用户报的现场(`/et` 席位,逐字):
-         *
-         *     ▸ 执行 第1轮 · 研发    ● 已完成 · 3s
-         *     │ 最新: API Error: {"type":"error","error":{"type":"api_error",
-         *                         "message":"Our servers are currently overloaded. Please try again later."}}
-         *
-         * 三秒、零重试,而 `shouldRetry` 对这一帧的判据是**对的**(errorPayload 把
-         * `api_error` 归一成 500)。病根不在判据,在**它根本不会被问到**:`withRetry` 的
-         * operation 返回的是 `Stream` 对象本身,try 到那一行就结束了,而流中途的一帧
-         * `event: error` 是在下面 `for await` 消费的时候才抛的 —— 已经在循环外面。
-         *
-         * 于是两件本来各自正确的事叠成了这个洞:
-         *  1. `5ba84ca` 把翻译型协议的非流式回退关掉了(它对这类链路永远走不通)——
-         *     而那条回退路里的 `executeNonStreamingRequest` **自带一整套 withRetry**,
-         *     也就是说它顺手拿走了这些席位唯一的重试;
-         *  2. `70f8a50` 修好的是 `shouldRetry` 的判据,而这条路上没人问它。
-         *
-         * 官方端点没有报这个,正是因为它的回退没关:错误落到非流式那条路上,在那里被
-         * 真正重试了。所以补丁只补这一个分支,不碰回退开着的那条路。
-         *
-         * 判据两条,缺一不可:
-         *  - **错误本身可重试** —— 复用 `shouldRetry`。政策是「所有失败都重试」,所以这一条
-         *    实际只在挡中止;和别处同一份判据,不在这里再写一套;
-         *  - **一个字都还没吐出去** —— 见 `emittedToCaller`。**这一条才是这里真正的约束**:
-         *    重发一个已经吐过正文的轮次,用户会看到同一段话说两遍,工具甚至跑两次。
-         *    它不是「这个错误不值得重试」,是「这一轮已经没法原样重来了」。
-         *
-         * 退避复用 `nextRetryDelay`(0.5s→1s→2s…,和别处同一条曲线),次数用通用的那个上限。
-         * 中止不在其中:`APIUserAbortError` 在上面已经原样抛出去了。
-         */
+        // withRetry covers stream creation; errors raised while consuming SSE
+        // must be retried here. Text/thinking alone no longer block replay: their
+        // completed messages are still pending and the next message_start resets
+        // the live preview. Never replay tool output or a committed response.
         const retryableMidStream = shouldRetry(streamingError)
         const midStreamMax = getDefaultMaxRetries()
-        if (retryableMidStream && !emittedToCaller && midStreamAttempt <= midStreamMax) {
+        if (retryableMidStream && !streamReplayBlockedBy && midStreamAttempt <= midStreamMax) {
           // 旧的那条流和它的响应体必须先放掉:下面要重新建一条,而这一条已经废了。
           releaseStreamResources()
+          pendingStreamMessages.length = 0
           const delayMs = nextRetryDelay(midStreamAttempt)
           logEvent('tengu_api_retry', {
             attempt: midStreamAttempt,
@@ -2618,6 +2601,14 @@ async function* queryModel(
             options,
             midStreamAttempt + 1,
           )
+        }
+
+        if (retryableMidStream && streamReplayBlockedBy) {
+          const reason = streamReplayBlockedBy === 'tool-output'
+            ? '本轮已输出工具调用或其它不可重放内容，为避免重复执行，不自动重发'
+            : '本轮响应已提交，不自动重发'
+          logForDebugging(`Streaming retry skipped: ${reason}`, { level: 'warn' })
+          reportContextNotice({ kind: 'api-retry-skipped', text: reason })
         }
 
         throw streamingError

@@ -2987,6 +2987,11 @@ export function handleMessageFromStream(
   }
 
   if (message.event.type === 'message_start') {
+    // A stream retry starts a new response without a new query-loop request.
+    // Its deltas must replace, not append to, the failed attempt's live preview.
+    onStreamingText?.(() => null)
+    onStreamingThinking?.(() => null)
+    onStreamingToolUses(() => [])
     if (message.ttftMs != null) {
       onApiMetrics?.({ ttftMs: message.ttftMs })
     }

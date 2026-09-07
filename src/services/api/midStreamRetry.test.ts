@@ -80,6 +80,7 @@ afterAll(() => {
 })
 
 const { queryModelWithStreaming } = await import('./claude.js')
+const { handleMessageFromStream } = await import('../../utils/messages.js')
 type Options = Awaited<typeof import('./claude.js')>['Options'] extends never
   ? never
   : Parameters<typeof queryModelWithStreaming>[0]['options']
@@ -183,6 +184,199 @@ describe('流中途的错误帧要能整轮重来', () => {
       type: 'service_unavailable_error', code: 'server_is_overloaded',
       message: 'Our servers are currently overloaded. Please try again later.', param: null,
     },
+  })
+
+  const serverError = frame('error', {
+    type: 'error',
+    error: {
+      type: 'server_error', code: 'server_error',
+      message: 'An error occurred while processing your request. You can retry your request.',
+    },
+  })
+  const thinkingDelta = frame('response.reasoning_summary_text.delta', {
+    type: 'response.reasoning_summary_text.delta', delta: '失败尝试的思考',
+  })
+  const textDelta = frame('response.output_text.delta', {
+    type: 'response.output_text.delta', delta: '失败尝试的正文',
+  })
+
+  for (const [name, prefix] of [
+    ['no-content', []],
+    ['visible-thinking', [thinkingDelta]],
+    ['closed-thinking', [thinkingDelta, reasoning]],
+    ['partial-text', [textDelta]],
+    ['empty-summary-parts', [
+      frame('response.reasoning_summary_part.added', { type: 'response.reasoning_summary_part.added' }),
+      frame('response.reasoning_summary_part.added', { type: 'response.reasoning_summary_part.added' }),
+    ]],
+    // 切换块会关闭前面的正文/思考,claude.ts 原来会立即将其作为 assistant 提交。
+    ['closed-text-and-thinking', [textDelta, thinkingDelta, reasoning, textDelta]],
+  ] as const) {
+    it(`SDK server_error 在 ${name} 后发生:重试且不提交失败尝试的内容`, async () => {
+      let calls = 0
+      const texts: string[] = []
+      const notices: string[] = []
+      const fetchFn = buildRoleFetch({
+        apiProtocol: 'openai-responses', transport: 'sdk',
+        apiUrl: 'https://gw.example/v1', apiToken: 'test-key', backendModel: 'test-model',
+      }, (async () => {
+        calls++
+        return sseResponse(calls === 1 ? [start, ...prefix, serverError] : [
+          start,
+          frame('response.output_text.delta', { type: 'response.output_text.delta', delta: '重试成功' }),
+          frame('response.completed', { type: 'response.completed', response: {} }),
+        ])
+      }) as typeof fetch)
+      await withContextNoticeSink(n => notices.push(n.text), async () => {
+        for await (const event of queryModelWithStreaming({
+          messages: messagesFixture(`probe-sdk-server-error-${name}`),
+          systemPrompt: [] as never, thinkingConfig: { type: 'disabled' }, tools: [] as never,
+          signal: new AbortController().signal, options: optionsWith(fetchFn),
+        })) {
+          if (event.type !== 'assistant') continue
+          expect(event.isApiErrorMessage).not.toBe(true)
+          for (const block of event.message.content) {
+            expect(block.type).toBe('text')
+            if (block.type === 'text') texts.push(block.text)
+          }
+        }
+      })
+      expect(calls).toBe(2)
+      expect(texts).toEqual(['重试成功'])
+      expect(notices.filter(n => n.includes('后重试'))).toHaveLength(1)
+      expect(notices.find(n => n.includes('后重试'))).toContain('server_error')
+    }, 10_000)
+  }
+
+  const tool = frame('response.output_item.done', {
+    type: 'response.output_item.done',
+    item: { type: 'function_call', id: 'fc-once', call_id: 'call-once', name: 'Read', arguments: '{"file_path":"/tmp/probe"}' },
+  })
+
+  for (const failAfterTool of [false, true]) {
+    it(`SDK 工具调用及时提交、保留块顺序,且之后出错不重复执行(失败: ${failAfterTool})`, async () => {
+      let calls = 0
+      const notices: string[] = []
+      const blockTypes: string[] = []
+      let finalErrors = 0
+      let toolDelivered = false
+      let previewDelivered = false
+      const fetchFn = buildRoleFetch({
+        apiProtocol: 'openai-responses', transport: 'sdk',
+        apiUrl: 'https://gw.example/v1', apiToken: 'test-key', backendModel: 'test-model',
+      }, (async () => {
+        calls++
+        return sseResponse([start, textDelta, thinkingDelta, reasoning, tool,
+          failAfterTool ? serverError : frame('response.completed', { type: 'response.completed', response: {} })])
+      }) as typeof fetch)
+      await withContextNoticeSink(n => notices.push(n.text), async () => {
+        for await (const event of queryModelWithStreaming({
+          messages: messagesFixture(`probe-sdk-tool-replay-${failAfterTool}`),
+          systemPrompt: [] as never, thinkingConfig: { type: 'disabled' }, tools: [] as never,
+          signal: new AbortController().signal, options: optionsWith(fetchFn),
+        })) {
+          if (event.type === 'stream_event' && event.event.type === 'content_block_delta') {
+            previewDelivered = true
+          }
+          if (event.type === 'stream_event' && event.event.type === 'message_delta') {
+            // VCR preserves event order, though it buffers the generator while
+            // recording. Verify the tool is yielded before response completion.
+            expect(toolDelivered).toBe(true)
+          }
+          if (event.type !== 'assistant') continue
+          if (event.isApiErrorMessage) {
+            expect(toolDelivered).toBe(true)
+            finalErrors++
+          } else {
+            expect(previewDelivered).toBe(true)
+            for (const block of event.message.content) {
+              blockTypes.push(block.type)
+              if (block.type === 'tool_use') toolDelivered = true
+              if (block.type === 'thinking') expect(block.signature).toBeTruthy()
+            }
+          }
+        }
+      })
+      expect(calls).toBe(1)
+      expect(blockTypes).toEqual(['text', 'thinking', 'tool_use'])
+      expect(finalErrors).toBe(failAfterTool ? 1 : 0)
+      expect(notices.some(n => n.includes('为避免重复执行'))).toBe(failAfterTool)
+    }, 10_000)
+  }
+
+  it('SDK 已输出并关闭思考块后持续 server_error:按配置重试到上限', async () => {
+    const savedRetries = process.env.CLAUDE_CODE_MAX_RETRIES
+    process.env.CLAUDE_CODE_MAX_RETRIES = '2'
+    let calls = 0
+    let finalErrors = 0
+    const attempts: number[] = []
+    try {
+      const fetchFn = buildRoleFetch({
+        apiProtocol: 'openai-responses', transport: 'sdk',
+        apiUrl: 'https://gw.example/v1', apiToken: 'test-key', backendModel: 'test-model',
+      }, (async () => {
+        calls++
+        return sseResponse([start, textDelta, thinkingDelta, reasoning, serverError])
+      }) as typeof fetch)
+      for await (const event of queryModelWithStreaming({
+        messages: messagesFixture('probe-sdk-visible-server-error-exhausted'),
+        systemPrompt: [] as never, thinkingConfig: { type: 'disabled' }, tools: [] as never,
+        signal: new AbortController().signal, options: optionsWith(fetchFn),
+      })) {
+        if (event.type === 'system' && event.subtype === 'api_error') attempts.push(event.retryAttempt)
+        if (event.type === 'assistant') {
+          expect(event.isApiErrorMessage).toBe(true)
+          expect(JSON.stringify(event.message.content)).toContain('server_error')
+          finalErrors++
+        }
+      }
+      expect(calls).toBe(3)
+      expect(attempts).toEqual([1, 2])
+      expect(finalErrors).toBe(1)
+    } finally {
+      if (savedRetries === undefined) delete process.env.CLAUDE_CODE_MAX_RETRIES
+      else process.env.CLAUDE_CODE_MAX_RETRIES = savedRetries
+    }
+  }, 10_000)
+
+  it('SDK server_error 退避期间取消:不再请求,也不提交失败内容', async () => {
+    const controller = new AbortController()
+    let calls = 0
+    let assistantMessages = 0
+    const fetchFn = buildRoleFetch({
+      apiProtocol: 'openai-responses', transport: 'sdk',
+      apiUrl: 'https://gw.example/v1', apiToken: 'test-key', backendModel: 'test-model',
+    }, (async () => {
+      calls++
+      return sseResponse([start, thinkingDelta, reasoning, serverError])
+    }) as typeof fetch)
+    await withContextNoticeSink(n => {
+      if (n.kind === 'api-retry') controller.abort()
+    }, async () => {
+      for await (const event of queryModelWithStreaming({
+        messages: messagesFixture('probe-sdk-visible-server-error-abort'),
+        systemPrompt: [] as never, thinkingConfig: { type: 'disabled' }, tools: [] as never,
+        signal: controller.signal, options: optionsWith(fetchFn),
+      })) {
+        if (event.type === 'assistant') assistantMessages++
+      }
+    })
+    expect(controller.signal.aborted).toBe(true)
+    expect(calls).toBe(1)
+    expect(assistantMessages).toBe(0)
+  })
+
+  it('新尝试的 message_start 清空失败尝试的实时预览', () => {
+    let text: string | null = '失败尝试的正文'
+    let thinking: unknown = { thinking: '失败尝试的思考', isStreaming: true }
+    let tools: unknown[] = [{}]
+    handleMessageFromStream({
+      type: 'stream_event', event: { type: 'message_start', message: {} },
+    } as never, () => {}, () => {}, () => {}, f => { tools = f(tools as never) },
+    undefined, f => { thinking = f(thinking as never) }, undefined, f => { text = f(text) })
+    expect(text).toBeNull()
+    expect(thinking).toBeNull()
+    expect(tools).toEqual([])
   })
 
   for (const hiddenReasoning of [false, true]) {
@@ -334,15 +528,13 @@ describe('流中途的错误帧要能整轮重来', () => {
     expect(bodies[1]).toContain('"stream":true')
   }, 60_000)
 
-  /**
-   * 反向:**已经吐过正文之后不许重来** —— 否则同一段话会说两遍,工具调用甚至跑两次。
-   * 变异:把 `emittedToCaller` 从判据里去掉 → 这条红(calls 会变成 2)。
-   */
-  it('已经吐过正文再断:不重来,原样报错', async () => {
+  it('已经吐过正文再断:仍然重试,只提交成功尝试的正文', async () => {
     let calls = 0
     const fetchFn = streamOnly(async () => {
       calls++
-      return sseResponse([MESSAGE_START, TEXT_AND_STOP.split('event: content_block_stop')[0]!, OVERLOADED_FRAME])
+      return calls === 1
+        ? sseResponse([MESSAGE_START, TEXT_AND_STOP.split('event: content_block_stop')[0]!, OVERLOADED_FRAME])
+        : sseResponse([MESSAGE_START, TEXT_AND_STOP])
     })
     const gen = queryModelWithStreaming({
       messages: messagesFixture('probe-2'),
@@ -352,7 +544,13 @@ describe('流中途的错误帧要能整轮重来', () => {
       signal: new AbortController().signal,
       options: optionsWith(fetchFn as never),
     })
-    await drain(gen as never)
-    expect(calls).toBe(1)
+    const texts: string[] = []
+    for await (const event of gen) {
+      if (event.type !== 'assistant') continue
+      expect(event.isApiErrorMessage).not.toBe(true)
+      for (const block of event.message.content) if (block.type === 'text') texts.push(block.text)
+    }
+    expect(calls).toBe(2)
+    expect(texts).toEqual(['答上来了'])
   }, 60_000)
 })
