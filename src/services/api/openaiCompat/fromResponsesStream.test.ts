@@ -123,6 +123,37 @@ describe('思考', () => {
 })
 
 describe('推理片段带回下一轮', () => {
+  const hiddenReasoning = {
+    type: 'response.output_item.done',
+    item: { type: 'reasoning', id: 'rs_hidden', encrypted_content: 'HIDDEN' },
+  }
+
+  for (const failure of [
+    { type: 'error', code: 'server_is_overloaded', message: 'Please try again later' },
+    { type: 'response.failed', response: { error: { message: 'Please try again later' } } },
+  ]) {
+    it(`只有推理密文后 ${failure.type}:不提交空 thinking 块,让上层继续重试`, async () => {
+      const es = await run([created, hiddenReasoning, failure])
+      expect(types(es)).toEqual(['message_start', 'error'])
+      expect(es[1].data.error.message).toBe('Please try again later')
+    })
+  }
+
+  it('随后工具调用成功:密文在工具之前交出,顺序和内容都保留', async () => {
+    const es = await run([
+      created,
+      hiddenReasoning,
+      { type: 'response.output_item.done', item: {
+        type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'Read', arguments: '{"file_path":"a.ts"}',
+      } },
+      completed(),
+    ])
+    expect(blocks(es)).toEqual(['thinking', 'tool_use'])
+    const sig = es.find(e => e.data?.delta?.type === 'signature_delta')!.data.delta.signature
+    expect(decodeReasoningSignature(sig)).toEqual({ id: 'rs_hidden', enc: 'HIDDEN' })
+    expect(es.find(e => e.data?.content_block?.type === 'tool_use')!.data.content_block.id).toBe('call_1')
+  })
+
   it('密文塞进 thinking 块的签名', async () => {
     const es = await run([
       created,

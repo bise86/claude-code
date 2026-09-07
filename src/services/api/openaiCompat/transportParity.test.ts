@@ -180,8 +180,8 @@ test('连不上:sdk 档也走同一句诊断,并以 502 交给上层重试', asy
  * 状态码在 `shouldRetry` 下都为真。中间那一段(SDK 把响应变成 APIError)是
  * `@anthropic-ai/sdk` 的既有行为。
  */
-import { APIError } from '@anthropic-ai/sdk'
-import { shouldRetry } from '../withRetry.js'
+import Anthropic, { APIError, APIUserAbortError } from '@anthropic-ai/sdk'
+import { CannotRetryError, shouldRetry, withRetry } from '../withRetry.js'
 
 test('sdk 档会返回的那些状态码,都会被上层重试', () => {
   // 404 上游报错、502 连不上/翻译层判失败、500 网关内部错、429 限流。
@@ -190,6 +190,103 @@ test('sdk 档会返回的那些状态码,都会被上层重试', () => {
       .toBe(`${status}: true`)
   }
 })
+
+for (const p of PROTOCOLS) {
+  for (const transport of ['raw', 'sdk'] as const) {
+    test(`[${p.name}/${transport}] 429 保留 Retry-After,退避后恢复流式回答`, async () => {
+      let calls = 0
+      const callTimes: number[] = []
+      const fetchOverride = buildRoleFetch({
+        apiProtocol: p.name, transport,
+        apiUrl: 'https://gw.example/v1', apiToken: 'sk-role',
+        backendModel: 'test-model', roleName: 'seat',
+      }, (async () => {
+        callTimes.push(performance.now())
+        calls++
+        return calls === 1
+          ? new Response(JSON.stringify({ error: { message: 'rate limited' } }), {
+            status: 429, headers: { 'Retry-After': '1' },
+          })
+          : new Response(p.sse(), { headers: { 'content-type': 'text/event-stream' } })
+      }) as typeof fetch)
+      const client = new Anthropic({ apiKey: 'test-key', maxRetries: 0, fetch: fetchOverride })
+      const retry = withRetry(
+        async () => client,
+        c => c.messages.create({
+          model: 'claude-alias', max_tokens: 100, stream: true,
+          messages: [{ role: 'user', content: '你好' }],
+        }),
+        { model: 'claude-alias', thinkingConfig: { type: 'disabled' }, maxRetries: 1 },
+      )
+      try {
+        const first = await retry.next()
+        expect(first.done).toBe(false)
+        if (first.done) throw new Error('Expected a retry notice')
+        expect(first.value.error.status).toBe(429)
+        expect(first.value.error.headers?.get('retry-after')).toBe('1')
+        expect(first.value.retryInMs).toBe(1000)
+        expect(calls).toBe(1)
+
+        const second = await retry.next()
+        expect(second.done).toBe(true)
+        if (!second.done) throw new Error('Expected a successful stream')
+        let text = ''
+        for await (const event of second.value) {
+          if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+            text += event.delta.text
+          }
+        }
+        expect(text).toBe('你好')
+        expect(calls).toBe(2)
+        expect(callTimes[1]! - callTimes[0]!).toBeGreaterThanOrEqual(950)
+      } finally {
+        await retry.return(undefined as never)
+      }
+    })
+  }
+}
+
+for (const transport of ['raw', 'sdk'] as const) {
+  test(`[${transport}] 持续 429 遵守重试次数,等待期间可以取消`, async () => {
+    let calls = 0
+    let retryAfter = '0'
+    const fetchOverride = buildRoleFetch({
+      apiProtocol: 'openai-responses', transport,
+      apiUrl: 'https://gw.example/v1', apiToken: 'sk-role', backendModel: 'test-model',
+    }, (async () => {
+      calls++
+      return new Response('{"error":{"message":"rate limited"}}', {
+        status: 429, headers: { 'retry-after': retryAfter },
+      })
+    }) as typeof fetch)
+    const client = new Anthropic({ apiKey: 'test-key', maxRetries: 0, fetch: fetchOverride })
+    const run = (signal?: AbortSignal) => withRetry(
+      async () => client,
+      c => c.messages.create({
+        model: 'claude-alias', max_tokens: 100, stream: true,
+        messages: [{ role: 'user', content: '你好' }],
+      }, { signal }),
+      { model: 'claude-alias', thinkingConfig: { type: 'disabled' }, maxRetries: 1, signal },
+    )
+
+    const bounded = run()
+    expect((await bounded.next()).done).toBe(false)
+    await expect(bounded.next()).rejects.toBeInstanceOf(CannotRetryError)
+    expect(calls).toBe(2)
+
+    retryAfter = '30'
+    const controller = new AbortController()
+    const cancelled = run(controller.signal)
+    const notice = await cancelled.next()
+    expect(notice.done).toBe(false)
+    if (notice.done) throw new Error('Expected a retry notice')
+    expect(notice.value.retryInMs).toBe(30_000)
+    const waiting = cancelled.next()
+    controller.abort()
+    await expect(waiting).rejects.toBeInstanceOf(APIUserAbortError)
+    expect(calls).toBe(3)
+  })
+}
 
 /**
  * **sdk 档必须补回 raw 档 `sniffSSE` 的那两条判断。**

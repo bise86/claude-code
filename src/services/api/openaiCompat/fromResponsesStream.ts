@@ -37,6 +37,16 @@ export async function* responsesEventsToAnthropicEvents(
   let stopReason = 'end_turn'
   /** 推理摘要可能分成多个 part。直接拼接会把段落粘死,所以第二段起自己补空行。 */
   let summaryParts = 0
+  // Codex 可以只返回推理密文,没有任何可见正文。先保存这些事件;随后若过载,
+  // 直接交出错误,让请求继续重试。提前交出空 thinking 块会触发引擎的
+  // emittedToCaller 保护,变成「只重试一次就结束」。正文/工具到达或正常结束时再交出。
+  const pendingReasoning: Evt[] = []
+  let outputStarted = false
+  function* flushPendingReasoning(): Generator<Evt> {
+    outputStarted = true
+    yield* pendingReasoning
+    pendingReasoning.length = 0
+  }
 
   const readUsage = (u: any): void => {
     if (!u) return
@@ -67,18 +77,27 @@ export async function* responsesEventsToAnthropicEvents(
 
       case 'response.reasoning_summary_part.added':
         // 只做分段记账,正文由下面的 delta 事件送。
-        if (summaryParts > 0) yield* w.thinking('\n\n')
+        if (summaryParts > 0) {
+          yield* flushPendingReasoning()
+          yield* w.thinking('\n\n')
+        }
         summaryParts++
         break
 
       case 'response.reasoning_summary_text.delta':
       case 'response.reasoning_text.delta':
         // 两个事件都存在:摘要(summary:'auto' 时)和推理正文(部分模型/配置下才有)。
-        if (typeof f.delta === 'string') yield* w.thinking(f.delta)
+        if (typeof f.delta === 'string' && f.delta.length > 0) {
+          yield* flushPendingReasoning()
+          yield* w.thinking(f.delta)
+        }
         break
 
       case 'response.output_text.delta':
-        if (typeof f.delta === 'string') yield* w.text(f.delta)
+        if (typeof f.delta === 'string' && f.delta.length > 0) {
+          yield* flushPendingReasoning()
+          yield* w.text(f.delta)
+        }
         break
 
       case 'response.refusal.delta':
@@ -86,7 +105,10 @@ export async function* responsesEventsToAnthropicEvents(
          * 拒答也是模型这一轮的回答。按「认不出来就忽略」丢掉它的话,用户拿到的是一个
          * **完全空白**的回复 —— 看不出是拒答、是超时,还是这条桥坏了。
          */
-        if (typeof f.delta === 'string') yield* w.text(f.delta)
+        if (typeof f.delta === 'string' && f.delta.length > 0) {
+          yield* flushPendingReasoning()
+          yield* w.text(f.delta)
+        }
         break
 
       case 'response.output_item.added': {
@@ -127,7 +149,11 @@ export async function* responsesEventsToAnthropicEvents(
            * 而一个天天调工具的员工,那是常态不是边界。
            */
           const enc = typeof item.encrypted_content === 'string' ? item.encrypted_content : ''
-          if (enc.length > 0) yield* w.signature(encodeReasoningSignature(String(item.id ?? ''), enc))
+          // 开场事件可以立即发;它不含正文,也不会阻止重试。
+          if (enc.length > 0) yield* w.startIfNeeded()
+          const reasoningEvents = enc.length > 0
+            ? [...w.signature(encodeReasoningSignature(String(item.id ?? ''), enc))]
+            : []
           /**
            * 盖完签名**立刻收口这个思考块**。
            *
@@ -138,7 +164,9 @@ export async function* responsesEventsToAnthropicEvents(
            * gpt-5.1-codex 系在一轮里交替吐 [reasoning, 正文, reasoning, function_call] 是这条
            * 协议的典型输出,中间隔着正文时 w.text 会顺手关掉;**唯独相邻**这一种排布中招。
            */
-          yield* w.closeThinking()
+          reasoningEvents.push(...w.closeThinking())
+          if (outputStarted) yield* reasoningEvents
+          else pendingReasoning.push(...reasoningEvents)
           break
         }
         if (item?.type !== 'function_call') break
@@ -149,6 +177,7 @@ export async function* responsesEventsToAnthropicEvents(
           : (c?.args && c.args.length > 0 ? c.args : (c?.fromDelta ?? ''))
         // **call_id**,不是 item_id:下一轮的 function_call_output 按 call_id 配对,
         // 传 item 的 `fc_…` 过去下一轮就撞不上。
+        yield* flushPendingReasoning()
         yield* w.toolUse({
           id: (typeof item.call_id === 'string' ? item.call_id : c?.callId),
           name: (typeof item.name === 'string' ? item.name : c?.name),
@@ -198,6 +227,7 @@ export async function* responsesEventsToAnthropicEvents(
     }
   }
 
+  yield* flushPendingReasoning()
   /**
    * 流断在半路时还攒着的调用**照发**。
    *

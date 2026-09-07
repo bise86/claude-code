@@ -65,10 +65,14 @@ function scrubAnthropicHeaders(headers: Headers): void {
  * 里就能读到真正的诊断。这一层不是 anthropic 的线上 API,而是我们自己的适配器,
  * body 的唯一消费者就是 SDK —— 多一个字段是安全的。
  */
-function failureResponse(status: number, message: string): Response {
+function failureResponse(status: number, message: string, upstreamHeaders?: Headers): Response {
+  const headers = new Headers({ 'content-type': 'application/json' })
+  // 错误体会重写,但上游要求的冷却时间必须交给 withRetry,否则 429 会过早重发。
+  const retryAfter = upstreamHeaders?.get('retry-after')
+  if (retryAfter !== null && retryAfter !== undefined) headers.set('retry-after', retryAfter)
   return new Response(
     JSON.stringify({ type: 'error', message, error: { type: 'api_error', message } }),
-    { status, headers: { 'content-type': 'application/json' } },
+    { status, headers },
   )
 }
 
@@ -195,7 +199,7 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
     for (const [k, v] of Object.entries(codexHdrs)) headers.set(k, v)
     // 拼好的地址要**留在手上**:它是诊断 502 的第一手材料,而此前它只存在于这一行表达式里。
     const dest = joinRoute(target.toString(), proto.route, PROTOCOL_ROUTES)
-    const said = (status: number, statusText: string) =>
+    const said = (status: number, statusText: string, upstreamHeaders?: Headers) =>
       (returnStatus: number, body: string, extra?: { notStreamed?: true; connectFailed?: true; emptyStream?: true }): Response =>
         failureResponse(returnStatus, upstreamFailureMessage({
           roleName: cfg.roleName, protocol: cfg.apiProtocol, url: dest,
@@ -205,7 +209,7 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
           route: proxyRouteNote(dest),
           transport: cfg.transport,
           ...extra,
-        }))
+        }), upstreamHeaders)
     /**
      * **sdk 档在这里分叉** —— 帧来自官方客户端,别的一切照旧(见 sdkTransport 的文件头)。
      *
@@ -232,10 +236,11 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
        * 只在「不是 SSE」时才 clone:clone 会把整条响应缓冲一份,而正常那条是几百 KB 的
        * 流式正文,复制一份纯属白烧内存。判失败的那些体都是小 JSON,拷了不心疼。
        */
-      const upstreamSeen: { status?: number; contentType?: string | null; text?: () => Promise<string> } = {}
+      const upstreamSeen: { status?: number; headers?: Headers; contentType?: string | null; text?: () => Promise<string> } = {}
       const spy = (async (u: any, i: any) => {
         const r = await inner(u, i)
         upstreamSeen.status = r.status
+        upstreamSeen.headers = r.headers
         upstreamSeen.contentType = r.headers.get('content-type')
         if (r.ok && !(upstreamSeen.contentType ?? '').includes('text/event-stream')) {
           const copy = r.clone()
@@ -256,7 +261,7 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
         // 中止原样抛 —— 和下面 raw 档 catch 里那条判据同因,判法见 isSdkAbort。
         if (isSdkAbort(e, abortSignal)) throw e
         const f = sdkFailure(e)
-        return said(f.status, '')(
+        return said(f.status, '', upstreamSeen.headers)(
           f.status > 0 ? f.status : 502,
           f.body,
           f.connectFailed ? { connectFailed: true } : undefined,
@@ -272,7 +277,7 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
       const peeked = await peekFrames(stream)
       if (peeked.empty) {
         const notSSE = !(upstreamSeen.contentType ?? '').includes('text/event-stream')
-        return said(upstreamSeen.status ?? 0, '')(
+        return said(upstreamSeen.status ?? 0, '', upstreamSeen.headers)(
           502,
           notSSE && upstreamSeen.text ? await upstreamSeen.text() : '',
           notSSE ? { notStreamed: true } : { emptyStream: true },
@@ -314,7 +319,7 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      * 之后返回 502,正文写「502 但不是 SSE」就是在编,用户会拿着 502 去找网关日志,
      * 而网关那边记的是一次成功的 200。
      */
-    const fail = said(res.status, res.statusText)
+    const fail = said(res.status, res.statusText, res.headers)
     // 上游报错:状态码原样透传,好让上层的重试策略照旧。
     if (!res.ok) return fail(res.status, await res.text().catch(() => ''))
     // 进程内的假 fetch 会给 `null` body;真 socket 永远不会(见下面 bytes === 0 那一条)。

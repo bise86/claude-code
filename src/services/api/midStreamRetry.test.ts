@@ -20,6 +20,8 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Message } from '../../types/message.js'
+import { buildRoleFetch } from './openaiCompat/roleFetch.js'
+import { withContextNoticeSink } from './contextNoticeSink.js'
 
 /**
  * `MACRO` 是打包时注入的全局(版本号那些),`bunfig.toml` 的 preload 在
@@ -168,6 +170,143 @@ const messagesFixture = (text: string): Message[] => [
 ]
 
 describe('流中途的错误帧要能整轮重来', () => {
+  const frame = (event: string, data: unknown): string =>
+    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+  const start = frame('response.created', { type: 'response.created', response: { id: 'resp-overload' } })
+  const reasoning = frame('response.output_item.done', {
+    type: 'response.output_item.done',
+    item: { id: 'rs-hidden', type: 'reasoning', encrypted_content: 'opaque-reasoning' },
+  })
+  const overloaded = frame('error', {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error', code: 'server_is_overloaded',
+      message: 'Our servers are currently overloaded. Please try again later.', param: null,
+    },
+  })
+
+  for (const hiddenReasoning of [false, true]) {
+    it(`SDK Responses 连续两次流中 server_is_overloaded 后恢复(隐藏推理: ${hiddenReasoning})`, async () => {
+      let calls = 0
+      const notices: string[] = []
+      const errors: string[] = []
+      const texts: string[] = []
+      const fetchFn = buildRoleFetch({
+        apiProtocol: 'openai-responses', transport: 'sdk',
+        apiUrl: 'https://gw.example/v1', apiToken: 'test-key',
+        backendModel: 'test-model', roleName: '研发',
+      }, (async () => {
+        calls++
+        return sseResponse(calls <= 2 ? [start, ...(calls === 2 && hiddenReasoning ? [reasoning] : []), overloaded] : [
+          start,
+          frame('response.output_text.delta', { type: 'response.output_text.delta', delta: '答上来了' }),
+          frame('response.completed', {
+            type: 'response.completed', response: { usage: { input_tokens: 1, output_tokens: 4 } },
+          }),
+        ])
+      }) as typeof fetch)
+      await withContextNoticeSink(n => notices.push(n.text), async () => {
+        for await (const event of queryModelWithStreaming({
+          messages: messagesFixture(`probe-sdk-repeated-overload-${hiddenReasoning}`),
+          systemPrompt: [] as never,
+          thinkingConfig: { type: 'disabled' },
+          tools: [] as never,
+          signal: new AbortController().signal,
+          options: optionsWith(fetchFn),
+        })) {
+          if (event.type !== 'assistant') continue
+          for (const block of event.message.content) {
+            // 失败尝试的密文不能留在会话里;成功的这次只有正文。
+            expect(block.type).not.toBe('thinking')
+            if (block.type === 'text') (event.isApiErrorMessage ? errors : texts).push(block.text)
+          }
+        }
+      })
+      expect(calls).toBe(3)
+      expect(errors).toEqual([])
+      expect(texts).toContain('答上来了')
+      const retries = notices.filter(n => n.includes('后重试'))
+      expect(retries).toHaveLength(2)
+      expect(retries[0]).toContain('第 1/10 次')
+      expect(retries[1]).toContain('第 2/10 次')
+    }, 10_000)
+  }
+
+  it('SDK 隐藏推理后持续过载:用尽配置的重试次数才报最终错误', async () => {
+    const savedRetries = process.env.CLAUDE_CODE_MAX_RETRIES
+    process.env.CLAUDE_CODE_MAX_RETRIES = '2'
+    let calls = 0
+    let finalErrors = 0
+    const attempts: number[] = []
+    try {
+      const fetchFn = buildRoleFetch({
+        apiProtocol: 'openai-responses', transport: 'sdk',
+        apiUrl: 'https://gw.example/v1', apiToken: 'test-key', backendModel: 'test-model',
+      }, (async () => {
+        calls++
+        return sseResponse([start, reasoning, overloaded])
+      }) as typeof fetch)
+      for await (const event of queryModelWithStreaming({
+        messages: messagesFixture('probe-sdk-hidden-overload-exhausted'),
+        systemPrompt: [] as never,
+        thinkingConfig: { type: 'disabled' },
+        tools: [] as never,
+        signal: new AbortController().signal,
+        options: optionsWith(fetchFn),
+      })) {
+        if (event.type === 'system' && event.subtype === 'api_error') attempts.push(event.retryAttempt)
+        if (event.type === 'assistant') {
+          expect(event.isApiErrorMessage).toBe(true)
+          finalErrors++
+        }
+      }
+      expect(calls).toBe(3)
+      expect(attempts).toEqual([1, 2])
+      expect(finalErrors).toBe(1)
+    } finally {
+      if (savedRetries === undefined) delete process.env.CLAUDE_CODE_MAX_RETRIES
+      else process.env.CLAUDE_CODE_MAX_RETRIES = savedRetries
+    }
+  }, 10_000)
+
+  it('HTTP 429:完整模型链路默认重试 10 次,共发出 11 次请求', async () => {
+    const savedRetries = process.env.CLAUDE_CODE_MAX_RETRIES
+    delete process.env.CLAUDE_CODE_MAX_RETRIES
+    let calls = 0
+    const retries: number[] = []
+    let finalError = false
+    try {
+      const fetchFn = streamOnly(async () => {
+        calls++
+        return new Response('{"error":{"type":"rate_limit_error","message":"Rate limited"}}', {
+          status: 429,
+          // 这条测次数;退避曲线和实际等待由其它用例验证。
+          headers: { 'content-type': 'application/json', 'retry-after': '0' },
+        })
+      })
+      for await (const event of queryModelWithStreaming({
+        messages: messagesFixture('probe-http-429-default-retries'),
+        systemPrompt: [] as never,
+        thinkingConfig: { type: 'disabled' },
+        tools: [] as never,
+        signal: new AbortController().signal,
+        options: optionsWith(fetchFn as never),
+      })) {
+        if (event.type === 'system' && event.subtype === 'api_error') {
+          retries.push(event.retryAttempt)
+          expect(event.maxRetries).toBe(10)
+        }
+        if (event.type === 'assistant' && event.isApiErrorMessage) finalError = true
+      }
+      expect(calls).toBe(11)
+      expect(retries).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+      expect(finalError).toBe(true)
+    } finally {
+      if (savedRetries === undefined) delete process.env.CLAUDE_CODE_MAX_RETRIES
+      else process.env.CLAUDE_CODE_MAX_RETRIES = savedRetries
+    }
+  })
+
   it('先 message_start 再 error:出网两次,第二次拿到答案', async () => {
     const bodies: string[] = []
     let calls = 0
