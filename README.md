@@ -24,6 +24,8 @@
 
 ## 架构概览
 
+文字说明：[单个阶段内的子 Agent 对话循环](docs/agent-conversation-workflow.md)——分析或执行任务怎样启动、每次 API 携带什么、何时调用下一轮、何时结束，以及与原生主／子 Agent 的关系；不展开阶段之间的编排。
+
 <table>
   <tr>
     <td align="center" width="25%"><img src="docs/01-overall-architecture.png" alt="整体架构"><br><b>整体架构</b></td>
