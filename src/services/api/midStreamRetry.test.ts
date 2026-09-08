@@ -421,9 +421,9 @@ describe('流中途的错误帧要能整轮重来', () => {
       expect(texts).toContain('答上来了')
       const retries = notices.filter(n => n.includes('后重试'))
       expect(retries).toHaveLength(2)
-      expect(retries[0]).toContain('第 1/10 次')
-      expect(retries[1]).toContain('第 2/10 次')
-    }, 10_000)
+      expect(retries[0]).toContain('3s 后重试(第 1/10 次)')
+      expect(retries[1]).toContain('6s 后重试(第 2/10 次)')
+    }, 20_000)
   }
 
   it('SDK 隐藏推理后持续过载:用尽配置的重试次数才报最终错误', async () => {
@@ -461,7 +461,7 @@ describe('流中途的错误帧要能整轮重来', () => {
       if (savedRetries === undefined) delete process.env.CLAUDE_CODE_MAX_RETRIES
       else process.env.CLAUDE_CODE_MAX_RETRIES = savedRetries
     }
-  }, 10_000)
+  }, 20_000)
 
   it('HTTP 429:完整模型链路默认重试 10 次,共发出 11 次请求', async () => {
     const savedRetries = process.env.CLAUDE_CODE_MAX_RETRIES
@@ -474,7 +474,7 @@ describe('流中途的错误帧要能整轮重来', () => {
         calls++
         return new Response('{"error":{"type":"rate_limit_error","message":"Rate limited"}}', {
           status: 429,
-          // 这条测次数;退避曲线和实际等待由其它用例验证。
+          // 这条测次数;Retry-After: 0 仍受 3s 下限约束,十次共等 30s。
           headers: { 'content-type': 'application/json', 'retry-after': '0' },
         })
       })
@@ -489,6 +489,7 @@ describe('流中途的错误帧要能整轮重来', () => {
         if (event.type === 'system' && event.subtype === 'api_error') {
           retries.push(event.retryAttempt)
           expect(event.maxRetries).toBe(10)
+          expect(event.retryInMs).toBe(3_000)
         }
         if (event.type === 'assistant' && event.isApiErrorMessage) finalError = true
       }
@@ -499,7 +500,7 @@ describe('流中途的错误帧要能整轮重来', () => {
       if (savedRetries === undefined) delete process.env.CLAUDE_CODE_MAX_RETRIES
       else process.env.CLAUDE_CODE_MAX_RETRIES = savedRetries
     }
-  })
+  }, 45_000)
 
   it('先 message_start 再 error:出网两次,第二次拿到答案', async () => {
     const bodies: string[] = []

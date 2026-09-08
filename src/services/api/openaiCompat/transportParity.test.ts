@@ -173,7 +173,7 @@ test('连不上:sdk 档也走同一句诊断,并以 502 交给上层重试', asy
  * **sdk 档的失败必须落进退避重试**,而且落进的是**我们这一套**,不是 SDK 自带的那套。
  *
  * 客户端上写死 `maxRetries: 0`(见 sdkTransport 的文件头):SDK 默认重试 2 次且**按状态码
- * 分档**(400 它不重试),而这个仓库的策略是所有错误都重试、10 次、0.5s 起翻倍到 32s。
+ * 分档**(400 它不重试),而这个仓库的策略是所有错误都重试、10 次、3s 起阶梯递增到 90s。
  * 两套叠起来是乘法,退避曲线还会错乱 —— SDK 自己先退两次,我们这边只记了第一次。
  *
  * 这条把两端钉在一起:上面几条测出 sdk 档失败时返回的**状态码原样透传**,这里测那些
@@ -224,7 +224,7 @@ for (const p of PROTOCOLS) {
         if (first.done) throw new Error('Expected a retry notice')
         expect(first.value.error.status).toBe(429)
         expect(first.value.error.headers?.get('retry-after')).toBe('1')
-        expect(first.value.retryInMs).toBe(1000)
+        expect(first.value.retryInMs).toBe(3000)
         expect(calls).toBe(1)
 
         const second = await retry.next()
@@ -238,7 +238,7 @@ for (const p of PROTOCOLS) {
         }
         expect(text).toBe('你好')
         expect(calls).toBe(2)
-        expect(callTimes[1]! - callTimes[0]!).toBeGreaterThanOrEqual(950)
+        expect(callTimes[1]! - callTimes[0]!).toBeGreaterThanOrEqual(2950)
       } finally {
         await retry.return(undefined as never)
       }

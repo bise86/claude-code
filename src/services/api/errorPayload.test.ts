@@ -309,14 +309,15 @@ describe('唯一的例外:中止', () => {
 })
 
 describe('退避曲线', () => {
-  /** 0.5s 起、翻倍、32s 封顶;抖动只往上加(≤25%),所以下界就是基数。 */
-  it('0.5s 起、翻倍、32s 封顶', () => {
-    expect(nextRetryDelay(1)).toBeGreaterThanOrEqual(500)
-    expect(nextRetryDelay(1)).toBeLessThanOrEqual(625)
-    expect(nextRetryDelay(2)).toBeGreaterThanOrEqual(1000)
-    expect(nextRetryDelay(3)).toBeGreaterThanOrEqual(2000)
-    expect(nextRetryDelay(9)).toBeGreaterThanOrEqual(32_000)
-    expect(nextRetryDelay(9)).toBeLessThanOrEqual(40_000)
+  it('默认十次重试按指定秒数等待,不加抖动', () => {
+    expect(Array.from({ length: 10 }, (_, i) => nextRetryDelay(i + 1))).toEqual([
+      3_000, 6_000, 10_000, 15_000, 30_000, 45_000, 60_000, 60_000, 90_000, 90_000,
+    ])
+  })
+
+  it('超过序列后保持 90s', () => {
+    expect(nextRetryDelay(11)).toBe(90_000)
+    expect(nextRetryDelay(100)).toBe(90_000)
   })
 
   /** 服务端说什么时候回来就什么时候回来 —— 在封顶以内的照办。 */
@@ -325,22 +326,30 @@ describe('退避曲线', () => {
     expect(nextRetryDelay(1, '45')).toBe(45_000)
   })
 
-  /**
-   * **但夹在一分钟以内。** 政策改成「所有失败都重试」之后,订阅账号的窗口限额第一次能
-   * 走到这一行,而它给的 `Retry-After` 是以小时计的 —— 一次调用不该为一个头挂几个小时。
-   *
-   * 变异:把 `nextRetryDelay` 里的 `Math.min(…, MAX_RETRY_DELAY_MS)` 去掉 → 这条红。
-   */
-  it('Retry-After 再大也夹在 60s', () => {
-    expect(nextRetryDelay(1, '18000')).toBe(60_000)
-    expect(nextRetryDelay(4, '3600')).toBe(60_000)
+  it('Retry-After 最短也等 3s', () => {
+    for (const header of ['-1', '0', '1', '2', '3']) {
+      expect(nextRetryDelay(1, header)).toBe(3_000)
+    }
+  })
+
+  it('Retry-After 再大也夹在 90s', () => {
+    expect(nextRetryDelay(1, '18000')).toBe(90_000)
+    expect(nextRetryDelay(4, '3600')).toBe(90_000)
+    expect(nextRetryDelay(1, '90')).toBe(90_000)
+  })
+
+  it('缺失或无效的 Retry-After 使用当前重试级别', () => {
+    for (const header of [undefined, null, '', 'invalid']) {
+      expect(nextRetryDelay(1, header)).toBe(3_000)
+      expect(nextRetryDelay(4, header)).toBe(15_000)
+    }
   })
 })
 
 /**
  * 判据对了不等于**用户看得见**:`withRetry` yield 出去的那条系统消息只到 QueryEngine ——
  * 子 agent 那条路上看不见它(`createSubagentContext` 对子 agent 写死
- * `addNotification: undefined`)。而一串重试加起来能有两分半:窗口一动不动,
+ * `addNotification: undefined`)。而一串重试加起来能有数分钟:窗口一动不动,
  * 和「这一席挂死了」长得一模一样。
  */
 describe('退避期间席位窗口有话说', () => {
@@ -361,7 +370,7 @@ describe('退避期间席位窗口有话说', () => {
     // 三样都要在:哪一类错、等多久、第几次 —— 少一样这一行就只是噪音。
     expect(seen[0]).toContain('500')
     expect(seen[0]).toContain('overloaded')
-    expect(seen[0]).toContain('后重试(第 1/2 次)')
+    expect(seen[0]).toContain('3s 后重试(第 1/2 次)')
   }, 30_000)
 })
 

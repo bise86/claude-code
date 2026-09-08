@@ -54,15 +54,12 @@ const FLOOR_OUTPUT_TOKENS = 3000
 const MAX_529_RETRIES = 3
 export const BASE_DELAY_MS = 500
 
-/**
- * 单次退避的**硬封顶**,`Retry-After` 也越不过去。
- *
- * 「所有失败都重试」之后,这个头第一次能拖住整个循环:订阅账号撞到窗口限额时上游给的
- * 就是几千秒,而 `getRetryDelay` 对这个头是原样照办的 —— 那在「只有真限流才走到这一行」
- * 的年代是对的,现在不是了。头照看,但夹在一分钟以内:真没好的话下一次重试会再撞一次
- * 同样的头,**总时长由 maxRetries 决定,不由一个头决定**。
- */
-const MAX_RETRY_DELAY_MS = 60_000
+const RETRY_DELAYS_MS = [
+  3_000, 6_000, 10_000, 15_000, 30_000, 45_000, 60_000, 60_000, 90_000, 90_000,
+] as const
+// 普通失败重试的等待范围,Retry-After 也受此限制。
+const MIN_RETRY_DELAY_MS = RETRY_DELAYS_MS[0]
+const MAX_RETRY_DELAY_MS = RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1]!
 
 // CLAUDE_CODE_UNATTENDED_RETRY: for unattended sessions (ant-only). Retries 429/529
 // indefinitely with higher backoff and periodic keep-alive yields so the host
@@ -262,7 +259,9 @@ export async function* withRetry<T>(
         if (retryAfterMs !== null && retryAfterMs < SHORT_RETRY_THRESHOLD_MS) {
           // Short retry-after: wait and retry with fast mode still active
           // to preserve prompt cache (same model name on retry).
-          await sleep(retryAfterMs, options.signal, { abortError })
+          await sleep(Math.max(MIN_RETRY_DELAY_MS, retryAfterMs), options.signal, {
+            abortError,
+          })
           continue
         }
         // Long or unknown retry-after: enter cooldown (switches to standard
@@ -467,7 +466,7 @@ export async function* withRetry<T>(
           yield createSystemAPIErrorMessage(error, delayMs, attempt, maxRetries)
         }
         // 子 agent(`/et` 的席位)那条路上,上面那个 yield 是看不见的 —— 它只到
-        // QueryEngine。退避期间席位窗口一个字都不动,而一串重试加起来能有两分半:
+        // QueryEngine。退避期间席位窗口一个字都不动,而一串重试加起来能有数分钟:
         // 和「这一席挂死了」长得一模一样。旁路一行,让它看得见自己在等什么。
         reportContextNotice({
           kind: 'api-retry',
@@ -531,17 +530,25 @@ export function getRetryDelay(
 }
 
 /**
- * 一次失败之后等多久。**所有失败共用这一条曲线**:0.5s 起、翻倍、32s 封顶、带抖动;
- * `Retry-After` 照看,但夹在 `MAX_RETRY_DELAY_MS` 以内(见那个常量)。
- *
- * 单拆一个函数是为了它能被**直接**探到:退避埋在生成器循环里,从外面只能靠等真实的
- * 秒数间接观察,而那样的探针要么慢得没人跑,要么就只好去测替身。
+ * 请求失败和流中断共用的阶梯退避,attempt 从 1 开始,超过序列后保持 90s。
+ * 不额外加抖动;Retry-After 优先,但限制在 3s～90s 之间。
  */
 export function nextRetryDelay(
   attempt: number,
   retryAfterHeader?: string | null,
 ): number {
-  return Math.min(getRetryDelay(attempt, retryAfterHeader), MAX_RETRY_DELAY_MS)
+  if (retryAfterHeader) {
+    const seconds = parseInt(retryAfterHeader, 10)
+    if (!isNaN(seconds)) {
+      return Math.max(
+        MIN_RETRY_DELAY_MS,
+        Math.min(seconds * 1000, MAX_RETRY_DELAY_MS),
+      )
+    }
+  }
+
+  const index = Math.max(0, Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1))
+  return RETRY_DELAYS_MS[index]!
 }
 
 export function parseMaxTokensContextOverflowError(error: APIError):
