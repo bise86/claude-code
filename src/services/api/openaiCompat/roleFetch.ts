@@ -1,6 +1,7 @@
 import type { RoleClientConfig } from '../../../tools/AgentTool/roles/roleTypes.js'
 import { proxyRouteNote, registerDirectHosts } from '../../../utils/lanDirect.js'
 import { estimateBodyTokens } from '../tokenEstimate.js'
+import { RetrySession, currentRetrySession, setRetrySessionFactory } from '../retrySession.js'
 import { anthropicEventsToSSE } from './blocks.js'
 import { PROTOCOL_ROUTES, TRANSLATING_PROTOCOLS } from './protocols.js'
 import { bodyPrefixKey, codexHeaders } from './codexIdentity.js'
@@ -27,6 +28,9 @@ import { upstreamFailureMessage } from './upstreamError.js'
  * 而随机段保证跨进程/跨 run 不撞 —— 用量表是按这个 id 去重的,撞一次就少记一次调用。
  */
 let requestSeq = 0
+// runAgent 为每次子 agent 调用复制配置;同一员工的后续工具轮次沿用已换过的标识。
+// WeakMap 不延长配置的生命,也不把随机标识写入 settings。
+const sessionIdentities = new WeakMap<RoleClientConfig, { nonce?: string }>()
 function mintRequestId(): string {
   requestSeq += 1
   return `req_role_${requestSeq}_${Math.random().toString(36).slice(2, 10)}`
@@ -98,6 +102,12 @@ export function isStreamOnlyFetch(fn: unknown): boolean {
 }
 
 export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetch): typeof fetch {
+  const rotateSession = cfg.rotateSessionOnRetry === true && cfg.apiProtocol !== 'anthropic'
+  let identity = sessionIdentities.get(cfg)
+  if (rotateSession && !identity) {
+    identity = {}
+    sessionIdentities.set(cfg, identity)
+  }
   const target = new URL(cfg.apiUrl)
   /**
    * 内网端点在**这里**再登记一次直连(见 utils/lanDirect)。
@@ -195,7 +205,9 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
      * `user-agent: OpenAI/JS` + `x-stainless-*` 一条都匹配不上。
      */
     const requestId = mintRequestId()
-    const codexHdrs = codexHeaders(bodyPrefixKey(outBody as any), requestId)
+    const retrySession = currentRetrySession()
+    const codexHdrs = codexHeaders(bodyPrefixKey(outBody as any), requestId,
+      rotateSession ? (retrySession ? retrySession.nonce : identity?.nonce) : undefined)
     for (const [k, v] of Object.entries(codexHdrs)) headers.set(k, v)
     // 拼好的地址要**留在手上**:它是诊断 502 的第一手材料,而此前它只存在于这一行表达式里。
     const dest = joinRoute(target.toString(), proto.route, PROTOCOL_ROUTES)
@@ -370,6 +382,12 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
    */
   if (cfg.apiProtocol !== 'anthropic') {
     Object.defineProperty(roleFetch, STREAM_ONLY, { value: true })
+  }
+  if (rotateSession && identity) {
+    const savedIdentity = identity
+    setRetrySessionFactory(roleFetch, () => new RetrySession(savedIdentity.nonce, nonce => {
+      savedIdentity.nonce = nonce
+    }))
   }
   return roleFetch
 }

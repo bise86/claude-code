@@ -15,7 +15,7 @@
  * 回调里 throw —— 那个形状恰恰是「在循环里面抛」,它绿了一整天,而真实链路一次都没重试过。
  * 这里数的是 `fetchOverride` 被调了几次:它是 `/et` 的员工链路真正出网的那一层。
  */
-import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -169,6 +169,160 @@ async function drain(gen: AsyncGenerator<unknown>): Promise<{ ok: boolean; error
 const messagesFixture = (text: string): Message[] => [
   { type: 'user', message: { role: 'user', content: text }, uuid: 'u1', timestamp: '' } as never,
 ]
+
+describe('会话轮换重试:真实 HTTP 与 SSE 链路', () => {
+  const realSetTimeout = globalThis.setTimeout.bind(globalThis)
+  let restoreClock = () => {}
+  let oldMax: string | undefined
+  beforeEach(() => {
+    oldMax = process.env.CLAUDE_CODE_MAX_RETRIES
+    delete process.env.CLAUDE_CODE_MAX_RETRIES
+    // 此组验证请求/计数/标识,仅加速退避等待;间隔由现有 nextRetryDelay 用例验证。
+    const clock = spyOn(globalThis, 'setTimeout').mockImplementation(((fn: any, ms?: number, ...args: any[]) =>
+      realSetTimeout(fn, ms !== undefined && ms >= 3_000 && ms <= 90_000 ? 0 : ms, ...args)) as typeof setTimeout)
+    restoreClock = () => clock.mockRestore()
+  })
+  afterEach(() => {
+    restoreClock()
+    if (oldMax === undefined) delete process.env.CLAUDE_CODE_MAX_RETRIES
+    else process.env.CLAUDE_CODE_MAX_RETRIES = oldMax
+  })
+  const frame = (type: string, extra: Record<string, unknown> = {}) =>
+    `event: ${type}\ndata: ${JSON.stringify({ type, ...extra })}\n\n`
+  const start = frame('response.created', { response: { id: 'resp-rotation' } })
+  const failure = frame('error', { error: { type: 'server_error', message: 'rotation probe failure' } })
+  const success = () => sseResponse([start,
+    frame('response.output_text.delta', { delta: '恢复成功' }),
+    frame('response.completed', { response: {} })])
+
+  async function probe(opts: {
+    name: string; transport?: 'raw' | 'sdk'; mode?: 'http' | 'sse' | 'mixed'
+    protocol?: 'openai' | 'openai-responses'; overflowFirst?: boolean
+    enabled?: boolean; succeedAt?: number; cancelOnRotation?: boolean; toolBeforeError?: boolean
+  }) {
+    const seen: { headers: Headers; body: any }[] = []
+    const retries: number[] = []
+    const delays: number[] = []
+    const notices: { kind: string; text: string }[] = []
+    const texts: string[] = []
+    let finalErrors = 0
+    const abort = new AbortController()
+    const fetch = buildRoleFetch({
+      apiProtocol: opts.protocol ?? 'openai-responses', transport: opts.transport ?? 'raw',
+      apiUrl: 'https://gw.example/v1', apiToken: 'test-key', backendModel: 'test-model',
+      rotateSessionOnRetry: opts.enabled ?? true,
+    }, (async (input: any, init: any = {}) => {
+      const raw = init.body ?? (input instanceof Request ? await input.clone().text() : '{}')
+      seen.push({ headers: new Headers(init.headers ?? input.headers), body: JSON.parse(String(raw)) })
+      if (seen.length > 20) { abort.abort(); throw new Error('重试次数未收口') }
+      if (seen.length === opts.succeedAt) return success()
+      if (opts.overflowFirst && seen.length === 1) {
+        return new Response(JSON.stringify({ error: {
+          type: 'invalid_request_error',
+          message: 'input length and `max_tokens` exceed context limit: 10000 + 6000 > 15000',
+        } }), { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      if (opts.toolBeforeError) return sseResponse([start, frame('response.output_item.done', {
+        item: { type: 'function_call', id: 'fc-rotation', call_id: 'call-rotation', name: 'Read', arguments: '{}' },
+      }), failure])
+      if (opts.mode === 'http' || (opts.mode === 'mixed' && seen.length % 2 === 1)) {
+        return new Response('{"error":{"type":"server_error","message":"rotation probe failure"}}',
+          { status: 500, headers: { 'content-type': 'application/json' } })
+      }
+      return sseResponse([start, frame('response.output_text.delta', { delta: '失败预览' }), failure])
+    }) as typeof globalThis.fetch)
+    await withContextNoticeSink(n => {
+      notices.push(n)
+      if (opts.cancelOnRotation && n.kind === 'api-session-rotated') abort.abort()
+    }, async () => {
+      for await (const event of queryModelWithStreaming({
+        messages: messagesFixture(`rotation-${opts.name}`), systemPrompt: [] as never,
+        thinkingConfig: { type: 'disabled' }, tools: [] as never,
+        signal: abort.signal, options: optionsWith(fetch),
+      })) {
+        if (event.type === 'system' && event.subtype === 'api_error') {
+          retries.push(event.retryAttempt)
+          delays.push(event.retryInMs)
+        }
+        if (event.type === 'assistant') {
+          if (event.isApiErrorMessage) finalErrors++
+          else for (const block of event.message.content) if (block.type === 'text') texts.push(block.text)
+        }
+      }
+    })
+    return { seen, retries, delays, notices, texts, finalErrors }
+  }
+
+  for (const transport of ['raw', 'sdk'] as const) {
+    for (const mode of ['http', 'sse', 'mixed'] as const) {
+      it(`${transport}/${mode}: 三组会话共 19 次请求,轮换两次,路由键始终相同`, async () => {
+        const p = await probe({ name: `${transport}-${mode}`, transport, mode })
+        expect(p.seen).toHaveLength(19)
+        const sessions = p.seen.map(s => s.headers.get('session-id'))
+        expect(new Set(sessions).size).toBe(3)
+        expect(new Set(sessions.slice(0, 4)).size).toBe(1)
+        expect(new Set(sessions.slice(4, 8)).size).toBe(1)
+        expect(new Set(sessions.slice(8)).size).toBe(1)
+        expect(new Set(p.seen.map(s => s.body.prompt_cache_key)).size).toBe(1)
+        expect(new Set(p.seen.map(s => s.headers.get('x-client-request-id'))).size).toBe(19)
+        expect(p.retries).toEqual([1, 2, 3, 1, 2, 3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        expect(p.delays.slice(0, 9)).toEqual([3000, 6000, 10000, 3000, 6000, 10000, 3000, 6000, 10000])
+        expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(2)
+        expect(p.finalErrors).toBe(1)
+        expect(p.texts).toEqual([])
+      })
+    }
+    it(`${transport}: 更换后的首次请求成功,停止重试且只提交成功内容`, async () => {
+      const p = await probe({ name: `${transport}-recovered`, transport, mode: 'mixed', succeedAt: 5 })
+      expect(p.seen).toHaveLength(5)
+      expect(p.finalErrors).toBe(0)
+      expect(p.texts).toEqual(['恢复成功'])
+      expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(1)
+    })
+    it(`${transport}/chat: 同样最多 19 次请求,保持原有请求体`, async () => {
+      const p = await probe({ name: `${transport}-chat`, transport, protocol: 'openai', mode: 'http' })
+      expect(p.seen).toHaveLength(19)
+      expect(new Set(p.seen.map(s => s.headers.get('session-id'))).size).toBe(3)
+      expect(p.seen.every(s => JSON.stringify(s.body) === JSON.stringify(p.seen[0].body))).toBe(true)
+      expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(2)
+      expect(p.finalErrors).toBe(1)
+    })
+    it(`${transport}: 开启后仍会修正上下文超限的输出上限`, async () => {
+      const p = await probe({ name: `${transport}-overflow`, transport, overflowFirst: true, succeedAt: 2 })
+      expect(p.seen).toHaveLength(2)
+      expect(p.seen[1].body.max_output_tokens).toBe(4000)
+      expect(p.seen[1].body.prompt_cache_key).toBe(p.seen[0].body.prompt_cache_key)
+      expect(p.retries).toEqual([1])
+      expect(p.texts).toEqual(['恢复成功'])
+      expect(p.finalErrors).toBe(0)
+    })
+  }
+
+  it('关闭开关仍是原来的 10 次重试,不轮换', async () => {
+    const p = await probe({ name: 'disabled', mode: 'http', enabled: false })
+    expect(p.seen).toHaveLength(11)
+    expect(new Set(p.seen.map(s => s.headers.get('session-id'))).size).toBe(1)
+    expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(0)
+  })
+  it('用户设置的 2 次预算仍优先,不因轮换扩张', async () => {
+    process.env.CLAUDE_CODE_MAX_RETRIES = '2'
+    const p = await probe({ name: 'small-budget', mode: 'mixed' })
+    expect(p.seen).toHaveLength(3)
+    expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(0)
+  })
+  it('轮换等待期间取消不会发出新请求', async () => {
+    const p = await probe({ name: 'cancel', mode: 'mixed', cancelOnRotation: true })
+    expect(p.seen).toHaveLength(4)
+    expect(p.finalErrors).toBe(0)
+    expect(p.texts).toEqual([])
+  })
+  it('已经输出工具调用时不重放,开关不能绕过这道保护', async () => {
+    const p = await probe({ name: 'tool', toolBeforeError: true })
+    expect(p.seen).toHaveLength(1)
+    expect(p.notices.some(n => n.kind === 'api-retry-skipped')).toBe(true)
+    expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(0)
+  })
+})
 
 describe('流中途的错误帧要能整轮重来', () => {
   const frame = (event: string, data: unknown): string =>

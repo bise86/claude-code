@@ -746,9 +746,11 @@ export async function* runAgent({
     // Per-role API client config (execMode: 'api' roles only) — consumed by
     // query.ts's resolveRoleFetch() to route this subagent's requests through
     // its own endpoint/protocol instead of the default fetch.
+    // Copy per invocation: retry-session identities are keyed by this object,
+    // so simultaneous uses of one role must not rotate each other's sessions.
     roleClientConfig:
-      agentDefinition.execMode === 'api'
-        ? agentDefinition.roleClientConfig
+      agentDefinition.execMode === 'api' && agentDefinition.roleClientConfig
+        ? { ...agentDefinition.roleClientConfig }
         : undefined,
     // Fork children (useExactTools path) need querySource on context.options
     // for the recursive-fork guard at AgentTool.tsx call() — it checks

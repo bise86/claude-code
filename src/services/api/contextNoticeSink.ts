@@ -43,6 +43,8 @@ export type ContextNoticeKind =
    * 而用户上一次为这类静默付的代价就是那句「没看到日志」。
    */
   | 'api-retry'
+  /** 会话头已更换,缓存路由键不变,重试计数重新开始。 */
+  | 'api-session-rotated'
   /** 流已经输出不可安全重放的内容;说明为何不能整轮重试。 */
   | 'api-retry-skipped'
   /**

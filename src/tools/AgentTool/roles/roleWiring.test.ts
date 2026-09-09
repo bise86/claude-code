@@ -10,6 +10,7 @@ import { describe, expect, it } from 'bun:test'
 import { parseRoles, roleLoadIssues } from './rolesFromSettings.js'
 import { buildRoleFetch } from '../../../services/api/openaiCompat/roleFetch.js'
 import { contextUnmanaged } from '../../../services/compact/roleContextCeiling.js'
+import { createRetrySession } from '../../../services/api/retrySession.js'
 
 const api = (over: Record<string, unknown> = {}) => ({
   name: 'gpt', whenToUse: 'w', execMode: 'api',
@@ -20,6 +21,27 @@ const issuesOf = (roles: unknown[], source: string): string[] => {
   parseRoles(roles, source)
   return roleLoadIssues().filter(i => i.source === source).map(i => i.reason)
 }
+
+describe('会话轮换开关', () => {
+  for (const enabled of [undefined, false, true]) {
+    it(`从配置一路传到请求能力(开启: ${enabled})`, () => {
+      const cfg = parseRoles([api({ apiProtocol: 'openai-responses', rotateSessionOnRetry: enabled })],
+        `session-rotation-${enabled}`)[0].agentDef.roleClientConfig!
+      expect(Boolean(createRetrySession(buildRoleFetch(cfg)))).toBe(enabled === true)
+    })
+  }
+  it('字符串不能误开开关,也不让整条员工消失', () => {
+    const source = 'session-rotation-invalid'
+    const out = parseRoles([api({ apiProtocol: 'openai-responses', rotateSessionOnRetry: 'true' })], source)
+    expect(out).toHaveLength(1)
+    expect(out[0].agentDef.roleClientConfig?.rotateSessionOnRetry).toBeUndefined()
+    expect(roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')).toContain('true / false')
+  })
+  it('不支持的协议会解释为何忽略', () => {
+    expect(issuesOf([api({ apiProtocol: 'anthropic', rotateSessionOnRetry: true })], 'session-rotation-anthropic')
+      .join('\n')).toContain('rotateSessionOnRetry')
+  })
+})
 
 describe('新协议真的配得进去', () => {
   it('apiProtocol: openai-responses 不再被 zod 拒掉', () => {

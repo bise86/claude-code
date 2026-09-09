@@ -292,10 +292,16 @@
 
   > 历史:sdk 档曾经多发一个 `truncation: "auto"`（想把上下文交给上游截断）。2026-08-20 跑机实测,new-api 网关的 `/v1/responses` 直接 400 `Unsupported parameter: truncation`——同一发去掉这个字段就 200，带不带 SDK 那套 `x-stainless-*` 头都 200。该字段已移除，两条路的请求体现在完全一致。
 
-  sdk 档的两处实现细节：客户端上 `maxRetries: 0`（重试策略统一留在 `withRetry`：所有错误都重试、10 次、0.5→32s；两套叠起来是乘法，而且退避曲线会错乱），以及**把我们自己的 fetch 传进 SDK**（内网直连、请求头清洗、连接失败的分类诊断都挂在它上面）。失败诊断里会额外印一句「sdk 传输」，好让灰度期间「切了之后开始报」和「本来就报」分得开。
+  sdk 档的两处实现细节：客户端上 `maxRetries: 0`（重试策略统一留在 `withRetry`：所有错误都重试，默认 10 次，阶梯间隔 3s～90s；两套叠起来是乘法，而且退避曲线会错乱），以及**把我们自己的 fetch 传进 SDK**（内网直连、请求头清洗、连接失败的分类诊断都挂在它上面）。失败诊断里会额外印一句「sdk 传输」，好让灰度期间「切了之后开始报」和「本来就报」分得开。
 
   只对 `execMode: 'api'` 的**翻译型协议**（`openai` / `openai-responses`）有意义；写在 `anthropic` 协议或 cli 档上会被忽略，并在 `/et` 启动关口上说明。
 
+
+- `rotateSessionOnRetry`：布尔值，默认 `false`。仅对 `execMode: "api"` 的 `openai` / `openai-responses` 生效，两种 `transport` 都支持。
+
+  在对应员工对象里添加 `"rotateSessionOnRetry": true` 即可开启。首次请求加 3 次重试仍失败后，更换 `session-id`、`thread-id`、`x-codex-window-id` 以及 metadata 中对应的值；计数归零，退避重新从 3s 开始（仍遵守 `Retry-After` 的 3s～90s 范围）。最多更换 2 次，最后一组继续使用原有重试上限，默认最多 19 次请求（4＋4＋11）。若 `CLAUDE_CODE_MAX_RETRIES` 小于 3，则先按该上限结束。HTTP 和 SSE 失败共用预算；取消、已输出工具或已提交响应不会因该开关而重放。
+
+  **`prompt_cache_key` 始终保留原值**，NewAPI 以此绑定渠道时不因本次轮换改变亲和键。若自定义亲和规则使用会话/线程请求头，应保持关闭。成功后同一员工调用的后续工具轮次沿用新标识；并发员工互不影响。每轮模型响应重新获得有限重试预算，阶段重跑另按 `/et` 的阶段策略处理。
 
 #### `cli` 模式
 

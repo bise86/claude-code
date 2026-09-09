@@ -44,6 +44,7 @@ import {
   isMockRateLimitError,
 } from '../rateLimitMocking.js'
 import { reportContextNotice } from './contextNoticeSink.js'
+import { MAX_SESSION_ROTATIONS, withRetrySession, type RetrySession } from './retrySession.js'
 import { effectiveErrorStatus, isAbortError } from './errorPayload.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
 
@@ -99,6 +100,8 @@ export interface RetryContext {
 }
 
 interface RetryOptions {
+  /** 仅由支持会话头轮换的 OpenAI 翻译链路传入,与流中途重试共用。 */
+  retrySession?: RetrySession
   maxRetries?: number
   model: string
   fallbackModel?: string
@@ -224,11 +227,12 @@ export async function* withRetry<T>(
         client = await getClient()
       }
 
-      return await operation(client, attempt, retryContext)
+      return await withRetrySession(options.retrySession, () =>
+        operation(client!, options.retrySession?.attempt ?? attempt, retryContext))
     } catch (error) {
       lastError = error
       logForDebugging(
-        `API error (attempt ${attempt}/${maxRetries + 1}): ${error instanceof APIError ? `${error.status} ${error.message}` : errorMessage(error)}`,
+        `API error (attempt ${options.retrySession?.attempt ?? attempt}/${maxRetries + 1}): ${error instanceof APIError ? `${error.status} ${error.message}` : errorMessage(error)}`,
         { level: 'error' },
       )
 
@@ -239,7 +243,7 @@ export async function* withRetry<T>(
       // and the for-loop terminates. Persistent sessions want the chunked
       // keep-alive path instead of fast-mode cache-preservation anyway.
       if (
-        wasFastModeActive &&
+        !options.retrySession && wasFastModeActive &&
         !isPersistentRetryEnabled() &&
         error instanceof APIError &&
         (error.status === 429 || is529Error(error))
@@ -283,7 +287,7 @@ export async function* withRetry<T>(
       // Fast mode fallback: if the API rejects the fast mode parameter
       // (e.g., org doesn't have fast mode enabled), permanently disable fast
       // mode and retry at standard speed.
-      if (wasFastModeActive && isFastModeNotEnabledError(error)) {
+      if (!options.retrySession && wasFastModeActive && isFastModeNotEnabledError(error)) {
         handleFastModeRejectedByAPI()
         retryContext.fastMode = false
         continue
@@ -291,7 +295,7 @@ export async function* withRetry<T>(
 
       // Track consecutive 529 errors
       if (
-        is529Error(error) &&
+        !options.retrySession && is529Error(error) &&
         // If FALLBACK_FOR_ALL_PRIMARY_MODELS is not set, fall through only if the primary model is a non-custom Opus model.
         // TODO: Revisit if the isNonCustomOpusModel check should still exist, or if isNonCustomOpusModel is a stale artifact of when Claude Code was hardcoded on Opus.
         (process.env.FALLBACK_FOR_ALL_PRIMARY_MODELS ||
@@ -315,8 +319,8 @@ export async function* withRetry<T>(
 
       // 次数用完了就报出来。「一律重试」不等于「无限重试」—— 边界在这里,不在判据里。
       const persistent =
-        isPersistentRetryEnabled() && isTransientCapacityError(error)
-      if (attempt > maxRetries && !persistent) {
+        !options.retrySession && isPersistentRetryEnabled() && isTransientCapacityError(error)
+      if (attempt > maxRetries && !persistent && !options.retrySession) {
         throw new CannotRetryError(error, retryContext)
       }
 
@@ -376,8 +380,17 @@ export async function* withRetry<T>(
             attempt,
           })
 
-          continue
+          if (!options.retrySession) continue
         }
+      }
+
+      if (options.retrySession) {
+        // OpenAI 翻译链路使用贯穿 HTTP/SSE 的有限预算,同时保留上面的参数修正。
+        if (!(yield* retryWithSession(error, options.retrySession, maxRetries, options.signal, options.querySource))) {
+          throw new CannotRetryError(error, retryContext)
+        }
+        attempt = options.retrySession.attempt - 1
+        continue
       }
 
       // For other errors, proceed with normal retry logic
@@ -478,6 +491,40 @@ export async function* withRetry<T>(
   }
 
   throw new CannotRetryError(lastError, retryContext)
+}
+
+/** HTTP 错误和可重放的 SSE 错误共用,只有实际重试才消耗/重置计数。 */
+export async function* retryWithSession(
+  error: unknown,
+  session: RetrySession,
+  maxRetries: number,
+  signal?: AbortSignal,
+  querySource?: QuerySource,
+): AsyncGenerator<SystemAPIErrorMessage, boolean> {
+  if (signal?.aborted) throw new APIUserAbortError()
+  if (!shouldRetry(error)) return false
+  const next = session.next(maxRetries)
+  if (!next) return false
+  const delayMs = nextRetryDelay(Math.max(1, next.retryAttempt), getRetryAfter(error))
+  const text = next.rotated
+    ? `已更换会话标识(第 ${next.rotation}/${MAX_SESSION_ROTATIONS} 次),保留缓存路由键;重试计数归零,${Math.round(delayMs / 1000)}s 后重新请求`
+    : retryNoticeText(error, delayMs, next.retryAttempt, maxRetries)
+  logForDebugging(text)
+  logEvent('tengu_api_retry', {
+    attempt: next.retryAttempt,
+    delayMs,
+    session_rotations: next.rotation,
+    query_source: querySource as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    error: errorMessage(error) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+    status: (error as APIError)?.status,
+    provider: getAPIProviderForStatsig(),
+  })
+  if (!next.rotated && error instanceof APIError) {
+    yield createSystemAPIErrorMessage(error, delayMs, next.retryAttempt, maxRetries)
+  }
+  reportContextNotice({ kind: next.rotated ? 'api-session-rotated' : 'api-retry', text })
+  await sleep(delayMs, signal, { abortError })
+  return true
 }
 
 /** 席位窗口上那一行。**一行**,因为它挤在流式正文中间。 */

@@ -93,6 +93,7 @@ const RoleSchema = z.object({
    * 自由字符串,合法性在下面自己判 —— 和 thinkingDepth 同一个理由。
    */
   transport: z.string().optional(),
+  rotateSessionOnRetry: z.unknown().optional(),
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   interactive: z.boolean().optional(),
@@ -234,6 +235,16 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
        * 变成猜。
        */
       let transport: 'raw' | 'sdk' | undefined
+      let rotateSessionOnRetry: boolean | undefined
+      if (r.rotateSessionOnRetry !== undefined) {
+        if (typeof r.rotateSessionOnRetry !== 'boolean') {
+          issues.push({ name: r.name, source, reason: 'rotateSessionOnRetry 必须为 true / false,已忽略' })
+        } else if (r.execMode !== 'api' || protocol === 'anthropic') {
+          issues.push({ name: r.name, source, reason: 'rotateSessionOnRetry 只对 api 模式的 openai / openai-responses 员工有效,已忽略' })
+        } else {
+          rotateSessionOnRetry = r.rotateSessionOnRetry
+        }
+      }
       const rawTransport = typeof r.transport === 'string' ? r.transport.trim().toLowerCase() : undefined
       if (rawTransport !== undefined && rawTransport !== '') {
         if (rawTransport === 'raw' || rawTransport === 'sdk') {
@@ -296,7 +307,7 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
         }
       }
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
-        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value, autoCompactTokenLimit: declaredLimit, transport }
+        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value, autoCompactTokenLimit: declaredLimit, transport, ...(rotateSessionOnRetry !== undefined ? { rotateSessionOnRetry } : {}) }
         : undefined
       /**
        * 内网端点**在载入时**就登记直连(见 utils/lanDirect)。

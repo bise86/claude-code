@@ -232,6 +232,7 @@ import { isToolFromMcpServer } from '../mcp/utils.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { CLIENT_REQUEST_ID_HEADER, getAnthropicClient } from './client.js'
 import { isStreamOnlyFetch } from './openaiCompat/roleFetch.js'
+import { createRetrySession, type RetrySession } from './retrySession.js'
 import { reportApiUsage } from './usageSink.js'
 import {
   API_ERROR_MESSAGE_PREFIX,
@@ -259,6 +260,7 @@ import {
   is529Error,
   nextRetryDelay,
   retryNoticeText,
+  retryWithSession,
   type RetryContext,
   shouldRetry,
   withRetry,
@@ -1039,6 +1041,7 @@ async function* queryModel(
    * 的一帧 `event: error` 抛出来时,`shouldRetry` 根本不会被问到。
    */
   midStreamAttempt = 1,
+  retrySession: RetrySession | undefined = createRetrySession(options.fetchOverride),
 ): AsyncGenerator<
   StreamEvent | AssistantMessage | SystemAPIErrorMessage,
   void
@@ -1870,6 +1873,7 @@ async function* queryModel(
         ...(isFastModeEnabled() ? { fastMode: isFastMode } : false),
         signal,
         querySource: options.querySource,
+        retrySession,
       },
     )
 
@@ -2559,7 +2563,14 @@ async function* queryModel(
         // the live preview. Never replay tool output or a committed response.
         const retryableMidStream = shouldRetry(streamingError)
         const midStreamMax = getDefaultMaxRetries()
-        if (retryableMidStream && !streamReplayBlockedBy && midStreamAttempt <= midStreamMax) {
+        if (retrySession && retryableMidStream && !streamReplayBlockedBy) {
+          releaseStreamResources()
+          pendingStreamMessages.length = 0
+          if (yield* retryWithSession(streamingError, retrySession, midStreamMax, signal, options.querySource)) {
+            return yield* queryModel(messages, systemPrompt, thinkingConfig, tools, signal, options,
+              midStreamAttempt + 1, retrySession)
+          }
+        } else if (retryableMidStream && !streamReplayBlockedBy && midStreamAttempt <= midStreamMax) {
           // 旧的那条流和它的响应体必须先放掉:下面要重新建一条,而这一条已经废了。
           releaseStreamResources()
           pendingStreamMessages.length = 0
