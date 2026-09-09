@@ -48,6 +48,9 @@ export const PHASE_LABEL: Record<PhaseName, string> = {
   verify: '测试修复', accept: '验收', integrate: '集成验收', observer: '观察',
 }
 
+/** 单点阶段的 API 失败和超时共用的额外重跑次数;执行与成本预估共用。 */
+export const PHASE_FAILURE_RETRIES = 1
+
 /**
  * 用户可以写的环节名 → 内部 phase 名。
  *

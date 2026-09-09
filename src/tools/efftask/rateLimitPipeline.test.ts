@@ -1,11 +1,7 @@
 /**
  * 限流在**单点调用**(分析 / 执行)上的行为。
  *
- * 圆桌那三条路一直有 `roundtableWithInfraRetry`,而 `runPhase` 的六个调用点**一条重试都
- * 没有**:分析拿到 429 就直接 `blockWithReason`,理由是一句英文的
- * `API Error: Request rejected (429)`,`capCategory` 是 undefined —— 阻断卡连一条对症的
- * 建议都给不出,`--retry-blocked` 也捞不回这个节点。而在订阅账号上 SDK 那一层对 429
- * **一次都不重试**(`withRetry.shouldRetry`),所以这里就是全部的重试。
+ * 底层 API 重试结束后,所有单点阶段都额外重跑一次;耗尽后保留对症的分类和建议。
  */
 import { describe, expect, it } from 'bun:test'
 
@@ -61,7 +57,7 @@ describe('分析环节吃到 429', () => {
     expect(n.blockedReason).toBe('')
   })
 
-  it('一直限流 → 三次之后阻断,而且**带着对症的分类和建议**', async () => {
+  it('一直限流 → 两次之后阻断,而且带着对症的分类和建议', async () => {
     let calls = 0
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') { calls++; rateLimit() }
@@ -69,7 +65,7 @@ describe('分析环节吃到 429', () => {
     }
     const n = root()
     await stepStart(n, ctxFor([n], runAgent))
-    expect(calls).toBe(3)
+    expect(calls).toBe(2)
     expect(n.status).toBe('BLOCKED')
     // 分类必须有:不带的话 capBlocked 是 false、capCategory 是 undefined,
     // 阻断卡给不出建议,`--retry-blocked` 也捞不回它。
@@ -80,7 +76,7 @@ describe('分析环节吃到 429', () => {
     expect(n.blockedReason).not.toContain('网络可用')
   })
 
-  it('别的 provider 报错**不重试** —— 那不是「慢一点」,是「这条路不通」', async () => {
+  it('其它 provider 错误同样额外重跑一次', async () => {
     let calls = 0
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') {
@@ -91,8 +87,7 @@ describe('分析环节吃到 429', () => {
     }
     const n = root()
     await stepStart(n, ctxFor([n], runAgent))
-    // 这条用例守的是**不重试** —— 那才是「这条路不通」和「慢一点」的区别。
-    expect(calls).toBe(1)
+    expect(calls).toBe(2)
     expect(n.status).toBe('BLOCKED')
     /**
      * **带分类,而且必须带。** 上一版这里断言 `undefined`,那不是判据、是当时的缺陷:
@@ -102,13 +97,13 @@ describe('分析环节吃到 429', () => {
      * 只要它不动,root 的 `childrenAllAccepted` 永远为假 —— 那趟 run 无论 resume 多少次
      * 都不可能 COMPLETED。
      *
-     * 分类不等于会重试:重试由 `RATE_LIMIT_ATTEMPTS` 那条路决定,上面 `calls === 1` 钉着。
+     * 阶段重跑耗尽后仍要保留分类,让 --retry-blocked 能恢复。
      */
     expect(n.capCategory).toBe('infra')
   })
 })
 
-describe('额度用尽:不重试,而且给的是另一句话', () => {
+describe('额度用尽:额外重跑后仍保留原来的建议', () => {
   /**
    * 变异测试实测存活:把 quota 那一版建议去掉(和限流共用一句)之后全套照绿。而两者
    * 的差别正是这次拆开它们的全部理由 —— 上游自己说 `resets 3pm`,而限流那一版写着
@@ -118,7 +113,7 @@ describe('额度用尽:不重试,而且给的是另一句话', () => {
     throw new ProviderApiError("Claude AI usage limit reached · resets 3pm", 'quota')
   }
 
-  it('只调一次,阻断建议是「等没有用」那一版', async () => {
+  it('共调两次,阻断建议是「等没有用」那一版', async () => {
     let calls = 0
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'plan') { calls++; quota() }
@@ -126,8 +121,7 @@ describe('额度用尽:不重试,而且给的是另一句话', () => {
     }
     const n = root()
     await stepStart(n, ctxFor([n], runAgent))
-    // 不重试:等没有用。
-    expect(calls).toBe(1)
+    expect(calls).toBe(2)
     expect(n.status).toBe('BLOCKED')
     // 带分类(否则 --retry-blocked 捞不回它、阻断卡也给不出建议)。
     expect(n.capCategory).toBe('infra')
@@ -209,13 +203,7 @@ describe('多角色圆桌耗尽在限流上 —— 用户报的正是这个场�
 })
 
 describe('执行环节吃到 429', () => {
-  /**
-   * **执行环节刻意不重试。** 执行者带写工具,一次 429 可能发生在它已经改过几个文件之后
-   * (provider 的错误消息是在工具循环中间到达的)。再跑一遍等于让第二个执行者对着一个
-   * 半改过的工作区从头开始 —— 那是返工循环该做的决定(它会先让验收员看过),不该由一条
-   * 网络错误在这里替它做。所以这里换成**带分类地阻断**。
-   */
-  it('只调一次,阻断时带 infra 分类和限流建议', async () => {
+  it('额外重跑一次,阻断时带 infra 分类和限流建议', async () => {
     let execCalls = 0
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'execute') { execCalls++; rateLimit() }
@@ -229,17 +217,13 @@ describe('执行环节吃到 429', () => {
     n.status = 'READY'
     n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
     await stepExecute(n, ctxFor([n], runAgent))
-    expect(execCalls).toBe(1)
+    expect(execCalls).toBe(2)
     expect(n.status).toBe('BLOCKED')
     expect(n.capCategory).toBe('infra')
     expect(n.blockedReason).toContain('上游在限流')
   })
 
-  it('观察评分也不重试 —— 一个不影响任何判决的数字不值 3 次调用', async () => {
-    /**
-     * 观察是**咨询性**的:调用失败只记一行「评分调用失败」,而默认(`scoreThreshold`
-     * 未设)连一轮返工都不触发。为它付 3 次调用 + 两次冷却是纯浪费。
-     */
+  it('观察评分同样额外重跑一次,仍失败时只记录原因', async () => {
     let scoreCalls = 0
     const runAgent: RunAgentFn = async req => {
       if (req.phase === 'observer') { scoreCalls++; rateLimit() }
@@ -252,7 +236,7 @@ describe('执行环节吃到 429', () => {
     n.plan = { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' }
     n.phaseRoles = { ...emptyPhaseRoles(), observer: [{ roleName: 'w' }] } as never
     await stepExecute(n, ctxFor([n], runAgent))
-    expect(scoreCalls).toBe(1)
+    expect(scoreCalls).toBe(2)
     // 而且节点照样验收通过 —— 评分失败不该让已经完成的工作失败。
     expect(n.status).toBe('ACCEPTED')
   })

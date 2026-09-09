@@ -1,9 +1,12 @@
 // src/tools/efftask/pipeline.ts
+import { APIError, APIUserAbortError } from '@anthropic-ai/sdk'
+import { isAbortError } from '../../services/api/errorPayload.js'
+import { CannotRetryError } from '../../services/api/withRetry.js'
 import { relativisePaths } from './escapedPaths.js'
 import { isAutoCompactEnabled } from '../../services/compact/autoCompact.js'
 import type { DegradePhase, EffTaskConfig, NodePlan, PhaseName, RoleBinding, RoundtableRecord, ScoreRecord, TaskNode, Verdict } from './types.js'
 import { roleBriefFor } from './roleDefs.js'
-import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_LABEL } from './types.js'
+import { ACTIVE_STATUSES, ALT_SOLUTION_CHARS, createNode, DEFAULT_CAPS, MANUAL_PASS_ROLE, MAX_MERGE_RESOLVE, MIN_MERGE_RESOLVE, PHASE_FAILURE_RETRIES, PHASE_LABEL } from './types.js'
 import type { StreamHandle, StreamMeta } from './agentStream.js'
 import { adviceOf, crossSeatNotice, degradeCarryPrompt, exhaustionRemedy, feedbackItems, planFeedbackPrompt, reviewRepeatNotice } from './reviewConvergence.js'
 import { ANSWER_TAGS, answerTag, capText, hollow, isProtocolBlocking, MAX_FIELD_CHARS, MAX_NEW_CHILDREN, MAX_SUMMARY_CHARS, parseExecOutput, parsePlanOutput, parseScoreOutput, undoneItems, MAX_REMEDY_CHILDREN } from './parseOutput.js'
@@ -490,8 +493,10 @@ type PhaseResult =
   // 也不是一次故障,重试是对的;而且阻断卡要给的是「上游限流」那一版建议。
   | {
       ok: false; reason: string; text?: string; timeout?: boolean; timeoutKind?: TimeoutKind
+      /** 模型请求失败,包括底层重试耗尽;本地上下文闸和中止不算。 */
+      apiFailure?: boolean
       cancelled?: boolean; rateLimited?: boolean
-      // 额度/权限用尽:**不重试**(等没有用),但要带分类和它自己那一句建议。
+      // 额度/权限用尽:阶段重跑仍失败时,保留它自己的分类和建议。
       quotaExhausted?: boolean
       /**
        * 提示词超长,而且**压缩重发三次之后仍然被拒**(适配层已经替我们试过了,见
@@ -540,18 +545,6 @@ type PlanPhaseResult =
  * (N 席并行)全都走这里,而不是走 runRoundtable。少给一个署名,这些席位就会退回
  * chunkBuffer 时代那种「几个人的话并成一坨、看不出谁说的」——正是本次要治的病。
  */
-/**
- * 上游限流时**同一次调用**最多重试几次。
- *
- * 只有 3 是因为退避本身在闸门里(2s → 4s → …),这里要的只是「别把一次限流变成一个
- * 节点的死刑」。圆桌那三条路有 `roundtableWithInfraRetry`,而**单次调用那六个调用点
- * 一条重试都没有**:分析和执行拿到 429 就直接 `blockWithReason`,`blockedReason` 是一句
- * 英文的 `API Error: Request rejected (429)`,`capCategory` 是 undefined —— 阻断卡连一条
- * 对症的建议都给不出。而在订阅账号上 SDK 那一层对 429 一次都不重试
- * (`withRetry.shouldRetry`),所以这就是全部的重试。
- */
-const RATE_LIMIT_ATTEMPTS = 3
-
 /**
  * 一次单点调用失败该按哪个阀报。
  *
@@ -628,23 +621,11 @@ function remedyOf(res: {
 }
 
 /**
- * 静默超时之后**原样再跑一次**这个环节。
- *
- * 1 = 只多试一次(一个环节最多 2 次调用),用户定的数。为什么值得试这一次:超时是
- * `infra` —— **没有任何人对这份工作做出过判断**,和「评审员否掉了」是两回事。而在此之前,
- * 走单次调用的那九处(分析 / 方案融合 / 方案精化 / 补验收点 / 质疑修复 / 测试修复 /
- * 观察评分 / 执行 / 冲突自动解决)一次都不重试:一次 10 分钟的静默 = 节点当场 BLOCKED,
- * 要人回到终端敲 `/et --resume <id> --retry-blocked` 才动得了 —— 跑机上那就是「下班之后
- * 整棵树停在那儿等一个人」。圆桌那三条路(方案评审 / 验收 / 集成验收)本来就会重派超时的
- * 席位(超时在 roundtable.ts 里被打上 `infra: true`,见 `roundtableWithInfraRetry`),
- * 这一条是把同一条政策补给单次调用。
- *
- * **`human` 那一种不在内**,这不是保守。它的意思是「没有人来点那个工具权限确认」
- * (预算见 `caps.humanTimeoutMs`,默认 7 天)。原样重跑只会再挂 7 天,而屏幕上那个确认
- * 依然没人点。它的补救是去把确认点掉(`humanTimeoutRemedy`),和节点大小、和
- * `nodeTimeoutMs` 都没有关系。
+ * API 失败(含底层重试耗尽)或阶段超时之后,额外重跑一次,包括执行和观察。
+ * 两类失败共用预算,限流也不再另叠一层阶段重派。圆桌保留自己的失败席位重试。
+ * 用户取消、等人工确认超时和本地错误不触发这次重跑。
  */
-const TIMEOUT_RETRIES = 1
+type PhaseFailure = Extract<PhaseResult, { ok: false }>
 
 /**
  * 重跑那一次要追加到提示词末尾的旁白。
@@ -660,10 +641,12 @@ const TIMEOUT_RETRIES = 1
  * 末尾那句「输出格式不变」不是废话:这段话追加在提示词**最后**,而各环节交代输出格式的
  * 那几行恰好也在最后 —— 不收口的话,模型读到的最后一句变成了这段旁白。
  */
-function timeoutRetryNote(kind: TimeoutKind | undefined): string {
-  const what = kind === 'total'
-    ? '上一次调用一直在输出,但久到超过总时长上限都没能完成一条完整消息,被系统中止了'
-    : '上一次调用连着很久一个字都没有输出,被系统按静默超时中止了'
+function phaseRetryNote(failure: PhaseFailure): string {
+  const what = !failure.timeout
+    ? '上一次调用因 API 请求失败而未能完成,现在按阶段重试策略额外重跑一次'
+    : failure.timeoutKind === 'total'
+      ? '上一次调用一直在输出,但久到超过总时长上限都没能完成一条完整消息,被系统中止了'
+      : '上一次调用连着很久一个字都没有输出,被系统按静默超时中止了'
   return '\n\n───── 这一次是重跑 ─────\n'
     + `${what} —— **不是有人否掉了你的答案**。这一次的任务和上面写的完全一样。\n`
     + '上一次可能已经在工作区里留下了一部分改动或产出:先看一眼现在的实际状态'
@@ -673,14 +656,13 @@ function timeoutRetryNote(kind: TimeoutKind | undefined): string {
 }
 
 async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: Omit<StreamMeta, 'nodeId'>): Promise<PhaseResult> {
-  /** 已经因为超时重跑过几次。0 = 这是第一次调用。 */
+  /** API 失败和阶段超时共用一次重跑预算。 */
   let retried = 0
-  /** 上一次是哪一种超时 —— 旁白要按它换措辞(静默 / 攒不出一条消息)。 */
-  let kind: TimeoutKind | undefined
+  let previousFailure: PhaseFailure | undefined
   for (;;) {
-    const res = await runPhaseWithRateLimitRetry(
+    const res = await runPhaseOnce(
       ctx,
-      retried === 0 ? req : { ...req, prompt: req.prompt + timeoutRetryNote(kind) },
+      previousFailure === undefined ? req : { ...req, prompt: req.prompt + phaseRetryNote(previousFailure) },
       /**
        * **重跑要在表头上看得出来。**
        *
@@ -688,18 +670,20 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: 
        * 所以两次调用结构上不会写进同一条流。但表头如果一模一样,节点详情里就是两条
        * 同名同轮次的「分析」,前一条停在「静默超时」—— 用户分不出哪条是后来的那次。
        */
-      retried === 0 ? meta : { ...meta, phaseLabel: `${meta.phaseLabel}(超时重跑)` },
+      previousFailure === undefined ? meta : {
+        ...meta,
+        phaseLabel: `${meta.phaseLabel}(${previousFailure.timeout ? '超时重跑' : 'API 失败重跑'})`,
+      },
     )
     if (res.ok) return res
     // 一次收窄,和 stepExecute 那一处同一条理由(见 `seatCallFailed`)。
-    const f = res as Extract<PhaseResult, { ok: false }> // 超时重跑
-    const again = retried < TIMEOUT_RETRIES
-      && f.timeout === true
-      // 见 TIMEOUT_RETRIES:等人超时重跑一次只会再挂一个 humanTimeoutMs。
+    const f = res as PhaseFailure
+    const again = retried < PHASE_FAILURE_RETRIES
+      && (f.apiFailure === true || f.timeout === true)
       && f.timeoutKind !== 'human'
-      // 中止 / 单节点取消是**决定**,不是故障 —— 和限流那个循环逐字同一条规矩。
+      && !f.cancelled && !req.signal.aborted
       && !ctx.signal.aborted && ctx.control?.wasCancelled(req.node.id) !== true
-    if (again) { kind = f.timeoutKind; retried++; continue }
+    if (again) { previousFailure = f; retried++; continue }
     /**
      * 「已经替他试过了」这件事要**写进 blockedReason**。
      *
@@ -713,42 +697,6 @@ async function runPhase(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: 
   }
 }
 
-/**
- * 一次调用 + 限流重试。超时重跑在外面那一层(`runPhase`)。
- */
-async function runPhaseWithRateLimitRetry(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: Omit<StreamMeta, 'nodeId'>): Promise<PhaseResult> {
-  /**
-   * 限流可以重试**几次**。
-   *
-   * **执行环节除外,而且这条界线是刻意的:** 执行者带写工具,一次 429 可能发生在它已经
-   * 改过几个文件之后(provider 的错误消息是在工具循环中间到达的)。再跑一遍等于让第二个
-   * 执行者对着一个半改过的工作区从头开始 —— 那是返工循环该做的决定(它会先让验收员看过),
-   * 不该由一条网络错误在这里替它做。执行环节改成**带上分类**地阻断,于是阻断卡会说
-   * 「上游限流」并给出可操作的下一步,`--retry-blocked` 也认它。
-   */
-  /**
-   * **执行和观察都不重试。**
-   *
-   *  - 执行:执行者带写工具,一次 429 可能发生在它已经改过几个文件之后(provider 的
-   *    错误消息是在工具循环中间到达的)。再跑一遍等于让第二个执行者对着一个半改过的
-   *    工作区从头开始 —— 那是返工循环该做的决定(它会先让验收员看过),不该由一条网络
-   *    错误在这里替它做。
-   *  - 观察评分:它是**咨询性**的。调用失败只会记一行「评分调用失败」,而默认
-   *    (`caps.scoreThreshold` 未设)连一轮返工都不触发。为一个不影响任何判决的数字
-   *    付 3 次调用 + 两次冷却,是纯粹的浪费。
-   */
-  const attempts = req.phase === 'execute' || req.phase === 'observer' ? 1 : RATE_LIMIT_ATTEMPTS
-  for (let attempt = 1; ; attempt++) {
-    const res = await runPhaseOnce(ctx, req, meta)
-    if (res.ok || !res.rateLimited || attempt >= attempts) return res
-    // 中止 / 单节点取消时不再试 —— 那两个是决定,不是故障。
-    if (ctx.signal.aborted || ctx.control?.wasCancelled(req.node.id) === true) return res
-    // **这里不 sleep。** 退避住在 `makeRunAgentFn` 顶部的闸门里(它是所有调用的必经点,
-    // 而且冷却是 run 级的:另外四个槽位也会一起等)。在这里再等一次就是双重惩罚 ——
-    // 一桌全 infra 的圆桌会付 4 次冷却而不是 3 次。
-  }
-}
-
 async function runPhaseOnce(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], meta: Omit<StreamMeta, 'nodeId'>): Promise<PhaseResult> {
   try {
     const text = await ctx.runAgent({
@@ -758,11 +706,17 @@ async function runPhaseOnce(ctx: PipelineCtx, req: Parameters<RunAgentFn>[0], me
     if (ctx.signal.aborted) return { ok: false, reason: '已中断', text }
     return { ok: true, text }
   } catch (e) {
+    const originalError = e instanceof CannotRetryError ? e.originalError : e
+    const aborted = originalError instanceof APIUserAbortError || isAbortError(originalError)
     // caps.nodeTimeoutMs is a safety VALVE (spec §11) and escalates differently from an
     // ordinary provider failure, so it travels as a flag rather than as prose to grep.
     return {
       ok: false,
       reason: e instanceof Error ? e.message : String(e),
+      apiFailure: !aborted && (
+        e instanceof CannotRetryError || e instanceof APIError ||
+        (e instanceof ProviderApiError && e.kind !== 'local_context_limit')
+      ),
       timeout: e instanceof PhaseTimeoutError,
       timeoutKind: e instanceof PhaseTimeoutError ? e.kind : undefined,
       cancelled: e instanceof NodeCancelledError,

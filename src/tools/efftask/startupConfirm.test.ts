@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, PHASE_NAMES } from './types.js'
 import type { EffTaskConfig, TaskNode } from './types.js'
-import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, type IsolationChoice, ISOLATION_DEGRADE_PREFIX, ISOLATION_REASON_PREFIX, ISOLATION_RECORD_PREFIX, reconcileIsolationNotices, splitNotices, isSharedTree, isolationChoiceLines, parallelismIsolation, poolDisposition, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, COST_RATE_LIMIT_ATTEMPTS, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines , type HandoffSummary } from './startupConfirm.js'
+import { clip, createResolveOnce, goalLine, raceConfirm, rosterLines, type ConfirmSurface, resumeSummarySections , capsLine, parallelismLine, handoffLines, undeliveredCommits, relativeTime, applyRosterToNodes, isolationChoice, type IsolationChoice, ISOLATION_DEGRADE_PREFIX, ISOLATION_REASON_PREFIX, ISOLATION_RECORD_PREFIX, reconcileIsolationNotices, splitNotices, isSharedTree, isolationChoiceLines, parallelismIsolation, poolDisposition, rosterEquals, exitReportLine, toggleRole, rosterEditorLines, applyStartupDecision, dispatchableRoles, costLine, skipConflictLines, skipConsequenceLines, proxyNoticeLines, runSpanLine, contextWindowNoticeLines, gitChoiceLines , type HandoffSummary } from './startupConfirm.js'
 import { applyRoleDefsToPhases } from './roleDefs.js'
 
 const later = (fn: () => void) => setTimeout(fn, 1)
@@ -1090,13 +1090,13 @@ describe('成本预估必须对得上真实调用数', () => {
     // 承诺 15 次。低估比高估糟 —— 用户按一个偏小的数批准。
     // 精确值,不用比值:比值断言会被**另一个**阶段的平方项满足 —— 实测把方案阶段的
     // 平方拆掉,验收阶段的平方仍让比值达标,测试照旧全绿。
-    // 默认 It=3,方案/质疑修复/验收各 1 席,观察 0 席,单点调用的限流重试 T=3:
-    //   方案阶段 = 3 × (1×T + 3×1) = 18;执行阶段 = 3 × (1 + 3×1 + 0) = 12;合计 30。
-    // 任一处平方被拆成一次方都会掉下来;T 漏掉会掉到 24。
-    expect(n(costLine(mk()))).toBe(30)
+    // 默认 It=3,单点阶段最多两次;方案与质疑修复 12 次,执行与验收 15 次,共 27 次。
+    // 验收保留圆桌的 infra 重试预算,其它阶段共用一次额外重跑。
+    expect(n(costLine(mk()))).toBe(27)
     const it2 = n(costLine(mk({ caps: { ...DEFAULT_CAPS, maxIterations: 2 } })))
     const it4 = n(costLine(mk({ caps: { ...DEFAULT_CAPS, maxIterations: 4 } })))
-    expect(it4 / it2).toBeGreaterThan(2.5)
+    expect(it2).toBe(16)
+    expect(it4).toBe(40)
   })
 
   it('算上方案席位 —— 顺序精化每一席都是一次串行调用', () => {
@@ -1110,7 +1110,7 @@ describe('成本预估必须对得上真实调用数', () => {
   it('算上观察席 —— 每次验收通过都打一次分,返工可让验收通过多次', () => {
     const without = n(costLine(mk()))
     const with1 = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), observer: [{ roleName: 'o' }] } })))
-    expect(with1 - without).toBe(DEFAULT_CAPS.maxIterations)
+    expect(with1 - without).toBe(DEFAULT_CAPS.maxIterations * 2)
   })
 
   it('措辞是上界,并说明实际通常远低于此', () => {
@@ -1149,34 +1149,32 @@ describe('新环节的成本必须计入,而默认配置的数字不能动', () 
   })
   const n = (s: string) => Number(s.match(/每节点最多 (\d+) 次/)![1])
 
-  it('默认配置是 30 —— 两个新环节都是 opt-in,而单点调用带限流重试', () => {
+  it('默认配置是 27,所有单点阶段都计入一次额外重跑', () => {
     // 照抄 accept 的 Math.max(1, seats) 写法会让这个数凭空涨一截,而实际一次调用都不会
     // 发生。关口高估同样是撒谎,只是方向相反:用户会去调一个根本不需要调的旋钮。
     //
-    // 24 → 30 是 `runPhase` 的限流重试(T=3,只作用在分析席位和融合席上)。它是**上限
-    // 口径**:不限流时一次都不会多跑。低估比高估糟 —— 用户按一个偏小的数批准,而这个
-    // 数字在关口上就是他批的那个。
-    expect(n(costLine(mk()))).toBe(30)
+    // 分析、质疑修复、执行每席最多两次;测试修复和观察未配席位时仍然不计数。
+    expect(n(costLine(mk()))).toBe(27)
   })
 
-  it('配了测试修复 → 数字涨,而且带 infra 重试层(平方项)', () => {
+  it('配了测试修复 → 每席都算上一次额外重跑', () => {
     const one = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }] } })))
     const two = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), verify: [{ roleName: 'v' }, { roleName: 'w' }] } })))
-    expect(one).toBeGreaterThan(30)
-    // It=3:一席 +9,两席 +18。一次方的话是 +3/+6。
-    expect(one - 30).toBe(9)
-    expect(two - one).toBe(9)
+    expect(one).toBeGreaterThan(27)
+    // It=3:每席每轮最多两次,一席 +6,两席 +12。
+    expect(one - 27).toBe(6)
+    expect(two - one).toBe(6)
   })
 
   it('配了集成验收 → 数字涨', () => {
     const withInt = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(), integrate: [{ roleName: 'i' }] } })))
-    expect(withInt - 30).toBe(9)
+    expect(withInt - 27).toBe(9)
   })
 
   it('两个都配 → 两份都算上', () => {
     const both = n(costLine(mk({ phaseRoles: { ...emptyPhaseRoles(),
       verify: [{ roleName: 'v' }], integrate: [{ roleName: 'i' }] } })))
-    expect(both).toBe(30 + 9 + 9)
+    expect(both).toBe(27 + 6 + 9)
   })
 })
 
@@ -1305,9 +1303,9 @@ describe('关口:跳过要说出后果,组合要拦住', () => {
 
   it('成本:被跳过的环节归零', () => {
     const n = (c: EffTaskConfig) => Number(costLine(c).match(/每节点最多 (\d+) 次/)![1])
-    expect(n(mk())).toBe(30)
-    expect(n(mk({ skipSteps: ['review'] as never }))).toBeLessThan(30)
-    expect(n(mk({ skipSteps: ['execute'] as never }))).toBeLessThan(30)
+    expect(n(mk())).toBe(27)
+    expect(n(mk({ skipSteps: ['review'] as never }))).toBeLessThan(27)
+    expect(n(mk({ skipSteps: ['execute'] as never }))).toBeLessThan(27)
     // 七个全跳 = 一次调用都没有。
     const all = ['plan', 'review', 'execute', 'verify', 'accept', 'integrate', 'observer']
     expect(n(mk({ skipSteps: all as never }))).toBe(0)
@@ -1318,10 +1316,10 @@ describe('关口:跳过要说出后果,组合要拦住', () => {
     const three = { ...emptyPhaseRoles(), plan: [{ roleName: 'a' }, { roleName: 'b' }, { roleName: 'c' }] }
     const refine = n(mk({ phaseRoles: three }))
     const table = n(mk({ phaseRoles: three, caps: { ...DEFAULT_CAPS, planConverge: '圆桌' } }))
-    // 融合那一席也是单点调用,所以它也带限流重试的 T 倍(It × T = 3 × 3)。
-    expect(table - refine).toBe(DEFAULT_CAPS.maxIterations * COST_RATE_LIMIT_ATTEMPTS)
+    // 融合那一席也是单点调用,每轮最多两次。
+    expect(table - refine).toBe(DEFAULT_CAPS.maxIterations * 2)
     // 单席位两种模式相同 —— 没有第二份稿可融合。
-    expect(n(mk({ caps: { ...DEFAULT_CAPS, planConverge: '圆桌' } }))).toBe(30)
+    expect(n(mk({ caps: { ...DEFAULT_CAPS, planConverge: '圆桌' } }))).toBe(27)
   })
 })
 

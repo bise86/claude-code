@@ -538,7 +538,7 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
      * **卡片告诉用户的那个默认值,必须和代码里的那个是同一个数。**
      *
      * 一条建议里印错默认值,用户会照着一个不存在的基线去判断「要不要调、调多少」。
-     * 和 `COST_RATE_LIMIT_ATTEMPTS` 那条断言同一个形状 —— 两份数字必须锚在一起。
+     * 两份数字必须锚在一起,否则默认值变了卡片还在指向旧配置。
      */
     const clientDefaultMs = 600 * 1000
     expect(esc).toContain(`API_TIMEOUT_MS(默认 ${clientDefaultMs})`)
@@ -558,7 +558,7 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
   it('说限流会「整趟 run 一起退避」,那退避的数就得对得上', () => {
     /**
      * 这一段写的是用户唯一能读到的口径(2s → 4s → …上限 60s、成功归零、只重派打不通的
-     * 那几席、执行环节不重试)。四条里任何一条对不上,用户就会照着一份错的模型去调
+     * 那几席、单阶段失败额外重跑一次)。四条里任何一条对不上,用户就会照着一份错的模型去调
      * 并行数和席位数 —— 而那正是他手上唯一的两个旋钮。
      */
     expect(README).toContain(norm('2s → 4s → 8s …上限 60s，成功一次就归零'))
@@ -571,8 +571,8 @@ describe('README 的键位表和按键处理函数说的是同一件事', () => 
     // 「成功一次就归零」。
     gate.noteSuccess()
     expect(gate.noteRateLimit()).toBe(2_000)
-    // 执行环节不重试这一条在 rateLimitPipeline.test.ts 里真跑;这里只钉文档口径的存在。
-    expect(README).toContain(norm('执行环节**不重试**'))
+    // 阶段重跑的次数在 rateLimitPipeline.test.ts / timeoutRetry.test.ts 里真跑。
+    expect(README).toContain(norm('单阶段 API 失败后额外重跑 1 次，包含执行和观察阶段'))
     expect(README).toContain(norm('重试只重发那 1 席'))
   })
 

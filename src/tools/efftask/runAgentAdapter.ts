@@ -1130,7 +1130,7 @@ export function makeRunAgentFn(deps: {
             try {
               req.stream?.push({
                 kind: 'text',
-                text: `\n[上游拒收:提示词过长。但**这次发出去的提示词只有 ${Math.round(Array.from(prompt).length / 1024)} KB**,超长的不是它 —— 多半是这次调用里某个工具一次返回了几 MB(例如 Glob 打全仓通配)。不重试:重跑会把那几 MB 再灌一遍]\n`,
+                text: `\n[上游拒收:提示词过长。但**这次发出去的提示词只有 ${Math.round(Array.from(prompt).length / 1024)} KB**,超长的不是它 —— 多半是这次调用里某个工具一次返回了几 MB(例如 Glob 打全仓通配)。不做提示词压缩重发:缩短这段提示词无法解决工具产出过大]\n`,
               })
             } catch { /* 提示而已 */ }
             throw e

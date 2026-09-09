@@ -1,4 +1,4 @@
-import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, PHASE_NAMES, PHASE_LABEL } from './types.js'
+import { DEFAULT_CAPS, DEFAULT_MAX_SEATS_PER_PHASE, PHASE_FAILURE_RETRIES, PHASE_NAMES, PHASE_LABEL } from './types.js'
 import { hostOf, isLanHost } from '../../utils/lanDirect.js'
 import { getProxyUrl } from '../../utils/proxy.js'
 import { formatContextWindow } from '../AgentTool/roles/roleContextWindow.js'
@@ -1175,15 +1175,6 @@ export function capsLine(config: EffTaskConfig): string {
  * **刻意不叫「并发」。** 并发上限是 parallelism,和这个数无关 —— 把排队总量说成在飞数
  * 会让用户以为自己要同时开 30 个连接,从而去调一个不解决问题的旋钮。
  */
-/**
- * 单次调用被上游限流时最多重试几次 —— 和 `pipeline.RATE_LIMIT_ATTEMPTS` **必须是同一个数**。
- *
- * 没有从 pipeline 导:那个模块 import 这个模块(startupConfirm)会成环。所以这里放一份
- * 常量,并由 docsAccuracy 里一条断言把两处钉在一起 —— 一份数字两个地方,漂移就是关口
- * 在对用户撒谎。
- */
-export const COST_RATE_LIMIT_ATTEMPTS = 3
-
 export function costLine(config: EffTaskConfig): string {
   const c = config.caps
   const seats = (p: PhaseName) => (config.phaseRoles[p] ?? []).length
@@ -1192,6 +1183,7 @@ export function costLine(config: EffTaskConfig): string {
   const skip = new Set(config.skipSteps ?? [])
   const on = (ph: PhaseName, n: number) => (skip.has(ph) ? 0 : n)
   const It = Math.max(1, c.maxIterations)
+  const phaseAttempts = 1 + PHASE_FAILURE_RETRIES
   // 方案阶段是**顺序精化**:每一席都是一次串行调用(runPlanRefinement)。写死 1 的话,
   // 配 4 个方案员工在关口上是免费的 —— 而那正是精化要用户知道的代价。
   // 圆桌模式多一次融合调用(只在 ≥2 席时)。
@@ -1199,26 +1191,16 @@ export function costLine(config: EffTaskConfig): string {
   const P = on('plan', c.planConverge === '圆桌' && seats('plan') > 1 ? planSeats + 1 : planSeats)
   const R = on('review', Math.max(1, seats('review')))
   const A = on('accept', Math.max(1, seats('accept')))
-  // 圆桌**自己**还有一层 infra 重试循环(roundtableWithInfraRetry 最多跑 maxIterations 桌),
-  // 所以是 It 的平方,不是一次方。漏掉它会低估约 2.5 倍 —— 实测 1 评审席 + 2 验收席、
-  // It=3 时真实 23 次而关口承诺 15 次。低估比高估糟:用户按一个偏小的数批准。
-  /**
-   * 单点调用(分析席位 + 融合席)自己还有一层**限流重试**:`runPhase` 对 429/529 最多
-   * 试 `RATE_LIMIT_ATTEMPTS` 次。圆桌那几席不吃这个乘子(它们直接调 runAgent,由
-   * roundtableWithInfraRetry 管),执行和观察也不吃(那两个明确 attempts=1)。
-   *
-   * 漏掉它的后果和上面那条 It² 逐字同类:实测 3 分析席圆桌 + 3 评审席、每次调用头两遍
-   * 429 第三遍成功 → 真实 45 次,而不带这个乘子的式子给出 39。**低估比高估糟**:
-   * 用户按一个偏小的数批准。
-   */
-  const planPhase = It * (P * COST_RATE_LIMIT_ATTEMPTS + It * R)
+  // 分析、融合和质疑修复都走 runPhase,API 失败/超时共用一次额外重跑。
+  const planPhase = It * (P + R) * phaseAttempts
   // 测试验证是 **opt-in**:没配这个环节的角色,这一步整个不发生。所以用 seats() 原值
   // 而不是 Math.max(1, …) —— 照抄 accept 的写法会让默认配置的关口数字凭空涨一截,
   // 而实际一次调用都不会有。关口高估同样是撒谎,只是方向相反(用户会去调一个根本不
   // 需要调的旋钮)。
   const V = on('verify', seats('verify'))
   // 打分在**每一次验收通过后**都跑,而返工循环可以让验收通过多次。
-  const execPhase = It * (on('execute', 1) + (V > 0 ? It * V : 0) + It * A + on('observer', seats('observer')))
+  // 执行、测试修复、观察同样算上阶段重跑;验收圆桌保留自己的 infra 重试层。
+  const execPhase = It * ((on('execute', 1) + V + on('observer', seats('observer'))) * phaseAttempts + It * A)
   // 集成提交:拆分型节点在子任务全部完成后的那一场,同样有自己的 infra 重试层。
   // 没配就回落到验收席位,不额外计数。
   const integratePhase = on('integrate', It * It * seats('integrate'))
