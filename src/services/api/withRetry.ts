@@ -506,8 +506,9 @@ export async function* retryWithSession(
   const next = session.next(maxRetries)
   if (!next) return false
   const delayMs = nextRetryDelay(Math.max(1, next.retryAttempt), getRetryAfter(error))
+  const cacheNotice = session.rotateCacheKeyOnRetry ? '同步更换缓存路由键' : '保留缓存路由键'
   const text = next.rotated
-    ? `已更换会话标识(第 ${next.rotation}/${MAX_SESSION_ROTATIONS} 次),保留缓存路由键;重试计数归零,${Math.round(delayMs / 1000)}s 后重新请求`
+    ? `已更换会话标识(第 ${next.rotation}/${MAX_SESSION_ROTATIONS} 次),${cacheNotice};重试计数归零,${Math.round(delayMs / 1000)}s 后重新请求`
     : retryNoticeText(error, delayMs, next.retryAttempt, maxRetries)
   logForDebugging(text)
   logEvent('tengu_api_retry', {

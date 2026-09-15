@@ -20,8 +20,10 @@ export type RoleClientConfig = {
    * 而一趟 /et 十几席同时死的代价已经付过一次。默认留在 raw,灰度切。
    */
   transport?: 'raw' | 'sdk'
-  /** 失败重试 3 次后更换会话头,最多 2 次;保留 prompt_cache_key。默认关闭。 */
+  /** 失败重试 3 次后更换会话头,最多 2 次。默认关闭。 */
   rotateSessionOnRetry?: boolean
+  /** Responses 会话轮换时同步更换 prompt_cache_key;需开启 rotateSessionOnRetry。默认关闭。 */
+  rotateCacheKeyOnRetry?: boolean
   apiUrl: string
   apiToken: string
   backendModel: string

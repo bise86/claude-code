@@ -199,6 +199,7 @@ describe('会话轮换重试:真实 HTTP 与 SSE 链路', () => {
     name: string; transport?: 'raw' | 'sdk'; mode?: 'http' | 'sse' | 'mixed'
     protocol?: 'openai' | 'openai-responses'; overflowFirst?: boolean
     enabled?: boolean; succeedAt?: number; cancelOnRotation?: boolean; toolBeforeError?: boolean
+    rotateCacheKeyOnRetry?: boolean
   }) {
     const seen: { headers: Headers; body: any }[] = []
     const retries: number[] = []
@@ -211,6 +212,7 @@ describe('会话轮换重试:真实 HTTP 与 SSE 链路', () => {
       apiProtocol: opts.protocol ?? 'openai-responses', transport: opts.transport ?? 'raw',
       apiUrl: 'https://gw.example/v1', apiToken: 'test-key', backendModel: 'test-model',
       rotateSessionOnRetry: opts.enabled ?? true,
+      rotateCacheKeyOnRetry: opts.rotateCacheKeyOnRetry,
     }, (async (input: any, init: any = {}) => {
       const raw = init.body ?? (input instanceof Request ? await input.clone().text() : '{}')
       seen.push({ headers: new Headers(init.headers ?? input.headers), body: JSON.parse(String(raw)) })
@@ -255,35 +257,55 @@ describe('会话轮换重试:真实 HTTP 与 SSE 链路', () => {
 
   for (const transport of ['raw', 'sdk'] as const) {
     for (const mode of ['http', 'sse', 'mixed'] as const) {
-      it(`${transport}/${mode}: 三组会话共 19 次请求,轮换两次,路由键始终相同`, async () => {
-        const p = await probe({ name: `${transport}-${mode}`, transport, mode })
+      it(`${transport}/${mode}: 三组会话共 19 次请求,路由键随会话轮换两次`, async () => {
+        const p = await probe({ name: `${transport}-${mode}`, transport, mode, rotateCacheKeyOnRetry: true })
         expect(p.seen).toHaveLength(19)
         const sessions = p.seen.map(s => s.headers.get('session-id'))
         expect(new Set(sessions).size).toBe(3)
         expect(new Set(sessions.slice(0, 4)).size).toBe(1)
         expect(new Set(sessions.slice(4, 8)).size).toBe(1)
         expect(new Set(sessions.slice(8)).size).toBe(1)
-        expect(new Set(p.seen.map(s => s.body.prompt_cache_key)).size).toBe(1)
+        expect(p.seen.map(s => s.body.prompt_cache_key)).toEqual(sessions)
         expect(new Set(p.seen.map(s => s.headers.get('x-client-request-id'))).size).toBe(19)
         expect(p.retries).toEqual([1, 2, 3, 1, 2, 3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         expect(p.delays.slice(0, 9)).toEqual([3000, 6000, 10000, 3000, 6000, 10000, 3000, 6000, 10000])
         expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(2)
+        expect(p.notices.filter(n => n.kind === 'api-session-rotated')
+          .every(n => n.text.includes('同步更换缓存路由键'))).toBe(true)
         expect(p.finalErrors).toBe(1)
         expect(p.texts).toEqual([])
       })
     }
+    for (const rotateCacheKeyOnRetry of [undefined, false]) {
+      it(`${transport}: 缓存键开关为 ${rotateCacheKeyOnRetry} 时只更换会话`, async () => {
+        const p = await probe({
+          name: `${transport}-cache-${rotateCacheKeyOnRetry}`, transport, mode: 'mixed',
+          rotateCacheKeyOnRetry, succeedAt: 5,
+        })
+        expect(p.seen).toHaveLength(5)
+        expect(p.seen[4].headers.get('session-id')).not.toBe(p.seen[0].headers.get('session-id'))
+        expect(p.seen.every(s => JSON.stringify(s.body) === JSON.stringify(p.seen[0].body))).toBe(true)
+        const notices = p.notices.filter(n => n.kind === 'api-session-rotated')
+        expect(notices).toHaveLength(1)
+        expect(notices[0].text).toContain('保留缓存路由键')
+        expect(p.finalErrors).toBe(0)
+      })
+    }
     it(`${transport}: 更换后的首次请求成功,停止重试且只提交成功内容`, async () => {
-      const p = await probe({ name: `${transport}-recovered`, transport, mode: 'mixed', succeedAt: 5 })
+      const p = await probe({ name: `${transport}-recovered`, transport, mode: 'mixed', succeedAt: 5,
+        rotateCacheKeyOnRetry: true })
       expect(p.seen).toHaveLength(5)
       expect(p.finalErrors).toBe(0)
       expect(p.texts).toEqual(['恢复成功'])
       expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(1)
     })
     it(`${transport}/chat: 同样最多 19 次请求,保持原有请求体`, async () => {
-      const p = await probe({ name: `${transport}-chat`, transport, protocol: 'openai', mode: 'http' })
+      const p = await probe({ name: `${transport}-chat`, transport, protocol: 'openai', mode: 'http',
+        rotateCacheKeyOnRetry: true })
       expect(p.seen).toHaveLength(19)
       expect(new Set(p.seen.map(s => s.headers.get('session-id'))).size).toBe(3)
       expect(p.seen.every(s => JSON.stringify(s.body) === JSON.stringify(p.seen[0].body))).toBe(true)
+      expect(p.seen.every(s => !('prompt_cache_key' in s.body))).toBe(true)
       expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(2)
       expect(p.finalErrors).toBe(1)
     })
@@ -299,9 +321,10 @@ describe('会话轮换重试:真实 HTTP 与 SSE 链路', () => {
   }
 
   it('关闭开关仍是原来的 10 次重试,不轮换', async () => {
-    const p = await probe({ name: 'disabled', mode: 'http', enabled: false })
+    const p = await probe({ name: 'disabled', mode: 'http', enabled: false, rotateCacheKeyOnRetry: true })
     expect(p.seen).toHaveLength(11)
     expect(new Set(p.seen.map(s => s.headers.get('session-id'))).size).toBe(1)
+    expect(new Set(p.seen.map(s => s.body.prompt_cache_key)).size).toBe(1)
     expect(p.notices.filter(n => n.kind === 'api-session-rotated')).toHaveLength(0)
   })
   it('用户设置的 2 次预算仍优先,不因轮换扩张', async () => {

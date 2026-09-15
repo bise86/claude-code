@@ -94,6 +94,7 @@ const RoleSchema = z.object({
    */
   transport: z.string().optional(),
   rotateSessionOnRetry: z.unknown().optional(),
+  rotateCacheKeyOnRetry: z.unknown().optional(),
   command: z.string().optional(),
   args: z.array(z.string()).optional(),
   interactive: z.boolean().optional(),
@@ -245,6 +246,18 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
           rotateSessionOnRetry = r.rotateSessionOnRetry
         }
       }
+      let rotateCacheKeyOnRetry: boolean | undefined
+      if (r.rotateCacheKeyOnRetry !== undefined) {
+        if (typeof r.rotateCacheKeyOnRetry !== 'boolean') {
+          issues.push({ name: r.name, source, reason: 'rotateCacheKeyOnRetry 必须为 true / false,已忽略' })
+        } else if (r.execMode !== 'api' || protocol !== 'openai-responses') {
+          issues.push({ name: r.name, source, reason: 'rotateCacheKeyOnRetry 只对 api 模式的 openai-responses 员工有效,已忽略' })
+        } else if (r.rotateCacheKeyOnRetry && !rotateSessionOnRetry) {
+          issues.push({ name: r.name, source, reason: 'rotateCacheKeyOnRetry 需要同时开启 rotateSessionOnRetry,已忽略' })
+        } else {
+          rotateCacheKeyOnRetry = r.rotateCacheKeyOnRetry
+        }
+      }
       const rawTransport = typeof r.transport === 'string' ? r.transport.trim().toLowerCase() : undefined
       if (rawTransport !== undefined && rawTransport !== '') {
         if (rawTransport === 'raw' || rawTransport === 'sdk') {
@@ -307,7 +320,7 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
         }
       }
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
-        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value, autoCompactTokenLimit: declaredLimit, transport, ...(rotateSessionOnRetry !== undefined ? { rotateSessionOnRetry } : {}) }
+        ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value, autoCompactTokenLimit: declaredLimit, transport, ...(rotateSessionOnRetry !== undefined ? { rotateSessionOnRetry } : {}), ...(rotateCacheKeyOnRetry !== undefined ? { rotateCacheKeyOnRetry } : {}) }
         : undefined
       /**
        * 内网端点**在载入时**就登记直连(见 utils/lanDirect)。

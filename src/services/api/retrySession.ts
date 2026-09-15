@@ -16,7 +16,11 @@ export class RetrySession {
   attempt = 1
   rotations = 0
 
-  constructor(public nonce?: string, private readonly onRotate?: (nonce: string) => void) {}
+  constructor(
+    public nonce?: string,
+    private readonly onRotate?: (nonce: string) => void,
+    public readonly rotateCacheKeyOnRetry = false,
+  ) {}
 
   next(maxRetries: number): SessionRetryDecision | undefined {
     if (!Number.isFinite(maxRetries) || maxRetries < 0) return undefined

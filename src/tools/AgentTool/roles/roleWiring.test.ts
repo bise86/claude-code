@@ -43,6 +43,57 @@ describe('会话轮换开关', () => {
   })
 })
 
+describe('缓存键轮换开关', () => {
+  for (const enabled of [undefined, false, true]) {
+    it(`独立开关从配置传到重试会话(开启: ${enabled})`, () => {
+      const out = parseRoles([api({ apiProtocol: 'openai-responses',
+        rotateSessionOnRetry: true, rotateCacheKeyOnRetry: enabled })], `cache-rotation-${enabled}`)
+      expect(out).toHaveLength(1)
+      const cfg = out[0].agentDef.roleClientConfig!
+      expect(cfg.rotateCacheKeyOnRetry).toBe(enabled)
+      expect(createRetrySession(buildRoleFetch(cfg))?.rotateCacheKeyOnRetry).toBe(enabled === true)
+    })
+  }
+
+  it('字符串不能误开开关,也不让整条员工消失', () => {
+    const source = 'cache-rotation-invalid'
+    const out = parseRoles([api({ apiProtocol: 'openai-responses',
+      rotateSessionOnRetry: true, rotateCacheKeyOnRetry: 'true' })], source)
+    expect(out).toHaveLength(1)
+    expect(out[0].agentDef.roleClientConfig?.rotateCacheKeyOnRetry).toBeUndefined()
+    expect(roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')).toContain('true / false')
+  })
+
+  for (const rotateSessionOnRetry of [undefined, false]) {
+    it(`未开启会话轮换时忽略缓存键开关(${rotateSessionOnRetry})`, () => {
+      const source = `cache-rotation-no-session-${rotateSessionOnRetry}`
+      const out = parseRoles([api({ apiProtocol: 'openai-responses',
+        rotateSessionOnRetry, rotateCacheKeyOnRetry: true })], source)
+      expect(out).toHaveLength(1)
+      const cfg = out[0].agentDef.roleClientConfig!
+      expect(cfg.rotateCacheKeyOnRetry).toBeUndefined()
+      expect(createRetrySession(buildRoleFetch(cfg))).toBeUndefined()
+      expect(roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n'))
+        .toContain('需要同时开启 rotateSessionOnRetry')
+    })
+  }
+
+  for (const role of [
+    api({ apiProtocol: 'anthropic', rotateSessionOnRetry: true, rotateCacheKeyOnRetry: true }),
+    api({ apiProtocol: 'openai', rotateSessionOnRetry: true, rotateCacheKeyOnRetry: true }),
+    { name: 'cli', whenToUse: 'w', execMode: 'cli', command: 'codex', rotateCacheKeyOnRetry: true },
+  ] as Record<string, unknown>[]) {
+    it(`不支持的协议或模式忽略开关(${role.apiProtocol ?? role.execMode})`, () => {
+      const source = `cache-rotation-unsupported-${role.apiProtocol ?? role.execMode}`
+      const out = parseRoles([role], source)
+      expect(out).toHaveLength(1)
+      expect(out[0].agentDef.roleClientConfig?.rotateCacheKeyOnRetry).toBeUndefined()
+      expect(roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n'))
+        .toContain('rotateCacheKeyOnRetry 只对 api 模式的 openai-responses 员工有效')
+    })
+  }
+})
+
 describe('新协议真的配得进去', () => {
   it('apiProtocol: openai-responses 不再被 zod 拒掉', () => {
     // 这条今天是红的:enum 只有 anthropic|openai,整条员工被跳过,而用户只看到

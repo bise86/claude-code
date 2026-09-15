@@ -166,6 +166,7 @@ export function toResponsesRequest(body: any, opts: ResponsesOptions): any {
    * 对话逐轮同值,换席位就换值。拿每轮都变的东西去填等于告诉上游「每轮都是新对话」。
    *
    * 放在最后算:它要读 `out.instructions` 和 `out.input`,那两样上面才刚拼好。
+   * 这里生成初始键;开启 rotateCacheKeyOnRetry 后,roleFetch 在会话轮换时同步为当前 session-id。
    * chat 那条协议不加 —— codex 不走那条,而一个上游没见过的字段是会 400 的
    * (truncation 那次的教训)。responses 这条已实测过网关收得下(200)。
    */

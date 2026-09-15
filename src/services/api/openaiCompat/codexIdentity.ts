@@ -18,7 +18,7 @@ import { createHash } from 'node:crypto'
  * `installation_id` 那类东西,也没有跟着改 `parallel_tool_calls`(那个会改模型行为,
  * 和分流无关)。指令、输入、工具本来就是我们自己的,谈不上一致。
  *
- * ## 路由键跨轮恒定,会话标识可按重试策略单独更换
+ * ## 路由键跨轮恒定,失败重试时可选择随会话标识一起更换
  *
  * codex 用它自己的会话 uuid。我们这一层是无状态的(每一轮从 anthropic 消息重建整个请求),
  * 手上没有会话对象,所以从**请求前缀**派生:`instructions` 加第一条 input。同一个席位的
@@ -26,6 +26,8 @@ import { createHash } from 'node:crypto'
  *
  * 这正是 `prompt_cache_key` 要的语义 —— 它是缓存路由键,值稳定才有意义。拿 requestId
  * 那种每轮都变的东西去填,等于每轮都告诉上游「这是一段新对话」。
+ * 同时启用 rotateSessionOnRetry 和 rotateCacheKeyOnRetry 时,roleFetch 将缓存路由键
+ * 同步设为新的 session-id,后续轮次沿用;默认只更换会话标识,保留缓存路由键。
  */
 
 /** codex 的 originator 取值集合里 CLI 那一档。二进制里同时有 codex_exec / codex-tui 等。 */
@@ -70,10 +72,10 @@ export function bodyPrefixKey(body: { instructions?: unknown; input?: unknown; m
  *
  * @param prefix 跨轮稳定的前缀键(见 bodyPrefixKey)
  * @param requestId 这一次调用自己的 id,用于请求头和 turn_id
- * @param sessionNonce 失败重试时可更换会话/线程/窗口,不改变原前缀对应的缓存路由键
+ * @param sessionNonce 失败重试时更换会话/线程/窗口;roleFetch 按开关将缓存路由键同步为 session-id
  */
 export function codexHeaders(prefix: string, requestId: string, sessionNonce?: string): Record<string, string> {
-  // 只改变会话/线程/窗口;缓存路由键和 installation 身份仍从原始前缀派生。
+  // 会话/线程/窗口使用轮换后的前缀;installation 身份仍从原始前缀派生。
   const sessionPrefix = sessionNonce === undefined ? prefix : `${prefix}\nretry-session:${sessionNonce}`
   const session = derivedId(sessionPrefix, 'session')
   const thread = derivedId(sessionPrefix, 'thread')

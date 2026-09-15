@@ -301,7 +301,20 @@
 
   在对应员工对象里添加 `"rotateSessionOnRetry": true` 即可开启。首次请求加 3 次重试仍失败后，更换 `session-id`、`thread-id`、`x-codex-window-id` 以及 metadata 中对应的值；计数归零，退避重新从 3s 开始（仍遵守 `Retry-After` 的 3s～90s 范围）。最多更换 2 次，最后一组继续使用原有重试上限，默认最多 19 次请求（4＋4＋11）。若 `CLAUDE_CODE_MAX_RETRIES` 小于 3，则先按该上限结束。HTTP 和 SSE 失败共用预算；取消、已输出工具或已提交响应不会因该开关而重放。
 
-  **`prompt_cache_key` 始终保留原值**，NewAPI 以此绑定渠道时不因本次轮换改变亲和键。若自定义亲和规则使用会话/线程请求头，应保持关闭。成功后同一员工调用的后续工具轮次沿用新标识；并发员工互不影响。每轮模型响应重新获得有限重试预算，阶段重跑另按 `/et` 的阶段策略处理。
+  默认 **`prompt_cache_key` 保留原值**；是否同步更换由下面的独立开关控制。成功后同一员工调用的后续工具轮次沿用新标识；并发员工互不影响。每轮模型响应重新获得有限重试预算，阶段重跑另按 `/et` 的阶段策略处理。
+
+- `rotateCacheKeyOnRetry`：布尔值，默认 `false`。仅对 `execMode: "api"` 的 `openai-responses` 生效，且需要同时开启 `rotateSessionOnRetry`；`raw` 和 `sdk` 都支持。
+
+  在对应员工对象中同时设置：
+
+  ```json
+  {
+    "rotateSessionOnRetry": true,
+    "rotateCacheKeyOnRetry": true
+  }
+  ```
+
+  每次轮换会话时，`prompt_cache_key` 同步更新为新的 `session-id`，后续工具轮次沿用新键。普通重试期间缓存键保持稳定。NewAPI 若以此绑定渠道，会按新键重新匹配；实际是否切换渠道取决于网关配置。省略或设为 `false` 时，只更换会话标识，保留缓存键。Chat Completions 请求仍不添加此字段。
 
 #### `cli` 模式
 

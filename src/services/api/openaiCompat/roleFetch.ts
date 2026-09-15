@@ -103,6 +103,7 @@ export function isStreamOnlyFetch(fn: unknown): boolean {
 
 export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetch): typeof fetch {
   const rotateSession = cfg.rotateSessionOnRetry === true && cfg.apiProtocol !== 'anthropic'
+  const rotateCacheKey = rotateSession && cfg.apiProtocol === 'openai-responses' && cfg.rotateCacheKeyOnRetry === true
   let identity = sessionIdentities.get(cfg)
   if (rotateSession && !identity) {
     identity = {}
@@ -208,6 +209,10 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
     const retrySession = currentRetrySession()
     const codexHdrs = codexHeaders(bodyPrefixKey(outBody as any), requestId,
       rotateSession ? (retrySession ? retrySession.nonce : identity?.nonce) : undefined)
+    // 显式开启后,缓存路由键跟随当前会话,后续工具轮次沿用新键。
+    if (rotateCacheKey && outBody && typeof outBody === 'object' && 'prompt_cache_key' in outBody) {
+      outBody.prompt_cache_key = codexHdrs['session-id']
+    }
     for (const [k, v] of Object.entries(codexHdrs)) headers.set(k, v)
     // 拼好的地址要**留在手上**:它是诊断 502 的第一手材料,而此前它只存在于这一行表达式里。
     const dest = joinRoute(target.toString(), proto.route, PROTOCOL_ROUTES)
@@ -387,7 +392,7 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
     const savedIdentity = identity
     setRetrySessionFactory(roleFetch, () => new RetrySession(savedIdentity.nonce, nonce => {
       savedIdentity.nonce = nonce
-    }))
+    }, rotateCacheKey))
   }
   return roleFetch
 }

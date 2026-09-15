@@ -54,29 +54,34 @@ const send = async (fetch: typeof globalThis.fetch, session?: RetrySession) => {
 }
 const rotate = (session: RetrySession) => { for (let i = 0; i < 4; i++) session.next(10) }
 
-describe('更换会话头但保留 NewAPI 路由键', () => {
+describe('更换会话头时按开关更换 NewAPI 路由键', () => {
   it('默认关闭,anthropic 即使设了开关也不开放更换能力', () => {
     for (const cfg of [{ ...config, rotateSessionOnRetry: undefined },
       { ...config, rotateSessionOnRetry: false }, { ...config, apiProtocol: 'anthropic' as const }]) {
-      expect(createRetrySession(buildRoleFetch(cfg))).toBeUndefined()
+      expect(createRetrySession(buildRoleFetch({ ...cfg, rotateCacheKeyOnRetry: true }))).toBeUndefined()
     }
   })
 
-  it('头和 metadata 同步更换,缓存键/请求内容/installation 不变,后续轮次沿用新会话', async () => {
-    const cfg = { ...config }
+  it('头、metadata 和缓存键同步更换,后续轮次沿用新会话及缓存键', async () => {
+    const cfg = { ...config, rotateCacheKeyOnRetry: true }
     const seen: Captured[] = []
     const fetch = buildRoleFetch(cfg, capture(seen))
     const session = createRetrySession(fetch)!
     await send(fetch, session)
     rotate(session)
     await send(fetch, session)
-    await send(buildRoleFetch(cfg, capture(seen)))
-    const [old, changed, later] = seen
-    expect(changed.body).toEqual(old.body)
-    expect(changed.body.prompt_cache_key).toBe(old.headers.get('session-id'))
+    const laterFetch = buildRoleFetch(cfg, capture(seen))
+    await send(laterFetch)
+    await send(laterFetch, createRetrySession(laterFetch))
+    const [old, changed, later, nextTurn] = seen
+    expect(changed.body).toEqual({ ...old.body, prompt_cache_key: changed.headers.get('session-id') })
+    expect(changed.body.prompt_cache_key).not.toBe(old.body.prompt_cache_key)
     expect(changed.headers.get('session-id')).not.toBe(old.headers.get('session-id'))
     expect(changed.headers.get('thread-id')).not.toBe(old.headers.get('thread-id'))
     expect(later.headers.get('session-id')).toBe(changed.headers.get('session-id'))
+    expect(later.body.prompt_cache_key).toBe(changed.body.prompt_cache_key)
+    expect(nextTurn.headers.get('session-id')).toBe(changed.headers.get('session-id'))
+    expect(nextTurn.body.prompt_cache_key).toBe(changed.body.prompt_cache_key)
     const meta = JSON.parse(changed.headers.get('x-codex-turn-metadata')!)
     expect(meta.session_id).toBe(changed.headers.get('session-id'))
     expect(meta.thread_id).toBe(changed.headers.get('thread-id'))
@@ -86,7 +91,7 @@ describe('更换会话头但保留 NewAPI 路由键', () => {
 
   it('相同提示词的并发调用各带自己的标识,另一员工不受影响', async () => {
     const seen: Captured[] = []
-    const fetch = buildRoleFetch({ ...config }, capture(seen))
+    const fetch = buildRoleFetch({ ...config, rotateCacheKeyOnRetry: true }, capture(seen))
     const a = createRetrySession(fetch)!
     const b = createRetrySession(fetch)!
     rotate(a)
@@ -94,6 +99,6 @@ describe('更换会话头但保留 NewAPI 路由键', () => {
     await send(buildRoleFetch({ ...config }, capture(seen)))
     expect(seen[0].headers.get('session-id')).not.toBe(seen[1].headers.get('session-id'))
     expect(seen[1].headers.get('session-id')).toBe(seen[2].headers.get('session-id'))
-    expect(new Set(seen.map(s => s.body.prompt_cache_key)).size).toBe(1)
+    expect(seen.map(s => s.body.prompt_cache_key)).toEqual(seen.map(s => s.headers.get('session-id')))
   })
 })

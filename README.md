@@ -680,7 +680,7 @@ Codex Responses（含 SDK 请求）收到 `server_error` / `server_is_overloaded
 
 **可选：失败重试后更换会话标识。** 在 `.claude/settings.json` 对应的 `roles[]` 员工配置中加入 `"rotateSessionOnRetry": true`（默认关闭），适用于 `execMode: "api"` 的 `openai` / `openai-responses`，`raw` 和 `sdk` 都支持。首次请求和接下来的 **3 次重试都失败**时，更换会话、线程、窗口请求头，重试计数归零，退避重新从 3s 起步（`Retry-After` 仍适用）。一轮模型响应最多更换 **2 次**；之后按原有重试上限继续，默认最多共 **19 次请求**（4＋4＋11）。`CLAUDE_CODE_MAX_RETRIES` 小于 3 时先按该上限结束，不额外更换。HTTP 错误和流中错误共用这个预算，成功后后续工具轮次沿用新标识；取消或已输出不可重放内容时不触发重发。日志会标明更换次数和计数归零。
 
-更换过程中 **`prompt_cache_key` 保持原值**，不会修改 NewAPI 的渠道亲和配置；这适用于 NewAPI 使用 `prompt_cache_key` 选渠道的规则。如果你的自定义亲和规则使用 `session-id` / `thread-id`，应保持这个开关关闭，否则更换这些头也会影响该规则。会话头变化能否解决上游故障取决于网关和后端行为。这里的次数是一轮模型响应的 API 重试预算，阶段失败后额外重跑一次仍按前面的阶段策略处理。
+默认更换会话时 **`prompt_cache_key` 保持原值**。若需要同时更换缓存键，在同一个 `openai-responses` 员工配置中再加入 **`"rotateCacheKeyOnRetry": true`**（默认关闭，需同时开启 `rotateSessionOnRetry`）。开启后，缓存键同步更新为新的 `session-id`，后续工具轮次沿用新键；`raw` 和 `sdk` 都支持。NewAPI 若使用该键绑定渠道，会按新键重新匹配，实际是否切换渠道取决于网关配置。Chat Completions 请求仍不添加此字段。这里的次数是一轮模型响应的 API 重试预算，阶段失败后额外重跑一次仍按前面的阶段策略处理。
 
 ### 常见坑
 
