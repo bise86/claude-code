@@ -3,6 +3,7 @@
 import type { RoleDef } from './roleDefs.js'
 import type { Strictness } from './strictness.js'
 import type { UsageTotals } from './usage.js'
+import { randomUUID } from 'node:crypto'
 
 /**
  * 一个**环节**(用户词汇里的「过程」)—— 流水线上一个真实的派发点。
@@ -441,7 +442,7 @@ export interface Verdict {
    *
    * Only meaningful on a FAILING verdict: a reviewer that passed has nothing to remedy.
    */
-  remedy?: { title: string; deps: string[] }[]
+  remedy?: { taskId?: string; title: string; deps: string[] }[]
 }
 export interface RoundtableRecord {
   round: number; verdicts: Verdict[]; synthesized: { pass: boolean; blockingSummary: string }
@@ -489,6 +490,14 @@ export interface ScoreRecord {
 
 export interface TaskNode {
   id: string
+  /** 按提示词规则生成的任务标识,未指定规则时用 UUID;id 仍是任务树内部路径。 */
+  taskId: string
+  /** 去重跳过的来源节点;不会将这条成功回执当成新的执行证据。 */
+  taskDuplicateOf?: string
+  /** 分析入口已认领,防止恢复/重做时再次启动同一任务。 */
+  taskPlanningStarted?: boolean
+  /** 执行入口已认领。自动返工仍在同一次入口内,重入则按开关去重。 */
+  taskExecutionStarted?: boolean
   title: string
   goal: string // immutable node goal; set once at creation, never overwritten by plan output
   parentId: string | null
@@ -666,7 +675,7 @@ export interface TaskNode {
    * resolution and the node-count reservation, and duplicating any of that here would give
    * the gate's tree different ids from the run's.
    */
-  confirmedDraft?: { children: { title: string; deps: string[] }[] }
+  confirmedDraft?: { children: { taskId?: string; title: string; deps: string[] }[] }
   /**
    * 手工重做指定的**重入环节**。一次性,由 step* 在第一轮消费后立刻清掉。
    *
@@ -1232,6 +1241,12 @@ export function clampParallelism(v: unknown, fallback = DEFAULT_PARALLELISM): nu
 }
 export interface EffTaskConfig {
   goalPrompt: string
+  /** 根据具体任务生成 ID 的规则,由提示词指定并在整棵任务树中沿用。 */
+  taskIdRule?: string
+  /** 需求解析器按规则和实际根任务推导的结果,不是用户配置的固定 ID。 */
+  rootTaskId?: string
+  /** 全局任务 ID 去重开关,缺省关闭。 */
+  taskDeduplication?: boolean
   parallelism: number
   phaseRoles: Record<PhaseName, RoleBinding[]>
   caps: Caps
@@ -1432,6 +1447,7 @@ export function emptyPlan(): NodePlan {
 
 export function createNode(args: {
   id: string
+  taskId?: string
   title: string
   goal?: string
   parentId: string | null
@@ -1442,6 +1458,7 @@ export function createNode(args: {
 }): TaskNode {
   return {
     id: args.id,
+    taskId: typeof args.taskId === 'string' && args.taskId.trim().length > 0 ? args.taskId : randomUUID(),
     title: args.title,
     goal: args.goal ?? args.title, // default goal to title so existing call-sites stay valid
     parentId: args.parentId,

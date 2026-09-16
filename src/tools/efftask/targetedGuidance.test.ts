@@ -346,7 +346,7 @@ describe('真的进了那次调用的提示词', () => {
     const withGuide = recorder()
     const without = recorder()
     const a = mk({ status: 'READY', kind: 'executable', plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' } })
-    const b = mk({ status: 'READY', kind: 'executable', plan: { solution: 's', keyPoints: 'k', risks: 'r', acceptance: 'a' } })
+    const b = structuredClone(a)
     await stepExecute(a, ctxFor([a], withGuide.fn, cfg({ phaseGuidance: {} })))
     await stepExecute(b, ctxFor([b], without.fn, cfg()))
     // answerTag 是每次调用随机的,所以只比去掉尾部那条格式要求之后的正文。

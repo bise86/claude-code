@@ -214,15 +214,15 @@ describe('角色定义的接线', () => {
     // 锚点不再钉 `modelJson: extractJson` 的字面量:抽取那一次现在还要把自己的实时窗口
     // 递进去(那一屏是用户敲完 /et 看到的第一屏,背后跑着一次真实模型调用)。钉住的是
     // 「正常那条路径确实带了 baseRoleDefs 且确实传了 modelJson」。
-    expect(occurrences('baseRoleDefs, baseCaps, modelJson:')).toBe(1)
-    expect(occurrences('unsupportedRoles, baseRoleDefs, baseCaps }')).toBe(1)
+    expect(occurrences('baseRoleDefs, baseCaps, taskDeduplication, modelJson:')).toBe(1)
+    expect(occurrences('unsupportedRoles, baseRoleDefs, baseCaps, taskDeduplication }')).toBe(1)
   })
 
   it('baseRoleDefs 在 effect 依赖里 —— 否则它变了也不会重新解析', () => {
     // 钉整串依赖的字面量会让「往数组里再加一项」变成一次假红。改成逐项断言:
     // 每个进解析的 prop 都必须在依赖里,加新 prop 时这条会诚实地要求你也加进去。
     const deps = SRC.match(/\}, \[args, knownRoles[^\]]*\]\)/)?.[0] ?? ''
-    for (const d of ['baseRoleDefs', 'baseCaps', 'baseRoleNotices', 'baseSkipSteps', 'extractJson', 'agentModels', 'mainModel']) {
+    for (const d of ['baseRoleDefs', 'baseCaps', 'taskDeduplication', 'baseRoleNotices', 'baseSkipSteps', 'extractJson', 'agentModels', 'mainModel']) {
       expect(`${d} 在依赖里: ${deps.includes(d)}`).toBe(`${d} 在依赖里: true`)
     }
   })
@@ -1560,7 +1560,7 @@ describe('新增任务:a 键六跳都要接上', () => {
   })
 
   it('关口真的会去调 runAddTask,而且落盘带状态账', () => {
-    expect(`调了: ${SRC.includes('void runAddTask(')}`).toBe('调了: true')
+    expect(`调了: ${SRC.includes('return runAddTask(')}`).toBe('调了: true')
     // 少了 journal:node.md 是整份覆盖写,磁盘满那一刻盘上留着的是上一次那份,
     // 而这条路上最脆的一个字节正是 anchor 的 childIds。
     expect(`账接了: ${SRC.includes('writeNodeFile(props.fs, dir, n, journal)')}`).toBe('账接了: true')

@@ -9,7 +9,7 @@ import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { Tools } from '../../Tool.js'
 import { relativisePaths } from '../../tools/efftask/escapedPaths.js'
 import { parseDirectives } from '../../tools/efftask/parseDirectives.js'
-import { collectCaps, collectRoleDefs, collectSkipSteps, mergeSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
+import { collectCaps, collectRoleDefs, collectSkipSteps, collectTaskDeduplication, mergeSkipSteps } from '../../tools/efftask/roleDefsFromSettings.js'
 import { collectRoleLoadIssues } from '../../tools/AgentTool/loadAgentsDir.js'
 import type { RoleDef } from '../../tools/efftask/roleDefs.js'
 import { makeRunAgentFn } from '../../tools/efftask/runAgentAdapter.js'
@@ -529,6 +529,7 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
       baseRoleNotices={[...roleLoadNotices(), ...collectedRoles.notices, ...collectedSkip.notices, ...collectedCaps.notices]}
       baseSkipSteps={collectedSkip.steps}
       baseCaps={collectedCaps.caps}
+      taskDeduplication={collectTaskDeduplication()}
       mcpToolNames={context.options.tools.filter(t => t.name.startsWith('mcp__')).map(t => t.name)}
       // 服务器状态和工具名是**两件事**:待审批的服务器不连接,于是它一个工具都不贡献,
       // 只看工具名的话「配了但没连上」和「根本没配」长得一模一样 —— 而前者用户报过。
@@ -1007,6 +1008,7 @@ type RunnerProps = {
   baseRoleDefs?: RoleDef[]
   /** settings.json 的 efftaskCaps 定的安全阀;提示词里说的**逐字段覆盖**它。 */
   baseCaps?: Caps
+  taskDeduplication?: boolean
   /** 读配置文件时产生的诊断 —— 必须并进 cfg.notices,否则关口对配置文件里的错误一言不发。 */
   baseRoleNotices?: string[]
   /** settings.json 的 efftaskSkipSteps 指定要跳过的环节;和提示词里说的**取并集**。 */
@@ -1547,6 +1549,8 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       props.active.runDir = runDir
 
       const { config: recovered, degraded } = await readRunManifest(props.fs, runDir)
+      // 全局开关以本次 /et 的 settings 为准,关闭后再恢复即可主动重跑旧任务。
+      recovered.taskDeduplication = props.taskDeduplication === true
       // 收口关口要在**任何节点检查之前**判定,而且独立于 status —— 一个跑完的 run 根节点
       // 已经 ACCEPTED,reseat 一个节点也捞不回来,于是下面那句「没有可恢复的节点」会直接
       // 把用户挡在门外,而集成分支就永远没人处置了。这正是「跑完先还终端、回头再收口」
@@ -1667,18 +1671,18 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     // biome-ignore lint/correctness/useExhaustiveDependencies: run once per phase entry
   }, [phase, runId])
 
-  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs, baseRoleNotices, baseSkipSteps, baseCaps } = props
+  const { args, knownRoles, unsupportedRoles, extractJson, agentModels, mainModel, baseRoleDefs, baseRoleNotices, baseSkipSteps, baseCaps, taskDeduplication } = props
   // parseDirectives is a MODEL call. It runs HERE, behind a 正在解析需求… view — never in
   // call(), which would freeze the terminal with no UI while spending tokens.
   React.useEffect(() => {
     if (isResume) return // resume recovers its config from run.md; no model call, no roster overwrite
     let cancelled = false
     const preStream = streams.current.open({ nodeId: PRE_TREE_NODE, phaseLabel: '需求解析', label: '主模型', pinned: true })
-    void parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, baseCaps, modelJson: p => extractJson(p, preStream) })
+    void parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, baseCaps, taskDeduplication, modelJson: p => extractJson(p, preStream) })
       // belt & braces: parseDirectives already swallows extraction failures, but a rejection
       // here would otherwise strand the UI on 'parsing' forever. Keep unsupportedRoles here
       // too: dropping it would let a cli-mode role back onto the roster unannounced.
-      .catch(() => parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, baseCaps }))
+      .catch(() => parseDirectives(args, { knownRoles, unsupportedRoles, baseRoleDefs, baseCaps, taskDeduplication }))
       .then(async cfg => {
         if (cancelled) return
         // parseDirectives only ever sees role NAMES, so the roster it produces cannot say
@@ -1728,7 +1732,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return () => {
       cancelled = true
     }
-  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, baseCaps, baseRoleNotices, baseSkipSteps, extractJson, agentModels, mainModel])
+  }, [args, knownRoles, unsupportedRoles, baseRoleDefs, baseCaps, taskDeduplication, baseRoleNotices, baseSkipSteps, extractJson, agentModels, mainModel])
 
   /**
    * Hand the confirmed run to the orchestrator. ONE definition, because two gates now reach
@@ -3330,6 +3334,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
     return (
       <AddTask
         scope={scope}
+        taskIdRule={config?.taskIdRule}
         // 关口上印的那个 id 必须是**真的会落盘的那一个**:slug 会退化成 `node`、
         // 序号会和已有兄弟撞,而两者都由这个函数解决。落盘之前还会再算一次。
         previewId={title => allocateChildId(scope.anchor, title, liveById())}
@@ -3373,11 +3378,14 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
           const orch = fromRunning ? orchRef.current : null
           // 一次操作一份账(三次写共用它),照 `commitRedo` 的先例。
           const journal = createNodeJournal({ fs: props.fs, runDir: dir })
-          void runAddTask(
+          return runAddTask(
             scope,
             { title, prompt },
             {
               byId: liveById,
+              taskDeduplication: cfg.taskDeduplication === true,
+              taskIdRule: cfg.taskIdRule,
+              modelJson: props.extractJson,
               now: () => new Date().toISOString(),
               // **带 journal**:node.md 是整份覆盖写,磁盘满那一刻盘上留着的是上一次那份,
               // 而这条路上最脆的一个字节正是 anchor 的 childIds。
@@ -4217,4 +4225,3 @@ export function DoneView(props: {
     </Box>
   )
 }
-

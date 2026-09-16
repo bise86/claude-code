@@ -30,6 +30,7 @@ import { wrapAnsi } from './ansiText.js'
  * 「你的阅读位置没了」。拒绝理由画在详情页页脚上(`act()` 那条路)。
  */
 export function AddTask(props: {
+  taskIdRule?: string
   scope: AddTaskScope
   /** 新任务最终的 id —— 由调用方按**当下**的树算(slug 会退化、序号会撞)。 */
   previewId: (title: string) => string
@@ -59,7 +60,7 @@ export function AddTask(props: {
   initialDropped?: number
   /** 每次提示词变化都往上报,好让它活过这一屏的卸载。 */
   onPromptChange?: (prompt: string, dropped: number) => void
-  onConfirm: (prompt: string, title: string) => void
+  onConfirm: (prompt: string, title: string) => void | Promise<void>
   onCancel: () => void
 }): React.ReactElement {
   const term = useTerminalSize()
@@ -80,6 +81,7 @@ export function AddTask(props: {
 
   /** 出口只许走一次 —— 确认和取消共用一把闩(见 useSettleOnce)。 */
   const settle = useSettleOnce()
+  const [submitting, setSubmitting] = React.useState(false)
 
   /**
    * 确认屏**真的画过一帧**了吗。
@@ -118,9 +120,16 @@ export function AddTask(props: {
       // 走不到(空提示词永远停在输入屏),但空提示词会造出一个目标为空的任务,
       // 而那正是这个仓库反复在防的「凭空多出一个没人说得清要干什么的节点」。
       if (t.length === 0) { setEditing(true); return }
-      settle(() => props.onConfirm(t, deriveTitle(t)))
+      settle(() => {
+        if (props.taskIdRule !== undefined) setSubmitting(true)
+        void props.onConfirm(t, deriveTitle(t))
+      })
     }
   }, { isActive: props.isActive !== false })
+
+  if (submitting) {
+    return <Text>正在根据任务内容和 ID 规则生成 ID，并新增任务…</Text>
+  }
 
   if (editing) {
     return (

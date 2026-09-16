@@ -1,3 +1,4 @@
+import { ensureTaskId, taskIdOf } from './taskIdentity.js'
 import { parse as yamlParse } from 'yaml'
 // 「零贡献」那句注记的措辞和 pipeline / 回溯共用一份 —— 各写一份的话,哪天改了措辞,
 // 这次回填就会把真的零贡献节点也放行。
@@ -400,6 +401,10 @@ export function validateLoadedNodes(
   const runKnowsContributed = [...byId.values()].some(n => n.contributed !== undefined)
 
   for (const n of byId.values()) {
+    ensureTaskId(n)
+    if (n.taskPlanningStarted !== true) delete n.taskPlanningStarted
+    if (n.taskExecutionStarted !== true) delete n.taskExecutionStarted
+    if (taskIdOf(n.taskDuplicateOf) === undefined) delete n.taskDuplicateOf
     if (!LEGAL_STATUS.has(n.status as string)) block(n, `恢复时发现非法状态 ${String(n.status)},无法安全重入`)
     if (!LEGAL_KIND.has(n.kind as string)) { repairs.push(`节点 ${n.id} 的 kind 非法,重置为 unknown`); n.kind = 'unknown' as NodeKind }
     n.deps = strArray(n.deps)
@@ -984,9 +989,9 @@ export function validateLoadedNodes(
       const kids = (n.confirmedDraft as { children?: unknown }).children
       const clean = Array.isArray(kids)
         ? kids
-            .filter((c): c is { title: string; deps?: unknown } =>
+            .filter((c): c is { taskId?: unknown; title: string; deps?: unknown } =>
               !!c && typeof c === 'object' && typeof (c as { title?: unknown }).title === 'string' && (c as { title: string }).title.length > 0)
-            .map(c => ({ title: c.title, deps: strArray(c.deps) }))
+            .map(c => ({ ...(taskIdOf(c.taskId) === undefined ? {} : { taskId: taskIdOf(c.taskId) }), title: c.title, deps: strArray(c.deps) }))
         : null
       // An array whose every entry is malformed cleans to [] — which is NOT "no children",
       // it is "we lost them". Kept, it made stepStart skip the plan call and approve an EMPTY
@@ -1191,6 +1196,9 @@ export async function readRunManifest(fs: FsLike, runDir: string): Promise<Manif
   if (typeof fm.goalPrompt === 'string' && fm.goalPrompt.length > 0) base.goalPrompt = fm.goalPrompt
   else degraded.push('run.md 缺少 goalPrompt(原始目标),整体验收将无法判定')
   base.parallelism = clampParallelism(fm.parallelism)
+  base.taskIdRule = taskIdOf(fm.taskIdRule)
+  if (base.taskIdRule !== undefined) base.rootTaskId = taskIdOf(fm.rootTaskId)
+  base.taskDeduplication = fm.taskDeduplication === true
 
   const caps = (fm.caps ?? {}) as Record<string, unknown>
   const rebuilt: Caps = {

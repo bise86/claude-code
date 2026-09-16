@@ -1097,6 +1097,7 @@ export function NodeDetail(props: {
               一个已判 executable 的节点上。 */}
           {n.childIds.length > 0 || n.kind === 'decompose' ? '拆分任务' : n.kind === 'executable' ? '执行任务' : '待定'}
           {' · '}{n.id} · {n.status} · {props.elapsed}
+          {n.taskId ? ` · 任务 ID: ${JSON.stringify(n.taskId)}` : ''}
           {n.childIds.length > 0 ? ` · 子任务 ${n.childIds.length} 个` : ''}
           {n.mergeConflict === true ? ' · 待人工解冲突' : ''}
         </Text>

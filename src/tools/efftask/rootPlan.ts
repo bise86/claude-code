@@ -18,7 +18,7 @@ import type { RunAgentFn } from './roundtable.js'
 import { createNode } from './types.js'
 import type { EffTaskConfig, NodeKind, NodePlan, TaskNode } from './types.js'
 
-export interface ChildSpec { title: string; deps: string[] }
+export interface ChildSpec { taskId?: string; title: string; deps: string[] }
 export interface RootDraft {
   kind: NodeKind
   plan: NodePlan
@@ -46,6 +46,7 @@ export function makeRootNode(cfg: EffTaskConfig, now: string): TaskNode {
   // reads node.goal, so the plan prompt must see the whole objective, not the truncation.
   return createNode({
     id: 'root',
+    taskId: cfg.taskIdRule === undefined ? undefined : cfg.rootTaskId,
     title: rootTitle(cfg.goalPrompt),
     goal: cfg.goalPrompt,
     parentId: null,
@@ -227,7 +228,7 @@ export function applyRootDraft(
   }
   // An executable root has no children, and an empty list must still mean "confirmed":
   // presence of the field is the signal, not its length.
-  root.confirmedDraft = { children: draft.children.map(c => ({ title: c.title, deps: [...c.deps] })) }
+  root.confirmedDraft = { children: draft.children.map(c => ({ ...c, deps: [...c.deps] })) }
   root.updatedAt = now
 }
 
@@ -329,7 +330,7 @@ export function planGaps(plan: { solution: string; keyPoints: string; risks: str
   return out
 }
 
-type ParsedPlan = { kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[] }
+type ParsedPlan = { kind: NodeKind; plan: NodePlan; children: ChildSpec[] }
 
 /**
  * 重拟的那一版是不是**真的**更好。

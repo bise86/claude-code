@@ -1,5 +1,6 @@
 // src/tools/efftask/parseOutput.ts
 import type { NodeKind, NodePlan, Verdict } from './types.js'
+import { taskIdOf } from './taskIdentity.js'
 
 /**
  * Fence tag each phase must wrap ITS ANSWER in. Generic ```json is reserved for
@@ -11,7 +12,7 @@ import type { NodeKind, NodePlan, Verdict } from './types.js'
  * recency both mis-select it, silently turning a fail into a pass. The tag is what
  * actually separates answer from quotation.
  */
-export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec', score: 'score', deps: 'deps', repair: 'repair' } as const
+export const ANSWER_TAGS = { plan: 'plan', verdict: 'verdict', exec: 'exec', score: 'score', deps: 'deps', repair: 'repair', identity: 'identity' } as const
 export type AnswerTag = (typeof ANSWER_TAGS)[keyof typeof ANSWER_TAGS]
 
 /**
@@ -368,6 +369,12 @@ function pickAnswer(
   return { obj: candidates[0].obj, ambiguous: candidates.length > 1 }
 }
 
+/** ID 生成只能采用本次回答块中的具体字符串,不能从引用的任务内容中取值。 */
+export function parseTaskIdOutput(text: string, tag: string): string | undefined {
+  const { obj, ambiguous } = pickAnswer(text, tag, o => 'taskId' in o, true)
+  return ambiguous ? undefined : taskIdOf(obj?.taskId)
+}
+
 /**
  * Caps on what a single model reply may put into a node.
  *
@@ -505,7 +512,7 @@ function taggedBlockBroken(text: string, tag: string): boolean {
 }
 
 export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
-  kind: NodeKind; plan: NodePlan; children: { title: string; deps: string[] }[]
+  kind: NodeKind; plan: NodePlan; children: { taskId?: string; title: string; deps: string[] }[]
   /** 本轮 tag 的围栏在场、但解析不出对象。见 `taggedBlockBroken`。 */
   parseFailed: boolean
   /**
@@ -550,7 +557,8 @@ export function parsePlanOutput(text: string, tag: string = ANSWER_TAGS.plan): {
   const children = rawChildren
     .map(c => {
       const co = c as Record<string, unknown>
-      return { title: str(co?.title).trim(), deps: Array.isArray(co?.deps) ? (co!.deps as unknown[]).map(d => str(d)).filter(Boolean) : [] }
+      const taskId = taskIdOf(co?.taskId)
+      return { ...(taskId === undefined ? {} : { taskId }), title: str(co?.title).trim(), deps: Array.isArray(co?.deps) ? (co!.deps as unknown[]).map(d => str(d)).filter(Boolean) : [] }
     })
     .filter(c => c.title.length > 0)
   const kind: NodeKind = obj?.kind === 'decompose' && children.length > 0 ? 'decompose' : 'executable'
@@ -692,13 +700,14 @@ export const MAX_REMEDY_CHILDREN = 3
  * safe-target rules, which exist because grafting onto a CREATED/READY node silently
  * overwrites its own plan and execute phases.
  */
-export function parseRemedy(o: Record<string, unknown>): { title: string; deps: string[] }[] {
+export function parseRemedy(o: Record<string, unknown>): { taskId?: string; title: string; deps: string[] }[] {
   const raw = o.remedy
   if (!Array.isArray(raw)) return []
   return raw
     .filter((c): c is Record<string, unknown> => !!c && typeof c === 'object')
     .slice(0, MAX_REMEDY_CHILDREN)
     .map(c => ({
+      ...(taskIdOf(c.taskId) === undefined ? {} : { taskId: taskIdOf(c.taskId) }),
       title: typeof c.title === 'string' ? capText(c.title.trim(), 200) : '',
       deps: Array.isArray(c.deps)
         ? c.deps.filter((d): d is string => typeof d === 'string').slice(0, MAX_REMEDY_CHILDREN).map(d => capText(d, 200))
@@ -785,7 +794,7 @@ export function parseDepsRecalc(text: string, tag: string = ANSWER_TAGS.deps): {
   return { answer: { deps }, ambiguous, broken, truncated }
 }
 
-export interface NewChildSpec { parent?: string; title: string; deps: string[] }
+export interface NewChildSpec { parent?: string; taskId?: string; title: string; deps: string[] }
 
 /**
  * Child specs an executor asked to graft onto the tree (spec §4 动态生长).
@@ -808,6 +817,7 @@ export function parseNewChildren(o: Record<string, unknown>): NewChildSpec[] {
     // into execStatus AFTER the caps, so 200 of them produced a 24 MB node.md. Measured.
     .slice(0, MAX_NEW_CHILDREN)
     .map(c => ({
+      ...(taskIdOf(c.taskId) === undefined ? {} : { taskId: taskIdOf(c.taskId) }),
       parent: typeof c.parent === 'string' && c.parent.length > 0 ? capText(c.parent, 200) : undefined,
       title: typeof c.title === 'string' ? capText(c.title.trim(), 200) : '',
       deps: Array.isArray(c.deps) ? c.deps.filter((d): d is string => typeof d === 'string').slice(0, MAX_NEW_CHILDREN).map(d => capText(d, 200)) : [],

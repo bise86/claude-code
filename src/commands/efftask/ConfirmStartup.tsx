@@ -217,6 +217,7 @@ export function ConfirmStartup(props: {
     <Box flexDirection="column" borderStyle="round" paddingX={1}>
       <Text bold>高效任务模式 · 启动确认</Text>
       <Text>目标: {goalLine(props.config.goalPrompt)}</Text>
+      <Text>任务 ID 规则: {props.config.taskIdRule ?? '未指定，自动生成 UUID'} · ID 去重: {props.config.taskDeduplication === true ? '开启（当前运行）' : '关闭'}</Text>
       <Text>{parallelismLine({ ...shown, parallelism }, { editable: !editing, isolation: isoShown })}</Text>
       {/* git 那几行。**不是警告色** —— 这是用户要自己决定的取舍,不是「有一部分不会生效」。
           编辑名册时不画键位提示(那时候 w/m/p 归编辑器)。 */}

@@ -1090,6 +1090,7 @@ export const SettingsSchema = lazySchema(() =>
       // 同样 z.unknown():校验和夹取在 applyCapsPatch 里,那里能给出「你要的是多少、
       // 实际按多少跑」这种带原因的 notice,而 zod 在这里只能整份拒掉。
       efftaskCaps: z.unknown().optional(),
+      efftaskTaskDeduplication: z.boolean().optional().describe('按字符串任务 ID 防止 /et 重复派发和执行,默认关闭'),
     })
     .passthrough(),
 )

@@ -3809,6 +3809,7 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
     // 名字曾经是「老 run 的行为不变」,而它验的其实只是「roleDefs 存在但席位无 roleTag
     // ≡ 完全没有 roleDefs」—— 基础提示词文案被改动会原样溜过去。改名说实话;
     // 「不多一个字」由下面那条黄金断言单独守。
+    const taskId = 'same-task-for-role-comparison'
     const grab = (roleDefs?: RoleDef[]) => {
       let p = ''
       const runAgent: RunAgentFn = async req => {
@@ -3818,6 +3819,7 @@ describe('角色简报到达真实的模型调用(不是只显示在关口上)',
           : vtag(req) + '\n{"pass":true,"blocking":[],"comments":"ok"}\n```'
       }
       const n = root()
+      n.taskId = taskId
       n.phaseRoles = { ...emptyPhaseRoles(), review: [{ roleName: 'opus-架构' }] }
       return stepStart(n, ctxFor([n], runAgent, { ...cfg, roleDefs, phaseRoles: n.phaseRoles })).then(() => p)
     }

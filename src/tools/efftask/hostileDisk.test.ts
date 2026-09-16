@@ -419,7 +419,7 @@ async function driveRecovery(nodeMd: string, intactField?: keyof TaskNode): Prom
 
 describe('磁盘上任何一个字段被写坏,恢复链路都不许抛', () => {
   const base = richNode()
-  const fields = Object.keys(base) as (keyof TaskNode)[]
+  const fields = [...Object.keys(base), 'taskDuplicateOf', 'taskPlanningStarted', 'taskExecutionStarted'] as (keyof TaskNode)[]
 
   it('字段清单必须覆盖 TaskNode 声明的每一个字段', () => {
     // `Object.keys(richNode())` can only see fields something ASSIGNS. A field added to the
@@ -594,7 +594,7 @@ describe('磁盘上任何一个字段被写坏,恢复链路都不许抛', () => 
 })
 
 describe('run.md 的每个配置字段被写坏,readRunManifest 都不许抛', () => {
-  const MANIFEST_FIELDS = ['createdAt', 'parallelism', 'phaseRoles', 'caps', 'goalPrompt', 'notices', 'mainModel', 'resumeGuidance', 'resumes', 'status', 'reason']
+  const MANIFEST_FIELDS = ['createdAt', 'parallelism', 'phaseRoles', 'caps', 'goalPrompt', 'notices', 'mainModel', 'resumeGuidance', 'resumes', 'status', 'reason', 'taskIdRule', 'rootTaskId', 'taskDeduplication']
   const CAP_FIELDS = ['maxDepth', 'maxNodes', 'maxIterations', 'nodeTimeoutMs', 'scoreThreshold']
 
   for (const field of MANIFEST_FIELDS) {

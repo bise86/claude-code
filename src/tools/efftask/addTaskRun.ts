@@ -18,8 +18,14 @@
 import { affectedByAddTask, allocateChildId, type AddTaskScope } from './addTask.js'
 import { clearReopenMarks, reopenAncestor } from './redo.js'
 import { createNode, type TaskNode } from './types.js'
+import { randomUUID } from 'node:crypto'
+import { reserveTaskId } from './taskIdentity.js'
+import { generateTaskId } from './generateTaskId.js'
 
 export interface AddTaskRunDeps {
+  taskDeduplication?: boolean
+  taskIdRule?: string
+  modelJson?: (prompt: string) => Promise<string>
   /** 活树。**每次现取** —— 关口开着的这几十秒里编排器一秒都没停。 */
   byId: () => Map<string, TaskNode>
   now: () => string
@@ -68,6 +74,7 @@ export interface AddTaskRunDeps {
 
 export type AddTaskOutcome =
   | { ok: true; node: TaskNode }
+  | { ok: true; skipped: true; taskId: string }
   | { ok: false; reason: string }
 
 /**
@@ -84,6 +91,38 @@ export async function runAddTask(
    * 复核:拿**现在**的树再算一遍 scope,和关口上那一份逐项比(`scopeDiff`)。
    * 返回一句话 = 差了,这次新增整个放弃。
    */
+  revalidate: () => string | undefined,
+): Promise<AddTaskOutcome> {
+  let taskId: string
+  try {
+    if (deps.taskIdRule === undefined) taskId = randomUUID()
+    else {
+      if (!deps.modelJson) throw new Error('任务 ID 生成器不可用,本次没有新增任务')
+      taskId = await generateTaskId({ rule: deps.taskIdRule, ...input, modelJson: deps.modelJson })
+    }
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e)
+    deps.onProblems([reason])
+    deps.onDone()
+    return { ok: false, reason }
+  }
+  const claim = deps.taskDeduplication === true ? reserveTaskId(deps.byId(), taskId) : undefined
+  if (claim === null) {
+    deps.onProblems([])
+    deps.onDone()
+    return { ok: true, skipped: true, taskId }
+  }
+  try {
+    return await runAddTaskCore(scope, { ...input, taskId }, deps, revalidate)
+  } finally {
+    claim?.release()
+  }
+}
+
+async function runAddTaskCore(
+  scope: AddTaskScope,
+  input: { taskId: string; title: string; prompt: string },
+  deps: AddTaskRunDeps,
   revalidate: () => string | undefined,
 ): Promise<AddTaskOutcome> {
   const fail = (reason: string): AddTaskOutcome => {
@@ -124,6 +163,7 @@ export async function runAddTask(
     const id = allocateChildId(anchor, input.title, byId)
     const node = createNode({
       id,
+      taskId: input.taskId,
       title: input.title,
       // 逐字。用户的原话就是这个任务的提示词 —— 不拼父目标、不加「本子任务:」。
       goal: input.prompt,

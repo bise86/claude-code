@@ -3,18 +3,21 @@ import { MAX_NODES_CEILING, clampParallelism, DEFAULT_CAPS, DEFAULT_MAX_SEATS_PE
 import type { Caps, EffTaskConfig, PhaseName } from './types.js'
 import { isStrictness, STRICTNESS_LEVELS } from './strictness.js'
 import { extractJsonBlock } from './parseOutput.js'
+import { taskIdRuleFromPrompt, taskIdOf } from './taskIdentity.js'
 import { applyRoleDefsToPhases, guessStep, mergeRoleDefs, parseRoleDefs, type RoleDef } from './roleDefs.js'
 
 export type ModelJsonFn = (prompt: string) => Promise<string>
 
 
 const EXTRACT_PROMPT = `你是配置解析器。把下面的"高效任务"指令抽成 JSON,只输出一个 json 代码块,字段:
-{ "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
+{ "taskIdRule"?: "按实际任务生成 ID 的规则", "rootTaskId"?: "按规则推导出的根任务 ID", "parallelism": number, "phaseRoles": { ${PHASE_NAMES.map(x => `"${x}"?: string[]`).join(', ')} },
   "skipSteps": ["要整个跳过的环节名"],
   "caps": { "maxDepth"?: number, "maxNodes"?: number, "maxIterations"?: number, "scoreThreshold"?: number, "maxSeatsPerPhase"?: number, "quorum"?: number, "quorumSeats"?: number, "planConverge"?: "圆桌"|"精化", "nodeTimeoutMs"?: number, "mergeResolveAttempts"?: number, "wipeOnAccept"?: boolean, "trunkResolveRounds"?: number, "strictness"?: ${STRICTNESS_LEVELS.map(s => `"${s}"`).join('|')} },
   "roles": [{ "name": "角色名", "step": "${PHASE_NAMES.join('|')}", "output": "产出什么", "purpose": "起什么作用", "staff"?: ["员工名"] }],
   "phaseGuidance": { "环节名": "指令里点名给这个环节的那几句话" },
   "roleGuidance": [{ "name": "角色名或员工名", "text": "指令里点名给这个人的那几句话" }] }
+taskIdRule:用户指定的是所有任务的 ID 生成规则,按原意保留。例如“任务id是相对路径”“每个任务用实际处理的文件相对路径作为ID”“任务ID:相对路径”都表示根据每个任务实际对应的文件生成 ID,不是给所有任务设置同一个固定值。
+rootTaskId 是你按规则和本次根任务实际处理的对象推导的具体结果。例如“修复 src/a.ts,任务 ID 用相对路径”→ taskIdRule="实际处理的文件相对路径",rootTaskId="src/a.ts"。不要把“相对路径”这几个字填成 ID。根任务是统筹任务、尚不能确定具体对象时省略 rootTaskId,由系统给它 UUID。未指定生成规则时两个字段都省略。不提供固定 ID 配置。
 phaseRoles 的值是**员工名**数组(可派发的身份)。
 圆桌通过门槛有两个字段,按用户的说法二选一:
 - 用户说**比例**(「过半」「三分之二」「八成」)→ caps.quorum,整数百分比 1-100。「过半通过」= 51(50 会让平票也通过),「三分之二」= 66(67 会让 2/3 恰好不通过),「八成」= 80。默认 100 = 全票。
@@ -181,10 +184,13 @@ export async function parseDirectives(
      * 「这次只跑个小的,200 个节点就行」应该赢。两者都没说的字段留在 DEFAULT_CAPS 上。
      */
     baseCaps?: Caps
+    taskDeduplication?: boolean
   },
 ): Promise<EffTaskConfig> {
   const base: EffTaskConfig = {
     goalPrompt: rawPrompt.trim(),
+    taskIdRule: taskIdRuleFromPrompt(rawPrompt),
+    taskDeduplication: opts.taskDeduplication === true,
     parallelism: DEFAULT_PARALLELISM,
     phaseRoles: emptyPhaseRoles(),
     caps: { ...DEFAULT_CAPS, ...(opts.baseCaps ?? {}) },
@@ -235,6 +241,11 @@ export async function parseDirectives(
     return applyDefs(base, opts.baseRoleDefs ?? [])
   }
 
+  base.taskIdRule ??= taskIdOf(obj.taskIdRule)
+  if (base.taskIdRule !== undefined) {
+    const derived = taskIdOf(obj.rootTaskId)
+    if (derived !== base.taskIdRule) base.rootTaskId = derived
+  }
   if (obj.parallelism !== undefined) base.parallelism = clampParallelism(obj.parallelism)
 
   const known = new Set(opts.knownRoles)

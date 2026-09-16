@@ -15,6 +15,19 @@ const SOURCE_LABEL: Record<(typeof SOURCES)[number], string> = {
   userSettings: '用户配置', projectSettings: '项目配置', localSettings: '本地配置',
 }
 
+/** 用户 → 项目 → 本地,显式 false 可以覆盖上一级的 true。 */
+export function collectTaskDeduplication(opts?: {
+  read?: (source: (typeof SOURCES)[number]) => { efftaskTaskDeduplication?: unknown } | undefined
+}): boolean {
+  const read = opts?.read ?? (source => getSettingsForSource(source))
+  let enabled = false
+  for (const source of SOURCES) {
+    const value = read(source)?.efftaskTaskDeduplication
+    if (typeof value === 'boolean') enabled = value
+  }
+  return enabled
+}
+
 /**
  * settings.json 里配置的角色 + 员工侧声明,合并成一份角色定义。
  *

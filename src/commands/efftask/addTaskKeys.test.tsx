@@ -194,6 +194,23 @@ async function mountGate(props: Partial<React.ComponentProps<typeof AddTask>> = 
 }
 
 describe('新增任务关口', () => {
+  it('配置 ID 规则时确认后显示生成进度,重复按键不会再提交', async () => {
+    let count = 0
+    let finish!: () => void
+    const pending = new Promise<void>(r => { finish = r })
+    const g = await mountGate({
+      initialPrompt: '修复 src/a.ts', taskIdRule: '文件相对路径',
+      onConfirm: () => { count++; return pending },
+    })
+    g.t.stdin.press(ENTER)
+    await tick()
+    expect(g.t.lastFrame()).toContain('正在根据任务内容和 ID 规则生成 ID')
+    g.t.stdin.press(ENTER + ENTER)
+    await tick()
+    expect(count).toBe(1)
+    finish()
+    g.app.unmount()
+  })
   it('先停在输入屏(提示词是空的,确认没有意义)', async () => {
     const g = await mountGate()
     const frame = g.t.lastFrame()

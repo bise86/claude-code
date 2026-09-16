@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+import { claimTaskStep, ensureTaskId, reserveTaskId, taskExists, taskIdOf, taskIdRulePrompt } from './taskIdentity.js'
 // src/tools/efftask/pipeline.ts
 import { APIError, APIUserAbortError } from '@anthropic-ai/sdk'
 import { isAbortError } from '../../services/api/errorPayload.js'
@@ -383,6 +385,58 @@ async function commit(node: TaskNode, status: TaskNode['status'], ctx: PipelineC
  * to control the clock precisely enough to assert on durations.
  */
 export const commitForTest = commit
+
+function taskIdentityPrompt(node: TaskNode, config: EffTaskConfig): string {
+  return `\n本任务的任务 ID:${quote(JSON.stringify(node.taskId))}。` +
+    (config.taskIdRule === undefined
+      ? '未指定任务 ID 生成规则,创建任务时省略 taskId,系统为每个任务生成独立的 UUID。\n'
+      : quote(taskIdRulePrompt(config.taskIdRule)) +
+        'children、newChildren、remedy 中每个任务都必须填写按规则生成的具体 taskId。\n') +
+    (config.taskDeduplication === true
+      ? '任务 ID 去重已开启:同 ID 已存在时,派发直接成功且不会新增子节点;同 ID 已运行、完成或失败时,重复执行直接成功。\n'
+      : '任务 ID 去重已关闭。\n')
+}
+
+/** 同一次入口内的自动返工照常执行;重复调用先成功返回,不触碰原执行者。 */
+async function runUniqueTaskStep(
+  node: TaskNode, ctx: PipelineCtx, phase: 'plan' | 'execute' | 'integrate', run: () => Promise<void>,
+): Promise<void> {
+  ensureTaskId(node)
+  if (isFinished(node) || ctx.signal.aborted) return run()
+  if (ctx.config.taskDeduplication !== true) {
+    // 关闭时只记执行历史,由原有阶段写盘带走,不加关口或额外写盘。
+    // 以后开启去重时仍能认出这些任务已经跑过。
+    if (phase === 'plan') node.taskPlanningStarted = true
+    if (phase === 'execute') node.taskExecutionStarted = true
+    return run()
+  }
+  const claim = claimTaskStep(node, ctx.byId)
+  if ('duplicate' in claim) {
+    // 同一个对象仍在飞时不允许把它改成 ACCEPTED,否则原调用会被中途截断。
+    if (claim.duplicate.id === node.id) return
+    node.taskDuplicateOf = claim.duplicate.id
+    noteOnNode(node, `任务 ID ${JSON.stringify(node.taskId)} 对应 ${claim.duplicate.id} 已运行或终结,已跳过执行并按成功处理`)
+    node.blockedReason = ''
+    await commit(node, 'ACCEPTED', ctx)
+    return
+  }
+  try {
+    if (phase !== 'integrate' && (node.taskExecutionStarted === true || (phase === 'plan' && node.taskPlanningStarted === true))) {
+      noteOnNode(node, `任务 ID ${JSON.stringify(node.taskId)} 已执行过,已跳过重复执行并按成功处理`)
+      node.blockedReason = ''
+      await commit(node, 'ACCEPTED', ctx)
+      return
+    }
+    if (phase !== 'integrate') {
+      if (phase === 'execute') node.taskExecutionStarted = true
+      else node.taskPlanningStarted = true
+      await ctx.persist(node)
+    }
+    await run()
+  } finally {
+    claim.release()
+  }
+}
 
 /**
  * 触阀但不停机 (spec §11 的 maxDepth 分支)。
@@ -1591,7 +1645,8 @@ export function planPrompt(
     `请输出一个 json 代码块:{ "kind":"decompose"|"executable", "solution", "keyPoints", "risks", "acceptance", ` +
     (feedback ? `"responses":["逐条回应上面的阻断意见"], ` : '') +
     `"outputOptional":true(可省), ` +
-    `"children":[{"title","deps":["兄弟标题"]}] }。` +
+    `"children":[{"taskId"?:"字符串任务 ID","title","deps":["兄弟标题"]}] }。` +
+    taskIdentityPrompt(node, ctx.config) +
     `能直接完成就 executable(children 省略);需要拆分就 decompose 并给出子任务标题与兄弟间依赖。\n` +
     /**
      * **代码在强制一条从没被说出口的契约 —— 这就是根因。**
@@ -1765,13 +1820,14 @@ const PLAN_FIELD_LABEL: Record<(typeof PLAN_FIELDS)[number], string> = {
  */
 function plannedChildren(
   node: TaskNode,
-  lastChildren: { title: string; deps: string[] }[],
+  lastChildren: { taskId?: string; title: string; deps: string[] }[],
   byId?: Map<string, TaskNode>,
-): { children: { title: string; deps: string[] }[]; dropped: number } {
+): { children: { taskId?: string; title: string; deps: string[] }[]; dropped: number } {
   const raw = node.childIds.length > 0 && byId
     ? node.childIds.map(id => {
         const c = byId.get(id)
         return {
+          taskId: c?.taskId,
           title: c?.title ?? id,
           // deps 存的是 id,渲染回标题。取不到就退回 id —— 一个陌生 id 读起来像坏数据
           // (它就是),比悄悄丢掉一条依赖诚实。
@@ -1782,6 +1838,7 @@ function plannedChildren(
       })
     : lastChildren
   const children = raw.slice(0, MAX_NEW_CHILDREN).map(c => ({
+    ...(c.taskId === undefined ? {} : { taskId: c.taskId }),
     title: capText(c.title, 200),
     deps: c.deps.slice(0, MAX_NEW_CHILDREN).map(d => capText(d, 200)),
   }))
@@ -1822,7 +1879,7 @@ function reviewFixPrompt(
   /** 本轮的严格度快照。由调用点算一次传进来,和记录上的戳同源。 */
   strict: Strictness | undefined = effectiveStrictness(ctx),
   /** 本轮拆分。见 `plannedChildren` —— 少了它,decompose 节点的子任务无从质疑。 */
-  planned: { children: { title: string; deps: string[] }[]; dropped: number } = { children: [], dropped: 0 },
+  planned: { children: { taskId?: string; title: string; deps: string[] }[]; dropped: number } = { children: [], dropped: 0 },
   /**
    * 上一关**已知没写好**的那几处(目前只有一种:方案没有验收点)。
    *
@@ -1974,7 +2031,8 @@ function executePrompt(node: TaskNode, ctx: PipelineCtx, tag: string, feedback =
     graftTargets(node, ctx) +
     `完成后输出:{ "execStatus":"做了什么、结果如何", ` +
     (feedback ? `"responses":["逐条回应上面的阻断意见"], ` : '') +
-    `"newChildren"?:[{"parent"?:"上面清单里的节点 id,省略则挂到本节点下","title","deps":["同批兄弟标题"]}] }。` +
+    `"newChildren"?:[{"taskId"?:"字符串任务 ID","parent"?:"上面清单里的节点 id,省略则挂到本节点下","title","deps":["同批兄弟标题"]}] }。` +
+    taskIdentityPrompt(node, ctx.config) +
     `只有在执行中发现必须先完成的新子任务时才给 newChildren。` +
     /**
      * 执行侧的逐条处置。理由与 planPrompt 那一段逐字相同(见 `TaskNode.execResponses`),
@@ -2674,8 +2732,9 @@ function integratePrompt(
     // and small on purpose: it is spent at most once per node, and these siblings all touch
     // the same files.
     `不通过时,若你认为"再补几个子任务"能补上缺口,可在同一个 json 里给出 ` +
-    `"remedy":[{"title":"子任务标题","deps":[]}](最多 ${MAX_REMEDY_CHILDREN} 个;` +
+    `"remedy":[{"taskId"?:"按实际任务生成的 ID","title":"子任务标题","deps":[]}](最多 ${MAX_REMEDY_CHILDREN} 个;` +
     `补不上、或问题不在于缺工作,就省略该字段)。\n` +
+    taskIdentityPrompt(node, ctx.config) +
     roundStakes(round, maxRounds, '集成验收') +
     // 判据同 verifyPrompt(有账才立规矩);evidenceChanged=false 的理由见 repeatRule 那个参数
     // —— 集成验收两轮之间子任务证据逐字节不变,「改了就该判通过」在这一关前提为假。
@@ -2691,7 +2750,7 @@ function integratePrompt(
      * 解释不了「一次都没写下来」—— 两条各修各的,不许拿一条去顶另一条。
      */
     `输出 json:{ "pass":boolean, "blocking":string[], "comments":string${RETRACTED_FIELD}${ADVICE_FIELD}` +
-    `, "remedy"?:{"title":string,"deps":string[]}[] }。` +
+    `, "remedy"?:{"taskId"?:string,"title":string,"deps":string[]}[] }。` +
     answerRule(tag)
   )
 }
@@ -3319,7 +3378,7 @@ type ReviewFixResult = {
    * 修订之后这一版的子任务。`undefined` = 这一关没有决定子任务(树上已经有子节点了,
    * 那时子任务的真相在树上,不在方案里 —— 见 `plannedChildren` 同一条规矩)。
    */
-  children?: { title: string; deps: string[] }[]
+  children?: { taskId?: string; title: string; deps: string[] }[]
   /** 用户点名取消了这个节点。**唯一**会让调用方停下来的结果。 */
   cancelled?: boolean
 }
@@ -3352,7 +3411,7 @@ type ReviewFixResult = {
 async function runReviewFix(
   node: TaskNode, ctx: PipelineCtx,
   opts: {
-    planned: { children: { title: string; deps: string[] }[]; dropped: number }
+    planned: { children: { taskId?: string; title: string; deps: string[] }[]; dropped: number }
     strict: Strictness | undefined
     gaps: string
   },
@@ -3861,6 +3920,10 @@ function lastFailureFeedback(log: { synthesized: { pass: boolean; blockingSummar
  * 判 ACCEPTED」,而一个分析时借来的工作区会让那个判据当场失真。
  */
 export async function stepStart(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  return runUniqueTaskStep(node, ctx, 'plan', () => stepStartWithWorktree(node, ctx))
+}
+
+async function stepStartWithWorktree(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   // 这两条早退不值得先去 `git worktree add` 一次;core 里原样保留着同样的判断。
   if (isFinished(node) || ctx.signal.aborted) return stepStartCore(node, ctx)
   // **只还自己借的那一份。** 带着工作区进 stepStart 的只有一种节点:冲突待人工处理的那种
@@ -3975,7 +4038,7 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   // loop, so replanning is bounded by the SAME maxIterations budget — a cycle costs a
   // retry, it does not instantly kill the run.
   for (;;) {
-    let lastChildren: { title: string; deps: string[] }[]
+    let lastChildren: { taskId?: string; title: string; deps: string[] }[]
     /**
      * 这一轮手上这份方案**够不够格交给执行者**。只有降级放行那一支读它。
      *
@@ -4190,6 +4253,12 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
     }
     if (node.kind !== 'decompose') { await commit(node, 'READY', ctx); return }
 
+    if (ctx.config.taskDeduplication === true) {
+      const count = lastChildren.length
+      lastChildren = lastChildren.filter(c => taskIdOf(c.taskId) === undefined || !taskExists(ctx.byId, c.taskId!))
+      if (count > lastChildren.length) noteOnNode(node, `已跳过 ${count - lastChildren.length} 个重复任务 ID 的派发,按成功处理`)
+      if (count > 0 && lastChildren.length === 0) { await commit(node, 'ACCEPTED', ctx); return }
+    }
     // Depth cap: force this node executable rather than decomposing. Do NOT silently drop
     // the children the model asked for — fold their titles into the solution so the work
     // survives as an in-node checklist.
@@ -4208,7 +4277,11 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
     }
 
     const created = await createChildren(node, lastChildren, ctx)
-    if (created.ok) { await commit(node, 'WAITING_CHILDREN', ctx); return }
+    if (created.ok) {
+      if (created.added === 0) noteOnNode(node, '子任务 ID 均已存在,已跳过派发并按成功处理')
+      await commit(node, created.added === 0 ? 'ACCEPTED' : 'WAITING_CHILDREN', ctx)
+      return
+    }
     // Node-count cap and persist failures are fatal (retrying can't make room or fix the
     // disk); a dependency cycle is a planning mistake the model can correct.
     if (!created.retryable) { await blockWithReason(node, created.reason, ctx, created.cap ? 'cap-nodes' : undefined); return }
@@ -4222,7 +4295,7 @@ async function stepStartCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
 }
 
 type CreateResult =
-  | { ok: true }
+  | { ok: true; added?: number; skipped?: string[] }
   // `cap` marks the node-count valve specifically. The caller used to compare the reason
   // against a string literal to tell it from a persist failure — two modules sharing a
   // sentence is not an interface, and the two need different cards.
@@ -4230,7 +4303,7 @@ type CreateResult =
 
 export async function createChildren(
   node: TaskNode,
-  specs: { title: string; deps: string[] }[],
+  specs: { taskId?: string; title: string; deps: string[] }[],
   ctx: PipelineCtx,
   /**
    * Extra context appended to each child's goal — why this batch exists.
@@ -4243,13 +4316,33 @@ export async function createChildren(
    */
   goalNote?: string,
 ): Promise<CreateResult> {
+  if (ctx.config.taskIdRule !== undefined && specs.some(c => taskIdOf(c.taskId) === undefined)) {
+    return { ok: false, reason: '已指定任务 ID 生成规则,请根据每个子任务的实际对象生成 taskId 后再派发', retryable: true }
+  }
   // Node-count cap: if creating these children would exceed maxNodes, create NONE
   // (never silently truncate). Not retryable — replanning can't create budget.
   // Reserved ATOMICALLY (see PipelineCtx.reserveNodes): the old check compared against
   // byId.size and then awaited before inserting, so two concurrent decompositions both
   // passed against the same stale size and the tree ran past the cap.
-  const slots = ctx.reserveNodes(specs.length)
+  const claims: { release(): void }[] = []
+  const skipped: string[] = []
+  specs = specs.flatMap(spec => {
+    const taskId = taskIdOf(spec.taskId) ?? randomUUID()
+    if (ctx.config.taskDeduplication === true) {
+      const claim = reserveTaskId(ctx.byId, taskId)
+      if (!claim) { skipped.push(taskId); return [] }
+      claims.push(claim)
+    }
+    return [{ ...spec, taskId }]
+  })
+  if (specs.length === 0 && skipped.length > 0) return { ok: true, added: 0, skipped }
+  let slots: NodeSlots | null
+  try { slots = ctx.reserveNodes(specs.length) } catch (e) {
+    claims.forEach(c => c.release())
+    throw e
+  }
   if (!slots) {
+    claims.forEach(c => c.release())
     return { ok: false, reason: '节点数超过上限', retryable: false, cap: true }
   }
   try {
@@ -4267,19 +4360,20 @@ export async function createChildren(
     // Build the group in a LOCAL array first. Nothing touches ctx.byId / node.childIds until
     // the cycle guard passes, so a rejected group leaves ZERO partial state behind.
     const base = node.childIds.length
-  const created: TaskNode[] = specs.map((c, i) => {
+    const created: TaskNode[] = specs.map((c, i) => {
       // Number AFTER the children this node already has. Restarting at 1 every batch makes
-    // childId collide with an existing sibling — and childId's own comment warns that the
-    // same (index, title) yields the same id and writeNode would OVERWRITE it. Reproduced:
-    // a second batch reusing a title reset an ACCEPTED sibling to CREATED, wiped its
-    // execStatus, and rewrote its node.md. That is irreversible loss of real work.
-    const id = childId(node.id, base + i + 1, c.title)
+      // childId collide with an existing sibling — and childId's own comment warns that the
+      // same (index, title) yields the same id and writeNode would OVERWRITE it. Reproduced:
+      // a second batch reusing a title reset an ACCEPTED sibling to CREATED, wiped its
+      // execStatus, and rewrote its node.md. That is irreversible loss of real work.
+      const id = childId(node.id, base + i + 1, c.title)
       const deps = c.deps
         .map(t => titleToIndex.get(t))
         .filter((di): di is number => di !== undefined && di !== i) // unknown title / self-reference
         .map(di => childId(node.id, base + di + 1, specs[di].title))
       return createNode({
         id,
+        taskId: c.taskId,
         title: c.title,
         // Children inherit a COMPOSED goal. A bare title strips all parent context and the
         // child then replans the wrong thing from nothing.
@@ -4313,8 +4407,9 @@ export async function createChildren(
     }
     // The parent's own durable point is the commit(WAITING_CHILDREN) that follows.
     safeUpdate(ctx)
-    return { ok: true }
+    return ctx.config.taskDeduplication === true ? { ok: true, added: created.length, skipped } : { ok: true }
   } finally {
+    claims.forEach(c => c.release())
     // UNCONDITIONAL. Once the children are in byId they are counted by byId.size, so the
     // reservation is always handed back here. Releasing per-return-path instead would miss
     // the THROW out of the raw ctx.now() inside the specs.map — and a leaked slot
@@ -4428,17 +4523,21 @@ async function scoreNode(node: TaskNode, ctx: PipelineCtx): Promise<boolean> {
  */
 async function growTree(
   node: TaskNode,
-  specs: { parent?: string; title: string; deps: string[] }[],
+  specs: { parent?: string; taskId?: string; title: string; deps: string[] }[],
   ctx: PipelineCtx,
 ): Promise<{ grown: string[]; refusals: string[] }> {
   const grown: string[] = []
   const refusals: string[] = []
   // Group by target so each target's children are created as ONE batch: createChildren
   // resolves sibling deps by title WITHIN a batch, so splitting them would break the links.
-  const byTarget = new Map<string, { title: string; deps: string[] }[]>()
+  const byTarget = new Map<string, { taskId?: string; title: string; deps: string[] }[]>()
   for (const spec of specs) {
+    if (ctx.config.taskDeduplication === true && taskIdOf(spec.taskId) !== undefined && taskExists(ctx.byId, spec.taskId!)) {
+      noteOnNode(node, `任务 ID ${JSON.stringify(spec.taskId)} 已存在,已跳过派发并按成功处理`)
+      continue
+    }
     const targetId = spec.parent ?? node.id
-    byTarget.set(targetId, [...(byTarget.get(targetId) ?? []), { title: spec.title, deps: spec.deps }])
+    byTarget.set(targetId, [...(byTarget.get(targetId) ?? []), { ...spec, title: spec.title, deps: spec.deps }])
   }
   for (const [targetId, kids] of byTarget) {
     const target = ctx.byId.get(targetId)
@@ -4479,6 +4578,7 @@ async function growTree(
       if (res.cap) notifyValve(node, why, 'cap-nodes', ctx)
       continue
     }
+    if (res.added === 0) continue
     // The target now has unfinished children, so it must wait — including when the target IS
     // the executing node, which is exactly the spec's "父节点转 WAITING_CHILDREN,待新子节点
     // ACCEPTED 后恢复". kind becomes decompose so the state machine routes it to integration
@@ -5235,6 +5335,10 @@ async function mergeAndRelease(node: TaskNode, ctx: PipelineCtx): Promise<boolea
 }
 
 export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  return runUniqueTaskStep(node, ctx, 'execute', () => stepExecuteCore(node, ctx))
+}
+
+async function stepExecuteCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   /**
@@ -5935,6 +6039,10 @@ export async function stepExecute(node: TaskNode, ctx: PipelineCtx): Promise<voi
 }
 
 export async function stepIntegrate(node: TaskNode, ctx: PipelineCtx): Promise<void> {
+  return runUniqueTaskStep(node, ctx, 'integrate', () => stepIntegrateCore(node, ctx))
+}
+
+async function stepIntegrateCore(node: TaskNode, ctx: PipelineCtx): Promise<void> {
   if (isFinished(node)) return
   if (ctx.signal.aborted) { await blockWithReason(node, '已中断', ctx); return }
   // A node that grew children mid-execute and then FAILED to merge arrives here still holding
@@ -6201,7 +6309,7 @@ async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: P
   // wholesale (sibling deps are resolved by title, so duplicates make every reference
   // ambiguous) — and the revision would be silently abandoned precisely when two roles agreed.
   const seen = new Set<string>()
-  const specs: { title: string; deps: string[] }[] = []
+  const specs: { taskId?: string; title: string; deps: string[] }[] = []
   /**
    * **跨轮取并集,新的在前。**
    *
@@ -6251,7 +6359,7 @@ async function reviseDecomposition(node: TaskNode, rec: RoundtableRecord, ctx: P
   const titles = new Set(specs.map(c => c.title))
   const chained = specs.map((c, i) => {
     const usable = c.deps.filter(d => titles.has(d) && d !== c.title)
-    return { title: c.title, deps: usable.length > 0 ? usable : i === 0 ? [] : [specs[i - 1].title] }
+    return { ...c, title: c.title, deps: usable.length > 0 ? usable : i === 0 ? [] : [specs[i - 1].title] }
   })
   // Carry WHY each child exists. createChildren composes a child goal from the parent goal
   // plus the parent's plan keyPoints — and that plan is the one the roundtable just refused,

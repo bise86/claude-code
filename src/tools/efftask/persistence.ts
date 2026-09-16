@@ -334,6 +334,7 @@ export function serializeNode(node: TaskNode): string {
   const c = stripControl
   const body =
     `# ${c(node.title)}\n\n` +
+    (typeof node.taskId === 'string' ? `任务 ID: ${c(node.taskId)}\n\n` : '') +
     /**
      * 手工新增的任务要**自报家门**,而且要落在 body 里。
      *
@@ -884,6 +885,9 @@ export async function writeRunManifest(
     phaseRoles: cfg.phaseRoles,
     caps: cfg.caps,
     goalPrompt: cfg.goalPrompt,
+    ...(cfg.taskIdRule !== undefined ? { taskIdRule: cfg.taskIdRule } : {}),
+    ...(cfg.rootTaskId !== undefined ? { rootTaskId: cfg.rootTaskId } : {}),
+    taskDeduplication: cfg.taskDeduplication === true,
     notices: cfg.notices ?? [],
     ...(cfg.mainModel ? { mainModel: cfg.mainModel } : {}),
     // Written CONDITIONALLY so a plain new run's frontmatter stays byte-identical to what

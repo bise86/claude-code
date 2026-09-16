@@ -1171,8 +1171,9 @@ describe('README 的强制通过一节说的和代码干的是同一件事', () 
   }
 
   it('「路由上逐字相同」是真的 —— 两条路算出来的树只差那两个标记', () => {
-    const a = planSkip([blocked()], 'root', '2026-07-30T00:00:00Z') as { nodes: TaskNode[] }
-    const b = planForcePass([blocked()], 'root', '2026-07-30T00:00:00Z') as { nodes: TaskNode[] }
+    const original = blocked()
+    const a = planSkip([structuredClone(original)], 'root', '2026-07-30T00:00:00Z') as { nodes: TaskNode[] }
+    const b = planForcePass([structuredClone(original)], 'root', '2026-07-30T00:00:00Z') as { nodes: TaskNode[] }
     expect(a).not.toHaveProperty('error')
     expect(b).not.toHaveProperty('error')
     // 把两个互斥的标记抹掉之后,**整棵树必须一模一样**。这是那句话唯一诚实的探针:
