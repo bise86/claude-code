@@ -393,11 +393,11 @@ function taskIdentityPrompt(node: TaskNode, config: EffTaskConfig): string {
       : quote(taskIdRulePrompt(config.taskIdRule)) +
         'children、newChildren、remedy 中每个任务都必须填写按规则生成的具体 taskId。\n') +
     (config.taskDeduplication === true
-      ? '任务 ID 去重已开启:同 ID 已存在时,派发直接成功且不会新增子节点;同 ID 已运行、完成或失败时,重复执行直接成功。\n'
+      ? '任务 ID 去重已开启:同 ID 已存在时,派发直接成功且不会新增子节点;另一个同 ID 节点已运行、完成或失败时,重复节点跳过执行并按成功处理。原任务的恢复、失败重试和手工重做照常执行。\n'
       : '任务 ID 去重已关闭。\n')
 }
 
-/** 同一次入口内的自动返工照常执行;重复调用先成功返回,不触碰原执行者。 */
+/** 拦截同 ID 的其他节点和仍在运行的并发调用;原节点的恢复、重试由正常状态机处理。 */
 async function runUniqueTaskStep(
   node: TaskNode, ctx: PipelineCtx, phase: 'plan' | 'execute' | 'integrate', run: () => Promise<void>,
 ): Promise<void> {
@@ -421,12 +421,9 @@ async function runUniqueTaskStep(
     return
   }
   try {
-    if (phase !== 'integrate' && (node.taskExecutionStarted === true || (phase === 'plan' && node.taskPlanningStarted === true))) {
-      noteOnNode(node, `任务 ID ${JSON.stringify(node.taskId)} 已执行过,已跳过重复执行并按成功处理`)
-      node.blockedReason = ''
-      await commit(node, 'ACCEPTED', ctx)
-      return
-    }
+    // 开始标记只用于识别其他同 ID 节点,不是本节点已经完成的证据。
+    // --resume/--retry-blocked/手工重做会把原节点重新排队,必须进入真实阶段。
+    // 无论此前因何种错误失败,都不能凭开始标记把未完成的原任务置为 ACCEPTED。
     if (phase !== 'integrate') {
       if (phase === 'execute') node.taskExecutionStarted = true
       else node.taskPlanningStarted = true

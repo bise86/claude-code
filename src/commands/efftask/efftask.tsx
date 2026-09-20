@@ -1549,7 +1549,7 @@ function EffTaskRunner(props: RunnerProps): React.ReactElement {
       props.active.runDir = runDir
 
       const { config: recovered, degraded } = await readRunManifest(props.fs, runDir)
-      // 全局开关以本次 /et 的 settings 为准,关闭后再恢复即可主动重跑旧任务。
+      // 全局开关以本次 /et 的 settings 为准;原任务的恢复重试不受去重开关阻拦。
       recovered.taskDeduplication = props.taskDeduplication === true
       // 收口关口要在**任何节点检查之前**判定,而且独立于 status —— 一个跑完的 run 根节点
       // 已经 ACCEPTED,reseat 一个节点也捞不回来,于是下面那句「没有可恢复的节点」会直接

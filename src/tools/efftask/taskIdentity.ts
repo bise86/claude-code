@@ -49,10 +49,10 @@ export function reserveTaskId(byId: Map<string, TaskNode>, taskId: string): { re
   return { release: () => { if (released) return; released = true; pending.delete(taskId) } }
 }
 
-/** 待执行的重复节点不挡首个执行者;已经开始/终结的同 ID 节点才挡。 */
+/** 只检查其他内部节点的执行历史;同一节点的恢复快照不算重复任务。 */
 export function executedDuplicate(node: TaskNode, byId: Map<string, TaskNode>): TaskNode | undefined {
   for (const candidate of byId.values()) {
-    if (candidate !== node && !candidate.taskDuplicateOf && candidate.taskId === node.taskId &&
+    if (candidate.id !== node.id && !candidate.taskDuplicateOf && candidate.taskId === node.taskId &&
       (candidate.taskPlanningStarted === true || candidate.taskExecutionStarted === true ||
         candidate.startedAt !== undefined || (candidate.status !== 'CREATED' && candidate.status !== 'READY'))) return candidate
   }

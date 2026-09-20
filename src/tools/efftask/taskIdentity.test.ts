@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test'
+import { APIConnectionError, APIError } from '@anthropic-ai/sdk'
 import { createNode, DEFAULT_CAPS, emptyPhaseRoles, type EffTaskConfig, type NodeStatus, type TaskNode } from './types.js'
 import { createChildren, stepExecute, stepIntegrate, stepStart, type PipelineCtx } from './pipeline.js'
-import { taskIdRuleFromPrompt, taskIdOf, taskExists } from './taskIdentity.js'
+import { taskIdRuleFromPrompt, taskIdOf, taskExists, executedDuplicate } from './taskIdentity.js'
 import { parseDirectives } from './parseDirectives.js'
 import { parseNewChildren, parsePlanOutput, parseRemedy } from './parseOutput.js'
 import { applyRootDraft, makeRootNode } from './rootPlan.js'
@@ -11,6 +12,9 @@ import { collectTaskDeduplication } from './roleDefsFromSettings.js'
 import { runAddTask } from './addTaskRun.js'
 import { addTaskScope } from './addTask.js'
 import { EffTaskOrchestrator } from './orchestrator.js'
+import { reseatTransientNodes } from './reseat.js'
+import { planRedo } from './redo.js'
+import { PhaseTimeoutError, ProviderApiError } from './runAgentAdapter.js'
 
 const NOW = '2026-09-15T00:00:00Z'
 const mk = (id = 'root', extra: Partial<TaskNode> = {}) => ({
@@ -261,7 +265,7 @@ describe('执行去重', () => {
     expect(original.status).toBe('CREATED')
   })
 
-  it('关闭时也记录历史,以后开启能去重;再次关闭则允许执行', async () => {
+  it('关闭时也记录历史,开启后拦截其他同 ID 节点,原任务仍能重做', async () => {
     const root = mk(), ctx = context([root], false)
     await stepStart(root, ctx)
     await stepExecute(root, ctx)
@@ -270,11 +274,14 @@ describe('执行去重', () => {
     root.status = 'CREATED'
     ctx.config.taskDeduplication = true
     ctx.calls.length = 0
-    await stepStart(root, ctx)
-    expect(root.status).toBe('ACCEPTED')
+    const duplicate = mk('duplicate', { taskId: root.taskId, kind: 'executable', status: 'READY' })
+    ctx.byId.set(duplicate.id, duplicate)
+    await stepExecute(duplicate, ctx)
+    expect(duplicate.taskDuplicateOf).toBe(root.id)
     expect(ctx.calls).toEqual([])
-    ctx.config.taskDeduplication = false
-    root.status = 'READY'
+    await stepStart(root, ctx)
+    expect(root.status).toBe('READY')
+    expect(ctx.calls).toContain('plan')
     await stepExecute(root, ctx)
     expect(ctx.calls.filter(p => p === 'execute')).toHaveLength(1)
   })
@@ -296,21 +303,32 @@ describe('执行去重', () => {
     expect(n.status).toBe('ACCEPTED')
   })
 
-  it('已有执行标记随节点保存,重新进入时不再调用执行者', async () => {
-    const n = parseNodeFile(serializeNode(mk('root', { kind: 'executable', status: 'READY', taskExecutionStarted: true })))
+  it('执行中断后重新加载,已有执行标记不妨碍恢复执行', async () => {
+    const n = parseNodeFile(serializeNode(mk('root', { kind: 'executable', status: 'EXECUTING', taskExecutionStarted: true })))
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('READY')
     const ctx = context([n])
     await stepExecute(n, ctx)
-    expect(ctx.calls).toEqual([])
+    expect(ctx.calls).toContain('execute')
     expect(n.status).toBe('ACCEPTED')
+    expect(n.execStatus).toContain('实现完成并通过全部测试')
   })
 
-  it('分析入口的认领同样持久化,重新进入已开始的任务不再分析或拆分', async () => {
-    const n = parseNodeFile(serializeNode(mk('root', { taskPlanningStarted: true })))
+  it('分析中断后重新加载,已有分析标记不妨碍生成方案', async () => {
+    const n = parseNodeFile(serializeNode(mk('root', { status: 'PLANNING', taskPlanningStarted: true })))
+    reseatTransientNodes([n], NOW, DEFAULT_CAPS)
+    expect(n.status).toBe('CREATED')
     const ctx = context([n])
     await stepStart(n, ctx)
-    expect(ctx.calls).toEqual([])
-    expect(n.status).toBe('ACCEPTED')
+    expect(ctx.calls).toContain('plan')
+    expect(n.status).toBe('READY')
+    expect(n.plan.solution).toBe('修改文件并跑测试')
     expect(n.childIds).toEqual([])
+  })
+
+  it('同一个内部节点的另一份快照不算重复任务', () => {
+    const n = mk('root', { status: 'READY', taskExecutionStarted: true })
+    expect(executedDuplicate(structuredClone(n), new Map([[n.id, n]]))).toBeUndefined()
   })
 
   it('编排器全过程只执行一个 ID,首个执行者不会被重复节点的成功回执误伤', async () => {
@@ -323,6 +341,91 @@ describe('执行去重', () => {
     expect(ctx.calls.filter(p => p === 'execute')).toHaveLength(1)
     expect(orch.nodes().filter(n => n.taskDuplicateOf)).toHaveLength(1)
   })
+})
+
+describe('去重开启时恢复原任务:所有错误原因均不应触发自身去重', () => {
+  const failures = [
+    { name: '429 限流', error: new ProviderApiError('API Error: 429 usage_limit_reached', 'rate_limit'), attempts: 2 },
+    { name: '上下文超限', error: new ProviderApiError('API Error: context_length_exceeded', 'prompt_too_long'), attempts: 2 },
+    { name: '额度用尽', error: new ProviderApiError('API Error: quota exhausted', 'quota'), attempts: 2 },
+    { name: '鉴权失败', error: new APIError(401, { message: 'unauthorized' }, undefined, new Headers()), attempts: 2 },
+    { name: '服务端错误', error: new APIError(500, { message: 'internal server error' }, undefined, new Headers()), attempts: 2 },
+    { name: '网络连接错误', error: new APIConnectionError({ message: 'ECONNRESET' }), attempts: 2 },
+    { name: '静默超时', error: new PhaseTimeoutError(1000, 'stall'), attempts: 2 },
+    { name: '总时长超限', error: new PhaseTimeoutError(1000, 'total'), attempts: 2 },
+    { name: '人工确认超时', error: new PhaseTimeoutError(1000, 'human'), attempts: 1 },
+    { name: '本地上下文限制', error: new ProviderApiError('local context limit', 'local_context_limit'), attempts: 1 },
+    { name: '普通异常', error: new Error('arbitrary local failure'), attempts: 1 },
+    { name: '非 Error 异常', error: 'unclassified failure', attempts: 1 },
+  ]
+  for (const phase of ['plan', 'execute'] as const) {
+    for (const failure of failures) for (const stillFailing of [false, true]) {
+      it(`${phase} 因${failure.name}失败后保存并 --retry-blocked,${stillFailing ? '重试仍失败就保持 BLOCKED' : '必须真正运行后才能成功'}`, async () => {
+        const n = mk('root', { taskId: phase === 'plan' ? 'pkg/spanconfig/spanconfigmanager#test#' : 'pkg/keys' })
+        const first = context([n])
+        first.config.skipSteps = ['review', 'verify', 'accept', 'integrate', 'observer']
+        const run = first.runAgent
+        const message = failure.error instanceof Error ? failure.error.message : String(failure.error)
+        first.runAgent = async req => {
+          if (req.phase === phase) {
+            first.calls.push(req.phase)
+            throw failure.error
+          }
+          return run(req)
+        }
+        const initial = new EffTaskOrchestrator(first.config, first, first.signal, [n])
+        expect((await initial.run()).status).toBe('blocked')
+        expect(first.calls.filter(p => p === phase)).toHaveLength(failure.attempts)
+        expect(n.status).toBe('BLOCKED')
+        expect(n.capBlocked).toBe(true)
+        expect(n.blockedReason).toContain(message)
+        if (phase === 'plan') expect(n.plan.solution).toBe('')
+
+        // 磁盘往返保留开始标记;重试走生产代码的恢复入口,不在测试里清标记。
+        const loaded = parseNodeFile(serializeNode(n))
+        const reseated = reseatTransientNodes([loaded], NOW, DEFAULT_CAPS, { retryBlocked: true })
+        expect(reseated.retried).toEqual([n.id])
+        expect(loaded.status).toBe(phase === 'plan' ? 'CREATED' : 'READY')
+        expect(loaded[phase === 'plan' ? 'taskPlanningStarted' : 'taskExecutionStarted']).toBe(true)
+        const retry = context([loaded])
+        retry.config.skipSteps = first.config.skipSteps
+        const resumedRun = retry.runAgent
+        retry.runAgent = async req => {
+          if (req.phase === phase && stillFailing) {
+            retry.calls.push(req.phase)
+            throw failure.error
+          }
+          return resumedRun(req)
+        }
+        const resumed = new EffTaskOrchestrator(retry.config, retry, retry.signal, [loaded])
+        expect((await resumed.run()).status).toBe(stillFailing ? 'blocked' : 'completed')
+        expect(retry.calls.filter(p => p === phase)).toHaveLength(stillFailing ? failure.attempts : 1)
+        expect(loaded.taskId).toBe(n.taskId)
+        expect(resumed.nodes()).toHaveLength(1)
+        expect(loaded.execStatus).not.toContain('已跳过重复执行')
+        if (stillFailing) {
+          expect(loaded.status).toBe('BLOCKED')
+          expect(loaded.blockedReason).toContain(message)
+        } else {
+          expect(loaded.status).toBe('ACCEPTED')
+          expect(loaded.plan.solution).not.toBe('')
+          expect(loaded.execStatus).toContain('实现完成并通过全部测试')
+        }
+      })
+    }
+
+    it(`手工从 ${phase} 重做同一任务时,实际执行请求的阶段`, async () => {
+      const n = mk(), first = context([n])
+      expect((await new EffTaskOrchestrator(first.config, first, first.signal, [n]).run()).status).toBe('completed')
+      const redo = planRedo([n], n.id, phase, NOW)
+      if ('error' in redo) throw new Error(redo.error)
+      const ctx = context(redo.nodes)
+      expect((await new EffTaskOrchestrator(ctx.config, ctx, ctx.signal, redo.nodes).run()).status).toBe('completed')
+      expect(ctx.calls).toContain(phase)
+      expect(redo.nodes[0]!.taskId).toBe(n.taskId)
+      expect(redo.nodes[0]!.execStatus).not.toContain('已跳过重复执行')
+    })
+  }
 })
 
 describe('手工新增去重', () => {

@@ -494,9 +494,9 @@ export interface TaskNode {
   taskId: string
   /** 去重跳过的来源节点;不会将这条成功回执当成新的执行证据。 */
   taskDuplicateOf?: string
-  /** 分析入口已认领,防止恢复/重做时再次启动同一任务。 */
+  /** 本节点曾进入分析,用于拦截其他同 ID 节点;不阻止本节点恢复或重做。 */
   taskPlanningStarted?: boolean
-  /** 执行入口已认领。自动返工仍在同一次入口内,重入则按开关去重。 */
+  /** 本节点曾进入执行,用于拦截其他同 ID 节点;不代表本节点执行成功。 */
   taskExecutionStarted?: boolean
   title: string
   goal: string // immutable node goal; set once at creation, never overwritten by plan output
