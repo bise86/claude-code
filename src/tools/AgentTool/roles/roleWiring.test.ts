@@ -347,15 +347,26 @@ describe('sdk 档:后果和失效的配置都要在关口上说出来', () => {
     parseRoles([api({ apiProtocol: 'openai-responses', transport: 'sdk' })], source)
     const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
     expect(reasons).toContain('不做本地上下文管理')
-    expect(reasons).toContain('交给 SDK / 模型处理')
+    expect(reasons).toContain('未开启服务端自动压缩')
   })
 
   it('写了两个旋钮时,把它们各自的归宿说清(contextWindow 仍管工具产出预算)', () => {
     const source = 'probe-sdk-knobs'
     parseRoles([api({ apiProtocol: 'openai-responses', transport: 'sdk', contextWindow: '1m', autoCompactTokenLimit: 900_000 })], source)
     const reasons = roleLoadIssues().filter(i => i.source === source).map(i => i.reason).join('\n')
-    expect(reasons).toContain('autoCompactTokenLimit 无效')
+    expect(reasons).toContain('服务端自动压缩,阈值 900000')
+    expect(reasons).not.toContain('autoCompactTokenLimit 无效')
     expect(reasons).toContain('工具产出的每消息预算')
+  })
+
+  it('chat/completions 的 sdk 档仍说明阈值无效', () => {
+    const reasons = issuesOf([api({ apiProtocol: 'openai', transport: 'sdk', contextWindow: '1m', autoCompactTokenLimit: 900_000 })], 'probe-sdk-chat').join('\n')
+    expect(reasons).toContain('autoCompactTokenLimit 无效')
+  })
+
+  it('sdk Responses 超过阈值上限时采用提示中的安全上限', () => {
+    const cfg = parseRoles([api({ apiProtocol: 'openai-responses', transport: 'sdk', contextWindow: '1m', autoCompactTokenLimit: 995_000 })], 'probe-sdk-cap')[0]!.agentDef.roleClientConfig!
+    expect(cfg.autoCompactTokenLimit).toBe(967_000)
   })
 
   it('raw 档一个字都不多说', () => {

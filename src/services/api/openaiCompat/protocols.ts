@@ -59,7 +59,7 @@ export interface TranslatingProtocol {
    * **sdk 档**:同一个请求体,改用官方 `openai` 客户端发出去,产出的帧和 raw 档同形。
    *
    * 收 `body` 而不是自己再构造一遍 —— 两条传输**共用** `buildBody` 的产物,这是
-   * 「换传输不改变语义」这条不变量的落点,也是对拍测试能做成严格相等的原因。
+   * 未启用服务端自动压缩时两条传输的请求体相同;压缩配置由 buildBody 根据 cfg 添加。
    *
    * `import type` 引 SDK:类型在构建期被完全擦掉,员工载入路径上不会因此多拖一个包。
    */
@@ -75,7 +75,11 @@ export const TRANSLATING_PROTOCOLS: Record<string, TranslatingProtocol> = {
   },
   'openai-responses': {
     route: 'responses',
-    buildBody: (body, cfg) => toResponsesRequest(body, { backendModel: cfg.backendModel, effort: cfg.thinkingDepth }),
+    buildBody: (body, cfg) => toResponsesRequest(body, {
+      backendModel: cfg.backendModel,
+      effort: cfg.thinkingDepth,
+      compactThreshold: cfg.transport === 'sdk' ? cfg.autoCompactTokenLimit : undefined,
+    }),
     toAnthropicEvents: responsesEventsToAnthropicEvents,
     sdkStream: (client, body, signal) => client.responses.create(body, { signal }) as any,
   },

@@ -295,7 +295,7 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
         const cap = maxUsefulAutoCompactLimit(window.value)
         if (declaredLimit > cap) {
           issues.push({ name: r.name, source, reason: `autoCompactTokenLimit 最多写到 ${cap}(窗口 ${formatContextWindow(window.value)} 要留给压缩自己一段摘要额度和缓冲),你写的 ${declaredLimit} 已忽略,仍按 ${cap} 触发` })
-          declaredLimit = undefined
+          declaredLimit = transport === 'sdk' && protocol === 'openai-responses' ? cap : undefined
         }
       }
       const translating = protocol !== 'anthropic'
@@ -304,20 +304,17 @@ export function parseRoles(rawRoles: unknown, source: string): { role: any; agen
         : resolveRoleThinking({ level, protocol: 'anthropic', model: r.model ?? '' })
       if (wire.note) issues.push({ name: r.name, source, reason: wire.note })
       const parsedEffort = translating ? undefined : (wire.value as EffortValue | undefined)
-      /**
-       * **`transport: 'sdk'` 这一档不做本地上下文管理**,要在开跑之前说一声 —— 这是一个
-       * 会改变运行行为的开关,而它的效果要跑很久才看得出来。只陈述我们这边做了什么、
-       * 哪些配置因此没有消费者;交出去之后由 SDK / 模型怎么处理,不在这里预测。
-       *
-       * 两个旋钮的归宿要说清:`autoCompactTokenLimit` 在这一档没有消费者;
-       * `contextWindow` 不再决定压缩时机,但**仍然**用于工具产出的每消息预算
-       * (`query.ts` 的 roleWindowChars),别因为这句话把它删了。
-       */
+      // SDK Responses can request server-side compaction; local compaction and
+      // the local blocking limit still stay disabled on all SDK transports.
       if (transport === 'sdk') {
-        issues.push({ name: r.name, source, reason: 'transport 为 sdk 的员工不做本地上下文管理:不压缩、封顶闸不拦,上下文交给 SDK / 模型处理' })
-        if (window.value !== undefined || declaredLimit !== undefined) {
-          issues.push({ name: r.name, source, reason: 'transport 为 sdk 时 autoCompactTokenLimit 无效,contextWindow 也不再决定压缩时机(但仍用于工具产出的每消息预算,别删)' })
+        if (protocol === 'openai-responses' && declaredLimit !== undefined) {
+          issues.push({ name: r.name, source, reason: `sdk + openai-responses 已配置服务端自动压缩,阈值 ${declaredLimit} tokens;不调用本地压缩,需要上游支持 context_management` })
+        } else if (protocol === 'openai-responses') {
+          issues.push({ name: r.name, source, reason: 'sdk + openai-responses 未配置有效的 autoCompactTokenLimit,未开启服务端自动压缩;不做本地上下文管理' })
+        } else {
+          issues.push({ name: r.name, source, reason: 'sdk + openai 不支持服务端自动压缩,autoCompactTokenLimit 无效;不做本地上下文管理' })
         }
+        issues.push({ name: r.name, source, reason: 'sdk 模式本地封顶闸不拦;contextWindow 仍用于阈值校验和工具产出的每消息预算,不会扩大上游模型窗口' })
       }
       const roleClientConfig: RoleClientConfig | undefined = r.execMode === 'api'
         ? { apiProtocol: protocol, apiUrl: r.apiUrl!, apiToken: r.apiToken!, backendModel: r.model!, thinkingDepth: wire.value === undefined ? undefined : String(wire.value), roleName: r.name, contextWindow: window.value, autoCompactTokenLimit: declaredLimit, transport, ...(rotateSessionOnRetry !== undefined ? { rotateSessionOnRetry } : {}), ...(rotateCacheKeyOnRetry !== undefined ? { rotateCacheKeyOnRetry } : {}) }

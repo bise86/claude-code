@@ -13,8 +13,8 @@ export type RoleClientConfig = {
    * - `sdk`:官方 `openai` 客户端发请求,产出的帧喂给**同一个**翻译器。
    *
    * 只对翻译型协议(openai / openai-responses)有意义 —— `anthropic` 档是原样转发,
-   * 没有可替换的帧来源。两条传输发的是同一个请求体、打的是同一个地址,差异只在
-   * 「帧从哪来」(见 services/api/openaiCompat/sdkTransport.ts 的文件头)。
+   * 没有可替换的帧来源。两条传输共用请求构造和事件翻译;SDK Responses 配置
+   * autoCompactTokenLimit 时额外发送服务端自动压缩配置。
    *
    * 之所以做成开关而不是直接换掉:这个仓库的历史是「新路第一趟必炸在没想到的地方」,
    * 而一趟 /et 十几席同时死的代价已经付过一次。默认留在 raw,灰度切。
@@ -38,8 +38,10 @@ export type RoleClientConfig = {
   contextWindow?: number
   /**
    * 自动压缩的**绝对阈值**(token 数)—— 对齐 codex 的 `model_auto_compact_token_limit`。
+   * SDK + openai-responses:显式配置后作为 compact_threshold 交给服务端自动压缩,
+   * 程序只保存并回传 compaction 状态。SDK + openai 不使用这个字段。
    *
-   * 不写的话阈值是从窗口推出来的(窗口 − 摘要保留 − 缓冲),1M 的窗口推出来是 967000;
+   * 本地压缩模式不写的话阈值是从窗口推出来的(窗口 − 摘要保留 − 缓冲),1M 的窗口推出来是 967000;
    * 写了就按写的这个数触发,但仍**取小**:`min(声明值, 推出来的那个)`。取小不是不信任
    * 用户 —— 压缩本身也是一次带着整段对话的请求,阈值贴着窗口的话被拒的是压缩自己,
    * 而这个 fork 撞上去没有兜底(见 roleContextWindow 的 maxUsefulAutoCompactLimit)。

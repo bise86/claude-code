@@ -47,7 +47,7 @@ describe('parseRoles', () => {
       // 用户看到的是「这个员工不存在」。
       expect(out).toHaveLength(1)
       expect(out[0].agentDef.contextWindow).toBe(128_000)
-      const issue = roleLoadIssues().find(i => i.reason.includes('contextWindow'))
+      const issue = roleLoadIssues().find(i => i.source === 'userSettings' && i.reason.includes('contextWindow'))
       expect(issue?.reason).toContain('128k')
     })
 

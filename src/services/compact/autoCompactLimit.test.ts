@@ -145,18 +145,16 @@ describe('原来那两条线一条都没被拆掉', () => {
 /**
  * **`transport: 'sdk'` = 这一席的上下文归上游管。**
  *
- * 约定有两半,必须**同时**成立:出网请求带 `truncation: 'auto'`(那一半由
- * openaiCompat/transportParity.test.ts 钉),以及我们这边**整套**让开 —— 自动压缩不动手,
- * 硬封顶闸也不开火。
+ * SDK Responses 配置阈值后通过 context_management 开启服务端压缩,
+ * 由 openaiCompat/responsesCompaction.test.ts 验证。本地摘要压缩和封顶闸仍让开。
  *
  * 第二条是最容易漏的:只关压缩而留着封顶闸,这一席会在请求发出去**之前**被我们自己
  * 合成的一条 `Prompt is too long` 判死,而那正是本该交给上游去截断的那一次请求 ——
  * 结果比改动前更糟(改动前至少还会先压一次)。所以两道闸各钉一条。
  */
-describe('sdk 档不做上下文管理', () => {
+describe('sdk 档不做本地摘要压缩和封顶拦截', () => {
   /**
-   * 用户 2026-08-20 定的:`transport: 'sdk'` 这一档我们**什么都不管** —— 不压缩、
-   * 封顶闸不拦,出网也不带 truncation(那个参数被跑机上的网关 400 掉了,见
+   * SDK 档不运行本地摘要压缩、封顶闸不拦,出网也不带 truncation(被网关 400 掉了,见
    * transportParity.test.ts 的文件头)。
    *
    * 两道闸各钉一条。**只关压缩而留着封顶闸是最糟的组合**:那一席会在请求发出去之前

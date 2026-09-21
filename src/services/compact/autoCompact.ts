@@ -413,9 +413,8 @@ export async function autoCompactIfNeeded(
   }
 
   /**
-   * `transport: 'sdk'` = 这一席完全不做上下文管理(见 contextUnmanaged)。放在最前面
-   * 而不是混进阈值算术里:这不是「阈值够不着」,是**这条路上不该有我们的压缩**,
-   * 两者在日志和遥测上要分得开。
+   * SDK 传输不运行本地摘要压缩(见 contextUnmanaged)。Responses 配置的阈值由
+   * 请求转换层交给服务端;这里提前返回,避免额外触发本地压缩请求。
    */
   if (contextUnmanaged(toolUseContext.options.roleClientConfig)) {
     return { wasCompacted: false }

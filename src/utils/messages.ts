@@ -1,4 +1,5 @@
 import { feature } from 'bun:bundle'
+import { isResponsesCompactionBlock } from '../services/api/openaiCompat/responsesCompaction.js'
 import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import type {
   ContentBlock,
@@ -4794,7 +4795,7 @@ function filterTrailingThinkingFromLastAssistant(
 
   const content = lastMessage.message.content
   const lastBlock = content.at(-1)
-  if (!lastBlock || !isThinkingBlock(lastBlock)) {
+  if (!lastBlock || !isThinkingBlock(lastBlock) || isResponsesCompactionBlock(lastBlock)) {
     return messages
   }
 
@@ -4802,7 +4803,7 @@ function filterTrailingThinkingFromLastAssistant(
   let lastValidIndex = content.length - 1
   while (lastValidIndex >= 0) {
     const block = content[lastValidIndex]
-    if (!block || !isThinkingBlock(block)) {
+    if (!block || !isThinkingBlock(block) || isResponsesCompactionBlock(block)) {
       break
     }
     lastValidIndex--
@@ -5029,6 +5030,9 @@ export function filterOrphanedThinkingOnlyMessages(
     if (!Array.isArray(content) || content.length === 0) {
       return true
     }
+
+    // A Responses checkpoint is durable state even without text or tools.
+    if (content.some(isResponsesCompactionBlock)) return true
 
     // Check if ALL content blocks are thinking blocks
     const allThinking = content.every(

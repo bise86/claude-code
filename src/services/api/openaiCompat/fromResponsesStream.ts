@@ -2,6 +2,7 @@ import { logError } from '../../../utils/log.js'
 import { createBlockWriter, type Evt, fallbackUsage } from './blocks.js'
 import type { StreamCtx } from './protocols.js'
 import { encodeReasoningSignature } from './toResponsesRequest.js'
+import { encodeCompactionSignature } from './responsesCompaction.js'
 
 /**
  * OpenAI **Responses** 事件流 → anthropic 事件流。
@@ -142,6 +143,24 @@ export async function* responsesEventsToAnthropicEvents(
 
       case 'response.output_item.done': {
         const item = f.item
+        if (item?.type === 'compaction') {
+          if (typeof item.encrypted_content !== 'string' || item.encrypted_content.length === 0) {
+            yield* w.error('Responses compaction item is missing encrypted_content; cannot preserve compacted context')
+            return
+          }
+          yield* w.startIfNeeded()
+          // Give the checkpoint its own block; never overwrite reasoning.
+          // Buffer state-only output so transient failures remain retryable.
+          const events = [
+            ...w.closeThinking(),
+            ...w.signature(encodeCompactionSignature(item)),
+            ...w.closeThinking(),
+          ]
+          if (outputStarted) yield* events
+          else pendingReasoning.push(...events)
+          summaryParts = 0
+          break
+        }
         if (item?.type === 'reasoning') {
           /**
            * 把密文塞进 thinking 块的签名带回下一轮。不带的话,下一轮只要有工具调用就

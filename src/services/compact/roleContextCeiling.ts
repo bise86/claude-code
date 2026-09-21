@@ -134,14 +134,14 @@ export type RoleCompactLimits = {
 }
 
 /**
- * **这一席完全不做上下文管理。**
+ * **这一席不运行本地摘要压缩和本地封顶闸。**
  *
- * `transport: 'sdk'` 的约定(用户 2026-08-20 定的):这条路上我们**什么都不管** ——
- * 不压缩、封顶闸不拦,出网请求也**不带** `truncation`(实测跑机那台 new-api 网关的
+ * `transport: 'sdk'` 不做本地摘要压缩、封顶闸不拦,出网请求也**不带**
+ * `truncation`(实测跑机那台 new-api 网关的
  * `/v1/responses` 不认这个参数,带上就是 400 `Unsupported parameter: truncation`)。
  *
- * 名字里的 `unmanaged` 说的是**我们这一侧**:交出去之后由 SDK / 模型怎么处理,不是这个
- * 模块的判断范围,也不该在这里写成预言。不叫「归上游管」是因为那句话我们证明不了。
+ * SDK Responses 配置 autoCompactTokenLimit 后,由请求转换层开启服务端自动压缩,
+ * 并保存、回传 compaction 状态。这里仍让开,不能再触发本地摘要或提前挡住请求。
  *
  * 两道闸必须**一起**让开:只关自动压缩而留着封顶闸,那一席会在请求发出去**之前**被我们
  * 自己合成的一条 `Prompt is too long` 判死 —— 那比让它真的发出去还早,而且报错里没有

@@ -22,6 +22,7 @@
  */
 import { bodyPrefixKey, derivedId } from './codexIdentity.js'
 import { stripAnthropicSystemBlocks } from './systemBlocks.js'
+import { decodeCompactionSignature } from './responsesCompaction.js'
 
 export const REASONING_SIG_PREFIX = 'openai-responses-reasoning:'
 
@@ -53,6 +54,8 @@ export interface ResponsesOptions {
   backendModel: string
   /** 已经按协议归一过的思考档位。原样填进 `reasoning.effort`。 */
   effort?: string
+  /** SDK Responses only: ask the server to compact during ordinary responses. */
+  compactThreshold?: number
 }
 
 export function toResponsesRequest(body: any, opts: ResponsesOptions): any {
@@ -62,38 +65,37 @@ export function toResponsesRequest(body: any, opts: ResponsesOptions): any {
     const toolUses = blocks.filter((b: any) => b?.type === 'tool_use')
     const toolResults = blocks.filter((b: any) => b?.type === 'tool_result')
     if (m.role === 'assistant') {
-      /**
-       * reasoning item 必须排在同一轮的 function_call **之前**,而且只在这一轮真的有
-       * 工具调用时才需要。没有工具调用的轮次带上它没坏处,但会白白多发一大段密文。
-       */
-      if (toolUses.length > 0) {
-        for (const b of blocks) {
-          if (b?.type !== 'thinking') continue
-          const r = decodeReasoningSignature(b.signature)
-          if (!r?.enc) continue
-          input.push({ type: 'reasoning', ...(r.id ? { id: r.id } : {}), encrypted_content: r.enc, summary: [] })
+      // Preserve stream order: checkpoints may occur between any two blocks,
+      // including in a message merged by normalizeMessagesForAPI.
+      let text = ''
+      const flushText = () => {
+        if (text.length > 0) input.push({ role: 'assistant', content: text })
+        text = ''
+      }
+      for (const b of blocks) {
+        if (b?.type === 'text') {
+          text += b.text
+        } else if (b?.type === 'thinking') {
+          const compacted = decodeCompactionSignature(b.signature)
+          if (compacted) {
+            // The latest checkpoint replaces its prefix in outgoing input.
+            // The local transcript stays intact for display and persistence.
+            text = ''
+            input.length = 0
+            input.push(compacted)
+          } else if (toolUses.length > 0) {
+            const r = decodeReasoningSignature(b.signature)
+            if (r?.enc) {
+              flushText()
+              input.push({ type: 'reasoning', ...(r.id ? { id: r.id } : {}), encrypted_content: r.enc, summary: [] })
+            }
+          }
+        } else if (b?.type === 'tool_use') {
+          flushText()
+          input.push({ type: 'function_call', call_id: b.id, name: b.name, arguments: JSON.stringify(b.input ?? {}) })
         }
       }
-      const text = textOf(blocks)
-      /**
-       * assistant 轮次用 `EasyInputMessage`(role + 纯字符串),**不是**
-       * `{type:'message', content:[{type:'output_text'…}]}`。
-       *
-       * 后者匹配的是 `ResponseOutputMessage`,它必填 `id` 和 `status`,里面的
-       * `ResponseOutputText` 还必填 `annotations` —— 这三个我们一个都没有,发出去是
-       * 一个校验不过的形状。而 `ResponseInputItem.Message` 的 role 只收
-       * user/system/developer,压根没有 assistant 这一档。
-       *
-       * 空文本直接跳过:一个「只有推理、没有正文」的轮次(推理中撞上限,或者吐完
-       * 推理就 finish)在这里会变成 `content: ''`,而部分后端对空 assistant 直接 400。
-       * 这条和 chat 那侧的同名守卫是同一个实测教训。
-       */
-      if (text.length > 0) input.push({ role: 'assistant', content: text })
-      for (const t of toolUses) {
-        // `call_id`,不是 item 的 `id` —— 两者是不同的命名空间(`call_…` vs `fc_…`),
-        // 而下一轮的 function_call_output 必须按 call_id 配对。
-        input.push({ type: 'function_call', call_id: t.id, name: t.name, arguments: JSON.stringify(t.input ?? {}) })
-      }
+      flushText()
       continue
     }
     if (toolResults.length > 0) {
@@ -128,6 +130,9 @@ export function toResponsesRequest(body: any, opts: ResponsesOptions): any {
   if (systemText.length > 0) out.instructions = systemText
   // anthropic 的 max_tokens 在这个协议里叫 max_output_tokens。
   if (body.max_tokens != null) out.max_output_tokens = body.max_tokens
+  if (opts.compactThreshold !== undefined) {
+    out.context_management = [{ type: 'compaction', compact_threshold: opts.compactThreshold }]
+  }
   if (body.temperature != null) out.temperature = body.temperature
   if (opts.effort) {
     // summary:'auto' 是**思考过程能不能上屏**的开关。不要它的话用户又回到「openai 员工

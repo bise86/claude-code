@@ -5,12 +5,13 @@
  * `new OpenAI({ fetch })` 交进去。同一份上游字节喂进去,翻译出来的 anthropic 事件流
  * 必须逐字相等,出网地址和鉴权头也必须相同。
  *
- * **请求体一个差异都不允许有。** 曾经有过一个:sdk 档发 `truncation: 'auto'`,想把上下文
+ * **未启用服务端压缩时请求体必须相同。** 曾经有过一个:sdk 档发 `truncation: 'auto'`,想把上下文
  * 交给上游截断。2026-08-20 跑机上实测:那台 new-api 网关的 `/v1/responses` 直接 400
  * `Unsupported parameter: truncation`(同一发去掉这个字段就 200,加不加 SDK 那套
  * `x-stainless-*` 头都 200 —— 所以病根是这个参数,不是 SDK)。这个字段已经拿掉。
  *
- * 下面那条「两条路请求体全等」的断言就是它的墓碑:再有人往 sdk 档单独塞字段,它立刻变红。
+ * 显式配置 SDK Responses 服务端压缩时允许多出 context_management,
+ * 该分支由 responsesCompaction.test.ts 覆盖;这里验证未开启时的传输等价性。
  */
 import { expect, test } from 'bun:test'
 import { buildRoleFetch } from './roleFetch.js'

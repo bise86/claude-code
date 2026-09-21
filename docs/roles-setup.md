@@ -263,7 +263,7 @@
   }
   ```
 
-  **不写的话**阈值是从窗口推出来的（`窗口 − 摘要保留 − 缓冲`）：1M 推出来是 967000，200k 是 167000，128k 是 97200。写了就按你写的这个数触发。
+  **本地压缩模式下不写的话**阈值是从窗口推出来的（`窗口 − 摘要保留 − 缓冲`）：1M 推出来是 967000，200k 是 167000，128k 是 97200。写了就按你写的这个数触发。
 
   **有上限,而且就是上面那个推出来的数**。压缩自己也是一次带着整段对话的请求：阈值贴着窗口的话，被上游拒收的是压缩本身，而这一席撞上去没有兜底（这个 fork 没有反应式压缩）。写大了不会静默生效——关口上会告诉你这个窗口最多能写到多少，然后按那个数触发。
 
@@ -273,24 +273,38 @@
   | 200k | 167000 |
   | 1M | 967000 |
 
-  **`transport: "sdk"` 的员工上这个键没有消费者** —— 那一档不做本地上下文压缩（见下面 `transport`），载入时会点名。
+  **`transport: "sdk"` + `apiProtocol: "openai-responses"` 时，这个键开启服务端自动压缩**，作为 `context_management: [{ type: "compaction", compact_threshold: ... }]` 随普通 Responses 请求发送。程序不单独调用压缩接口，也不运行本地摘要压缩。必须显式配置有效阈值；不写时不启用。`sdk` + `openai`（Chat Completions）不支持这项能力，启动时会说明阈值无效。
+
+  ```json
+  {
+    "execMode": "api",
+    "transport": "sdk",
+    "apiProtocol": "openai-responses",
+    "contextWindow": "1m",
+    "autoCompactTokenLimit": 900000
+  }
+  ```
+
+  以上字段合并到员工现有配置即可；`model`、`apiUrl`、`apiToken` 等连接配置照常保留。服务端超过 900000 tokens 时执行压缩，返回的加密 `compaction` 项会保存在本地会话中，并回传到下一轮。后续出网请求只携带最近一次压缩项及之后的消息，本地显示和持久化历史保留。会话恢复后也会沿用压缩状态。
+
+  上游网关和模型必须支持 Responses 的 `context_management`；不支持时会显示上游错误，不会静默关闭压缩或回落本地摘要。`contextWindow` 是本地窗口声明，不会扩大上游的实际窗口。参见 [OpenAI 服务端压缩文档](https://developers.openai.com/api/docs/guides/compaction)。
 
   **只在 `execMode: 'api'` 上生效**。cli 档的外部 CLI 自己管上下文，写在那种员工上会被忽略并在关口上说明；要给一个 cli 档的 codex 设这两个值，直接写进它自己的参数：`"args": ["-c", "model_context_window=1000000", "-c", "model_auto_compact_token_limit=900000"]`。
 
-  还有一条和跑动有关：上游真的拒收过一次之后，我们会学一个更小的窗口上界，阈值跟着重算，并**仍与你写的数取小**——只会压得更早，不会更晚。
+  本地压缩模式还有一条和跑动有关：上游真的拒收过一次之后，我们会学一个更小的窗口上界，阈值跟着重算，并**仍与你写的数取小**——只会压得更早，不会更晚。
 
 - `transport`：这一席用哪条**传输**把请求发出去。`"raw"`（默认）或 `"sdk"`。
 
   | | raw（默认） | sdk |
   |---|---|---|
   | 请求怎么发 | 我们自己的 fetch + SSE 解析 | 官方 `openai` 客户端 |
-  | 上下文压缩 | **我们做**：到阈值先摘要一次，再补恢复附件（最近读的文件、plan、skill、MCP 指令…） | **不做** —— 交给 SDK / 模型处理 |
+  | 上下文压缩 | **我们做**：到阈值先摘要一次，再补恢复附件（最近读的文件、plan、skill、MCP 指令…） | Responses 配置有效阈值时由服务端自动压缩；程序保存并回传压缩状态 |
   | 本地硬封顶闸 | 生效 | 不拦 |
-  | `contextWindow` / `autoCompactTokenLimit` | 都用于压缩 | `autoCompactTokenLimit` 无消费者；`contextWindow` 不再决定压缩时机，但**仍用于工具产出的每消息预算**，别因此删掉它 |
+  | `contextWindow` / `autoCompactTokenLimit` | 都用于压缩 | Responses 的 `autoCompactTokenLimit` 传给服务端；`contextWindow` 用于阈值校验和工具产出的每消息预算 |
 
-  除上下文之外，两条路是**同一件事**：同一个地址、同一个鉴权头、**逐字相同的请求体**，同一份上游字节翻出来的事件流逐字相同。这条等价性由 `transportParity.test.ts` 拿同一份字节喂两条路钉住，不是一句承诺。
+  两条路共用地址、鉴权和协议转换。未启用服务端自动压缩时请求体相同；启用后 SDK Responses 请求额外带 `context_management`。传输等价性和压缩状态回传分别由 `transportParity.test.ts`、`responsesCompaction.test.ts` 验证。
 
-  > 历史:sdk 档曾经多发一个 `truncation: "auto"`（想把上下文交给上游截断）。2026-08-20 跑机实测,new-api 网关的 `/v1/responses` 直接 400 `Unsupported parameter: truncation`——同一发去掉这个字段就 200，带不带 SDK 那套 `x-stainless-*` 头都 200。该字段已移除，两条路的请求体现在完全一致。
+  > 历史:sdk 档曾经多发一个 `truncation: "auto"`（想把上下文交给上游截断）。2026-08-20 跑机实测,new-api 网关的 `/v1/responses` 直接 400 `Unsupported parameter: truncation`。该字段仍不发送；现在的自动压缩使用独立的 `context_management` 能力，需要上游支持。
 
   sdk 档的两处实现细节：客户端上 `maxRetries: 0`（重试策略统一留在 `withRetry`：所有错误都重试，默认 10 次，阶梯间隔 3s～90s；两套叠起来是乘法，而且退避曲线会错乱），以及**把我们自己的 fetch 传进 SDK**（内网直连、请求头清洗、连接失败的分类诊断都挂在它上面）。失败诊断里会额外印一句「sdk 传输」，好让灰度期间「切了之后开始报」和「本来就报」分得开。
 
