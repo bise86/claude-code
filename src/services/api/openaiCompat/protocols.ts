@@ -5,6 +5,7 @@ import { openaiChunksToAnthropicEvents } from './fromOpenAIStream.js'
 import { responsesEventsToAnthropicEvents } from './fromResponsesStream.js'
 import { toOpenAIRequest } from './toOpenAIRequest.js'
 import { toResponsesRequest } from './toResponsesRequest.js'
+import { prepareResponsesToolOutputs } from './responsesToolOutput.js'
 
 /**
  * 一种**要翻译**的员工协议。
@@ -53,6 +54,8 @@ export interface TranslatingProtocol {
   route: string
   /** anthropic 请求体 → 该协议请求体。纯函数。 */
   buildBody(anthropicBody: any, cfg: RoleClientConfig): unknown
+  /** Apply protocol field limits to the outgoing body; may persist oversized output. */
+  prepareBody?(body: any): Promise<void>
   /** 该协议的帧流 → anthropic 事件流。纯函数(生成器)。 */
   toAnthropicEvents(frames: AsyncIterable<any>, ctx: StreamCtx): AsyncGenerator<Evt>
   /**
@@ -80,6 +83,7 @@ export const TRANSLATING_PROTOCOLS: Record<string, TranslatingProtocol> = {
       effort: cfg.thinkingDepth,
       compactThreshold: cfg.transport === 'sdk' ? cfg.autoCompactTokenLimit : undefined,
     }),
+    prepareBody: prepareResponsesToolOutputs,
     toAnthropicEvents: responsesEventsToAnthropicEvents,
     sdkStream: (client, body, signal) => client.responses.create(body, { signal }) as any,
   },

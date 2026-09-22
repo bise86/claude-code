@@ -289,6 +289,8 @@
 
   上游网关和模型必须支持 Responses 的 `context_management`；不支持时会显示上游错误，不会静默关闭压缩或回落本地摘要。`contextWindow` 是本地窗口声明，不会扩大上游的实际窗口。参见 [OpenAI 服务端压缩文档](https://developers.openai.com/api/docs/guides/compaction)。
 
+  **工具结果的单字段长度限制与上下文 token 窗口不同**。Responses 会拒绝超过 `10485760` 字符的 `input[].output`（`string_above_max_length`），自动压缩阈值不能解除这个限制。程序在发送前将超限工具结果完整保存到本地会话的 `tool-results` 目录，请求中携带预览和文件路径，并显示提示；模型可用 Read 分段读取或 Grep 检索。`raw`、`sdk` 以及恢复的旧会话均适用，不需要新增配置。保存失败时显示本地错误并保留原始结果，不发送已知超限的请求。
+
   **只在 `execMode: 'api'` 上生效**。cli 档的外部 CLI 自己管上下文，写在那种员工上会被忽略并在关口上说明；要给一个 cli 档的 codex 设这两个值，直接写进它自己的参数：`"args": ["-c", "model_context_window=1000000", "-c", "model_auto_compact_token_limit=900000"]`。
 
   本地压缩模式还有一条和跑动有关：上游真的拒收过一次之后，我们会学一个更小的窗口上界，阈值跟着重算，并**仍与你写的数取小**——只会压得更早，不会更晚。

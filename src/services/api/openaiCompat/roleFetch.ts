@@ -188,6 +188,15 @@ export function buildRoleFetch(cfg: RoleClientConfig, inner: typeof fetch = fetc
     headers.set('content-type', 'application/json')
     const anthropicBody = JSON.parse(init.body as string)
     const outBody = proto.buildBody(anthropicBody, cfg)
+    if (proto.prepareBody) {
+      init.signal?.throwIfAborted()
+      try {
+        await proto.prepareBody(outBody)
+      } catch (error) {
+        return failureResponse(400, `员工「${cfg.roleName}」请求准备失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+      init.signal?.throwIfAborted()
+    }
     /**
      * 流式请求就明说要 SSE。
      *
