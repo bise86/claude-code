@@ -24,7 +24,7 @@
 
 ## 架构概览
 
-文字说明：[单个阶段内的子 Agent 对话循环](docs/agent-conversation-workflow.md)——分析或执行任务怎样启动、每次 API 携带什么、何时调用下一轮、何时结束，以及与原生主／子 Agent 的关系；不展开阶段之间的编排。
+文字说明：[Claude Code Agent 机制：对话循环与主从协作](docs/agent-conversation-workflow.md)——模型请求与工具反馈怎样循环，主会话怎样分配、干预、回收和恢复子任务，以及 Agent Teams 和整体目标对齐的机制。
 
 <table>
   <tr>
