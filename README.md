@@ -24,7 +24,7 @@
 
 ## 架构概览
 
-文字说明：[Claude Code Agent 机制：对话循环与主从协作](docs/agent-conversation-workflow.md)——模型请求与工具反馈怎样循环，主会话怎样分配、干预、回收和恢复子任务，以及 Agent Teams 和整体目标对齐的机制。
+文字说明：[Claude Code Agent 机制：对话循环与主从协作](docs/agent-conversation-workflow.md)——模型请求与工具反馈怎样循环，主会话怎样识别子 agent、关联回复、路由消息、分配和回收任务，以及 Agent Teams 和整体目标对齐的机制。
 
 <table>
   <tr>

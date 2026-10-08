@@ -4,7 +4,7 @@ Claude Code 的 Agent 机制包含两个相互衔接的层次：单个 agent 内
 
 主模型决定如何理解需求、划分工作和判断产出；子 agent 在各自的上下文里执行任务；运行时负责模型请求、工具执行、权限、消息路由、取消和资源清理。运行时能够记录执行状态，但不会默认证明所有自然语言需求都已满足。
 
-本文以本仓库保留的 Claude Code 原生 `Agent`、`query()` 和 Agent Teams 链路为依据，覆盖任务派发、上下文、前后台执行、干预、结果回收、恢复和目标对齐。项目自定义的任务编排不在本文范围内。模型协议兼容层单独放在附录中。
+本文以本仓库保留的 Claude Code 原生 `Agent`、`query()` 和 Agent Teams 链路为依据，覆盖任务派发、身份与消息路由、上下文、前后台执行、干预、结果回收、恢复和目标对齐。项目自定义的任务编排不在本文范围内。模型协议兼容层单独放在附录中。
 
 实现基线：`14c8b49`；官方文档核对日期：2026-10-08。源码中的特性开关、构建条件和权限配置会影响具体行为；本文的实现描述不代表每个官方发行版都采用完全相同的默认值。
 
@@ -40,6 +40,26 @@ fork 复制的是启动时的上下文，不是与父会话实时共享同一份
 在本仓库中，fork 路径仅在 `FORK_SUBAGENT` 构建特性启用、处于交互会话且不是 coordinator 时生效：生效时，省略 `subagent_type` 进入 fork 路径；否则省略该字段默认选择 `general-purpose`。团队派发还有独立条件：Agent Teams 启用，存在有效团队上下文或 `team_name`，同时提供 `name`，才会进入 teammate 的创建路径。给普通后台 subagent 命名也可以只是为了让它能通过 `SendMessage` 寻址。
 
 源码：[AgentTool.tsx](../src/tools/AgentTool/AgentTool.tsx)、[forkSubagent.ts](../src/tools/AgentTool/forkSubagent.ts)、[spawnMultiAgent.ts](../src/tools/shared/spawnMultiAgent.ts)。产品概念参见 [官方：Subagents](https://code.claude.com/docs/en/sub-agents) 与 [官方：Agent Teams](https://code.claude.com/docs/en/agent-teams)。
+
+### 1.3 角色、实例、调用和任务各用什么标识
+
+主会话区分子 agent，靠的是运行时生成的实例身份和调用关联，不是靠报告正文自报姓名，也不是按启动或完成顺序猜测。
+
+| 字段 | 标识什么 | 是否可以直接作为消息收件人 |
+| --- | --- | --- |
+| `subagent_type` | agent 的角色定义，如 `general-purpose` | 不能仅凭角色类型定位一个实例 |
+| `description` | 本次工作的显示说明 | 不用于寻址 |
+| 普通子 agent 的 `agentId` | 某个具体实例，新建时生成，恢复时沿用 | 可以作为 `SendMessage.to` |
+| 普通子 agent 的 `name` | 已注册时，作为实例 ID 的可读别名 | 可以，但必须是注册表中的实际名称 |
+| `tool_use.id` / `tool_result.tool_use_id` | 一次具体的工具调用及其返回 | 用于关联调用，不是收件地址 |
+| 运行任务的 `task_id` | 运行时跟踪、停止或读取输出的任务 | 普通 `local_agent` 中等于 `agentId`；不能推广到其它任务类型 |
+| `TaskCreate` 的任务 ID | 工作清单中的一个工作项，如任务 `#3` | 不是 agent 或运行任务地址 |
+| 团队的 `agentName`、`teamName` | 当前团队中的成员名称及其命名空间 | `SendMessage.to` 使用成员实际名称 |
+| 团队成员的完整 `agentId` | 形如 `researcher@auth-team` 的成员身份 | 本仓库的 `SendMessage.to` 拒绝含 `@` 的地址，应使用成员名称 |
+
+同一个角色可以启动多个实例；相同的角色、模型或显示说明不会使实例合并。工具调用 ID 标识某次启动或续跑操作，agent ID 标识持续使用的实例，二者也不能互相替代。
+
+源码：[uuid.ts](../src/utils/uuid.ts)、[ids.ts](../src/types/ids.ts)、[AgentTool.tsx](../src/tools/AgentTool/AgentTool.tsx)、[LocalAgentTask.tsx](../src/tasks/LocalAgentTask/LocalAgentTask.tsx)、[agentId.ts](../src/utils/agentId.ts)、[SendMessageTool.ts](../src/tools/SendMessageTool/SendMessageTool.ts)。
 
 ## 2. 主会话与子 Agent 共用的对话引擎
 
@@ -284,6 +304,25 @@ Agent Teams 的自动领取和依赖门控在第 12 节单独说明。
 
 源码：[tools.ts](../src/constants/tools.ts)、[agentToolUtils.ts](../src/tools/AgentTool/agentToolUtils.ts)、[AgentTool.tsx](../src/tools/AgentTool/AgentTool.tsx)。
 
+### 7.5 派发时建立实例与分工的对应关系
+
+每次新建普通子 agent 或 fork，`AgentTool` 调用 `createAgentId()` 生成随机实例 ID，通常为 `a` 加 16 位十六进制字符。这个 ID 会传给 `runAgent()`，用于独立记录和运行状态；普通本地运行任务也用同一 ID 注册，所以该路径的运行任务 ID 等于 agent ID。
+
+直接后台派发且提供 `name` 时，运行时还在 `agentNameRegistry` 中保存 `name → agentId`。主模型不需要直接读取这张内部 Map：它在自己的对话历史中已有委派参数、对应的工具调用，以及工具返回的 agent ID，可以把它们与工作范围联系起来。
+
+例如，当前没有团队上下文，主会话派发两个普通后台子 agent，二者都使用 `general-purpose`。以下 ID 用于示意：
+
+| 工作范围 | 本次 `Agent` 调用 ID | 注册的 `name` | 返回的 `agentId` / 本地运行任务 ID |
+| --- | --- | --- | --- |
+| 调查认证调用路径 | `toolu_A` | `auth-path` | `a0000000000000001` |
+| 检查认证测试覆盖 | `toolu_B` | `auth-tests` | `a0000000000000002` |
+
+主模型据此知道“调用路径问题交给 `auth-path`，测试问题交给 `auth-tests`”。这个工作含义由委派内容确定；程序保存的是实例和地址，不会根据后续一句自然语言自动选择最合适的 agent。
+
+普通名称注册有明确范围：只在直接后台启动路径建立，前台派发以及之后转入后台不会因此自动注册同名别名。Map 按名称精确匹配，重复名称会被新的实例覆盖。因此应使用不同名称，并保留返回的实例 ID；要继续旧实例时，原 ID 比已被复用的别名明确。
+
+源码：[AgentTool.tsx](../src/tools/AgentTool/AgentTool.tsx)、[uuid.ts](../src/utils/uuid.ts)、[LocalAgentTask.tsx](../src/tasks/LocalAgentTask/LocalAgentTask.tsx)、[AppStateStore.ts](../src/state/AppStateStore.ts)。
+
 ## 8. 前台与后台怎样协作
 
 ### 8.1 结果通过两种方式回到主会话
@@ -313,9 +352,56 @@ Agent Teams 的自动领取和依赖门控在第 12 节单独说明。
 
 源码：[AgentTool.tsx](../src/tools/AgentTool/AgentTool.tsx)、[runAgent.ts](../src/tools/AgentTool/runAgent.ts)、[agentToolUtils.ts](../src/tools/AgentTool/agentToolUtils.ts)、[LocalAgentTask.tsx](../src/tasks/LocalAgentTask/LocalAgentTask.tsx)。
 
+### 8.4 主会话怎样知道是哪个子 Agent 返回
+
+前台结果包含 `tool_result.tool_use_id`，与原 `Agent` 工具调用的 `tool_use.id` 对应。例如 `toolu_B` 的结果就属于派发 B 的那次调用；即使并行执行时 B 先于 A 返回，也不需要靠消息顺序判断。部分 Explore / Plan 返回会省略 agent ID 尾注，但不会丢掉这条工具调用关联。
+
+后台派发的首次工具结果同样对应原调用，并返回新 agent ID。之后的完成通知用 `<task-id>` 标识运行实例，并可携带 `<tool-use-id>` 关联本次启动操作。沿用第 7.5 节的例子，下面只保留用于关联的字段：
+
+```xml
+<task-notification>
+<task-id>a0000000000000002</task-id>
+<tool-use-id>toolu_B</tool-use-id>
+<status>completed</status>
+<result>认证测试覆盖的检查结论……</result>
+</task-notification>
+```
+
+主会话可以据 `a0000000000000002` 及原委派知道这是测试检查者返回的结果。`description` 和摘要帮助阅读，实例 ID 与调用 ID 才提供关联。`<tool-use-id>` 是可选字段，不能要求每份通知都同时具有两种 ID。
+
+恢复执行时沿用原 agent ID，但通知的工具调用关联可以变为这次 `SendMessage` 的调用 ID。因此“同一个 agent 的新一轮结果”和“同一个工具调用的返回”不是一回事。
+
+源码：[toolExecution.ts](../src/services/tools/toolExecution.ts)、[AgentTool.tsx](../src/tools/AgentTool/AgentTool.tsx)、[LocalAgentTask.tsx](../src/tasks/LocalAgentTask/LocalAgentTask.tsx)、[resumeAgent.ts](../src/tools/AgentTool/resumeAgent.ts)。
+
 ## 9. 运行中的任务怎样干预
 
-### 9.1 补充指令：排队等待模型读取
+### 9.1 收件人怎样解析
+
+主模型先根据分工、已收到的结果和委派历史选择目标，再把地址填进 `SendMessage.to`。发送普通文本消息且 `to` 不是 `"*"` 时，在本节讨论的本地普通子 agent 与团队路径中，运行时按以下顺序解析：
+
+```text
+SendMessage.to
+  → 查 agentNameRegistry：是否为已注册的普通子 agent 别名
+  → 未命中时，检查是否为格式合法的原始普通 agent ID
+  → 得到普通 agent ID：查 tasks[agentId]
+      → 正在运行：加入该任务的 pendingMessages
+      → 已结束或内存中没有该任务：尝试按该 ID 从记录恢复
+  → 没有解析成普通 agent ID：进入当前团队的成员邮箱路径
+```
+
+沿用第 7.5 节的实例，给测试检查者追加要求，可以使用注册别名：
+
+```json
+{"to":"auth-tests","summary":"检查并发测试","message":"请同时检查刷新 token 的并发测试覆盖，并返回相关用例位置。"}
+```
+
+也可以将 `to` 写成它的实际实例 ID `a0000000000000002`。角色名 `general-purpose`、显示说明、工具调用 ID 和清单任务 `#3` 都不是这个实例的替代地址。
+
+名称查找优先于原始 ID 和团队成员路径；同名别名会遮住同名 teammate。原始 ID 已解析但恢复失败时，会报告失败，不再尝试另一位同名成员。裸成员名称对应邮箱的写入也不等于接收者已读取消息。`to: "*"` 另走团队广播，结构化 shutdown、计划批准等消息另走对应协议处理。
+
+`TaskStop` 和 `TaskOutput` 按运行任务 ID 查找，不使用这张名称注册表。例如停止上述测试检查者应传 `task_id: "a0000000000000002"`，不能直接照搬 `to: "auth-tests"` 的别名。
+
+### 9.2 补充指令：排队等待模型读取
 
 本仓库的 `SendMessage` 可以按已注册名称或 agent ID 找到普通本地子 agent。目标正在运行时，消息加入该任务的 `pendingMessages`，返回成功表示已排队。
 
@@ -323,9 +409,11 @@ Agent Teams 的自动领取和依赖门控在第 12 节单独说明。
 
 所以需要区分三件事：消息排队成功、消息进入下一轮上下文、子模型按消息完成工作。它们不是同一个确认。
 
+普通 `pendingMessages` 队列保存的是文本，注入的附件标记为 coordinator 来源，不含团队消息那样的发送者 `from` 信封。因此不能把普通定向文本队列理解成每条都自动携带对等发送者身份的聊天系统；普通子 agent 的执行结果来源由第 8.4 节的返回关联识别。
+
 源码：[SendMessageTool.ts](../src/tools/SendMessageTool/SendMessageTool.ts)、[LocalAgentTask.tsx](../src/tasks/LocalAgentTask/LocalAgentTask.tsx)、[attachments.ts](../src/utils/attachments.ts)。
 
-### 9.2 用户纠正不会自动广播
+### 9.3 用户纠正不会自动广播
 
 主会话中的用户输入默认交给主会话。`query()` 对消息队列做 agent 归属过滤，子 agent 不会消费主会话的用户提示流。
 
@@ -335,7 +423,7 @@ Agent Teams 的自动领取和依赖门控在第 12 节单独说明。
 
 源码：[query.ts](../src/query.ts)、[SendMessageTool.ts](../src/tools/SendMessageTool/SendMessageTool.ts)。
 
-### 9.3 停止任务：中止执行，不回滚文件
+### 9.4 停止任务：中止执行，不回滚文件
 
 `TaskStop` 查找运行任务，调用其对应的停止实现。普通本地子 agent 通过取消控制器中止运行，并将任务置为 `killed`；生命周期退出路径可以回传已经产生的部分结果。
 
@@ -398,6 +486,8 @@ TaskStop
 
 即使运行任务已从内存移除，仍可能通过磁盘记录恢复；没有可用记录时则不能续接。agent ID 是寻址标识，不是永久可恢复的承诺。恢复的是原 agent 留下的上下文，不是自动补齐它停止之后主会话发生的所有事情。
 
+普通名称注册表属于应用内存状态，同一次运行中可以保留已结束实例的别名，恢复路径也沿用已有映射；但名称不属于原 agent 的持久化元数据，重启后不能假定别名会自动重建。记录按所属会话与 agent ID 定位，agent ID 也不是跨任意会话的全局访问地址。恢复原实例应结合保存的会话记录和实例 ID。
+
 原 worktree 不存在时，当前实现可以退回父工作目录；原 agent 定义不可用时也有回退选择。因此“恢复成功”不等于原文件环境和全部配置必然完整重现。委派方需要提供影响后续工作的代码状态、需求变化和其它 agent 的有效结论。
 
 源码：[resumeAgent.ts](../src/tools/AgentTool/resumeAgent.ts)、[SendMessageTool.ts](../src/tools/SendMessageTool/SendMessageTool.ts)。
@@ -417,9 +507,35 @@ Agent Teams 的 lead 是主会话。teammate 有独立上下文，可以通过�
 
 `TeamCreate` 建立团队配置和任务目录，不等于已经创建 teammate 或开始执行任务。成员由后续派发启动。本仓库支持同进程 teammate，也包含 tmux/iTerm 等分进程启动路径，具体采用哪一种由环境和配置决定。
 
-### 12.2 显式分配与自主领取
+### 12.2 团队成员怎样寻址、识别发送者
 
-lead 可以创建任务并设置 owner。启用团队机制时，`TaskUpdate` 的负责人变更会向相应成员发送任务分配消息。
+团队成员有三类相互关联但用途不同的标识。例如，`auth-team` 中的成员 `researcher`，完整身份是 `researcher@auth-team`；同进程成员还有另行生成的后台运行任务 ID；它领取的清单任务 `#3` 又是另一个工作项。
+
+发送团队消息时，`SendMessage.to` 使用实际成员名称，例如 `researcher` 或 `team-lead`，而不是 `researcher@auth-team`。运行时结合当前 `teamName`，定位到以下邮箱：
+
+```text
+~/.claude/teams/auth-team/inboxes/researcher.json
+```
+
+创建成员时，程序会检查已有成员名并尝试添加 `-2`、`-3` 等后缀，同时规范化名称；应以派发结果返回的实际 `name` 为准，而不是继续使用最初期望的名称。`to: "*"` 是当前团队的广播，并不是向所有普通后台子 agent 广播。
+
+团队普通发信接口不要求模型填写 `from`。运行时从当前成员身份取出发送者名称，写入包含 `from`、正文、时间等字段的邮箱消息。同进程成员通过异步上下文隔离各自身份；分进程成员通过启动参数初始化自己的团队身份。
+
+当 `researcher` 发消息给 lead 时，主会话收到的上下文包装类似：
+
+```xml
+<teammate-message teammate_id="researcher" summary="任务3调查结果">
+任务 #3：已定位刷新竞态，调用路径与证据如下……
+</teammate-message>
+```
+
+这里的 `teammate_id` 属性取自消息的 `from`，通常承载成员名称，并不是完整的 `researcher@auth-team`。它告诉主模型“谁发来的”；普通团队信封没有强制清单任务 ID，所以“回答哪项工作”还需要结合正文中的任务号、原委派记录和任务清单。一个成员先后处理 `#3` 与 `#7` 时，不能只凭同一个发送者就把两项结果混为一项。
+
+源码：[agentId.ts](../src/utils/agentId.ts)、[spawnMultiAgent.ts](../src/tools/shared/spawnMultiAgent.ts)、[SendMessageTool.ts](../src/tools/SendMessageTool/SendMessageTool.ts)、[teammateMailbox.ts](../src/utils/teammateMailbox.ts)、[teammateContext.ts](../src/utils/teammateContext.ts)、[teammate.ts](../src/utils/teammate.ts)。
+
+### 12.3 显式分配与自主领取
+
+lead 可以创建任务，并将 `owner` 设为成员实际名称，例如 `researcher`。启用团队机制时，`TaskUpdate` 的负责人变更会向相应成员发送包含清单任务 `taskId`、主题、描述和分配者的 `task_assignment` 消息。
 
 同进程成员的外层运行器也可以寻找未分配、依赖已完成的任务，通过 `claimTask()` 领取后继续工作。领取路径使用文件锁并重新检查状态，避免多个成员同时成功领取同一项任务。
 
@@ -427,7 +543,7 @@ lead 可以创建任务并设置 owner。启用团队机制时，`TaskUpdate` �
 
 源码：[TeamCreateTool.ts](../src/tools/TeamCreateTool/TeamCreateTool.ts)、[TaskUpdateTool.ts](../src/tools/TaskUpdateTool/TaskUpdateTool.ts)、[tasks.ts](../src/utils/tasks.ts)、[inProcessRunner.ts](../src/utils/swarm/inProcessRunner.ts)。
 
-### 12.3 普通回答、消息和 Idle 的区别
+### 12.4 普通回答、消息和 Idle 的区别
 
 teammate 通过 `SendMessage` 显式向 lead 或其它成员传达结果。邮箱消息进入接收方的上下文，普通回答不会自动成为所有成员都能看到的聊天消息。
 
@@ -440,7 +556,7 @@ teammate 通过 `SendMessage` 显式向 lead 或其它成员传达结果。邮�
 | 共享任务的 `completed` | 某项工作被标记完成 |
 | teammate 退出 | 该成员的运行生命周期结束 |
 
-### 12.4 干预、批准与退出
+### 12.5 干预、批准与退出
 
 同进程 teammate 分别持有整个成员生命周期的取消控制器，以及当前工作轮次的取消控制器，因此可以区分“中断这轮工作”和“结束成员”。
 
@@ -448,7 +564,7 @@ teammate 通过 `SendMessage` 显式向 lead 或其它成员传达结果。邮�
 
 团队还可以配置 `TeammateIdle` 或 `TaskCompleted` 等 hooks，在成员准备空闲或清单任务准备完成时返回阻断反馈。正常收尾时对在办任务运行检查，不代表运行器会自动把这些任务标记完成。这些事件提供检查入口，具体标准仍需明确实现。
 
-### 12.5 未完成任务与团队目录的回收
+### 12.6 未完成任务与团队目录的回收
 
 lead 处理 `shutdown_approved`、界面主动移除成员等路径会调用 `unassignTeammateTasks()`，清除该成员未完成任务的 owner，并重置为 `pending`，供后续重新领取。仅看到成员退出、失败或被停止，不能推断这些归属回收步骤已经执行。这回收的是任务归属，不会撤销已经产生的代码或其它产物；接手者仍需要知道当前状态。
 
@@ -511,6 +627,7 @@ lead 处理 `shutdown_approved`、界面主动移除成员等路径会调用 `un
 | 主会话怎样进入循环 | [REPL.tsx](../src/screens/REPL.tsx)、[QueryEngine.ts](../src/QueryEngine.ts)：`query()` |
 | 模型怎样获知可用 agent 与委派规则 | [prompt.ts](../src/tools/AgentTool/prompt.ts)：`getPrompt()` |
 | 普通、fork、teammate 怎样分流 | [AgentTool.tsx](../src/tools/AgentTool/AgentTool.tsx)：`call()`；[forkSubagent.ts](../src/tools/AgentTool/forkSubagent.ts) |
+| 实例 ID、别名和调用关联怎样建立 | [uuid.ts](../src/utils/uuid.ts)、[ids.ts](../src/types/ids.ts)、[AgentTool.tsx](../src/tools/AgentTool/AgentTool.tsx)、[AppStateStore.ts](../src/state/AppStateStore.ts)、[toolExecution.ts](../src/services/tools/toolExecution.ts) |
 | 子 agent 怎样建立上下文并启动 | [runAgent.ts](../src/tools/AgentTool/runAgent.ts)：`initialMessages`、`createSubagentContext()`、`query()` |
 | 下一轮模型请求怎样触发 | [query.ts](../src/query.ts)：`queryLoop`、`needsFollowUp`、下一轮 `state` |
 | 模型请求体怎样构造 | [claude.ts](../src/services/api/claude.ts)：`paramsFromContext()` |
@@ -522,6 +639,7 @@ lead 处理 `shutdown_approved`、界面主动移除成员等路径会调用 `un
 | 已结束 agent 怎样续跑 | [resumeAgent.ts](../src/tools/AgentTool/resumeAgent.ts)：`resumeAgentBackground()` |
 | 独立记录怎样存储 | [sessionStorage.ts](../src/utils/sessionStorage.ts)：agent transcript 与元数据 |
 | Teams 怎样创建、通信和执行 | [spawnMultiAgent.ts](../src/tools/shared/spawnMultiAgent.ts)、[teammateMailbox.ts](../src/utils/teammateMailbox.ts)、[inProcessRunner.ts](../src/utils/swarm/inProcessRunner.ts) |
+| Teams 的成员身份和发信人从哪里来 | [agentId.ts](../src/utils/agentId.ts)、[teammateContext.ts](../src/utils/teammateContext.ts)、[teammate.ts](../src/utils/teammate.ts) |
 | 工作清单怎样分配、领取和更新 | [TaskCreateTool.ts](../src/tools/TaskCreateTool/TaskCreateTool.ts)、[TaskUpdateTool.ts](../src/tools/TaskUpdateTool/TaskUpdateTool.ts)、[tasks.ts](../src/utils/tasks.ts) |
 
 ## 附录：本项目的模型协议兼容层
